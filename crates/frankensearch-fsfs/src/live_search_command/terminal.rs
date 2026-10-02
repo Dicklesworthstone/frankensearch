@@ -24,8 +24,8 @@ use ftui_render::diff::BufferDiff;
 use ftui_render::frame::Frame;
 use ftui_render::grapheme_pool::GraphemePool;
 use ftui_render::presenter::Presenter;
-use ftui_widgets::{Widget, paragraph::Paragraph};
 use ftui_tty::{TtyBackend, TtySessionOptions};
+use ftui_widgets::{Widget, paragraph::Paragraph};
 
 use super::Options;
 use model::{Model, display_text};
@@ -98,13 +98,17 @@ struct TerminalSurface {
 
 impl TerminalSurface {
     fn open() -> io::Result<Self> {
-        let mut backend = TtyBackend::open(80, 24, TtySessionOptions {
-            alternate_screen: true,
-            // Normal exits restore via TtyBackend's drop. Its existing signal
-            // cleanup also protects force-exit during an uninterruptible syscall.
-            intercept_signals: true,
-            features: BackendFeatures::default(),
-        })?;
+        let mut backend = TtyBackend::open(
+            80,
+            24,
+            TtySessionOptions {
+                alternate_screen: true,
+                // Normal exits restore via TtyBackend's drop. Its existing signal
+                // cleanup also protects force-exit during an uninterruptible syscall.
+                intercept_signals: true,
+                features: BackendFeatures::default(),
+            },
+        )?;
         let presenter = Presenter::new(io::stdout(), *backend.presenter().capabilities());
         Ok(Self { presenter, backend })
     }
@@ -124,7 +128,8 @@ impl Surface for TerminalSurface {
             frame.buffer
         };
         let diff = BufferDiff::full(size.0, size.1);
-        self.presenter.present_with_pool(&buffer, &diff, Some(&pool), None)?;
+        self.presenter
+            .present_with_pool(&buffer, &diff, Some(&pool), None)?;
         Ok(())
     }
 
@@ -132,9 +137,11 @@ impl Surface for TerminalSurface {
         if !self.backend.poll_event(Duration::ZERO)? {
             return Ok(None);
         }
-        Ok(self.backend.read_event()?.as_ref().map(|event| {
-            action_for(event).unwrap_or(Action::Ignore)
-        }))
+        Ok(self
+            .backend
+            .read_event()?
+            .as_ref()
+            .map(|event| action_for(event).unwrap_or(Action::Ignore)))
     }
 }
 
@@ -144,40 +151,94 @@ fn render(model: &Model, width: u16, height: u16, frame: &mut Frame<'_>) {
             Paragraph::new(text).render(Rect::new(0, row, width, 1), frame);
         }
     };
-    line(frame, 0, format!("fsfs LIVE | {} | {}",
-        if model.hybrid { "hybrid subscription" } else { "lexical subscription" },
-        display_text(&model.query, 120)));
+    line(
+        frame,
+        0,
+        format!(
+            "fsfs LIVE | {} | {}",
+            if model.hybrid {
+                "hybrid subscription"
+            } else {
+                "lexical subscription"
+            },
+            display_text(&model.query, 120)
+        ),
+    );
     if height < 6 {
-        line(frame, height.saturating_sub(1), "Resize terminal | q/Esc: quit".to_owned());
+        line(
+            frame,
+            height.saturating_sub(1),
+            "Resize terminal | q/Esc: quit".to_owned(),
+        );
         return;
     }
     line(frame, 1, model.status());
-    line(frame, 2, format!("Committed revision: {}",
-        display_text(model.revision.as_deref().unwrap_or("none"), 180)));
+    line(
+        frame,
+        2,
+        format!(
+            "Committed revision: {}",
+            display_text(model.revision.as_deref().unwrap_or("none"), 180)
+        ),
+    );
     let list_rows = usize::from(if height >= 10 { height - 8 } else { height - 4 });
     let start = model.selected.saturating_sub(list_rows.saturating_sub(1));
     if model.results.is_empty() {
-        let message = if model.sequence == 0 { "Waiting for publication..." } else { "No matching results" };
+        let message = if model.sequence == 0 {
+            "Waiting for publication..."
+        } else {
+            "No matching results"
+        };
         line(frame, 3, message.to_owned());
     }
     for (offset, result) in model.results.iter().enumerate().skip(start).take(list_rows) {
-        let location = result.hit.item.get("path").and_then(serde_json::Value::as_str)
+        let location = result
+            .hit
+            .item
+            .get("path")
+            .and_then(serde_json::Value::as_str)
             .unwrap_or(&result.hit.doc_id);
         let location = display_text(location, 512);
-        let location = result.hit.item.get("line").and_then(serde_json::Value::as_u64)
+        let location = result
+            .hit
+            .item
+            .get("line")
+            .and_then(serde_json::Value::as_u64)
             .map_or_else(|| location.clone(), |number| format!("{location}:{number}"));
         let row = 3_u16.saturating_add(u16::try_from(offset - start).unwrap_or(u16::MAX));
-        line(frame, row, format!("{} {:>4}  {:>10.5}  {location}",
-            if offset == model.selected { ">" } else { " " }, result.rank, result.hit.score));
+        line(
+            frame,
+            row,
+            format!(
+                "{} {:>4}  {:>10.5}  {location}",
+                if offset == model.selected { ">" } else { " " },
+                result.rank,
+                result.hit.score
+            ),
+        );
     }
-    if height >= 10 && let Some(selected) = model.results.get(model.selected) {
-        line(frame, height - 4, format!("Selected: {}", display_text(&selected.hit.doc_id, 512)));
-        let snippet = selected.hit.item.get("snippet").and_then(serde_json::Value::as_str)
+    if height >= 10
+        && let Some(selected) = model.results.get(model.selected)
+    {
+        line(
+            frame,
+            height - 4,
+            format!("Selected: {}", display_text(&selected.hit.doc_id, 512)),
+        );
+        let snippet = selected
+            .hit
+            .item
+            .get("snippet")
+            .and_then(serde_json::Value::as_str)
             .unwrap_or("No stored snippet in this result payload");
         Paragraph::new(display_text(snippet, 2_000))
             .render(Rect::new(0, height - 3, width, 2), frame);
     }
-    line(frame, height - 1, "Up/Down or j/k: select | PgUp/PgDn: 10 rows | Home/End | q/Esc: quit".to_owned());
+    line(
+        frame,
+        height - 1,
+        "Up/Down or j/k: select | PgUp/PgDn: 10 rows | Home/End | q/Esc: quit".to_owned(),
+    );
 }
 
 struct FrameOutput<S> {
@@ -189,13 +250,19 @@ struct FrameOutput<S> {
 impl<S: Surface> FrameOutput<S> {
     fn new(mut surface: S, model: Model) -> io::Result<Self> {
         surface.present(&model)?;
-        Ok(Self { surface, model, pending: Vec::new() })
+        Ok(Self {
+            surface,
+            model,
+            pending: Vec::new(),
+        })
     }
 
     fn input(&mut self) -> io::Result<Option<Action>> {
         let mut redraw = false;
         for _ in 0..MAX_EVENTS_PER_TICK {
-            let Some(action) = self.surface.poll_action()? else { break };
+            let Some(action) = self.surface.poll_action()? else {
+                break;
+            };
             match action {
                 Action::Quit | Action::Interrupt => return Ok(Some(action)),
                 Action::Ignore => continue,
@@ -215,10 +282,13 @@ impl<S: Surface> FrameOutput<S> {
 
 impl<S: Surface> Write for FrameOutput<S> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.pending.len().checked_add(bytes.len())
+        self.pending
+            .len()
+            .checked_add(bytes.len())
             .filter(|length| *length <= MAX_FRAME_BYTES)
             .ok_or_else(|| model::invalid("terminal live-search frame exceeds 16 MiB"))?;
-        self.pending.try_reserve(bytes.len())
+        self.pending
+            .try_reserve(bytes.len())
             .map_err(|_| io::Error::other("cannot reserve terminal live-search frame"))?;
         self.pending.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -241,7 +311,9 @@ impl<S: Surface> Write for FrameOutput<S> {
 struct SharedOutput<S>(Arc<Mutex<FrameOutput<S>>>);
 
 fn lock<S>(shared: &Mutex<FrameOutput<S>>) -> io::Result<MutexGuard<'_, FrameOutput<S>>> {
-    shared.lock().map_err(|_| io::Error::other("terminal live-search state was poisoned"))
+    shared
+        .lock()
+        .map_err(|_| io::Error::other("terminal live-search state was poisoned"))
 }
 
 impl<S: Surface> Write for SharedOutput<S> {
@@ -289,9 +361,9 @@ async fn drive<S: Surface, F: Future<Output = SearchResult<u64>>>(
         // Poll exactly once per input tick. The underlying future retains the
         // real task waker; the timer also guarantees a bounded input interval
         // even when the subscriber is waiting on a long configured poll delay.
-        if let Poll::Ready(result) = poll_fn(|context| {
-            Poll::Ready(work.as_mut().poll(context))
-        }).await {
+        if let Poll::Ready(result) =
+            poll_fn(|context| Poll::Ready(work.as_mut().poll(context))).await
+        {
             return result;
         }
         asupersync::time::sleep(cx.now(), INPUT_TICK).await;
@@ -305,14 +377,18 @@ pub(super) async fn execute(
 ) -> SearchResult<u64> {
     checkpoint(cx)?;
     preflight()?;
-    let model = Model::new(options.query.clone(), options.hybrid, options.limits.max_results);
+    let model = Model::new(
+        options.query.clone(),
+        options.hybrid,
+        options.limits.max_results,
+    );
     let output = FrameOutput::new(TerminalSurface::open()?, model)?;
     let shared = Arc::new(Mutex::new(output));
     let mut writer = SharedOutput(Arc::clone(&shared));
     let work = super::execute_with_runtime(cx, options, &mut writer, runtime);
     // Backend drop restores the terminal on every return, including an input,
     // admission, decoding, rendering or output error. No raw guard escapes.
-    drive(cx, shared.as_ref(), work).await
+    Box::pin(drive(cx, shared.as_ref(), work)).await
 }
 
 #[cfg(test)]
@@ -322,7 +398,9 @@ mod tests {
 
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::{IndexableDocument, LexicalWrite};
-    use frankensearch_fsfs::adapters::live_search::{LiveSearchConfig, LiveSearchHit, LiveSearchTracker};
+    use frankensearch_fsfs::adapters::live_search::{
+        LiveSearchConfig, LiveSearchHit, LiveSearchTracker,
+    };
     use frankensearch_fsfs::generation_store::{CompleteGenerationStore, GenerationPublication};
     use frankensearch_quill::{QuillConfig, QuillIndex};
     use ftui_core::event::{KeyEvent, Modifiers};
@@ -341,7 +419,10 @@ mod tests {
 
     impl Surface for RecordingSurface {
         fn present(&mut self, model: &Model) -> io::Result<()> {
-            if self.fail_after.is_some_and(|count| self.frames.len() >= count) {
+            if self
+                .fail_after
+                .is_some_and(|count| self.frames.len() >= count)
+            {
                 return Err(io::Error::other("injected terminal failure"));
             }
             self.frames.push(model.clone());
@@ -349,7 +430,11 @@ mod tests {
         }
 
         fn poll_action(&mut self) -> io::Result<Option<Action>> {
-            if self.quit_when_polled.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            if self
+                .quit_when_polled
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst))
+            {
                 return Ok(Some(Action::Quit));
             }
             Ok(self.actions.pop_front())
@@ -362,9 +447,17 @@ mod tests {
 
     fn record() -> Vec<u8> {
         let mut tracker = LiveSearchTracker::new("alpha", LiveSearchConfig::default()).unwrap();
-        let frame = tracker.apply("generation", vec![LiveSearchHit {
-            doc_id: "doc-a".to_owned(), score: 1.0, item: json!({"path": "a.rs"}),
-        }]).unwrap().unwrap();
+        let frame = tracker
+            .apply(
+                "generation",
+                vec![LiveSearchHit {
+                    doc_id: "doc-a".to_owned(),
+                    score: 1.0,
+                    item: json!({"path": "a.rs"}),
+                }],
+            )
+            .unwrap()
+            .unwrap();
         let mut bytes = serde_json::to_vec(&frame).unwrap();
         bytes.push(b'\n');
         bytes
@@ -387,7 +480,10 @@ mod tests {
 
     #[test]
     fn failed_presentation_and_partial_records_leave_the_display_baseline_unchanged() {
-        let mut failed = output(RecordingSurface { fail_after: Some(1), ..RecordingSurface::default() });
+        let mut failed = output(RecordingSurface {
+            fail_after: Some(1),
+            ..RecordingSurface::default()
+        });
         failed.write_all(&record()).unwrap();
         assert!(failed.flush().is_err());
         assert_eq!(failed.model.sequence, 0);
@@ -408,14 +504,23 @@ mod tests {
 
     #[test]
     fn terminal_flags_are_explicit_and_do_not_enable_indexing_or_hybrid_models() {
-        let options = Options::parse(vec!["--index-dir".into(), "/store".into(),
-            "--query".into(), "alpha".into(), "--tui".into()]).unwrap();
+        let options = Options::parse(vec![
+            "--index-dir".into(),
+            "/store".into(),
+            "--query".into(),
+            "alpha".into(),
+            "--tui".into(),
+        ])
+        .unwrap();
         assert!(options.tui);
         assert!(!options.hybrid);
         assert!(options.watch_source.is_none());
         for suffix in [vec!["--tui"], vec!["--format", "jsonl"]] {
-            let args = ["--index-dir", "/store", "--query", "alpha", "--tui"].into_iter()
-                .chain(suffix).map(std::ffi::OsString::from).collect();
+            let args = ["--index-dir", "/store", "--query", "alpha", "--tui"]
+                .into_iter()
+                .chain(suffix)
+                .map(std::ffi::OsString::from)
+                .collect();
             assert!(Options::parse(args).is_err());
         }
         for (input, output) in [(false, false), (true, false), (false, true)] {
@@ -428,16 +533,28 @@ mod tests {
     fn key_releases_and_modified_navigation_do_not_move_or_quit() {
         let press = KeyEvent::new(KeyCode::Char('q'));
         assert_eq!(action_for(&Event::Key(press)), Some(Action::Quit));
-        assert_eq!(action_for(&Event::Key(press.with_kind(KeyEventKind::Release))), None);
-        assert_eq!(action_for(&Event::Key(press.with_modifiers(Modifiers::ALT))), None);
-        assert_eq!(action_for(&Event::Key(KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL))), Some(Action::Interrupt));
+        assert_eq!(
+            action_for(&Event::Key(press.with_kind(KeyEventKind::Release))),
+            None
+        );
+        assert_eq!(
+            action_for(&Event::Key(press.with_modifiers(Modifiers::ALT))),
+            None
+        );
+        assert_eq!(
+            action_for(&Event::Key(
+                KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL)
+            )),
+            Some(Action::Interrupt)
+        );
     }
 
     #[test]
     fn ignored_input_is_drained_but_a_flood_cannot_starve_the_subscription() {
         let mut output = output(RecordingSurface {
             actions: std::iter::repeat_n(Action::Ignore, MAX_EVENTS_PER_TICK + 1)
-                .chain([Action::Quit]).collect(),
+                .chain([Action::Quit])
+                .collect(),
             ..RecordingSurface::default()
         });
         assert_eq!(output.input().unwrap(), None);
@@ -452,14 +569,19 @@ mod tests {
 
     impl Future for PendingWork {
         type Output = SearchResult<u64>;
-        fn poll(self: std::pin::Pin<&mut Self>, _: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Self::Output> {
             self.polled.store(true, Ordering::SeqCst);
             Poll::Pending
         }
     }
 
     impl Drop for PendingWork {
-        fn drop(&mut self) { self.dropped.store(true, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
     }
 
     #[test]
@@ -468,9 +590,13 @@ mod tests {
             let dropped = Arc::new(AtomicBool::new(false));
             let polled = Arc::new(AtomicBool::new(false));
             let output = Mutex::new(output(RecordingSurface {
-                actions: [Action::Quit].into(), ..RecordingSurface::default()
+                actions: [Action::Quit].into(),
+                ..RecordingSurface::default()
             }));
-            let work = PendingWork { dropped: Arc::clone(&dropped), polled: Arc::clone(&polled) };
+            let work = PendingWork {
+                dropped: Arc::clone(&dropped),
+                polled: Arc::clone(&polled),
+            };
             assert_eq!(drive(&cx, &output, work).await.unwrap(), 0);
             assert!(dropped.load(Ordering::SeqCst));
             assert!(!polled.load(Ordering::SeqCst));
@@ -510,7 +636,9 @@ mod tests {
                 frame.buffer
             };
             let mut presenter = Presenter::new(Vec::new(), TerminalCapabilities::detect());
-            presenter.present_with_pool(&buffer, &BufferDiff::full(width, height), Some(&pool), None).unwrap();
+            presenter
+                .present_with_pool(&buffer, &BufferDiff::full(width, height), Some(&pool), None)
+                .unwrap();
             let rendered = String::from_utf8(presenter.writer_mut().clone()).unwrap();
             if width >= 80 {
                 assert!(rendered.contains("👩‍💻"));
@@ -532,21 +660,48 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
             let build = store.begin(&cx).unwrap();
-            let index = QuillIndex::create(&cx, &build.path().join("lexical"), QuillConfig {
-                deterministic_ingest: true, ..QuillConfig::default()
-            }).await.unwrap();
-            LexicalWrite::index_documents(&index, &cx, &[
-                IndexableDocument::new("source-a", "alpha searchable source").with_metadata("path", "source-a.rs"),
-            ]).await.unwrap();
+            let index = QuillIndex::create(
+                &cx,
+                &build.path().join("lexical"),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[
+                    IndexableDocument::new("source-a", "alpha searchable source")
+                        .with_metadata("path", "source-a.rs"),
+                ],
+            )
+            .await
+            .unwrap();
             LexicalWrite::commit(&index, &cx).await.unwrap();
             drop(index);
-            assert!(matches!(build.publish(&cx, |_, _| Ok(())).unwrap(), GenerationPublication::Durable(_)));
-            let options = Options::parse(vec!["--index-dir".into(), root.path().as_os_str().to_owned(),
-                "--query".into(), "alpha".into(), "--once".into(), "--tui".into()]).unwrap();
+            assert!(matches!(
+                build.publish(&cx, |_, _| Ok(())).unwrap(),
+                GenerationPublication::Durable(_)
+            ));
+            let options = Options::parse(vec![
+                "--index-dir".into(),
+                root.path().as_os_str().to_owned(),
+                "--query".into(),
+                "alpha".into(),
+                "--once".into(),
+                "--tui".into(),
+            ])
+            .unwrap();
             let shared = Arc::new(Mutex::new(output(RecordingSurface::default())));
             let mut writer = SharedOutput(Arc::clone(&shared));
             let work = super::super::execute_with_runtime(&cx, &options, &mut writer, None);
-            assert_eq!(drive(&cx, shared.as_ref(), work).await.unwrap(), 1);
+            assert_eq!(
+                Box::pin(drive(&cx, shared.as_ref(), work)).await.unwrap(),
+                1
+            );
             let view = lock(shared.as_ref()).unwrap();
             assert_eq!(view.model.results.len(), 1);
             assert_eq!(view.model.results[0].hit.doc_id, "source-a");

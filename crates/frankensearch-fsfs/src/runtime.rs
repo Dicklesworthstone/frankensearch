@@ -44503,6 +44503,10 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let project = temp.path().join("project");
             fs::create_dir_all(project.join("logs")).expect("create source root");
+            // Discovery applies the enclosing repository's .gitignore files.
+            // rch places TMPDIR inside this repository, whose `*.log` rule
+            // would hide the fixture log; make the fixture its own root.
+            fs::create_dir(project.join(".git")).expect("fixture repository root");
             fs::write(project.join("guide.md"), "ordinary guide about badgers\n")
                 .expect("write guide");
             fs::write(project.join("logs/server.log"), "quokka request served\n")
