@@ -77,16 +77,15 @@ pub struct QuillConfig {
     /// when its hull is at most this fraction holes, which keeps an ordinary
     /// index from paying for a merge that mostly copies empty address space.
     ///
-    /// An index built by many short writer sessions is almost all holes by
-    /// construction, and at the default no window of it is ever eligible.
-    /// Opening a writer resumes at the next lease boundary above the
-    /// manifest's document-id high watermark, so a session that publishes
-    /// three documents still moves its successor past a whole 65,536-wide
-    /// lease. An incremental indexer that runs briefly every few minutes
-    /// therefore accumulates tiny segments inside ~99%-hole leases; the tier
-    /// policy refuses all of them, compaction is driven by tombstone density
-    /// alone and an append-only corpus produces no tombstones, so the segment
-    /// count only grows between full rebuilds (#41).
+    /// Holes between segments come from burned lease tails. A writer resumes
+    /// exactly at the manifest's document-id high watermark, and the most
+    /// recent lease reserves only what it issues, so a session that writes
+    /// through one shard leaves no gap: an incremental indexer that publishes
+    /// three documents per session moves the watermark by three, and its tiny
+    /// segments stay mergeable (#41, bd-k07zw). A session that spreads
+    /// batches over several shards burns the unused block tail of every
+    /// lease but the last, and an index built from many such sessions can be
+    /// mostly holes, so that at the default no window of it is eligible.
     ///
     /// Such a deployment should raise this toward `1.0`. Concat merge
     /// preserves document ids across gaps and the planner keeps merged

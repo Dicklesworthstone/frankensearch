@@ -2647,8 +2647,23 @@ mod retained_search_tests {
                 !names.iter().any(|name| name.ends_with(".retired")),
                 "{names:?}"
             );
-            let live = KeeperSnapshot::open(&engine, DEFAULT_SCHEMA)
-                .expect("snapshot")
+            let snapshot = KeeperSnapshot::open(&engine, DEFAULT_SCHEMA).expect("snapshot");
+            // Every publication is a short single-shard writer session. Each
+            // used to open a fresh 65,536-docid lease that the bulk-finish
+            // concat stored as DOCLEN/IDMAP holes (bd-k07zw); five sessions
+            // over a handful of rows must stay inside the first block.
+            let manifest = &snapshot.loaded_manifest().manifest;
+            assert!(
+                manifest.docid_high_watermark < frankensearch_quill::scribe::DOCID_LEASE_BLOCK,
+                "watermark {} after five publications: {:?}",
+                manifest.docid_high_watermark,
+                manifest
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.docid_lo, segment.docid_hi))
+                    .collect::<Vec<_>>()
+            );
+            let live = snapshot
                 .segment_stats()
                 .expect("segment stats")
                 .sealed_segments;

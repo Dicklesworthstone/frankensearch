@@ -5179,8 +5179,10 @@ fn filled_vec<T: Clone>(
 // Q1 docid allocation and shard routing (bd-quill-e1-scribe-bejd.6)
 // ---------------------------------------------------------------------------
 
-/// Width of one docid lease block in global docids (Q1 §2): exactly one
-/// tombstone `chunk_id` of 65,536 contiguous docids.
+/// Width of one docid lease block in global docids (Q1 §2).
+///
+/// Exactly one tombstone `chunk_id` of 65,536 contiguous docids. A lease never
+/// crosses a block boundary, and its ordinals are relative to the block base.
 pub const DOCID_LEASE_BLOCK: u64 = DOC_ORDS_PER_LEASE as u64;
 
 /// One recorded lease grant in the allocator's append-only session log.
@@ -5191,10 +5193,22 @@ pub const DOCID_LEASE_BLOCK: u64 = DOC_ORDS_PER_LEASE as u64;
 pub struct LeaseGrant {
     /// Zero-based shard that received the lease.
     pub shard: usize,
-    /// Global docid at ordinal zero of the block (always 65,536-aligned).
-    pub base_docid: u64,
+    /// Global docid at ordinal zero of the lease's block (always
+    /// 65,536-aligned); the value spans report as [`DocIdSpan::lease_base`].
+    pub lease_base: u64,
+    /// First ordinal of the block the lease covers: the session watermark's
+    /// offset inside the block, zero for every lease after a block boundary.
+    pub first_ord: u32,
     /// Monotone grant sequence within the allocator session.
     pub grant_seq: u64,
+}
+
+impl LeaseGrant {
+    /// Global docid of the first document the lease can issue.
+    #[must_use]
+    pub const fn first_docid(&self) -> u64 {
+        self.lease_base + self.first_ord as u64
+    }
 }
 
 /// One contiguous run of docids allocated inside a single lease block.
@@ -5272,11 +5286,12 @@ impl BatchDocIds {
 pub struct LeaseBurnRecord {
     /// Zero-based shard that held the lease.
     pub shard: usize,
-    /// Global docid at ordinal zero of the burned-or-exhausted block.
+    /// Global docid at ordinal zero of the lease's block.
     pub lease_base: u64,
     /// Docids consumed by documents before the session ended.
     pub used: u32,
-    /// Docids burned (never issued, never reusable — Q1-d).
+    /// Claimed docids never issued (never reusable — Q1-d). Zero for the
+    /// frontier lease, which reserves only what it issues.
     pub burned: u32,
 }
 
@@ -5285,14 +5300,11 @@ pub struct LeaseBurnRecord {
 pub struct LeaseBurnReport {
     /// One record per grant in grant order.
     pub records: Vec<LeaseBurnRecord>,
-    /// Docids skipped at session open to align a non-block-aligned manifest
-    /// watermark up to the next lease boundary.
-    pub open_gap_burned: u64,
-    /// Total docids leased during the session (blocks × 65,536).
+    /// Total docids the session's leases reserved (`total_used + total_burned`).
     pub total_leased: u64,
     /// Total docids consumed by documents.
     pub total_used: u64,
-    /// Total docids burned: open gap plus unused lease tails (Q1-d).
+    /// Total docids burned: reserved lease tails never issued (Q1-d).
     pub total_burned: u64,
     /// Watermark the next session must open from; never decreases.
     pub final_watermark: u64,
@@ -5339,20 +5351,35 @@ struct ShardLease {
 /// (`docs/contracts/quill-q1-docid-discipline.md` §2).
 ///
 /// One allocator serves one writer session. It opens from the manifest's
-/// persisted `docid_high_watermark` and never issues a docid below it. Shards
-/// hold session leases of [`DOCID_LEASE_BLOCK`] contiguous docids, reused
-/// across watch-mode batches; when a session ends the unused tail of every
-/// live lease is burned, never reused (Q1-d).
+/// persisted `docid_high_watermark` and never issues a docid below it. A
+/// shard's lease starts at the watermark (or the next block boundary, see
+/// below), may grow to the end of its [`DOCID_LEASE_BLOCK`], and is reused
+/// across watch-mode batches.
 ///
-/// The watermark advances by whole lease blocks *at grant time*, so a crash
-/// mid-session lands recovery on a watermark that already accounts for every
-/// burned tail — no end-of-session manifest write is required for safety.
+/// Only the *frontier* lease — the most recently granted one — reserves
+/// lazily: nothing lies above it, so it reserves exactly what it issues and
+/// the watermark is the exact allocation frontier. Before another shard's
+/// lease may start, the frontier lease claims the rest of its block, so
+/// concurrently live leases stay disjoint. When the session ends, the
+/// claimed but unissued tail of every other live lease is burned, never
+/// reused (Q1-d); the frontier lease burns nothing. A session that writes
+/// through one shard therefore burns nothing at all. Short sessions (one per
+/// fsfs watch publication, delete, or append; an incremental library indexer)
+/// used to burn up to a block each, which merges stored as dense DOCLEN/IDMAP
+/// holes (bd-k07zw, #41) and which exhausts the u32 docid space after 65,536
+/// sessions.
+///
+/// The watermark advances when docids are reserved, so a crash mid-session
+/// lands recovery on a watermark that covers every docid reserved before the
+/// last publish — no end-of-session manifest write is required for safety.
+/// Docids reserved after the last publish appear in no published artifact.
 /// The value to persist at the next manifest publish is [`Self::watermark`].
 #[derive(Debug)]
 pub struct DocIdAllocator {
     shard_count: usize,
-    next_block_base: u64,
-    open_gap_burned: u64,
+    next_unreserved: u64,
+    /// Shard holding the frontier lease, which ends at `next_unreserved`.
+    frontier_shard: Option<usize>,
     grant_seq: u64,
     leases: Vec<Option<ShardLease>>,
     grants: Vec<LeaseGrant>,
@@ -5364,8 +5391,8 @@ impl DocIdAllocator {
     pub(crate) fn speculative_clone(&self) -> Self {
         Self {
             shard_count: self.shard_count,
-            next_block_base: self.next_block_base,
-            open_gap_burned: self.open_gap_burned,
+            next_unreserved: self.next_unreserved,
+            frontier_shard: self.frontier_shard,
             grant_seq: self.grant_seq,
             leases: self.leases.clone(),
             grants: self.grants.clone(),
@@ -5386,10 +5413,10 @@ impl DocIdAllocator {
 
     /// Open a session allocator at the manifest's persisted watermark.
     ///
-    /// A watermark that is not lease-block-aligned is aligned *up* to the next
-    /// block boundary, burning the gap (Q1-d makes burning always safe; the
-    /// Keeper manifest validator already guarantees the watermark is at or
-    /// above every live docid, so the gap can contain no live document).
+    /// The first lease starts exactly at the watermark, inside its block when
+    /// the watermark is not block-aligned; nothing is skipped. The Keeper
+    /// manifest validator guarantees the watermark is at or above every
+    /// published docid, so the lease can collide with no live document.
     ///
     /// # Errors
     ///
@@ -5398,11 +5425,10 @@ impl DocIdAllocator {
         if shard_count == 0 {
             return Err(DocIdAllocatorError::ZeroShards);
         }
-        let next_block_base = manifest_watermark.div_ceil(DOCID_LEASE_BLOCK) * DOCID_LEASE_BLOCK;
         Ok(Self {
             shard_count,
-            next_block_base,
-            open_gap_burned: next_block_base - manifest_watermark,
+            next_unreserved: manifest_watermark,
+            frontier_shard: None,
             grant_seq: 0,
             leases: vec![None; shard_count],
             grants: Vec::new(),
@@ -5419,11 +5445,13 @@ impl DocIdAllocator {
 
     /// Watermark to persist in the manifest at the next publish.
     ///
-    /// Advances by whole lease blocks at grant time and never decreases, so
-    /// persisting it at any point preserves Q1-d across crashes.
+    /// The first docid no lease has reserved. It advances as the frontier
+    /// lease issues docids, and to a block end when the frontier lease claims
+    /// its block for another shard's grant. It never decreases, so persisting
+    /// it at any point preserves Q1-d across crashes.
     #[must_use]
     pub const fn watermark(&self) -> u64 {
-        self.next_block_base
+        self.next_unreserved
     }
 
     /// Append-only log of every lease grant this session, in grant order.
@@ -5439,6 +5467,23 @@ impl DocIdAllocator {
         self.leases
             .get(shard)
             .and_then(|lease| lease.map(|live| (live.base_docid, live.next_ord)))
+    }
+
+    /// Docids [`Self::alloc_batch`] can issue to `shard` as one span, without
+    /// an R1 cut: the rest of the shard's live lease, or of the block a fresh
+    /// lease would start in. Zero once the docid space is exhausted.
+    #[must_use]
+    pub fn contiguous_capacity(&self, shard: usize) -> u32 {
+        if let Some(lease) = self.leases.get(shard).copied().flatten()
+            && lease.next_ord < DOC_ORDS_PER_LEASE
+        {
+            return DOC_ORDS_PER_LEASE - lease.next_ord;
+        }
+        let start = self.next_grant_start(shard);
+        if start > u64::from(u32::MAX) {
+            return 0;
+        }
+        u32::try_from(DOCID_LEASE_BLOCK - start % DOCID_LEASE_BLOCK).unwrap_or(0)
     }
 
     /// Allocate `count` docids for one batch routed to `shard`.
@@ -5476,6 +5521,9 @@ impl DocIdAllocator {
             lease.next_ord += take;
             remaining -= take;
             spans.push(span);
+            if self.frontier_shard == Some(shard) {
+                self.next_unreserved = span.global_end();
+            }
         }
         Ok(BatchDocIds { spans })
     }
@@ -5491,35 +5539,53 @@ impl DocIdAllocator {
         Ok(batch.spans[0].global_first())
     }
 
-    /// End the session: burn the unused tail of every live lease (Q1-d) and
-    /// return whole-session lease accounting. The allocator is closed;
-    /// further allocation returns [`DocIdAllocatorError::SessionClosed`].
+    /// End the session: burn the claimed but unissued tail of every live
+    /// lease except the frontier lease (Q1-d) and return whole-session lease
+    /// accounting. The allocator is closed; further allocation returns
+    /// [`DocIdAllocatorError::SessionClosed`].
     #[must_use]
     pub fn end_session(&mut self) -> LeaseBurnReport {
         self.open = false;
         let mut report = LeaseBurnReport {
-            open_gap_burned: self.open_gap_burned,
-            final_watermark: self.next_block_base,
+            final_watermark: self.next_unreserved,
             ..LeaseBurnReport::default()
         };
         for grant in &self.grants {
-            let live = self.leases[grant.shard].filter(|live| live.base_docid == grant.base_docid);
+            let live = self.leases[grant.shard].filter(|live| live.base_docid == grant.lease_base);
             // A grant that is not the shard's live lease was necessarily
             // exhausted in place before its successor was granted.
-            let used = live.map_or(DOC_ORDS_PER_LEASE, |live| live.next_ord);
-            let burned = DOC_ORDS_PER_LEASE - used;
+            let issued_end = live.map_or(DOC_ORDS_PER_LEASE, |live| live.next_ord);
+            let used = issued_end - grant.first_ord;
+            let burned = if live.is_some() && self.frontier_shard != Some(grant.shard) {
+                DOC_ORDS_PER_LEASE - issued_end
+            } else {
+                0
+            };
             report.records.push(LeaseBurnRecord {
                 shard: grant.shard,
-                lease_base: grant.base_docid,
+                lease_base: grant.lease_base,
                 used,
                 burned,
             });
-            report.total_leased += DOCID_LEASE_BLOCK;
+            report.total_leased += u64::from(used) + u64::from(burned);
             report.total_used += u64::from(used);
             report.total_burned += u64::from(burned);
         }
-        report.total_burned += self.open_gap_burned;
         report
+    }
+
+    /// First docid of the next lease granted to `shard`. A frontier lease
+    /// held by another shard first claims the rest of its block, so the new
+    /// lease starts at the next block boundary; otherwise it starts exactly
+    /// at the watermark.
+    const fn next_grant_start(&self, shard: usize) -> u64 {
+        let offset = self.next_unreserved % DOCID_LEASE_BLOCK;
+        match self.frontier_shard {
+            Some(frontier) if frontier != shard && offset != 0 => {
+                self.next_unreserved - offset + DOCID_LEASE_BLOCK
+            }
+            _ => self.next_unreserved,
+        }
     }
 
     fn ensure_usable(&self, shard: usize) -> Result<(), DocIdAllocatorError> {
@@ -5545,20 +5611,26 @@ impl DocIdAllocator {
     }
 
     fn grant_lease(&mut self, shard: usize) -> Result<(), DocIdAllocatorError> {
-        let base = self.next_block_base;
+        let start = self.next_grant_start(shard);
+        let offset = start % DOCID_LEASE_BLOCK;
+        let base = start - offset;
         if base > u64::from(u32::MAX) - (DOCID_LEASE_BLOCK - 1) {
             return Err(DocIdAllocatorError::DocIdSpaceExhausted { base });
         }
+        let first_ord =
+            u32::try_from(offset).map_err(|_| DocIdAllocatorError::DocIdSpaceExhausted { base })?;
         let grant = LeaseGrant {
             shard,
-            base_docid: base,
+            lease_base: base,
+            first_ord,
             grant_seq: self.grant_seq,
         };
         self.grant_seq += 1;
-        self.next_block_base += DOCID_LEASE_BLOCK;
+        self.next_unreserved = start;
+        self.frontier_shard = Some(shard);
         self.leases[shard] = Some(ShardLease {
             base_docid: base,
-            next_ord: 0,
+            next_ord: first_ord,
         });
         self.grants.push(grant);
         if self.trace_grants {
@@ -5573,7 +5645,8 @@ impl DocIdAllocator {
             phase = "scribe.docid_lease_grant",
             shard_id = grant.shard,
             grant_seq = grant.grant_seq,
-            lease_base = grant.base_docid,
+            lease_base = grant.lease_base,
+            first_ord = grant.first_ord,
             "docid lease granted"
         );
     }
@@ -9469,20 +9542,24 @@ mod tests {
         assert_eq!(b.lease_base, DOCID_LEASE_BLOCK);
         assert_eq!(a.ord_start, 0);
         assert_eq!(b.ord_start, 0);
-        // Blocks are pairwise disjoint and watermark advances by whole blocks.
+        // Shard 1's grant made shard 0 claim the rest of block 0, so the
+        // concurrently live leases are disjoint. Shard 1 holds the frontier
+        // lease, which reserves only what it issued.
         assert!(a.global_end() <= b.lease_base);
-        assert_eq!(allocator.watermark(), 2 * DOCID_LEASE_BLOCK);
+        assert_eq!(allocator.watermark(), DOCID_LEASE_BLOCK + 20);
         assert_eq!(
             allocator.lease_grants(),
             &[
                 LeaseGrant {
                     shard: 0,
-                    base_docid: 0,
+                    lease_base: 0,
+                    first_ord: 0,
                     grant_seq: 0,
                 },
                 LeaseGrant {
                     shard: 1,
-                    base_docid: DOCID_LEASE_BLOCK,
+                    lease_base: DOCID_LEASE_BLOCK,
+                    first_ord: 0,
                     grant_seq: 1,
                 },
             ]
@@ -9490,16 +9567,108 @@ mod tests {
     }
 
     #[test]
-    fn allocator_aligns_unaligned_manifest_watermark_and_accounts_gap() {
-        // 70_000 sits inside block 1; opening must align up to block 2 and
-        // burn the gap (Q1-d: burning is always safe, reuse never is).
+    fn single_shard_session_opens_at_unaligned_watermark_without_burning() {
+        // 70_000 sits inside block 1. The lease starts there, inside the
+        // block, and reserves only what it issues.
         let mut allocator = DocIdAllocator::open(70_000, 1).expect("unaligned watermark opens");
-        assert_eq!(allocator.watermark(), 2 * DOCID_LEASE_BLOCK);
+        assert_eq!(allocator.watermark(), 70_000);
+        assert_eq!(
+            allocator.contiguous_capacity(0),
+            2 * DOC_ORDS_PER_LEASE - 70_000
+        );
         let batch = allocator.alloc_batch(0, 3).expect("batch allocates");
-        assert_eq!(batch.spans()[0].lease_base, 2 * DOCID_LEASE_BLOCK);
+        let span = batch.spans()[0];
+        assert_eq!(span.lease_base, DOCID_LEASE_BLOCK);
+        assert_eq!(span.global_first(), 70_000);
+        assert_eq!(allocator.watermark(), 70_003);
         let report = allocator.end_session();
-        assert_eq!(report.open_gap_burned, 2 * DOCID_LEASE_BLOCK - 70_000);
-        assert!(report.total_burned >= report.open_gap_burned);
+        assert_eq!(report.total_burned, 0);
+        assert_eq!(report.total_used, 3);
+        assert_eq!(report.total_leased, 3);
+        assert_eq!(report.final_watermark, 70_003);
+        assert_eq!(
+            report.records,
+            [LeaseBurnRecord {
+                shard: 0,
+                lease_base: DOCID_LEASE_BLOCK,
+                used: 3,
+                burned: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn frontier_lease_claims_its_block_before_another_shard_grants() {
+        let mut allocator = DocIdAllocator::open(70_000, 2).expect("unaligned watermark opens");
+        let first = allocator.alloc_batch(0, 3).expect("shard 0 allocates");
+        assert_eq!(first.spans()[0].global_first(), 70_000);
+        // Shard 0 holds the frontier lease: it reserved only what it issued.
+        assert_eq!(allocator.watermark(), 70_003);
+        assert_eq!(allocator.contiguous_capacity(1), DOC_ORDS_PER_LEASE);
+        let second = allocator.alloc_batch(1, 3).expect("shard 1 allocates");
+        // Shard 1's grant made shard 0 claim the rest of block 1.
+        assert_eq!(second.spans()[0].global_first(), 2 * DOCID_LEASE_BLOCK);
+        assert_eq!(allocator.watermark(), 2 * DOCID_LEASE_BLOCK + 3);
+        // Shard 0 keeps issuing inside its claimed block without moving the
+        // watermark past shard 1's frontier lease.
+        let third = allocator.alloc_batch(0, 4).expect("shard 0 continues");
+        assert_eq!(third.spans()[0].global_first(), 70_003);
+        assert_eq!(allocator.watermark(), 2 * DOCID_LEASE_BLOCK + 3);
+        assert_eq!(
+            allocator.lease_grants()[0],
+            LeaseGrant {
+                shard: 0,
+                lease_base: DOCID_LEASE_BLOCK,
+                first_ord: 70_000 - DOC_ORDS_PER_LEASE,
+                grant_seq: 0,
+            }
+        );
+        let report = allocator.end_session();
+        // Only the non-frontier lease burns its claimed tail.
+        assert_eq!(report.records[0].used, 7);
+        assert_eq!(
+            u64::from(report.records[0].burned),
+            2 * DOCID_LEASE_BLOCK - 70_007
+        );
+        assert_eq!((report.records[1].used, report.records[1].burned), (3, 0));
+        assert_eq!(report.total_used + report.total_burned, report.total_leased);
+        assert_eq!(report.final_watermark, 2 * DOCID_LEASE_BLOCK + 3);
+    }
+
+    #[test]
+    fn short_multi_shard_session_through_one_shard_burns_nothing() {
+        // #41: an incremental indexer publishing a few documents per session
+        // used to move the watermark past a whole lease every time.
+        let mut watermark = 0;
+        for session in 1..=4_u64 {
+            let mut allocator = DocIdAllocator::open(watermark, 8).expect("session opens");
+            allocator.alloc_batch(0, 3).expect("one small batch");
+            let report = allocator.end_session();
+            assert_eq!(report.total_burned, 0);
+            assert_eq!(report.final_watermark, 3 * session);
+            watermark = report.final_watermark;
+        }
+    }
+
+    #[test]
+    fn consecutive_single_shard_sessions_issue_contiguous_docids() {
+        // bd-k07zw: every short writer session (watch publication, delete,
+        // append) used to start a fresh 65,536-docid block, and merges
+        // materialized each burned tail as dense DOCLEN/IDMAP holes.
+        let mut watermark = 2_017;
+        for _ in 0..5 {
+            let mut allocator = DocIdAllocator::open(watermark, 1).expect("session opens");
+            let docid = allocator.alloc_one(0).expect("one upsert");
+            assert_eq!(
+                docid, watermark,
+                "the session must continue at the frontier"
+            );
+            let report = allocator.end_session();
+            assert_eq!(report.total_burned, 0);
+            assert_eq!(report.final_watermark, watermark + 1);
+            watermark = report.final_watermark;
+        }
+        assert_eq!(watermark, 2_022);
     }
 
     #[test]
@@ -9510,6 +9679,7 @@ mod tests {
         assert_eq!(first.spans()[0].lease_base, second.spans()[0].lease_base);
         assert_eq!(second.spans()[0].ord_start, 7);
         assert_eq!(allocator.lease_grants().len(), 1);
+        assert_eq!(allocator.watermark(), 16);
     }
 
     #[test]
@@ -9572,13 +9742,17 @@ mod tests {
                     }
                 }
             }
-            // All grants inside one session are pairwise disjoint blocks.
+            // Every grant inside one session lies in its own block, at or
+            // above the watermark the session opened from.
             let grants = allocator.lease_grants();
             for (i, a) in grants.iter().enumerate() {
+                assert!(
+                    a.first_docid() >= watermark,
+                    "session {session} grant {a:?}"
+                );
                 for b in &grants[i + 1..] {
-                    assert!(
-                        a.base_docid + DOCID_LEASE_BLOCK <= b.base_docid
-                            || b.base_docid + DOCID_LEASE_BLOCK <= a.base_docid,
+                    assert_ne!(
+                        a.lease_base, b.lease_base,
                         "session {session} grants overlap: {a:?} vs {b:?}"
                     );
                 }
@@ -9593,10 +9767,17 @@ mod tests {
             assert_eq!(live.len(), unique.len(), "live leases overlap");
             let report = allocator.end_session();
             assert_eq!(report.total_used, session_allocated);
-            assert_eq!(
-                report.total_used + report.total_burned,
-                report.total_leased + report.open_gap_burned
-            );
+            assert_eq!(report.total_used + report.total_burned, report.total_leased);
+            // Only non-frontier live leases burn, at most one tail each.
+            let burning_leases = live.len().saturating_sub(1) as u64;
+            assert!(report.total_burned <= burning_leases * (DOCID_LEASE_BLOCK - 1));
+            if shard_count == 1 {
+                assert_eq!(
+                    report.total_burned, 0,
+                    "the frontier lease reserves on issue"
+                );
+                assert_eq!(report.final_watermark, watermark + session_allocated);
+            }
             assert!(report.final_watermark >= watermark);
             watermark = report.final_watermark;
         }
@@ -9623,22 +9804,18 @@ mod tests {
             (report.records[1].used, report.records[1].burned),
             (DOC_ORDS_PER_LEASE, 0)
         );
-        assert_eq!(
-            (report.records[2].used, report.records[2].burned),
-            (5, DOC_ORDS_PER_LEASE - 5)
-        );
-        assert_eq!(report.total_leased, 3 * DOCID_LEASE_BLOCK);
+        // Shard 1's second lease is the frontier lease: it burns nothing.
+        assert_eq!((report.records[2].used, report.records[2].burned), (5, 0));
+        assert_eq!(report.total_leased, 2 * DOCID_LEASE_BLOCK + 5);
         assert_eq!(report.total_used, DOCID_LEASE_BLOCK + 15);
-        assert_eq!(
-            report.total_burned,
-            u64::from(DOC_ORDS_PER_LEASE - 10) + u64::from(DOC_ORDS_PER_LEASE - 5)
-        );
-        assert_eq!(report.final_watermark, 3 * DOCID_LEASE_BLOCK);
+        assert_eq!(report.total_burned, u64::from(DOC_ORDS_PER_LEASE - 10));
+        assert_eq!(report.final_watermark, 2 * DOCID_LEASE_BLOCK + 5);
 
-        // The next session opens at the burned watermark: the tails are gone.
+        // The next session opens at the watermark: shard 0's burned tail is
+        // gone, and every docid it issues lies above everything issued here.
         let mut next = DocIdAllocator::open(report.final_watermark, 2).expect("next session");
         let batch = next.alloc_batch(0, 1).expect("next session allocates");
-        assert_eq!(batch.spans()[0].lease_base, 3 * DOCID_LEASE_BLOCK);
+        assert_eq!(batch.spans()[0].global_first(), 2 * DOCID_LEASE_BLOCK + 5);
     }
 
     #[test]
@@ -9688,6 +9865,20 @@ mod tests {
             allocator.alloc_batch(1, 1),
             Err(DocIdAllocatorError::DocIdSpaceExhausted {
                 base: last_base + DOCID_LEASE_BLOCK,
+            })
+        );
+        assert_eq!(allocator.contiguous_capacity(1), 0);
+
+        // A single shard issues up to the very last u32 docid.
+        let last_docid = u64::from(u32::MAX);
+        let mut single = DocIdAllocator::open(last_docid, 1).expect("last docid opens");
+        assert_eq!(single.contiguous_capacity(0), 1);
+        assert_eq!(single.alloc_one(0), Ok(last_docid));
+        assert_eq!(single.contiguous_capacity(0), 0);
+        assert_eq!(
+            single.alloc_one(0),
+            Err(DocIdAllocatorError::DocIdSpaceExhausted {
+                base: last_docid + 1,
             })
         );
     }

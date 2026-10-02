@@ -16893,8 +16893,11 @@ impl FsfsRuntime {
         // documents by default), which Quill ingests serially, so extra shards
         // only rotated the flushes through up to 32 docid leases: the concat
         // then spans all of them, and DOCLEN/IDMAP store every unused slot
-        // (bd-k07zw). One shard fills one lease. Watch sessions use the
-        // deterministic singleton policy in `build_live_ingest_pipeline`.
+        // (bd-k07zw). With one shard Quill reserves only the docids it issues,
+        // so the build packs into one run and a later session (an edit's
+        // complete-generation rebuild, delete, append) continues at the exact
+        // frontier. Watch sessions use the deterministic singleton policy in
+        // `build_live_ingest_pipeline`.
         publication_lease.fence("one-shot lexical writer admission")?;
         let lexical_index = QuillIndex::create(
             cx,

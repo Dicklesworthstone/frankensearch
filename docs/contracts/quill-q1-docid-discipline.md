@@ -20,10 +20,11 @@ Holes *inside* an interval (burned lease tails §2, compaction-dropped docs §5)
 ## 2. Allocation
 
 - **Keeper owns a monotone allocator.** The high-watermark persists in the MANIFEST (`docid_high_watermark`); a writer session loads it at `open_writer()` and never hands out a docid below it.
-- **Session leases.** Each ingest shard leases contiguous blocks of **65,536 docids** (one lease block = one `chunk_id` in the tombstone encoding — deliberate alignment). Leases belong to a shard **session**; watch-mode batches within a session reuse the shard's current lease.
-- **Burn on end.** When a session ends (or a shard is retired), the unused tail of its lease is **burned**: the watermark does not roll back, the docids are never reused (Q1-d). Docids are cheap; correctness is not.
+- **Session leases.** Each ingest shard leases contiguous docids inside one **65,536-docid block** (one lease block = one `chunk_id` in the tombstone encoding — deliberate alignment; lease ordinals are block-relative). A lease starts at the watermark — inside its block when the watermark is unaligned — or at the next block boundary (below). Leases belong to a shard **session**; watch-mode batches within a session reuse the shard's current lease.
+- **Frontier reservation.** The most recently granted lease (the *frontier* lease) reserves only the docids it issues, so the watermark is the exact allocation frontier. Before another shard's lease may start, the frontier lease claims the rest of its block (the watermark jumps to the block end) and the new lease starts at that boundary, so concurrently live leases are disjoint. bd-k07zw / #41: short sessions — one per fsfs watch publication, delete, or append, or an incremental library indexer — used to reserve a whole block each, which merges stored as dense DOCLEN/IDMAP holes.
+- **Burn on end.** When a session ends (or a shard is retired), the claimed but unissued tail of each live lease other than the frontier lease is **burned**: the watermark does not roll back, the docids are never reused (Q1-d). A session that writes through one shard burns nothing.
 - **Upserts allocate new docids.** An upsert = allocate a fresh docid from the shard's lease + tombstone the old docid. IDHASH probes visit current segments in descending `seal_seq`, verify exact IDMAP bytes, and continue after a tombstoned representative; a merge republishes older rows under a fresh `seal_seq`, so container order is not physical-update recency. At most one live docid per `DocId` string (the upsert invariant).
-- **Docid width:** u32 in all payloads (u64 in headers/manifest for future-proofing). At the design scale (≤ ~1M live docs, watch churn), monotone-with-burn consumes u32 space in millennia of realistic updates. A renumbering **deep compaction** is reserved (format-registry note) as the u32-exhaustion escape hatch; it is never expected to run and is not implemented at 1.0.
+- **Docid width:** u32 in all payloads (u64 in headers/manifest for future-proofing). Consumption is one docid per indexed row plus burned tails; a session that spreads batches over k shards can burn up to k − 1 blocks, while a session through one shard consumes only what it indexes. A renumbering **deep compaction** is reserved (format-registry note) as the u32-exhaustion escape hatch; it is never expected to run and is not implemented at 1.0.
 
 ## 3. The two rules that keep intervals disjoint (R1, R2)
 
@@ -65,7 +66,7 @@ the CPU/storage trade is measured rather than hidden in ordinary merges.
 
 ### 4.1 Positional sections across run gaps
 
-A bound-consecutive run may still have docid gaps *between* segments (burned tails within the same lease-block sequence). Merged positional sections (DOCLEN/IDMAP/STOREDMETA) index by `docid − lo₁` over the merged span and therefore materialize those gaps as holes (FSLX §5.5/§5.6 hole conventions). Space cost is bounded: gaps inside a run come only from burned tails of the *same shards' consecutive leases*, which R1 caps at sub-lease size per seam. The tier policy MAY additionally decline runs whose hole ratio exceeds a threshold (`merge_max_hole_ratio`, default 0.5) — a policy knob, not a correctness requirement.
+A bound-consecutive run may still have docid gaps *between* segments (burned tails within the same lease-block sequence). Merged positional sections (DOCLEN/IDMAP/STOREDMETA) index by `docid − lo₁` over the merged span and therefore materialize those gaps as holes (FSLX §5.5/§5.6 hole conventions). Space cost is bounded: gaps inside a run come only from burned tails of non-frontier leases, which R1 caps at sub-lease size per seam; a session through one shard leaves none. The tier policy MAY additionally decline runs whose hole ratio exceeds a threshold (`merge_max_hole_ratio`, default 0.5) — a policy knob, not a correctness requirement.
 
 ## 5. Compaction (the only re-encoding path)
 
@@ -89,7 +90,7 @@ Compaction rewrites one segment to fold its tombstones: surviving docids are **p
 - **Tombstones** live in the manifest (FSLX §6.3), keyed by absolute docid; merge unions them; Q1 untouched.
 - **Upserts** never mutate segments; they tombstone + re-add under a fresh docid (§2), so Q1-c/Q1-d hold trivially.
 - **The delta segment** allocates from the same shard lease; R1 applies to its seals identically (bead e5.4 note).
-- **Resumable bulk builds** (bd-quill-duel-resumable-bulk) take *fresh* leases on resume; skipped (already-present) docs keep their existing docids; Q1-d is preserved because nothing re-allocates. Result-level equivalence to an uninterrupted build holds by Q1-OB3 logic (docids differ by burn; scores/results don't).
+- **Resumable bulk builds** (bd-quill-duel-resumable-bulk) take *fresh* leases on resume, starting at the persisted watermark; skipped (already-present) docs keep their existing docids; Q1-d is preserved because nothing re-allocates. Result-level equivalence to an uninterrupted build holds by Q1-OB3 logic (docids differ by burn; scores/results don't).
 - **Cross-process writers** (bd-quill-duel-writer-lock): the single-writer lock makes the allocator single-owner per generation; the publish CAS prevents a stale writer from publishing a manifest whose watermark/leases raced. Q1 needs *exactly one live allocator* — the lock provides it.
 - **BM25 scores** never depend on docid values (only on per-term stats and per-doc norms), which is why burn-gaps and merge schedules are score-invisible (Q1-OB3's foundation).
 

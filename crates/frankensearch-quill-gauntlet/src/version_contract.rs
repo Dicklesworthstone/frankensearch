@@ -596,10 +596,13 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             .ok_or_else(|| GauntletError::InvalidContract {
                 reason: "Q1 E3.5 could not choose a first-stage fixture segment id".to_owned(),
             })?;
-            // A single writer's merge safely retains its live lease. Reopen
-            // the committed snapshot after merging to end that writer session:
-            // the successor allocator starts beyond the reserved lease range,
-            // leaving a real unused tail inside the final merge hull.
+            // A single writer's merge safely retains its live lease, and a
+            // reopened single-shard writer continues at the exact docid
+            // frontier (bd-k07zw), so neither leaves a gap. Reopen with two
+            // ingest shards instead: batch c fills the frontier lease, and
+            // when batch d's shard is granted a lease, c's lease claims the
+            // rest of its block. That unused tail is a real burned gap inside
+            // the final merge hull.
             index
                 .concat_merge(
                     cx,
@@ -611,7 +614,11 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
                 .map_err(|error| q1_merge_error("publish first-stage concat merge", error))?;
             index = QuillIndex::from_in_memory_snapshot(
                 index.snapshot()?.as_ref().clone(),
-                config.clone(),
+                QuillConfig {
+                    deterministic_ingest: false,
+                    max_ingest_shards: 2,
+                    ..config.clone()
+                },
             )
             .map_err(|error| q1_merge_error("reopen first-stage snapshot", error))?;
         }
@@ -654,7 +661,11 @@ async fn run_q1_concat_merge_fixture(cx: &Cx) -> Result<Vec<String>, GauntletErr
             (left_hi < right_lo).then_some(left_hi)
         })
         .ok_or_else(|| GauntletError::InvalidContract {
-            reason: "Q1 E3.5 did not construct an interior burned lease tail".to_owned(),
+            reason: format!(
+                "Q1 E3.5 did not construct an interior burned lease tail (needs two ingest \
+                 shards; available parallelism {})",
+                std::thread::available_parallelism().map_or(1, usize::from)
+            ),
         })?;
     let merged_docid_lo = index.snapshot()?.segments()[0].manifest().docid_lo;
     let merged_docid_hi = index.snapshot()?.segments()[2].manifest().docid_hi;
