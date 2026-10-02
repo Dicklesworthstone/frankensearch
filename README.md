@@ -612,9 +612,18 @@ publisher, corrupt bundle, cancellation before completion, or failed
 synchronization prevents a success receipt. This also provides an explicit
 durability retry after a publication whose final directory synchronization failed.
 
+Every command that publishes a successor (`index`, `watch`, `append-batch`,
+`delete`, `compact`) then reclaims older generations: it keeps the selected
+generation and its immediate predecessor (the rollback target), removes
+everything older plus abandoned unsealed builds, and never removes a generation
+that any live reader, in any process, still holds. The receipt reports what was
+kept and removed (`retention` in JSON). `FSFS_GENERATION_RETENTION=report`
+reports what would be removed without removing anything, and
+`FSFS_GENERATION_RETENTION=off` keeps every generation.
+
 This is the cooperative local store. The complete FSVI v2 authority migration
-and automatic reclamation of retained generations remain unfinished. Commands
-refuse to create a nested index inside a sealed generation.
+remains unfinished. Commands refuse to create a nested index inside a sealed
+generation.
 
 ## Reproducible Showcase Suite
 

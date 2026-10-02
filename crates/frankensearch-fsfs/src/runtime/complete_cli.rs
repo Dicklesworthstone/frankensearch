@@ -19,10 +19,82 @@ use super::{
 use crate::adapters::format_emitter::{emit_envelope, meta_for_format};
 use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER, CompleteGenerationStore,
-    GenerationPublication,
+    GenerationPublication, GenerationRetention, RETAINED_PREDECESSORS, RetentionPlan,
+    RetentionReport,
 };
 use crate::output_schema::OutputEnvelope;
 use crate::{CliCommand, OutputFormat, ShutdownCoordinator};
+
+/// What retention did after one publication, as its receipt reports it.
+#[derive(Debug)]
+pub(super) enum RetentionOutcome {
+    Collected(RetentionReport),
+    Reported(RetentionPlan),
+    Off,
+    Failed {
+        mode: GenerationRetention,
+        error: String,
+    },
+}
+
+impl RetentionOutcome {
+    fn summary(&self) -> String {
+        let megabytes = |bytes: u64| bytes as f64 / 1_000_000.0;
+        match self {
+            Self::Collected(report) => {
+                use std::fmt::Write as _;
+                let mut text = format!("kept up to {RETAINED_PREDECESSORS} predecessor(s)");
+                if !report.removed.is_empty() {
+                    let _ = write!(
+                        text,
+                        ", removed {} older generation(s), {:.1} MB",
+                        report.removed.len(),
+                        megabytes(report.reclaimed_bytes)
+                    );
+                }
+                if !report.pinned.is_empty() {
+                    let _ = write!(text, ", {} kept for live readers", report.pinned.len());
+                }
+                text
+            }
+            Self::Reported(plan) => format!(
+                "retention report: {} older generation(s), {:.1} MB reclaimable",
+                plan.reclaimable.len(),
+                megabytes(plan.reclaimable.iter().map(|generation| generation.bytes).sum())
+            ),
+            Self::Off => "predecessors retained".to_owned(),
+            Self::Failed { error, .. } => format!("retention failed, every generation kept: {error}"),
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Collected(report) => serde_json::json!({
+                "mode": GenerationRetention::Collect.as_str(),
+                "kept_predecessors": RETAINED_PREDECESSORS,
+                "removed": report.removed,
+                "reclaimed_bytes": report.reclaimed_bytes,
+                "pinned": report.pinned,
+            }),
+            Self::Reported(plan) => serde_json::json!({
+                "mode": GenerationRetention::Report.as_str(),
+                "kept_predecessors": RETAINED_PREDECESSORS,
+                "retained": plan.retained,
+                "reclaimable": plan.reclaimable.iter().map(|generation| serde_json::json!({
+                    "generation_id": generation.id,
+                    "bytes": generation.bytes,
+                    "sealed": generation.sealed,
+                })).collect::<Vec<_>>(),
+                "reclaimable_bytes": plan.reclaimable.iter().map(|generation| generation.bytes).sum::<u64>(),
+            }),
+            Self::Off => serde_json::json!({ "mode": GenerationRetention::Off.as_str() }),
+            Self::Failed { mode, error } => serde_json::json!({
+                "mode": mode.as_str(),
+                "error": error,
+            }),
+        }
+    }
+}
 
 pub(super) fn require_durable_publication(
     publication: GenerationPublication,
@@ -347,7 +419,53 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let generation =
             require_durable_publication(self.rebuild_retained_generation(cx, root).await?)?;
-        self.emit_complete_generation_receipt(root, &generation, "index", writer)
+        let retention = self.retire_superseded_generations(cx, root);
+        self.emit_complete_generation_receipt(root, &generation, "index", &retention, writer)
+    }
+
+    /// Apply the configured retention after a durable publication (bd-2op1d).
+    ///
+    /// A failure is reported in the receipt, never returned: the publication
+    /// it follows has already succeeded.
+    pub(super) fn retire_superseded_generations(&self, cx: &Cx, root: &Path) -> RetentionOutcome {
+        let mode = self.generation_retention;
+        let result = match mode {
+            GenerationRetention::Off => return RetentionOutcome::Off,
+            GenerationRetention::Collect => CompleteGenerationStore::open(cx, root)
+                .and_then(|store| store.collect_retained(cx, RETAINED_PREDECESSORS))
+                .map(RetentionOutcome::Collected),
+            GenerationRetention::Report => CompleteGenerationStore::open(cx, root)
+                .and_then(|store| store.plan_retention(cx, RETAINED_PREDECESSORS))
+                .map(RetentionOutcome::Reported),
+        };
+        match result {
+            Ok(outcome) => {
+                if let RetentionOutcome::Collected(report) = &outcome
+                    && !report.removed.is_empty()
+                {
+                    tracing::info!(
+                        store_root = %root.display(),
+                        removed = report.removed.len(),
+                        reclaimed_bytes = report.reclaimed_bytes,
+                        pinned = report.pinned.len(),
+                        "fsfs removed superseded complete generations"
+                    );
+                }
+                outcome
+            }
+            Err(error) => {
+                tracing::warn!(
+                    store_root = %root.display(),
+                    mode = mode.as_str(),
+                    error = %error,
+                    "complete-generation retention failed; every generation was kept"
+                );
+                RetentionOutcome::Failed {
+                    mode,
+                    error: error.to_string(),
+                }
+            }
+        }
     }
 
     pub(super) fn emit_complete_generation_receipt<W: Write>(
@@ -355,6 +473,7 @@ impl FsfsRuntime {
         root: &Path,
         generation: &crate::generation_store::PublishedGeneration,
         command: &str,
+        retention: &RetentionOutcome,
         writer: &mut W,
     ) -> SearchResult<()> {
         if self.cli_input.format == OutputFormat::Table {
@@ -367,9 +486,10 @@ impl FsfsRuntime {
             }
             writeln!(
                 writer,
-                "Published complete generation {} at {} (durable; predecessors retained)",
+                "Published complete generation {} at {} (durable; {})",
                 generation.id(),
                 generation.path().display(),
+                retention.summary(),
             )?;
         } else {
             let mut payload = serde_json::json!({
@@ -381,6 +501,7 @@ impl FsfsRuntime {
                 "generation_complete": true,
                 "vector_generation": Self::inspect_published_vector_generation(generation.path()),
                 "quality_generation": Self::inspect_published_quality_generation(generation.path()),
+                "retention": retention.to_json(),
             });
             // The build summary a legacy index reports (file counts, bytes,
             // reason codes), read back from the sealed generation. Its
@@ -424,13 +545,17 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let (publication, deleted) = self.delete_retained_generation(cx, root).await?;
         let generation = publication.map(require_durable_publication).transpose()?;
+        let retention = generation
+            .as_ref()
+            .map(|_| self.retire_superseded_generations(cx, root));
         if self.cli_input.format == OutputFormat::Table {
             writeln!(writer, "{deleted} documents deleted")?;
-            if let Some(generation) = &generation {
+            if let (Some(generation), Some(retention)) = (&generation, &retention) {
                 writeln!(
                     writer,
-                    "Published complete generation {} (durable; predecessors retained)",
+                    "Published complete generation {} (durable; {})",
                     generation.id(),
+                    retention.summary(),
                 )?;
             }
         } else {
@@ -438,6 +563,9 @@ impl FsfsRuntime {
                 "deleted": deleted,
                 "generation_changed": generation.is_some(),
             });
+            if let Some(retention) = &retention {
+                payload["retention"] = retention.to_json();
+            }
             if let Some(generation) = &generation {
                 payload["generation_id"] = serde_json::json!(generation.id());
                 payload["generation_path"] = serde_json::json!(generation.path());
@@ -469,13 +597,17 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let (publication, appended) = self.append_retained_generation(cx, root).await?;
         let generation = publication.map(require_durable_publication).transpose()?;
+        let retention = generation
+            .as_ref()
+            .map(|_| self.retire_superseded_generations(cx, root));
         if self.cli_input.format == OutputFormat::Table {
             writeln!(writer, "{appended} documents inserted or replaced")?;
-            if let Some(generation) = &generation {
+            if let (Some(generation), Some(retention)) = (&generation, &retention) {
                 return self.emit_complete_generation_receipt(
                     root,
                     generation,
                     "append-batch",
+                    retention,
                     writer,
                 );
             }
@@ -484,6 +616,9 @@ impl FsfsRuntime {
                 "appended": appended,
                 "generation_changed": generation.is_some(),
             });
+            if let Some(retention) = &retention {
+                payload["retention"] = retention.to_json();
+            }
             if let Some(generation) = &generation {
                 payload["generation_id"] = serde_json::json!(generation.id());
                 payload["generation_path"] = serde_json::json!(generation.path());
@@ -515,13 +650,21 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let (publication, mut payload) = self.compact_retained_generation(cx, root).await?;
         let generation = require_durable_publication(publication)?;
+        let retention = self.retire_superseded_generations(cx, root);
         if self.cli_input.format == OutputFormat::Table {
             writeln!(
                 writer,
                 "Compacted all present vector tiers into an isolated successor"
             )?;
-            return self.emit_complete_generation_receipt(root, &generation, "compact", writer);
+            return self.emit_complete_generation_receipt(
+                root,
+                &generation,
+                "compact",
+                &retention,
+                writer,
+            );
         }
+        payload["retention"] = retention.to_json();
         payload["generation_id"] = serde_json::json!(generation.id());
         payload["generation_path"] = serde_json::json!(generation.path());
         payload["store_root"] = serde_json::json!(root);

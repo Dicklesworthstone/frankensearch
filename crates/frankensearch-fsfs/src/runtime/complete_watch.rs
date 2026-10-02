@@ -777,7 +777,8 @@ impl FsfsRuntime {
             ));
         }
         self.watch_retained_generations(cx, root, |generation| {
-            self.emit_complete_generation_receipt(root, generation, "watch", writer)
+            let retention = self.retire_superseded_generations(cx, root);
+            self.emit_complete_generation_receipt(root, generation, "watch", &retention, writer)
         })
         .await
     }

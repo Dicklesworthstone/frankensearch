@@ -18,7 +18,7 @@ use super::{
     BundleManifest, COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER,
     CompleteGenerationStore, GENERATIONS, GenerationPublication, MAX_MANIFEST_BYTES,
     MAX_POINTER_BYTES, NEXT_GENERATION, POINTER_MAGIC, PublicationLease, PublishedGeneration,
-    checkpoint, decode_pointer, digest, hex, invalid, inventory, open_regular,
+    checkpoint, decode_pointer, digest, hex, invalid, inventory, open_regular, pin_generation,
     read_bounded_regular, require_directory, sync_tree, write_new_synced,
 };
 
@@ -78,6 +78,10 @@ impl CompleteGenerationStore {
         require_directory(&parent)?;
         let path = parent.join(id);
         require_directory(&path)?;
+        // Pin before admission: a retention pass that already removed this
+        // generation leaves nothing to admit, and one that has not yet can no
+        // longer remove it.
+        let pin = pin_generation(&self.root, id)?;
         let bytes =
             read_bounded_regular(&path.join(COMPLETE_GENERATION_MANIFEST), MAX_MANIFEST_BYTES)?;
         if digest(&bytes) != manifest_sha256 {
@@ -105,6 +109,7 @@ impl CompleteGenerationStore {
             path,
             id: id.to_owned(),
             manifest_sha256: manifest_sha256.to_owned(),
+            _pin: pin,
         })
     }
 

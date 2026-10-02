@@ -5599,6 +5599,8 @@ pub struct FsfsRuntime {
     native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
     #[cfg(feature = "embedded-models")]
     bundled_model_materializer: Option<PathBuf>,
+    /// What complete-generation commands do with superseded generations.
+    generation_retention: crate::generation_store::GenerationRetention,
 }
 
 /// Private CLI entry point used to extract embedded weights in a short-lived process.
@@ -5621,7 +5623,19 @@ impl FsfsRuntime {
             native_blocking_pool: None,
             #[cfg(feature = "embedded-models")]
             bundled_model_materializer: None,
+            generation_retention: crate::generation_store::GenerationRetention::default(),
         }
+    }
+
+    /// Choose what complete-generation commands do with superseded
+    /// generations after a durable publication (default: collect).
+    #[must_use]
+    pub const fn with_generation_retention(
+        mut self,
+        retention: crate::generation_store::GenerationRetention,
+    ) -> Self {
+        self.generation_retention = retention;
+        self
     }
 
     /// Use the supplied fsfs executable to materialize embedded weights before loading them.
