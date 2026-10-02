@@ -71,12 +71,25 @@ pub const MODEL_CONFORMANCE_TEXTS_V1: [&str; 4] = [
     "naive cafe Tokyo",
 ];
 
-/// Pinned adapter-level token budget passed to `FastEmbed` 7.0.1.
-#[cfg(feature = "fastembed")]
-pub(crate) const FASTEMBED_MAX_LENGTH_V1: usize = 512;
-/// Exact truncation and padding policy imposed by the pinned `FastEmbed` adapter.
-pub(crate) const FASTEMBED_SEQUENCE_POLICY_V1: &str =
+/// Exact truncation and padding policy of the `MiniLM` quality tier under the
+/// pinned `FastEmbed` adapter. 256 tokens (bd-7651e) embedded code about 2x
+/// faster than 512 with no measured BEIR or code-set loss.
+pub(crate) const FASTEMBED_SEQUENCE_POLICY_256: &str =
+    "max-length=256;longest-first;batch-longest-padding";
+/// Exact truncation and padding policy of every other `FastEmbed` producer.
+pub(crate) const FASTEMBED_SEQUENCE_POLICY_512: &str =
     "max-length=512;longest-first;batch-longest-padding";
+
+/// Token budget the pinned `FastEmbed` 7.0.1 adapter passes for a registered
+/// sequence policy; `None` for a policy it cannot execute.
+#[cfg(feature = "fastembed")]
+pub(crate) fn fastembed_max_length(sequence_policy: &str) -> Option<usize> {
+    match sequence_policy {
+        FASTEMBED_SEQUENCE_POLICY_256 => Some(256),
+        FASTEMBED_SEQUENCE_POLICY_512 => Some(512),
+        _ => None,
+    }
+}
 /// Exact `FastEmbed` plus adapter-level output normalization pipeline.
 pub(crate) const FASTEMBED_OUTPUT_NORMALIZATION_V1: &str =
     "fastembed-l2-eps-1e-12-then-l2-f32-zero-on-degenerate-v1";
@@ -353,7 +366,7 @@ impl ModelArtifactManifestV1 {
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
             model_preprocessing: "bert-tokenizer-special-tokens=true;empty-input=zero-vector"
                 .to_owned(),
-            sequence_policy: FASTEMBED_SEQUENCE_POLICY_V1.to_owned(),
+            sequence_policy: FASTEMBED_SEQUENCE_POLICY_256.to_owned(),
             pooling: "attention-mask-mean-pool-v1".to_owned(),
             output_normalization: FASTEMBED_OUTPUT_NORMALIZATION_V1.to_owned(),
             query_instruction: String::new(),
@@ -401,7 +414,8 @@ impl ModelArtifactManifestV1 {
             weights_format: "safetensors-f32-runtime-int8-linear-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
             model_preprocessing: "bert-special-tokens=true;token-type-ids=zero".to_owned(),
-            sequence_policy: "max-length=512;longest-first;no-padding".to_owned(),
+            // 256 tokens, as the FastEmbed MiniLM tier (bd-7651e).
+            sequence_policy: "max-length=256;longest-first;no-padding".to_owned(),
             pooling: "mean-all-returned-tokens-including-specials-no-padding-v1".to_owned(),
             output_normalization: "l2-f32-if-norm-gt-zero-else-unchanged-v1".to_owned(),
             query_instruction: String::new(),
@@ -1250,7 +1264,7 @@ fn fastembed_execution_contract(
         tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
         model_preprocessing: "model-tokenizer-special-tokens=true;empty-input=zero-vector"
             .to_owned(),
-        sequence_policy: FASTEMBED_SEQUENCE_POLICY_V1.to_owned(),
+        sequence_policy: FASTEMBED_SEQUENCE_POLICY_512.to_owned(),
         pooling: "attention-mask-mean-pool-v1".to_owned(),
         output_normalization: FASTEMBED_OUTPUT_NORMALIZATION_V1.to_owned(),
         query_instruction: String::new(),
@@ -4502,6 +4516,83 @@ mod tests {
 
     // Preserve the immediately preceding dependency identity independently of
     // adapter package version and every platform's numerical certificate.
+    /// Reconstruct an English `MiniLM` producer before bd-7651e moved it from
+    /// 512 to 256 tokens. Every other producer is returned unchanged.
+    fn before_minilm_256(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        let historical = match (
+            manifest.execution.backend.as_str(),
+            manifest.logical_model_id.as_str(),
+        ) {
+            ("fastembed-onnx", "all-minilm-l6-v2") => {
+                Some((FASTEMBED_SEQUENCE_POLICY_256, FASTEMBED_SEQUENCE_POLICY_512))
+            }
+            ("frankentorch-native-minilm" | "frankentorch-native-minilm-f32", _) => Some((
+                "max-length=256;longest-first;no-padding",
+                "max-length=512;longest-first;no-padding",
+            )),
+            _ => None,
+        };
+        if let Some((current, previous)) = historical {
+            assert_eq!(manifest.execution.sequence_policy, current);
+            previous.clone_into(&mut manifest.execution.sequence_policy);
+        }
+        manifest
+    }
+
+    /// bd-7651e: only the sequence policy moves, so the embedding space and
+    /// every producer fingerprint change, but the conformance texts are far
+    /// shorter than either budget and their certified vectors stay identical.
+    #[test]
+    fn minilm_256_changes_only_the_space_sequence_policy() {
+        for current in [
+            ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap(),
+        ] {
+            let previous = before_minilm_256(current.clone());
+            assert_ne!(
+                current.space_contract_fingerprint().unwrap(),
+                previous.space_contract_fingerprint().unwrap()
+            );
+            assert_eq!(
+                current.execution.golden_vectors,
+                previous.execution.golden_vectors
+            );
+            let current_identity = current
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            let previous_identity = previous
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            assert_ne!(current_identity.space, previous_identity.space);
+            assert!(
+                current_identity
+                    .verify_exact_producer_with(&previous_identity)
+                    .is_err(),
+                "a 512-token index must never admit the 256-token producer"
+            );
+            let mut restored = current.clone();
+            previous
+                .execution
+                .sequence_policy
+                .clone_into(&mut restored.execution.sequence_policy);
+            assert_eq!(restored, previous, "no other manifest field may drift");
+        }
+        for unchanged in [
+            ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+            ModelArtifactManifestV1::multilingual_minilm_native_frankentorch().unwrap(),
+        ] {
+            assert_eq!(before_minilm_256(unchanged.clone()), unchanged);
+            assert!(
+                unchanged
+                    .execution
+                    .sequence_policy
+                    .starts_with("max-length=512;")
+            );
+        }
+    }
+
     fn before_fastembed_7(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         if manifest.execution.backend == "fastembed-onnx" {
             assert!(
@@ -4592,6 +4683,7 @@ mod tests {
     // qualified Windows output. Current owning-loader tests check the new bits.
     fn before_dependency_refresh(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         let current = manifest.freeze().unwrap().fingerprint;
+        manifest = before_minilm_256(manifest);
         manifest = before_fastembed_7(manifest);
         manifest = before_adapter_release(manifest);
         let (current_protocol, previous_protocol) = match manifest.execution.backend.as_str() {
@@ -6144,17 +6236,24 @@ mod tests {
         use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 
         let current = ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap();
+        // GOLDEN-CHANGE bd-7651e: the tokenizer refresh is checked from the
+        // 512-token producer that preceded the move to 256 tokens; both of its
+        // fingerprints below are the retained pre-change values.
+        let before_256 = before_minilm_256(current.clone());
         let historical = before_dependency_refresh(current.clone());
         let mut restored = historical.clone();
-        current
+        before_256
             .execution
             .protocol_revision
             .clone_into(&mut restored.execution.protocol_revision);
         assert_eq!(
-            restored, current,
+            restored, before_256,
             "only tokenizer protocol provenance changed"
         );
         let current_identity = current
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        let before_256_identity = before_256
             .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
             .unwrap();
         let historical_identity = historical
@@ -6165,16 +6264,23 @@ mod tests {
             "35d0a014b4ec6224eb42552ea1099b24bead0c9c51906b6035207b6105e8af01"
         );
         assert_eq!(
-            current_identity.fingerprint(),
+            before_256_identity.fingerprint(),
             "aa25d24b07a2d233445cb6605c95d33601ea36a044d3a4b2bed65e7590386109"
         );
-        assert_eq!(current_identity.space, historical_identity.space);
+        // GOLDEN-CHANGE bd-7651e: the 256-token space; only sequence_policy moved
+        // (minilm_256_changes_only_the_space_sequence_policy proves that).
+        assert_eq!(
+            current_identity.fingerprint(),
+            "8c37f4cf6f63cdbc937ff7b03369606555e0eb165779c0019b1591fcadaf0860"
+        );
+        assert_eq!(before_256_identity.space, historical_identity.space);
+        assert_ne!(current_identity.space, before_256_identity.space);
         assert_eq!(
             current.execution.golden_vectors,
             historical.execution.golden_vectors
         );
         assert_eq!(
-            current_identity.verify_exact_producer_with(&historical_identity),
+            before_256_identity.verify_exact_producer_with(&historical_identity),
             Err(ProducerCompatibilityErrorV1::CertificateRequired)
         );
     }
@@ -6203,7 +6309,8 @@ mod tests {
                     .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
                     .unwrap()
                     .fingerprint(),
-                "aa25d24b07a2d233445cb6605c95d33601ea36a044d3a4b2bed65e7590386109"
+                // GOLDEN-CHANGE bd-7651e: the current 256-token F32 identity.
+                "8c37f4cf6f63cdbc937ff7b03369606555e0eb165779c0019b1591fcadaf0860"
             );
             TEST_VERIFY_FILE_HASH_CALLS.with(std::cell::Cell::get)
         };

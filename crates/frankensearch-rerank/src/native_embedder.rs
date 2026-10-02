@@ -40,7 +40,11 @@ const MULTILINGUAL_MODEL_NAME: &str = "paraphrase-multilingual-minilm-l12-v2";
 const MULTILINGUAL_EMBEDDER_ID: &str = "paraphrase-multilingual-minilm-l12-v2-384-native";
 const DIM: usize = 384;
 const IDENTITY_DIMENSION: u32 = 384;
-const IDENTITY_SEQUENCE_POLICY: &str = "max-length=512;longest-first;no-padding";
+/// The English `MiniLM` truncates at 256 tokens (bd-7651e: about 2x faster
+/// embedding on code than 512, no measured BEIR or code-set loss).
+const ENGLISH_MAX_LENGTH: usize = 256;
+const ENGLISH_SEQUENCE_POLICY: &str = "max-length=256;longest-first;no-padding";
+const MULTILINGUAL_SEQUENCE_POLICY: &str = "max-length=512;longest-first;no-padding";
 const IDENTITY_POOLING: &str = "mean-all-returned-tokens-including-specials-no-padding-v1";
 const IDENTITY_OUTPUT_NORMALIZATION: &str = "l2-f32-if-norm-gt-zero-else-unchanged-v1";
 /// Token budget per batched forward (mirrors the reranker's chunking) so each
@@ -85,6 +89,22 @@ impl NativeEmbeddingModel {
         match self {
             Self::AllMiniLmL6V2F32 => LinearPrecision::F32,
             Self::AllMiniLmL6V2 | Self::ParaphraseMultilingualMiniLmL12V2 => LinearPrecision::Int8,
+        }
+    }
+
+    /// Token budget each text is truncated to, specials included.
+    const fn max_length(self) -> usize {
+        match self {
+            Self::AllMiniLmL6V2 | Self::AllMiniLmL6V2F32 => ENGLISH_MAX_LENGTH,
+            Self::ParaphraseMultilingualMiniLmL12V2 => DEFAULT_MAX_LENGTH,
+        }
+    }
+
+    /// The registered sequence policy `max_length` implements.
+    const fn sequence_policy(self) -> &'static str {
+        match self {
+            Self::AllMiniLmL6V2 | Self::AllMiniLmL6V2F32 => ENGLISH_SEQUENCE_POLICY,
+            Self::ParaphraseMultilingualMiniLmL12V2 => MULTILINGUAL_SEQUENCE_POLICY,
         }
     }
 
@@ -196,7 +216,7 @@ impl NativeEmbedder {
             (
                 "sequence policy",
                 identity.space.sequence_policy.as_str(),
-                IDENTITY_SEQUENCE_POLICY,
+                profile.sequence_policy(),
             ),
             ("pooling", identity.space.pooling.as_str(), IDENTITY_POOLING),
             (
@@ -232,7 +252,7 @@ impl NativeEmbedder {
             })?;
         tokenizer
             .with_truncation(Some(tokenizers::TruncationParams {
-                max_length: DEFAULT_MAX_LENGTH,
+                max_length: profile.max_length(),
                 ..Default::default()
             }))
             .map_err(|e| SearchError::ModelLoadFailed {
@@ -276,7 +296,7 @@ impl NativeEmbedder {
             tokenizer: Arc::new(tokenizer),
             admission: Arc::new(AsyncMutex::new(())),
             blocking_pool: None,
-            max_length: DEFAULT_MAX_LENGTH,
+            max_length: profile.max_length(),
             name: model_name.to_owned(),
             id: profile.embedder_id().to_owned(),
             identity,
@@ -325,7 +345,7 @@ impl NativeEmbedder {
             model = model_name,
             dimension = DIM,
             encoder_layers = profile.encoder_layers(),
-            max_length = DEFAULT_MAX_LENGTH,
+            max_length = profile.max_length(),
             manifest = %verified.frozen().fingerprint,
             identity = %embedder.identity.fingerprint(),
             precision = ?profile.linear_precision(),
@@ -1017,8 +1037,27 @@ mod tests {
             .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
             .expect("derive native MiniLM identity");
         assert_eq!(identity.space.dimension, IDENTITY_DIMENSION);
-        assert_eq!(identity.space.sequence_policy, IDENTITY_SEQUENCE_POLICY);
+        assert_eq!(identity.space.sequence_policy, ENGLISH_SEQUENCE_POLICY);
         assert_eq!(identity.space.pooling, IDENTITY_POOLING);
+        // Every profile's manifest registers exactly the budget it truncates to.
+        for profile in [
+            NativeEmbeddingModel::AllMiniLmL6V2,
+            NativeEmbeddingModel::AllMiniLmL6V2F32,
+            NativeEmbeddingModel::ParaphraseMultilingualMiniLmL12V2,
+        ] {
+            let manifest = profile.manifest().expect("registered native manifest");
+            assert_eq!(
+                manifest.execution.sequence_policy,
+                profile.sequence_policy()
+            );
+            assert_eq!(
+                profile.sequence_policy(),
+                format!(
+                    "max-length={};longest-first;no-padding",
+                    profile.max_length()
+                )
+            );
+        }
         assert_eq!(
             identity.space.output_normalization,
             IDENTITY_OUTPUT_NORMALIZATION
@@ -1101,7 +1140,7 @@ mod tests {
         );
         let long = "Search finds related documents across the library. ".repeat(100);
         let texts = ["", "hello world", "identifier fsvi_v2", long.as_str()];
-        assert_eq!(embedder.tokenize(&long).unwrap().len(), DEFAULT_MAX_LENGTH);
+        assert_eq!(embedder.tokenize(&long).unwrap().len(), ENGLISH_MAX_LENGTH);
         let batch = embedder.embed_batch_sync(&texts).unwrap();
         let repeated = embedder.embed_batch_sync(&texts).unwrap();
         assert_eq!(
