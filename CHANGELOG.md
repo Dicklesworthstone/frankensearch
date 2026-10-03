@@ -23,6 +23,47 @@ The September 21 supplement records executable complete-generation integration,
 live replacement-generation watching, Unix-socket serving, and reloadable default
 configuration files. These changes remain unreleased.
 
+### Release-preparation limitations (2026-10-03)
+
+- The optional HNSW A/B development feature requires a separately prepared
+  pinned Git checkout that is absent from a fresh Cargo home. The workspace
+  all-features build stops during that source attestation, so its tests were
+  not run. This feature is not enabled by the released binary profiles or
+  supported facade bundles; their qualification remains separate. Reproducible
+  A/B dependency preparation is tracked in
+  [#63](https://github.com/Dicklesworthstone/frankensearch/issues/63).
+- Dependency preparation advances FastEmbed to 7.1.0, FrankenSQLite to 0.4.7,
+  and the development JSON Schema validator to 0.58.5. The FastEmbed dependency
+  revision participates in producer identity, so an index produced by the
+  previous adapter requires fresh admission or rebuilding. Model artifacts,
+  sequence policies, and existing numerical certificates remain unchanged;
+  actual runtime qualification remains required.
+- GNU full compatibility with glibc 2.28 remains unqualified. The previous
+  v1.10.0 GNU full metadata already declares a 2.43 floor; the current prebuilt
+  ONNX Runtime archive has unresolved libc symbols introduced after 2.28.
+  These observations do not measure the next binary's final floor. A pinned
+  compatible runtime build and exact model admission are tracked in
+  [#62](https://github.com/Dicklesworthstone/frankensearch/issues/62).
+- FrankenTUI remains on the compatible published 0.7.0 family. The attempted
+  0.9.0 upgrade fails actual workspace check and strict Clippy because it removes
+  the backend presenter API used by fsfs. The preceding 0.8.0 family is not
+  published. Migrating the terminal session to the separate presentation API is
+  tracked in [#61](https://github.com/Dicklesworthstone/frankensearch/issues/61).
+- The opt-in complete-generation layout can admit a reader without a retention
+  pin when the reader lacks write permission. A separately writable owner may
+  then reclaim the reader's older generation after publishing replacements,
+  making subsequent path-based reads unavailable. Ordinary writable pinned
+  readers remain protected. This is a source-reviewed reader-availability
+  limitation; no surviving-generation corruption or unique-source-data loss
+  was established. See [#60](https://github.com/Dicklesworthstone/frankensearch/issues/60).
+  A failed retention pass can also have reclaimed some older generations before
+  returning an error; its current "every generation kept" diagnostic is overly
+  broad. These limitations affect the optional complete-generation path.
+- The facade's repository-README doctest include now stays inside the packaged
+  crate. Cargo packages the authoritative workspace README through a separate
+  link, while preserving the existing facade guide. Packaged doctest and source
+  gates remain required before publication.
+
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
