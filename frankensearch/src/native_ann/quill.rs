@@ -706,18 +706,19 @@ mod tests {
     fn unsealed_delta_is_not_authenticated_by_a_keeper_only_receipt() {
         use frankensearch_quill::contract::fieldnorm_to_id;
         use frankensearch_quill::delta::{DeltaFieldNorm, DeltaSegment, DeltaTermPosting};
+        use frankensearch_quill::scribe::DOC_ORDS_PER_LEASE;
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let provider = Provider::new();
             let fixture = fixture(&cx, &provider, &["alpha", "beta"]).await;
             let keeper = fixture.lexical.snapshot().unwrap();
             let manifest = &keeper.loaded_manifest().manifest;
-            let mut delta = DeltaSegment::new(
-                frankensearch_quill::DEFAULT_SCHEMA,
-                manifest.docid_high_watermark,
-                usize::MAX,
-            )
-            .unwrap();
+            let lease_base = manifest
+                .docid_high_watermark
+                .next_multiple_of(u64::from(DOC_ORDS_PER_LEASE));
+            let mut delta =
+                DeltaSegment::new(frankensearch_quill::DEFAULT_SCHEMA, lease_base, usize::MAX)
+                    .unwrap();
             // The shipping schema's ID, content and title fields, respectively.
             let norms = [(0, 1), (1, 2), (2, 0)].map(|(field_ord, raw_length)| DeltaFieldNorm {
                 field_ord,
@@ -726,7 +727,7 @@ mod tests {
             });
             delta
                 .apply_document(
-                    u32::try_from(manifest.docid_high_watermark).unwrap(),
+                    u32::try_from(lease_base).unwrap(),
                     "new".into(),
                     &norms,
                     &[
