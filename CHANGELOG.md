@@ -23,6 +23,51 @@ The September 21 supplement records executable complete-generation integration,
 live replacement-generation watching, Unix-socket serving, and reloadable default
 configuration files. These changes remain unreleased.
 
+### Published fsfs 1.12.1 / frankensearch 0.7.1 (2026-10-03)
+
+[fsfs v1.12.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.1)
+and all thirteen crates.io packages are published from
+[`d1cb86e1`](https://github.com/Dicklesworthstone/frankensearch/commit/d1cb86e1848309fe39fb7c8c4c4d7356ebd878aa).
+The [0.7.1 crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.7.1)
+contains the unchanged registry archives; its heterogeneous package versions and
+SHA-256 digests are recorded in the embedded manifest. The binary release
+retains GitHub's latest-release routing. Earlier preparation statements below
+record their original qualification boundary.
+
+- The six published binary profiles are GNU x86-64 Full, macOS ARM64 Full,
+  Linux x86-64/ARM64 musl Lite, and macOS x86-64/ARM64 Lite. Signed checksums,
+  archive metadata and signatures cover the published payloads. The actual GNU
+  Full binary requires **glibc 2.43**, matching the previous Full
+  release’s declared floor; compatibility with older glibc remains unqualified (#62). Static
+  musl Lite provides lexical search without the semantic model loaders.
+- Current-source default workspace tests passed: **9,707 passed, zero failed,
+  100 ignored**. Strict default/Lite Clippy, the portable descriptor tests,
+  real-model integration, and all ten supported packaged facade feature
+  configurations passed. Workspace all-features was not run because of the
+  optional Git-only HNSW A/B dependency (#63). Supplemental full Quill tooling
+  qualification is separate from these results.
+- Tests against the public signed Full binary passed for fresh curl|bash
+  installation, real semantic queries with eighteen validator negative
+  controls, installer upgrade from 1.10.0, and the actual `fsfs update` upgrade
+  from 1.10.0 with the previous binary preserved as a verified backup.
+- The generated ACFS FrankenSearch module and its stock installer/security
+  helpers passed in a fresh Ubuntu 24.04 container against the public signed
+  musl Lite artifact. Its installed binary hash matched the release metadata.
+  This qualifies that module's lexical route, not the complete ACFS bootstrap
+  or Full semantic search. The existing installer checksum is unchanged.
+- The optional unpublished Quill fuzz-harness probe hit its existing two-second
+  rendezvous deadline under concurrent execution. The unchanged exact serial
+  test subsequently passed; that does not erase the original failing probe
+  receipt. The timing limitation remains tracked in
+  [#65](https://github.com/Dicklesworthstone/frankensearch/issues/65).
+- Bound-response identity, phase/cache admission, cancellation and recovery
+  protections have named passing tests. Ordinary warmed/in-flight advertised
+  embedder-metadata drift remains unqualified and tracked in
+  [#55](https://github.com/Dicklesworthstone/frankensearch/issues/55).
+  The original WAL cold/warm survivor regression is covered; rejection of every
+  immediately preceding forwarded-reply and progressive-wrapper wire version
+  is not established by the current negative controls (#54).
+
 ### Release-preparation limitations (2026-10-03)
 
 - Native Darwin compilation exposed an unreleased complete-daemon client
@@ -76,7 +121,7 @@ configuration files. These changes remain unreleased.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| frankensearch 0.7.1 / fsfs 1.12.1 | Release preparation | 2026-09-20–10-03 | Minor release of all 13 crates plus the fsfs binary, including the Darwin daemon socket repair: progressive warm-daemon streaming, complete-generation CLI with bounded retention, CJK keyword bigrams, MiniLM at 256 tokens, contiguous Quill docids, watch/delete/append fixes, installer profile/offline fixes |
+| [frankensearch 0.7.1](https://crates.io/crates/frankensearch/0.7.1) / [fsfs 1.12.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.1) | GitHub and crates.io publication | 2026-10-03 | Minor release of all 13 crates plus the fsfs binary, including the Darwin daemon socket repair: progressive warm-daemon streaming, complete-generation CLI with bounded retention, CJK keyword bigrams, MiniLM at 256 tokens, contiguous Quill docids, watch/delete/append fixes, installer profile/offline fixes |
 | frankensearch 0.6.1 | crates.io publication + `frankensearch-v0.6.1` git tag | 2026-09-19 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
