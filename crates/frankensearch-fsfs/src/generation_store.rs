@@ -404,9 +404,10 @@ pub(crate) fn reject_published_write(root: &Path) -> SearchResult<()> {
     Ok(())
 }
 
-/// Predecessors a complete-generation command keeps after it publishes. Each
-/// generation is a full copy, so one keeps a settled store near twice a fresh
-/// build while leaving the previous generation available to restore.
+/// Predecessors a complete-generation command keeps after it publishes.
+///
+/// Each generation is a full copy, so one keeps a settled store near twice a
+/// fresh build while leaving the previous generation available to restore.
 pub const RETAINED_PREDECESSORS: usize = 1;
 
 /// What a complete-generation command does with superseded generations after

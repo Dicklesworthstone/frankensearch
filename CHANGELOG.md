@@ -27,7 +27,7 @@ configuration files. These changes remain unreleased.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased fsfs | Release preparation | 2026-09-09–21 | Progressive warm-daemon streaming, complete-generation CLI integration, reloadable config defaults, indexing and model fixes, installer profile/offline fixes, and lexical-flush retry retention |
+| frankensearch 0.7.0 / fsfs 1.12.0 | Release preparation | 2026-09-20–10-02 | Minor release of all 13 crates plus the fsfs binary: progressive warm-daemon streaming, complete-generation CLI with bounded retention, CJK keyword bigrams, MiniLM at 256 tokens, contiguous Quill docids, watch/delete/append fixes, installer profile/offline fixes |
 | frankensearch 0.6.1 | crates.io publication + `frankensearch-v0.6.1` git tag | 2026-09-19 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
@@ -235,13 +235,78 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
-## Unreleased changes after frankensearch 0.6.1
+## frankensearch 0.7.0 / fsfs 1.12.0 — release preparation
 
-The September 20 entries cover landed source through
-[`aaf8bae1`](https://github.com/Dicklesworthstone/frankensearch/commit/aaf8bae1169f39acdaf12c0e58b65a0ab876ab7c).
-These changes are **not included in the published 0.6.1 crate family**.
-The combined-source quality gate and rebuilt platform artifacts are still being
-qualified; individual results below are narrower than release acceptance.
+Minor-version release of the whole library family plus the next fsfs binary:
+facade 0.7.0, rerank 0.5.0, fsfs 1.12.0, TUI 0.3.1, and core, durability,
+embed, index, lexical, fusion, Quill, storage and ops 0.4.0.
+`frankensearch-quill-gauntlet` remains `publish = false`. Every entry below
+landed after the 0.6.1 crates; none of it is in 0.6.1. Publication is pending
+the quality gate and the six platform binaries.
+
+**Breaking changes.** `cargo semver-checks` against the published crates:
+
+- `frankensearch-core`: `ExplainedSource::LexicalBm25` carries a per-term,
+  per-field `terms` breakdown instead of `matched_terms`, `tf` and `idf`.
+- `frankensearch-quill`: `Analyzer` gained `FrankensearchCjkBigrams` (the
+  default schema's CJK analyzer), which shifts the discriminants of the CASS
+  analyzers; `LeaseGrant` reports `lease_base` and `first_ord` instead of
+  `base_docid`, and `LeaseBurnReport` no longer has `open_gap_burned`.
+- Every other crate exposes core types, so each takes a minor version with
+  core. TUI uses no core type and takes a patch.
+
+**Rebuild stored indexes.** The MiniLM token limit (256, below) and the embed
+0.4.0 adapter revision are both part of the stored producer identity, so
+semantic vectors written by the 0.3 line are refused as current; run `fsfs
+index` (or rebuild library-held vectors). Older identities still verify for
+historical fixtures. The default Quill schema now indexes CJK bigrams, so a
+keyword index built with the 0.3 default schema is a schema mismatch: fsfs
+rebuilds its keyword index automatically, library users reindex. Quill 0.4.0
+still reads the MANIFEST images written by 0.2.3 through 0.3.5.
+
+- **The MiniLM quality tier reads 256 tokens per chunk, not 512, and
+  indexes 1.7x faster.** Attention cost grows with the square of the
+  length, and an earlier evaluation found no significant quality loss at 256
+  on SciFact, NFCorpus, ArguAna or a 253-query code-search set. A fresh
+  `fsfs index` of a 579-file Rust tree took 14.1 s instead of 24.1 s. The
+  limit belongs to each model: the FastEmbed and native English MiniLM
+  embedders use 256, while Snowflake, Nomic, the multilingual MiniLM and the
+  cross-encoder reranker keep 512. The token limit is part of the stored
+  embedding identity, so an index built at 512 is refused for refinement and
+  watch until `fsfs index` runs again; that run re-embeds only the quality
+  tier. Library users with stored MiniLM vectors must rebuild them; older
+  identities still verify for historical fixtures (bd-7651e).
+
+- **Complete-generation stores no longer grow without bound.** Every
+  publication (`index`, `watch`, `append-batch`, `delete`, `compact`) now
+  removes generations older than the selected one and its immediate
+  predecessor, plus abandoned builds, and never removes a generation that a
+  live reader in any process still holds (readers pin with a shared file
+  lock). Under `fsfs watch` on a 579-file Rust tree, 20 one-line edits keep
+  two generations and 109 MB, 2.0x the fresh 54 MB build; before, five
+  edits reached 380 MB and seven generations. The receipt reports what was
+  kept and removed. `FSFS_GENERATION_RETENTION=report` only reports, and
+  `FSFS_GENERATION_RETENTION=off` keeps everything (bd-2op1d).
+
+- **Each edit adds one keyword row, not 2.4 MB.** A Quill writer session
+  started at the next 65,536-number block above the stored watermark, and the
+  merge that ends every complete-generation edit stored the skipped numbers
+  as per-document table entries: each one-line edit grew the keyword segment
+  by 2.35 MB, and the document-number space ran out after 65,536 sessions.
+  A session now continues at the exact watermark, and only the newest lease
+  reserves lazily. On the same tree, five edits grow the keyword segment from
+  34.06 to 34.17 MB instead of 45.83 MB. Library writers that publish a few
+  documents per session (GH #41) get the same contiguous numbering (bd-k07zw).
+
+- **`fsfs delete`, `append-batch` and watch no longer double the keyword
+  index.** Keyword segments were built without repair sidecars, but every
+  mutation reopened them with RaptorQ protection, which wrote a sidecar for
+  every segment: after deleting one file the keyword directory went from 35.5
+  to 76.5 MB. Keyword segments now never carry sidecars, since they rebuild
+  from your files in seconds. A corrupt segment is still quarantined
+  (`*.fslx.quarantine`) and its documents reindexed: Quill's plain writer now
+  verifies every segment when it opens and quarantines any that fail, with no
+  sidecar involved. Vector files keep their sidecars (bd-2pkpj).
 
 - **`fsfs watch` no longer rebuilds an index `fsfs index` just finished.**
   Two defects made the first watch after an index rewrite everything.
@@ -284,8 +349,10 @@ qualified; individual results below are narrower than release acceptance.
   2,031,651 document numbers. The build now uses one shard, which fills one
   block: the same tree spans 2,017 numbers, its keyword index shrinks from
   163 to 89 MB and the whole index from 216 to 143 MB, with the same build
-  time. Each later writer session (`fsfs watch`, `delete`, `append-batch`)
-  still starts a new block (bd-k07zw).
+  time. Later writer sessions (`fsfs watch`, `delete`, `append-batch`, each
+  complete-generation edit) now continue at the exact last document number
+  instead of starting a new block; see "Each edit adds one keyword row"
+  above (bd-k07zw).
 
 - **`fsfs watch` indexes the same files as `fsfs index`.** `fsfs index` skips
   hidden files and directories and honors `.gitignore`, `.ignore`,

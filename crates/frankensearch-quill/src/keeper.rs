@@ -97,7 +97,7 @@ pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 ///
 /// The build-time assertion in this module's tests intentionally forces this
 /// value to change when `Cargo.toml` changes.
-pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 3, 5);
+pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 4, 0);
 
 const MANIFEST_MIN_BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 /// v2 images carry the additional `last_publish_unix_s` word after `flags`.
@@ -17773,16 +17773,17 @@ mod tests {
     fn empty_manifest_has_stable_wire_golden() -> TestResult {
         let manifest = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
         let bytes = manifest.to_bytes()?;
-        // GOLDEN-CHANGE: the 0.3.5 package release (main's CASS grammar and
-        // the #58 union fix, after the 0.3.2 through 0.3.4 hotfixes) advances
+        // GOLDEN-CHANGE: the 0.4.0 package release (the public API breaks:
+        // the CJK analyzer variant and the docid lease reports) advances
         // producer metadata, not the wire format. Bytes 36..40 are
-        // `CURRENT_ENGINE_VERSION` (0.3.5 => `05 00 03 00`); the trailing CRC32
+        // `CURRENT_ENGINE_VERSION` (0.4.0 => `00 00 04 00`); the trailing CRC32
         // (zlib, little-endian) covers all prior bytes, the method that
-        // reproduces every retained image below. The published 0.3.4 hotfix
-        // image joins the still-readable list.
+        // reproduces every retained image below. The 0.3.5 image, written by
+        // main-built binaries and never published, joins the still-readable
+        // list.
         let expected = hex_bytes(
             "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
-             05000300000000000000000000000000000000000000000018144d5e",
+             00000400000000000000000000000000000000000000000020d1b7d3",
         );
         assert_eq!(bytes, expected);
         assert_eq!(Manifest::from_bytes(&bytes)?, manifest);
@@ -17790,6 +17791,11 @@ mod tests {
         // Keep previous producers' exact wire images readable and writable;
         // only their engine-version word and the covering CRC differ.
         for (version, wire_hex) in [
+            (
+                pack_engine_version(0, 3, 5),
+                "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
+                 05000300000000000000000000000000000000000000000018144d5e",
+            ),
             (
                 pack_engine_version(0, 3, 4),
                 "46534c584d414e0002000000010000000000000000000000000000008877665544332211\

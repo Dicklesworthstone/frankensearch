@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-fsfs"
-version = "1.11.0"
+version = "1.12.0"
 default-run = "fsfs"
 description = "Standalone fsfs CLI for two-tier hybrid local search"
 edition.workspace = true
@@ -137,7 +137,7 @@ same-file = "1.0.6"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-frankensearch = { path = "../../frankensearch", version = "0.6.1", default-features = false }
+frankensearch = { path = "../../frankensearch", version = "0.7.0", default-features = false }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
 frankensearch-lexical = { workspace = true }

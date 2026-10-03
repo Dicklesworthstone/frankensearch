@@ -4377,10 +4377,14 @@ mod tests {
         assert_eq!(identity.storage.endianness, "little-endian");
     }
 
-    // Package 0.3.1 changes only these adapters' implementation provenance.
-    // Reconstruct the historical 0.2.7 revision before checking its frozen
-    // fixtures; native frankentorch producers use independently pinned revisions.
-    fn before_adapter_release(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+    // Rewrite the adapter package version of the Potion and FastEmbed
+    // producers; native frankentorch producers use independently pinned
+    // revisions and are returned unchanged.
+    fn with_adapter_package(
+        mut manifest: ModelArtifactManifestV1,
+        from: &str,
+        to: &str,
+    ) -> ModelArtifactManifestV1 {
         if matches!(
             manifest.execution.backend.as_str(),
             "model2vec-native" | "fastembed-onnx"
@@ -4388,26 +4392,40 @@ mod tests {
             let adapter = manifest
                 .execution
                 .implementation_revision
-                .strip_prefix("frankensearch-embed-0.3.1+")
-                .expect("current adapter must identify the actual 0.3.1 package");
+                .strip_prefix(&format!("frankensearch-embed-{from}+"))
+                .unwrap_or_else(|| panic!("adapter must identify the actual {from} package"))
+                .to_owned();
             manifest.execution.implementation_revision =
-                format!("frankensearch-embed-0.2.7+{adapter}");
+                format!("frankensearch-embed-{to}+{adapter}");
         }
         manifest
+    }
+
+    // Package 0.4.0 changes only these adapters' implementation provenance.
+    // Reconstruct the 0.3.1 revision that wrote every index of the 0.3 line.
+    fn before_embed_0_4(manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        with_adapter_package(manifest, "0.4.0", "0.3.1")
+    }
+
+    // Package 0.3.1 changed only these adapters' implementation provenance.
+    // Reconstruct the historical 0.2.7 revision before checking its frozen
+    // fixtures.
+    fn before_adapter_release(manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        with_adapter_package(manifest, "0.3.1", "0.2.7")
     }
 
     #[test]
     fn adapter_release_changes_producer_identity_without_changing_space_or_vectors() {
         use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.0");
         for current in [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
         ] {
-            let historical = before_adapter_release(current.clone());
+            let historical = before_adapter_release(before_embed_0_4(current.clone()));
             assert_eq!(
                 current.space_contract_fingerprint().unwrap(),
                 historical.space_contract_fingerprint().unwrap()
@@ -4439,35 +4457,32 @@ mod tests {
                 current.freeze().unwrap().fingerprint,
                 historical.freeze().unwrap().fingerprint
             );
-            // Preserve admission refusal for the immediately preceding adapter
-            // too, without changing its model bytes, space, or certificate.
-            let mut previous = current.clone();
-            let adapter = current
-                .execution
-                .implementation_revision
-                .strip_prefix("frankensearch-embed-0.3.1+")
-                .expect("current adapter identifies this package");
-            previous.execution.implementation_revision =
-                format!("frankensearch-embed-0.3.0+{adapter}");
-            assert_eq!(
-                current.space_contract_fingerprint().unwrap(),
-                previous.space_contract_fingerprint().unwrap()
-            );
-            assert_eq!(
-                current.execution.golden_vectors,
-                previous.execution.golden_vectors
-            );
-            let previous_identity = previous
-                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
-                .unwrap();
-            assert_eq!(
-                current_identity.verify_exact_producer_with(&previous_identity),
-                Err(ProducerCompatibilityErrorV1::CertificateRequired)
-            );
-            assert_ne!(
-                current.freeze().unwrap().fingerprint,
-                previous.freeze().unwrap().fingerprint
-            );
+            // Preserve admission refusal for the 0.3 line's adapters too,
+            // without changing their model bytes, space, or certificate.
+            for previous_package in ["0.3.1", "0.3.0"] {
+                let previous = with_adapter_package(current.clone(), "0.4.0", previous_package);
+                assert_ne!(previous, current);
+                assert_eq!(
+                    current.space_contract_fingerprint().unwrap(),
+                    previous.space_contract_fingerprint().unwrap()
+                );
+                assert_eq!(
+                    current.execution.golden_vectors,
+                    previous.execution.golden_vectors
+                );
+                let previous_identity = previous
+                    .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                    .unwrap();
+                assert_eq!(
+                    current_identity.verify_exact_producer_with(&previous_identity),
+                    Err(ProducerCompatibilityErrorV1::CertificateRequired),
+                    "a {previous_package} adapter must not be admitted as current"
+                );
+                assert_ne!(
+                    current.freeze().unwrap().fingerprint,
+                    previous.freeze().unwrap().fingerprint
+                );
+            }
         }
     }
 
@@ -4514,8 +4529,6 @@ mod tests {
         );
     }
 
-    // Preserve the immediately preceding dependency identity independently of
-    // adapter package version and every platform's numerical certificate.
     /// Reconstruct an English `MiniLM` producer before bd-7651e moved it from
     /// 512 to 256 tokens. Every other producer is returned unchanged.
     fn before_minilm_256(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
@@ -4593,6 +4606,8 @@ mod tests {
         }
     }
 
+    // Preserve the immediately preceding dependency identity independently of
+    // adapter package version and every platform's numerical certificate.
     fn before_fastembed_7(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         if manifest.execution.backend == "fastembed-onnx" {
             assert!(
@@ -4624,12 +4639,16 @@ mod tests {
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
         ] {
+            // Only the FastEmbed segment moves; the adapter package stays.
             let previous = before_fastembed_7(current.clone());
             assert!(
                 previous
                     .execution
                     .implementation_revision
-                    .starts_with("frankensearch-embed-0.3.1+fastembed-6.0.3")
+                    .starts_with(&format!(
+                        "frankensearch-embed-{}+fastembed-6.0.3",
+                        env!("CARGO_PKG_VERSION")
+                    ))
             );
             assert_eq!(current.artifacts, previous.artifacts);
             assert_eq!(
@@ -4683,6 +4702,7 @@ mod tests {
     // qualified Windows output. Current owning-loader tests check the new bits.
     fn before_dependency_refresh(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         let current = manifest.freeze().unwrap().fingerprint;
+        manifest = before_embed_0_4(manifest);
         manifest = before_minilm_256(manifest);
         manifest = before_fastembed_7(manifest);
         manifest = before_adapter_release(manifest);
@@ -4848,9 +4868,10 @@ mod tests {
         // previous-version check; all artifact and input fields stay frozen.
         // bd-dsbym: retain every prior fixture verbatim after correcting the
         // Tokenizers/FastEmbed dependency identity. No vector golden changes.
-        // GOLDEN-CHANGE releases 0.3.0/0.3.1: reconstruct the prior 0.2.7 adapter
-        // before checking these exact historical hashes. Production manifests
-        // keep their actual package revision; no historical hash is replaced.
+        // GOLDEN-CHANGE releases 0.3.0/0.3.1/0.4.0: reconstruct the prior 0.2.7
+        // adapter (through 0.3.1) before checking these exact historical
+        // hashes. Production manifests keep their actual package revision; no
+        // historical hash is replaced.
         // GOLDEN-CHANGE Safetensors 0.8.0: Potion's producer protocol now names
         // its actual dependency. The reconstruction restores 0.7.0 alongside
         // the old Tokenizers protocol; artifacts and vector certificates stay exact.
