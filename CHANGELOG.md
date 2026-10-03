@@ -25,6 +25,14 @@ configuration files. These changes remain unreleased.
 
 ### Release-preparation limitations (2026-10-03)
 
+- Native Darwin compilation exposed an unreleased complete-daemon client
+  regression: Apple platforms do not provide Rustix's socket creation flags.
+  The client now sets close-on-exec and nonblocking flags on its owned Apple
+  descriptor before connecting; other platforms retain atomic flag creation.
+  A real descriptor test checks both flags. See
+  [#64](https://github.com/Dicklesworthstone/frankensearch/issues/64).
+  The unpublished v1.12.0 and crates-v0.7.0 candidate tags remain unchanged;
+  the repaired candidate is fsfs 1.12.1 / frankensearch 0.7.1.
 - The optional HNSW A/B development feature requires a separately prepared
   pinned Git checkout that is absent from a fresh Cargo home. The workspace
   all-features build stops during that source attestation, so its tests were
@@ -68,7 +76,7 @@ configuration files. These changes remain unreleased.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| frankensearch 0.7.0 / fsfs 1.12.0 | Release preparation | 2026-09-20–10-02 | Minor release of all 13 crates plus the fsfs binary: progressive warm-daemon streaming, complete-generation CLI with bounded retention, CJK keyword bigrams, MiniLM at 256 tokens, contiguous Quill docids, watch/delete/append fixes, installer profile/offline fixes |
+| frankensearch 0.7.1 / fsfs 1.12.1 | Release preparation | 2026-09-20–10-03 | Minor release of all 13 crates plus the fsfs binary, including the Darwin daemon socket repair: progressive warm-daemon streaming, complete-generation CLI with bounded retention, CJK keyword bigrams, MiniLM at 256 tokens, contiguous Quill docids, watch/delete/append fixes, installer profile/offline fixes |
 | frankensearch 0.6.1 | crates.io publication + `frankensearch-v0.6.1` git tag | 2026-09-19 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
