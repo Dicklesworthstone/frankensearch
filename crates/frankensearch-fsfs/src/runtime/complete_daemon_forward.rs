@@ -607,7 +607,7 @@ mod tests {
                 .contains("wrong semantic producer: fixture")
         );
         assert!(std::error::Error::source(&error).is_some());
-        for stale in [1, 2] {
+        for stale in (1..VERSION).chain([VERSION + 1]) {
             reply.fsfs_complete_cli = stale;
             assert!(
                 matches!(decode_reply(&serde_json::to_vec(&reply).unwrap(), &request),

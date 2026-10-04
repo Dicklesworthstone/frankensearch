@@ -560,8 +560,9 @@ mod tests {
         let parsed = parse_request(&bytes).unwrap();
         assert!(parsed.request.search.explain);
         assert_eq!(parsed.request.search.filter, wrapper.request.search.filter);
-        // Earlier versions cannot acknowledge request-scoped explanations.
-        for version in [1, 2, 3] {
+        // Every other version is refused at both levels, the immediately
+        // preceding one included: `VERSION`'s history lists what each changed.
+        for version in (1..VERSION).chain([VERSION + 1]) {
             let mut stale = value.clone();
             stale["fsfs_complete_cli_stream"] = serde_json::json!(version);
             assert!(parse_request(&serde_json::to_vec(&stale).unwrap()).is_err());

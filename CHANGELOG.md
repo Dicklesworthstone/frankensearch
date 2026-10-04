@@ -400,6 +400,20 @@ These changes landed after the 2026-10-03 publication; they are not in fsfs
   The existing installation is still left in place. Checked on Ubuntu 22.04
   (glibc 2.35) with the v1.10.0 standard archive.
 
+- **fsfs refuses an embedder whose identity changes during inference
+  ([#55](https://github.com/Dicklesworthstone/frankensearch/issues/55)).**
+  Every fsfs embedding (query, watch ingest, `append-batch`, `fsfs index`
+  batches) already had to carry the identity its tier was admitted under. A
+  provider that switched producer while inferring could still label its
+  vector with that identity and have it scored or stored. fsfs now also checks
+  the identity the provider reports before and after each inference, as the
+  library's two-tier searcher and the recovery path already did, and refuses
+  a change with `UnverifiableRemoteSpace`. A drift seen before the call runs
+  no inference, and cancellation still takes precedence. The complete-generation
+  forwarding tests now refuse every other protocol version on the reply and
+  on both levels of the streaming request, including the immediately
+  preceding one (#54).
+
 ---
 
 ## frankensearch 0.7.0 / fsfs 1.12.0 — release preparation

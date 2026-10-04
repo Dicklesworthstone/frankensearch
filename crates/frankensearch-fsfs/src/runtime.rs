@@ -1004,15 +1004,21 @@ impl AdmittedEmbedder {
     }
 
     /// Embed a query or document text and return its values only when the
-    /// response itself carries the admitted identity, the exact width and
+    /// provider still advertises the admitted identity before and after
+    /// inference and the response itself carries it, with the exact width and
     /// finite values. A cancellation observed after inference takes
-    /// precedence over a provider error.
+    /// precedence over identity drift, which takes precedence over a provider
+    /// error.
     async fn embed_admitted(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
+        self.check_current_identity()?;
         let response = self.embedder.embed_bound(cx, text).await;
         cx.checkpoint().map_err(|_| SearchError::Cancelled {
             phase: "admitted_embedding".to_owned(),
             reason: "runtime cancellation requested".to_owned(),
         })?;
+        // A provider that changed producer while inferring may still label the
+        // response with the identity it was asked for.
+        self.check_current_identity()?;
         let bound = response?;
         bound.validate()?;
         if bound.identity != self.identity {
@@ -1021,12 +1027,16 @@ impl AdmittedEmbedder {
         Ok(bound.values)
     }
 
-    /// Embed a batch through the provider's bound batch operation; every
-    /// response must validate and carry the admitted identity. The caller
+    /// Embed a batch through the provider's bound batch operation; the
+    /// provider must advertise the admitted identity before and after
+    /// inference, and every response must validate and carry it. The caller
     /// checks cancellation and the response count, which the indexing retry
     /// loop already does after inference.
     async fn embed_batch_admitted(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
-        let responses = self.embedder.embed_batch_bound(cx, texts).await?;
+        self.check_current_identity()?;
+        let responses = self.embedder.embed_batch_bound(cx, texts).await;
+        self.check_current_identity()?;
+        let responses = responses?;
         let mut values = Vec::with_capacity(responses.len());
         for response in responses {
             response.validate()?;
@@ -28863,6 +28873,14 @@ mod tests {
         CancelThenRespond,
         /// Cancel the caller, then fail.
         CancelThenFail,
+        /// `[1.0, 0.0]` bound to the admitted identity whatever `identity()`
+        /// now reports.
+        Admitted,
+        /// Switch `identity()` to the drifted identity mid-inference, then
+        /// answer like [`Self::Admitted`].
+        DriftThenRespond,
+        /// Like [`Self::DriftThenRespond`], cancelling the caller first.
+        CancelDriftThenRespond,
     }
 
     /// A provider whose raw `embed` always succeeds with `[1.0, 0.0]` while
@@ -28920,6 +28938,16 @@ mod tests {
                     BoundScript::CancelThenFail => {
                         cx.cancel_with(asupersync::types::CancelKind::User, Some("test"));
                         failure()
+                    }
+                    BoundScript::Admitted => bound(vec![1.0, 0.0], self.advertised.clone()),
+                    BoundScript::DriftThenRespond => {
+                        self.drift.store(true, Ordering::SeqCst);
+                        bound(vec![1.0, 0.0], self.advertised.clone())
+                    }
+                    BoundScript::CancelDriftThenRespond => {
+                        cx.cancel_with(asupersync::types::CancelKind::User, Some("test"));
+                        self.drift.store(true, Ordering::SeqCst);
+                        bound(vec![1.0, 0.0], self.advertised.clone())
                     }
                 }
             })
@@ -29035,6 +29063,43 @@ mod tests {
                 Err(SearchError::UnverifiableRemoteSpace { .. })
             ));
 
+            // Drift the response does not show: the provider changes producer
+            // before or during inference but still labels its vector with the
+            // admitted identity.
+            let stale = |script| {
+                let mut embedder = ScriptedBoundEmbedder::new(script);
+                embedder.drifted = Some(test_identity("drifted-model-2", 2).clone());
+                Arc::new(embedder)
+            };
+            let before = stale(BoundScript::Admitted);
+            let admission = admitted_shared(&before);
+            assert_eq!(admission.embed_admitted(&cx, "query").await.unwrap(), vec![1.0, 0.0]);
+            before.drift.store(true, Ordering::SeqCst);
+            let result = admission.embed_admitted(&cx, "query").await;
+            assert!(
+                matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })),
+                "{result:?}"
+            );
+            assert_eq!(
+                before.calls.load(Ordering::SeqCst),
+                1,
+                "inference ran after the drift was visible"
+            );
+            let during = stale(BoundScript::DriftThenRespond);
+            let result = admitted_shared(&during).embed_admitted(&cx, "query").await;
+            assert!(
+                matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })),
+                "{result:?}"
+            );
+            let during = stale(BoundScript::DriftThenRespond);
+            let result = admitted_shared(&during)
+                .embed_batch_admitted(&cx, &["first", "second"])
+                .await;
+            assert!(
+                matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })),
+                "{result:?}"
+            );
+
             // Provider failure stays a provider failure.
             let (result, _) = query(BoundScript::Fail).await;
             assert!(
@@ -29042,13 +29107,17 @@ mod tests {
                 "{result:?}"
             );
         });
-        // Cancellation observed during inference wins over both a good
-        // response and a provider error.
-        for script in [BoundScript::CancelThenRespond, BoundScript::CancelThenFail] {
+        // Cancellation observed during inference wins over a good response, a
+        // provider error and identity drift.
+        for script in [
+            BoundScript::CancelThenRespond,
+            BoundScript::CancelThenFail,
+            BoundScript::CancelDriftThenRespond,
+        ] {
             run_test_with_cx(|cx| async move {
-                let result = admitted(ScriptedBoundEmbedder::new(script))
-                    .embed_admitted(&cx, "query")
-                    .await;
+                let mut embedder = ScriptedBoundEmbedder::new(script);
+                embedder.drifted = Some(test_identity("drifted-model-2", 2).clone());
+                let result = admitted(embedder).embed_admitted(&cx, "query").await;
                 assert!(
                     matches!(result, Err(SearchError::Cancelled { .. })),
                     "{result:?}"
