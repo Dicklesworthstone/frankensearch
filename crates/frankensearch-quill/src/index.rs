@@ -100,11 +100,11 @@ use crate::quiver::{
 };
 use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
-    AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES,
-    DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator, DocIdSpan, DocumentAccumulation,
-    FIELD_PREFIX_BYTES, FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput,
-    FrankensearchTokenizer, IndexedFieldValue, IndexedNumericValue, ShardRouter, StoredFieldValue,
-    TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer, flush_accumulator_with_mode, flush_delta_snapshot,
+    AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES, DeltaFlushInput,
+    DocIdAllocator, DocIdSpan, DocumentAccumulation, FIELD_PREFIX_BYTES, FlushDocumentInput,
+    FlushError, FlushMode, FlushSegmentInput, FrankensearchTokenizer, IndexedFieldValue,
+    IndexedNumericValue, ShardRouter, StoredFieldValue, TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer,
+    flush_accumulator_with_mode, flush_delta_snapshot,
 };
 use crate::segment::{EncodedSegment, SectionKind};
 use crate::snippet::{SnippetConfig, SnippetGenerator, SnippetTerm};
@@ -5411,7 +5411,6 @@ impl QuillWriterState {
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         validate_config(&config)?;
-        validate_non_durable_quarantine(&config)?;
         let open_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_OPEN,
@@ -5425,7 +5424,9 @@ impl QuillWriterState {
         let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
         let instrumented = open_span.clone();
         async move {
-            let writer = KeeperWriter::open(cx, directory, DEFAULT_SCHEMA).await?;
+            let writer =
+                open_sidecarless_writer(cx, directory.into(), DEFAULT_SCHEMA, &config, false)
+                    .await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), DEFAULT_SCHEMA, config)?;
             record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
@@ -5452,7 +5453,6 @@ impl QuillWriterState {
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         validate_config(&config)?;
-        validate_non_durable_quarantine(&config)?;
         let open_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_OPEN,
@@ -5466,7 +5466,8 @@ impl QuillWriterState {
         let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
         let instrumented = open_span.clone();
         async move {
-            let writer = KeeperWriter::open(cx, directory, schema).await?;
+            let writer =
+                open_sidecarless_writer(cx, directory.into(), schema, &config, false).await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), schema, config)?;
             record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
@@ -5588,7 +5589,6 @@ impl QuillWriterState {
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
         validate_config(&config)?;
-        validate_non_durable_quarantine(&config)?;
         let open_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::KEEPER_OPEN,
@@ -5602,7 +5602,8 @@ impl QuillWriterState {
         let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
         let instrumented = open_span.clone();
         async move {
-            let writer = KeeperWriter::create(cx, directory, schema).await?;
+            let writer =
+                open_sidecarless_writer(cx, directory.into(), schema, &config, true).await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), schema, config)?;
             record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
@@ -5703,7 +5704,7 @@ impl QuillWriterState {
         let initial_snapshot = backend.retained_snapshot_for_bookkeeping().clone();
         let manifest = &initial_snapshot.loaded_manifest().manifest;
         let initial_generation = manifest.generation;
-        let next_lease_base = next_lease_boundary(manifest.docid_high_watermark)?;
+        let next_lease_base = validate_docid_watermark(manifest.docid_high_watermark)?;
         let detected_parallelism = ingest_parallelism_at_construction();
         let shard_router = ShardRouter::from_config(&config, detected_parallelism);
         let docid_allocator = DocIdAllocator::open(next_lease_base, shard_router.shard_count())
@@ -7128,10 +7129,7 @@ impl QuillWriterState {
             let count = range.len();
             let count_u32 = u32::try_from(count)
                 .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
-            let remaining = live_lease.map_or(DOC_ORDS_PER_LEASE, |(_, next_ord)| {
-                DOC_ORDS_PER_LEASE - next_ord
-            });
-            if count_u32 > remaining {
+            if count_u32 > planned_allocator.contiguous_capacity(shard) {
                 return Ok(None);
             }
             let shard_prepared_metadata = if let Some(metadata) = prepared_metadata.as_mut() {
@@ -13589,10 +13587,43 @@ fn validate_non_durable_quarantine(config: &QuillConfig) -> Result<(), QuillInde
         return Err(QuillIndexError::Config(SearchError::InvalidConfig {
             field: "quarantine_on_unrepairable".to_owned(),
             value: "true".to_owned(),
-            reason: "requires open_durable/create_durable and a FileProtector".to_owned(),
+            reason: "requires an on-disk writer; in-memory and read-only indexes cannot \
+                     quarantine segments"
+                .to_owned(),
         }));
     }
     Ok(())
+}
+
+/// Open (or with `create`, create) the Keeper writer of an index without
+/// repair sidecars. `quarantine_on_unrepairable` selects the writer that
+/// verifies every segment and quarantines an unrepairable one.
+async fn open_sidecarless_writer(
+    cx: &Cx,
+    directory: PathBuf,
+    schema: SchemaDescriptor,
+    config: &QuillConfig,
+    create: bool,
+) -> Result<KeeperWriter, QuillIndexError> {
+    if config.quarantine_on_unrepairable {
+        #[cfg(feature = "durability")]
+        return Ok(if create {
+            KeeperWriter::create_quarantining(cx, directory, schema).await?
+        } else {
+            KeeperWriter::open_quarantining(cx, directory, schema).await?
+        });
+        #[cfg(not(feature = "durability"))]
+        return Err(QuillIndexError::Config(SearchError::InvalidConfig {
+            field: "quarantine_on_unrepairable".to_owned(),
+            value: "true".to_owned(),
+            reason: "segment quarantine requires the durability feature".to_owned(),
+        }));
+    }
+    Ok(if create {
+        KeeperWriter::create(cx, directory, schema).await?
+    } else {
+        KeeperWriter::open(cx, directory, schema).await?
+    })
 }
 
 /// Minimum total sealed live-document count before ranked queries fan
@@ -13956,21 +13987,16 @@ fn wall_clock_unix_s() -> Result<i64, QuillIndexError> {
     i64::try_from(seconds).map_err(|_| invalid_state("Unix timestamp does not fit i64"))
 }
 
-fn next_lease_boundary(watermark: u64) -> Result<u64, QuillIndexError> {
+/// The writer session's allocator opens exactly at the manifest watermark (a
+/// lease may start inside its block); only a watermark beyond the u32 docid
+/// space is refused.
+fn validate_docid_watermark(watermark: u64) -> Result<u64, QuillIndexError> {
     if watermark > MAX_GLOBAL_DOCID_EXCLUSIVE {
         return Err(invalid_state(
             "manifest document-id watermark exceeds the Q1 address space",
         ));
     }
-    let lease_size = u64::from(DOC_ORDS_PER_LEASE);
-    let remainder = watermark % lease_size;
-    if remainder == 0 {
-        return Ok(watermark);
-    }
-    watermark
-        .checked_add(lease_size - remainder)
-        .filter(|boundary| *boundary <= MAX_GLOBAL_DOCID_EXCLUSIVE)
-        .ok_or_else(|| invalid_state("manifest document-id watermark cannot reach another lease"))
+    Ok(watermark)
 }
 
 /// Minimum documents a shard must receive to be worth enrolling in a fan-out.
@@ -17593,6 +17619,7 @@ mod tests {
         EncodedPositionList, EncodedPostingList, StatsSection, aggregate_field_stats,
     };
     use crate::schema::{Analyzer, FSFS_CHUNK_SCHEMA, FieldDescriptor};
+    use crate::scribe::DOC_ORDS_PER_LEASE;
 
     const CONCAT_MERGE_QUERIES: [&str; 4] =
         ["rust", "python", "rust OR python", "\"rust ownership\""];
@@ -25093,12 +25120,15 @@ mod tests {
             assert!(error.to_string().contains("fully committed"));
             index.commit(&cx).await.expect("commit scalar row");
 
+            // The single-shard writer's watermark is its exact frontier; a
+            // Delta lease must start at the next block boundary above it.
             let lease_base = index
                 .snapshot()
                 .expect("sealed scalar snapshot is authoritative")
                 .loaded_manifest()
                 .manifest
-                .docid_high_watermark;
+                .docid_high_watermark
+                .next_multiple_of(u64::from(DOC_ORDS_PER_LEASE));
             let global_docid = u32::try_from(lease_base).expect("Delta docid");
             let generation = index
                 .snapshot()
@@ -35006,6 +35036,74 @@ mod tests {
         });
     }
 
+    /// bd-k07zw: fsfs publishes every complete-generation edit, delete, and
+    /// append through a short single-shard writer session that ends in a
+    /// bulk-finish concat. Each session used to open a fresh 65,536-docid
+    /// lease, and the concat stored the skipped slots as dense DOCLEN/IDMAP
+    /// holes (2.36 MB per one-line edit). The session must continue at the
+    /// exact docid frontier, so each new row widens the merged hull by one
+    /// slot.
+    #[test]
+    fn reopened_single_shard_sessions_merge_without_lease_holes() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("lexical directory");
+            let bulk = || QuillConfig {
+                bulk_load_mode: true,
+                max_ingest_shards: 1,
+                ..QuillConfig::default()
+            };
+            let documents = (0..5)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("doc-{ordinal}"),
+                        format!("generation fixture document {ordinal}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let index = QuillIndex::create(&cx, directory.path(), bulk())
+                .await
+                .expect("create bulk index");
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index initial build");
+            let built = index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finish initial build");
+            assert_eq!(built.loaded_manifest().manifest.docid_high_watermark, 5);
+            drop(index);
+
+            for session in 0..3_u64 {
+                let index = QuillIndex::create(&cx, directory.path(), bulk())
+                    .await
+                    .expect("reopen for one session");
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new(
+                            format!("added-{session}"),
+                            format!("generation fixture addition {session}"),
+                        )],
+                    )
+                    .await
+                    .expect("index one added document");
+                let snapshot = index.finish_bulk_load(&cx).await.expect("finish session");
+                let manifest = &snapshot.loaded_manifest().manifest;
+                assert_eq!(manifest.segments.len(), 1);
+                let segment = &manifest.segments[0];
+                assert_eq!(
+                    (segment.docid_lo, segment.docid_hi),
+                    (0, 6 + session),
+                    "session {session} must widen the hull by one slot, not by a lease"
+                );
+                assert_eq!(manifest.docid_high_watermark, 6 + session);
+                assert_eq!(snapshot.doc_count(), 6 + session);
+                drop(index);
+            }
+        });
+    }
+
     /// Bounded seal-producing batches compose across commits, and a REJECTED
     /// batch composes with them by contributing nothing.
     ///
@@ -35877,23 +35975,15 @@ mod tests {
     }
 
     #[test]
-    fn unaligned_manifest_watermark_burns_the_partial_lease() {
+    fn manifest_watermark_opens_exactly_inside_the_q1_address_space() {
         let lease_size = u64::from(DOC_ORDS_PER_LEASE);
-        assert_eq!(next_lease_boundary(0).expect("genesis"), 0);
-        assert_eq!(
-            next_lease_boundary(1).expect("partial first lease"),
-            lease_size
-        );
-        assert_eq!(
-            next_lease_boundary(lease_size).expect("aligned lease"),
-            lease_size
-        );
-        assert_eq!(
-            next_lease_boundary(lease_size + 1).expect("partial second lease"),
-            lease_size * 2
-        );
-        assert!(next_lease_boundary(MAX_GLOBAL_DOCID_EXCLUSIVE - 1).is_ok());
-        assert!(next_lease_boundary(MAX_GLOBAL_DOCID_EXCLUSIVE + 1).is_err());
+        for watermark in [0, 1, lease_size, lease_size + 1, MAX_GLOBAL_DOCID_EXCLUSIVE] {
+            assert_eq!(
+                validate_docid_watermark(watermark).expect("in-range watermark"),
+                watermark
+            );
+        }
+        assert!(validate_docid_watermark(MAX_GLOBAL_DOCID_EXCLUSIVE + 1).is_err());
     }
 
     #[test]
