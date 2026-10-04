@@ -344,10 +344,13 @@ searches stop at `INITIAL` until you re-index with the model present.
 `fsfs status` shows both generations (`vector_generation_id`,
 `quality_generation_id`). Deletes, `append-batch`, `compact`, and watch mode
 keep the two tiers in step. Both generations carry RaptorQ repair sidecars
-(`index.fsvi.fec`, `quality.fsvi.fec`) like Quill's segments: `fsfs doctor`
+(`index.fsvi.fec`, `quality.fsvi.fec`): `fsfs doctor`
 verifies them as `durability.vector_sidecars`, `fsfs compact` restores a
 generation whose bytes drifted before merging, and an in-place delete drops
-the sidecar until the next compaction re-protects the file. The first search in a shell pays the model load
+the sidecar until the next compaction re-protects the file. Keyword segments
+carry no sidecars, since they rebuild from your files in seconds: every
+keyword writer verifies its segments when it opens, quarantines one that
+fails (`*.fslx.quarantine`), and reindexes the documents it held. The first search in a shell pays the model load
 (about 3 s for potion, plus the MiniLM session for the quality stage); the
 query daemon that `fsfs search` starts by default keeps later searches to tens
 of milliseconds and exits on its own after ten idle minutes.
@@ -609,9 +612,18 @@ publisher, corrupt bundle, cancellation before completion, or failed
 synchronization prevents a success receipt. This also provides an explicit
 durability retry after a publication whose final directory synchronization failed.
 
+Every command that publishes a successor (`index`, `watch`, `append-batch`,
+`delete`, `compact`) then reclaims older generations: it keeps the selected
+generation and its immediate predecessor (the rollback target), removes
+everything older plus abandoned unsealed builds, and never removes a generation
+that any live reader, in any process, still holds. The receipt reports what was
+kept and removed (`retention` in JSON). `FSFS_GENERATION_RETENTION=report`
+reports what would be removed without removing anything, and
+`FSFS_GENERATION_RETENTION=off` keeps every generation.
+
 This is the cooperative local store. The complete FSVI v2 authority migration
-and automatic reclamation of retained generations remain unfinished. Commands
-refuse to create a nested index inside a sealed generation.
+remains unfinished. Commands refuse to create a nested index inside a sealed
+generation.
 
 ## Reproducible Showcase Suite
 

@@ -1,5 +1,32 @@
 # Dependency Upgrade Log
 
+## 2026-10-03 — Release dependency preparation
+
+The live stable-version census selects the published FrankenSQLite 0.4.7
+family, FastEmbed 7.1.0, JSON Schema 0.58.5, libc 0.2.190, thiserror 2.0.21,
+and xxhash-rust 0.8.19. All twenty SQLite lock entries and the ten direct
+SQLite requirements advance together. The publication planner now requires
+the same registry-only 0.4.7 identity, including the pager, and its existing
+self-test also rejects a coherent previous 0.4.4 family.
+
+FrankenTUI 0.9.0 failed actual workspace check and strict Clippy because its
+backend no longer exposes the presenter API used by fsfs. The preceding 0.8.0
+family is unpublished, so the candidate retains the working 0.7.0 family.
+The migration is tracked in GitHub issue #61.
+
+FastEmbed's version participates in producer admission. Current producer
+identities name 7.1.0; independently reconstructed 7.0.1 and older identities
+remain rejected by current admission. Model bytes, token policies and
+numerical certificates are unchanged. The plain manifest suite passed 131
+tests with zero failures and one existing ignore. Workspace check and strict
+Clippy also passed through RCH. The plain source-stable default workspace
+suite passed 9,706 top-level tests including doctests, with zero failures and
+100 declared ignores; nested child-suite summaries are excluded. The workspace
+all-features build stopped before testing because the optional HNSW A/B feature
+requires an undeclared pinned Git-cache checkout (#63). That development
+feature is outside the release profiles. Real-model, supported-feature
+packaged-consumer and release-artifact qualification remain pending.
+
 ## 2026-09-18 — Dependency qualification follow-through
 
 The repaired Windows model promotion path passes 123 manifest tests, with no

@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-fsfs"
-version = "1.11.0"
+version = "1.12.1"
 default-run = "fsfs"
 description = "Standalone fsfs CLI for two-tier hybrid local search"
 edition.workspace = true
@@ -111,8 +111,8 @@ ahash = { workspace = true }
 # lexical token text — the per-token to_ascii_lowercase heap alloc dominated
 # tokenize_lexical emission. Already resolved in the workspace lock (fusion dep).
 compact_str = "0.10"
-fsqlite = { version = "0.4.4", default-features = false, features = ["native", "async-api"] }
-fsqlite-types = { version = "0.4.4", features = ["native"] }
+fsqlite = { version = "0.4.7", default-features = false, features = ["native", "async-api"] }
+fsqlite-types = { version = "0.4.7", features = ["native"] }
 serde = { workspace = true }
 # Receipt hashes include JSON Value bytes; keep their insertion order stable
 # instead of depending on another workspace member to enable this feature.
@@ -137,14 +137,14 @@ same-file = "1.0.6"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-frankensearch = { path = "../../frankensearch", version = "0.6.1", default-features = false }
+frankensearch = { path = "../../frankensearch", version = "0.7.1", default-features = false }
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
 frankensearch-lexical = { workspace = true }
 proptest = { workspace = true }
 # Fixtures are in-memory/local; the default HTTP resolver pulls the forbidden
 # reqwest/hyper/Tokio stack without providing any test coverage value.
-jsonschema = { version = "0.56", default-features = false, features = ["idna"] }
+jsonschema = { version = "0.58.5", default-features = false, features = ["idna"] }
 criterion = { workspace = true }
 
 [[bench]]

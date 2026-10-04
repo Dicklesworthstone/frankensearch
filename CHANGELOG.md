@@ -23,11 +23,105 @@ The September 21 supplement records executable complete-generation integration,
 live replacement-generation watching, Unix-socket serving, and reloadable default
 configuration files. These changes remain unreleased.
 
+### Published fsfs 1.12.1 / frankensearch 0.7.1 (2026-10-03)
+
+[fsfs v1.12.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.1)
+and all thirteen crates.io packages are published from
+[`d1cb86e1`](https://github.com/Dicklesworthstone/frankensearch/commit/d1cb86e1848309fe39fb7c8c4c4d7356ebd878aa).
+The [0.7.1 crate bundle](https://github.com/Dicklesworthstone/frankensearch/releases/tag/crates-v0.7.1)
+contains the unchanged registry archives; its heterogeneous package versions and
+SHA-256 digests are recorded in the embedded manifest. The binary release
+retains GitHub's latest-release routing. Earlier preparation statements below
+record their original qualification boundary.
+
+- The six published binary profiles are GNU x86-64 Full, macOS ARM64 Full,
+  Linux x86-64/ARM64 musl Lite, and macOS x86-64/ARM64 Lite. Signed checksums,
+  archive metadata and signatures cover the published payloads. The actual GNU
+  Full binary requires **glibc 2.43**, matching the previous Full
+  release’s declared floor; compatibility with older glibc remains unqualified (#62). Static
+  musl Lite provides lexical search without the semantic model loaders.
+- Current-source default workspace tests passed: **9,707 passed, zero failed,
+  100 ignored**. Strict default/Lite Clippy, the portable descriptor tests,
+  real-model integration, and all ten supported packaged facade feature
+  configurations passed. Workspace all-features was not run because of the
+  optional Git-only HNSW A/B dependency (#63). Supplemental full Quill tooling
+  qualification is separate from these results.
+- Tests against the public signed Full binary passed for fresh curl|bash
+  installation, real semantic queries with eighteen validator negative
+  controls, installer upgrade from 1.10.0, and the actual `fsfs update` upgrade
+  from 1.10.0 with the previous binary preserved as a verified backup.
+- The generated ACFS FrankenSearch module and its stock installer/security
+  helpers passed in a fresh Ubuntu 24.04 container against the public signed
+  musl Lite artifact. Its installed binary hash matched the release metadata.
+  This qualifies that module's lexical route, not the complete ACFS bootstrap
+  or Full semantic search. The existing installer checksum is unchanged.
+- The optional unpublished Quill fuzz-harness probe hit its existing two-second
+  rendezvous deadline under concurrent execution. The unchanged exact serial
+  test subsequently passed; that does not erase the original failing probe
+  receipt. The timing limitation remains tracked in
+  [#65](https://github.com/Dicklesworthstone/frankensearch/issues/65).
+- Bound-response identity, phase/cache admission, cancellation and recovery
+  protections have named passing tests. Ordinary warmed/in-flight advertised
+  embedder-metadata drift remains unqualified and tracked in
+  [#55](https://github.com/Dicklesworthstone/frankensearch/issues/55).
+  The original WAL cold/warm survivor regression is covered; rejection of every
+  immediately preceding forwarded-reply and progressive-wrapper wire version
+  is not established by the current negative controls (#54).
+
+### Release-preparation limitations (2026-10-03)
+
+- Native Darwin compilation exposed an unreleased complete-daemon client
+  regression: Apple platforms do not provide Rustix's socket creation flags.
+  The client now sets close-on-exec and nonblocking flags on its owned Apple
+  descriptor before connecting; other platforms retain atomic flag creation.
+  A real descriptor test checks both flags. See
+  [#64](https://github.com/Dicklesworthstone/frankensearch/issues/64).
+  The unpublished v1.12.0 and crates-v0.7.0 candidate tags remain unchanged;
+  the repaired candidate is fsfs 1.12.1 / frankensearch 0.7.1.
+- The optional HNSW A/B development feature requires a separately prepared
+  pinned Git checkout that is absent from a fresh Cargo home. The workspace
+  all-features build stops during that source attestation, so its tests were
+  not run. This feature is not enabled by the released binary profiles or
+  supported facade bundles; their qualification remains separate. Reproducible
+  A/B dependency preparation is tracked in
+  [#63](https://github.com/Dicklesworthstone/frankensearch/issues/63).
+- Dependency preparation advances FastEmbed to 7.1.0, FrankenSQLite to 0.4.7,
+  and the development JSON Schema validator to 0.58.5. The FastEmbed dependency
+  revision participates in producer identity, so an index produced by the
+  previous adapter requires fresh admission or rebuilding. Model artifacts,
+  sequence policies, and existing numerical certificates remain unchanged;
+  actual runtime qualification remains required.
+- GNU full compatibility with glibc 2.28 remains unqualified. The previous
+  v1.10.0 GNU full metadata already declares a 2.43 floor; the current prebuilt
+  ONNX Runtime archive has unresolved libc symbols introduced after 2.28.
+  These observations do not measure the next binary's final floor. A pinned
+  compatible runtime build and exact model admission are tracked in
+  [#62](https://github.com/Dicklesworthstone/frankensearch/issues/62).
+- FrankenTUI remains on the compatible published 0.7.0 family. The attempted
+  0.9.0 upgrade fails actual workspace check and strict Clippy because it removes
+  the backend presenter API used by fsfs. The preceding 0.8.0 family is not
+  published. Migrating the terminal session to the separate presentation API is
+  tracked in [#61](https://github.com/Dicklesworthstone/frankensearch/issues/61).
+- The opt-in complete-generation layout can admit a reader without a retention
+  pin when the reader lacks write permission. A separately writable owner may
+  then reclaim the reader's older generation after publishing replacements,
+  making subsequent path-based reads unavailable. Ordinary writable pinned
+  readers remain protected. This is a source-reviewed reader-availability
+  limitation; no surviving-generation corruption or unique-source-data loss
+  was established. See [#60](https://github.com/Dicklesworthstone/frankensearch/issues/60).
+  A failed retention pass can also have reclaimed some older generations before
+  returning an error; its current "every generation kept" diagnostic is overly
+  broad. These limitations affect the optional complete-generation path.
+- The facade's repository-README doctest include now stays inside the packaged
+  crate. Cargo packages the authoritative workspace README through a separate
+  link, while preserving the existing facade guide. Packaged doctest and source
+  gates remain required before publication.
+
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased fsfs | Release preparation | 2026-09-09–21 | Progressive warm-daemon streaming, complete-generation CLI integration, reloadable config defaults, indexing and model fixes, installer profile/offline fixes, and lexical-flush retry retention |
+| [frankensearch 0.7.1](https://crates.io/crates/frankensearch/0.7.1) / [fsfs 1.12.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.1) | GitHub and crates.io publication | 2026-10-03 | Minor release of all 13 crates plus the fsfs binary, including the Darwin daemon socket repair: progressive warm-daemon streaming, complete-generation CLI with bounded retention, CJK keyword bigrams, MiniLM at 256 tokens, contiguous Quill docids, watch/delete/append fixes, installer profile/offline fixes |
 | frankensearch 0.6.1 | crates.io publication + `frankensearch-v0.6.1` git tag | 2026-09-19 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
 | [v1.10.0](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.10.0) | Release | 2026-09-08 | Native multilingual search and semantic build profile, bounded caller-owned inference, operation-scoped durability locks, FrankenSQLite 0.3.18 |
@@ -235,13 +329,78 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
-## Unreleased changes after frankensearch 0.6.1
+## frankensearch 0.7.0 / fsfs 1.12.0 — release preparation
 
-The September 20 entries cover landed source through
-[`aaf8bae1`](https://github.com/Dicklesworthstone/frankensearch/commit/aaf8bae1169f39acdaf12c0e58b65a0ab876ab7c).
-These changes are **not included in the published 0.6.1 crate family**.
-The combined-source quality gate and rebuilt platform artifacts are still being
-qualified; individual results below are narrower than release acceptance.
+Minor-version release of the whole library family plus the next fsfs binary:
+facade 0.7.0, rerank 0.5.0, fsfs 1.12.0, TUI 0.3.1, and core, durability,
+embed, index, lexical, fusion, Quill, storage and ops 0.4.0.
+`frankensearch-quill-gauntlet` remains `publish = false`. Every entry below
+landed after the 0.6.1 crates; none of it is in 0.6.1. Publication is pending
+the quality gate and the six platform binaries.
+
+**Breaking changes.** `cargo semver-checks` against the published crates:
+
+- `frankensearch-core`: `ExplainedSource::LexicalBm25` carries a per-term,
+  per-field `terms` breakdown instead of `matched_terms`, `tf` and `idf`.
+- `frankensearch-quill`: `Analyzer` gained `FrankensearchCjkBigrams` (the
+  default schema's CJK analyzer), which shifts the discriminants of the CASS
+  analyzers; `LeaseGrant` reports `lease_base` and `first_ord` instead of
+  `base_docid`, and `LeaseBurnReport` no longer has `open_gap_burned`.
+- Every other crate exposes core types, so each takes a minor version with
+  core. TUI uses no core type and takes a patch.
+
+**Rebuild stored indexes.** The MiniLM token limit (256, below) and the embed
+0.4.0 adapter revision are both part of the stored producer identity, so
+semantic vectors written by the 0.3 line are refused as current; run `fsfs
+index` (or rebuild library-held vectors). Older identities still verify for
+historical fixtures. The default Quill schema now indexes CJK bigrams, so a
+keyword index built with the 0.3 default schema is a schema mismatch: fsfs
+rebuilds its keyword index automatically, library users reindex. Quill 0.4.0
+still reads the MANIFEST images written by 0.2.3 through 0.3.5.
+
+- **The MiniLM quality tier reads 256 tokens per chunk, not 512, and
+  indexes 1.7x faster.** Attention cost grows with the square of the
+  length, and an earlier evaluation found no significant quality loss at 256
+  on SciFact, NFCorpus, ArguAna or a 253-query code-search set. A fresh
+  `fsfs index` of a 579-file Rust tree took 14.1 s instead of 24.1 s. The
+  limit belongs to each model: the FastEmbed and native English MiniLM
+  embedders use 256, while Snowflake, Nomic, the multilingual MiniLM and the
+  cross-encoder reranker keep 512. The token limit is part of the stored
+  embedding identity, so an index built at 512 is refused for refinement and
+  watch until `fsfs index` runs again; that run re-embeds only the quality
+  tier. Library users with stored MiniLM vectors must rebuild them; older
+  identities still verify for historical fixtures (bd-7651e).
+
+- **Complete-generation stores no longer grow without bound.** Every
+  publication (`index`, `watch`, `append-batch`, `delete`, `compact`) now
+  removes generations older than the selected one and its immediate
+  predecessor, plus abandoned builds, and never removes a generation that a
+  live reader in any process still holds (readers pin with a shared file
+  lock). Under `fsfs watch` on a 579-file Rust tree, 20 one-line edits keep
+  two generations and 109 MB, 2.0x the fresh 54 MB build; before, five
+  edits reached 380 MB and seven generations. The receipt reports what was
+  kept and removed. `FSFS_GENERATION_RETENTION=report` only reports, and
+  `FSFS_GENERATION_RETENTION=off` keeps everything (bd-2op1d).
+
+- **Each edit adds one keyword row, not 2.4 MB.** A Quill writer session
+  started at the next 65,536-number block above the stored watermark, and the
+  merge that ends every complete-generation edit stored the skipped numbers
+  as per-document table entries: each one-line edit grew the keyword segment
+  by 2.35 MB, and the document-number space ran out after 65,536 sessions.
+  A session now continues at the exact watermark, and only the newest lease
+  reserves lazily. On the same tree, five edits grow the keyword segment from
+  34.06 to 34.17 MB instead of 45.83 MB. Library writers that publish a few
+  documents per session (GH #41) get the same contiguous numbering (bd-k07zw).
+
+- **`fsfs delete`, `append-batch` and watch no longer double the keyword
+  index.** Keyword segments were built without repair sidecars, but every
+  mutation reopened them with RaptorQ protection, which wrote a sidecar for
+  every segment: after deleting one file the keyword directory went from 35.5
+  to 76.5 MB. Keyword segments now never carry sidecars, since they rebuild
+  from your files in seconds. A corrupt segment is still quarantined
+  (`*.fslx.quarantine`) and its documents reindexed: Quill's plain writer now
+  verifies every segment when it opens and quarantines any that fail, with no
+  sidecar involved. Vector files keep their sidecars (bd-2pkpj).
 
 - **`fsfs watch` no longer rebuilds an index `fsfs index` just finished.**
   Two defects made the first watch after an index rewrite everything.
@@ -284,8 +443,10 @@ qualified; individual results below are narrower than release acceptance.
   2,031,651 document numbers. The build now uses one shard, which fills one
   block: the same tree spans 2,017 numbers, its keyword index shrinks from
   163 to 89 MB and the whole index from 216 to 143 MB, with the same build
-  time. Each later writer session (`fsfs watch`, `delete`, `append-batch`)
-  still starts a new block (bd-k07zw).
+  time. Later writer sessions (`fsfs watch`, `delete`, `append-batch`, each
+  complete-generation edit) now continue at the exact last document number
+  instead of starting a new block; see "Each edit adds one keyword row"
+  above (bd-k07zw).
 
 - **`fsfs watch` indexes the same files as `fsfs index`.** `fsfs index` skips
   hidden files and directories and honors `.gitignore`, `.ignore`,

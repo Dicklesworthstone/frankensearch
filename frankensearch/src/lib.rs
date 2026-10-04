@@ -199,9 +199,10 @@ compile_error!("feature `full-fts5` requires both `full` and `fts5`");
 ///
 /// The 2026-09-01 reality check found the README quickstart importing a
 /// removed trait with nothing noticing, because no gate compiled it. Exists
-/// only under `cfg(doctest)`, so it adds nothing to any build or package.
+/// only under `cfg(doctest)`, so it adds no normal-build API. The package-local
+/// README link preserves the same coverage after Cargo flattens the archive.
 #[cfg(doctest)]
-#[doc = include_str!("../../README.md")]
+#[doc = include_str!("../WORKSPACE_README.md")]
 pub struct ReadmeDoctests;
 
 // ─── Sub-crate module aliases (advanced access) ─────────────────────────────
