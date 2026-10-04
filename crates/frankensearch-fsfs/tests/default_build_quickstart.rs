@@ -1498,9 +1498,10 @@ mod loader_only {
             NativeEmbedder::load_model(&native_directory, NativeEmbeddingModel::AllMiniLmL6V2F32)
                 .unwrap();
         let fingerprint = native.identity().unwrap().fingerprint();
+        // GOLDEN-CHANGE bd-7651e: the current 256-token F32 identity.
         assert_eq!(
-            fingerprint, "aa25d24b07a2d233445cb6605c95d33601ea36a044d3a4b2bed65e7590386109",
-            "native producer must name the current tokenizer protocol; historical identity is pinned separately"
+            fingerprint, "8c37f4cf6f63cdbc937ff7b03369606555e0eb165779c0019b1591fcadaf0860",
+            "native producer must name the current tokenizer protocol and sequence policy; historical identities are pinned separately"
         );
         let config = temp.path().join("native.toml");
         fs::write(

@@ -254,8 +254,9 @@ impl FederatedSearcher {
                 return Err(SearchError::InvalidConfig {
                     field: "federated.indices".to_owned(),
                     value: "duplicate_name".to_owned(),
-                    reason: "dispatched index names must be unique for unambiguous fusion and coverage"
-                        .to_owned(),
+                    reason:
+                        "dispatched index names must be unique for unambiguous fusion and coverage"
+                            .to_owned(),
                 });
             }
         }
@@ -1839,10 +1840,16 @@ mod tests {
         shards
     }
 
-    fn assert_same_federated_hits(actual: &[super::FederatedHit], expected: &[super::FederatedHit]) {
+    fn assert_same_federated_hits(
+        actual: &[super::FederatedHit],
+        expected: &[super::FederatedHit],
+    ) {
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(expected) {
-            assert_eq!(actual.result.score.to_bits(), expected.result.score.to_bits());
+            assert_eq!(
+                actual.result.score.to_bits(),
+                expected.result.score.to_bits()
+            );
             assert_eq!(
                 serde_json::to_value(&actual.result).unwrap(),
                 serde_json::to_value(&expected.result).unwrap(),
@@ -1976,7 +1983,10 @@ mod tests {
                 .add_index("drop", drop, 1.0);
             let response = federated
                 .search_with_index_text(&cx, "query -dropme", 10, |index, doc_id| {
-                    stores.get(index).and_then(|store| store.get(doc_id)).cloned()
+                    stores
+                        .get(index)
+                        .and_then(|store| store.get(doc_id))
+                        .cloned()
                 })
                 .await
                 .unwrap();
@@ -1992,10 +2002,7 @@ mod tests {
     #[test]
     fn indexed_text_preserves_shared_provider_results_and_global_fusion() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[
-                ("shared", &[1.0, 0.0]),
-                ("excluded", &[0.5, 0.5]),
-            ]);
+            let index = build_searcher(&[("shared", &[1.0, 0.0]), ("excluded", &[0.5, 0.5])]);
             let texts = std::collections::BTreeMap::from([
                 ("shared".to_owned(), "keep".to_owned()),
                 ("excluded".to_owned(), "dropme".to_owned()),
@@ -2004,7 +2011,9 @@ mod tests {
                 .add_index("a", Arc::clone(&index), 1.0)
                 .add_index("b", index, 2.0);
             let shared = federated
-                .search(&cx, "query -dropme", 10, |doc_id| texts.get(doc_id).cloned())
+                .search(&cx, "query -dropme", 10, |doc_id| {
+                    texts.get(doc_id).cloned()
+                })
                 .await
                 .unwrap();
             let indexed = federated

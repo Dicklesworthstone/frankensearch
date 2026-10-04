@@ -93,7 +93,11 @@ pub(crate) fn reject_sealed_ancestry(root: &Path) -> SearchResult<()> {
             Err(error) => return Err(error.into()),
         }
     }
-    Err(std::io::Error::new(ErrorKind::NotFound, "publication root has no existing ancestor").into())
+    Err(std::io::Error::new(
+        ErrorKind::NotFound,
+        "publication root has no existing ancestor",
+    )
+    .into())
 }
 
 #[cfg(all(test, unix))]
@@ -141,7 +145,10 @@ mod tests {
 
         let error = PublicationLease::acquire(&nested).expect_err("sealed ancestor");
         assert!(error.to_string().contains("sealed complete generation"));
-        assert_eq!(std::fs::read(&lock).expect("record"), b"retained owner record");
+        assert_eq!(
+            std::fs::read(&lock).expect("record"),
+            b"retained owner record"
+        );
         assert_eq!(
             std::fs::read(&artifact).expect("artifact"),
             b"retained segment"
@@ -156,7 +163,10 @@ mod tests {
         let missing = root.path().join("new-index");
         assert!(PublicationLease::acquire(&missing.join("nested")).is_err());
         assert!(!missing.exists());
-        assert_eq!(std::fs::read_dir(root.path()).expect("inventory").count(), 1);
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("inventory").count(),
+            1
+        );
     }
 
     #[test]
@@ -165,8 +175,7 @@ mod tests {
         let sealed = root.path().join("sealed");
         let nested = sealed.join("lexical");
         std::fs::create_dir_all(&nested).expect("nested index");
-        std::fs::write(sealed.join(COMPLETE_GENERATION_MANIFEST), b"sealed")
-            .expect("seal marker");
+        std::fs::write(sealed.join(COMPLETE_GENERATION_MANIFEST), b"sealed").expect("seal marker");
         let alias = root.path().join("mutable-looking-alias");
         std::os::unix::fs::symlink(&nested, &alias).expect("alias");
 
@@ -205,8 +214,7 @@ mod tests {
         let root = tempfile::tempdir().expect("root");
         let sealed = root.path().join("generation");
         std::fs::create_dir(&sealed).expect("sealed directory");
-        std::fs::write(sealed.join(COMPLETE_GENERATION_MANIFEST), b"sealed")
-            .expect("seal marker");
+        std::fs::write(sealed.join(COMPLETE_GENERATION_MANIFEST), b"sealed").expect("seal marker");
         let mutable = root.path().join("generation-other");
         let nested = mutable.join("new/nested");
         let lease = PublicationLease::acquire(&nested).expect("mutable sibling");
@@ -228,8 +236,7 @@ mod tests {
         let sealed = root.path().join("sealed");
         let nested = sealed.join("lexical");
         std::fs::create_dir_all(&nested).expect("nested index");
-        std::fs::write(sealed.join(COMPLETE_GENERATION_MANIFEST), b"sealed")
-            .expect("seal marker");
+        std::fs::write(sealed.join(COMPLETE_GENERATION_MANIFEST), b"sealed").expect("seal marker");
         let missing = root.path().join("missing");
         let indirect = missing.join("../sealed/lexical/new-index");
 

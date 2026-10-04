@@ -74,16 +74,15 @@ const SEMANTIC_QUERIES: &str =
 
 /// Target passage size in bytes. Chosen so a passage is a few paragraphs of
 /// narrative — large enough to carry a scene's meaning into a sentence
-/// embedding, small enough that a typical passage fits `MiniLM`'s 512-token
-/// window.
+/// embedding.
 ///
 /// This is a floor, not a cap: paragraphs are never split, so a single long
 /// paragraph produces an oversized passage. Over this fixture the result is 339
 /// passages averaging ~1.1 KB, with the longest around 2.2 KB (~550 tokens).
-/// The embedder truncates those few at 512 tokens, which costs the tail of a
-/// long paragraph and is deliberately accepted — the alternative is splitting
-/// mid-paragraph, which would damage the meaning the embedding is supposed to
-/// capture.
+/// `MiniLM` truncates at 256 tokens (bd-7651e), so a longer passage is embedded
+/// from its opening only. That is deliberately accepted — the alternative is
+/// splitting mid-paragraph, which would damage the meaning the embedding is
+/// supposed to capture.
 const TARGET_PASSAGE_BYTES: usize = 900;
 
 /// Split the book into chapter-attributed passages.

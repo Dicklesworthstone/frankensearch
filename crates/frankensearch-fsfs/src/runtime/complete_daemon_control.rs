@@ -149,20 +149,14 @@ pub(super) async fn connect(
     started: Instant,
     timeout: Duration,
 ) -> SearchResult<UnixStream> {
-    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+    use rustix::net::SocketAddrUnix;
 
     retained_search_checkpoint(cx)?;
     remaining(started, timeout)?;
     let address = SocketAddrUnix::new(path).map_err(io::Error::from)?;
     // Set NONBLOCK before connect: setting it on an already-connected std
     // stream leaves a full accept backlog able to block the owning task.
-    let socket = rustix::net::socket_with(
-        AddressFamily::UNIX,
-        SocketType::STREAM,
-        SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
-        None,
-    )
-    .map_err(io::Error::from)?;
+    let socket = client_socket()?;
     match rustix::net::connect(&socket, &address) {
         Ok(()) => return Ok(UnixStream::from(socket)),
         Err(rustix::io::Errno::INPROGRESS) => {}
@@ -184,6 +178,36 @@ pub(super) async fn connect(
             Err(error) => return Err(error.into()),
         }
         asupersync::time::sleep(cx.now(), left.min(IO_POLL_INTERVAL)).await;
+    }
+}
+
+fn client_socket() -> io::Result<rustix::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketType};
+
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        use rustix::net::SocketFlags;
+        rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::NONBLOCK | SocketFlags::CLOEXEC,
+            None,
+        )
+        .map_err(io::Error::from)
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        // Apple sockets do not accept these flags at creation. Set both on
+        // the owned descriptor before connect, without an async yield.
+        let socket = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)
+            .map_err(io::Error::from)?;
+        let flags = rustix::io::fcntl_getfd(&socket).map_err(io::Error::from)?;
+        rustix::io::fcntl_setfd(&socket, flags | rustix::io::FdFlags::CLOEXEC)
+            .map_err(io::Error::from)?;
+        let flags = rustix::fs::fcntl_getfl(&socket).map_err(io::Error::from)?;
+        rustix::fs::fcntl_setfl(&socket, flags | rustix::fs::OFlags::NONBLOCK)
+            .map_err(io::Error::from)?;
+        Ok(socket)
     }
 }
 
@@ -262,6 +286,21 @@ mod tests {
     use std::io::Write;
     use std::net::Shutdown;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn client_socket_is_nonblocking_and_closes_on_exec() {
+        let socket = client_socket().unwrap();
+        assert!(
+            rustix::fs::fcntl_getfl(&socket)
+                .unwrap()
+                .contains(rustix::fs::OFlags::NONBLOCK)
+        );
+        assert!(
+            rustix::io::fcntl_getfd(&socket)
+                .unwrap()
+                .contains(rustix::io::FdFlags::CLOEXEC)
+        );
+    }
 
     #[test]
     fn lifecycle_controls_are_versioned_and_not_search_queries() {

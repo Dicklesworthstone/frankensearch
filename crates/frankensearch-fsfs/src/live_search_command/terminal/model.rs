@@ -82,19 +82,24 @@ impl Model {
             SearchOutputPhase::Initial => !same_generation,
             SearchOutputPhase::Refined | SearchOutputPhase::RefinementFailed => {
                 same_generation
-                    && self.physical.as_ref().is_some_and(|(_, _, phase)| {
-                        *phase == SearchOutputPhase::Initial
-                    })
+                    && self
+                        .physical
+                        .as_ref()
+                        .is_some_and(|(_, _, phase)| *phase == SearchOutputPhase::Initial)
             }
         };
         if !valid_phase || frame.generation_id.is_empty() || frame.manifest_sha256.is_empty() {
-            return Err(invalid("live-search phase does not follow its physical generation"));
+            return Err(invalid(
+                "live-search phase does not follow its physical generation",
+            ));
         }
         if frame.annotations.get("query").and_then(Value::as_str) != Some(self.query.as_str())
             || frame.annotations.get("phase")
                 != Some(&serde_json::to_value(frame.phase).map_err(invalid_json)?)
         {
-            return Err(invalid("hybrid phase annotations contradict their query or phase"));
+            return Err(invalid(
+                "hybrid phase annotations contradict their query or phase",
+            ));
         }
         match (frame.phase, frame.update) {
             (SearchOutputPhase::RefinementFailed, None) => {
@@ -103,10 +108,13 @@ impl Model {
             }
             (SearchOutputPhase::Initial | SearchOutputPhase::Refined, Some(update)) => {
                 let revision = format!(
-                    "{}@{}:{}", frame.generation_id, frame.manifest_sha256, frame.phase,
+                    "{}@{}:{}",
+                    frame.generation_id, frame.manifest_sha256, frame.phase,
                 );
                 if update.generation != revision {
-                    return Err(invalid("hybrid result revision does not bind its receipt and phase"));
+                    return Err(invalid(
+                        "hybrid result revision does not bind its receipt and phase",
+                    ));
                 }
                 self.apply_update(update)?;
             }
@@ -126,12 +134,19 @@ impl Model {
             || frame.generation.is_empty()
             || self.revision.as_ref() == Some(&frame.generation)
         {
-            return Err(invalid("live-search revision chain is missing or out of order"));
+            return Err(invalid(
+                "live-search revision chain is missing or out of order",
+            ));
         }
         if frame.result_count > self.max_results {
-            return Err(invalid("live-search result count exceeds the requested window"));
+            return Err(invalid(
+                "live-search result count exceeds the requested window",
+            ));
         }
-        let selected_id = self.results.get(self.selected).map(|result| result.hit.doc_id.clone());
+        let selected_id = self
+            .results
+            .get(self.selected)
+            .map(|result| result.hit.doc_id.clone());
         let by_id: BTreeMap<String, RankedLiveSearchHit<Value>> = match frame.event {
             LiveSearchEvent::Snapshot { results } if self.sequence == 0 => {
                 if results.len() > self.max_results {
@@ -147,10 +162,16 @@ impl Model {
             }
             LiveSearchEvent::Delta { changes } if self.sequence != 0 => {
                 if changes.len() > self.max_results.saturating_mul(2) {
-                    return Err(invalid("live-search delta exceeds the bounded result window"));
+                    return Err(invalid(
+                        "live-search delta exceeds the bounded result window",
+                    ));
                 }
-                let mut by_id: BTreeMap<_, _> = self.results.iter().cloned()
-                    .map(|result| (result.hit.doc_id.clone(), result)).collect();
+                let mut by_id: BTreeMap<_, _> = self
+                    .results
+                    .iter()
+                    .cloned()
+                    .map(|result| (result.hit.doc_id.clone(), result))
+                    .collect();
                 let mut touched = BTreeSet::new();
                 for change in changes {
                     let id = match &change {
@@ -164,17 +185,35 @@ impl Model {
                     match change {
                         LiveSearchChange::Added { result } => {
                             if by_id.insert(result.hit.doc_id.clone(), result).is_some() {
-                                return Err(invalid("live-search addition replaces an existing identity"));
+                                return Err(invalid(
+                                    "live-search addition replaces an existing identity",
+                                ));
                             }
                         }
-                        LiveSearchChange::Removed { doc_id, previous_rank } => {
-                            if by_id.remove(&doc_id).is_none_or(|old| old.rank != previous_rank) {
-                                return Err(invalid("live-search removal does not match its baseline"));
+                        LiveSearchChange::Removed {
+                            doc_id,
+                            previous_rank,
+                        } => {
+                            if by_id
+                                .remove(&doc_id)
+                                .is_none_or(|old| old.rank != previous_rank)
+                            {
+                                return Err(invalid(
+                                    "live-search removal does not match its baseline",
+                                ));
                             }
                         }
-                        LiveSearchChange::Updated { previous_rank, result } => {
-                            if by_id.get(&result.hit.doc_id).is_none_or(|old| old.rank != previous_rank) {
-                                return Err(invalid("live-search update does not match its baseline"));
+                        LiveSearchChange::Updated {
+                            previous_rank,
+                            result,
+                        } => {
+                            if by_id
+                                .get(&result.hit.doc_id)
+                                .is_none_or(|old| old.rank != previous_rank)
+                            {
+                                return Err(invalid(
+                                    "live-search update does not match its baseline",
+                                ));
                             }
                             by_id.insert(result.hit.doc_id.clone(), result);
                         }
@@ -185,24 +224,30 @@ impl Model {
             _ => return Err(invalid("expected a first snapshot followed only by deltas")),
         };
         if by_id.len() != frame.result_count {
-            return Err(invalid("live-search result count does not match the complete delta"));
+            return Err(invalid(
+                "live-search result count does not match the complete delta",
+            ));
         }
         // Apply the whole delta before checking ranks: a rank swap necessarily
         // has transient collisions while its individual changes are processed.
         let mut results = by_id.into_values().collect::<Vec<_>>();
         results.sort_by_key(|result| result.rank);
         for (offset, result) in results.iter().enumerate() {
-            if result.hit.doc_id.is_empty() || !result.hit.score.is_finite()
+            if result.hit.doc_id.is_empty()
+                || !result.hit.score.is_finite()
                 || u64::try_from(offset + 1).ok() != Some(result.rank)
             {
-                return Err(invalid("live-search identities, scores or ranks are invalid"));
+                return Err(invalid(
+                    "live-search identities, scores or ranks are invalid",
+                ));
             }
         }
         // A sequence of individually small deltas must not accumulate an
         // unbounded retained window. Count serialization without allocating it.
         let mut bound = WindowBytes(super::MAX_FRAME_BYTES);
         serde_json::to_writer(&mut bound, &results).map_err(invalid_json)?;
-        self.selected = selected_id.as_ref()
+        self.selected = selected_id
+            .as_ref()
             .and_then(|id| results.iter().position(|result| &result.hit.doc_id == id))
             .unwrap_or_else(|| self.selected.min(results.len().saturating_sub(1)));
         self.results = results;
@@ -212,7 +257,9 @@ impl Model {
     }
 
     pub fn move_by(&mut self, distance: isize) {
-        self.selected = self.selected.saturating_add_signed(distance)
+        self.selected = self
+            .selected
+            .saturating_add_signed(distance)
             .min(self.results.len().saturating_sub(1));
     }
 
@@ -226,9 +273,18 @@ impl Model {
             Some(SearchOutputPhase::Refined) => "Refined",
             Some(SearchOutputPhase::RefinementFailed) => "Refinement failed; Initial retained",
         };
-        let reason = self.annotations.get("skip_reason").and_then(Value::as_str)
-            .map_or_else(String::new, |reason| format!(" | {}", display_text(reason, 100)));
-        format!("{phase} | {} results | revision {}{reason}", self.results.len(), self.sequence)
+        let reason = self
+            .annotations
+            .get("skip_reason")
+            .and_then(Value::as_str)
+            .map_or_else(String::new, |reason| {
+                format!(" | {}", display_text(reason, 100))
+            });
+        format!(
+            "{phase} | {} results | revision {}{reason}",
+            self.results.len(),
+            self.sequence
+        )
     }
 }
 
@@ -236,7 +292,9 @@ struct WindowBytes(usize);
 
 impl Write for WindowBytes {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.checked_sub(bytes.len())
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
             .ok_or_else(|| invalid("terminal result window exceeds its byte bound"))?;
         Ok(bytes.len())
     }
@@ -274,11 +332,22 @@ mod tests {
     use super::*;
 
     fn hit(id: &str, score: f64) -> LiveSearchHit<Value> {
-        LiveSearchHit { doc_id: id.to_owned(), score, item: json!({"path": id, "snippet": "alpha"}) }
+        LiveSearchHit {
+            doc_id: id.to_owned(),
+            score,
+            item: json!({"path": id, "snippet": "alpha"}),
+        }
     }
 
     fn tracker() -> LiveSearchTracker<Value> {
-        LiveSearchTracker::new("alpha", LiveSearchConfig { max_results: 3, min_score_delta: 0.0 }).unwrap()
+        LiveSearchTracker::new(
+            "alpha",
+            LiveSearchConfig {
+                max_results: 3,
+                min_score_delta: 0.0,
+            },
+        )
+        .unwrap()
     }
 
     fn bytes(frame: &LiveSearchFrame<Value>) -> Vec<u8> {
@@ -289,8 +358,13 @@ mod tests {
 
     fn fixture() -> (Model, LiveSearchTracker<Value>) {
         let mut tracker = tracker();
-        let frame = tracker.apply("g1", vec![hit("a", 3.0), hit("b", 2.0), hit("c", 1.0)]).unwrap().unwrap();
-        let model = Model::new("alpha".to_owned(), false, 3).prepare(&bytes(&frame)).unwrap();
+        let frame = tracker
+            .apply("g1", vec![hit("a", 3.0), hit("b", 2.0), hit("c", 1.0)])
+            .unwrap()
+            .unwrap();
+        let model = Model::new("alpha".to_owned(), false, 3)
+            .prepare(&bytes(&frame))
+            .unwrap();
         (model, tracker)
     }
 
@@ -298,19 +372,34 @@ mod tests {
     fn snapshots_and_atomic_rank_swaps_keep_the_selected_identity() {
         let (mut model, mut tracker) = fixture();
         model.selected = 1;
-        let frame = tracker.apply("g2", vec![hit("b", 5.0), hit("a", 3.0), hit("c", 1.0)]).unwrap().unwrap();
+        let frame = tracker
+            .apply("g2", vec![hit("b", 5.0), hit("a", 3.0), hit("c", 1.0)])
+            .unwrap()
+            .unwrap();
         let next = model.prepare(&bytes(&frame)).unwrap();
         assert_eq!(next.selected, 0);
         assert_eq!(next.results[next.selected].hit.doc_id, "b");
-        assert_eq!(next.results.iter().map(|result| result.rank).collect::<Vec<_>>(), [1, 2, 3]);
-        assert_eq!(model.sequence, 1, "preparing must not acknowledge the old display");
+        assert_eq!(
+            next.results
+                .iter()
+                .map(|result| result.rank)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            model.sequence, 1,
+            "preparing must not acknowledge the old display"
+        );
     }
 
     #[test]
     fn removing_selection_uses_a_remaining_rank_and_an_empty_window_is_not_waiting() {
         let (mut model, mut tracker) = fixture();
         model.selected = 2;
-        let frame = tracker.apply("g2", vec![hit("a", 3.0), hit("b", 2.0)]).unwrap().unwrap();
+        let frame = tracker
+            .apply("g2", vec![hit("a", 3.0), hit("b", 2.0)])
+            .unwrap()
+            .unwrap();
         let model = model.prepare(&bytes(&frame)).unwrap();
         assert_eq!(model.selected, 1);
         let frame = tracker.apply("g3", Vec::new()).unwrap().unwrap();
@@ -318,7 +407,11 @@ mod tests {
         assert!(model.results.is_empty());
         assert_eq!(model.selected, 0);
         assert!(!model.status().contains("Waiting"));
-        assert!(Model::new("alpha".to_owned(), false, 3).status().contains("Waiting"));
+        assert!(
+            Model::new("alpha".to_owned(), false, 3)
+                .status()
+                .contains("Waiting")
+        );
     }
 
     #[test]
@@ -350,32 +443,49 @@ mod tests {
             assert_eq!(model.results[1].hit.doc_id, "b");
         }
         let next = model.prepare(&bytes(&frame)).unwrap();
-        assert!(next.prepare(&bytes(&frame)).is_err(), "replay cannot double-apply a delta");
+        assert!(
+            next.prepare(&bytes(&frame)).is_err(),
+            "replay cannot double-apply a delta"
+        );
     }
 
     #[test]
     fn malformed_delta_identities_ranks_and_counts_are_refused_atomically() {
         let (model, mut tracker) = fixture();
-        let frame = tracker.apply("g2", vec![hit("b", 5.0), hit("a", 3.0)]).unwrap().unwrap();
+        let frame = tracker
+            .apply("g2", vec![hit("b", 5.0), hit("a", 3.0)])
+            .unwrap()
+            .unwrap();
         for defect in 0..5 {
             let mut bad = frame.clone();
-            let LiveSearchEvent::Delta { changes } = &mut bad.event else { panic!("delta"); };
+            let LiveSearchEvent::Delta { changes } = &mut bad.event else {
+                panic!("delta");
+            };
             match defect {
                 0 => changes.push(changes[0].clone()),
                 1 => bad.result_count = 3,
-                2 => changes.push(LiveSearchChange::Removed { doc_id: "missing".into(), previous_rank: 1 }),
+                2 => changes.push(LiveSearchChange::Removed {
+                    doc_id: "missing".into(),
+                    previous_rank: 1,
+                }),
                 3 => {
-                    let update = changes.iter_mut().find_map(|change| match change {
-                        LiveSearchChange::Updated { result, .. } => Some(result),
-                        _ => None,
-                    }).unwrap();
+                    let update = changes
+                        .iter_mut()
+                        .find_map(|change| match change {
+                            LiveSearchChange::Updated { result, .. } => Some(result),
+                            _ => None,
+                        })
+                        .unwrap();
                     update.rank = 99;
                 }
                 _ => {
-                    let previous = changes.iter_mut().find_map(|change| match change {
-                        LiveSearchChange::Updated { previous_rank, .. } => Some(previous_rank),
-                        _ => None,
-                    }).unwrap();
+                    let previous = changes
+                        .iter_mut()
+                        .find_map(|change| match change {
+                            LiveSearchChange::Updated { previous_rank, .. } => Some(previous_rank),
+                            _ => None,
+                        })
+                        .unwrap();
                     *previous = 99;
                 }
             }
@@ -398,16 +508,27 @@ mod tests {
         let mut combined = bytes(&frame);
         combined.extend_from_slice(&bytes(&frame));
         assert!(original.prepare(&combined).is_err());
-        assert!(original.prepare(&serde_json::to_vec(&frame).unwrap()).is_err());
+        assert!(
+            original
+                .prepare(&serde_json::to_vec(&frame).unwrap())
+                .is_err()
+        );
     }
 
     #[test]
     fn score_thresholds_preserve_the_published_scores_in_empty_deltas() {
-        let mut tracker = LiveSearchTracker::new("alpha", LiveSearchConfig {
-            max_results: 3, min_score_delta: 0.1,
-        }).unwrap();
+        let mut tracker = LiveSearchTracker::new(
+            "alpha",
+            LiveSearchConfig {
+                max_results: 3,
+                min_score_delta: 0.1,
+            },
+        )
+        .unwrap();
         let first = tracker.apply("g1", vec![hit("a", 1.0)]).unwrap().unwrap();
-        let model = Model::new("alpha".into(), false, 3).prepare(&bytes(&first)).unwrap();
+        let model = Model::new("alpha".into(), false, 3)
+            .prepare(&bytes(&first))
+            .unwrap();
         let small = tracker.apply("g2", vec![hit("a", 1.05)]).unwrap().unwrap();
         let model = model.prepare(&bytes(&small)).unwrap();
         assert_eq!(model.results[0].hit.score.to_bits(), 1.0_f64.to_bits());
@@ -424,10 +545,14 @@ mod tests {
         let update = if phase == SearchOutputPhase::RefinementFailed {
             None
         } else {
-            tracker.apply(&format!("generation@digest:{phase}"), hits).unwrap()
+            tracker
+                .apply(&format!("generation@digest:{phase}"), hits)
+                .unwrap()
         };
         let frame = RetainedLiveSearchFrame {
-            generation_id: "generation".into(), manifest_sha256: "digest".into(), phase,
+            generation_id: "generation".into(),
+            manifest_sha256: "digest".into(),
+            phase,
             annotations: json!({"query": "alpha", "phase": phase, "skip_reason": "quality_timeout"}),
             update,
         };
@@ -441,10 +566,20 @@ mod tests {
     #[test]
     fn hybrid_refinement_updates_the_same_window_and_checks_its_receipt() {
         let mut tracker = tracker();
-        let initial = hybrid_bytes(&mut tracker, SearchOutputPhase::Initial, vec![hit("a", 0.1), hit("b", 0.05)]);
-        let mut model = Model::new("alpha".into(), true, 3).prepare(&initial).unwrap();
+        let initial = hybrid_bytes(
+            &mut tracker,
+            SearchOutputPhase::Initial,
+            vec![hit("a", 0.1), hit("b", 0.05)],
+        );
+        let mut model = Model::new("alpha".into(), true, 3)
+            .prepare(&initial)
+            .unwrap();
         model.selected = 1;
-        let refined = hybrid_bytes(&mut tracker, SearchOutputPhase::Refined, vec![hit("b", 0.9), hit("a", 0.1)]);
+        let refined = hybrid_bytes(
+            &mut tracker,
+            SearchOutputPhase::Refined,
+            vec![hit("b", 0.9), hit("a", 0.1)],
+        );
         let next = model.prepare(&refined).unwrap();
         assert_eq!(next.selected, 0);
         assert_eq!(next.sequence, 2);
@@ -459,9 +594,19 @@ mod tests {
     #[test]
     fn refinement_failure_preserves_initial_without_fabricating_removals() {
         let mut tracker = tracker();
-        let initial = hybrid_bytes(&mut tracker, SearchOutputPhase::Initial, vec![hit("a", 0.1)]);
-        let model = Model::new("alpha".into(), true, 3).prepare(&initial).unwrap();
-        let failed = hybrid_bytes(&mut tracker, SearchOutputPhase::RefinementFailed, Vec::new());
+        let initial = hybrid_bytes(
+            &mut tracker,
+            SearchOutputPhase::Initial,
+            vec![hit("a", 0.1)],
+        );
+        let model = Model::new("alpha".into(), true, 3)
+            .prepare(&initial)
+            .unwrap();
+        let failed = hybrid_bytes(
+            &mut tracker,
+            SearchOutputPhase::RefinementFailed,
+            Vec::new(),
+        );
         let next = model.prepare(&failed).unwrap();
         assert_eq!(next.results, model.results);
         assert_eq!(next.sequence, model.sequence);
@@ -469,7 +614,11 @@ mod tests {
         assert!(next.status().contains("Initial retained"));
         assert!(next.status().contains("quality_timeout"));
         assert!(next.prepare(&failed).is_err());
-        assert!(Model::new("alpha".into(), true, 3).prepare(&failed).is_err());
+        assert!(
+            Model::new("alpha".into(), true, 3)
+                .prepare(&failed)
+                .is_err()
+        );
     }
 
     #[test]

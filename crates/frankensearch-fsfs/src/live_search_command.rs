@@ -457,7 +457,7 @@ fn run(options: Options) -> SearchResult<u64> {
         let scope = request_shutdown.cancellation_scope(&cx);
         if options.tui {
             #[cfg(unix)]
-            return terminal::execute(&scope, &options, app_runtime).await;
+            return Box::pin(terminal::execute(&scope, &options, app_runtime)).await;
             #[cfg(not(unix))]
             return Err(invalid("--tui requires the Unix terminal backend"));
         }
