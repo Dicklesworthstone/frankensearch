@@ -43,6 +43,9 @@
 #              binary) when the registered models are present; otherwise a typed SKIP that
 #              still fails the gate unless QUALITY_GATE_ALLOW_MODEL_SKIP=1
 #   quickstart scripts/check_fsfs_executable_quickstart.sh against the freshly built binary
+#   lite       the model-free `--no-default-features` binary (every musl and Intel macOS
+#              release asset) indexes and searches lexically from a pristine home; it
+#              shipped through 1.12.1 able to do neither (bd-636yz)
 #
 # Environment:
 #   QUALITY_GATE_STAGES        comma list to run (default: stock stages plus quill;
@@ -67,11 +70,11 @@ unset RCH_REQUIRE_REMOTE || true
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
 MODEL_DIR="${QUALITY_GATE_MODEL_DIR:-$HOME/.local/share/frankensearch/models}"
-STAGES="${QUALITY_GATE_STAGES:-fmt,check,clippy,cross,tests,quill,fsfs,facade,e2e,quickstart}"
+STAGES="${QUALITY_GATE_STAGES:-fmt,check,clippy,cross,tests,quill,fsfs,facade,e2e,quickstart,lite}"
 IFS=',' read -ra selected_stages <<< "$STAGES"
 for stage in "${selected_stages[@]}"; do
   case "$stage" in
-    fmt|check|clippy|cross|tests|quill|quill-full|quill-probes|fsfs|facade|examples|perf|e2e|quickstart) ;;
+    fmt|check|clippy|cross|tests|quill|quill-full|quill-probes|fsfs|facade|examples|perf|e2e|quickstart|lite) ;;
     *) printf '[quality-gate] FAIL unknown stage: %s\n' "$stage" >&2; exit 2 ;;
   esac
 done
@@ -200,6 +203,39 @@ fi
 
 if want quickstart; then
   run_stage quickstart env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" scripts/check_fsfs_executable_quickstart.sh --negative-probes --require-source --keep-artifacts
+fi
+
+# Last: its --no-default-features build relinks target/debug/fsfs, which the stages
+# above build with the default features.
+lite_smoke() {
+  local work target out
+  target="${CARGO_TARGET_DIR:-$REPO_ROOT/target}"
+  cargo build --locked -p frankensearch-fsfs --no-default-features --bin fsfs || return 1
+  work="$(mktemp -d "$TMPDIR/fsfs-lite-gate.XXXXXX")" || return 1
+  mkdir -p "$work/home" "$work/rt" "$work/proj/src"
+  cp "$target/debug/fsfs" "$work/fsfs"
+  printf 'pub fn quokka_marker() -> u8 { 7 }\n' >"$work/proj/src/lib.rs"
+  printf 'Wombat notes about nothing in particular.\n' >"$work/proj/README.md"
+  if ! out="$(cd "$work/proj" && env -i HOME="$work/home" PATH=/usr/bin:/bin TMPDIR="$TMPDIR" \
+      XDG_RUNTIME_DIR="$work/rt" "$work/fsfs" index . --format json 2>&1)" \
+    || ! printf '%s' "$out" | python3 -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+sys.exit(not (d["generation_complete"] and d["indexed_files"] == 2 and d["vector_generation"] is None))'; then
+    printf 'lite index failed:\n%s\n' "$out"
+    return 1
+  fi
+  if ! out="$(cd "$work/proj" && env -i HOME="$work/home" PATH=/usr/bin:/bin TMPDIR="$TMPDIR" \
+      XDG_RUNTIME_DIR="$work/rt" "$work/fsfs" search quokka --no-daemon --format json 2>&1)" \
+    || ! printf '%s' "$out" | python3 -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+sys.exit(not (d["skip_reason"] == "lexical_only" and d["hits"] and d["hits"][0]["path"] == "src/lib.rs"))'; then
+    printf 'lite search failed:\n%s\n' "$out"
+    return 1
+  fi
+  rm -rf "$work"
+}
+if want lite; then
+  run_stage lite lite_smoke
 fi
 
 echo "[quality-gate] finished=$(date -u +%FT%TZ) failures=${#failures[@]}"

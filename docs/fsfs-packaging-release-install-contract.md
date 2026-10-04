@@ -179,6 +179,14 @@ For a `v<version>` binary release tag, every declared full target MUST publish:
 
 `<ext>` is `tar.xz` for Linux and macOS, and `zip` for Windows.
 
+The `x86_64-unknown-linux-gnu` full binary MUST be built with
+`scripts/build_fsfs_gnu_full_release.sh`, which compiles inside Ubuntu 24.04
+and refuses a binary needing any glibc symbol newer than 2.39. A binary linked
+on the release host inherits that host's glibc (2.43 for v1.10.0 and v1.12.1),
+which the default installer route then offers to every glibc host. The
+bundled ONNX Runtime archive needs glibc 2.38, so no older floor is possible
+without rebuilding it (#62). Metadata SHOULD record `minimum_glibc`.
+
 Every lite target MUST instead publish:
 
 - archive: `fsfs-lite-<version>-<target>.tar.xz`

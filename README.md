@@ -40,13 +40,18 @@ missing or malformed checksum, unavailable SHA-256 tool, or mismatch is a hard
 failure. If the platform has no full semantic release artifact, the ordinary
 path builds the loader-capable default from source; it never silently installs
 the model-free lite profile. Use `--lite` only when that reduced capability is
-intentional. Intel macOS is the explicit exception: the pinned ONNX Runtime has
-no supported x86_64 Darwin distribution, so ordinary semantic installation
-fails with `unsupported_platform` and points to `--lite` instead of attempting
-a source build that cannot succeed.
+intentional: lite indexes and searches by keyword only, and its `watch`,
+`delete`, `append-batch` and `compact` commands need a standard build (rerun
+`fsfs index` to refresh a lite index). Intel macOS is the explicit exception:
+the pinned ONNX Runtime has no supported x86_64 Darwin distribution, so
+ordinary semantic installation fails with `unsupported_platform` and points to
+`--lite` instead of attempting a source build that cannot succeed.
 
-The Linux x86-64 full archive requires glibc 2.43 or newer; build from source on
-older glibc systems for full semantic search. The standard installer
+The fsfs 1.12.1 Linux x86-64 full archive requires glibc 2.43 or newer.
+Releases built with `scripts/build_fsfs_gnu_full_release.sh` (inside Ubuntu
+24.04) require glibc 2.39. A source build works from glibc 2.38, the floor of
+the bundled ONNX Runtime archive; older systems have no semantic build yet
+([#62](https://github.com/Dicklesworthstone/frankensearch/issues/62)). The standard installer
 provisions and verifies the two default search models, Potion and MiniLM,
 requiring roughly 621 MB. Install optional models separately with
 `fsfs download-models MODEL`. Offline installation requires the default pair

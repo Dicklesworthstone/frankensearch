@@ -504,6 +504,14 @@ const REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE: &str =
     "vector.quality_tier.skipped.model_unavailable";
 const REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED: &str =
     "vector.quality_tier.abandoned.embedding_failed";
+/// A lexical-only generation (a build without semantic loaders) has neither
+/// vector tier; both reason codes are recorded on it.
+const REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY: &str =
+    "vector.quality_tier.skipped.lexical_only";
+const REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY: &str = "vector.fast_tier.skipped.lexical_only";
+/// Checkpoint embedder identity of a lexical-only generation, which embeds
+/// nothing. No embedder reports this id, so no vector reuse can match it.
+const LEXICAL_ONLY_GENERATION_EMBEDDER_ID: &str = "fsfs-lexical-only";
 const FSFS_EXPLAIN_SESSION_FILE: &str = "explain/last_search_session.json";
 const FSFS_FLUSH_REQUEST_FILE: &str = ".fsfs-flush-request.json";
 const FSFS_FLUSH_ACK_FILE: &str = ".fsfs-flush-ack.json";
@@ -852,7 +860,8 @@ impl SearchExecutionMode {
 /// `pressure.degradation_override` applied to a search, per the stage
 /// contracts in `pressure.rs`: lexical-only drops the semantic lanes, and
 /// metadata-only or paused refuse search. `auto`, `full` and `embed_deferred`
-/// keep the requested mode (their query contract is hybrid).
+/// keep the requested mode (their query contract is hybrid), except in a build
+/// without semantic loaders, whose only mode is lexical-only.
 fn degraded_search_mode(
     override_mode: crate::config::DegradationOverrideMode,
     requested: SearchExecutionMode,
@@ -865,7 +874,23 @@ fn degraded_search_mode(
         }
         DegradationOverrideMode::Auto
         | DegradationOverrideMode::ForceFull
-        | DegradationOverrideMode::ForceEmbedDeferred => Ok(requested),
+        | DegradationOverrideMode::ForceEmbedDeferred => Ok(build_search_mode(requested)),
+    }
+}
+
+/// Whether this binary can embed at all. The model-free lite build
+/// (`--no-default-features`) has no `Model2Vec` or `FastEmbed` loader, so it
+/// indexes and searches lexically by design: its generations carry no vector
+/// tiers, and every search runs in its one declared mode, lexical-only.
+const SEMANTIC_LOADERS_COMPILED: bool = cfg!(feature = "semantic-support");
+
+/// The search mode this build can serve for `requested` (see
+/// [`SEMANTIC_LOADERS_COMPILED`]).
+const fn build_search_mode(requested: SearchExecutionMode) -> SearchExecutionMode {
+    if SEMANTIC_LOADERS_COMPILED {
+        requested
+    } else {
+        SearchExecutionMode::LexicalOnly
     }
 }
 
@@ -2022,7 +2047,8 @@ struct FsfsIndexPayload {
     semantic_deferred_files: usize,
     embedding_retries: usize,
     embedding_failures: usize,
-    vector_generation: PublishedVectorGeneration,
+    /// Absent for a lexical-only generation, which has no vector tiers.
+    vector_generation: Option<PublishedVectorGeneration>,
     quality_generation: Option<PublishedVectorGeneration>,
     /// Union coverage of completed fast-window sources, without double
     /// counting overlap. A complete generation can intentionally cap a file.
@@ -2043,7 +2069,11 @@ impl FsfsIndexPayload {
         writer: &mut W,
     ) -> SearchResult<()> {
         let mut warnings = Vec::new();
-        if self.vector_generation.is_hash_control {
+        if self
+            .vector_generation
+            .as_ref()
+            .is_some_and(|generation| generation.is_hash_control)
+        {
             warnings.push(OutputWarning::new(
                 OutputWarningCode::HASH_FALLBACK,
                 "A legacy hash control generation was detected; semantic results were not admitted. Rebuild with a verified semantic embedder.",
@@ -5601,6 +5631,9 @@ pub struct FsfsRuntime {
     bundled_model_materializer: Option<PathBuf>,
     /// What complete-generation commands do with superseded generations.
     generation_retention: crate::generation_store::GenerationRetention,
+    /// Build generations with the lexical arm only: no embedder, no vector
+    /// tiers. Always set in a build without semantic loaders (bd-636yz).
+    lexical_only_indexing: bool,
 }
 
 /// Private CLI entry point used to extract embedded weights in a short-lived process.
@@ -5624,7 +5657,16 @@ impl FsfsRuntime {
             #[cfg(feature = "embedded-models")]
             bundled_model_materializer: None,
             generation_retention: crate::generation_store::GenerationRetention::default(),
+            lexical_only_indexing: !SEMANTIC_LOADERS_COMPILED,
         }
+    }
+
+    /// Index as a build without semantic loaders does, in a build that has them.
+    #[cfg(test)]
+    #[must_use]
+    const fn with_lexical_only_indexing(mut self) -> Self {
+        self.lexical_only_indexing = true;
+        self
     }
 
     /// Choose what complete-generation commands do with superseded
@@ -13213,6 +13255,12 @@ impl FsfsRuntime {
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
         if !vector_path.exists() {
+            if Self::is_lexical_only_generation(&index_root) {
+                return Err(Self::lexical_only_generation_refusal(
+                    &index_root,
+                    "append-batch",
+                ));
+            }
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
         // Complete input validation before taking publication ownership or
@@ -13669,6 +13717,9 @@ impl FsfsRuntime {
         }
 
         if !vector_path.exists() {
+            if Self::is_lexical_only_generation(&index_root) {
+                return Err(Self::lexical_only_generation_refusal(&index_root, "delete"));
+            }
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
@@ -13879,6 +13930,9 @@ impl FsfsRuntime {
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
         if !vector_path.exists() {
+            if Self::is_lexical_only_generation(&index_root) {
+                return Err(Self::lexical_only_generation_refusal(&index_root, "compact"));
+            }
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
@@ -14568,10 +14622,30 @@ impl FsfsRuntime {
 
         checks.push(Self::collect_lexical_engine_doctor_check(&index_root)?);
         checks.push(self.collect_shadow_oracle_doctor_check(&index_root)?);
-        checks.push(Self::collect_zero_signal_doctor_check(&index_root));
-        checks.push(Self::collect_vector_generation_doctor_check(&index_root));
-        checks.push(Self::collect_quality_generation_doctor_check(&index_root));
-        checks.push(Self::collect_vector_durability_doctor_check(&index_root));
+        if SEMANTIC_LOADERS_COMPILED {
+            checks.push(Self::collect_zero_signal_doctor_check(&index_root));
+            checks.push(Self::collect_vector_generation_doctor_check(&index_root));
+            checks.push(Self::collect_quality_generation_doctor_check(&index_root));
+            checks.push(Self::collect_vector_durability_doctor_check(&index_root));
+        } else {
+            // "Run fsfs index to build the semantic index" cannot help a build
+            // without semantic loaders: its generations are lexical-only.
+            for name in [
+                "semantic.zero_signal",
+                "semantic.vector_generation",
+                "semantic.quality_generation",
+                "durability.vector_sidecars",
+            ] {
+                checks.push(DoctorCheck {
+                    name: name.to_owned(),
+                    verdict: DoctorVerdict::Pass,
+                    detail: "not applicable: this lite build has no semantic loaders, so its \
+                             generations are lexical-only"
+                        .to_owned(),
+                    suggestion: None,
+                });
+            }
+        }
 
         // 5. Index directory permissions, without mutating the live index.
         if index_root.exists() {
@@ -16607,6 +16681,18 @@ impl FsfsRuntime {
 
         candidates.sort_by(|left, right| left.file_key.cmp(&right.file_key));
 
+        // A lexical-only generation indexes every embeddable file through the
+        // lexical arm alone and resolves no embedder: a build without semantic
+        // loaders has none to resolve (bd-636yz).
+        let lexical_only = self.lexical_only_indexing;
+        if lexical_only {
+            for candidate in &mut candidates {
+                if candidate.ingestion_class == IngestionClass::FullSemanticLexical {
+                    candidate.ingestion_class = IngestionClass::LexicalOnly;
+                }
+            }
+        }
+
         // 1. Resolve and prove the real semantic embedder before creating any
         // vector/cache artifacts. Test builds may retain their explicit hash
         // control fixture, but no production indexing path admits it.
@@ -16615,19 +16701,32 @@ impl FsfsRuntime {
         // prompt to provision missing registered models; every other lane
         // (offline, non-TTY, machine formats, declined) falls through to the
         // existing typed readiness error with its `fsfs download-models` argv.
-        control.checkpoint(cx, "index.model_provisioning", true)?;
-        self.maybe_offer_interactive_model_provisioning(cx).await?;
-        control.checkpoint(cx, "index.fast_model_load", true)?;
-        let embedder = self.resolve_fast_embedder()?;
-        control.checkpoint(cx, "index.fast_model_loaded", true)?;
-        Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
-        Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+        let embedder = if lexical_only {
+            None
+        } else {
+            control.checkpoint(cx, "index.model_provisioning", true)?;
+            self.maybe_offer_interactive_model_provisioning(cx).await?;
+            control.checkpoint(cx, "index.fast_model_load", true)?;
+            let embedder = self.resolve_fast_embedder()?;
+            control.checkpoint(cx, "index.fast_model_loaded", true)?;
+            Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
+            Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
+            Some(embedder)
+        };
+        let (embedder_id, embedder_dimension) = embedder.as_ref().map_or_else(
+            || (LEXICAL_ONLY_GENERATION_EMBEDDER_ID.to_owned(), 0),
+            |embedder| (embedder.id().to_owned(), embedder.dimension()),
+        );
 
         // 1b. The quality tier. Built from the same document set as the fast
         // tier whenever the configuration allows a quality stage and a
         // verified quality model is present; otherwise the reason is recorded
         // on the generation and search serves INITIAL only.
-        let (quality_embedder, mut quality_tier_reason) = self.resolve_indexing_quality_embedder();
+        let (quality_embedder, mut quality_tier_reason) = if lexical_only {
+            (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY)
+        } else {
+            self.resolve_indexing_quality_embedder()
+        };
         control.checkpoint(cx, "index.quality_model_loaded", true)?;
         if let Some(quality_embedder) = quality_embedder.as_ref() {
             Self::probe_indexing_embedder(cx, quality_embedder.as_ref()).await?;
@@ -16635,7 +16734,10 @@ impl FsfsRuntime {
         // Each generation is stamped with its producer's identity; every
         // vector stored in it must come from a response bound to that same
         // identity, so capture it once and hold each batch to it.
-        let fast_admission = AdmittedEmbedder::admit(Arc::clone(&embedder))?;
+        let fast_admission = embedder
+            .as_ref()
+            .map(|embedder| AdmittedEmbedder::admit(Arc::clone(embedder)))
+            .transpose()?;
         let quality_admission = quality_embedder
             .as_ref()
             .map(|embedder| AdmittedEmbedder::admit(Arc::clone(embedder)))
@@ -16741,8 +16843,8 @@ impl FsfsRuntime {
                 index_root: index_root_label.clone(),
                 started_at_ms: checkpoint_started_at,
                 updated_at_ms: pressure_timestamp_ms(),
-                embedder_id: embedder.id().to_owned(),
-                embedder_dimension: embedder.dimension(),
+                embedder_id: embedder_id.clone(),
+                embedder_dimension,
                 embedder_is_hash_fallback: false,
                 artifacts_durable: false,
                 source_hash_hex: existing_checkpoint
@@ -16761,61 +16863,71 @@ impl FsfsRuntime {
         )?;
 
         let mut vector_generation_compatible = false;
-        let embedder_revision = fast_admission.identity.fingerprint();
-        let mut vector_index = if checkpoint_manifests.is_some() && vector_path.exists() {
-            // Reuse mutates the checkpoint generations in place. A warm query
-            // daemon from any earlier `fsfs search` holds them under the
-            // reader side of the map lock, which refused this open and
-            // rebuilt both tiers from scratch (bd-jm1dx).
-            #[cfg(unix)]
-            self.quiesce_query_daemon("index")?;
-            match Self::open_vector_index_for_mutation(&vector_path) {
-                Ok(index)
-                    if vector_checkpoint_reusable(
-                        &index,
+        let mut vector_index = if let Some(fast_admission) = fast_admission.as_ref() {
+            let embedder = fast_admission.embedder();
+            let embedder_revision = fast_admission.identity.fingerprint();
+            let reused = if checkpoint_manifests.is_some() && vector_path.exists() {
+                // Reuse mutates the checkpoint generations in place. A warm query
+                // daemon from any earlier `fsfs search` holds them under the
+                // reader side of the map lock, which refused this open and
+                // rebuilt both tiers from scratch (bd-jm1dx).
+                #[cfg(unix)]
+                self.quiesce_query_daemon("index")?;
+                match Self::open_vector_index_for_mutation(&vector_path) {
+                    Ok(index)
+                        if vector_checkpoint_reusable(
+                            &index,
+                            embedder.id(),
+                            &embedder_revision,
+                            embedder.dimension(),
+                        ) =>
+                    {
+                        vector_generation_compatible = true;
+                        Some(index)
+                    }
+                    Ok(index) => {
+                        warn!(
+                            stored_embedder_id = index.embedder_id(),
+                            active_embedder_id = embedder.id(),
+                            stored_revision = index.embedder_revision(),
+                            active_revision = %embedder_revision,
+                            stored_dimension = index.dimension(),
+                            active_dimension = embedder.dimension(),
+                            wal_records = index.wal_record_count(),
+                            "checkpoint FSVI does not match the active embedder identity; rebuilding vectors"
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        warn!(error = %error, "checkpoint FSVI is unavailable; rebuilding vectors");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            Some(match reused {
+                Some(index) => index,
+                None => {
+                    publication_lease.fence("one-shot vector generation replacement")?;
+                    VectorIndex::replace_with_empty(
+                        &vector_path,
                         embedder.id(),
                         &embedder_revision,
                         embedder.dimension(),
-                    ) =>
-                {
-                    vector_generation_compatible = true;
-                    Some(index)
+                    )?
                 }
-                Ok(index) => {
-                    warn!(
-                        stored_embedder_id = index.embedder_id(),
-                        active_embedder_id = embedder.id(),
-                        stored_revision = index.embedder_revision(),
-                        active_revision = %embedder_revision,
-                        stored_dimension = index.dimension(),
-                        active_dimension = embedder.dimension(),
-                        wal_records = index.wal_record_count(),
-                        "checkpoint FSVI does not match the active embedder identity; rebuilding vectors"
-                    );
-                    None
-                }
-                Err(error) => {
-                    warn!(error = %error, "checkpoint FSVI is unavailable; rebuilding vectors");
-                    None
-                }
-            }
+            })
         } else {
+            // A fast tier left by an earlier semantic build no longer
+            // describes this generation's documents.
+            publication_lease.fence("one-shot lexical-only vector generation retirement")?;
+            Self::retire_vector_generation(&vector_path, REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY)?;
             None
         };
-        if vector_index.is_none() {
-            publication_lease.fence("one-shot vector generation replacement")?;
-            vector_index = Some(VectorIndex::replace_with_empty(
-                &vector_path,
-                embedder.id(),
-                &embedder_revision,
-                embedder.dimension(),
-            )?);
-        }
-        let mut vector_index = vector_index.expect("vector index initialized above");
-        let initial_live_vector_ids = if vector_generation_compatible {
-            vector_live_doc_ids(&vector_index)?
-        } else {
-            HashSet::new()
+        let initial_live_vector_ids = match vector_index.as_ref() {
+            Some(index) if vector_generation_compatible => vector_live_doc_ids(index)?,
+            _ => HashSet::new(),
         };
 
         // Quality tier: reuse the checkpointed generation only under the same
@@ -16876,7 +16988,7 @@ impl FsfsRuntime {
             quality_vector_index = Some(index);
         } else if quality_vector_path.exists() {
             publication_lease.fence("one-shot stale quality generation retirement")?;
-            Self::retire_quality_generation(&quality_vector_path, quality_tier_reason)?;
+            Self::retire_vector_generation(&quality_vector_path, quality_tier_reason)?;
         }
 
         publication_lease.fence("one-shot lexical generation planning")?;
@@ -16958,8 +17070,8 @@ impl FsfsRuntime {
                     manifest,
                     candidate,
                     &content_hash_hex,
-                    embedder.id(),
-                    embedder.dimension(),
+                    &embedder_id,
+                    embedder_dimension,
                     false,
                     &initial_live_vector_ids,
                 );
@@ -16996,7 +17108,9 @@ impl FsfsRuntime {
             })
             .map(String::as_str)
             .collect::<Vec<_>>();
-        if !stale_vector_ids.is_empty() {
+        if let Some(vector_index) = vector_index.as_mut()
+            && !stale_vector_ids.is_empty()
+        {
             publication_lease.fence("one-shot stale vector tombstones")?;
             vector_index.soft_delete_batch(&stale_vector_ids)?;
         }
@@ -17059,8 +17173,8 @@ impl FsfsRuntime {
             index_root: index_root_label,
             started_at_ms: checkpoint_started_at,
             updated_at_ms: pressure_timestamp_ms(),
-            embedder_id: embedder.id().to_string(),
-            embedder_dimension: embedder.dimension(),
+            embedder_id: embedder_id.clone(),
+            embedder_dimension,
             embedder_is_hash_fallback: false,
             artifacts_durable: false,
             source_hash_hex: String::new(),
@@ -17366,7 +17480,9 @@ impl FsfsRuntime {
                     let texts = live.iter().map(|(_, text)| *text).collect::<Vec<_>>();
                     let outcome = Self::embed_indexing_batch_with_backoffs(
                         cx,
-                        &fast_admission,
+                        fast_admission
+                            .as_ref()
+                            .ok_or_else(Self::lexical_only_generation_has_no_fast_tier)?,
                         &texts,
                         &WINDOW_RETRY_BACKOFFS_MS,
                         |retry_number, retry_budget, backoff_ms, error, _elapsed_ms| {
@@ -17444,7 +17560,10 @@ impl FsfsRuntime {
                         control.checkpoint(cx, "index.fast_window_publish", true)?;
                         let vector_start = Instant::now();
                         publication_lease.fence("one-shot fast passage WAL append")?;
-                        vector_index.append_batch(&vector_batch)?;
+                        vector_index
+                            .as_mut()
+                            .ok_or_else(Self::lexical_only_generation_has_no_fast_tier)?
+                            .append_batch(&vector_batch)?;
                         semantic_succeeded_this_chunk.extend(published);
                         vector_elapsed_ms =
                             vector_elapsed_ms.saturating_add(vector_start.elapsed().as_millis());
@@ -17460,7 +17579,9 @@ impl FsfsRuntime {
                 const RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] = [200, 400];
                 let batch_outcome = Self::embed_indexing_batch_with_backoffs(
                     cx,
-                    &fast_admission,
+                    fast_admission
+                        .as_ref()
+                        .ok_or_else(Self::lexical_only_generation_has_no_fast_tier)?,
                     &semantic_texts,
                     &RETRY_BACKOFFS_MS,
                     |retry_number, retry_budget, backoff_ms, error, batch_embedding_elapsed_ms| {
@@ -17527,7 +17648,10 @@ impl FsfsRuntime {
                             .map(|(pending, embedding)| (pending.document.id.clone(), embedding))
                             .collect::<Vec<_>>();
                         publication_lease.fence("one-shot vector WAL append")?;
-                        vector_index.append_batch(&vector_batch)?;
+                        vector_index
+                            .as_mut()
+                            .ok_or_else(Self::lexical_only_generation_has_no_fast_tier)?
+                            .append_batch(&vector_batch)?;
                         semantic_succeeded_this_chunk
                             .extend(semantic_docs.iter().map(|pending| pending.file_key.clone()));
                         vector_elapsed_ms =
@@ -17672,7 +17796,7 @@ impl FsfsRuntime {
                             publication_lease
                                 .fence("one-shot abandoned quality generation retirement")?;
                             quality_vector_index = None;
-                            Self::retire_quality_generation(
+                            Self::retire_vector_generation(
                                 &quality_vector_path,
                                 REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED,
                             )?;
@@ -17719,7 +17843,9 @@ impl FsfsRuntime {
 
                 let vector_compact_start = Instant::now();
                 publication_lease.fence("one-shot incremental vector reconciliation")?;
-                reconcile_fast_vector_generation(&mut vector_index, &checkpoint)?;
+                if let Some(vector_index) = vector_index.as_mut() {
+                    reconcile_fast_vector_generation(vector_index, &checkpoint)?;
+                }
                 if let Some(quality_index) = quality_vector_index.as_mut() {
                     publication_lease
                         .fence("one-shot incremental quality vector reconciliation")?;
@@ -17887,7 +18013,9 @@ impl FsfsRuntime {
 
         let vector_finish_start = Instant::now();
         publication_lease.fence("final vector generation reconciliation")?;
-        reconcile_fast_vector_generation(&mut vector_index, &checkpoint)?;
+        if let Some(vector_index) = vector_index.as_mut() {
+            reconcile_fast_vector_generation(vector_index, &checkpoint)?;
+        }
         if let Some(quality_index) = quality_vector_index.as_mut() {
             publication_lease.fence("final quality vector generation reconciliation")?;
             reconcile_vector_generation(quality_index, &checkpoint)?;
@@ -17903,11 +18031,16 @@ impl FsfsRuntime {
         // Both generations are final: drop the writer handles (the protector
         // takes the reader side of the map lock) and write their RaptorQ
         // sidecars under the same lease.
-        let published_vector = PublishedVectorGeneration {
-            id: vector_index.embedder_id().to_owned(),
-            dimension: vector_index.dimension(),
-            is_hash_control: Self::is_legacy_hash_vector_generation(vector_index.embedder_id()),
-        };
+        let published_vector = vector_index
+            .as_ref()
+            .map(|index| PublishedVectorGeneration {
+                id: index.embedder_id().to_owned(),
+                dimension: index.dimension(),
+                is_hash_control: Self::is_legacy_hash_vector_generation(index.embedder_id()),
+            });
+        if published_vector.is_none() {
+            observed_reason_codes.insert(REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY.to_owned());
+        }
         let published_quality =
             quality_vector_index
                 .as_ref()
@@ -18036,7 +18169,7 @@ impl FsfsRuntime {
             skipped_files,
             total_canonical_bytes,
             semantic_docs = semantic_doc_count,
-            embedder = embedder.id(),
+            embedder = %embedder_id,
             embedder_degraded,
             embedding_retries,
             embedding_failures,
@@ -19677,20 +19810,63 @@ impl FsfsRuntime {
     /// generation being published (tier disabled for this run, or its
     /// embedding budget was exhausted). Both the FSVI and its WAL sidecar go;
     /// a stale quality tier must never be served beside a newer fast tier.
-    fn retire_quality_generation(quality_vector_path: &Path, reason: &str) -> SearchResult<()> {
-        let wal_path = frankensearch_index::wal_path_for(quality_vector_path);
-        for path in [quality_vector_path, wal_path.as_path()] {
+    /// Whether `index_root` holds a lexical-only generation: its sentinel
+    /// records the skipped fast tier and no fast tier exists.
+    fn is_lexical_only_generation(index_root: &Path) -> bool {
+        !index_root.join(FSFS_VECTOR_INDEX_FILE).exists()
+            && Self::read_index_sentinel(index_root)
+                .ok()
+                .flatten()
+                .is_some_and(|sentinel| {
+                    sentinel
+                        .reason_codes
+                        .iter()
+                        .any(|code| code == REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY)
+                })
+    }
+
+    /// `fsfs delete`, `append-batch`, `compact` and watch mode update the
+    /// vector tiers a lexical-only generation does not have (bd-636yz).
+    fn lexical_only_generation_refusal(index_root: &Path, command: &str) -> SearchError {
+        SearchError::InvalidConfig {
+            field: "index.generation".to_owned(),
+            value: "lexical_only".to_owned(),
+            reason: format!(
+                "`fsfs {command}` updates vector tiers, and the lexical-only generation at {} \
+                 (built without semantic loaders) has none yet; rerun `fsfs index` on its \
+                 source directory to refresh it",
+                index_root.display()
+            ),
+        }
+    }
+
+    /// A lexical-only generation classes no file for embedding, so a semantic
+    /// row reaching its fast tier is refused rather than given one.
+    fn lexical_only_generation_has_no_fast_tier() -> SearchError {
+        SearchError::InvalidConfig {
+            field: "indexing.lexical_only".to_owned(),
+            value: "semantic_row".to_owned(),
+            reason: "a lexical-only generation has no fast tier to embed into".to_owned(),
+        }
+    }
+
+    fn retire_vector_generation(vector_path: &Path, reason: &str) -> SearchResult<()> {
+        let wal_path = frankensearch_index::wal_path_for(vector_path);
+        let mut retired = false;
+        for path in [vector_path, wal_path.as_path()] {
             match fs::remove_file(path) {
-                Ok(()) => {}
+                Ok(()) => retired = true,
                 Err(error) if error.kind() == ErrorKind::NotFound => {}
                 Err(error) => return Err(SearchError::Io(error)),
             }
         }
-        info!(
-            path = %quality_vector_path.display(),
-            reason,
-            "retired quality-tier vector generation"
-        );
+        if retired {
+            info!(
+                path = %vector_path.display(),
+                reason,
+                "retired vector generation"
+            );
+        }
         Ok(())
     }
 
@@ -20488,6 +20664,9 @@ impl FsfsRuntime {
     ) -> SearchResult<(LiveIngestPipeline, Arc<std::sync::Mutex<VectorIndex>>)> {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        if Self::is_lexical_only_generation(&index_root) {
+            return Err(Self::lexical_only_generation_refusal(&index_root, "watch"));
+        }
         let window_membership = self.load_watch_window_membership(&index_root)?;
         // Reuse evidence a clean exit leaves behind extends the admission made
         // here, so no other mutator may land between proving it and owning
@@ -21684,7 +21863,7 @@ impl FsfsRuntime {
     }
 
     async fn run_search_dashboard_tui(&self, cx: &Cx) -> SearchResult<()> {
-        degraded_search_mode(
+        let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
             SearchExecutionMode::Full,
         )?;
@@ -21700,9 +21879,7 @@ impl FsfsRuntime {
         let mut state =
             SearchDashboardState::new(status_payload, mode_hint, result_limit, no_color)
                 .with_view_settings(&self.config.tui);
-        let mut resources = self
-            .prepare_search_execution_resources(cx, SearchExecutionMode::Full)
-            .await?;
+        let mut resources = self.prepare_search_execution_resources(cx, mode).await?;
 
         match FtuiSession::enter() {
             Ok(mut session) => {
@@ -22208,7 +22385,8 @@ impl FsfsRuntime {
     /// The dashboard's lexical-only lane: single-token queries, and every query
     /// while `pressure.degradation_override` forces lexical-only search.
     fn tui_lexical_only_lane(&self, query: &str) -> bool {
-        Self::tui_prefers_lexical_only_query(query)
+        !SEMANTIC_LOADERS_COMPILED
+            || Self::tui_prefers_lexical_only_query(query)
             || self.config.pressure.degradation_override
                 == crate::config::DegradationOverrideMode::ForceLexicalOnly
     }
@@ -39155,6 +39333,134 @@ mod tests {
                     .iter()
                     .any(|hit| hit.path.contains("auth") || hit.path.contains("README")),
                 "expected auth-related hit path in payload"
+            );
+        });
+    }
+
+    /// bd-636yz: a build without semantic loaders (forced here) builds a
+    /// lexical-only generation: no embedder, no vector tiers, both lexical-only
+    /// reason codes, searchable lexically. Over a semantic generation it retires
+    /// the vector tiers, a semantic search then refuses instead of serving stale
+    /// vectors, and a second run resumes the lexical-only checkpoint.
+    #[test]
+    fn lexical_only_indexing_builds_a_searchable_generation_without_vector_tiers() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(
+                project.join("src/auth.rs"),
+                "pub fn authenticate_quokka(token: &str) -> bool { !token.is_empty() }\n",
+            )
+            .expect("write auth source");
+            fs::write(
+                project.join("README.md"),
+                "Wombat middleware validates incoming bearer tokens.\n",
+            )
+            .expect("write readme");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            let index_root = project.join(".frankensearch");
+            let fast_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            let quality_path = index_root.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE);
+            let index_input = CliInput {
+                command: CliCommand::Index,
+                target_path: Some(project.clone()),
+                ..CliInput::default()
+            };
+
+            Box::pin(
+                FsfsRuntime::new(config.clone())
+                    .with_cli_input(index_input.clone())
+                    .run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |_| Ok(()),
+                        false,
+                        false,
+                    ),
+            )
+            .await
+            .expect("semantic index");
+            assert!(fast_path.is_file(), "the semantic build has a fast tier");
+
+            for run in ["over the semantic generation", "resuming its own checkpoint"] {
+                let payload = Box::pin(
+                    FsfsRuntime::new(config.clone())
+                        .with_lexical_only_indexing()
+                        .with_cli_input(index_input.clone())
+                        .run_one_shot_index_scaffold_internal(
+                            &cx,
+                            CliCommand::Index,
+                            |_| Ok(()),
+                            false,
+                            false,
+                        ),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("lexical-only index {run}: {error}"));
+                assert!(payload.generation.generation_complete, "{run}");
+                assert_eq!(payload.generation.indexed_files, 2, "{run}");
+                assert_eq!(payload.semantic_indexed_files, 0, "{run}");
+                assert!(payload.vector_generation.is_none(), "{run}");
+                assert!(payload.quality_generation.is_none(), "{run}");
+                for code in [
+                    super::REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY,
+                    super::REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY,
+                ] {
+                    assert!(
+                        payload.generation.reason_codes.iter().any(|seen| seen == code),
+                        "{run}: missing {code} in {:?}",
+                        payload.generation.reason_codes
+                    );
+                }
+                assert!(!fast_path.exists(), "{run}: fast tier retired");
+                assert!(!quality_path.exists(), "{run}: no quality tier");
+            }
+
+            let delete_error = FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Delete,
+                    index_dir: Some(index_root.clone()),
+                    delete_ids: vec!["README.md".to_owned()],
+                    ..CliInput::default()
+                })
+                .run_delete_command(&cx)
+                .await
+                .expect_err("a vector mutation has no tier to update");
+            assert!(
+                matches!(
+                    &delete_error,
+                    SearchError::InvalidConfig { value, .. } if value == "lexical_only"
+                ),
+                "{delete_error:?}"
+            );
+
+            let search_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+            let payloads = search_runtime
+                .execute_search_payloads_with_mode(
+                    &cx,
+                    "quokka",
+                    5,
+                    SearchExecutionMode::LexicalOnly,
+                )
+                .await
+                .expect("lexical search over a lexical-only generation");
+            let hits = &payloads.last().expect("one phase").hits;
+            assert!(
+                hits.first().is_some_and(|hit| hit.path.ends_with("auth.rs")),
+                "{hits:?}"
+            );
+            assert!(
+                search_runtime
+                    .execute_search_payloads_with_mode(&cx, "quokka", 5, SearchExecutionMode::Full)
+                    .await
+                    .is_err(),
+                "a semantic search must refuse a generation with no vector tiers"
             );
         });
     }

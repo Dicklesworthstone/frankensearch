@@ -334,6 +334,36 @@ Historical adapter identities remain rejected by strict admission, and the
 These changes landed after the 2026-10-03 publication; they are not in fsfs
 1.12.1 or the 0.7.1 crates.
 
+- **The lite build can index and search (bd-636yz).** Every model-free lite
+  binary through 1.12.1 (the musl and Intel macOS assets, `install.sh
+  --lite`) failed `fsfs index` and `fsfs search` with exit 78
+  `embedder_unavailable`: indexing always resolved an embedder, and a lite
+  build only has the hash control, which production refuses. A build without
+  semantic loaders now builds a lexical-only generation: every file goes
+  through the keyword index, no embedder is resolved, no vector tier is
+  written, and the generation records `vector.fast_tier.skipped.lexical_only`
+  and `vector.quality_tier.skipped.lexical_only` (`vector_generation: null`
+  in the index output). Search runs lexical-only and reports
+  `skip_reason: "lexical_only"`. Vector tiers left by an earlier full build
+  are retired, and a full build refuses semantic search on a lexical-only
+  generation until `fsfs index` runs again. `fsfs doctor` reports the vector
+  checks as not applicable instead of advising a rebuild that cannot help.
+  `watch`, `delete`, `append-batch` and `compact` still need vector tiers;
+  on a lexical-only generation they now say so and point to `fsfs index`
+  instead of reporting "no index found". The quality gate gains a `lite`
+  stage that builds the lite binary and indexes and searches from an empty
+  home.
+
+- **The Linux release binary can be built for glibc 2.39 (#62).**
+  `scripts/build_fsfs_gnu_full_release.sh` builds the standard
+  `x86_64-unknown-linux-gnu` binary inside Ubuntu 24.04 and refuses the
+  result if it needs any glibc symbol newer than 2.39; the archives through
+  1.12.1 were linked on a glibc 2.43 host and need 2.43. Built from the 1.12.1
+  source, the binary reports its version in a stock Ubuntu 24.04 image,
+  indexes both semantic tiers there with the real Potion and MiniLM models,
+  and serves refined hybrid results. The packaging contract now requires the
+  script for that asset.
+
 - **A complete-generation reader without write access keeps its
   generation ([#60](https://github.com/Dicklesworthstone/frankensearch/issues/60)).**
   A reader that could not open its pin file read-write (another user's

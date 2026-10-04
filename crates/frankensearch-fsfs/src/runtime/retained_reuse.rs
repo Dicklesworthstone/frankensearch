@@ -213,14 +213,18 @@ fn completed_receipt(
 ) -> SearchResult<ReuseReceipt> {
     let checkpoint = &payload.input_checkpoint;
     let final_state = &payload.generation;
+    let (vector_id, vector_dimension) = payload.vector_generation.as_ref().map_or(
+        (super::LEXICAL_ONLY_GENERATION_EMBEDDER_ID, 0),
+        |generation| (generation.id.as_str(), generation.dimension),
+    );
     if !final_state.generation_complete
         || !checkpoint.artifacts_durable
         || checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
         || checkpoint.target_root != final_state.target_root
         || checkpoint.index_root != final_state.index_root
         || checkpoint.index_root != root.display().to_string()
-        || checkpoint.embedder_id != payload.vector_generation.id
-        || checkpoint.embedder_dimension != payload.vector_generation.dimension
+        || checkpoint.embedder_id != vector_id
+        || checkpoint.embedder_dimension != vector_dimension
     {
         return Err(reuse_error(
             "observed checkpoint does not belong to the completed candidate",
