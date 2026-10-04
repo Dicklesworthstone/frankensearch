@@ -348,11 +348,14 @@ These changes landed after the 2026-10-03 publication; they are not in fsfs
   are retired, and a full build refuses semantic search on a lexical-only
   generation until `fsfs index` runs again. `fsfs doctor` reports the vector
   checks as not applicable instead of advising a rebuild that cannot help.
-  `watch`, `delete`, `append-batch` and `compact` still need vector tiers;
-  on a lexical-only generation they now say so and point to `fsfs index`
-  instead of reporting "no index found". The quality gate gains a `lite`
-  stage that builds the lite binary and indexes and searches from an empty
-  home.
+  `watch` keeps a lexical-only index current through a keyword-only ingest
+  (new, changed and removed files were searchable from another process about
+  2 seconds after the edit, while the watcher ran; with no vector writer lock,
+  lite can search while watching). `delete` and `append-batch` update the
+  keyword rows and the generation's manifests, and `compact` reports that
+  there is nothing to compact. The quality gate gains a `lite` stage that
+  builds the lite binary, then indexes, searches and deletes from an empty
+  home (bd-hu41r).
 
 - **Searching while `fsfs watch` runs names the watcher again.** A running
   watch leaves the generation marked incomplete while it holds the vector

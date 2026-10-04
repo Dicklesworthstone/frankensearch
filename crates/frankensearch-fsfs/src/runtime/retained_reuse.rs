@@ -2067,7 +2067,7 @@ mod generation_tests {
                     runtime.config.discovery.clone(),
                     Arc::new(pipeline),
                 ),
-                vector_index,
+                vector_index: Some(vector_index),
                 reuse,
             };
             // The production exit order: stop, compact both WALs, then evidence.
@@ -2075,7 +2075,7 @@ mod generation_tests {
                 .finalize_shutdown(
                     cx,
                     crate::shutdown::ShutdownReason::UserRequest,
-                    Some(&session.vector_index),
+                    session.vector_index.as_ref(),
                     session.quality_vector_index.as_ref(),
                 )
                 .await

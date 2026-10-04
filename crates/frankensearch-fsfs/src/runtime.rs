@@ -2992,7 +2992,8 @@ struct LiveQualityTier {
 /// compacts, and the reuse record a clean exit turns into warm evidence.
 struct LiveWatchSession {
     watcher: FsWatcher,
-    vector_index: Arc<std::sync::Mutex<VectorIndex>>,
+    /// Absent when watching a lexical-only generation.
+    vector_index: Option<Arc<std::sync::Mutex<VectorIndex>>>,
     quality_vector_index: Option<Arc<std::sync::Mutex<VectorIndex>>>,
     reuse: Option<Arc<retained_reuse::ReuseLedger>>,
 }
@@ -3068,6 +3069,262 @@ impl<'a> BatchStorage<'a> {
     /// The catalog if an operation of this batch opened it.
     fn opened(&self) -> Option<&StorageBatchContext> {
         self.context.get().and_then(Option::as_ref)
+    }
+}
+
+/// The absolute path and index key of a watched file, refusing a key that
+/// escapes `target_root` through ".." components, symlinks or an absolute path.
+fn resolve_watched_paths(target_root: &Path, file_key: &str) -> SearchResult<(PathBuf, String)> {
+    let key_path = Path::new(file_key);
+    // Reject ".." components outright. This prevents traversal even when
+    // canonicalize() falls back to the raw path for missing files.
+    if key_path
+        .components()
+        .any(|c| c == std::path::Component::ParentDir)
+    {
+        return Err(SearchError::InvalidConfig {
+            field: "file_key".into(),
+            value: file_key.into(),
+            reason: "file_key must not contain '..' components (directory traversal)".into(),
+        });
+    }
+    let abs_path = if key_path.is_absolute() {
+        PathBuf::from(file_key)
+    } else {
+        target_root.join(file_key)
+    };
+    // Resolve symlinks / ".." components, then verify the result stays
+    // inside target_root.  Without this check, symlinks or absolute paths
+    // could escape the project boundary (path traversal).
+    let canonical = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
+    if !canonical.starts_with(target_root) {
+        return Err(SearchError::InvalidConfig {
+            field: "file_key".into(),
+            value: file_key.into(),
+            reason: "path escapes target root (directory traversal)".into(),
+        });
+    }
+    let rel_key = normalize_file_key_for_index(&canonical, target_root);
+    Ok((canonical, rel_key))
+}
+
+/// Answer an out-of-band `fsfs flush` request against a live keyword writer:
+/// publish its staged rows, then acknowledge with the published freshness.
+async fn acknowledge_lexical_flush_barrier(cx: &Cx, lexical_index: &QuillIndex) -> SearchResult<bool> {
+    let Some(directory) = lexical_index.directory() else {
+        return Ok(false);
+    };
+    let request_path = directory.join(FSFS_FLUSH_REQUEST_FILE);
+    let Some(request) =
+        read_durable_json::<FsfsFlushRequest>(&request_path, "fsfs.flush.request.read")?
+    else {
+        return Ok(false);
+    };
+    let ack_path = directory.join(FSFS_FLUSH_ACK_FILE);
+    if read_durable_json::<FsfsFlushAck>(&ack_path, "fsfs.flush.ack.read")?
+        .is_some_and(|ack| ack.request_id == request.request_id)
+    {
+        return Ok(false);
+    }
+
+    lexical_index.commit(cx).await?;
+    let ack = FsfsFlushAck {
+        request_id: request.request_id,
+        index_freshness: FsfsRuntime::index_freshness_payload(lexical_index.segment_stats()?),
+    };
+    write_durable_json(&ack_path, &ack, "fsfs.flush.ack.write")?;
+    Ok(true)
+}
+
+/// Upsert one watched file unless its published row already holds this
+/// exact document, and report whether it did. Re-upserting identical
+/// content published a Quill generation per file: the first watch after
+/// `fsfs index` rewrote the whole keyword index one file at a time.
+async fn apply_watched_lexical_upsert(
+    cx: &Cx,
+    lexical_index: &QuillIndex,
+    mutation: LexicalMutation,
+) -> SearchResult<bool> {
+    // A published witness cannot prove anything while rows are staged:
+    // after a new file earlier in the batch (new rows stay staged), the
+    // next unchanged file was rewritten and re-embedded with both models.
+    // Publish the staged rows first when a witness could prove this one.
+    if lexical_index.has_uncommitted_changes()
+        && lexical_index.document_witness(&mutation.doc_id)?.is_some()
+    {
+        lexical_index.commit(cx).await?;
+    }
+    let backend = QuillLexicalBackend::new(lexical_index);
+    let mut pipeline = LexicalPipeline::new(backend);
+    let _stats = pipeline.apply_incremental(std::slice::from_ref(&mutation))?;
+    let resume = pipeline.backend_mut().flush_resumable(cx).await?;
+    Ok(resume.unchanged > 0)
+}
+
+/// Watch-mode ingest for a lexical-only generation (a build without semantic
+/// loaders): it keeps the keyword index current and has no vector tier to
+/// mirror (bd-hu41r).
+struct LexicalOnlyWatchIngest {
+    target_root: PathBuf,
+    lexical_index: QuillIndex,
+    canonicalizer: DefaultCanonicalizer,
+}
+
+impl WatchIngestPipeline for LexicalOnlyWatchIngest {
+    fn apply_batch<'a>(
+        &'a self,
+        cx: &'a Cx,
+        batch: &'a [WatchIngestOp],
+    ) -> crate::watcher::WatchIngestFuture<'a, usize> {
+        Box::pin(self.apply_batch_inner(cx, batch))
+    }
+
+    fn poll_flush_barrier<'a>(&'a self, cx: &'a Cx) -> crate::watcher::WatchIngestFuture<'a, bool> {
+        Box::pin(acknowledge_lexical_flush_barrier(cx, &self.lexical_index))
+    }
+}
+
+impl LexicalOnlyWatchIngest {
+    fn new(target_root: PathBuf, lexical_index: QuillIndex) -> Self {
+        Self {
+            target_root,
+            lexical_index,
+            canonicalizer: DefaultCanonicalizer::default(),
+        }
+    }
+
+    async fn apply_batch_inner(&self, cx: &Cx, batch: &[WatchIngestOp]) -> SearchResult<usize> {
+        let mut count = 0_usize;
+        for op in batch {
+            let changed = match op {
+                WatchIngestOp::Upsert {
+                    file_key,
+                    revision,
+                    ingestion_class,
+                } => self.apply_upsert(cx, file_key, *revision, *ingestion_class).await?,
+                WatchIngestOp::Delete { file_key, .. } => {
+                    let (_abs_path, rel_key) = resolve_watched_paths(&self.target_root, file_key)?;
+                    self.apply_delete(cx, rel_key).await?;
+                    true
+                }
+            };
+            if changed {
+                count = count.saturating_add(1);
+            }
+        }
+        if count > 0 {
+            self.lexical_index.commit(cx).await?;
+            info!(
+                batch_size = batch.len(),
+                reindexed = count,
+                "watcher lexical-only ingest batch committed"
+            );
+            // A long-lived writer sweeps only at open, so reclaim the inputs
+            // retired by this session's merges; a failed sweep retries next batch.
+            let options = frankensearch_quill::GarbageCollectionOptions {
+                grace_period: frankensearch_quill::DEFAULT_GARBAGE_GRACE,
+            };
+            if let Err(error) = self.lexical_index.collect_garbage_with(cx, options).await {
+                warn!(
+                    error = %error,
+                    "watcher lexical garbage sweep failed; retrying after the next batch"
+                );
+            }
+        }
+        Ok(count)
+    }
+
+    async fn apply_delete(&self, cx: &Cx, rel_key: String) -> SearchResult<()> {
+        let backend = QuillLexicalBackend::new(&self.lexical_index);
+        let mut pipeline = LexicalPipeline::new(backend);
+        let _stats = pipeline.apply_incremental(&[LexicalMutation::delete(
+            rel_key,
+            0,
+            IngestionClass::Skip,
+            "watch_delete",
+        )])?;
+        pipeline.backend_mut().flush(cx).await
+    }
+
+    /// Reindex one watched file and report whether its keyword row changed.
+    /// A vanished, policy-skipped or textless file loses its row.
+    async fn apply_upsert(
+        &self,
+        cx: &Cx,
+        file_key: &str,
+        revision: i64,
+        ingestion_class: IngestionClass,
+    ) -> SearchResult<bool> {
+        let (abs_path, rel_key) = resolve_watched_paths(&self.target_root, file_key)?;
+        // Nothing is embedded here; a semantic file is indexed lexically.
+        let ingestion_class = match ingestion_class {
+            IngestionClass::FullSemanticLexical => IngestionClass::LexicalOnly,
+            IngestionClass::Skip => {
+                self.apply_delete(cx, rel_key).await?;
+                return Ok(true);
+            }
+            other => other,
+        };
+        let bytes = match async_file_read(&abs_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.apply_delete(cx, rel_key).await?;
+                return Ok(true);
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::IsADirectory | ErrorKind::PermissionDenied | ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut classification_metadata = None;
+        let text = if is_pdf_file(&abs_path) {
+            try_extract_pdf_text(&bytes, &abs_path)
+        } else {
+            let classification = classify_file_for_ingest(&abs_path, &bytes);
+            let allowed = file_classification_allows_index(&classification);
+            classification_metadata = Some(classification);
+            allowed.then(|| String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let Some(text) = text else {
+            self.apply_delete(cx, rel_key).await?;
+            return Ok(true);
+        };
+        let canonical = self.canonicalizer.canonicalize(&text);
+        if canonical.trim().is_empty() {
+            self.apply_delete(cx, rel_key).await?;
+            return Ok(true);
+        }
+        let doc = watched_document(
+            &abs_path,
+            &rel_key,
+            &canonical,
+            ingestion_class,
+            classification_metadata.as_ref(),
+            None,
+        )
+        .await;
+        // The planner indexes a metadata-only file's path, not its text.
+        let lexical_text = if ingestion_class == IngestionClass::MetadataOnly {
+            String::new()
+        } else {
+            LEXICAL_CANONICALIZER.canonicalize(&text)
+        };
+        let mut mutation = LexicalMutation::upsert(
+            rel_key,
+            u64::try_from(revision).unwrap_or(0),
+            ingestion_class,
+            lexical_text,
+            "watch_upsert",
+        );
+        mutation.title.clone_from(&doc.title);
+        mutation.metadata.clone_from(&doc.metadata);
+        let unchanged = apply_watched_lexical_upsert(cx, &self.lexical_index, mutation).await?;
+        Ok(!unchanged)
     }
 }
 
@@ -3186,31 +3443,7 @@ impl LiveIngestPipeline {
     }
 
     async fn acknowledge_flush_barrier(&self, cx: &Cx) -> SearchResult<bool> {
-        let Some(directory) = self.lexical_index.directory() else {
-            return Ok(false);
-        };
-        let request_path = directory.join(FSFS_FLUSH_REQUEST_FILE);
-        let Some(request) =
-            read_durable_json::<FsfsFlushRequest>(&request_path, "fsfs.flush.request.read")?
-        else {
-            return Ok(false);
-        };
-        let ack_path = directory.join(FSFS_FLUSH_ACK_FILE);
-        if read_durable_json::<FsfsFlushAck>(&ack_path, "fsfs.flush.ack.read")?
-            .is_some_and(|ack| ack.request_id == request.request_id)
-        {
-            return Ok(false);
-        }
-
-        self.lexical_index.commit(cx).await?;
-        let ack = FsfsFlushAck {
-            request_id: request.request_id,
-            index_freshness: FsfsRuntime::index_freshness_payload(
-                self.lexical_index.segment_stats()?,
-            ),
-        };
-        write_durable_json(&ack_path, &ack, "fsfs.flush.ack.write")?;
-        Ok(true)
+        acknowledge_lexical_flush_barrier(cx, &self.lexical_index).await
     }
 
     fn new(
@@ -3267,37 +3500,7 @@ impl LiveIngestPipeline {
     }
 
     fn resolve_paths(&self, file_key: &str) -> frankensearch_core::SearchResult<(PathBuf, String)> {
-        let key_path = Path::new(file_key);
-        // Reject ".." components outright. This prevents traversal even when
-        // canonicalize() falls back to the raw path for missing files.
-        if key_path
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
-            return Err(frankensearch_core::SearchError::InvalidConfig {
-                field: "file_key".into(),
-                value: file_key.into(),
-                reason: "file_key must not contain '..' components (directory traversal)".into(),
-            });
-        }
-        let abs_path = if key_path.is_absolute() {
-            PathBuf::from(file_key)
-        } else {
-            self.target_root.join(file_key)
-        };
-        // Resolve symlinks / ".." components, then verify the result stays
-        // inside target_root.  Without this check, symlinks or absolute paths
-        // could escape the project boundary (path traversal).
-        let canonical = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
-        if !canonical.starts_with(&self.target_root) {
-            return Err(frankensearch_core::SearchError::InvalidConfig {
-                field: "file_key".into(),
-                value: file_key.into(),
-                reason: "path escapes target root (directory traversal)".into(),
-            });
-        }
-        let rel_key = normalize_file_key_for_index(&canonical, &self.target_root);
-        Ok((canonical, rel_key))
+        resolve_watched_paths(&self.target_root, file_key)
     }
 
     fn soft_delete_vector(&self, rel_key: &str) -> SearchResult<()> {
@@ -3482,23 +3685,7 @@ impl LiveIngestPipeline {
         cx: &Cx,
         mutation: LexicalMutation,
     ) -> SearchResult<bool> {
-        // A published witness cannot prove anything while rows are staged:
-        // after a new file earlier in the batch (new rows stay staged), the
-        // next unchanged file was rewritten and re-embedded with both models.
-        // Publish the staged rows first when a witness could prove this one.
-        if self.lexical_index.has_uncommitted_changes()
-            && self
-                .lexical_index
-                .document_witness(&mutation.doc_id)?
-                .is_some()
-        {
-            self.lexical_index.commit(cx).await?;
-        }
-        let backend = QuillLexicalBackend::new(&self.lexical_index);
-        let mut pipeline = LexicalPipeline::new(backend);
-        let _stats = pipeline.apply_incremental(std::slice::from_ref(&mutation))?;
-        let resume = pipeline.backend_mut().flush_resumable(cx).await?;
-        Ok(resume.unchanged > 0)
+        apply_watched_lexical_upsert(cx, &self.lexical_index, mutation).await
     }
 
     #[allow(clippy::arc_with_non_send_sync)]
@@ -13256,10 +13443,9 @@ impl FsfsRuntime {
 
         if !vector_path.exists() {
             if Self::is_lexical_only_generation(&index_root) {
-                return Err(Self::lexical_only_generation_refusal(
-                    &index_root,
-                    "append-batch",
-                ));
+                return self
+                    .run_lexical_only_append_batch(cx, &index_root, writer)
+                    .await;
             }
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
@@ -13718,7 +13904,9 @@ impl FsfsRuntime {
 
         if !vector_path.exists() {
             if Self::is_lexical_only_generation(&index_root) {
-                return Err(Self::lexical_only_generation_refusal(&index_root, "delete"));
+                return self
+                    .run_lexical_only_delete_command(cx, &index_root)
+                    .await;
             }
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
@@ -13931,7 +14119,7 @@ impl FsfsRuntime {
 
         if !vector_path.exists() {
             if Self::is_lexical_only_generation(&index_root) {
-                return Err(Self::lexical_only_generation_refusal(&index_root, "compact"));
+                return self.run_lexical_only_compact_command();
             }
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
@@ -19844,6 +20032,172 @@ impl FsfsRuntime {
         }
     }
 
+    /// Emit a mutation command's machine payload, or its one-line table form.
+    fn emit_command_payload(
+        &self,
+        command: &'static str,
+        table_line: &str,
+        payload: serde_json::Value,
+    ) -> SearchResult<()> {
+        if self.cli_input.format == OutputFormat::Table {
+            println!("{table_line}");
+            return Ok(());
+        }
+        let meta = meta_for_format(command, self.cli_input.format);
+        let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
+        let mut stdout = std::io::stdout();
+        emit_envelope(&envelope, self.cli_input.format, &mut stdout)?;
+        if self.cli_input.format != OutputFormat::Jsonl {
+            stdout
+                .write_all(b"\n")
+                .map_err(|source| SearchError::SubsystemError {
+                    subsystem: command,
+                    source: Box::new(source),
+                })?;
+        }
+        Ok(())
+    }
+
+    /// `fsfs delete` on a lexical-only generation: remove the matching files'
+    /// keyword rows and manifest entries; there is no vector tier (bd-hu41r).
+    async fn run_lexical_only_delete_command(&self, cx: &Cx, index_root: &Path) -> SearchResult<()> {
+        let ids = &self.cli_input.delete_ids;
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(index_root)?;
+        let membership = match (
+            Self::read_matching_manifest_generation(index_root)?,
+            Self::read_index_sentinel(index_root)?,
+        ) {
+            (Some(manifests), Some(sentinel)) => (manifests, sentinel),
+            _ => {
+                return Err(complete_cli::complete_cli_error(
+                    "delete_membership",
+                    "the lexical-only generation's manifests disagree; rerun `fsfs index`",
+                ));
+            }
+        };
+        let targets = membership
+            .0
+            .keys()
+            .filter(|source| {
+                ids.iter().any(|requested| {
+                    if self.cli_input.delete_prefix {
+                        source.starts_with(requested.as_str())
+                    } else {
+                        *source == requested
+                    }
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !targets.is_empty() {
+            publication_lease.fence("lexical-only delete publication")?;
+            let mutations = targets
+                .iter()
+                .map(|doc_id| {
+                    LexicalMutation::delete(doc_id.clone(), 0, IngestionClass::Skip, "delete_command")
+                })
+                .collect::<Vec<_>>();
+            self.apply_one_shot_lexical_mutations(cx, index_root, &mutations)
+                .await?;
+            let (mut manifests, sentinel) = membership;
+            for id in &targets {
+                manifests.remove(id);
+            }
+            publication_lease.fence("lexical-only delete membership publication")?;
+            self.write_window_mutation_membership(index_root, manifests, sentinel, "delete")?;
+        }
+        info!(deleted = targets.len(), "lexical-only delete completed");
+        self.emit_command_payload(
+            "delete",
+            &format!("{} documents deleted", targets.len()),
+            serde_json::json!({
+                "deleted": targets.len(),
+                "tombstone_count": 0,
+                "tombstone_ratio": 0.0,
+                "needs_vacuum": false,
+            }),
+        )
+    }
+
+    /// `fsfs append-batch` on a lexical-only generation: upsert the documents'
+    /// keyword rows and manifest entries; nothing is embedded (bd-hu41r).
+    async fn run_lexical_only_append_batch<W: Write + Send>(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let docs = retained_reuse::read_append_documents(cx, self).await?;
+        if docs.is_empty() {
+            return self.emit_append_batch_receipt(0, 0, false, writer);
+        }
+        for id in docs.keys() {
+            semantic_windows::validate_source_id(id)?;
+        }
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(index_root)?;
+        let (Some(mut manifests), Some(sentinel)) = (
+            Self::read_matching_manifest_generation(index_root)?,
+            Self::read_index_sentinel(index_root)?,
+        ) else {
+            return Err(complete_cli::complete_cli_error(
+                "append_membership",
+                "the lexical-only generation's manifests disagree; rerun `fsfs index`",
+            ));
+        };
+        let lexical_revision = pressure_timestamp_ms();
+        let mutations = docs
+            .iter()
+            .map(|(id, document)| {
+                LexicalMutation::upsert(
+                    id.clone(),
+                    lexical_revision,
+                    IngestionClass::LexicalOnly,
+                    document.lexical_text.clone(),
+                    "append_batch",
+                )
+            })
+            .collect::<Vec<_>>();
+        retained_search_checkpoint(cx)?;
+        publication_lease.fence("lexical-only append-batch publication")?;
+        self.apply_one_shot_lexical_mutations(cx, index_root, &mutations)
+            .await?;
+        let revision = i64::try_from(lexical_revision).unwrap_or(i64::MAX);
+        for (id, document) in &docs {
+            manifests.insert(
+                id.clone(),
+                IndexManifestEntry {
+                    file_key: id.clone(),
+                    revision,
+                    ingestion_class: ingestion_class_label(IngestionClass::LexicalOnly).to_owned(),
+                    canonical_bytes: u64::try_from(document.embedding_text.len())
+                        .unwrap_or(u64::MAX),
+                    reason_code: "append_batch".to_owned(),
+                    fast_windows: None,
+                },
+            );
+        }
+        publication_lease.fence("lexical-only append-batch membership publication")?;
+        self.write_window_mutation_membership(index_root, manifests, sentinel, "append-batch")?;
+        info!(count = docs.len(), "lexical-only append-batch completed");
+        self.emit_append_batch_receipt(docs.len(), 0, false, writer)
+    }
+
+    /// `fsfs compact` on a lexical-only generation: no vector tier holds a WAL
+    /// or tombstones, and the keyword index merges its own segments.
+    fn run_lexical_only_compact_command(&self) -> SearchResult<()> {
+        self.emit_command_payload(
+            "compact",
+            "nothing to compact: this lexical-only generation has no vector tiers, and its keyword index merges itself",
+            serde_json::json!({
+                "main_records_before": 0,
+                "wal_records_merged": 0,
+                "total_records_after": 0,
+                "tombstones_removed": 0,
+                "lexical_only": true,
+            }),
+        )
+    }
+
     /// A lexical-only generation classes no file for embedding, so a semantic
     /// row reaching its fast tier is refused rather than given one.
     fn lexical_only_generation_has_no_fast_tier() -> SearchError {
@@ -20810,7 +21164,22 @@ impl FsfsRuntime {
             let (ingest, vector_index) = factory(self)?;
             return Ok(LiveWatchSession {
                 watcher: FsWatcher::new(vec![target_root], self.config.discovery.clone(), ingest),
-                vector_index,
+                vector_index: Some(vector_index),
+                quality_vector_index: None,
+                reuse: None,
+            });
+        }
+
+        let index_root = self.resolve_index_root(&target_root)?;
+        if Self::is_lexical_only_generation(&index_root) {
+            let ingest = self.build_lexical_only_watch_ingest(cx, &index_root).await?;
+            return Ok(LiveWatchSession {
+                watcher: FsWatcher::new(
+                    vec![target_root],
+                    self.config.discovery.clone(),
+                    Arc::new(ingest),
+                ),
+                vector_index: None,
                 quality_vector_index: None,
                 reuse: None,
             });
@@ -20825,10 +21194,45 @@ impl FsfsRuntime {
                 self.config.discovery.clone(),
                 Arc::new(pipeline),
             ),
-            vector_index,
+            vector_index: Some(vector_index),
             quality_vector_index,
             reuse,
         })
+    }
+
+    /// The keyword writer a lexical-only generation is watched through: the
+    /// same unprotected-but-verified Quill configuration as the live pipeline.
+    async fn build_lexical_only_watch_ingest(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+    ) -> SearchResult<LexicalOnlyWatchIngest> {
+        let target_root = self.resolve_target_root()?;
+        let lexical_layout = Self::resolve_lexical_engine(index_root)?;
+        let (Some(BlueGreenEngine::Quill), Some(lexical_path)) =
+            (lexical_layout.engine(), lexical_layout.engine_dir())
+        else {
+            return Err(SearchError::IndexNotFound {
+                path: index_root.join("lexical"),
+            });
+        };
+        let lexical_index = QuillIndex::create(
+            cx,
+            &lexical_path,
+            QuillConfig {
+                max_ingest_shards: 1,
+                deterministic_ingest: true,
+                quarantine_on_unrepairable: true,
+                ..QuillConfig::default()
+            },
+        )
+        .await?;
+        info!(
+            target_root = %target_root.display(),
+            index_root = %index_root.display(),
+            "lexical-only ingest pipeline initialized for watch mode"
+        );
+        Ok(LexicalOnlyWatchIngest::new(target_root, lexical_index))
     }
 
     /// Leave warm reuse evidence behind a cleanly stopped windowed session
@@ -22682,7 +23086,7 @@ impl FsfsRuntime {
                         self.finalize_shutdown(
                             cx,
                             reason,
-                            Some(&session.vector_index),
+                            session.vector_index.as_ref(),
                             session.quality_vector_index.as_ref(),
                         ),
                     )
@@ -39478,23 +39882,35 @@ mod tests {
                 assert!(!quality_path.exists(), "{run}: no quality tier");
             }
 
-            let delete_error = FsfsRuntime::new(config.clone())
+            // bd-hu41r: delete and compact work on the keyword arm alone.
+            FsfsRuntime::new(config.clone())
                 .with_cli_input(CliInput {
                     command: CliCommand::Delete,
                     index_dir: Some(index_root.clone()),
                     delete_ids: vec!["README.md".to_owned()],
+                    format: OutputFormat::Json,
                     ..CliInput::default()
                 })
                 .run_delete_command(&cx)
                 .await
-                .expect_err("a vector mutation has no tier to update");
-            assert!(
-                matches!(
-                    &delete_error,
-                    SearchError::InvalidConfig { value, .. } if value == "lexical_only"
-                ),
-                "{delete_error:?}"
+                .expect("lexical-only delete");
+            let manifests = FsfsRuntime::read_matching_manifest_generation(&index_root)
+                .expect("read manifests")
+                .expect("matching manifests after delete");
+            assert_eq!(
+                manifests.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["src/auth.rs"]
             );
+            assert!(FsfsRuntime::is_lexical_only_generation(&index_root));
+            FsfsRuntime::new(config.clone())
+                .with_cli_input(CliInput {
+                    command: CliCommand::Compact,
+                    index_dir: Some(index_root.clone()),
+                    format: OutputFormat::Json,
+                    ..CliInput::default()
+                })
+                .run_compact_command()
+                .expect("lexical-only compact is a no-op");
 
             let search_runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 command: CliCommand::Search,
@@ -39515,6 +39931,19 @@ mod tests {
                 hits.first().is_some_and(|hit| hit.path.ends_with("auth.rs")),
                 "{hits:?}"
             );
+            let deleted = search_runtime
+                .execute_search_payloads_with_mode(
+                    &cx,
+                    "wombat",
+                    5,
+                    SearchExecutionMode::LexicalOnly,
+                )
+                .await
+                .expect("lexical search for the deleted file");
+            assert!(
+                deleted.last().expect("one phase").hits.is_empty(),
+                "the deleted README must not match"
+            );
             assert!(
                 search_runtime
                     .execute_search_payloads_with_mode(&cx, "quokka", 5, SearchExecutionMode::Full)
@@ -39522,6 +39951,102 @@ mod tests {
                     .is_err(),
                 "a semantic search must refuse a generation with no vector tiers"
             );
+        });
+    }
+
+    /// bd-hu41r: watching a lexical-only generation keeps its keyword index
+    /// current through the lexical-only ingest: a new file becomes searchable,
+    /// a deleted one disappears and an unchanged replay publishes nothing, while
+    /// a search from another runtime still runs against the live writer.
+    #[test]
+    fn lexical_only_watch_ingest_keeps_the_keyword_index_current() {
+        use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(project.join("src/keep.rs"), "pub fn keep_quokka() {}\n").expect("write");
+            fs::write(project.join("src/gone.rs"), "pub fn gone_wombat() {}\n").expect("write");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            let index_root = project.join(".frankensearch");
+            let runtime = FsfsRuntime::new(config.clone())
+                .with_lexical_only_indexing()
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                });
+            Box::pin(runtime.run_one_shot_index_scaffold_internal(
+                &cx,
+                CliCommand::Index,
+                |_| Ok(()),
+                false,
+                false,
+            ))
+            .await
+            .expect("lexical-only index");
+            assert!(FsfsRuntime::is_lexical_only_generation(&index_root));
+
+            let ingest = runtime
+                .build_lexical_only_watch_ingest(&cx, &index_root)
+                .await
+                .expect("lexical-only watch ingest");
+            fs::write(project.join("src/new.rs"), "pub fn new_ocelot() {}\n").expect("write");
+            fs::remove_file(project.join("src/gone.rs")).expect("remove");
+            let changed = ingest
+                .apply_batch(
+                    &cx,
+                    &[
+                        WatchIngestOp::Upsert {
+                            file_key: "src/keep.rs".to_owned(),
+                            revision: 1,
+                            ingestion_class: IngestionClass::FullSemanticLexical,
+                        },
+                        WatchIngestOp::Upsert {
+                            file_key: "src/new.rs".to_owned(),
+                            revision: 2,
+                            ingestion_class: IngestionClass::FullSemanticLexical,
+                        },
+                        WatchIngestOp::Delete {
+                            file_key: "src/gone.rs".to_owned(),
+                            revision: 3,
+                        },
+                    ],
+                )
+                .await
+                .expect("apply a watch batch");
+            assert_eq!(changed, 2, "the unchanged replay of keep.rs publishes nothing");
+
+            let searcher = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(index_root),
+                ..CliInput::default()
+            });
+            for (query, expected) in [
+                ("new_ocelot", Some("src/new.rs")),
+                ("keep_quokka", Some("src/keep.rs")),
+                ("gone_wombat", None),
+            ] {
+                let payloads = searcher
+                    .execute_search_payloads_with_mode(
+                        &cx,
+                        query,
+                        5,
+                        SearchExecutionMode::LexicalOnly,
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("search {query}: {error}"));
+                let hits = &payloads.last().expect("one phase").hits;
+                match expected {
+                    Some(path) => assert!(
+                        hits.first().is_some_and(|hit| hit.path.ends_with(path)),
+                        "{query}: {hits:?}"
+                    ),
+                    None => assert!(hits.is_empty(), "{query}: {hits:?}"),
+                }
+            }
+            drop(ingest);
         });
     }
 

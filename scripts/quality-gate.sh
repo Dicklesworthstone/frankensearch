@@ -44,8 +44,8 @@
 #              still fails the gate unless QUALITY_GATE_ALLOW_MODEL_SKIP=1
 #   quickstart scripts/check_fsfs_executable_quickstart.sh against the freshly built binary
 #   lite       the model-free `--no-default-features` binary (every musl and Intel macOS
-#              release asset) indexes and searches lexically from a pristine home; it
-#              shipped through 1.12.1 able to do neither (bd-636yz)
+#              release asset) indexes, searches and deletes lexically from a pristine
+#              home; it shipped through 1.12.1 unable to index or search (bd-636yz)
 #
 # Environment:
 #   QUALITY_GATE_STAGES        comma list to run (default: stock stages plus quill;
@@ -230,6 +230,19 @@ sys.exit(not (d["generation_complete"] and d["indexed_files"] == 2 and d["vector
 d = json.load(sys.stdin)["data"]
 sys.exit(not (d["skip_reason"] == "lexical_only" and d["hits"] and d["hits"][0]["path"] == "src/lib.rs"))'; then
     printf 'lite search failed:\n%s\n' "$out"
+    return 1
+  fi
+  if ! out="$(cd "$work/proj" && env -i HOME="$work/home" PATH=/usr/bin:/bin TMPDIR="$TMPDIR" \
+      XDG_RUNTIME_DIR="$work/rt" "$work/fsfs" delete src/lib.rs --format json 2>&1)"; then
+    printf 'lite delete failed:\n%s\n' "$out"
+    return 1
+  fi
+  if ! out="$(cd "$work/proj" && env -i HOME="$work/home" PATH=/usr/bin:/bin TMPDIR="$TMPDIR" \
+      XDG_RUNTIME_DIR="$work/rt" "$work/fsfs" search quokka --no-daemon --format json 2>&1)" \
+    || ! printf '%s' "$out" | python3 -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+sys.exit(bool(d["hits"]))'; then
+    printf 'lite search after delete still matched:\n%s\n' "$out"
     return 1
   fi
   rm -rf "$work"
