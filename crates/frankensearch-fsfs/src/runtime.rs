@@ -18647,13 +18647,17 @@ impl FsfsRuntime {
     fn explain_vector_writer_lock(index_root: &Path, error: SearchError) -> SearchError {
         match error {
             SearchError::InvalidConfig { ref field, .. } if field == "fsvi.map_lock" => {
-                SearchError::InvalidConfig {
-                    field: "index.vector_files".to_owned(),
-                    value: index_root.display().to_string(),
-                    reason: "another fsfs process is writing this index's vector files: a running `fsfs watch` holds them until it exits, and `fsfs index`, `compact`, `delete` or `append-batch` until it finishes. Search again once it stops; a watcher's changes become searchable when it exits".to_owned(),
-                }
+                Self::vector_writer_active_error(index_root)
             }
             other => other,
+        }
+    }
+
+    fn vector_writer_active_error(index_root: &Path) -> SearchError {
+        SearchError::InvalidConfig {
+            field: "index.vector_files".to_owned(),
+            value: index_root.display().to_string(),
+            reason: "another fsfs process is writing this index's vector files: a running `fsfs watch` holds them until it exits, and `fsfs index`, `compact`, `delete` or `append-batch` until it finishes. Search again once it stops; a watcher's changes become searchable when it exits. To search while watching, build the index with FSFS_COMPLETE_GENERATIONS=1".to_owned(),
         }
     }
 
@@ -19871,6 +19875,21 @@ impl FsfsRuntime {
     }
 
     fn validate_search_generation_at_root(
+        index_root: &Path,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<()> {
+        // A live writer (a running watch, or an index, compact, delete or
+        // append run) leaves the generation marked incomplete while it holds
+        // the vector files: name it instead of advising a resume (bd-vht3y).
+        match Self::validate_recorded_search_generation_at_root(index_root, mode) {
+            Err(_) if Self::vector_generation_in_use(index_root) => {
+                Err(Self::vector_writer_active_error(index_root))
+            }
+            admission => admission,
+        }
+    }
+
+    fn validate_recorded_search_generation_at_root(
         index_root: &Path,
         mode: SearchExecutionMode,
     ) -> SearchResult<()> {
@@ -29842,7 +29861,48 @@ mod tests {
                 "{table}"
             );
 
+            // A running watcher also leaves the generation marked incomplete;
+            // search must name the writer, not advise resuming an index.
+            runtime
+                .write_index_sentinel(
+                    &index_root,
+                    &super::IndexSentinel {
+                        schema_version: 1,
+                        generation_complete: false,
+                        generated_at_ms: 0,
+                        command: "watch".to_owned(),
+                        target_root: temp.path().display().to_string(),
+                        index_root: index_root.display().to_string(),
+                        discovered_files: 0,
+                        indexed_files: 0,
+                        skipped_files: 0,
+                        reason_codes: Vec::new(),
+                        total_canonical_bytes: 0,
+                        source_hash_hex: String::new(),
+                        fast_window_max_per_file: 1,
+                    },
+                )
+                .expect("write an incomplete sentinel");
+            let held = FsfsRuntime::validate_search_generation_at_root(
+                &index_root,
+                super::SearchExecutionMode::Full,
+            )
+            .expect_err("incomplete generation while the writer is held");
+            assert!(
+                matches!(&held, SearchError::InvalidConfig { field, .. } if field == "index.vector_files"),
+                "{held}"
+            );
+
             drop(writer);
+            let unheld = FsfsRuntime::validate_search_generation_at_root(
+                &index_root,
+                super::SearchExecutionMode::Full,
+            )
+            .expect_err("still incomplete once the writer is gone");
+            assert!(
+                matches!(&unheld, SearchError::InvalidConfig { field, .. } if field == "semantic.index_generation"),
+                "{unheld}"
+            );
             let released = runtime
                 .collect_status_payload()
                 .expect("status after release");

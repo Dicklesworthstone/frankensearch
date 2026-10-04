@@ -321,8 +321,9 @@ with "another fsfs process is writing this index's vector files" until the
 watcher stops; new and changed files are ingested and become searchable the
 moment it exits, and the in-process TUI cockpit can search a watched index.
 The opt-in complete-generation layout (see "Complete generations" below)
-serves searches while it is watched, but it keeps every published generation
-on disk: each watched change adds one until retention lands (bd-2op1d).
+serves searches while it is watched: a watched change is searchable from
+another process within seconds, and retention keeps the active generation and
+one predecessor (about twice a fresh build on disk).
 
 Example output:
 
@@ -466,7 +467,7 @@ surrounding context to the cross-encoder. When Quill holds the document body,
 this also preserves the indexed version after a source edit or deletion and
 uses extracted PDF text. Vector-only indexes use a bounded source-text read.
 
-### Fast semantic windows (unreleased, on by default)
+### Fast semantic windows (on by default)
 
 The fast tier embeds up to 128 overlapping windows of each file, not just its
 opening. The cap is `indexing.fast_window_max_per_file` in your project
@@ -540,7 +541,7 @@ the BM25 tier matches for it. The BM25 tier also understands:
 `*` is not a wildcard: `quantiz*` searches for the word `quantiz`. To see how
 each word scored for a hit, run `fsfs explain <rank>` after the search.
 
-### Complete generations (unreleased, opt-in)
+### Complete generations (opt-in)
 
 The complete-generation store publishes lexical data, vector tiers, and the
 catalog as one retained bundle. Opt in on the initial build; later commands
@@ -1000,7 +1001,7 @@ Notes:
 - Keep `TwoTierConfig` explicit in code for reproducible behavior across environments.
 - This path is proven with the real models, not doubles: the gate's `facade` stage runs `integration.rs::real_models_two_tier_search_yields_refined_through_the_public_api` (potion fast tier + MiniLM quality tier from the registered cache; INITIAL then REFINED with the quality tier searched). Reproduce locally with `FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 cargo test -p frankensearch --features hybrid --test integration -- real_models`.
 
-### Native ANN on admitted v2 indexes (unreleased, opt-in)
+### Native ANN on admitted v2 indexes (opt-in)
 
 An index opened through `TwoTierIndex::open_admitted_v2_with_paths` can use
 independent native HNSW graphs for fast and quality retrieval. Enable either

@@ -354,6 +354,17 @@ These changes landed after the 2026-10-03 publication; they are not in fsfs
   stage that builds the lite binary and indexes and searches from an empty
   home.
 
+- **Searching while `fsfs watch` runs names the watcher again.** A running
+  watch leaves the generation marked incomplete while it holds the vector
+  files, and that check ran first, so a search from another process failed
+  with "semantic index generation ... is incomplete; resume `fsfs index`",
+  advice that cannot help while the watcher runs. When generation admission
+  fails and another process holds the vector files' writer lock, search now
+  reports the writer (as bd-vht3y intended) and adds that a store built with
+  `FSFS_COMPLETE_GENERATIONS=1` can be searched while it is watched: on such
+  a store a new file was searchable from another process about 5 seconds
+  after the edit.
+
 - **The Linux release binary can be built for glibc 2.39 (#62).**
   `scripts/build_fsfs_gnu_full_release.sh` builds the standard
   `x86_64-unknown-linux-gnu` binary inside Ubuntu 24.04 and refuses the
