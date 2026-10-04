@@ -913,6 +913,36 @@ check_installer_rollback_e2e() {
     FAILURES=$((FAILURES + 1))
   fi
 
+  # A binary linked against a newer glibc fails in the dynamic loader. The
+  # installer must name that cause and the static alternative (GH #62), not
+  # report a version mismatch, and still preserve the incumbent.
+  local glibc_stage="$work/glibc-stage" glibc_archive glibc_digest
+  mkdir -p "$glibc_stage"
+  cat >"$glibc_stage/fsfs" <<'GLIBC_STUB'
+#!/bin/sh
+printf '%s\n' "$0: /lib/x86_64-linux-gnu/libc.so.6: version \`GLIBC_2.38' not found (required by $0)" >&2
+printf '%s\n' "$0: /lib/x86_64-linux-gnu/libm.so.6: version \`GLIBC_2.99' not found (required by $0)" >&2
+exit 1
+GLIBC_STUB
+  chmod 0755 "$glibc_stage/fsfs"
+  glibc_archive="$work/fsfs-9.9.9-glibc.tar.gz"
+  tar -czf "$glibc_archive" -C "$glibc_stage" fsfs
+  glibc_digest=$(installer_file_digest "$glibc_archive")
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --lite --version v9.9.9 \
+    --artifact-url "$glibc_archive" --checksum "$glibc_digest" --dest "$dest" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"install.verify.glibc_too_old"* \
+    && "$output" == *"needs glibc 2.99"* \
+    && ( "$output" == *"install.sh --from-source"* || "$output" == *"source build cannot help"* ) \
+    && "$output" != *"install.verify.version_mismatch"* ]] \
+    && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]]; then
+    echo "[installer][OK]   a glibc-too-new binary is diagnosed and preserves the incumbent"
+  else
+    echo "[installer][FAIL] glibc loader failure status=$status output=$output"
+    FAILURES=$((FAILURES + 1))
+  fi
+
   # Fault injection affects only the filesystem operation being tested. The
   # real installer must refuse a failed backup, and restore the real backup
   # after a publication command has already damaged the destination.

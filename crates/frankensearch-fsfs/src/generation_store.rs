@@ -697,7 +697,10 @@ fn open_existing_pin_read_only(root: &Path, id: &str) -> std::io::Result<File> {
 /// The pin file handle a reader or collector locks: read-write (creating it)
 /// when it may, else the existing file read-only. `Err` carries both causes.
 #[cfg(unix)]
-fn lockable_pin_file(root: &Path, id: &str) -> Result<File, (std::io::Error, Option<std::io::Error>)> {
+fn lockable_pin_file(
+    root: &Path,
+    id: &str,
+) -> Result<File, (std::io::Error, Option<std::io::Error>)> {
     match open_pin_file(root, id) {
         Ok(file) => Ok(file),
         Err(error)

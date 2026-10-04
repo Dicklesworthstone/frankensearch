@@ -329,6 +329,35 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
+## Unreleased changes after fsfs 1.12.1 / frankensearch 0.7.1
+
+These changes landed after the 2026-10-03 publication; they are not in fsfs
+1.12.1 or the 0.7.1 crates.
+
+- **A complete-generation reader without write access keeps its
+  generation ([#60](https://github.com/Dicklesworthstone/frankensearch/issues/60)).**
+  A reader that could not open its pin file read-write (another user's
+  store, a read-only mount) was admitted with no pin at all, so the owner's
+  next publication could remove the generation it was reading. The reader
+  now takes the same shared lock through a read-only handle, which `flock`
+  allows, and the owner creates pin files as readable as the rest of the
+  store (mode 0644 under its umask). A reader that cannot open the pin file
+  at all is refused with a `PermissionDenied` error that names the fix,
+  instead of being admitted unpinned. Same-user readers are unchanged.
+
+- **The installer says when a host's glibc is too old.** The standard Linux
+  build needs glibc 2.43 (#62), so on Ubuntu 22.04 or 24.04 the downloaded
+  binary fails in the dynamic loader, and the installer reported only that
+  the candidate did not report the expected version. It now reads the
+  loader's message and reports `install.verify.glibc_too_old` with the
+  required and installed glibc versions. On glibc 2.38 or newer it suggests
+  `install.sh --from-source`; below 2.38 it says a source build cannot help
+  either, because the bundled ONNX Runtime archive itself needs glibc 2.38.
+  The existing installation is still left in place. Checked on Ubuntu 22.04
+  (glibc 2.35) with the v1.10.0 standard archive.
+
+---
+
 ## frankensearch 0.7.0 / fsfs 1.12.0 — release preparation
 
 Minor-version release of the whole library family plus the next fsfs binary:

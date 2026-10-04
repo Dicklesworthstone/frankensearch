@@ -552,8 +552,16 @@ provision_default_semantic_models() {
   ok "Default search model artifacts are present and verified."
 }
 
+# Highest glibc symbol version a dynamic-loader failure names, e.g. "2.43" from
+# "version `GLIBC_2.43' not found (required by fsfs)"; empty for any other output.
+glibc_requirement_from_loader_error() {
+  printf '%s\n' "$1" \
+    | sed -n 's/.*version .GLIBC_\([0-9][0-9]*\.[0-9][0-9]*\). not found.*/\1/p' \
+    | sort -t. -k1,1n -k2,2n | tail -n 1
+}
+
 verify_staged_binary() {
-  local staged_binary="$1" version_output=""
+  local staged_binary="$1" version_output="" required_glibc="" host_glibc=""
   if [ -z "$VERSION" ]; then
     err "install.verify.version_mismatch: an expected version is required; nothing was replaced"
     return 1
@@ -565,6 +573,19 @@ verify_staged_binary() {
         return 0
         ;;
     esac
+  fi
+  required_glibc=$(glibc_requirement_from_loader_error "$version_output")
+  if [ -n "$required_glibc" ]; then
+    host_glibc=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
+    err "install.verify.glibc_too_old: this ${BINARY_NAME} build needs glibc ${required_glibc}, but this host has glibc ${host_glibc:-older than that}. The existing fsfs installation was not replaced."
+    # The bundled ONNX Runtime archive itself needs glibc 2.38 (C23 strtol
+    # family), so a source build only helps from there up (GH #62).
+    if [ -n "$host_glibc" ] && [ "$(printf '%s\n2.38\n' "$host_glibc" | sort -t. -k1,1n -k2,2n | head -n 1)" = "2.38" ]; then
+      err "  Build it from source on this host instead (about 20 minutes): install.sh --from-source"
+    else
+      err "  A source build cannot help either: the bundled ONNX Runtime needs glibc 2.38 or newer (GH #62)."
+    fi
+    return 1
   fi
   err "install.verify.version_mismatch: candidate must report ${BINARY_NAME} ${VERSION#v}. The existing fsfs installation was not replaced."
   return 1
