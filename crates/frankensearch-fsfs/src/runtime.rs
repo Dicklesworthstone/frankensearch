@@ -800,6 +800,29 @@ const fn daemon_spawn_suppressed() -> bool {
     false
 }
 
+/// Refuse a daemon socket path the platform cannot bind (`sun_path` is 108
+/// bytes on Linux and 104 on macOS, including the terminating NUL) before
+/// spawning a daemon that could never answer: the caller then searches in
+/// process at once instead of after the readiness timeout. A long macOS user
+/// name is enough to reach the limit under `~/Library/Caches`.
+#[cfg(unix)]
+fn ensure_daemon_socket_path_fits(socket_path: &Path) -> SearchResult<()> {
+    let capacity =
+        std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let length = socket_path.as_os_str().len();
+    if length < capacity {
+        return Ok(());
+    }
+    Err(SearchError::InvalidConfig {
+        field: "cli.daemon_socket".to_owned(),
+        value: socket_path.display().to_string(),
+        reason: format!(
+            "the daemon socket path is {length} bytes, but Unix sockets allow at most {}; pass --daemon-socket with a shorter path to keep a warm daemon",
+            capacity - 1
+        ),
+    })
+}
+
 /// The query daemon closed or reset the connection, as opposed to a local
 /// transport fault.
 #[cfg(unix)]
@@ -2926,7 +2949,9 @@ struct LiveIngestPipeline {
 /// The membership a generation built with fast windows must keep exact for
 /// search: each semantic source's window plan, its rows, and the sentinel
 /// that counts them. Loaded when watch starts, marked incomplete while a batch
-/// mutates rows, and republished after the batch's lexical commit.
+/// mutates rows, and republished after the batch's lexical commit. A
+/// lexical-only watch keeps the same source manifests for `delete`, `status`
+/// and reuse ([`LexicalOnlyWatchIngest`]).
 struct LiveWindowMembership {
     runtime: FsfsRuntime,
     index_root: PathBuf,
@@ -3172,12 +3197,17 @@ async fn apply_watched_lexical_upsert(
 }
 
 /// Watch-mode ingest for a lexical-only generation (a build without semantic
-/// loaders): it keeps the keyword index current and has no vector tier to
-/// mirror (bd-hu41r).
+/// loaders): it keeps the keyword index and the source manifests current and
+/// has no vector tier to mirror (bd-hu41r). `fsfs delete` finds a lexical-only
+/// source through those manifests, so a watched file must be recorded there.
 struct LexicalOnlyWatchIngest {
     target_root: PathBuf,
     lexical_index: QuillIndex,
     canonicalizer: DefaultCanonicalizer,
+    membership: LiveWindowMembership,
+    /// Set when a batch recorded or forgot a source, so its membership is
+    /// republished after the batch's keyword commit.
+    membership_changed: AtomicBool,
 }
 
 impl WatchIngestPipeline for LexicalOnlyWatchIngest {
@@ -3195,11 +3225,13 @@ impl WatchIngestPipeline for LexicalOnlyWatchIngest {
 }
 
 impl LexicalOnlyWatchIngest {
-    fn new(target_root: PathBuf, lexical_index: QuillIndex) -> Self {
+    fn new(target_root: PathBuf, lexical_index: QuillIndex, membership: LiveWindowMembership) -> Self {
         Self {
             target_root,
             lexical_index,
             canonicalizer: DefaultCanonicalizer::default(),
+            membership,
+            membership_changed: AtomicBool::new(false),
         }
     }
 
@@ -3241,6 +3273,10 @@ impl LexicalOnlyWatchIngest {
                 );
             }
         }
+        // The manifests describe published rows, so they follow the commit.
+        if self.membership_changed.swap(false, Ordering::SeqCst) {
+            self.membership.publish()?;
+        }
         Ok(count)
     }
 
@@ -3248,12 +3284,17 @@ impl LexicalOnlyWatchIngest {
         let backend = QuillLexicalBackend::new(&self.lexical_index);
         let mut pipeline = LexicalPipeline::new(backend);
         let _stats = pipeline.apply_incremental(&[LexicalMutation::delete(
-            rel_key,
+            rel_key.clone(),
             0,
             IngestionClass::Skip,
             "watch_delete",
         )])?;
-        pipeline.backend_mut().flush(cx).await
+        pipeline.backend_mut().flush(cx).await?;
+        if self.membership.records(&rel_key) {
+            self.membership.forget(&rel_key);
+            self.membership_changed.store(true, Ordering::SeqCst);
+        }
+        Ok(())
     }
 
     /// Reindex one watched file and report whether its keyword row changed.
@@ -3325,7 +3366,7 @@ impl LexicalOnlyWatchIngest {
             LEXICAL_CANONICALIZER.canonicalize(&text)
         };
         let mut mutation = LexicalMutation::upsert(
-            rel_key,
+            rel_key.clone(),
             u64::try_from(revision).unwrap_or(0),
             ingestion_class,
             lexical_text,
@@ -3334,6 +3375,17 @@ impl LexicalOnlyWatchIngest {
         mutation.title.clone_from(&doc.title);
         mutation.metadata.clone_from(&doc.metadata);
         let unchanged = apply_watched_lexical_upsert(cx, &self.lexical_index, mutation).await?;
+        if !unchanged || !self.membership.records(&rel_key) {
+            self.membership.record(IndexManifestEntry {
+                file_key: rel_key,
+                revision,
+                ingestion_class: ingestion_class_label(ingestion_class).to_owned(),
+                canonical_bytes: u64::try_from(canonical.len()).unwrap_or(u64::MAX),
+                reason_code: ingestion_plan_reason(ingestion_class).to_owned(),
+                fast_windows: None,
+            });
+            self.membership_changed.store(true, Ordering::SeqCst);
+        }
         Ok(!unchanged)
     }
 }
@@ -7914,6 +7966,7 @@ impl FsfsRuntime {
         shutdown: Option<&ShutdownCoordinator>,
     ) -> SearchResult<()> {
         let socket_path = self.resolve_daemon_socket_path()?;
+        ensure_daemon_socket_path_fits(&socket_path)?;
         if let Some(parent) = socket_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -8883,6 +8936,7 @@ impl FsfsRuntime {
                 SearchExecutionMode::Full,
             )?;
             let socket_path = self.resolve_daemon_socket_path()?;
+            ensure_daemon_socket_path_fits(&socket_path)?;
             let mut stream = if let Ok(stream) = UnixStream::connect(&socket_path) {
                 stream
             } else {
@@ -21237,12 +21291,27 @@ impl FsfsRuntime {
             },
         )
         .await?;
+        let rebuild = |what: &str| SearchError::InvalidConfig {
+            field: "index.lexical_only_membership".to_owned(),
+            value: index_root.display().to_string(),
+            reason: format!("this lexical-only generation has no {what}; rebuild it with `fsfs index`"),
+        };
+        let manifests = Self::read_matching_manifest_generation(index_root)?
+            .ok_or_else(|| rebuild("matching source manifests"))?;
+        let sentinel =
+            Self::read_index_sentinel(index_root)?.ok_or_else(|| rebuild("completion sentinel"))?;
+        let membership = LiveWindowMembership {
+            runtime: self.clone(),
+            index_root: index_root.to_path_buf(),
+            max_per_file: 1,
+            state: std::sync::Mutex::new((manifests, sentinel)),
+        };
         info!(
             target_root = %target_root.display(),
             index_root = %index_root.display(),
             "lexical-only ingest pipeline initialized for watch mode"
         );
-        Ok(LexicalOnlyWatchIngest::new(target_root, lexical_index))
+        Ok(LexicalOnlyWatchIngest::new(target_root, lexical_index, membership))
     }
 
     /// Leave warm reuse evidence behind a cleanly stopped windowed session
@@ -31942,6 +32011,50 @@ mod tests {
         });
     }
 
+    /// A socket path longer than `sun_path` is refused before a daemon is
+    /// spawned, with the `cli.daemon_socket` error search falls back on,
+    /// instead of after the readiness timeout of a daemon that cannot bind.
+    #[cfg(unix)]
+    #[test]
+    fn overlong_daemon_socket_is_refused_before_spawning() {
+        let capacity = std::mem::size_of::<libc::sockaddr_un>()
+            - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        let path_of = |length: usize| PathBuf::from(format!("/{}", "s".repeat(length - 1)));
+        super::ensure_daemon_socket_path_fits(&path_of(capacity - 1))
+            .expect("the longest bindable path fits");
+        assert!(matches!(
+            super::ensure_daemon_socket_path_fits(&path_of(capacity)),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "cli.daemon_socket"
+        ));
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("daemon socket tempdir");
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                daemon: true,
+                daemon_socket: Some(directory.path().join("d".repeat(capacity))),
+                index_dir: Some(directory.path().join("index")),
+                ..CliInput::default()
+            });
+            let _suppression = super::DaemonSpawnSuppression::armed();
+            let started = Instant::now();
+            let error = runtime
+                .search_payloads_via_daemon_with_sink(&cx, "query", 5, None)
+                .await
+                .expect_err("an overlong socket cannot serve");
+            assert!(
+                matches!(&error, SearchError::InvalidConfig { field, reason, .. }
+                    if field == "cli.daemon_socket" && reason.contains("Unix sockets allow at most")),
+                "{error:?}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "refused after {:?}",
+                started.elapsed()
+            );
+        });
+    }
+
     #[test]
     fn indexing_probe_returns_final_typed_error_after_bounded_retries() {
         run_test_with_cx(|cx| async move {
@@ -40026,7 +40139,8 @@ mod tests {
     /// bd-hu41r: watching a lexical-only generation keeps its keyword index
     /// current through the lexical-only ingest: a new file becomes searchable,
     /// a deleted one disappears and an unchanged replay publishes nothing, while
-    /// a search from another runtime still runs against the live writer.
+    /// a search from another runtime still runs against the live writer. The
+    /// source manifests follow too, so `fsfs delete` finds a watched file.
     #[test]
     fn lexical_only_watch_ingest_keeps_the_keyword_index_current() {
         use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
@@ -40087,35 +40201,83 @@ mod tests {
                 .expect("apply a watch batch");
             assert_eq!(changed, 2, "the unchanged replay of keep.rs publishes nothing");
 
-            let searcher = FsfsRuntime::new(config).with_cli_input(CliInput {
+            // The source manifests follow the watch, so `status` counts the new
+            // file and `delete` can find it.
+            let manifests = FsfsRuntime::read_matching_manifest_generation(&index_root)
+                .expect("read manifests")
+                .expect("matching manifests after a watch batch");
+            assert_eq!(
+                manifests.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["src/keep.rs", "src/new.rs"]
+            );
+            let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
+                .expect("read sentinel")
+                .expect("sentinel after a watch batch");
+            assert_eq!(sentinel.indexed_files, 2);
+            assert!(sentinel.generation_complete);
+
+            let searcher = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
                 command: CliCommand::Search,
-                index_dir: Some(index_root),
+                index_dir: Some(index_root.clone()),
                 ..CliInput::default()
             });
+            let first_hit = |query: &'static str| {
+                let searcher = &searcher;
+                let cx = &cx;
+                async move {
+                    let payloads = searcher
+                        .execute_search_payloads_with_mode(
+                            cx,
+                            query,
+                            5,
+                            SearchExecutionMode::LexicalOnly,
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("search {query}: {error}"));
+                    payloads
+                        .last()
+                        .expect("one phase")
+                        .hits
+                        .first()
+                        .map(|hit| hit.path.clone())
+                }
+            };
             for (query, expected) in [
                 ("new_ocelot", Some("src/new.rs")),
                 ("keep_quokka", Some("src/keep.rs")),
                 ("gone_wombat", None),
             ] {
-                let payloads = searcher
-                    .execute_search_payloads_with_mode(
-                        &cx,
-                        query,
-                        5,
-                        SearchExecutionMode::LexicalOnly,
-                    )
-                    .await
-                    .unwrap_or_else(|error| panic!("search {query}: {error}"));
-                let hits = &payloads.last().expect("one phase").hits;
+                let hit = first_hit(query).await;
                 match expected {
                     Some(path) => assert!(
-                        hits.first().is_some_and(|hit| hit.path.ends_with(path)),
-                        "{query}: {hits:?}"
+                        hit.as_deref().is_some_and(|hit| hit.ends_with(path)),
+                        "{query}: {hit:?}"
                     ),
-                    None => assert!(hits.is_empty(), "{query}: {hits:?}"),
+                    None => assert_eq!(hit, None, "{query}"),
                 }
             }
+
+            // After the watch stops, `fsfs delete` removes a file it added.
             drop(ingest);
+            FsfsRuntime::new(config)
+                .with_cli_input(CliInput {
+                    command: CliCommand::Delete,
+                    index_dir: Some(index_root.clone()),
+                    delete_ids: vec!["src/new.rs".to_owned()],
+                    format: OutputFormat::Json,
+                    ..CliInput::default()
+                })
+                .run_delete_command(&cx)
+                .await
+                .expect("delete a watched file");
+            assert_eq!(first_hit("new_ocelot").await, None);
+            let manifests = FsfsRuntime::read_matching_manifest_generation(&index_root)
+                .expect("read manifests")
+                .expect("matching manifests after delete");
+            assert_eq!(
+                manifests.keys().map(String::as_str).collect::<Vec<_>>(),
+                ["src/keep.rs"]
+            );
         });
     }
 

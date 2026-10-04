@@ -415,6 +415,15 @@ release; every library crate is unchanged from its 0.7.1-line version.
   on both levels of the streaming request, including the immediately
   preceding one (#54).
 
+- **A search no longer waits 2 seconds for a daemon that cannot start.** A
+  Unix socket path is limited to 107 bytes on Linux and 103 on macOS. When
+  the default daemon socket was longer (on macOS a user name of 15 or more
+  characters is enough, under `~/Library/Caches/run`), every `fsfs search`
+  spawned a daemon that could not bind, waited out its 2-second readiness
+  timeout, and then searched in process. Search now checks the length first
+  and searches in process at once; `fsfs serve` reports the limit and the
+  `--daemon-socket` remedy instead of a bare bind error.
+
 ---
 
 ## frankensearch 0.7.0 / fsfs 1.12.0 — release preparation
