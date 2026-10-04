@@ -329,10 +329,11 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
-## Unreleased changes after fsfs 1.12.1 / frankensearch 0.7.1
+## fsfs 1.12.2 — release preparation
 
-These changes landed after the 2026-10-03 publication; they are not in fsfs
-1.12.1 or the 0.7.1 crates.
+These changes landed after the 2026-10-03 publication of fsfs 1.12.1 and the
+0.7.1 crates. Only `frankensearch-fsfs` changed, so 1.12.2 is an fsfs-only
+release; every library crate is unchanged from its 0.7.1-line version.
 
 - **The lite build can index and search (bd-636yz).** Every model-free lite
   binary through 1.12.1 (the musl and Intel macOS assets, `install.sh
