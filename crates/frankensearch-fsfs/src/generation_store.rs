@@ -2,8 +2,11 @@
 //!
 //! A rebuild writes to a fresh directory, not to the serving generation. After
 //! engine-level admission succeeds, an inventory authenticates the entire bundle
-//! and one atomic pointer switch publishes it. Abandoned builds and predecessors
-//! are deliberately retained; neither cancellation nor Drop deletes data.
+//! and one atomic pointer switch publishes it. Publication, cancellation and
+//! Drop never delete data: predecessors and abandoned builds stay until an
+//! explicit retention pass ([`CompleteGenerationStore::collect_retained`])
+//! removes those older than the newest kept predecessors, skipping any
+//! generation a live reader in any process pins.
 //!
 //! This is a cooperative, trusted-directory protocol, not protection against a
 //! hostile process replacing directory ancestors or mutating files outside the
@@ -15,6 +18,7 @@ use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,6 +38,8 @@ pub const COMPLETE_GENERATION_POINTER: &str = "FSFS-CURRENT";
 /// The presence of a sealed inventory makes a generation read-only to writers.
 pub const COMPLETE_GENERATION_MANIFEST: &str = "FSFS-BUNDLE.json";
 const GENERATIONS: &str = "generations";
+/// Per-generation reader pin files; never part of a sealed bundle.
+const READER_PINS: &str = "readers";
 const POINTER_MAGIC: &str = "FSFS-COMPLETE-GENERATION-v1";
 const MAX_POINTER_BYTES: u64 = 256;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
@@ -50,12 +56,34 @@ pub struct CompleteGenerationStore {
 /// One admitted generation. Retaining it pins a directory, not a changing CURRENT.
 ///
 /// All reads for an operation must use this path. Do not resolve CURRENT again
-/// between opening the lexical, vector, catalog, or content artifacts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// between opening the lexical, vector, catalog, or content artifacts. While any
+/// clone lives, retention in every process leaves this generation on disk.
+#[derive(Debug, Clone)]
 pub struct PublishedGeneration {
     path: PathBuf,
     id: String,
     manifest_sha256: String,
+    /// Held only for its lock; dropping the last clone releases the pin.
+    _pin: Option<Arc<GenerationPin>>,
+}
+
+impl PartialEq for PublishedGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.id == other.id
+            && self.manifest_sha256 == other.manifest_sha256
+    }
+}
+
+impl Eq for PublishedGeneration {}
+
+/// A shared `flock(2)` on one generation's pin file under `readers/`, outside
+/// every sealed bundle. Retention deletes a generation only while holding the
+/// exclusive lock, so a live reader in any process keeps its bundle on disk,
+/// and the kernel releases the pin when that process exits.
+#[derive(Debug)]
+struct GenerationPin {
+    _file: File,
 }
 
 impl PublishedGeneration {
@@ -327,10 +355,12 @@ impl GenerationBuild {
                 "selected predecessor changed during rebuild",
             ));
         }
+        let pin = pin_generation(&self.store.root, &self.id)?;
         let generation = PublishedGeneration {
             path: self.path,
             id: self.id,
             manifest_sha256,
+            _pin: pin,
         };
         fs::rename(
             &temporary,
@@ -372,6 +402,387 @@ pub(crate) fn reject_published_write(root: &Path) -> SearchResult<()> {
         ));
     }
     Ok(())
+}
+
+/// Predecessors a complete-generation command keeps after it publishes.
+///
+/// Each generation is a full copy, so one keeps a settled store near twice a
+/// fresh build while leaving the previous generation available to restore.
+pub const RETAINED_PREDECESSORS: usize = 1;
+
+/// What a complete-generation command does with superseded generations after
+/// a durable publication (`FSFS_GENERATION_RETENTION`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GenerationRetention {
+    /// Remove generations older than the [`RETAINED_PREDECESSORS`] newest
+    /// predecessors, and abandoned builds, unless a live reader pins them.
+    #[default]
+    Collect,
+    /// Report what `Collect` would remove; remove nothing.
+    Report,
+    /// Keep every generation.
+    Off,
+}
+
+impl GenerationRetention {
+    /// Parse `collect`, `report`, or `off` (ASCII case-insensitive).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "collect" => Some(Self::Collect),
+            "report" => Some(Self::Report),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// The lowercase name `parse` accepts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Collect => "collect",
+            Self::Report => "report",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// What one retention pass keeps or would reclaim. Planning never mutates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionPlan {
+    /// The selected generation, which retention never removes.
+    pub active: Option<String>,
+    /// Sealed unselected generations kept as the newest predecessors.
+    pub retained: Vec<String>,
+    /// Generations a collection would remove, oldest first.
+    pub reclaimable: Vec<ReclaimableGeneration>,
+}
+
+/// One generation directory a retention pass may remove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimableGeneration {
+    /// Generation identifier (its directory name).
+    pub id: String,
+    /// Bytes its directory tree holds.
+    pub bytes: u64,
+    /// False for an abandoned build that never sealed an inventory.
+    pub sealed: bool,
+}
+
+/// What one collection removed and what live readers kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionReport {
+    /// Removed generation identifiers, oldest first.
+    pub removed: Vec<String>,
+    /// Bytes the removed directory trees held.
+    pub reclaimed_bytes: u64,
+    /// Reclaimable generations a live reader still pins.
+    pub pinned: Vec<String>,
+}
+
+impl CompleteGenerationStore {
+    /// Plan retention without changing anything: keep the selection and the
+    /// `keep_predecessors` newest other sealed generations; everything else
+    /// under `generations/` (older sealed generations and abandoned unsealed
+    /// builds) is reclaimable. Only directories named like generations count.
+    ///
+    /// # Errors
+    /// Returns cancellation, malformed-selection, or filesystem errors. A
+    /// malformed selection is never guessed around: nothing is reclaimable
+    /// until it is repaired.
+    pub fn plan_retention(&self, cx: &Cx, keep_predecessors: usize) -> SearchResult<RetentionPlan> {
+        checkpoint(cx)?;
+        let active = match read_pointer(&self.root)? {
+            Some(pointer) => Some(decode_pointer(&pointer, &self.root)?.0),
+            None => None,
+        };
+        let parent = self.root.join(GENERATIONS);
+        let entries = match fs::read_dir(&parent) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(RetentionPlan {
+                    active,
+                    ..RetentionPlan::default()
+                });
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut sealed = Vec::new();
+        let mut abandoned = Vec::new();
+        for entry in entries {
+            checkpoint(cx)?;
+            let entry = entry?;
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !is_generation_id(&id) || active.as_deref() == Some(id.as_str()) {
+                continue;
+            }
+            if !fs::symlink_metadata(entry.path())?.is_dir() {
+                continue;
+            }
+            if is_sealed(&entry.path())? {
+                sealed.push(id);
+            } else {
+                abandoned.push(id);
+            }
+        }
+        // Identifiers start with a fixed-width creation timestamp, and builds
+        // are serialized by the publication lease, so this is publication order.
+        sealed.sort_unstable_by(|left, right| right.cmp(left));
+        let older = sealed.split_off(keep_predecessors.min(sealed.len()));
+        let mut reclaimable = Vec::with_capacity(older.len() + abandoned.len());
+        for (id, is_sealed) in older
+            .into_iter()
+            .map(|id| (id, true))
+            .chain(abandoned.into_iter().map(|id| (id, false)))
+        {
+            let bytes = tree_bytes(cx, &parent.join(&id), 0)?;
+            reclaimable.push(ReclaimableGeneration {
+                id,
+                bytes,
+                sealed: is_sealed,
+            });
+        }
+        reclaimable.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+        Ok(RetentionPlan {
+            active,
+            retained: sealed,
+            reclaimable,
+        })
+    }
+
+    /// Remove what [`Self::plan_retention`] finds reclaimable, under the
+    /// publication lease, skipping any generation a live reader pins.
+    ///
+    /// Holding the lease means no build is in progress, so an unsealed
+    /// directory is an abandoned build, never a running one.
+    ///
+    /// # Errors
+    /// Returns lease contention (a build is running), cancellation,
+    /// malformed-selection, or filesystem errors; generations removed before
+    /// an error stay removed.
+    pub fn collect_retained(
+        &self,
+        cx: &Cx,
+        keep_predecessors: usize,
+    ) -> SearchResult<RetentionReport> {
+        checkpoint(cx)?;
+        let lease = PublicationLease::acquire(&self.root)?;
+        lease.fence("complete-generation retention")?;
+        let plan = self.plan_retention(cx, keep_predecessors)?;
+        let parent = self.root.join(GENERATIONS);
+        let mut report = RetentionReport::default();
+        for generation in plan.reclaimable {
+            checkpoint(cx)?;
+            lease.fence("complete-generation retention removal")?;
+            // Readers pin only sealed generations; an abandoned build has none.
+            let exclusive = if generation.sealed {
+                match exclusive_pin(&self.root, &generation.id)? {
+                    Some(pin) => Some(pin),
+                    None => {
+                        report.pinned.push(generation.id);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
+            let path = parent.join(&generation.id);
+            require_directory(&path)?;
+            fs::remove_dir_all(&path)?;
+            if exclusive.is_some() {
+                match fs::remove_file(self.root.join(READER_PINS).join(pin_name(&generation.id))) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            drop(exclusive);
+            report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(generation.bytes);
+            report.removed.push(generation.id);
+        }
+        if !report.removed.is_empty() {
+            File::open(&parent)?.sync_all()?;
+        }
+        Ok(report)
+    }
+}
+
+/// Whether `name` has the exact shape [`CompleteGenerationStore::begin`] mints.
+fn is_generation_id(name: &str) -> bool {
+    let mut parts = name.split('-');
+    parts.next() == Some("g")
+        && parts.next().is_some_and(|part| hex(part, 32))
+        && parts.next().is_some_and(|part| hex(part, 8))
+        && parts.next().is_some_and(|part| hex(part, 16))
+        && parts.next().is_none()
+}
+
+fn pin_name(id: &str) -> String {
+    format!("{id}.pin")
+}
+
+#[cfg(unix)]
+fn no_follow_flag() -> std::io::Result<i32> {
+    i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).map_err(|_| {
+        std::io::Error::new(
+            ErrorKind::Unsupported,
+            "O_NOFOLLOW does not fit the open(2) flag word on this target",
+        )
+    })
+}
+
+#[cfg(unix)]
+fn require_pin_directory(directory: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(directory)?.is_dir() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "reader pin directory is not a non-symlink directory",
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn require_regular_pin(file: File) -> std::io::Result<File> {
+    if file.metadata()?.file_type().is_file() {
+        Ok(file)
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "reader pin is not a regular file",
+        ))
+    }
+}
+
+/// Open (creating if needed) one generation's pin file read-write. A new pin
+/// file is as readable as the rest of the store (mode 0644 under the owner's
+/// umask), so a reader without write access can still lock it shared through
+/// [`open_existing_pin_read_only`].
+#[cfg(unix)]
+fn open_pin_file(root: &Path, id: &str) -> std::io::Result<File> {
+    let directory = root.join(READER_PINS);
+    match fs::create_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    require_pin_directory(&directory)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o644)
+        .custom_flags(no_follow_flag()?)
+        .open(directory.join(pin_name(id)))?;
+    require_regular_pin(file)
+}
+
+/// Open an existing pin file read-only: `flock(2)` needs no write access, so
+/// this pins as firmly as a read-write handle on the same inode.
+#[cfg(unix)]
+fn open_existing_pin_read_only(root: &Path, id: &str) -> std::io::Result<File> {
+    let directory = root.join(READER_PINS);
+    require_pin_directory(&directory)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(no_follow_flag()?)
+        .open(directory.join(pin_name(id)))?;
+    require_regular_pin(file)
+}
+
+/// The pin file handle a reader or collector locks: read-write (creating it)
+/// when it may, else the existing file read-only. `Err` carries both causes.
+#[cfg(unix)]
+fn lockable_pin_file(root: &Path, id: &str) -> Result<File, (std::io::Error, Option<std::io::Error>)> {
+    match open_pin_file(root, id) {
+        Ok(file) => Ok(file),
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            open_existing_pin_read_only(root, id).map_err(|fallback| (error, Some(fallback)))
+        }
+        Err(error) => Err((error, None)),
+    }
+}
+
+/// Take a shared pin on `id` for as long as the returned handle lives.
+///
+/// A reader without write access to the store (another user, a read-only
+/// mount) locks the existing pin file read-only. A reader that cannot open it
+/// at all is refused rather than admitted unpinned: a writable collector in
+/// another process would otherwise be free to remove the generation (GH #60).
+fn pin_generation(root: &Path, id: &str) -> SearchResult<Option<Arc<GenerationPin>>> {
+    #[cfg(unix)]
+    {
+        let file = match lockable_pin_file(root, id) {
+            Ok(file) => file,
+            Err((error, None)) => return Err(error.into()),
+            Err((write, Some(read))) => {
+                return Err(SearchError::Io(std::io::Error::new(
+                    write.kind(),
+                    format!(
+                        "cannot pin complete generation {id} for reading (read-write: {write}; \
+                         read-only: {read}); without a pin, retention in another process could \
+                         remove it while it is open. Run as the store owner, or have the owner \
+                         publish again so that {READER_PINS}/{id}.pin exists and is readable"
+                    ),
+                )));
+            }
+        };
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)
+            .map_err(|errno| SearchError::Io(std::io::Error::from(errno)))?;
+        Ok(Some(Arc::new(GenerationPin { _file: file })))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, id);
+        Ok(None)
+    }
+}
+
+/// Try to take the exclusive pin retention needs before removing `id`.
+/// `None` means a live reader holds it.
+fn exclusive_pin(root: &Path, id: &str) -> SearchResult<Option<File>> {
+    #[cfg(unix)]
+    {
+        let file = lockable_pin_file(root, id).map_err(|(error, _)| SearchError::Io(error))?;
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Some(file)),
+            Err(rustix::io::Errno::AGAIN) => Ok(None),
+            Err(errno) => Err(SearchError::Io(std::io::Error::from(errno))),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, id);
+        Ok(None)
+    }
+}
+
+/// Bytes held by regular files under `directory`, without following symlinks.
+fn tree_bytes(cx: &Cx, directory: &Path, depth: usize) -> SearchResult<u64> {
+    checkpoint(cx)?;
+    if depth > MAX_TREE_DEPTH {
+        return Err(invalid(directory, "generation tree exceeds depth limit"));
+    }
+    let mut total = 0_u64;
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if metadata.is_dir() {
+            total = total.saturating_add(tree_bytes(cx, &entry.path(), depth + 1)?);
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -852,6 +1263,203 @@ mod tests {
                 panic!("sync: {source}"); // ubs:ignore — cfg(test) assertion: uncertain durability must fail the test.
             }
         }
+    }
+
+    fn generation_names(root: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(root.join(GENERATIONS))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    /// bd-2op1d: retention keeps the selection and the newest predecessors,
+    /// reclaims older sealed generations and abandoned builds, and leaves
+    /// anything not named like a generation alone. Planning changes nothing.
+    #[test]
+    fn retention_keeps_the_newest_predecessors_and_reclaims_the_rest() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let ids = (0..5)
+                .map(|ordinal| publish(&store, &cx, &format!("v{ordinal}")).id().to_owned())
+                .collect::<Vec<_>>();
+            let abandoned = {
+                let build = store.begin(&cx).unwrap();
+                write_bundle(build.path(), "never sealed");
+                build
+                    .path()
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            fs::create_dir(root.path().join(GENERATIONS).join("operator-notes")).unwrap();
+            let before = generation_names(root.path());
+
+            let plan = store.plan_retention(&cx, 2).unwrap();
+            assert_eq!(plan.active.as_deref(), Some(ids[4].as_str()));
+            assert_eq!(plan.retained, [ids[3].clone(), ids[2].clone()]);
+            let reclaimable = plan
+                .reclaimable
+                .iter()
+                .map(|generation| (generation.id.clone(), generation.sealed))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                reclaimable,
+                [
+                    (ids[0].clone(), true),
+                    (ids[1].clone(), true),
+                    (abandoned.clone(), false)
+                ]
+            );
+            assert!(
+                plan.reclaimable
+                    .iter()
+                    .all(|generation| generation.bytes > 0)
+            );
+            assert_eq!(
+                generation_names(root.path()),
+                before,
+                "planning is a dry run"
+            );
+
+            let report = store.collect_retained(&cx, 2).unwrap();
+            assert_eq!(report.removed, [ids[0].clone(), ids[1].clone(), abandoned]);
+            assert!(report.pinned.is_empty());
+            assert_eq!(
+                report.reclaimed_bytes,
+                plan.reclaimable
+                    .iter()
+                    .map(|generation| generation.bytes)
+                    .sum::<u64>()
+            );
+            let mut kept = vec![
+                ids[2].clone(),
+                ids[3].clone(),
+                ids[4].clone(),
+                "operator-notes".to_owned(),
+            ];
+            kept.sort_unstable();
+            assert_eq!(generation_names(root.path()), kept);
+            assert_eq!(store.active(&cx).unwrap().unwrap().id(), ids[4]);
+            assert!(store.plan_retention(&cx, 2).unwrap().reclaimable.is_empty());
+        });
+    }
+
+    /// bd-2op1d: a generation a live reader holds is never removed, and it
+    /// becomes reclaimable as soon as that reader is gone.
+    #[test]
+    fn retention_never_removes_a_generation_a_live_reader_pins() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "first"));
+            let reader = store.active(&cx).unwrap().unwrap();
+            let pinned = reader.id().to_owned();
+            let second = publish(&store, &cx, "second").id().to_owned();
+            drop(publish(&store, &cx, "third"));
+
+            let report = store.collect_retained(&cx, 0).unwrap();
+            assert_eq!(report.removed, [second]);
+            assert_eq!(report.pinned, std::slice::from_ref(&pinned));
+            assert!(reader.path().join(COMPLETE_GENERATION_MANIFEST).is_file());
+
+            drop(reader);
+            let report = store.collect_retained(&cx, 0).unwrap();
+            assert_eq!(report.removed, [pinned]);
+            assert!(report.pinned.is_empty());
+        });
+    }
+
+    /// GH #60: a reader without write access to its pin file (another user, a
+    /// read-only mount) still pins with a read-only handle, so a writable
+    /// collector keeps G0 through the publication of G1 and G2.
+    #[test]
+    fn a_reader_without_pin_write_access_still_blocks_retention() {
+        use std::os::unix::fs::PermissionsExt;
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let pinned = publish(&store, &cx, "first").id().to_owned();
+            let pin_path = root.path().join(READER_PINS).join(pin_name(&pinned));
+            fs::set_permissions(&pin_path, fs::Permissions::from_mode(0o444)).unwrap();
+            if !rustix::process::geteuid().is_root() {
+                assert_eq!(
+                    open_pin_file(root.path(), &pinned).unwrap_err().kind(),
+                    ErrorKind::PermissionDenied,
+                    "the reader below must take the read-only path"
+                );
+            }
+            let reader = store.active(&cx).unwrap().unwrap();
+            assert_eq!(reader.id(), pinned);
+            let second = publish(&store, &cx, "second").id().to_owned();
+            drop(publish(&store, &cx, "third"));
+
+            let report = store.collect_retained(&cx, 1).unwrap();
+            assert!(report.removed.is_empty());
+            assert_eq!(report.pinned, std::slice::from_ref(&pinned));
+            assert!(reader.path().join(COMPLETE_GENERATION_MANIFEST).is_file());
+            let readmitted = store
+                .open_retained(&cx, &pinned, reader.manifest_sha256())
+                .unwrap();
+            assert_eq!(readmitted, reader);
+            drop(readmitted);
+
+            drop(reader);
+            let report = store.collect_retained(&cx, 1).unwrap();
+            assert_eq!(report.removed, [pinned]);
+            assert!(report.pinned.is_empty());
+            assert!(generation_names(root.path()).contains(&second));
+        });
+    }
+
+    /// GH #60: a reader that cannot open the pin file at all is refused with
+    /// a typed error, never admitted unpinned.
+    #[test]
+    fn a_reader_that_cannot_open_its_pin_is_refused_not_admitted_unpinned() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            // Root opens a mode-0000 file, so the refusal is unreachable here.
+            return;
+        }
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let id = publish(&store, &cx, "first").id().to_owned();
+            let pin_path = root.path().join(READER_PINS).join(pin_name(&id));
+            fs::set_permissions(&pin_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+            let error = store.active(&cx).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::Io(io)
+                        if io.kind() == ErrorKind::PermissionDenied
+                            && io.to_string().contains("cannot pin complete generation")
+                ),
+                "{error:?}"
+            );
+
+            fs::set_permissions(&pin_path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(store.active(&cx).unwrap().unwrap().id(), id);
+        });
+    }
+
+    #[test]
+    fn retention_refuses_to_run_while_a_build_holds_the_lease() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "first"));
+            drop(publish(&store, &cx, "second"));
+            let build = store.begin(&cx).unwrap();
+            let before = generation_names(root.path());
+            assert!(store.collect_retained(&cx, 0).is_err());
+            assert_eq!(generation_names(root.path()), before);
+            drop(build);
+        });
     }
 
     #[test]

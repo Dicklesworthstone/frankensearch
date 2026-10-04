@@ -268,12 +268,17 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         "FSFS_COMPLETE_GENERATIONS",
     )?
     .unwrap_or(false);
+    // What a complete-store publication does with superseded generations:
+    // collect (default), report (dry run), or off.
+    let generation_retention = parse_generation_retention(&env_map)?;
     let mut resolved_config = loaded.config;
     if runtime_cli_input.watch {
         resolved_config.indexing.watch_mode = true;
     }
     let cli_quiet = runtime_cli_input.quiet;
-    let app_runtime = FsfsRuntime::new(resolved_config).with_cli_input(runtime_cli_input);
+    let app_runtime = FsfsRuntime::new(resolved_config)
+        .with_cli_input(runtime_cli_input)
+        .with_generation_retention(generation_retention);
     #[cfg(feature = "embedded-models")]
     let app_runtime = app_runtime.with_bundled_model_materializer(std::env::current_exe()?);
     let interface_mode = match command {
@@ -1170,6 +1175,26 @@ fn apply_cli_env_overrides(
     }
 
     Ok(())
+}
+
+fn parse_generation_retention(
+    env_map: &HashMap<String, String>,
+) -> SearchResult<frankensearch_fsfs::generation_store::GenerationRetention> {
+    use frankensearch_fsfs::generation_store::GenerationRetention;
+    const CANONICAL: &str = "FRANKENSEARCH_GENERATION_RETENTION";
+    const LEGACY: &str = "FSFS_GENERATION_RETENTION";
+    let Some((name, value)) = env_map
+        .get(CANONICAL)
+        .map(|value| (CANONICAL, value))
+        .or_else(|| env_map.get(LEGACY).map(|value| (LEGACY, value)))
+    else {
+        return Ok(GenerationRetention::default());
+    };
+    GenerationRetention::parse(value).ok_or_else(|| SearchError::InvalidConfig {
+        field: name.to_owned(),
+        value: value.clone(),
+        reason: "expected collect, report, or off".to_owned(),
+    })
 }
 
 fn parse_env_bool(
