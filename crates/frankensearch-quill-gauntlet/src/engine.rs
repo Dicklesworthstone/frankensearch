@@ -12950,6 +12950,38 @@ mod tests {
 
         const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(2);
 
+        /// Fail a missed rendezvous with what the writer did instead (GH #65):
+        /// returned without syncing, failed, panicked, or arrived late. The
+        /// deadline is unchanged; the late arrival is only observed.
+        fn missed_rendezvous<T>(
+            role: &str,
+            writer: std::thread::JoinHandle<Result<T, GauntletError>>,
+            events: &mpsc::Receiver<&'static str>,
+        ) -> ! {
+            const LATE_OBSERVATION: Duration = Duration::from_secs(30);
+            let outcome = if writer.is_finished() {
+                match writer.join() {
+                    Ok(Ok(_)) => "returned success without reaching its directory sync".to_owned(),
+                    Ok(Err(error)) => format!("returned an error: {error}"),
+                    Err(_) => "panicked".to_owned(),
+                }
+            } else {
+                let waited = std::time::Instant::now();
+                events.recv_timeout(LATE_OBSERVATION).map_or_else(
+                    |_| format!("was still running {LATE_OBSERVATION:?} after the deadline"),
+                    |label| {
+                        format!(
+                            "reached the {label} rendezvous {:?} after the deadline",
+                            waited.elapsed()
+                        )
+                    },
+                )
+            };
+            panic!(
+                "{role} must reach its directory-sync rendezvous within {RENDEZVOUS_TIMEOUT:?}; it {outcome}"
+            );
+        }
+
         let replay = typed_query_test_replay(&[22, 1, 7, 99], TypedQueryTree::MixedHitMiss(1, 7));
         let root = typed_query_replay_test_root("existing-success-directory-sync");
         let sidecar_directory = root.join(TYPED_QUERY_FUZZ_REPLAY_DIRECTORY);
@@ -12991,23 +13023,21 @@ mod tests {
         let winner = std::thread::spawn(move || {
             persist_typed_query_fuzz_replay(&winner_root, &winner_replay)
         });
-        assert_eq!(
-            sync_event_receiver
-                .recv_timeout(RENDEZVOUS_TIMEOUT)
-                .expect("winner must reach the post-rename, pre-directory-sync rendezvous"),
-            "winner"
-        );
+        // The winner parks after its rename, before its directory sync.
+        let Ok(winner_event) = sync_event_receiver.recv_timeout(RENDEZVOUS_TIMEOUT) else {
+            missed_rendezvous("winner", winner, &sync_event_receiver)
+        };
+        assert_eq!(winner_event, "winner");
 
         let loser_root = root.clone();
         let loser_replay = replay.clone();
         let loser =
             std::thread::spawn(move || persist_typed_query_fuzz_replay(&loser_root, &loser_replay));
-        assert_eq!(
-            sync_event_receiver
-                .recv_timeout(RENDEZVOUS_TIMEOUT)
-                .expect("loser must authenticate the existing entry and reach its directory sync"),
-            "loser"
-        );
+        // The loser authenticates the existing entry and reaches its own sync.
+        let Ok(loser_event) = sync_event_receiver.recv_timeout(RENDEZVOUS_TIMEOUT) else {
+            missed_rendezvous("loser", loser, &sync_event_receiver)
+        };
+        assert_eq!(loser_event, "loser");
         assert!(
             !loser.is_finished(),
             "loser must not return before its own held-directory sync completes"
