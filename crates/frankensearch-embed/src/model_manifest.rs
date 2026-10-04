@@ -71,12 +71,25 @@ pub const MODEL_CONFORMANCE_TEXTS_V1: [&str; 4] = [
     "naive cafe Tokyo",
 ];
 
-/// Pinned adapter-level token budget passed to `FastEmbed` 7.0.1.
-#[cfg(feature = "fastembed")]
-pub(crate) const FASTEMBED_MAX_LENGTH_V1: usize = 512;
-/// Exact truncation and padding policy imposed by the pinned `FastEmbed` adapter.
-pub(crate) const FASTEMBED_SEQUENCE_POLICY_V1: &str =
+/// Exact truncation and padding policy of the `MiniLM` quality tier under the
+/// pinned `FastEmbed` adapter. 256 tokens (bd-7651e) embedded code about 2x
+/// faster than 512 with no measured BEIR or code-set loss.
+pub(crate) const FASTEMBED_SEQUENCE_POLICY_256: &str =
+    "max-length=256;longest-first;batch-longest-padding";
+/// Exact truncation and padding policy of every other `FastEmbed` producer.
+pub(crate) const FASTEMBED_SEQUENCE_POLICY_512: &str =
     "max-length=512;longest-first;batch-longest-padding";
+
+/// Token budget the pinned `FastEmbed` 7.1.0 adapter passes for a registered
+/// sequence policy; `None` for a policy it cannot execute.
+#[cfg(feature = "fastembed")]
+pub(crate) fn fastembed_max_length(sequence_policy: &str) -> Option<usize> {
+    match sequence_policy {
+        FASTEMBED_SEQUENCE_POLICY_256 => Some(256),
+        FASTEMBED_SEQUENCE_POLICY_512 => Some(512),
+        _ => None,
+    }
+}
 /// Exact `FastEmbed` plus adapter-level output normalization pipeline.
 pub(crate) const FASTEMBED_OUTPUT_NORMALIZATION_V1: &str =
     "fastembed-l2-eps-1e-12-then-l2-f32-zero-on-degenerate-v1";
@@ -344,16 +357,16 @@ impl ModelArtifactManifestV1 {
         let execution = ModelExecutionContractV1 {
             backend: "fastembed-onnx".to_owned(),
             implementation_revision: format!(
-                "frankensearch-embed-{}+fastembed-7.0.1",
+                "frankensearch-embed-{}+fastembed-7.1.0",
                 env!("CARGO_PKG_VERSION")
             ),
-            protocol_revision: "fastembed-7.0.1+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
+            protocol_revision: "fastembed-7.1.0+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
             numeric_profile: "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1".to_owned(),
             weights_format: "onnx-opset-pinned-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
             model_preprocessing: "bert-tokenizer-special-tokens=true;empty-input=zero-vector"
                 .to_owned(),
-            sequence_policy: FASTEMBED_SEQUENCE_POLICY_V1.to_owned(),
+            sequence_policy: FASTEMBED_SEQUENCE_POLICY_256.to_owned(),
             pooling: "attention-mask-mean-pool-v1".to_owned(),
             output_normalization: FASTEMBED_OUTPUT_NORMALIZATION_V1.to_owned(),
             query_instruction: String::new(),
@@ -401,7 +414,8 @@ impl ModelArtifactManifestV1 {
             weights_format: "safetensors-f32-runtime-int8-linear-v1".to_owned(),
             tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
             model_preprocessing: "bert-special-tokens=true;token-type-ids=zero".to_owned(),
-            sequence_policy: "max-length=512;longest-first;no-padding".to_owned(),
+            // 256 tokens, as the FastEmbed MiniLM tier (bd-7651e).
+            sequence_policy: "max-length=256;longest-first;no-padding".to_owned(),
             pooling: "mean-all-returned-tokens-including-specials-no-padding-v1".to_owned(),
             output_normalization: "l2-f32-if-norm-gt-zero-else-unchanged-v1".to_owned(),
             query_instruction: String::new(),
@@ -1241,16 +1255,16 @@ fn fastembed_execution_contract(
     Ok(ModelExecutionContractV1 {
         backend: "fastembed-onnx".to_owned(),
         implementation_revision: format!(
-            "frankensearch-embed-{}+fastembed-7.0.1:{model_id}",
+            "frankensearch-embed-{}+fastembed-7.1.0:{model_id}",
             env!("CARGO_PKG_VERSION")
         ),
-        protocol_revision: "fastembed-7.0.1+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
+        protocol_revision: "fastembed-7.1.0+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned(),
         numeric_profile: "ort-2.0.0-rc.13-cpu-f32-host-default-intra-threads-v1".to_owned(),
         weights_format: "onnx-opset-pinned-v1".to_owned(),
         tokenizer_family: "huggingface-tokenizers-json-v1".to_owned(),
         model_preprocessing: "model-tokenizer-special-tokens=true;empty-input=zero-vector"
             .to_owned(),
-        sequence_policy: FASTEMBED_SEQUENCE_POLICY_V1.to_owned(),
+        sequence_policy: FASTEMBED_SEQUENCE_POLICY_512.to_owned(),
         pooling: "attention-mask-mean-pool-v1".to_owned(),
         output_normalization: FASTEMBED_OUTPUT_NORMALIZATION_V1.to_owned(),
         query_instruction: String::new(),
@@ -4363,10 +4377,14 @@ mod tests {
         assert_eq!(identity.storage.endianness, "little-endian");
     }
 
-    // Package 0.3.1 changes only these adapters' implementation provenance.
-    // Reconstruct the historical 0.2.7 revision before checking its frozen
-    // fixtures; native frankentorch producers use independently pinned revisions.
-    fn before_adapter_release(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+    // Rewrite the adapter package version of the Potion and FastEmbed
+    // producers; native frankentorch producers use independently pinned
+    // revisions and are returned unchanged.
+    fn with_adapter_package(
+        mut manifest: ModelArtifactManifestV1,
+        from: &str,
+        to: &str,
+    ) -> ModelArtifactManifestV1 {
         if matches!(
             manifest.execution.backend.as_str(),
             "model2vec-native" | "fastembed-onnx"
@@ -4374,26 +4392,40 @@ mod tests {
             let adapter = manifest
                 .execution
                 .implementation_revision
-                .strip_prefix("frankensearch-embed-0.3.1+")
-                .expect("current adapter must identify the actual 0.3.1 package");
+                .strip_prefix(&format!("frankensearch-embed-{from}+"))
+                .unwrap_or_else(|| panic!("adapter must identify the actual {from} package"))
+                .to_owned();
             manifest.execution.implementation_revision =
-                format!("frankensearch-embed-0.2.7+{adapter}");
+                format!("frankensearch-embed-{to}+{adapter}");
         }
         manifest
+    }
+
+    // Package 0.4.0 changes only these adapters' implementation provenance.
+    // Reconstruct the 0.3.1 revision that wrote every index of the 0.3 line.
+    fn before_embed_0_4(manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        with_adapter_package(manifest, "0.4.0", "0.3.1")
+    }
+
+    // Package 0.3.1 changed only these adapters' implementation provenance.
+    // Reconstruct the historical 0.2.7 revision before checking its frozen
+    // fixtures.
+    fn before_adapter_release(manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        with_adapter_package(manifest, "0.3.1", "0.2.7")
     }
 
     #[test]
     fn adapter_release_changes_producer_identity_without_changing_space_or_vectors() {
         use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 
-        assert_eq!(env!("CARGO_PKG_VERSION"), "0.3.1");
+        assert_eq!(env!("CARGO_PKG_VERSION"), "0.4.0");
         for current in [
             ModelArtifactManifestV1::potion_128m_native().unwrap(),
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
         ] {
-            let historical = before_adapter_release(current.clone());
+            let historical = before_adapter_release(before_embed_0_4(current.clone()));
             assert_eq!(
                 current.space_contract_fingerprint().unwrap(),
                 historical.space_contract_fingerprint().unwrap()
@@ -4425,35 +4457,32 @@ mod tests {
                 current.freeze().unwrap().fingerprint,
                 historical.freeze().unwrap().fingerprint
             );
-            // Preserve admission refusal for the immediately preceding adapter
-            // too, without changing its model bytes, space, or certificate.
-            let mut previous = current.clone();
-            let adapter = current
-                .execution
-                .implementation_revision
-                .strip_prefix("frankensearch-embed-0.3.1+")
-                .expect("current adapter identifies this package");
-            previous.execution.implementation_revision =
-                format!("frankensearch-embed-0.3.0+{adapter}");
-            assert_eq!(
-                current.space_contract_fingerprint().unwrap(),
-                previous.space_contract_fingerprint().unwrap()
-            );
-            assert_eq!(
-                current.execution.golden_vectors,
-                previous.execution.golden_vectors
-            );
-            let previous_identity = previous
-                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
-                .unwrap();
-            assert_eq!(
-                current_identity.verify_exact_producer_with(&previous_identity),
-                Err(ProducerCompatibilityErrorV1::CertificateRequired)
-            );
-            assert_ne!(
-                current.freeze().unwrap().fingerprint,
-                previous.freeze().unwrap().fingerprint
-            );
+            // Preserve admission refusal for the 0.3 line's adapters too,
+            // without changing their model bytes, space, or certificate.
+            for previous_package in ["0.3.1", "0.3.0"] {
+                let previous = with_adapter_package(current.clone(), "0.4.0", previous_package);
+                assert_ne!(previous, current);
+                assert_eq!(
+                    current.space_contract_fingerprint().unwrap(),
+                    previous.space_contract_fingerprint().unwrap()
+                );
+                assert_eq!(
+                    current.execution.golden_vectors,
+                    previous.execution.golden_vectors
+                );
+                let previous_identity = previous
+                    .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                    .unwrap();
+                assert_eq!(
+                    current_identity.verify_exact_producer_with(&previous_identity),
+                    Err(ProducerCompatibilityErrorV1::CertificateRequired),
+                    "a {previous_package} adapter must not be admitted as current"
+                );
+                assert_ne!(
+                    current.freeze().unwrap().fingerprint,
+                    previous.freeze().unwrap().fingerprint
+                );
+            }
         }
     }
 
@@ -4500,6 +4529,150 @@ mod tests {
         );
     }
 
+    /// Reconstruct an English `MiniLM` producer before bd-7651e moved it from
+    /// 512 to 256 tokens. Every other producer is returned unchanged.
+    fn before_minilm_256(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        let historical = match (
+            manifest.execution.backend.as_str(),
+            manifest.logical_model_id.as_str(),
+        ) {
+            ("fastembed-onnx", "all-minilm-l6-v2") => {
+                Some((FASTEMBED_SEQUENCE_POLICY_256, FASTEMBED_SEQUENCE_POLICY_512))
+            }
+            ("frankentorch-native-minilm" | "frankentorch-native-minilm-f32", _) => Some((
+                "max-length=256;longest-first;no-padding",
+                "max-length=512;longest-first;no-padding",
+            )),
+            _ => None,
+        };
+        if let Some((current, previous)) = historical {
+            assert_eq!(manifest.execution.sequence_policy, current);
+            previous.clone_into(&mut manifest.execution.sequence_policy);
+        }
+        manifest
+    }
+
+    /// bd-7651e: only the sequence policy moves, so the embedding space and
+    /// every producer fingerprint change, but the conformance texts are far
+    /// shorter than either budget and their certified vectors stay identical.
+    #[test]
+    fn minilm_256_changes_only_the_space_sequence_policy() {
+        for current in [
+            ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch().unwrap(),
+            ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap(),
+        ] {
+            let previous = before_minilm_256(current.clone());
+            assert_ne!(
+                current.space_contract_fingerprint().unwrap(),
+                previous.space_contract_fingerprint().unwrap()
+            );
+            assert_eq!(
+                current.execution.golden_vectors,
+                previous.execution.golden_vectors
+            );
+            let current_identity = current
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            let previous_identity = previous
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            assert_ne!(current_identity.space, previous_identity.space);
+            assert!(
+                current_identity
+                    .verify_exact_producer_with(&previous_identity)
+                    .is_err(),
+                "a 512-token index must never admit the 256-token producer"
+            );
+            let mut restored = current.clone();
+            previous
+                .execution
+                .sequence_policy
+                .clone_into(&mut restored.execution.sequence_policy);
+            assert_eq!(restored, previous, "no other manifest field may drift");
+        }
+        for unchanged in [
+            ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+            ModelArtifactManifestV1::multilingual_minilm_native_frankentorch().unwrap(),
+        ] {
+            assert_eq!(before_minilm_256(unchanged.clone()), unchanged);
+            assert!(
+                unchanged
+                    .execution
+                    .sequence_policy
+                    .starts_with("max-length=512;")
+            );
+        }
+    }
+
+    // Keep the 7.0.1 producer independently of older dependency history.
+    fn before_fastembed_7_1(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
+        if manifest.execution.backend == "fastembed-onnx" {
+            assert!(
+                manifest
+                    .execution
+                    .implementation_revision
+                    .contains("+fastembed-7.1.0")
+            );
+            manifest.execution.implementation_revision = manifest
+                .execution
+                .implementation_revision
+                .replacen("+fastembed-7.1.0", "+fastembed-7.0.1", 1);
+            assert_eq!(
+                manifest.execution.protocol_revision,
+                "fastembed-7.1.0+ort-2.0.0-rc.13-user-defined-onnx-v1"
+            );
+            manifest.execution.protocol_revision =
+                "fastembed-7.0.1+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned();
+        }
+        manifest
+    }
+
+    #[test]
+    fn fastembed_7_1_requires_new_producer_admission_with_unchanged_certificates() {
+        use frankensearch_core::generation::ProducerCompatibilityErrorV1;
+
+        for current in [
+            ModelArtifactManifestV1::minilm_fastembed().unwrap(),
+            ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
+            ModelArtifactManifestV1::nomic_fastembed().unwrap(),
+        ] {
+            let previous = before_fastembed_7_1(current.clone());
+            assert_eq!(current.artifacts, previous.artifacts);
+            assert_eq!(
+                current.execution.golden_vectors,
+                previous.execution.golden_vectors
+            );
+            assert_eq!(
+                current.space_contract_fingerprint().unwrap(),
+                previous.space_contract_fingerprint().unwrap()
+            );
+            let current_identity = current
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            let previous_identity = previous
+                .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+                .unwrap();
+            assert_ne!(current_identity.producer, previous_identity.producer);
+            assert_eq!(
+                current_identity.verify_exact_producer_with(&previous_identity),
+                Err(ProducerCompatibilityErrorV1::CertificateRequired)
+            );
+            let mut restored = previous;
+            restored.execution.implementation_revision = restored
+                .execution
+                .implementation_revision
+                .replacen("+fastembed-7.0.1", "+fastembed-7.1.0", 1);
+            restored.execution.protocol_revision =
+                "fastembed-7.1.0+ort-2.0.0-rc.13-user-defined-onnx-v1".to_owned();
+            assert_eq!(
+                restored, current,
+                "only the dependency producer identity changes"
+            );
+        }
+    }
+
     // Preserve the immediately preceding dependency identity independently of
     // adapter package version and every platform's numerical certificate.
     fn before_fastembed_7(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
@@ -4532,13 +4705,19 @@ mod tests {
             ModelArtifactManifestV1::minilm_fastembed().unwrap(),
             ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
             ModelArtifactManifestV1::nomic_fastembed().unwrap(),
-        ] {
+        ]
+        .map(before_fastembed_7_1)
+        {
+            // Only the FastEmbed segment moves; the adapter package stays.
             let previous = before_fastembed_7(current.clone());
             assert!(
                 previous
                     .execution
                     .implementation_revision
-                    .starts_with("frankensearch-embed-0.3.1+fastembed-6.0.3")
+                    .starts_with(&format!(
+                        "frankensearch-embed-{}+fastembed-6.0.3",
+                        env!("CARGO_PKG_VERSION")
+                    ))
             );
             assert_eq!(current.artifacts, previous.artifacts);
             assert_eq!(
@@ -4592,6 +4771,9 @@ mod tests {
     // qualified Windows output. Current owning-loader tests check the new bits.
     fn before_dependency_refresh(mut manifest: ModelArtifactManifestV1) -> ModelArtifactManifestV1 {
         let current = manifest.freeze().unwrap().fingerprint;
+        manifest = before_embed_0_4(manifest);
+        manifest = before_minilm_256(manifest);
+        manifest = before_fastembed_7_1(manifest);
         manifest = before_fastembed_7(manifest);
         manifest = before_adapter_release(manifest);
         let (current_protocol, previous_protocol) = match manifest.execution.backend.as_str() {
@@ -4756,9 +4938,10 @@ mod tests {
         // previous-version check; all artifact and input fields stay frozen.
         // bd-dsbym: retain every prior fixture verbatim after correcting the
         // Tokenizers/FastEmbed dependency identity. No vector golden changes.
-        // GOLDEN-CHANGE releases 0.3.0/0.3.1: reconstruct the prior 0.2.7 adapter
-        // before checking these exact historical hashes. Production manifests
-        // keep their actual package revision; no historical hash is replaced.
+        // GOLDEN-CHANGE releases 0.3.0/0.3.1/0.4.0: reconstruct the prior 0.2.7
+        // adapter (through 0.3.1) before checking these exact historical
+        // hashes. Production manifests keep their actual package revision; no
+        // historical hash is replaced.
         // GOLDEN-CHANGE Safetensors 0.8.0: Potion's producer protocol now names
         // its actual dependency. The reconstruction restores 0.7.0 alongside
         // the old Tokenizers protocol; artifacts and vector certificates stay exact.
@@ -6144,17 +6327,24 @@ mod tests {
         use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 
         let current = ModelArtifactManifestV1::minilm_native_frankentorch_f32().unwrap();
+        // GOLDEN-CHANGE bd-7651e: the tokenizer refresh is checked from the
+        // 512-token producer that preceded the move to 256 tokens; both of its
+        // fingerprints below are the retained pre-change values.
+        let before_256 = before_minilm_256(current.clone());
         let historical = before_dependency_refresh(current.clone());
         let mut restored = historical.clone();
-        current
+        before_256
             .execution
             .protocol_revision
             .clone_into(&mut restored.execution.protocol_revision);
         assert_eq!(
-            restored, current,
+            restored, before_256,
             "only tokenizer protocol provenance changed"
         );
         let current_identity = current
+            .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
+            .unwrap();
+        let before_256_identity = before_256
             .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
             .unwrap();
         let historical_identity = historical
@@ -6165,16 +6355,23 @@ mod tests {
             "35d0a014b4ec6224eb42552ea1099b24bead0c9c51906b6035207b6105e8af01"
         );
         assert_eq!(
-            current_identity.fingerprint(),
+            before_256_identity.fingerprint(),
             "aa25d24b07a2d233445cb6605c95d33601ea36a044d3a4b2bed65e7590386109"
         );
-        assert_eq!(current_identity.space, historical_identity.space);
+        // GOLDEN-CHANGE bd-7651e: the 256-token space; only sequence_policy moved
+        // (minilm_256_changes_only_the_space_sequence_policy proves that).
+        assert_eq!(
+            current_identity.fingerprint(),
+            "8c37f4cf6f63cdbc937ff7b03369606555e0eb165779c0019b1591fcadaf0860"
+        );
+        assert_eq!(before_256_identity.space, historical_identity.space);
+        assert_ne!(current_identity.space, before_256_identity.space);
         assert_eq!(
             current.execution.golden_vectors,
             historical.execution.golden_vectors
         );
         assert_eq!(
-            current_identity.verify_exact_producer_with(&historical_identity),
+            before_256_identity.verify_exact_producer_with(&historical_identity),
             Err(ProducerCompatibilityErrorV1::CertificateRequired)
         );
     }
@@ -6203,7 +6400,8 @@ mod tests {
                     .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
                     .unwrap()
                     .fingerprint(),
-                "aa25d24b07a2d233445cb6605c95d33601ea36a044d3a4b2bed65e7590386109"
+                // GOLDEN-CHANGE bd-7651e: the current 256-token F32 identity.
+                "8c37f4cf6f63cdbc937ff7b03369606555e0eb165779c0019b1591fcadaf0860"
             );
             TEST_VERIFY_FILE_HASH_CALLS.with(std::cell::Cell::get)
         };

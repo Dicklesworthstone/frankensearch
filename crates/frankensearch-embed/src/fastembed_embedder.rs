@@ -28,8 +28,7 @@ use fastembed::{
 use tracing::instrument;
 
 use crate::model_manifest::{
-    FASTEMBED_MAX_LENGTH_V1, FASTEMBED_OUTPUT_NORMALIZATION_V1, FASTEMBED_SEQUENCE_POLICY_V1,
-    ModelArtifactManifestV1, ModelManifest,
+    FASTEMBED_OUTPUT_NORMALIZATION_V1, ModelArtifactManifestV1, ModelManifest, fastembed_max_length,
 };
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -142,7 +141,7 @@ fn frozen_manifest_for_config(
                 .to_owned(),
         });
     }
-    if manifest.execution.sequence_policy != FASTEMBED_SEQUENCE_POLICY_V1
+    if fastembed_max_length(&manifest.execution.sequence_policy).is_none()
         || manifest.execution.output_normalization != FASTEMBED_OUTPUT_NORMALIZATION_V1
     {
         return Err(SearchError::InvalidConfig {
@@ -300,7 +299,17 @@ impl FastEmbedEmbedder {
         let mut user_model = UserDefinedEmbeddingModel::new(model_bytes, tokenizer_files);
         user_model.pooling = Some(config.pooling);
 
-        let init_options = InitOptionsUserDefined::new().with_max_length(FASTEMBED_MAX_LENGTH_V1);
+        // The registered sequence policy is part of the producer identity, so
+        // the token budget comes from it, never from a global default.
+        let max_length = fastembed_max_length(&frozen_manifest.execution.sequence_policy)
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "fastembed.execution_contract".to_owned(),
+                value: frozen_manifest.logical_model_id.clone(),
+                reason:
+                    "registered sequence policy is not one the pinned FastEmbed adapter executes"
+                        .to_owned(),
+            })?;
+        let init_options = InitOptionsUserDefined::new().with_max_length(max_length);
         let mut text_embedding = TextEmbedding::try_new_from_user_defined(user_model, init_options)
             .map_err(|e| SearchError::ModelLoadFailed {
                 path: model_dir.clone(),
@@ -1115,7 +1124,7 @@ mod tests {
             "naive",
             "semantic",
         ];
-        // Word counts span one token to far past the 512-token truncation.
+        // Word counts span one token to far past the 256-token truncation.
         let texts = [1_usize, 7, 40, 130, 260, 511, 900, 3, 75, 2000, 18, 333]
             .iter()
             .enumerate()
