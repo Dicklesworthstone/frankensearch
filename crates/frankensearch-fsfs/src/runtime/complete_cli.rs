@@ -238,7 +238,7 @@ impl FsfsRuntime {
         let mut reader = Box::pin(self.open_retained_search(cx, root)).await?;
         retained_search_checkpoint(cx)?;
         eprintln!(
-            "fsfs: dashboard is pinned to complete generation {}; reopen it to see a newer generation ('/' to search, 'q' to quit)",
+            "fsfs: dashboard is pinned to complete generation {}; reopen it to see a newer generation (type to search; Esc, then q, to quit)",
             reader.generation().id(),
         );
         // Do not enter generic first-run onboarding: this runtime names a sealed

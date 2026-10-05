@@ -690,18 +690,22 @@ fn configured_runtime(options: &Options) -> SearchResult<Option<FsfsRuntime>> {
 #[cfg(unix)]
 mod terminal {
     use super::{Duration, Event, Screen, SearchResult, View, literal};
-    use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
+    use ftui_backend::{BackendEventSource, BackendFeatures};
     use ftui_core::geometry::Rect;
+    use ftui_core::terminal_capabilities::TerminalCapabilities;
     use ftui_render::grapheme_pool::GraphemePool;
+    use ftui_render::presenter::Presenter;
     use ftui_render::{buffer::Buffer, diff::BufferDiff, frame::Frame};
     use ftui_text::{Line, Text};
     use ftui_tty::{TtyBackend, TtySessionOptions};
     use ftui_widgets::{Widget, paragraph::Paragraph};
 
     pub(super) struct Terminal {
+        // Flush presenter output before the backend restores the terminal.
+        presenter: Presenter<std::io::Stdout>,
         backend: TtyBackend,
-        // ftui-tty 0.7 exposes no presenter pool and presents without one, so
-        // the terminal owns its frames' pool, as the fsfs dashboard does.
+        // The presenter draws without a pool, so the terminal owns its frames'
+        // pool, as the fsfs dashboard does.
         grapheme_pool: GraphemePool,
         previous: Option<(u16, u16, Buffer)>,
     }
@@ -720,7 +724,11 @@ mod terminal {
                     },
                 },
             )?;
+            // The capabilities `TtyBackend::open` detects for its own session.
+            let presenter =
+                Presenter::new(std::io::stdout(), TerminalCapabilities::with_overrides());
             Ok(Self {
+                presenter,
                 backend,
                 grapheme_pool: GraphemePool::new(),
                 previous: None,
@@ -807,10 +815,11 @@ mod terminal {
                 .previous
                 .as_ref()
                 .filter(|(old_width, old_height, _)| *old_width == width && *old_height == height)
-                .map(|(_, _, old)| BufferDiff::compute(old, &buffer));
-            self.backend
-                .presenter()
-                .present_ui(&buffer, diff.as_ref(), diff.is_none())?;
+                .map_or_else(
+                    || BufferDiff::full(width, height),
+                    |(_, _, old)| BufferDiff::compute(old, &buffer),
+                );
+            self.presenter.present(&buffer, &diff)?;
             self.previous = Some((width, height, buffer));
             Ok(())
         }

@@ -424,6 +424,14 @@ release; every library crate is unchanged from its 0.7.1-line version.
   and searches in process at once; `fsfs serve` reports the limit and the
   `--daemon-socket` remedy instead of a bare bind error.
 
+- **Resizing the terminal no longer crashes `fsfs tui`.** The dashboard, and
+  the `frankensearch-ops` console, diffed each frame against the previous one
+  even when the terminal had changed size, and the renderer asserts equal
+  sizes: the first resize exited with code 101 ("buffer widths must match"),
+  in 1.12.1 too. A frame after a resize is now repainted in full. Checked in a
+  real terminal: both repaint after a resize and exit 0 on quit; `fsfs-live`
+  and `fsfs live-search --tui` already handled resizes.
+
 ---
 
 ## frankensearch 0.7.0 / fsfs 1.12.0 — release preparation

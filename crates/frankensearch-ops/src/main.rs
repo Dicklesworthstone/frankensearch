@@ -4,12 +4,14 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
+use ftui_backend::{BackendEventSource, BackendFeatures};
 use ftui_core::event::Event;
+use ftui_core::terminal_capabilities::TerminalCapabilities;
 use ftui_render::buffer::Buffer;
 use ftui_render::diff::BufferDiff;
 use ftui_render::frame::Frame;
 use ftui_render::grapheme_pool::GraphemePool;
+use ftui_render::presenter::Presenter;
 use ftui_tty::{TtyBackend, TtySessionOptions};
 
 use frankensearch_ops::{
@@ -18,6 +20,8 @@ use frankensearch_ops::{
 use frankensearch_tui::InputEvent;
 
 struct TerminalGuard {
+    // Flush presenter output before the backend restores the terminal.
+    presenter: Presenter<io::Stdout>,
     backend: TtyBackend,
 }
 
@@ -38,7 +42,9 @@ impl TerminalGuard {
             },
         };
         let backend = TtyBackend::open(80, 24, options)?;
-        Ok(Self { backend })
+        // The capabilities `TtyBackend::open` detects for its own session.
+        let presenter = Presenter::new(io::stdout(), TerminalCapabilities::with_overrides());
+        Ok(Self { presenter, backend })
     }
 }
 
@@ -175,13 +181,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut frame = Frame::new(width, height, &mut pool);
         app.render(&mut frame);
 
+        // A diff needs equal sizes (it asserts so): after a resize, repaint.
         let diff = prev_buffer
             .as_ref()
-            .map(|prev| BufferDiff::compute(prev, &frame.buffer));
-        terminal
-            .backend
-            .presenter()
-            .present_ui(&frame.buffer, diff.as_ref(), false)?;
+            .filter(|prev| prev.width() == width && prev.height() == height)
+            .map_or_else(
+                || BufferDiff::full(width, height),
+                |prev| BufferDiff::compute(prev, &frame.buffer),
+            );
+        terminal.presenter.present(&frame.buffer, &diff)?;
         prev_buffer = Some(frame.buffer);
 
         let timeout = refresh_every.saturating_sub(last_refresh.elapsed());

@@ -66,8 +66,10 @@ use frankensearch_storage::{
     PipelineConfig, Storage, StorageBackedJobRunner, StorageConfig as PipelineStorageConfig,
 };
 #[cfg(unix)]
-use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
+use ftui_backend::{BackendEventSource, BackendFeatures};
 use ftui_core::event::{Event, KeyCode, Modifiers};
+#[cfg(unix)]
+use ftui_core::terminal_capabilities::TerminalCapabilities;
 use ftui_extras::markdown::{
     MarkdownDetection, MarkdownRenderer, MarkdownTheme, is_likely_markdown,
 };
@@ -80,6 +82,8 @@ use ftui_render::diff::BufferDiff;
 use ftui_render::frame::Frame;
 #[cfg(unix)]
 use ftui_render::grapheme_pool::GraphemePool;
+#[cfg(unix)]
+use ftui_render::presenter::Presenter;
 use ftui_style::Style;
 use ftui_text::search::search_ascii_case_insensitive;
 use ftui_text::{Line, Span, Text, WrapMode};
@@ -21668,7 +21672,9 @@ impl FsfsRuntime {
         }
 
         if self.index_artifacts_exist()? {
-            eprintln!("fsfs: entering search dashboard (press '/' to search, 'q' to quit)");
+            // The query field has focus when the dashboard opens, so a bare
+            // `q` is typed into it.
+            eprintln!("fsfs: entering search dashboard (type to search; Esc, then q, to quit)");
             let start = std::time::Instant::now();
             let result = self.run_search_dashboard_tui(cx).await;
             if let Err(ref error) = result {
@@ -24253,8 +24259,25 @@ impl Drop for TerminalRenderGuard {
     }
 }
 
+/// The diff that presents `current` after `previous`: exact when the sizes
+/// match and a full repaint otherwise. A diff asserts equal sizes, so
+/// resizing the terminal used to crash the dashboard.
+#[cfg(unix)]
+fn frame_diff(previous: Option<&Buffer>, current: &Buffer) -> BufferDiff {
+    previous
+        .filter(|previous| {
+            previous.width() == current.width() && previous.height() == current.height()
+        })
+        .map_or_else(
+            || BufferDiff::full(current.width(), current.height()),
+            |previous| BufferDiff::compute(previous, current),
+        )
+}
+
 #[cfg(unix)]
 struct FtuiSession {
+    // Flush presenter output before the backend restores the terminal.
+    presenter: Presenter<std::io::Stdout>,
     backend: TtyBackend,
     grapheme_pool: GraphemePool,
     previous_buffer: Option<Buffer>,
@@ -24273,7 +24296,10 @@ impl FtuiSession {
         };
         let backend = TtyBackend::open(80, 24, options)
             .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
+        // The capabilities `TtyBackend::open` detects for its own session.
+        let presenter = Presenter::new(std::io::stdout(), TerminalCapabilities::with_overrides());
         Ok(Self {
+            presenter,
             backend,
             grapheme_pool: GraphemePool::new(),
             previous_buffer: None,
@@ -24287,13 +24313,9 @@ impl FtuiSession {
             .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
         let mut frame = Frame::new(width, height, &mut self.grapheme_pool);
         renderer(&mut frame);
-        let diff = self
-            .previous_buffer
-            .as_ref()
-            .map(|previous| BufferDiff::compute(previous, &frame.buffer));
-        self.backend
-            .presenter()
-            .present_ui(&frame.buffer, diff.as_ref(), false)
+        let diff = frame_diff(self.previous_buffer.as_ref(), &frame.buffer);
+        self.presenter
+            .present(&frame.buffer, &diff)
             .map_err(|error| tui_subsystem_error("fsfs.tui.ftui", error.to_string()))?;
         self.previous_buffer = Some(frame.buffer);
         Ok(())
@@ -32009,6 +32031,24 @@ mod tests {
                 "cancel must not wait out the full daemon connect retry budget"
             );
         });
+    }
+
+    /// Resizing the terminal repaints instead of diffing buffers of different
+    /// sizes: `BufferDiff::compute` asserts equal sizes, and the dashboard
+    /// exited 101 ("buffer widths must match") on the first resize.
+    #[cfg(unix)]
+    #[test]
+    fn dashboard_frame_diff_repaints_after_a_resize() {
+        use ftui_render::{buffer::Buffer, diff::BufferDiff};
+        let full = BufferDiff::full(120, 40).len();
+        assert!(full > 0);
+        let resized = super::frame_diff(Some(&Buffer::new(100, 30)), &Buffer::new(120, 40));
+        assert_eq!(resized.len(), full, "a resize repaints every cell");
+        assert_eq!(super::frame_diff(None, &Buffer::new(120, 40)).len(), full);
+        assert!(
+            super::frame_diff(Some(&Buffer::new(120, 40)), &Buffer::new(120, 40)).is_empty(),
+            "an unchanged frame of the same size sends nothing"
+        );
     }
 
     /// A socket path longer than `sun_path` is refused before a daemon is

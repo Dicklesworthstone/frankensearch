@@ -17,9 +17,10 @@ use asupersync::Cx;
 use asupersync::types::CancelKind;
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::FsfsRuntime;
-use ftui_backend::{Backend, BackendEventSource, BackendFeatures, BackendPresenter};
+use ftui_backend::{BackendEventSource, BackendFeatures};
 use ftui_core::event::{Event, KeyCode, KeyEventKind};
 use ftui_core::geometry::Rect;
+use ftui_core::terminal_capabilities::TerminalCapabilities;
 use ftui_render::diff::BufferDiff;
 use ftui_render::frame::Frame;
 use ftui_render::grapheme_pool::GraphemePool;
@@ -98,7 +99,7 @@ struct TerminalSurface {
 
 impl TerminalSurface {
     fn open() -> io::Result<Self> {
-        let mut backend = TtyBackend::open(
+        let backend = TtyBackend::open(
             80,
             24,
             TtySessionOptions {
@@ -109,7 +110,8 @@ impl TerminalSurface {
                 features: BackendFeatures::default(),
             },
         )?;
-        let presenter = Presenter::new(io::stdout(), *backend.presenter().capabilities());
+        // The capabilities `TtyBackend::open` detects for its own session.
+        let presenter = Presenter::new(io::stdout(), TerminalCapabilities::with_overrides());
         Ok(Self { presenter, backend })
     }
 }
