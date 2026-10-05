@@ -22,6 +22,11 @@ use super::{NativeBuildRetrieval, NativeBuiltIndex, NativeIndexBuilder, NativeRe
 use crate::native_ann::{NativeShardHit, NativeShardSet, checkpoint, invalid};
 use crate::{Cx, Embedder, IndexableDocument, SearchError, SearchResult};
 
+#[cfg(feature = "quill")]
+mod hybrid;
+#[cfg(feature = "quill")]
+pub use hybrid::{NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits};
+
 const SNAPSHOT_FILE: &str = "native.sharded.json";
 const SNAPSHOT_SCHEMA: &str = "frankensearch.native-sharded-source-vector.v1";
 const MAX_DESCRIPTOR_BYTES: u64 = 1024 * 1024;

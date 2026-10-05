@@ -4,6 +4,7 @@
 //! valid source/vector and lexical artifacts describe the same documents. Counts
 //! and generation numbers are necessary but cannot establish that association.
 
+use std::borrow::Borrow;
 use std::collections::BTreeMap;
 
 use frankensearch_quill::{DEFAULT_SCHEMA, Query, QuillSearchIndex};
@@ -20,10 +21,12 @@ use crate::{Cx, IndexableDocument, SearchResult};
 /// bitmap are resident, while stored fields are compared one document at a time.
 /// This uses ordinary Quill admission/collection limits; it does not disable fuel
 /// or replace byte comparisons with the noncryptographic IDMAP content witness.
-pub(super) fn validate(
+/// Borrowed entries let partitioned callers share this same census without
+/// cloning document bodies into a second contiguous source collection.
+pub(in crate::native_ann::builder) fn validate<T: Borrow<IndexableDocument>>(
     cx: &Cx,
     lexical: &QuillSearchIndex,
-    documents: &[IndexableDocument],
+    documents: &[T],
 ) -> SearchResult<()> {
     checkpoint(cx, "native_ann.builder.lexical_source_start")?;
     let count = u64::try_from(documents.len()).map_err(|_| {
@@ -50,7 +53,10 @@ pub(super) fn validate(
     for hit in page.hits.iter() {
         checkpoint(cx, "native_ann.builder.lexical_source_document")?;
         let position = documents
-            .binary_search_by(|document| document.id.as_str().cmp(hit.document_id.as_str()))
+            .binary_search_by(|document| {
+                let document: &IndexableDocument = document.borrow();
+                document.id.as_str().cmp(hit.document_id.as_str())
+            })
             .map_err(|_| {
                 invalid(
                     "builder.lexical_source_join",
@@ -65,7 +71,7 @@ pub(super) fn validate(
                 "each source identity must name exactly one live lexical document",
             ));
         }
-        let document = &documents[position];
+        let document: &IndexableDocument = documents[position].borrow();
         // Quill's shipping writer serializes this ordered string map. Compare
         // exact canonical bytes, not a JSON parser that accepts duplicate keys.
         let ordered_metadata: BTreeMap<_, _> = document.metadata.iter().collect();

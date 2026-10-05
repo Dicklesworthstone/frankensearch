@@ -1,5 +1,6 @@
 //! Native build-to-query integration with a privately owned Quill lexical arm.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
@@ -7,10 +8,10 @@ use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 use super::super::{checkpoint, invalid};
 use super::{NativeBuiltIndex, NativeIndexBuilder};
 use crate::native_ann::NativeProgressiveSearch;
-use crate::{Cx, LexicalRead, LexicalWrite, Reranker, ScoredResult, SearchResult};
+use crate::{Cx, IndexableDocument, LexicalRead, LexicalWrite, Reranker, ScoredResult, SearchResult};
 
-mod cohort;
-mod snapshot;
+pub(super) mod cohort;
+pub(super) mod snapshot;
 use snapshot::LexicalSeal;
 pub use snapshot::NativeHybridReopenLimits;
 
@@ -35,50 +36,61 @@ impl NativeIndexBuilder {
     /// produce a partial hybrid success or overwrite an older generation.
     pub async fn build_hybrid(self, cx: &Cx) -> SearchResult<NativeBuiltHybridIndex> {
         let vectors = Box::pin(self.build(cx)).await?;
-        checkpoint(cx, "native_ann.builder.lexical_start")?;
         let path = vectors.directory.join("lexical");
-        std::fs::create_dir(&path)?;
-        let response = Box::pin(QuillIndex::create(
-            cx,
-            &path,
-            QuillConfig {
-                bulk_load_mode: true,
-                deterministic_ingest: true,
-                max_ingest_shards: 1,
-                ..QuillConfig::default()
-            },
-        ))
-        .await;
-        checkpoint(cx, "native_ann.builder.lexical_created")?;
-        let lexical = response?;
-        for document in vectors.documents.iter() {
-            checkpoint(cx, "native_ann.builder.lexical_document")?;
-            let response = LexicalWrite::index_document(&lexical, cx, document).await;
-            checkpoint(cx, "native_ann.builder.lexical_document_complete")?;
-            response?;
-        }
-        let response = Box::pin(lexical.finish_bulk_load(cx)).await;
-        checkpoint(cx, "native_ann.builder.lexical_finalized")?;
-        response?;
-        if LexicalRead::doc_count(&lexical)? != vectors.documents.len() {
-            return Err(invalid(
-                "builder.lexical_membership",
-                "cardinality",
-                "Quill must contain the complete source cohort",
-            ));
-        }
-        // The writer remains alive until the reader has admitted its sealed
-        // publication. Another writer cannot publish between finalize and open.
-        // Capture bytes here, NOT at a later seal: a newer publication on disk
-        // must never be blessed as belonging to these retained source vectors.
-        let seal = LexicalSeal::capture(cx, &path, lexical.search_snapshot()?.keeper_generation())?;
-        let response = Box::pin(QuillSearchIndex::open(cx, &path, QuillConfig::default())).await;
-        checkpoint(cx, "native_ann.builder.lexical_reader")?;
-        let reader = response?;
+        let (lexical, reader, seal) = create_lexical(cx, &path, vectors.documents.iter()).await?;
         let built = NativeBuiltHybridIndex::from_readers(cx, vectors, reader, seal)?;
         drop(lexical);
         Ok(built)
     }
+}
+
+// One global lexical population for either contiguous or partitioned vectors.
+// Return the writer too: callers keep its lease through exact source admission.
+// Iterating references avoids a second copy of all source bodies for shards.
+pub(super) async fn create_lexical<'a>(
+    cx: &Cx,
+    path: &Path,
+    documents: impl IntoIterator<Item = &'a IndexableDocument>,
+) -> SearchResult<(QuillIndex, QuillSearchIndex, LexicalSeal)> {
+    checkpoint(cx, "native_ann.builder.lexical_start")?;
+    std::fs::create_dir(path)?;
+    let response = Box::pin(QuillIndex::create(
+        cx,
+        path,
+        QuillConfig {
+            bulk_load_mode: true,
+            deterministic_ingest: true,
+            max_ingest_shards: 1,
+            ..QuillConfig::default()
+        },
+    ))
+    .await;
+    checkpoint(cx, "native_ann.builder.lexical_created")?;
+    let lexical = response?;
+    let mut count = 0_usize;
+    for document in documents {
+        checkpoint(cx, "native_ann.builder.lexical_document")?;
+        let response = LexicalWrite::index_document(&lexical, cx, document).await;
+        checkpoint(cx, "native_ann.builder.lexical_document_complete")?;
+        response?;
+        count = count.checked_add(1).ok_or_else(|| {
+            invalid("builder.lexical_membership", "overflow", "source count overflowed")
+        })?;
+    }
+    let response = Box::pin(lexical.finish_bulk_load(cx)).await;
+    checkpoint(cx, "native_ann.builder.lexical_finalized")?;
+    response?;
+    if LexicalRead::doc_count(&lexical)? != count {
+        return Err(invalid(
+            "builder.lexical_membership", "cardinality",
+            "Quill must contain the complete source cohort",
+        ));
+    }
+    // Capture while the writer still excludes publication, not later at seal.
+    let seal = LexicalSeal::capture(cx, path, lexical.search_snapshot()?.keeper_generation())?;
+    let response = Box::pin(QuillSearchIndex::open(cx, path, QuillConfig::default())).await;
+    checkpoint(cx, "native_ann.builder.lexical_reader")?;
+    Ok((lexical, response?, seal))
 }
 
 type SourceTextLookup = dyn Fn(&str) -> Option<String> + Send + Sync;
