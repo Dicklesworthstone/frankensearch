@@ -5509,6 +5509,73 @@ mod tests {
         });
     }
 
+    /// Exact recursive snapshot of an index directory: every relative path in
+    /// sorted order, with `None` for directories and the full bytes of every
+    /// regular file. Any other file kind fails the snapshot.
+    fn exact_file_tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn visit(root: &Path, directory: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            let mut children = std::fs::read_dir(directory)
+                .expect("read snapshot directory")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("enumerate snapshot directory");
+            children.sort_unstable_by_key(std::fs::DirEntry::path);
+            for child in children {
+                let path = child.path();
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("snapshot entry below root")
+                    .to_path_buf();
+                let file_type = child.file_type().expect("snapshot entry type");
+                if file_type.is_dir() {
+                    entries.push((relative, None));
+                    visit(root, &path, entries);
+                } else {
+                    assert!(file_type.is_file(), "snapshot forbids non-regular files");
+                    entries.push((relative, Some(std::fs::read(&path).expect("snapshot file"))));
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    /// A read-only open plus a query must leave the on-disk index byte-for-byte
+    /// unchanged: no file added, removed, or rewritten. This pins the
+    /// "never mutates anything" half of the `open_read_only` contract at the
+    /// file level, which is what lets concurrent readers and cold-open
+    /// measurements treat the published generation as immutable.
+    #[test]
+    fn open_read_only_and_search_leave_every_index_byte_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        run_with_cx(|cx| async move {
+            let writer = TantivyIndex::create(&path).expect("create writer-backed fixture");
+            writer
+                .index_documents(&cx, &sample_docs())
+                .await
+                .expect("populate writer-backed fixture");
+            writer.commit(&cx).await.expect("commit fixture");
+            drop(writer);
+
+            let before = exact_file_tree_snapshot(&path);
+            let reader = TantivyIndex::open_read_only(&path).expect("open read-only handle");
+            assert!(reader.is_read_only());
+            assert_eq!(reader.doc_count().expect("document count"), 5);
+            let hits = reader
+                .search_doc_ids(&cx, "Rust", 10)
+                .expect("read-only search");
+            assert_eq!(hits.len(), 2, "both Rust documents must match");
+            drop(reader);
+            let after = exact_file_tree_snapshot(&path);
+            assert_eq!(
+                after, before,
+                "read-only open and query must not add, remove, or rewrite any index byte"
+            );
+        });
+    }
+
     // ─── Indexing tests ─────────────────────────────────────────────────
 
     #[test]
