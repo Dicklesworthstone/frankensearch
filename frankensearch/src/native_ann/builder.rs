@@ -38,6 +38,9 @@ mod input_budget;
 mod snapshot;
 pub use snapshot::NativeReopenLimits;
 
+/// Complete document-to-shard construction and explicitly selected restart.
+pub mod sharded;
+
 mod update;
 pub use update::NativeIndexUpdate;
 use update::ReuseSource;
@@ -85,6 +88,7 @@ pub enum NativeBuildRetrieval {
     },
 }
 
+#[derive(Clone)]
 struct TierPlan {
     embedder: Arc<dyn Embedder>,
     identity: EmbeddingIdentityBundleV1,
@@ -378,18 +382,7 @@ impl NativeIndexBuilder {
     /// errors. An already-existing destination is always refused.
     pub async fn build(mut self, cx: &Cx) -> SearchResult<NativeBuiltIndex> {
         checkpoint(cx, "native_ann.builder.start")?;
-        self.documents.sort_by(|a, b| a.id.cmp(&b.id));
-        for (position, doc) in self.documents.iter().enumerate() {
-            checkpoint(cx, "native_ann.builder.source")?;
-            if doc.id.is_empty() || (position > 0 && self.documents[position - 1].id == doc.id) {
-                return Err(invalid(
-                    "builder.documents",
-                    "empty-or-duplicate-id",
-                    "source document IDs must be nonempty and unique",
-                ));
-            }
-            input_budget::validate_document_size(doc.content.len(), self.max_batch_input_bytes)?;
-        }
+        self.validate_documents(cx)?;
         let fast_binding = self.fast.binding(&self.generation)?;
         let quality_binding = self
             .quality
@@ -471,12 +464,30 @@ impl NativeIndexBuilder {
             quality,
         })
     }
+
+    // Shared preflight: a duplicate or oversized document in the LAST shard
+    // must fail before the first shard creates files or starts inference.
+    fn validate_documents(&mut self, cx: &Cx) -> SearchResult<()> {
+        self.documents.sort_by(|a, b| a.id.cmp(&b.id));
+        for (position, doc) in self.documents.iter().enumerate() {
+            checkpoint(cx, "native_ann.builder.source")?;
+            if doc.id.is_empty() || (position > 0 && self.documents[position - 1].id == doc.id) {
+                return Err(invalid(
+                    "builder.documents",
+                    "empty-or-duplicate-id",
+                    "source document IDs must be nonempty and unique",
+                ));
+            }
+            input_budget::validate_document_size(doc.content.len(), self.max_batch_input_bytes)?;
+        }
+        Ok(())
+    }
 }
 
 /// A successfully built native tier with its retained query provider and exact
 /// reopen specification. Paths are diagnostics/reopen inputs, never query inputs.
 pub struct NativeBuiltTier {
-    index: NativeAnnIndex,
+    index: Arc<NativeAnnIndex>,
     embedder: Arc<dyn Embedder>,
     producer_identity: EmbeddingIdentityBundleV1,
     precision: NativeBuildPrecision,
@@ -489,7 +500,7 @@ pub struct NativeBuiltTier {
 impl NativeBuiltTier {
     /// The admitted native/exact index; no vector pathname is reopened by search.
     #[must_use]
-    pub const fn index(&self) -> &NativeAnnIndex {
+    pub fn index(&self) -> &NativeAnnIndex {
         &self.index
     }
     /// Provider used to produce every stored row.
@@ -593,7 +604,7 @@ fn finish_tier(
     };
     index.admit_identity(plan.embedder.identity()?)?;
     Ok(NativeBuiltTier {
-        index,
+        index: Arc::new(index),
         embedder: plan.embedder,
         producer_identity: plan.identity,
         precision: plan.precision,

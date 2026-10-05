@@ -500,7 +500,7 @@ fn open_tier(
     };
     index.admit_identity(plan.embedder.identity()?)?;
     Ok(NativeBuiltTier {
-        index,
+        index: Arc::new(index),
         embedder: plan.embedder,
         producer_identity: plan.identity,
         precision: plan.precision,
@@ -663,6 +663,67 @@ pub(super) fn read_selected(
 
 pub(super) fn verify_selected(cx: &Cx, path: &Path, expected: Artifact) -> SearchResult<()> {
     read_and_verify(cx, path, expected, |_| Ok(()))
+}
+
+// A sharded selector must bound the WHOLE inventory before allocating the
+// first vector image. Authenticate each small child descriptor and account for
+// its declared source/vector/graph bytes. Ordinary selected reopen subsequently
+// validates every actual artifact; this preflight is not engine admission.
+pub(super) fn selected_footprint(
+    cx: &Cx,
+    directory: &Path,
+    expected: Artifact,
+    limits: NativeReopenLimits,
+    fast: Arc<dyn Embedder>,
+    quality: Option<Arc<dyn Embedder>>,
+) -> SearchResult<(ArtifactGenerationIdentityV1, usize, bool, u64)> {
+    limits.validate()?;
+    let directory = checked_directory(directory)?;
+    let bytes = read_selected(cx, &directory.join(SNAPSHOT_FILE), expected, SNAPSHOT_MAX_BYTES)?;
+    let saved: Snapshot = serde_json::from_slice(&bytes)
+        .map_err(|_| rejected("schema", "malformed native snapshot descriptor"))?;
+    if saved.schema != SNAPSHOT_SCHEMA {
+        return Err(rejected("schema", "unsupported native snapshot schema"));
+    }
+    saved.generation.validate()?;
+    saved.fast.plan(fast)?;
+    match (&saved.quality, quality) {
+        (Some(tier), Some(provider)) => { tier.plan(provider)?; }
+        (None, None) => {}
+        _ => return Err(rejected("topology", "required quality provider topology disagrees")),
+    }
+    let count = usize::try_from(saved.documents)
+        .map_err(|_| rejected("documents", "source count does not fit this platform"))?;
+    if count > limits.max_documents {
+        return Err(rejected("documents", "source count exceeds the selected limit"));
+    }
+    saved.source.validate()?;
+    if saved.source.byte_len > limits.max_source_bytes {
+        return Err(rejected("source_size", "source exceeds the selected limit"));
+    }
+    let mut total = expected.byte_len.checked_add(saved.source.byte_len)
+        .ok_or_else(|| rejected("artifact_size", "selected byte count overflowed"))?;
+    for tier in std::iter::once(&saved.fast).chain(saved.quality.iter()) {
+        tier.producer.validate()?;
+        tier.vector.validate()?;
+        if tier.vector.byte_len > limits.max_vector_bytes {
+            return Err(rejected("vector_size", "vector exceeds the selected limit"));
+        }
+        total = total.checked_add(tier.vector.byte_len)
+            .ok_or_else(|| rejected("artifact_size", "selected byte count overflowed"))?;
+        if let Some(graph) = &tier.graph {
+            graph.validate().map_err(|_| rejected("graph", "invalid selected graph receipt"))?;
+            if graph.graph_byte_len > limits.max_graph_bytes {
+                return Err(rejected("graph_size", "graph exceeds the selected limit"));
+            }
+            // The graph's separate receipt is bounded by the ordinary reopen.
+            // Charge its full bound, not a guessed encoded size.
+            total = total.checked_add(graph.graph_byte_len)
+                .and_then(|bytes| bytes.checked_add(SNAPSHOT_MAX_BYTES))
+                .ok_or_else(|| rejected("artifact_size", "selected byte count overflowed"))?;
+        }
+    }
+    Ok((saved.generation, count, saved.quality.is_some(), total))
 }
 
 fn read_and_verify<F>(cx: &Cx, path: &Path, expected: Artifact, mut consume: F) -> SearchResult<()>
