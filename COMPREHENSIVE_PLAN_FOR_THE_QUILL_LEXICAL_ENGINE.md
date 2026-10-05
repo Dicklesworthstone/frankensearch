@@ -4,6 +4,10 @@
 
 **Status:** Design plan (pre-implementation). **Tracking:** beads epic family `quill` (see §19). **Oracle:** tantivy `0.26.1` (pinned, `Cargo.lock`).
 
+> Historical API note: every `LexicalSearch` reference below describes the former
+> combined read/write seam. The implemented public contract is now split into
+> `LexicalRead` and `LexicalWrite`.
+
 ---
 
 ## 0. The Thesis: What "Leapfrog" Actually Means Here
