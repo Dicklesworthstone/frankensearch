@@ -99,8 +99,8 @@ mod imp {
     //   * the `libc` crate ships no Darwin ACL bindings (no acl_get_fd_np,
     //     no acl_t, no ACL_TYPE_EXTENDED) — verified against libc 0.2.184;
     //   * unlike Linux (where POSIX ACLs surface as the
-    //     `system.posix_acl_access` xattr, which this module reads via a
-    //     safe `libc::fgetxattr` binding), macOS does NOT expose ACLs
+    //     `system.posix_acl_access` xattr, which this module reads via
+    //     rustix's safe `fgetxattr` binding), macOS does NOT expose ACLs
     //     through the readable xattr namespace: an empirical test on arm64
     //     macOS showed `fgetxattr(fd, "com.apple.system.Security", ...)`
     //     returning -1 in every state — clean, +ALLOW, +DENY, cleared —
@@ -152,28 +152,22 @@ mod imp {
     use super::ExtendedAclPresence;
     use std::ffi::CStr;
     use std::io;
-    use std::os::fd::{AsRawFd, BorrowedFd};
+    use std::os::fd::BorrowedFd;
 
     const ACL_XATTR_NAMES: [&CStr; 2] = [c"system.posix_acl_access", c"system.posix_acl_default"];
 
     pub(super) fn extended_acl_presence(fd: BorrowedFd<'_>) -> io::Result<ExtendedAclPresence> {
         for name in ACL_XATTR_NAMES {
-            // SAFETY: the descriptor is kept open by `BorrowedFd` for the
-            // duration of the call, `name` is a NUL-terminated C string,
-            // and a null destination buffer with size 0 is the documented
-            // fgetxattr size-probe form (no memory is written).
-            #[allow(unsafe_code)]
-            let size =
-                unsafe { libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
-            if size >= 0 {
-                return Ok(ExtendedAclPresence::Present);
-            }
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
+            // A zero-length destination is the documented fgetxattr
+            // size-probe form: the kernel reports the attribute length and
+            // writes no memory. rustix's binding keeps this free of `unsafe`.
+            let mut size_probe = [0_u8; 0];
+            match rustix::fs::fgetxattr(fd, name, &mut size_probe) {
+                Ok(_) => return Ok(ExtendedAclPresence::Present),
                 // ENODATA: this ACL xattr is not attached. ENOTSUP: the
                 // filesystem cannot hold POSIX ACLs, so none is attached.
-                Some(libc::ENODATA | libc::ENOTSUP) => {}
-                _ => return Err(error),
+                Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => {}
+                Err(error) => return Err(error.into()),
             }
         }
         Ok(ExtendedAclPresence::Absent)
@@ -194,17 +188,59 @@ mod imp {
     }
 }
 
+/// Raw `system.posix_acl_access` / `system.posix_acl_default` xattr image
+/// (format version 2) carrying one named-user entry plus the mask it
+/// requires: a non-minimal ACL the kernel must store as an xattr.
+///
+/// `permissions` are the `[owner, named user, owning group, mask, other]`
+/// permission bits. Test fixtures install the image through a retained
+/// descriptor with `fsetxattr`, so neither this module's tests nor the
+/// generation-root ACL gate tests depend on an external `setfacl` binary.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn linux_extended_acl_xattr(named_user_id: u32, permissions: [u16; 5]) -> Vec<u8> {
+    const ACL_UNDEFINED_ID: u32 = u32::MAX;
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_USER: u16 = 0x02;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+
+    let [owner, named, group, mask, other] = permissions;
+    let mut bytes = Vec::with_capacity(44);
+    bytes.extend_from_slice(&2_u32.to_le_bytes());
+    for (tag, bits, id) in [
+        (ACL_USER_OBJ, owner, ACL_UNDEFINED_ID),
+        (ACL_USER, named, named_user_id),
+        (ACL_GROUP_OBJ, group, ACL_UNDEFINED_ID),
+        (ACL_MASK, mask, ACL_UNDEFINED_ID),
+        (ACL_OTHER, other, ACL_UNDEFINED_ID),
+    ] {
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&bits.to_le_bytes());
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ExtendedAclPresence, extended_acl_presence};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::ExtendedAclPresence;
+    use super::extended_acl_presence;
     use std::fs::File;
+    #[cfg(not(target_os = "linux"))]
     use std::io;
     use std::os::fd::AsFd;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::BorrowedFd;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::path::Path;
+    #[cfg(target_os = "macos")]
     use std::process::Command;
 
     /// Run an ACL-mutating platform binary, or return `false` when the
     /// binary is unavailable so the test can skip rather than lie.
+    #[cfg(target_os = "macos")]
     fn run_acl_tool(program: &str, args: &[&str]) -> io::Result<bool> {
         match Command::new(program).args(args).output() {
             Ok(output) if output.status.success() => Ok(true),
@@ -217,6 +253,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn assert_presence(path: &Path, expected: ExtendedAclPresence, context: &str) {
         let handle = File::open(path).expect("fixture must open");
         assert_eq!(
@@ -248,6 +285,42 @@ mod tests {
         );
     }
 
+    /// On Unix targets without an audited probe, the answer must be the
+    /// typed `Unsupported` error, never a silent `Absent`.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    #[test]
+    fn unaudited_unix_platform_fails_closed_as_unsupported() {
+        let handle = File::open("/dev/null").expect("a retained descriptor fixture must open");
+        let error = extended_acl_presence(handle.as_fd())
+            .expect_err("an unaudited Unix ACL ABI must never report Absent");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// Install a raw extended ACL through `fd`, or return `false` when the
+    /// filesystem cannot hold POSIX ACLs so the test can skip rather than lie.
+    /// No external `setfacl` binary is involved, so these tests exercise the
+    /// probe instead of silently skipping where `setfacl` is absent. The
+    /// named-user entry is the caller's own uid, which is always mapped in
+    /// the current user namespace.
+    #[cfg(target_os = "linux")]
+    fn install_linux_acl(fd: BorrowedFd<'_>, name: &str) -> bool {
+        let acl = super::linux_extended_acl_xattr(
+            rustix::process::getuid().as_raw(),
+            [0o7, 0o4, 0o5, 0o5, 0o5],
+        );
+        match rustix::fs::fsetxattr(fd, name, &acl, rustix::fs::XattrFlags::empty()) {
+            Ok(()) => true,
+            // tmpdirs on exotic filesystems may legitimately refuse.
+            Err(rustix::io::Errno::NOTSUP) => {
+                eprintln!("skipping: this filesystem cannot hold POSIX ACLs ({name})");
+                false
+            }
+            Err(error) => {
+                panic!("raw Linux {name} fixture must install through the retained fd: {error}")
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_access_acl_toggles_presence_through_a_retained_fd() {
@@ -255,32 +328,18 @@ mod tests {
         let file_path = dir.path().join("acl-file");
         File::create(&file_path).expect("create fixture file");
         let retained = File::open(&file_path).expect("open fixture");
-        let path_text = file_path.to_str().expect("utf8 fixture path");
 
-        let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
-        let spec = format!("u:{user}:r");
-        match run_acl_tool("setfacl", &["-m", &spec, path_text]) {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("skipping: setfacl binary not installed");
-                return;
-            }
-            Err(error) => {
-                // tmpdirs on exotic filesystems may legitimately refuse.
-                eprintln!("skipping: setfacl unusable here: {error}");
-                return;
-            }
+        if !install_linux_acl(retained.as_fd(), "system.posix_acl_access") {
+            return;
         }
         assert_eq!(
-            extended_acl_presence(retained.as_fd()).expect("probe after setfacl"),
+            extended_acl_presence(retained.as_fd()).expect("probe after raw ACL installation"),
             ExtendedAclPresence::Present,
             "an access ACL must be observed through the retained descriptor"
         );
 
-        assert!(
-            run_acl_tool("setfacl", &["-b", path_text]).expect("setfacl -b must succeed"),
-            "setfacl disappeared mid-test"
-        );
+        rustix::fs::fremovexattr(&retained, "system.posix_acl_access")
+            .expect("raw Linux access ACL fixture must be removable through the retained fd");
         assert_eq!(
             extended_acl_presence(retained.as_fd()).expect("probe after clear"),
             ExtendedAclPresence::Absent,
@@ -294,25 +353,23 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let sub = dir.path().join("default-acl-dir");
         std::fs::create_dir(&sub).expect("create fixture dir");
-        let path_text = sub.to_str().expect("utf8 fixture path");
+        let retained = File::open(&sub).expect("open directory fixture");
 
-        let user = std::env::var("USER").unwrap_or_else(|_| "root".to_string());
-        let spec = format!("u:{user}:rx");
-        match run_acl_tool("setfacl", &["-d", "-m", &spec, path_text]) {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("skipping: setfacl binary not installed");
-                return;
-            }
-            Err(error) => {
-                eprintln!("skipping: setfacl unusable here: {error}");
-                return;
-            }
+        if !install_linux_acl(retained.as_fd(), "system.posix_acl_default") {
+            return;
         }
         assert_presence(
             &sub,
             ExtendedAclPresence::Present,
             "a default ACL alone must report Present for a directory",
+        );
+
+        rustix::fs::fremovexattr(&retained, "system.posix_acl_default")
+            .expect("raw Linux default ACL fixture must be removable through the retained fd");
+        assert_eq!(
+            extended_acl_presence(retained.as_fd()).expect("probe after default ACL clear"),
+            ExtendedAclPresence::Absent,
+            "clearing the default ACL must return the retained directory to Absent"
         );
     }
 

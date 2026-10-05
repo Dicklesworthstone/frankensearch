@@ -12836,26 +12836,16 @@ mod tests {
             mask_permissions: u16,
             other_permissions: u16,
         ) {
-            const ACL_UNDEFINED_ID: u32 = u32::MAX;
-            const ACL_USER_OBJ: u16 = 0x01;
-            const ACL_USER: u16 = 0x02;
-            const ACL_GROUP_OBJ: u16 = 0x04;
-            const ACL_MASK: u16 = 0x10;
-            const ACL_OTHER: u16 = 0x20;
-
-            let mut bytes = Vec::with_capacity(44);
-            bytes.extend_from_slice(&2_u32.to_le_bytes());
-            for (tag, permissions, id) in [
-                (ACL_USER_OBJ, owner_permissions, ACL_UNDEFINED_ID),
-                (ACL_USER, named_permissions, 424_242),
-                (ACL_GROUP_OBJ, group_permissions, ACL_UNDEFINED_ID),
-                (ACL_MASK, mask_permissions, ACL_UNDEFINED_ID),
-                (ACL_OTHER, other_permissions, ACL_UNDEFINED_ID),
-            ] {
-                bytes.extend_from_slice(&tag.to_le_bytes());
-                bytes.extend_from_slice(&permissions.to_le_bytes());
-                bytes.extend_from_slice(&id.to_le_bytes());
-            }
+            let bytes = crate::fd_acl::linux_extended_acl_xattr(
+                424_242,
+                [
+                    owner_permissions,
+                    named_permissions,
+                    group_permissions,
+                    mask_permissions,
+                    other_permissions,
+                ],
+            );
             rustix::fs::fsetxattr(
                 descriptor.as_fd(),
                 name,
