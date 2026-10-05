@@ -121,6 +121,7 @@ record their original qualification boundary.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [fsfs 1.12.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.3) / [frankensearch-tui 0.4.0](https://crates.io/crates/frankensearch-tui/0.4.0) | GitHub and crates.io publication | 2026-10-05 | Valid UTF-8 files no longer quarantined when the 8 KiB probe cuts a character (about two thirds of CJK documents over 8 KiB); warm daemon through a short private socket directory; FrankenTUI 0.9; complete-generation retention-race fixes |
 | [fsfs 1.12.2](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.2) | GitHub and crates.io publication (fsfs only) | 2026-10-05 | Lite builds index, watch and search by keyword; GNU binary built for glibc 2.39; TUI resize crash fixed; no 2 s wait for an unbindable daemon socket; read-only complete-generation readers keep their generation (#60); embedder identity rechecked around inference (#55) |
 | [frankensearch 0.7.1](https://crates.io/crates/frankensearch/0.7.1) / [fsfs 1.12.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.1) | GitHub and crates.io publication | 2026-10-03 | Minor release of all 13 crates plus the fsfs binary, including the Darwin daemon socket repair: progressive warm-daemon streaming, complete-generation CLI with bounded retention, CJK keyword bigrams, MiniLM at 256 tokens, contiguous Quill docids, watch/delete/append fixes, installer profile/offline fixes |
 | frankensearch 0.6.1 | crates.io publication + `frankensearch-v0.6.1` git tag | 2026-09-19 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
@@ -330,13 +331,28 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
-## fsfs 1.12.3 / frankensearch-tui 0.4.0 — release preparation
+## fsfs 1.12.3 / frankensearch-tui 0.4.0 — 2026-10-05
 
-These changes landed after the 2026-10-05 publication of fsfs 1.12.2. The
-crates to publish are `frankensearch-tui` 0.4.0 (FrankenTUI 0.9 in its public
-API) and `frankensearch-fsfs` 1.12.3; the other library crates stay at their
-0.7.1-line versions. The fsfs binary also carries the complete-generation
-retention-race fixes from 8c48ab2d and 1f2a2563.
+[fsfs v1.12.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.3),
+[frankensearch-fsfs 1.12.3](https://crates.io/crates/frankensearch-fsfs/1.12.3) and
+[frankensearch-tui 0.4.0](https://crates.io/crates/frankensearch-tui/0.4.0) are
+published from
+[`cc528269`](https://github.com/Dicklesworthstone/frankensearch/commit/cc528269c66ce89f640b860aff80992cc2333704).
+These changes landed after the publication of fsfs 1.12.2 earlier the same
+day. `frankensearch-tui` 0.4.0 carries FrankenTUI 0.9 in its public API; the
+other library crates stay at their 0.7.1-line versions. The fsfs binary also
+carries the complete-generation retention-race fixes from 8c48ab2d and
+1f2a2563.
+
+Checked before publication: the gate on cc528269 passed check, cross, quill,
+fsfs, facade, facade-doc, real-model e2e, the attested quickstart and lite.
+`cargo test --workspace --tests` passed except eight new fusion native-cache
+tests from 2bb0ba16, which fail at one fixture site and which fsfs does not
+reach (bd-m8ojn). The six binaries ran whole sessions (lite MUSL x86-64, GNU
+natively; Darwin lite natively and under Rosetta; lite ARM64 under QEMU); the
+release lite binary indexed all four files of the UTF-8 probe tree and found
+`キリン`; 1.12.3 searched an index written by 1.12.2 at once, and `fsfs update`
+from 1.12.2 installed byte-identical binaries for both profiles.
 
 - **Valid UTF-8 files are no longer quarantined when the encoding probe cuts
   a character.** The classifier checks a file's first 8 KiB, and a strict

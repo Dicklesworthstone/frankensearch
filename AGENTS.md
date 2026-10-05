@@ -390,12 +390,12 @@ be git-sourced and are now registry renames — keep the rename form, never the 
 
 `rerank` and `native` are exact aliases — there is no ONNX-only rerank lane, and
 `fastembed-reranker` also enables `native`. Published registry line as of
-2026-10-05: facade `frankensearch 0.7.1`, rerank `0.5.0`, TUI `0.3.1`,
-ops `0.4.0`, the other eight library members `0.4.0`, all from source
+2026-10-05: facade `frankensearch 0.7.1`, rerank `0.5.0`, ops `0.4.0`, the
+other eight library members `0.4.0`, all from source
 `d1cb86e1848309fe39fb7c8c4c4d7356ebd878aa` (tags `crates-v0.7.1`, `v1.12.1`);
-and fsfs `1.12.2` alone from `3bfb37541a141d511e15a8f8ec56e306a6983233`
-(tag `v1.12.2`, the latest GitHub binary release, signed with the key in
-`minisign.pub`). Never republish a version that exists on the registry;
+and fsfs `1.12.3` with TUI `0.4.0` from
+`cc528269c66ce89f640b860aff80992cc2333704` (tag `v1.12.3`, the latest GitHub
+binary release, signed with the key in `minisign.pub`). Never republish a version that exists on the registry;
 bumps go forward only. Crate publication does not qualify a binary release.
 Verify later updates against the registry and GitHub release receipts. Embedder adapter and dependency-protocol updates
 change producer fingerprints; retain historical fixture checks and require
