@@ -126,7 +126,7 @@ fn fast_ids(index: &TwoTierIndex) -> Vec<String> {
         EmbeddingIdentityBundleV1::explicit_test_model("cache-fast", 2),
     ).unwrap());
     index.activate_owner_backed_search(&query).unwrap().search_fast(10).unwrap()
-        .into_iter().map(|hit| hit.doc_id).collect()
+        .into_iter().map(|hit| hit.doc_id.to_string()).collect()
 }
 
 fn quality_ids(index: &TwoTierIndex) -> Vec<String> {
@@ -135,7 +135,7 @@ fn quality_ids(index: &TwoTierIndex) -> Vec<String> {
         EmbeddingIdentityBundleV1::explicit_test_model("cache-quality", 3),
     ).unwrap();
     index.search_quality_with_producer(&query, 10).unwrap()
-        .into_iter().map(|hit| hit.doc_id).collect()
+        .into_iter().map(|hit| hit.doc_id.to_string()).collect()
 }
 
 #[test]
