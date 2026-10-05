@@ -8,7 +8,9 @@ use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 use super::super::{checkpoint, invalid};
 use super::{NativeBuiltIndex, NativeIndexBuilder};
 use crate::native_ann::NativeProgressiveSearch;
-use crate::{Cx, IndexableDocument, LexicalRead, LexicalWrite, Reranker, ScoredResult, SearchResult};
+use crate::{
+    Cx, IndexableDocument, LexicalRead, LexicalWrite, Reranker, ScoredResult, SearchResult,
+};
 
 pub(super) mod cohort;
 pub(super) mod snapshot;
@@ -74,7 +76,11 @@ pub(super) async fn create_lexical<'a>(
         checkpoint(cx, "native_ann.builder.lexical_document_complete")?;
         response?;
         count = count.checked_add(1).ok_or_else(|| {
-            invalid("builder.lexical_membership", "overflow", "source count overflowed")
+            invalid(
+                "builder.lexical_membership",
+                "overflow",
+                "source count overflowed",
+            )
         })?;
     }
     let response = Box::pin(lexical.finish_bulk_load(cx)).await;
@@ -82,7 +88,8 @@ pub(super) async fn create_lexical<'a>(
     response?;
     if LexicalRead::doc_count(&lexical)? != count {
         return Err(invalid(
-            "builder.lexical_membership", "cardinality",
+            "builder.lexical_membership",
+            "cardinality",
             "Quill must contain the complete source cohort",
         ));
     }

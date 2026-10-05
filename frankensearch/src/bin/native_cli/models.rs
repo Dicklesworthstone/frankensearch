@@ -14,7 +14,7 @@ use super::{Models, Result, bad};
 /// Stable across feature combinations: adding a compiled backend must not
 /// silently change the model selected by the same command line.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum QualityBackend {
+pub enum QualityBackend {
     #[default]
     Onnx,
     NativeInt8,
@@ -50,7 +50,7 @@ impl QualityBackend {
 }
 
 #[derive(Debug, Default)]
-pub(super) struct QualityOptions {
+pub struct QualityOptions {
     // None and explicit Onnx choose the same backend, but explicit options on
     // a fast-only selection are errors rather than silently ignored requests.
     pub(super) backend: Option<QualityBackend>,
@@ -79,8 +79,13 @@ impl QualityOptions {
                 let path = self.directory.as_deref().ok_or_else(|| {
                     bad("native quality requires --quality-model-dir naming its exact verified model directory")
                 })?;
-                if path.to_str().is_none_or(|text| text.trim().is_empty() || text.contains('\0')) {
-                    return Err(bad("quality model directory must be nonblank, UTF-8, and NUL-free"));
+                if path
+                    .to_str()
+                    .is_none_or(|text| text.trim().is_empty() || text.contains('\0'))
+                {
+                    return Err(bad(
+                        "quality model directory must be nonblank, UTF-8, and NUL-free",
+                    ));
                 }
             }
         }
@@ -130,7 +135,7 @@ fn checkpoint(cx: &Cx) -> Result<()> {
 /// the executing producer certificate; it is not an unchecked weights loader.
 /// Its async inference retains the command-owned pool through updates and live
 /// activation. Startup verification/loading itself remains synchronous.
-pub(super) fn load(
+pub fn load(
     cx: &Cx,
     root: Option<&Path>,
     required_quality: bool,
@@ -141,49 +146,58 @@ pub(super) fn load(
     let backend = options.preflight(required_quality, pool.is_some())?;
     let policy = DetectOptions {
         offline: Some(true),
-        ..DetectOptions::default()
     };
     let fast_result = EmbedderStack::auto_detect_fast_semantic_with_options(root, &policy);
     checkpoint(cx)?;
     let fast = fast_result?.fast_arc();
     let quality_result = backend
-        .map(|backend| load_quality(backend, root, options, &policy, pool))
+        .map(|backend| load_quality(backend, root, options, policy, pool))
         .transpose();
     checkpoint(cx)?;
-    Ok(Models { fast, quality: quality_result? })
+    Ok(Models {
+        fast,
+        quality: quality_result?,
+    })
 }
 
 fn load_quality(
     backend: QualityBackend,
     root: Option<&Path>,
     options: &QualityOptions,
-    policy: &DetectOptions,
+    policy: DetectOptions,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<Arc<dyn Embedder>> {
     if backend == QualityBackend::Onnx {
-        return EmbedderStack::auto_detect_quality_with_options(root, policy)?
+        return EmbedderStack::auto_detect_quality_with_options(root, &policy)?
             .ok_or_else(|| bad("the required local ONNX quality model is unavailable; no native or hash substitution is permitted"));
     }
     #[cfg(any(feature = "native", feature = "rerank"))]
     {
-        let profile = backend.native_profile().ok_or_else(|| bad("native quality profile is missing"))?;
-        let directory = options.directory.as_deref().ok_or_else(|| bad("native quality directory is missing"))?;
+        let profile = backend
+            .native_profile()
+            .ok_or_else(|| bad("native quality profile is missing"))?;
+        let directory = options
+            .directory
+            .as_deref()
+            .ok_or_else(|| bad("native quality directory is missing"))?;
         let pool = pool.ok_or_else(|| bad("native quality requires the caller's blocking pool"))?;
-        let model = frankensearch::NativeEmbedder::load_model(directory, profile)?
-            .with_blocking_pool(pool);
+        let model =
+            frankensearch::NativeEmbedder::load_model(directory, profile)?.with_blocking_pool(pool);
         Ok(Arc::new(model))
     }
     #[cfg(not(any(feature = "native", feature = "rerank")))]
     {
         let _ = (options, pool);
-        Err(bad("native quality is not compiled in; build with --features hybrid-native"))
+        Err(bad(
+            "native quality is not compiled in; build with --features hybrid-native",
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{Command, Options};
+    use super::*;
 
     fn parse(args: &[&str]) -> Result<Option<Options>> {
         Options::parse(args.iter().map(|value| (*value).to_owned()))
@@ -214,9 +228,19 @@ mod tests {
             ("search", Command::Search),
             ("serve", Command::Serve),
         ] {
-            let mut args = vec![command, "--receipt", "receipt.json", "--quality-backend",
-                "native-multilingual", "--quality-model-dir", "multilingual"];
-            if matches!(expected, Command::Index | Command::Update | Command::Rebuild) {
+            let mut args = vec![
+                command,
+                "--receipt",
+                "receipt.json",
+                "--quality-backend",
+                "native-multilingual",
+                "--quality-model-dir",
+                "multilingual",
+            ];
+            if matches!(
+                expected,
+                Command::Index | Command::Update | Command::Rebuild
+            ) {
                 args.extend(["--index-dir", "new-index"]);
             }
             if matches!(expected, Command::Update | Command::Rebuild) {
@@ -227,8 +251,14 @@ mod tests {
             }
             let options = parse(&args).unwrap().unwrap();
             assert_eq!(options.command, expected);
-            assert_eq!(options.quality.backend, Some(QualityBackend::NativeMultilingual));
-            assert_eq!(options.quality.directory.as_deref(), Some(Path::new("multilingual")));
+            assert_eq!(
+                options.quality.backend,
+                Some(QualityBackend::NativeMultilingual)
+            );
+            assert_eq!(
+                options.quality.directory.as_deref(),
+                Some(Path::new("multilingual"))
+            );
         }
     }
 
@@ -237,8 +267,18 @@ mod tests {
         for tail in [
             vec!["--quality-backend", "native-int8"],
             vec!["--quality-model-dir", "native-model"],
-            vec!["--quality-backend", "onnx", "--quality-model-dir", "native-model"],
-            vec!["--quality-backend", "native-f32", "--quality-model-dir", "bad\0path"],
+            vec![
+                "--quality-backend",
+                "onnx",
+                "--quality-model-dir",
+                "native-model",
+            ],
+            vec![
+                "--quality-backend",
+                "native-f32",
+                "--quality-model-dir",
+                "bad\0path",
+            ],
             vec!["--quality-backend", "onnx", "--quality-backend", "onnx"],
         ] {
             let mut args = vec!["search", "--receipt", "saved.json", "--query", "retry"];
@@ -246,8 +286,18 @@ mod tests {
             assert!(parse(&args).is_err());
         }
         for command in ["index", "rebuild"] {
-            let mut args = vec![command, "--receipt", "old.json", "--index-dir", "new",
-                "--fast-only", "--quality-backend", "native-f32", "--quality-model-dir", "native"];
+            let mut args = vec![
+                command,
+                "--receipt",
+                "old.json",
+                "--index-dir",
+                "new",
+                "--fast-only",
+                "--quality-backend",
+                "native-f32",
+                "--quality-model-dir",
+                "native",
+            ];
             if command == "rebuild" {
                 args.extend(["--new-receipt", "next.json"]);
             }
@@ -260,8 +310,17 @@ mod tests {
         let default = QualityOptions::default();
         assert_eq!(default.preflight(false, false).unwrap(), None);
         for backend in [QualityBackend::Onnx, QualityBackend::NativeInt8] {
-            let selected = QualityOptions { backend: Some(backend), directory: None };
-            assert!(selected.preflight(false, true).unwrap_err().to_string().contains("fast-only"));
+            let selected = QualityOptions {
+                backend: Some(backend),
+                directory: None,
+            };
+            assert!(
+                selected
+                    .preflight(false, true)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fast-only")
+            );
         }
     }
 
@@ -273,7 +332,8 @@ mod tests {
             directory: Some(root.path().join("missing-native")),
         };
         let error = load(&Cx::for_testing(), Some(root.path()), true, &options, None)
-            .err().expect("no native pool or feature");
+            .err()
+            .expect("no native pool or feature");
         let expected = if cfg!(any(feature = "native", feature = "rerank")) {
             "blocking pool"
         } else {
@@ -292,10 +352,19 @@ mod tests {
         let cx = Cx::for_testing();
         let root = tempfile::tempdir().unwrap();
         cx.set_cancel_requested(true);
-        let result = load(&cx, Some(root.path()), true, &QualityOptions::default(), None);
+        let result = load(
+            &cx,
+            Some(root.path()),
+            true,
+            &QualityOptions::default(),
+            None,
+        );
         cx.set_cancel_requested(false);
         let error = result.err().expect("cancelled load");
-        assert!(matches!(error.downcast_ref::<SearchError>(), Some(SearchError::Cancelled { .. })));
+        assert!(matches!(
+            error.downcast_ref::<SearchError>(),
+            Some(SearchError::Cancelled { .. })
+        ));
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
@@ -303,16 +372,24 @@ mod tests {
     fn native_profile_does_not_require_the_onnx_bundle_to_build_the_binary() {
         // Manifest contract only, not a Cargo resolution or compilation claim.
         let manifest: toml::Value = toml::from_str(include_str!("../../../Cargo.toml")).unwrap();
-        assert_eq!(manifest["features"]["hybrid-native"].as_array().unwrap(), &[
-            toml::Value::String("model2vec".to_owned()),
-            toml::Value::String("quill".to_owned()),
-            toml::Value::String("native".to_owned()),
-        ]);
-        let binary = manifest["bin"].as_array().unwrap().iter()
-            .find(|binary| binary["name"].as_str() == Some("frankensearch-native")).unwrap();
-        assert_eq!(binary["required-features"].as_array().unwrap(), &[
-            toml::Value::String("quill".to_owned()),
-        ]);
+        assert_eq!(
+            manifest["features"]["hybrid-native"].as_array().unwrap(),
+            &[
+                toml::Value::String("model2vec".to_owned()),
+                toml::Value::String("quill".to_owned()),
+                toml::Value::String("native".to_owned()),
+            ]
+        );
+        let binary = manifest["bin"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|binary| binary["name"].as_str() == Some("frankensearch-native"))
+            .unwrap();
+        assert_eq!(
+            binary["required-features"].as_array().unwrap(),
+            &[toml::Value::String("quill".to_owned()),]
+        );
     }
 
     #[cfg(any(feature = "native", feature = "rerank"))]
@@ -320,23 +397,35 @@ mod tests {
     fn native_backend_variants_select_their_exact_registered_constructors() {
         use frankensearch::NativeEmbeddingModel;
         assert_eq!(QualityBackend::Onnx.native_profile(), None);
-        assert_eq!(QualityBackend::NativeInt8.native_profile(), Some(NativeEmbeddingModel::AllMiniLmL6V2));
-        assert_eq!(QualityBackend::NativeF32.native_profile(), Some(NativeEmbeddingModel::AllMiniLmL6V2F32));
-        assert_eq!(QualityBackend::NativeMultilingual.native_profile(),
-            Some(NativeEmbeddingModel::ParaphraseMultilingualMiniLmL12V2));
+        assert_eq!(
+            QualityBackend::NativeInt8.native_profile(),
+            Some(NativeEmbeddingModel::AllMiniLmL6V2)
+        );
+        assert_eq!(
+            QualityBackend::NativeF32.native_profile(),
+            Some(NativeEmbeddingModel::AllMiniLmL6V2F32)
+        );
+        assert_eq!(
+            QualityBackend::NativeMultilingual.native_profile(),
+            Some(NativeEmbeddingModel::ParaphraseMultilingualMiniLmL12V2)
+        );
     }
 }
 
-#[cfg(all(test, feature = "model2vec", any(feature = "native", feature = "rerank")))]
+#[cfg(all(
+    test,
+    feature = "model2vec",
+    any(feature = "native", feature = "rerank")
+))]
 mod real_model_tests {
+    use super::super::{Options, Selection, execute, filter, query, serve};
     use super::*;
-    use super::super::{
-        Options, Selection, execute, filter, query, serve,
-    };
 
     fn required_directory(variable: &str) -> PathBuf {
-        let path = PathBuf::from(std::env::var_os(variable)
-            .unwrap_or_else(|| panic!("set {variable} to the installed verified model directory")));
+        let path =
+            PathBuf::from(std::env::var_os(variable).unwrap_or_else(|| {
+                panic!("set {variable} to the installed verified model directory")
+            }));
         assert!(path.is_dir(), "{variable} must name an existing directory");
         path
     }
@@ -350,9 +439,12 @@ mod real_model_tests {
     ) -> Options {
         let mut args = vec![
             command.to_owned(),
-            "--model-dir".to_owned(), root.to_str().unwrap().to_owned(),
-            "--quality-backend".to_owned(), backend.to_owned(),
-            "--quality-model-dir".to_owned(), quality.to_str().unwrap().to_owned(),
+            "--model-dir".to_owned(),
+            root.to_str().unwrap().to_owned(),
+            "--quality-backend".to_owned(),
+            backend.to_owned(),
+            "--quality-model-dir".to_owned(),
+            quality.to_str().unwrap().to_owned(),
         ];
         for (flag, path) in extra {
             args.push((*flag).to_owned());
@@ -365,7 +457,9 @@ mod real_model_tests {
         let model_root = required_directory("FRANKENSEARCH_NATIVE_CLI_MODEL_ROOT");
         let quality_dir = required_directory(quality_variable);
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(0, 2).build().unwrap();
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
         let pool = runtime.blocking_handle().unwrap();
         runtime.block_on(async move {
             let cx = Cx::current().expect("caller runtime installs a context");
@@ -490,7 +584,10 @@ mod real_model_tests {
     #[test]
     #[ignore = "requires installed Potion and MULTILINGUAL_MINILM_FIXTURE_DIR; no download or skip fallback"]
     fn native_multilingual_real_index_query_update_and_rebuild() {
-        roundtrip("native-multilingual", "MULTILINGUAL_MINILM_FIXTURE_DIR",
-            "paraphrase-multilingual-minilm-l12-v2-384-native");
+        roundtrip(
+            "native-multilingual",
+            "MULTILINGUAL_MINILM_FIXTURE_DIR",
+            "paraphrase-multilingual-minilm-l12-v2-384-native",
+        );
     }
 }

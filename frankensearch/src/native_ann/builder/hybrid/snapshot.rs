@@ -92,7 +92,11 @@ impl LexicalSeal {
         self.generation
     }
 
-    pub(in crate::native_ann::builder) fn capture(cx: &Cx, directory: &Path, generation: u64) -> SearchResult<Self> {
+    pub(in crate::native_ann::builder) fn capture(
+        cx: &Cx,
+        directory: &Path,
+        generation: u64,
+    ) -> SearchResult<Self> {
         let limits = NativeHybridReopenLimits::default();
         let names = lexical_names(cx, directory, limits.max_lexical_files)?;
         let mut files = Vec::new();
@@ -117,7 +121,10 @@ impl LexicalSeal {
         Ok(seal)
     }
 
-    pub(in crate::native_ann::builder) fn validate(&self, limits: NativeHybridReopenLimits) -> SearchResult<()> {
+    pub(in crate::native_ann::builder) fn validate(
+        &self,
+        limits: NativeHybridReopenLimits,
+    ) -> SearchResult<()> {
         limits.validate()?;
         if self.files.is_empty() || self.files.len() > limits.max_lexical_files {
             return Err(rejected(

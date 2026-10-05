@@ -17,17 +17,54 @@ fn parser_requires_explicit_destinations_and_rejects_inapplicable_options() {
     assert!(!index.fast_only);
     assert!(!index.exact);
     let search = options(&[
-        "search", "--receipt", "selected.json", "--query", "-obsolete retry", "--mode", "fast",
+        "search",
+        "--receipt",
+        "selected.json",
+        "--query",
+        "-obsolete retry",
+        "--mode",
+        "fast",
     ]);
     assert_eq!(search.mode, Mode::Fast);
     for args in [
         vec!["index", "--receipt", "selected.json"],
         vec!["index", "--index-dir", "new"],
         vec!["search", "--receipt", "selected.json"],
-        vec!["search", "--receipt", "selected.json", "--query", "x", "--exact"],
-        vec!["index", "--index-dir", "new", "--receipt", "r", "--batch-size", "0"],
-        vec!["search", "--receipt", "r", "--query", "x", "--limit", "1001"],
-        vec!["search", "--receipt", "r", "--receipt", "other", "--query", "x"],
+        vec![
+            "search",
+            "--receipt",
+            "selected.json",
+            "--query",
+            "x",
+            "--exact",
+        ],
+        vec![
+            "index",
+            "--index-dir",
+            "new",
+            "--receipt",
+            "r",
+            "--batch-size",
+            "0",
+        ],
+        vec![
+            "search",
+            "--receipt",
+            "r",
+            "--query",
+            "x",
+            "--limit",
+            "1001",
+        ],
+        vec![
+            "search",
+            "--receipt",
+            "r",
+            "--receipt",
+            "other",
+            "--query",
+            "x",
+        ],
         vec!["index", "--index-dir", "--receipt", "r"],
     ] {
         assert!(Options::parse(args.into_iter().map(str::to_owned)).is_err());
@@ -75,7 +112,10 @@ fn unterminated_input_and_json_output_are_bounded() {
     assert!(encode(&"x", 3).is_err());
     let mut output = Vec::new();
     assert!(emit(&mut output, &"x".repeat(MAX_OUTPUT_BYTES)).is_err());
-    assert!(output.is_empty(), "encode refusal must not expose a partial record");
+    assert!(
+        output.is_empty(),
+        "encode refusal must not expose a partial record"
+    );
 }
 
 // Identified deterministic providers test actual Quill/FSVI/native-HNSW build,
@@ -104,11 +144,21 @@ impl Embedder for FixtureModel {
         })
     }
 
-    fn dimension(&self) -> usize { 3 }
-    fn id(&self) -> &str { &self.identity.space.logical_model_id }
-    fn model_name(&self) -> &str { self.id() }
-    fn is_semantic(&self) -> bool { true }
-    fn category(&self) -> ModelCategory { self.category }
+    fn dimension(&self) -> usize {
+        3
+    }
+    fn id(&self) -> &str {
+        &self.identity.space.logical_model_id
+    }
+    fn model_name(&self) -> &str {
+        self.id()
+    }
+    fn is_semantic(&self) -> bool {
+        true
+    }
+    fn category(&self) -> ModelCategory {
+        self.category
+    }
 }
 
 fn fixture_models(quality: bool) -> (Models, Arc<AtomicUsize>, Arc<AtomicUsize>) {
@@ -132,8 +182,13 @@ fn fixture_models(quality: bool) -> (Models, Arc<AtomicUsize>, Arc<AtomicUsize>)
 fn source() -> Vec<IndexableDocument> {
     let mut retry = IndexableDocument::new("retry.rs", "retry network requests with backoff");
     retry.title = Some("network retry".to_owned());
-    retry.metadata.insert("language".to_owned(), "rust".to_owned());
-    vec![retry, IndexableDocument::new("garden.md", "garden flowers in spring")]
+    retry
+        .metadata
+        .insert("language".to_owned(), "rust".to_owned());
+    vec![
+        retry,
+        IndexableDocument::new("garden.md", "garden flowers in spring"),
+    ]
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -151,25 +206,49 @@ fn native_and_exact_builds_reopen_both_tiers_without_reembedding() {
                 .await
                 .unwrap();
             assert_eq!(index.vectors().fast().graph_path().is_some(), !exact);
-            assert_eq!(index.vectors().quality().unwrap().graph_path().is_some(), !exact);
+            assert_eq!(
+                index.vectors().quality().unwrap().graph_path().is_some(),
+                !exact
+            );
             save_selection(&selection, &receipt_path).unwrap();
-            let expected = search(&index, &cx, "retry network", Mode::Full, 2, [None, None]).await.unwrap();
+            let expected = search(&index, &cx, "retry network", Mode::Full, 2, [None, None])
+                .await
+                .unwrap();
             assert_eq!(expected["phase"], "refined");
             assert_eq!(expected["results"][0]["doc_id"], "retry.rs");
             drop(index);
-            let counts = (fast_calls.load(Ordering::Relaxed), quality_calls.load(Ordering::Relaxed));
+            let counts = (
+                fast_calls.load(Ordering::Relaxed),
+                quality_calls.load(Ordering::Relaxed),
+            );
             let selected = Selection::read(&receipt_path).unwrap();
             let reopened = selected.open(&cx, models.clone()).await.unwrap();
             assert_eq!(fast_calls.load(Ordering::Relaxed), counts.0);
             assert_eq!(quality_calls.load(Ordering::Relaxed), counts.1);
-            assert_eq!(reopened.vectors().document("retry.rs").unwrap().metadata["language"], "rust");
-            let actual = search(&reopened, &cx, "retry network", Mode::Full, 2, [None, None]).await.unwrap();
+            assert_eq!(
+                reopened.vectors().document("retry.rs").unwrap().metadata["language"],
+                "rust"
+            );
+            let actual = search(&reopened, &cx, "retry network", Mode::Full, 2, [None, None])
+                .await
+                .unwrap();
             assert_eq!(actual, expected);
             let fast_before = fast_calls.load(Ordering::Relaxed);
-            search(&reopened, &cx, "retry network", Mode::Quality, 2, [None, None]).await.unwrap();
+            search(
+                &reopened,
+                &cx,
+                "retry network",
+                Mode::Quality,
+                2,
+                [None, None],
+            )
+            .await
+            .unwrap();
             assert_eq!(fast_calls.load(Ordering::Relaxed), fast_before);
             let quality_before = quality_calls.load(Ordering::Relaxed);
-            search(&reopened, &cx, "retry network", Mode::Fast, 2, [None, None]).await.unwrap();
+            search(&reopened, &cx, "retry network", Mode::Fast, 2, [None, None])
+                .await
+                .unwrap();
             assert_eq!(quality_calls.load(Ordering::Relaxed), quality_before);
             assert!(new_path(&directory).is_err());
             assert!(save_selection(&selection, &receipt_path).is_err());
@@ -186,26 +265,47 @@ fn fast_only_reopen_refuses_quality_queries_and_cancelled_builds_leave_no_destin
     run_test_with_cx(|cx| async move {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().join("fast");
-        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused", "--fast-only"]);
+        let options = options(&[
+            "index",
+            "--index-dir",
+            "unused",
+            "--receipt",
+            "unused",
+            "--fast-only",
+        ]);
         let providers = fixture_models(false).0;
         let (index, selection) = build(&cx, &options, &directory, source(), providers.clone())
             .await
             .unwrap();
         assert!(selection.quality_producer.is_none());
-        assert_eq!(search(&index, &cx, "retry", Mode::Full, 2, [None, None]).await.unwrap()["phase"], "initial");
-        assert!(search(&index, &cx, "retry", Mode::Quality, 2, [None, None]).await.is_err());
+        assert_eq!(
+            search(&index, &cx, "retry", Mode::Full, 2, [None, None])
+                .await
+                .unwrap()["phase"],
+            "initial"
+        );
+        assert!(
+            search(&index, &cx, "retry", Mode::Quality, 2, [None, None])
+                .await
+                .is_err()
+        );
         drop(index);
         assert!(selection.open(&cx, providers.clone()).await.is_ok());
         let cancelled = temporary.path().join("cancelled");
         cx.set_cancel_requested(true);
-        assert!(build(&cx, &options, &cancelled, source(), providers).await.is_err());
+        assert!(
+            build(&cx, &options, &cancelled, source(), providers)
+                .await
+                .is_err()
+        );
         cx.set_cancel_requested(false);
         assert!(!cancelled.exists());
     });
 }
 
 fn output_frames(bytes: &[u8]) -> Vec<serde_json::Value> {
-    bytes.split(|byte| *byte == b'\n')
+    bytes
+        .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
         .map(|line| serde_json::from_slice(line).unwrap())
         .collect()
@@ -249,9 +349,15 @@ fn warm_serve_flushes_initial_before_quality_and_survives_bad_requests() {
         let temporary = tempfile::tempdir().unwrap();
         let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
         let (providers, fast_calls, quality_calls) = fixture_models(true);
-        let (index, _) = build(&cx, &options, &temporary.path().join("index"), source(), providers)
-            .await
-            .unwrap();
+        let (index, _) = build(
+            &cx,
+            &options,
+            &temporary.path().join("index"),
+            source(),
+            providers,
+        )
+        .await
+        .unwrap();
         let fast_before = fast_calls.load(Ordering::Relaxed);
         let quality_before = quality_calls.load(Ordering::Relaxed);
         let mut output = ObservedOutput {
@@ -269,9 +375,18 @@ fn warm_serve_flushes_initial_before_quality_and_survives_bad_requests() {
             "{\"id\":\"never\",\"query\":\"must not run\"}\n"
         ));
         let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
-        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None, &query::Policy::default())
-            .await
-            .unwrap();
+        serve::run(
+            &live,
+            &cx,
+            &mut input,
+            &mut output,
+            (Mode::Full, 2),
+            false,
+            None,
+            &query::Policy::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(output.initial_flushes, 2);
         assert_eq!(fast_calls.load(Ordering::Relaxed), fast_before + 2);
         assert_eq!(quality_calls.load(Ordering::Relaxed), quality_before + 2);
@@ -279,7 +394,10 @@ fn warm_serve_flushes_initial_before_quality_and_survives_bad_requests() {
         assert_eq!(frames[0]["event"], "ready");
         assert_eq!(frames[1]["status"], "failed");
         for id in ["a", "b"] {
-            let request = frames.iter().filter(|frame| frame["id"] == id).collect::<Vec<_>>();
+            let request = frames
+                .iter()
+                .filter(|frame| frame["id"] == id)
+                .collect::<Vec<_>>();
             assert_eq!(request.len(), 4);
             assert_eq!(request[0]["event"], "started");
             assert_eq!(request[1]["phase"], "initial");
@@ -292,7 +410,11 @@ fn warm_serve_flushes_initial_before_quality_and_survives_bad_requests() {
                 assert_eq!(frame["generation"], frames[0]["generation"]);
             }
         }
-        assert!(frames.iter().any(|frame| frame["id"] == "invalid" && frame["status"] == "failed"));
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["id"] == "invalid" && frame["status"] == "failed")
+        );
         assert!(!frames.iter().any(|frame| frame["id"] == "never"));
     });
 }
@@ -303,12 +425,24 @@ struct FailingQuality {
 }
 
 impl Embedder for FailingQuality {
-    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { self.inner.identity() }
-    fn dimension(&self) -> usize { self.inner.dimension() }
-    fn id(&self) -> &str { self.inner.id() }
-    fn model_name(&self) -> &str { self.inner.model_name() }
-    fn is_semantic(&self) -> bool { true }
-    fn category(&self) -> ModelCategory { self.inner.category() }
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        self.inner.identity()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+    fn is_semantic(&self) -> bool {
+        true
+    }
+    fn category(&self) -> ModelCategory {
+        self.inner.category()
+    }
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
             if self.fail.swap(false, Ordering::AcqRel) {
@@ -335,9 +469,15 @@ fn warm_serve_retains_initial_on_quality_failure_and_runs_the_next_query() {
             inner: providers.quality.take().unwrap(),
             fail: Arc::clone(&fail),
         }));
-        let (index, _) = build(&cx, &options, &temporary.path().join("index"), source(), providers)
-            .await
-            .unwrap();
+        let (index, _) = build(
+            &cx,
+            &options,
+            &temporary.path().join("index"),
+            source(),
+            providers,
+        )
+        .await
+        .unwrap();
         fail.store(true, Ordering::Release);
         let mut input = Cursor::new(concat!(
             "{\"id\":\"first\",\"query\":\"retry network\"}\n",
@@ -345,16 +485,33 @@ fn warm_serve_retains_initial_on_quality_failure_and_runs_the_next_query() {
         ));
         let mut output = Vec::new();
         let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
-        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None, &query::Policy::default()).await.unwrap();
+        serve::run(
+            &live,
+            &cx,
+            &mut input,
+            &mut output,
+            (Mode::Full, 2),
+            false,
+            None,
+            &query::Policy::default(),
+        )
+        .await
+        .unwrap();
         let frames = output_frames(&output);
-        let first = frames.iter().filter(|frame| frame["id"] == "first").collect::<Vec<_>>();
+        let first = frames
+            .iter()
+            .filter(|frame| frame["id"] == "first")
+            .collect::<Vec<_>>();
         assert_eq!(first[1]["phase"], "initial");
         assert_eq!(first[2]["phase"], "refinement_failed");
         assert_eq!(first[2]["results"], first[1]["results"]);
         assert_eq!(first[3]["status"], "degraded");
         assert_eq!(first[3]["ok"], false);
         assert_eq!(first[3]["partial_results"], true);
-        let second = frames.iter().filter(|frame| frame["id"] == "second").collect::<Vec<_>>();
+        let second = frames
+            .iter()
+            .filter(|frame| frame["id"] == "second")
+            .collect::<Vec<_>>();
         assert_eq!(second[2]["phase"], "refined");
         assert_eq!(second[3]["status"], "complete");
     });
@@ -375,22 +532,50 @@ fn broken_initial_delivery_stops_before_quality_inference() {
                 Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed client"))
             }
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
     run_test_with_cx(|cx| async move {
         let temporary = tempfile::tempdir().unwrap();
         let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
         let (providers, fast_calls, quality_calls) = fixture_models(true);
-        let (index, _) = build(&cx, &options, &temporary.path().join("index"), source(), providers)
-            .await
-            .unwrap();
-        let before = (fast_calls.load(Ordering::Relaxed), quality_calls.load(Ordering::Relaxed));
+        let (index, _) = build(
+            &cx,
+            &options,
+            &temporary.path().join("index"),
+            source(),
+            providers,
+        )
+        .await
+        .unwrap();
+        let before = (
+            fast_calls.load(Ordering::Relaxed),
+            quality_calls.load(Ordering::Relaxed),
+        );
         let request = serve::Request {
-            id: None, query: "retry".to_owned(), mode: None, limit: None, filter: None, timeout_ms: None,
+            id: None,
+            query: "retry".to_owned(),
+            mode: None,
+            limit: None,
+            filter: None,
+            timeout_ms: None,
         };
         let mut output = ClosedOutput { writes: 0 };
-        assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output, None, &query::Policy::default())
-            .await.is_err());
+        assert!(
+            serve::stream_one(
+                &index,
+                &cx,
+                &request,
+                1,
+                (Mode::Full, 2),
+                &mut output,
+                None,
+                &query::Policy::default()
+            )
+            .await
+            .is_err()
+        );
         assert_eq!(output.writes, 2, "no terminal write after failed delivery");
         assert_eq!(fast_calls.load(Ordering::Relaxed), before.0 + 1);
         assert_eq!(quality_calls.load(Ordering::Relaxed), before.1);
@@ -400,7 +585,13 @@ fn broken_initial_delivery_stops_before_quality_inference() {
 #[test]
 fn update_admission_preserves_last_edit_wins_and_rejects_invalid_records() {
     let options = options(&[
-        "update", "--receipt", "old", "--index-dir", "new", "--new-receipt", "new.json",
+        "update",
+        "--receipt",
+        "old",
+        "--index-dir",
+        "new",
+        "--new-receipt",
+        "new.json",
     ]);
     assert_eq!(options.command, Command::Update);
     let edits = update::read_edits(&mut Cursor::new(concat!(
@@ -408,7 +599,8 @@ fn update_admission_preserves_last_edit_wins_and_rejects_invalid_records() {
         "{\"op\":\"delete\",\"id\":\"a\"}\n",
         "{\"op\":\"upsert\",\"id\":\"a\",\"content\":\"final\"}\n",
         "{\"op\":\"delete\",\"id\":\"missing\"}"
-    ))).unwrap();
+    )))
+    .unwrap();
     assert_eq!(edits.len(), 2);
     assert_eq!(edits["a"].as_ref().unwrap().content, "final");
     assert!(edits["missing"].is_none());
@@ -420,9 +612,10 @@ fn update_admission_preserves_last_edit_wins_and_rejects_invalid_records() {
     ] {
         assert!(update::read_edits(&mut Cursor::new(input)).is_err());
     }
-    assert!(Options::parse([
-        "update", "--receipt", "old", "--index-dir", "new",
-    ].map(str::to_owned)).is_err());
+    assert!(
+        Options::parse(["update", "--receipt", "old", "--index-dir", "new",].map(str::to_owned))
+            .is_err()
+    );
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -432,8 +625,15 @@ fn selected_update_reuses_unchanged_vectors_and_keeps_old_readers() {
         let temporary = tempfile::tempdir().unwrap();
         let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
         let (models, fast_calls, quality_calls) = fixture_models(true);
-        let (old, old_selection) = build(&cx, &options, &temporary.path().join("old"), source(), models.clone())
-            .await.unwrap();
+        let (old, old_selection) = build(
+            &cx,
+            &options,
+            &temporary.path().join("old"),
+            source(),
+            models.clone(),
+        )
+        .await
+        .unwrap();
         let before_fast = fs::read(old.vectors().fast().vector_path()).unwrap();
         let before_quality = fs::read(old.vectors().quality().unwrap().vector_path()).unwrap();
         assert!(new_path(&old.vectors().directory().join("nested-index")).is_err());
@@ -441,34 +641,86 @@ fn selected_update_reuses_unchanged_vectors_and_keeps_old_readers() {
         std::os::unix::fs::symlink(old.vectors().directory(), &alias).unwrap();
         assert!(new_path(&alias.join("nested-receipt.json")).is_err());
         assert!(new_path(&temporary.path().join("new-sibling")).is_ok());
-        let counts = (fast_calls.load(Ordering::Relaxed), quality_calls.load(Ordering::Relaxed));
+        let counts = (
+            fast_calls.load(Ordering::Relaxed),
+            quality_calls.load(Ordering::Relaxed),
+        );
         let edits = update::read_edits(&mut Cursor::new(concat!(
             "{\"op\":\"upsert\",\"id\":\"retry.rs\",\"content\":\"retry network requests with backoff\",\"title\":\"Updated title\",\"metadata\":{\"version\":\"two\"}}\n",
             "{\"op\":\"delete\",\"id\":\"garden.md\"}\n",
             "{\"op\":\"upsert\",\"id\":\"river.md\",\"content\":\"river currents\"}\n"
         ))).unwrap();
         let (new, selection) = update::apply(
-            &cx, &old_selection, &old, &temporary.path().join("new"), edits, 8,
-        ).await.unwrap();
-        assert_eq!(selection.generation.sequence, old_selection.generation.sequence + 1);
+            &cx,
+            &old_selection,
+            &old,
+            &temporary.path().join("new"),
+            edits,
+            8,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            selection.generation.sequence,
+            old_selection.generation.sequence + 1
+        );
         assert_eq!(fast_calls.load(Ordering::Relaxed), counts.0 + 1);
         assert_eq!(quality_calls.load(Ordering::Relaxed), counts.1 + 1);
         assert!(new.vectors().document("garden.md").is_none());
-        assert_eq!(new.vectors().document("retry.rs").unwrap().metadata["version"], "two");
-        assert_eq!(new.vectors().document("retry.rs").unwrap().title.as_deref(), Some("Updated title"));
-        assert!(new.lexical().search(&cx, "garden", 10).await.unwrap().is_empty());
-        assert_eq!(old.lexical().search(&cx, "garden", 10).await.unwrap().len(), 1);
-        assert_eq!(new.lexical().search(&cx, "river", 10).await.unwrap().len(), 1);
+        assert_eq!(
+            new.vectors().document("retry.rs").unwrap().metadata["version"],
+            "two"
+        );
+        assert_eq!(
+            new.vectors().document("retry.rs").unwrap().title.as_deref(),
+            Some("Updated title")
+        );
+        assert!(
+            new.lexical()
+                .search(&cx, "garden", 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            old.lexical().search(&cx, "garden", 10).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            new.lexical().search(&cx, "river", 10).await.unwrap().len(),
+            1
+        );
         assert!(old.vectors().document("river.md").is_none());
-        assert_eq!(fs::read(old.vectors().fast().vector_path()).unwrap(), before_fast);
-        assert_eq!(fs::read(old.vectors().quality().unwrap().vector_path()).unwrap(), before_quality);
+        assert_eq!(
+            fs::read(old.vectors().fast().vector_path()).unwrap(),
+            before_fast
+        );
+        assert_eq!(
+            fs::read(old.vectors().quality().unwrap().vector_path()).unwrap(),
+            before_quality
+        );
         drop(new);
         let receipt = temporary.path().join("new.json");
         save_selection(&selection, &receipt).unwrap();
-        let reopened = Selection::read(&receipt).unwrap().open(&cx, models).await.unwrap();
+        let reopened = Selection::read(&receipt)
+            .unwrap()
+            .open(&cx, models)
+            .await
+            .unwrap();
         assert_eq!(reopened.vectors().documents().len(), 2);
-        assert_eq!(reopened.lexical().search(&cx, "river", 10).await.unwrap().len(), 1);
-        assert_eq!(old.lexical().search(&cx, "garden", 10).await.unwrap().len(), 1);
+        assert_eq!(
+            reopened
+                .lexical()
+                .search(&cx, "river", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            old.lexical().search(&cx, "garden", 10).await.unwrap().len(),
+            1
+        );
     });
 }
 
@@ -481,28 +733,60 @@ fn failed_and_cancelled_updates_do_not_modify_the_selected_predecessor() {
         let (mut models, _, _) = fixture_models(true);
         let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
         models.quality = Some(Arc::new(FailingQuality {
-            inner: models.quality.take().unwrap(), fail: Arc::clone(&fail),
+            inner: models.quality.take().unwrap(),
+            fail: Arc::clone(&fail),
         }));
-        let (old, selection) = build(&cx, &options, &temporary.path().join("old"), source(), models.clone())
-            .await.unwrap();
+        let (old, selection) = build(
+            &cx,
+            &options,
+            &temporary.path().join("old"),
+            source(),
+            models.clone(),
+        )
+        .await
+        .unwrap();
         let receipt = temporary.path().join("old.json");
         save_selection(&selection, &receipt).unwrap();
         let before = fs::read(&receipt).unwrap();
         let vectors = fs::read(old.vectors().fast().vector_path()).unwrap();
-        let changes = || update::read_edits(&mut Cursor::new(
-            "{\"op\":\"upsert\",\"id\":\"new\",\"content\":\"river\"}\n"
-        )).unwrap();
+        let changes = || {
+            update::read_edits(&mut Cursor::new(
+                "{\"op\":\"upsert\",\"id\":\"new\",\"content\":\"river\"}\n",
+            ))
+            .unwrap()
+        };
         fail.store(true, Ordering::Release);
-        assert!(update::apply(&cx, &selection, &old, &temporary.path().join("failed"), changes(), 8)
-            .await.is_err());
+        assert!(
+            update::apply(
+                &cx,
+                &selection,
+                &old,
+                &temporary.path().join("failed"),
+                changes(),
+                8
+            )
+            .await
+            .is_err()
+        );
         cx.set_cancel_requested(true);
         let cancelled = temporary.path().join("cancelled");
-        assert!(update::apply(&cx, &selection, &old, &cancelled, changes(), 8).await.is_err());
+        assert!(
+            update::apply(&cx, &selection, &old, &cancelled, changes(), 8)
+                .await
+                .is_err()
+        );
         cx.set_cancel_requested(false);
         assert!(!cancelled.exists());
         assert_eq!(fs::read(&receipt).unwrap(), before);
-        assert_eq!(fs::read(old.vectors().fast().vector_path()).unwrap(), vectors);
-        let reopened = Selection::read(&receipt).unwrap().open(&cx, models).await.unwrap();
+        assert_eq!(
+            fs::read(old.vectors().fast().vector_path()).unwrap(),
+            vectors
+        );
+        let reopened = Selection::read(&receipt)
+            .unwrap()
+            .open(&cx, models)
+            .await
+            .unwrap();
         assert_eq!(reopened.vectors().documents().len(), 2);
         assert!(reopened.vectors().document("new").is_none());
     });
@@ -516,12 +800,43 @@ mod filter_tests;
 
 #[test]
 fn query_timeout_options_are_explicit_positive_and_search_only() {
-    assert_eq!(options(&["search", "--receipt", "r", "--query", "q", "--timeout-ms", "500"]).timeout_ms, Some(500));
-    assert_eq!(options(&["serve", "--receipt", "r", "--timeout-ms", "1000"]).timeout_ms, Some(1000));
+    assert_eq!(
+        options(&[
+            "search",
+            "--receipt",
+            "r",
+            "--query",
+            "q",
+            "--timeout-ms",
+            "500"
+        ])
+        .timeout_ms,
+        Some(500)
+    );
+    assert_eq!(
+        options(&["serve", "--receipt", "r", "--timeout-ms", "1000"]).timeout_ms,
+        Some(1000)
+    );
     for args in [
-        vec!["search", "--receipt", "r", "--query", "q", "--timeout-ms", "0"],
+        vec![
+            "search",
+            "--receipt",
+            "r",
+            "--query",
+            "q",
+            "--timeout-ms",
+            "0",
+        ],
         vec!["serve", "--receipt", "r", "--timeout-ms", "600001"],
-        vec!["index", "--receipt", "r", "--index-dir", "new", "--timeout-ms", "50"],
+        vec![
+            "index",
+            "--receipt",
+            "r",
+            "--index-dir",
+            "new",
+            "--timeout-ms",
+            "50",
+        ],
     ] {
         assert!(Options::parse(args.into_iter().map(str::to_owned)).is_err());
     }
@@ -531,7 +846,9 @@ fn deadline_policy(milliseconds: u64) -> (Arc<asupersync::time::VirtualClock>, q
     let clock = Arc::new(asupersync::time::VirtualClock::new());
     let policy = query::Policy {
         maximum_ms: Some(milliseconds),
-        timer: Some(asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock))),
+        timer: Some(asupersync::time::TimerDriverHandle::with_virtual_clock(
+            Arc::clone(&clock),
+        )),
         ..query::Policy::default()
     };
     (clock, policy)
@@ -547,22 +864,45 @@ fn bounded_buffered_search_keeps_all_modes_and_scopes_on_the_same_results() {
         let directory = tempfile::tempdir().unwrap();
         let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
         let (models, fast, quality) = fixture_models(true);
-        let (index, _) = build(&cx, &options, &directory.path().join("index"), source(), models).await.unwrap();
+        let (index, _) = build(
+            &cx,
+            &options,
+            &directory.path().join("index"),
+            source(),
+            models,
+        )
+        .await
+        .unwrap();
         let restriction = filter::Filter::parse(r#"{"ids":["retry.rs"]}"#).unwrap();
         let (clock, policy) = deadline_policy(10);
         for scope in [None, Some(&restriction)] {
             for mode in [Mode::Fast, Mode::Quality, Mode::Full] {
-                let expected = search(&index, &cx, "retry", mode, 2, [None, scope]).await.unwrap();
+                let expected = search(&index, &cx, "retry", mode, 2, [None, scope])
+                    .await
+                    .unwrap();
                 let deadline = policy.start(&cx, None).unwrap();
-                let result = query::within(&cx, deadline.as_ref(),
-                    search(&index, &cx, "retry", mode, 2, [None, scope])).await.unwrap();
+                let result = query::within(
+                    &cx,
+                    deadline.as_ref(),
+                    search(&index, &cx, "retry", mode, 2, [None, scope]),
+                )
+                .await
+                .unwrap();
                 assert_eq!(result, expected);
                 let before = (fast.load(Ordering::SeqCst), quality.load(Ordering::SeqCst));
                 clock.advance(10_000_000);
-                let error = query::within(&cx, deadline.as_ref(),
-                    search(&index, &cx, "retry", mode, 2, [None, scope])).await.unwrap_err();
+                let error = query::within(
+                    &cx,
+                    deadline.as_ref(),
+                    search(&index, &cx, "retry", mode, 2, [None, scope]),
+                )
+                .await
+                .unwrap_err();
                 assert_eq!(query::failure(error.as_ref())["code"], "search_timeout");
-                assert_eq!((fast.load(Ordering::SeqCst), quality.load(Ordering::SeqCst)), before);
+                assert_eq!(
+                    (fast.load(Ordering::SeqCst), quality.load(Ordering::SeqCst)),
+                    before
+                );
             }
         }
         assert!(!cx.is_cancel_requested());
@@ -576,16 +916,29 @@ struct AdvancingQuality {
 }
 
 impl Embedder for AdvancingQuality {
-    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { self.inner.identity() }
-    fn dimension(&self) -> usize { self.inner.dimension() }
-    fn id(&self) -> &str { self.inner.id() }
-    fn model_name(&self) -> &str { self.inner.model_name() }
-    fn is_semantic(&self) -> bool { self.inner.is_semantic() }
-    fn category(&self) -> ModelCategory { self.inner.category() }
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        self.inner.identity()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+    fn is_semantic(&self) -> bool {
+        self.inner.is_semantic()
+    }
+    fn category(&self) -> ModelCategory {
+        self.inner.category()
+    }
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
             let values = self.inner.embed(cx, text).await?;
-            self.clock.advance(self.advance_once.swap(0, Ordering::SeqCst) as u64);
+            self.clock
+                .advance(self.advance_once.swap(0, Ordering::SeqCst) as u64);
             Ok(values)
         })
     }
@@ -601,9 +954,19 @@ fn late_quality_preserves_initial_and_the_warm_server_accepts_the_next_request()
         let (clock, policy) = deadline_policy(5);
         let advance_once = Arc::new(AtomicUsize::new(0));
         models.quality = Some(Arc::new(AdvancingQuality {
-            inner: models.quality.take().unwrap(), clock, advance_once: Arc::clone(&advance_once),
+            inner: models.quality.take().unwrap(),
+            clock,
+            advance_once: Arc::clone(&advance_once),
         }));
-        let (index, selected) = build(&cx, &options, &directory.path().join("index"), source(), models).await.unwrap();
+        let (index, selected) = build(
+            &cx,
+            &options,
+            &directory.path().join("index"),
+            source(),
+            models,
+        )
+        .await
+        .unwrap();
         let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
         advance_once.store(10_000_000, Ordering::SeqCst);
         let mut input = Cursor::new(concat!(
@@ -611,19 +974,42 @@ fn late_quality_preserves_initial_and_the_warm_server_accepts_the_next_request()
             "{\"id\":\"next\",\"query\":\"retry\"}\n",
         ));
         let mut output = Vec::new();
-        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None, &policy).await.unwrap();
+        serve::run(
+            &live,
+            &cx,
+            &mut input,
+            &mut output,
+            (Mode::Full, 2),
+            false,
+            None,
+            &policy,
+        )
+        .await
+        .unwrap();
         let frames = output_frames(&output);
-        let slow = frames.iter().filter(|f| f["id"] == "slow").collect::<Vec<_>>();
+        let slow = frames
+            .iter()
+            .filter(|f| f["id"] == "slow")
+            .collect::<Vec<_>>();
         assert_eq!(slow.len(), 3, "no late Refined page");
         assert_eq!(slow[1]["phase"], "initial");
         assert_eq!(slow[1]["results"][0]["doc_id"], "retry.rs");
         assert_eq!(slow[2]["status"], "timed_out");
-        assert_eq!(slow[2]["budget_ms"], 5, "request could not widen server ceiling");
+        assert_eq!(
+            slow[2]["budget_ms"], 5,
+            "request could not widen server ceiling"
+        );
         assert_eq!(slow[2]["partial_results"], true);
-        let next = frames.iter().filter(|f| f["id"] == "next").collect::<Vec<_>>();
+        let next = frames
+            .iter()
+            .filter(|f| f["id"] == "next")
+            .collect::<Vec<_>>();
         assert_eq!(next[2]["phase"], "refined");
         assert_eq!(next[3]["status"], "complete");
-        assert_eq!(live.snapshot(&cx).await.unwrap().generation(), selected.generation);
+        assert_eq!(
+            live.snapshot(&cx).await.unwrap().generation(),
+            selected.generation
+        );
         assert!(!cx.is_cancel_requested());
     });
 }
@@ -651,12 +1037,36 @@ fn time_spent_delivering_initial_cannot_grant_quality_a_new_budget() {
         let directory = tempfile::tempdir().unwrap();
         let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
         let (models, _, quality) = fixture_models(true);
-        let (index, _) = build(&cx, &options, &directory.path().join("index"), source(), models).await.unwrap();
+        let (index, _) = build(
+            &cx,
+            &options,
+            &directory.path().join("index"),
+            source(),
+            models,
+        )
+        .await
+        .unwrap();
         let quality_before = quality.load(Ordering::SeqCst);
         let (clock, policy) = deadline_policy(10);
-        let mut output = DelayedOutput { bytes: Vec::new(), clock };
+        let mut output = DelayedOutput {
+            bytes: Vec::new(),
+            clock,
+        };
         let request: serve::Request = serde_json::from_str(r#"{"query":"retry"}"#).unwrap();
-        assert!(!serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output, None, &policy).await.unwrap());
+        assert!(
+            !serve::stream_one(
+                &index,
+                &cx,
+                &request,
+                1,
+                (Mode::Full, 2),
+                &mut output,
+                None,
+                &policy
+            )
+            .await
+            .unwrap()
+        );
         assert_eq!(quality.load(Ordering::SeqCst), quality_before);
         let frames = output_frames(&output.bytes);
         assert_eq!(frames[1]["phase"], "initial");

@@ -2,10 +2,13 @@
 //! Every phase is flushed before the next phase is polled. No result cache,
 //! model reload, independent tier refresh, or detached request task is involved.
 
+pub use frankensearch::native_ann::builder::live::NativeLiveHybridIndex;
 use frankensearch::native_ann::{NativePhaseCandidates, NativeSearchPhase};
-pub(super) use frankensearch::native_ann::builder::live::NativeLiveHybridIndex;
 
-use super::*;
+use super::{
+    ArtifactGenerationIdentityV1, BufRead, Cx, Deserialize, Error, Mode, NativeBuiltHybridIndex,
+    Read, Result, SCHEMA, Write, bad, emit, filter, query, validate_query,
+};
 
 #[path = "activation.rs"]
 mod activation;
@@ -16,7 +19,7 @@ mod warm_update;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ActivationPermission {
+pub enum ActivationPermission {
     Disabled,
     Enabled,
 }
@@ -24,7 +27,7 @@ pub(super) enum ActivationPermission {
 /// Startup-only grants to the trusted stdin controller. Activating a supplied
 /// receipt does not implicitly grant permission to create files or run indexing.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Controls {
+pub struct Controls {
     pub(super) activation: bool,
     pub(super) updates: bool,
 }
@@ -40,7 +43,7 @@ enum Message {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Request {
+pub struct Request {
     pub(super) id: Option<String>,
     pub(super) query: String,
     pub(super) mode: Option<Mode>,
@@ -114,7 +117,9 @@ async fn phases<W: Write>(
 ) -> std::result::Result<bool, Failure> {
     let scoped = query::within(cx, deadline, async {
         filter::Query::prepare(index, cx, filters)
-    }).await.map_err(Failure::Query)?;
+    })
+    .await
+    .map_err(Failure::Query)?;
     let mut started = serde_json::json!({
         "event": "started", "ok": true, "mode": mode, "limit": limit,
     });
@@ -131,40 +136,64 @@ async fn phases<W: Write>(
         frames.partial = true;
         return Ok(false);
     }
-    let mut stream = match rerank {
-        Some(rerank) => scoped.progressive_with_reranker(
-            cx, &request.query, limit, rerank.model.as_ref(), rerank.window,
-        ),
-        None => scoped.progressive(cx, &request.query, limit),
-    }.map_err(|error| Failure::Query(error.into()))?;
+    let mut stream = rerank
+        .map_or_else(
+            || scoped.progressive(cx, &request.query, limit),
+            |rerank| {
+                scoped.progressive_with_reranker(
+                    cx,
+                    &request.query,
+                    limit,
+                    rerank.model.as_ref(),
+                    rerank.window,
+                )
+            },
+        )
+        .map_err(|error| Failure::Query(error.into()))?;
     let mut degraded = false;
     while !stream.is_finished() {
         // One deadline, not a renewed timeout per phase. Do not time output:
         // delivery may already be visible and must never be reported undone.
         let phase = query::within(cx, deadline, async {
             stream.next_phase().await.map_err(Into::into)
-        }).await.map_err(Failure::Query)?;
-        let Some(phase) = phase else { break; };
+        })
+        .await
+        .map_err(Failure::Query)?;
+        let Some(phase) = phase else {
+            break;
+        };
         let mut payload = match phase {
-            NativeSearchPhase::Initial { results, candidates } => {
-                result_frame("initial", results, candidates)
-            }
-            NativeSearchPhase::Refined { results, candidates } => {
-                result_frame("refined", results, candidates)
-            }
-            NativeSearchPhase::Reranked { results, candidates, evaluated } => {
-                let mut frame = result_frame("reranked", results, candidates);
+            NativeSearchPhase::Initial {
+                results,
+                candidates,
+            } => result_frame("initial", &results, candidates),
+            NativeSearchPhase::Refined {
+                results,
+                candidates,
+            } => result_frame("refined", &results, candidates),
+            NativeSearchPhase::Reranked {
+                results,
+                candidates,
+                evaluated,
+            } => {
+                let mut frame = result_frame("reranked", &results, candidates);
                 frame["evaluated"] = serde_json::json!(evaluated);
                 frame
             }
-            NativeSearchPhase::RefinementFailed { initial_results, error } => {
+            NativeSearchPhase::RefinementFailed {
+                initial_results,
+                error,
+            } => {
                 degraded = true;
                 serde_json::json!({
                     "event": "results", "ok": false, "phase": "refinement_failed",
                     "results": initial_results, "error": error.to_string(),
                 })
             }
-            NativeSearchPhase::RerankFailed { previous_results, error } => {
+            NativeSearchPhase::RerankFailed {
+                previous_results,
+                error,
+            } => {
                 degraded = true;
                 serde_json::json!({
                     "event": "results", "ok": false, "phase": "rerank_failed",
@@ -184,7 +213,7 @@ async fn phases<W: Write>(
 
 fn result_frame(
     phase: &str,
-    results: Vec<frankensearch::ScoredResult>,
+    results: &[frankensearch::ScoredResult],
     candidates: NativePhaseCandidates,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -198,7 +227,7 @@ fn result_frame(
 /// Returns false for a failed/degraded request that was fully reported. Output
 /// failure returns Err and must stop the process, even when more input exists.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn stream_one<W: Write>(
+pub async fn stream_one<W: Write>(
     index: &NativeBuiltHybridIndex,
     cx: &Cx,
     request: &Request,
@@ -220,10 +249,23 @@ pub(super) async fn stream_one<W: Write>(
     let limit = request.limit.unwrap_or(defaults.1);
     let result = async {
         request.validate().map_err(Failure::Query)?;
-        let deadline = policy.start(cx, request.timeout_ms).map_err(Failure::Query)?;
-        phases(index, cx, request, mode, limit, &mut frames,
-            [base_filter, request.filter.as_ref()], deadline.as_ref(), policy.reranker_for(mode)).await
-    }.await;
+        let deadline = policy
+            .start(cx, request.timeout_ms)
+            .map_err(Failure::Query)?;
+        phases(
+            index,
+            cx,
+            request,
+            mode,
+            limit,
+            &mut frames,
+            [base_filter, request.filter.as_ref()],
+            deadline.as_ref(),
+            policy.reranker_for(mode),
+        )
+        .await
+    }
+    .await;
     match result {
         Ok(degraded) => {
             frames.send(serde_json::json!({
@@ -246,7 +288,7 @@ pub(super) async fn stream_one<W: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run_with_controls<R: BufRead, W: Write>(
+pub async fn run_with_controls<R: BufRead, W: Write>(
     live: &NativeLiveHybridIndex,
     cx: &Cx,
     input: &mut R,
@@ -256,62 +298,75 @@ pub(super) async fn run_with_controls<R: BufRead, W: Write>(
     base_filter: Option<&filter::Filter>,
     policy: &query::Policy,
 ) -> Result<()> {
-    cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
+    cx.checkpoint()
+        .map_err(|_| bad("native serving cancelled"))?;
     if let Some(filter) = base_filter {
         filter.validate()?;
     }
     let initial = live.snapshot(cx).await?;
     let index = initial.index();
-    emit(output, &serde_json::json!({
-        "schema": SCHEMA, "event": "ready", "ok": true,
-        "generation": index.vectors().fast().index().owner_witness().generation,
-        "documents": index.vectors().documents().len(),
-        "quality": index.vectors().quality().is_some(),
-        "fast_native_hnsw": index.vectors().fast().graph_path().is_some(),
-        "activation_enabled": controls.activation,
-        "updates_enabled": controls.updates,
-        "update_max_mutations": warm_update::MAX_MUTATIONS,
-        "default_filter_applied": base_filter.is_some(),
-        "maximum_timeout_ms": policy.maximum_ms(),
-        "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
-        "rerank_window": policy.rerank.as_ref().map(|r| r.window),
-    }))?;
+    emit(
+        output,
+        &serde_json::json!({
+            "schema": SCHEMA, "event": "ready", "ok": true,
+            "generation": index.vectors().fast().index().owner_witness().generation,
+            "documents": index.vectors().documents().len(),
+            "quality": index.vectors().quality().is_some(),
+            "fast_native_hnsw": index.vectors().fast().graph_path().is_some(),
+            "activation_enabled": controls.activation,
+            "updates_enabled": controls.updates,
+            "update_max_mutations": warm_update::MAX_MUTATIONS,
+            "default_filter_applied": base_filter.is_some(),
+            "maximum_timeout_ms": policy.maximum_ms(),
+            "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
+            "rerank_window": policy.rerank.as_ref().map(|r| r.window),
+        }),
+    )?;
     drop(initial);
-    let mut line = Vec::new();
+    let mut request_line = Vec::new();
     let mut ordinal = 0_u64;
     loop {
         // Standard input is a blocking read on the owning command lane. EOF
         // exits normally. No preemptible idle read or detached input task is claimed.
-        cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
-        line.clear();
+        cx.checkpoint()
+            .map_err(|_| bad("native serving cancelled"))?;
+        request_line.clear();
         let count = (&mut *input)
             .take(MAX_REQUEST_BYTES as u64 + 1)
-            .read_until(b'\n', &mut line)?;
-        cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
+            .read_until(b'\n', &mut request_line)?;
+        cx.checkpoint()
+            .map_err(|_| bad("native serving cancelled"))?;
         if count == 0 {
             return Ok(());
         }
-        if line.len() > MAX_REQUEST_BYTES {
-            return Err(bad("serve request exceeds 1 MiB; session stopped without draining input"));
+        if request_line.len() > MAX_REQUEST_BYTES {
+            return Err(bad(
+                "serve request exceeds 1 MiB; session stopped without draining input",
+            ));
         }
-        let raw = line.trim_ascii();
+        let raw = request_line.trim_ascii();
         if raw.is_empty() {
             continue;
         }
         if raw == b"quit" || raw == b"exit" {
             return Ok(());
         }
-        ordinal = ordinal.checked_add(1).ok_or_else(|| bad("request ordinal exhausted"))?;
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| bad("request ordinal exhausted"))?;
         let message: Message = match serde_json::from_slice(raw) {
             Ok(request) => request,
             Err(error) => {
                 let snapshot = live.snapshot(cx).await?;
-                emit(output, &serde_json::json!({
-                    "schema": SCHEMA, "event": "terminal", "ok": false, "status": "failed",
-                    "request": ordinal, "id": null, "seq": 0, "partial_results": false,
-                    "generation": snapshot.generation(),
-                    "error": format!("invalid request ({:?} at column {})", error.classify(), error.column()),
-                }))?;
+                emit(
+                    output,
+                    &serde_json::json!({
+                        "schema": SCHEMA, "event": "terminal", "ok": false, "status": "failed",
+                        "request": ordinal, "id": null, "seq": 0, "partial_results": false,
+                        "generation": snapshot.generation(),
+                        "error": format!("invalid request ({:?} at column {})", error.classify(), error.column()),
+                    }),
+                )?;
                 continue;
             }
         };
@@ -320,16 +375,24 @@ pub(super) async fn run_with_controls<R: BufRead, W: Write>(
                 // Pin once, through Initial, quality, hydration and terminal
                 // delivery. Never resolve the serving selection between phases.
                 let snapshot = live.snapshot(cx).await?;
-                let _complete =
-                    stream_one(snapshot.index(), cx, &request, ordinal, defaults, output, base_filter, policy).await?;
+                let _complete = stream_one(
+                    snapshot.index(),
+                    cx,
+                    &request,
+                    ordinal,
+                    defaults,
+                    output,
+                    base_filter,
+                    policy,
+                )
+                .await?;
             }
             Message::Control(request) => {
                 activation::execute(live, cx, &request, ordinal, controls.activation, output)
                     .await?;
             }
             Message::Update(request) => {
-                warm_update::execute(live, cx, request, ordinal, controls.updates, output)
-                    .await?;
+                warm_update::execute(live, cx, request, ordinal, controls.updates, output).await?;
             }
         }
     }
@@ -339,7 +402,7 @@ pub(super) async fn run_with_controls<R: BufRead, W: Write>(
 // non-writing server. Production callers must supply both grants explicitly.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run<R: BufRead, W: Write>(
+pub async fn run<R: BufRead, W: Write>(
     live: &NativeLiveHybridIndex,
     cx: &Cx,
     input: &mut R,
@@ -350,7 +413,17 @@ pub(super) async fn run<R: BufRead, W: Write>(
     policy: &query::Policy,
 ) -> Result<()> {
     run_with_controls(
-        live, cx, input, output, defaults,
-        Controls { activation: allow_activation, updates: false }, base_filter, policy,
-    ).await
+        live,
+        cx,
+        input,
+        output,
+        defaults,
+        Controls {
+            activation: allow_activation,
+            updates: false,
+        },
+        base_filter,
+        policy,
+    )
+    .await
 }

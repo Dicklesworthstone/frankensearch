@@ -5,13 +5,19 @@ use std::collections::BTreeMap;
 
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 
-use super::*;
+use super::{
+    BlockingPoolHandle, BufRead, BufReader, Cx, Deserialize, File, GenerationComponentReceiptV1,
+    HashMap, IndexableDocument, MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECORD_BYTES, Models,
+    NativeBuiltHybridIndex, Options, Path, Read, Result, SCHEMA, SELECTION_SCHEMA, Selection,
+    SnapshotReceipt, Write, bad, build_with_generation, emit, encode, fs, io, models,
+    new_generation, new_path, save_selection,
+};
 
-pub(super) type Edits = BTreeMap<String, Option<IndexableDocument>>;
+pub type Edits = BTreeMap<String, Option<IndexableDocument>>;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub(super) enum Mutation {
+pub enum Mutation {
     Upsert {
         id: String,
         content: String,
@@ -19,12 +25,19 @@ pub(super) enum Mutation {
         #[serde(default)]
         metadata: HashMap<String, String>,
     },
-    Delete { id: String },
+    Delete {
+        id: String,
+    },
 }
 
 fn admit_mutation(edits: &mut Edits, mutation: Mutation) -> Result<()> {
     let (id, document) = match mutation {
-        Mutation::Upsert { id, content, title, metadata } => {
+        Mutation::Upsert {
+            id,
+            content,
+            title,
+            metadata,
+        } => {
             let mut document = IndexableDocument::new(id.clone(), content);
             document.title = title;
             document.metadata = metadata;
@@ -33,7 +46,9 @@ fn admit_mutation(edits: &mut Edits, mutation: Mutation) -> Result<()> {
         Mutation::Delete { id } => (id, None),
     };
     if id.trim().is_empty() || id.contains('\0') || id.len() > usize::from(u16::MAX) {
-        return Err(bad("update IDs must be nonblank, NUL-free, and at most 65535 bytes"));
+        return Err(bad(
+            "update IDs must be nonblank, NUL-free, and at most 65535 bytes",
+        ));
     }
     edits.insert(id, document);
     if edits.len() > MAX_DOCUMENTS {
@@ -45,7 +60,7 @@ fn admit_mutation(edits: &mut Edits, mutation: Mutation) -> Result<()> {
 /// The stdio server bounds the complete request before decoding this array.
 /// Reuse the JSONL command's validation and last-edit-wins semantics, including
 /// validation of overwritten records, rather than a second mutation language.
-pub(super) fn from_mutations(mutations: Vec<Mutation>) -> Result<Edits> {
+pub fn from_mutations(mutations: Vec<Mutation>) -> Result<Edits> {
     let mut edits = BTreeMap::new();
     for mutation in mutations {
         admit_mutation(&mut edits, mutation)?;
@@ -53,7 +68,7 @@ pub(super) fn from_mutations(mutations: Vec<Mutation>) -> Result<Edits> {
     Ok(edits)
 }
 
-pub(super) fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
+pub fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
     let mut edits = BTreeMap::new();
     let mut line = Vec::new();
     let mut total = 0_usize;
@@ -67,7 +82,9 @@ pub(super) fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
             return Ok(edits);
         }
         ordinal += 1;
-        total = total.checked_add(count).ok_or_else(|| bad("update byte count overflow"))?;
+        total = total
+            .checked_add(count)
+            .ok_or_else(|| bad("update byte count overflow"))?;
         if line.len() > MAX_RECORD_BYTES || total > MAX_INPUT_BYTES {
             return Err(bad("update exceeds its record or total input byte limit"));
         }
@@ -77,7 +94,8 @@ pub(super) fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
         let mutation: Mutation = serde_json::from_slice(&line).map_err(|error| {
             bad(&format!(
                 "invalid update on line {ordinal} ({:?} at column {})",
-                error.classify(), error.column(),
+                error.classify(),
+                error.column(),
             ))
         })?;
         admit_mutation(&mut edits, mutation)?;
@@ -86,18 +104,24 @@ pub(super) fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
 
 // Bound the final retained source cohort, not just the delta. Repeated updates
 // must not evade the CLI's source limits by adding a bounded batch every time.
-pub(super) fn validate_final_cohort(cx: &Cx, index: &NativeBuiltHybridIndex, edits: &Edits) -> Result<()> {
+pub fn validate_final_cohort(cx: &Cx, index: &NativeBuiltHybridIndex, edits: &Edits) -> Result<()> {
     let mut count = 0_usize;
     let mut bytes = 0_usize;
     let mut admit = |document: &IndexableDocument| -> Result<()> {
-        cx.checkpoint().map_err(|error| frankensearch::SearchError::Cancelled {
-            phase: "native_cli.update".to_owned(), reason: error.to_string(),
-        })?;
+        cx.checkpoint()
+            .map_err(|error| frankensearch::SearchError::Cancelled {
+                phase: "native_cli.update".to_owned(),
+                reason: error.to_string(),
+            })?;
         let encoded = encode(document, MAX_RECORD_BYTES)?;
         count += 1;
-        bytes = bytes.checked_add(encoded.len()).ok_or_else(|| bad("source byte count overflow"))?;
+        bytes = bytes
+            .checked_add(encoded.len())
+            .ok_or_else(|| bad("source byte count overflow"))?;
         if count > MAX_DOCUMENTS || bytes > MAX_INPUT_BYTES {
-            return Err(bad("the final source cohort exceeds the document or encoded-byte limit"));
+            return Err(bad(
+                "the final source cohort exceeds the document or encoded-byte limit",
+            ));
         }
         Ok(())
     };
@@ -118,7 +142,7 @@ pub(super) fn validate_final_cohort(cx: &Cx, index: &NativeBuiltHybridIndex, edi
     Ok(())
 }
 
-pub(super) async fn apply(
+pub async fn apply(
     cx: &Cx,
     previous: &Selection,
     index: &NativeBuiltHybridIndex,
@@ -130,10 +154,14 @@ pub(super) async fn apply(
         return Err(bad("update source does not match the selected predecessor"));
     }
     validate_final_cohort(cx, index, &edits)?;
-    let sequence = previous.generation.sequence.checked_add(1)
+    let sequence = previous
+        .generation
+        .sequence
+        .checked_add(1)
         .ok_or_else(|| bad("generation sequence exhausted"))?;
     let generation = new_generation(sequence)?;
-    let mut update = index.begin_update(cx, directory, generation)?
+    let mut update = index
+        .begin_update(cx, directory, generation)?
         .with_batch_size(batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
     for (id, document) in edits {
@@ -150,7 +178,10 @@ pub(super) async fn apply(
         schema: SELECTION_SCHEMA.to_owned(),
         directory: successor.vectors().directory().to_path_buf(),
         generation,
-        snapshot: SnapshotReceipt { byte_len: snapshot.byte_len, sha256: snapshot.sha256 },
+        snapshot: SnapshotReceipt {
+            byte_len: snapshot.byte_len,
+            sha256: snapshot.sha256,
+        },
         documents: successor.vectors().documents().len(),
         fast_producer: previous.fast_producer.clone(),
         quality_producer: previous.quality_producer.clone(),
@@ -158,7 +189,7 @@ pub(super) async fn apply(
     Ok((successor, selection))
 }
 
-pub(super) async fn execute(
+pub async fn execute(
     cx: &Cx,
     options: &Options,
     output: &mut impl Write,
@@ -166,14 +197,26 @@ pub(super) async fn execute(
 ) -> Result<()> {
     let previous = Selection::read(&options.receipt)?;
     let old_root = fs::canonicalize(&previous.directory)?;
-    let directory = new_path(options.directory.as_deref().ok_or_else(|| bad("missing new index directory"))?)?;
-    let receipt = new_path(options.new_receipt.as_deref().ok_or_else(|| bad("missing --new-receipt"))?)?;
+    let directory = new_path(
+        options
+            .directory
+            .as_deref()
+            .ok_or_else(|| bad("missing new index directory"))?,
+    )?;
+    let receipt = new_path(
+        options
+            .new_receipt
+            .as_deref()
+            .ok_or_else(|| bad("missing --new-receipt"))?,
+    )?;
     if directory.starts_with(&old_root)
         || receipt.starts_with(&old_root)
         || directory.starts_with(&receipt)
         || receipt.starts_with(&directory)
     {
-        return Err(bad("new destinations must be outside the predecessor and must not overlap"));
+        return Err(bad(
+            "new destinations must be outside the predecessor and must not overlap",
+        ));
     }
     let edits = match &options.input {
         Some(path) => read_edits(&mut BufReader::new(File::open(path)?))?,
@@ -181,22 +224,30 @@ pub(super) async fn execute(
     };
     let edited_ids = edits.len();
     let models = models::load(
-        cx, options.models.as_deref(), previous.quality_producer.is_some(), &options.quality, pool,
+        cx,
+        options.models.as_deref(),
+        previous.quality_producer.is_some(),
+        &options.quality,
+        pool,
     )?;
     let index = previous.open(cx, models).await?;
-    let (_successor, selection) = apply(cx, &previous, &index, &directory, edits, options.batch_size).await?;
+    let (_successor, selection) =
+        apply(cx, &previous, &index, &directory, edits, options.batch_size).await?;
     save_selection(&selection, &receipt)?;
-    emit(output, &serde_json::json!({
-        "schema": SCHEMA, "ok": true, "event": "updated",
-        "predecessor": previous.generation, "edited_ids": edited_ids,
-        "receipt": receipt, "selection": selection,
-    }))
+    emit(
+        output,
+        &serde_json::json!({
+            "schema": SCHEMA, "ok": true, "event": "updated",
+            "predecessor": previous.generation, "edited_ids": edited_ids,
+            "receipt": receipt, "selection": selection,
+        }),
+    )
 }
 
 /// Rebuild every search artifact from the authenticated retained source stream.
 /// This is deliberately distinct from update: no original model or search owner
 /// is required, no vectors are reused, and every new row binds its actual producer.
-pub(super) async fn rebuild(
+pub async fn rebuild(
     cx: &Cx,
     options: &Options,
     output: &mut impl Write,
@@ -204,7 +255,8 @@ pub(super) async fn rebuild(
 ) -> Result<()> {
     rebuild_with_loader(cx, options, output, |root, quality| {
         models::load(cx, root, quality, &options.quality, pool)
-    }).await
+    })
+    .await
 }
 
 async fn rebuild_with_loader<F>(
@@ -236,7 +288,9 @@ where
         || directory.starts_with(&receipt)
         || receipt.starts_with(&directory)
     {
-        return Err(bad("new destinations must be outside the predecessor and must not overlap"));
+        return Err(bad(
+            "new destinations must be outside the predecessor and must not overlap",
+        ));
     }
     // Authenticate all source bytes before model loading, inference or candidate
     // creation. Do not attempt ordinary reopen first: it must reject the very
@@ -254,23 +308,26 @@ where
     let models = load(options.models.as_deref(), !options.fast_only)?;
     rebuild_checkpoint(cx)?;
     if models.quality.is_some() == options.fast_only {
-        return Err(bad("loaded model topology disagrees with the explicit rebuild policy"));
+        return Err(bad(
+            "loaded model topology disagrees with the explicit rebuild policy",
+        ));
     }
-    let (_successor, selection) = build_with_generation(
-        cx, options, &directory, generation, documents, models,
-    )
-    .await?;
+    let (_successor, selection) =
+        build_with_generation(cx, options, &directory, generation, documents, models).await?;
     // A cancelled seal can leave inert evidence, but must not get a success
     // receipt. No cancellation point follows saving the caller-visible receipt.
     rebuild_checkpoint(cx)?;
     save_selection(&selection, &receipt)?;
-    emit(output, &serde_json::json!({
-        "schema": SCHEMA, "ok": true, "event": "rebuilt",
-        "predecessor": previous.generation,
-        "recovery": "authenticated_retained_source",
-        "vectors_reused": false,
-        "receipt": receipt, "selection": selection,
-    }))
+    emit(
+        output,
+        &serde_json::json!({
+            "schema": SCHEMA, "ok": true, "event": "rebuilt",
+            "predecessor": previous.generation,
+            "recovery": "authenticated_retained_source",
+            "vectors_reused": false,
+            "receipt": receipt, "selection": selection,
+        }),
+    )
 }
 
 fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocument>> {
@@ -288,7 +345,9 @@ fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocu
         limits,
     )?;
     if generation != selection.generation || documents.len() != selection.documents {
-        return Err(bad("recovered source differs from the trusted selection's generation or count"));
+        return Err(bad(
+            "recovered source differs from the trusted selection's generation or count",
+        ));
     }
     // A library snapshot can use a broader source-ID contract than this CLI.
     // Reject it explicitly instead of silently dropping or renaming documents.
@@ -299,7 +358,9 @@ fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocu
             || document.id.contains('\0')
             || document.id.len() > usize::from(u16::MAX)
         {
-            return Err(bad("recovered IDs must be nonblank, NUL-free, and at most 65535 bytes"));
+            return Err(bad(
+                "recovered IDs must be nonblank, NUL-free, and at most 65535 bytes",
+            ));
         }
         let encoded = encode(document, MAX_RECORD_BYTES)?;
         bytes = bytes
@@ -314,10 +375,11 @@ fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocu
 }
 
 fn rebuild_checkpoint(cx: &Cx) -> Result<()> {
-    cx.checkpoint().map_err(|_| frankensearch::SearchError::Cancelled {
-        phase: "native_cli.rebuild".to_owned(),
-        reason: "source rebuild cancelled".to_owned(),
-    })?;
+    cx.checkpoint()
+        .map_err(|_| frankensearch::SearchError::Cancelled {
+            phase: "native_cli.rebuild".to_owned(),
+            reason: "source rebuild cancelled".to_owned(),
+        })?;
     Ok(())
 }
 

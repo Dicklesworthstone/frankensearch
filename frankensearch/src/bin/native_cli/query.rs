@@ -5,20 +5,23 @@
 use std::future::Future;
 use std::time::Duration;
 
-use asupersync::time::TimerDriverHandle;
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use asupersync::time::TimerDriverHandle;
 use frankensearch::SearchError;
-use frankensearch::{Reranker, native_ann::NativeSearchPhase};
 use frankensearch::native_ann::builder::deadline::NativeSearchDeadline;
+use frankensearch::{Reranker, native_ann::NativeSearchPhase};
 
-use super::*;
+use super::{
+    Arc, Cx, Error, Mode, NativeBuiltHybridIndex, Path, Result, SCHEMA, bad, filter, search,
+    validate_query,
+};
 
-pub(super) const MAX_TIMEOUT_MS: u64 = 600_000;
+pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
 /// A server budget is both the default and a ceiling on request overrides.
 /// No configured budget preserves the previous unbounded-query policy.
 #[derive(Default)]
-pub(super) struct Policy {
+pub struct Policy {
     pub(super) maximum_ms: Option<u64>,
     pub(super) timer: Option<TimerDriverHandle>,
     pub(super) rerank: Option<Rerank>,
@@ -27,7 +30,11 @@ pub(super) struct Policy {
 impl Policy {
     pub(super) fn new(cx: &Cx, maximum_ms: Option<u64>) -> Result<Self> {
         validate_timeout(maximum_ms)?;
-        Ok(Self { maximum_ms, timer: cx.timer_driver(), ..Self::default() })
+        Ok(Self {
+            maximum_ms,
+            timer: cx.timer_driver(),
+            ..Self::default()
+        })
     }
 
     pub(super) fn maximum_ms(&self) -> Option<u64> {
@@ -35,7 +42,11 @@ impl Policy {
     }
 
     pub(super) fn reranker_for(&self, mode: Mode) -> Option<&Rerank> {
-        if mode == Mode::Full { self.rerank.as_ref() } else { None }
+        if mode == Mode::Full {
+            self.rerank.as_ref()
+        } else {
+            None
+        }
     }
 
     pub(super) fn effective_ms(&self, requested_ms: Option<u64>) -> Result<Option<u64>> {
@@ -55,11 +66,13 @@ impl Policy {
         self.effective_ms(requested_ms)?
             .map(|milliseconds| {
                 let duration = Duration::from_millis(milliseconds);
-                match &self.timer {
-                    Some(timer) => NativeSearchDeadline::with_timer(cx, timer.clone(), duration),
-                    None => NativeSearchDeadline::after(cx, duration),
-                }
-                .map_err(Into::into)
+                self.timer
+                    .as_ref()
+                    .map_or_else(
+                        || NativeSearchDeadline::after(cx, duration),
+                        |timer| NativeSearchDeadline::with_timer(cx, timer.clone(), duration),
+                    )
+                    .map_err(Into::into)
             })
             .transpose()
     }
@@ -67,7 +80,7 @@ impl Policy {
 
 /// One explicitly loaded model reused by every full-mode request. Sources come
 /// only from the query's retained hybrid cohort, never from mutable file paths.
-pub(super) struct Rerank {
+pub struct Rerank {
     pub(super) model: Arc<dyn Reranker>,
     pub(super) window: usize,
 }
@@ -93,7 +106,8 @@ impl Rerank {
         })?;
         #[cfg(any(feature = "native", feature = "rerank"))]
         {
-            let pool = pool.ok_or_else(|| bad("native reranking requires the caller's blocking pool"))?;
+            let pool =
+                pool.ok_or_else(|| bad("native reranking requires the caller's blocking pool"))?;
             let model = frankensearch::NativeReranker::load(directory)?.with_blocking_pool(pool);
             cx.checkpoint().map_err(|_| SearchError::Cancelled {
                 phase: "native_cli.rerank.loaded".to_owned(),
@@ -104,7 +118,9 @@ impl Rerank {
         #[cfg(not(any(feature = "native", feature = "rerank")))]
         {
             let _ = (directory, window, pool);
-            Err(bad("native reranking is not compiled in; build with --features hybrid,rerank"))
+            Err(bad(
+                "native reranking is not compiled in; build with --features hybrid,rerank",
+            ))
         }
     }
 
@@ -118,7 +134,7 @@ impl Rerank {
 /// The phase label comes from the phase actually delivered, so an empty pool is
 /// not described as reranked when the native engine correctly skipped inference.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn buffered(
+pub async fn buffered(
     index: &NativeBuiltHybridIndex,
     cx: &Cx,
     text: &str,
@@ -135,14 +151,20 @@ pub(super) async fn buffered(
         validate_query(text)?;
         let scoped = filter::Query::prepare(index, cx, filters)?;
         let mut stream = scoped.progressive_with_reranker(
-            cx, text, limit, rerank.model.as_ref(), rerank.window,
+            cx,
+            text,
+            limit,
+            rerank.model.as_ref(),
+            rerank.window,
         )?;
         let mut final_page = None;
         while let Some(phase) = stream.next_phase().await? {
             let (phase, results, evaluated) = match phase {
                 NativeSearchPhase::Initial { results, .. } => ("initial", results, 0),
                 NativeSearchPhase::Refined { results, .. } => ("refined", results, 0),
-                NativeSearchPhase::Reranked { results, evaluated, .. } => ("reranked", results, evaluated),
+                NativeSearchPhase::Reranked {
+                    results, evaluated, ..
+                } => ("reranked", results, evaluated),
                 NativeSearchPhase::RefinementFailed { error, .. }
                 | NativeSearchPhase::RerankFailed { error, .. } => return Err(error.into()),
             };
@@ -157,12 +179,15 @@ pub(super) async fn buffered(
         scoped.annotate(&mut payload);
         rerank.annotate(&mut payload);
         Ok(payload)
-    }).await
+    })
+    .await
 }
 
-pub(super) fn validate_timeout(milliseconds: Option<u64>) -> Result<()> {
+pub fn validate_timeout(milliseconds: Option<u64>) -> Result<()> {
     if milliseconds.is_some_and(|value| value == 0 || value > MAX_TIMEOUT_MS) {
-        return Err(bad("query timeout must be between 1 and 600000 milliseconds"));
+        return Err(bad(
+            "query timeout must be between 1 and 600000 milliseconds",
+        ));
     }
     Ok(())
 }
@@ -171,28 +196,36 @@ pub(super) fn validate_timeout(milliseconds: Option<u64>) -> Result<()> {
 fn native_error(error: Box<dyn Error + Send + Sync>) -> SearchError {
     match error.downcast::<SearchError>() {
         Ok(error) => *error,
-        Err(source) => SearchError::SubsystemError { subsystem: "native_cli.query", source },
+        Err(source) => SearchError::SubsystemError {
+            subsystem: "native_cli.query",
+            source,
+        },
     }
 }
 
-pub(super) async fn within<T>(
+pub async fn within<T>(
     cx: &Cx,
     deadline: Option<&NativeSearchDeadline>,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
     match deadline {
-        Some(deadline) => Ok(deadline.run(cx, async { future.await.map_err(native_error) }).await?),
+        Some(deadline) => Ok(deadline
+            .run(cx, async { future.await.map_err(native_error) })
+            .await?),
         None => future.await,
     }
 }
 
 /// Stable timeout/cancellation facts accompany the human-readable error. There
 /// is no query text, source document or model path in these additional fields.
-pub(super) fn failure(error: &(dyn Error + 'static)) -> serde_json::Value {
+pub fn failure(error: &(dyn Error + 'static)) -> serde_json::Value {
     let mut fields = serde_json::json!({ "status": "failed", "error": error.to_string() });
     if let Some(error) = error.downcast_ref::<SearchError>() {
         match error {
-            SearchError::SearchTimeout { elapsed_ms, budget_ms } => {
+            SearchError::SearchTimeout {
+                elapsed_ms,
+                budget_ms,
+            } => {
                 fields["status"] = serde_json::json!("timed_out");
                 fields["code"] = serde_json::json!("search_timeout");
                 fields["elapsed_ms"] = serde_json::json!(elapsed_ms);
@@ -215,7 +248,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
-    pub(crate) fn policy(cx: &Cx, milliseconds: u64) -> (Arc<VirtualClock>, Policy) {
+    pub fn policy(cx: &Cx, milliseconds: u64) -> (Arc<VirtualClock>, Policy) {
         let clock = Arc::new(VirtualClock::new());
         let timer = TimerDriverHandle::with_virtual_clock(Arc::clone(&clock));
         let mut policy = Policy::new(cx, Some(milliseconds)).unwrap();
@@ -234,7 +267,10 @@ mod tests {
         assert!(policy.effective_ms(Some(MAX_TIMEOUT_MS + 1)).is_err());
         let unbounded = Policy::new(&cx, None).unwrap();
         assert!(unbounded.start(&cx, None).unwrap().is_none());
-        assert!(unbounded.start(&cx, Some(10)).is_err(), "no hidden timer fallback");
+        assert!(
+            unbounded.start(&cx, Some(10)).is_err(),
+            "no hidden timer fallback"
+        );
     }
 
     #[test]
@@ -246,14 +282,19 @@ mod tests {
             clock.advance(7_000_000);
             Ok(7)
         }));
-        assert!(matches!(first.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-            Poll::Ready(Ok(7))));
+        assert!(matches!(
+            first.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Ready(Ok(7))
+        ));
         drop(first);
         let mut second = Box::pin(within(&cx, Some(&deadline), async {
             clock.advance(4_000_000);
             Ok(11)
         }));
-        let Poll::Ready(Err(error)) = second.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+        let Poll::Ready(Err(error)) = second
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
             panic!("late synchronous work must be refused"); // ubs:ignore — test assertion.
         };
         let facts = failure(error.as_ref());
@@ -267,7 +308,9 @@ mod tests {
     fn expiry_and_drop_release_pending_work_but_cancellation_keeps_its_type() {
         struct DropCount<'a>(&'a AtomicUsize);
         impl Drop for DropCount<'_> {
-            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
         }
         let cx = Cx::for_testing();
         let drops = AtomicUsize::new(0);
@@ -278,14 +321,23 @@ mod tests {
                 let _drop = DropCount(&drops);
                 std::future::pending::<Result<()>>().await
             }));
-            assert!(work.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                work.as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             clock.advance(10_000_000);
             cx.set_cancel_requested(cancel);
-            let Poll::Ready(Err(error)) = work.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+            let Poll::Ready(Err(error)) =
+                work.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+            else {
                 panic!("expired pending work must finish"); // ubs:ignore — test assertion.
             };
             let facts = failure(error.as_ref());
-            assert_eq!(facts["status"], if cancel { "cancelled" } else { "timed_out" });
+            assert_eq!(
+                facts["status"],
+                if cancel { "cancelled" } else { "timed_out" }
+            );
             assert!(policy.timer.as_ref().unwrap().is_empty());
             drop(work);
             cx.set_cancel_requested(false);
@@ -297,7 +349,11 @@ mod tests {
             let _drop = DropCount(&drops);
             std::future::pending::<Result<()>>().await
         }));
-        assert!(work.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            work.as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         drop(work);
         assert_eq!(drops.load(Ordering::SeqCst), 3);
         assert!(policy.timer.as_ref().unwrap().is_empty());

@@ -1,4 +1,5 @@
 use super::*;
+use crate::{Arc, ArtifactGenerationIdentityV1, Command, Embedder, PathBuf};
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Waker};
@@ -82,7 +83,9 @@ impl Embedder for Provider {
 fn source() -> Vec<IndexableDocument> {
     let mut retry = IndexableDocument::new("retry.rs", "retry network requests café 🦀");
     retry.title = Some("東京 title".to_owned());
-    retry.metadata.insert("language".to_owned(), "rust".to_owned());
+    retry
+        .metadata
+        .insert("language".to_owned(), "rust".to_owned());
     vec![retry, IndexableDocument::new("garden.md", "garden flowers")]
 }
 
@@ -95,7 +98,9 @@ fn options(root: &Path, name: &str) -> Options {
         root.join(name).display().to_string(),
         "--new-receipt".to_owned(),
         root.join(format!("{name}.json")).display().to_string(),
-    ]).unwrap().unwrap()
+    ])
+    .unwrap()
+    .unwrap()
 }
 
 struct Fixture {
@@ -115,12 +120,23 @@ async fn fixture(cx: &Cx, root: &Path, quality: bool, sequence: u64) -> Fixture 
     };
     let options = options(root, "unused");
     let (index, selection) = build_with_generation(
-        cx, &options, &root.join("old"),
+        cx,
+        &options,
+        &root.join("old"),
         ArtifactGenerationIdentityV1::new(sequence, [0x41; 16]).unwrap(),
-        source(), models.clone(),
-    ).await.unwrap();
+        source(),
+        models.clone(),
+    )
+    .await
+    .unwrap();
     save_selection(&selection, &root.join("old.json")).unwrap();
-    Fixture { index, selection, models, fast, quality: slow }
+    Fixture {
+        index,
+        selection,
+        models,
+        fast,
+        quality: slow,
+    }
 }
 
 fn image(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
@@ -133,7 +149,10 @@ fn image(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
             if entry.file_type().unwrap().is_dir() {
                 pending.push(path);
             } else {
-                files.insert(path.strip_prefix(root).unwrap().to_path_buf(), fs::read(path).unwrap());
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
             }
         }
     }
@@ -152,10 +171,23 @@ fn rebuild_requires_fresh_destinations_and_never_accepts_stdin_or_search_options
     let parsed = options(root.path(), "new");
     assert_eq!(parsed.command, Command::Rebuild);
     assert!(!parsed.fast_only);
-    for flag in ["--input", "--query", "--filter", "--timeout-ms", "--allow-activation"] {
+    for flag in [
+        "--input",
+        "--query",
+        "--filter",
+        "--timeout-ms",
+        "--allow-activation",
+    ] {
         let args = [
-            "rebuild", "--receipt", "old", "--index-dir", "new", "--new-receipt", "new.json",
-            flag, "value",
+            "rebuild",
+            "--receipt",
+            "old",
+            "--index-dir",
+            "new",
+            "--new-receipt",
+            "new.json",
+            flag,
+            "value",
         ];
         assert!(Options::parse(args.map(str::to_owned)).is_err(), "{flag}");
     }
@@ -166,10 +198,24 @@ fn rebuild_requires_fresh_destinations_and_never_accepts_stdin_or_search_options
     ] {
         assert!(Options::parse(args.into_iter().map(str::to_owned)).is_err());
     }
-    let parsed = Options::parse([
-        "rebuild", "--receipt", "old", "--index-dir", "new", "--new-receipt", "new.json",
-        "--fast-only", "--exact", "--batch-size", "2",
-    ].map(str::to_owned)).unwrap().unwrap();
+    let parsed = Options::parse(
+        [
+            "rebuild",
+            "--receipt",
+            "old",
+            "--index-dir",
+            "new",
+            "--new-receipt",
+            "new.json",
+            "--fast-only",
+            "--exact",
+            "--batch-size",
+            "2",
+        ]
+        .map(str::to_owned),
+    )
+    .unwrap()
+    .unwrap();
     assert!(parsed.fast_only && parsed.exact);
     assert_eq!(parsed.batch_size, 2);
 }
@@ -177,7 +223,11 @@ fn rebuild_requires_fresh_destinations_and_never_accepts_stdin_or_search_options
 #[test]
 fn rebuild_recovers_missing_search_artifacts_and_reembeds_with_new_producers() {
     run_test_with_cx(|cx| async move {
-        for (old_quality, new_quality, exact) in [(true, true, false), (false, true, true), (true, false, false)] {
+        for (old_quality, new_quality, exact) in [
+            (true, true, false),
+            (false, true, true),
+            (true, false, false),
+        ] {
             let root = tempfile::tempdir().unwrap();
             let old = fixture(&cx, root.path(), old_quality, 41).await;
             drop(old.index); // Do not alter files while a mapped reader lives.
@@ -185,9 +235,10 @@ fn rebuild_recovers_missing_search_artifacts_and_reembeds_with_new_producers() {
             fs::create_dir(&displaced).unwrap();
             for entry in fs::read_dir(&old.selection.directory).unwrap() {
                 let entry = entry.unwrap();
-                if !matches!(entry.file_name().to_str(),
-                    Some("native.hybrid.json" | "native.snapshot.json" | "native.source.jsonl"))
-                {
+                if !matches!(
+                    entry.file_name().to_str(),
+                    Some("native.hybrid.json" | "native.snapshot.json" | "native.source.jsonl")
+                ) {
                     fs::rename(entry.path(), displaced.join(entry.file_name())).unwrap();
                 }
             }
@@ -207,11 +258,19 @@ fn rebuild_recovers_missing_search_artifacts_and_reembeds_with_new_producers() {
             rebuild_with_loader(&cx, &options, &mut output, |_, required_quality| {
                 assert_eq!(required_quality, new_quality);
                 Ok(models.clone())
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert_eq!(new_fast.calls.load(Ordering::SeqCst), 2);
-            assert_eq!(new_slow.calls.load(Ordering::SeqCst), if new_quality { 2 } else { 0 });
+            assert_eq!(
+                new_slow.calls.load(Ordering::SeqCst),
+                if new_quality { 2 } else { 0 }
+            );
             assert_eq!(old.fast.calls.load(Ordering::SeqCst), 2);
-            assert_eq!(old.quality.calls.load(Ordering::SeqCst), if old_quality { 2 } else { 0 });
+            assert_eq!(
+                old.quality.calls.load(Ordering::SeqCst),
+                if old_quality { 2 } else { 0 }
+            );
             let receipt = Selection::read(options.new_receipt.as_ref().unwrap()).unwrap();
             assert_eq!(receipt.generation.sequence, 42);
             assert_ne!(receipt.generation.nonce, old.selection.generation.nonce);
@@ -219,16 +278,36 @@ fn rebuild_recovers_missing_search_artifacts_and_reembeds_with_new_producers() {
             let reopened = receipt.open(&cx, models).await.unwrap();
             assert_eq!(reopened.vectors().fast().graph_path().is_some(), !exact);
             assert_eq!(reopened.vectors().quality().is_some(), new_quality);
-            assert_eq!(reopened.vectors().document("retry.rs").unwrap().metadata["language"], "rust");
-            assert_eq!(reopened.vectors().document("retry.rs").unwrap().content, source()[0].content);
-            assert_eq!(reopened.vectors().document("retry.rs").unwrap().title, source()[0].title);
-            assert_eq!(reopened.lexical().search(&cx, "garden", 10).await.unwrap().len(), 1);
+            assert_eq!(
+                reopened.vectors().document("retry.rs").unwrap().metadata["language"],
+                "rust"
+            );
+            assert_eq!(
+                reopened.vectors().document("retry.rs").unwrap().content,
+                source()[0].content
+            );
+            assert_eq!(
+                reopened.vectors().document("retry.rs").unwrap().title,
+                source()[0].title
+            );
+            assert_eq!(
+                reopened
+                    .lexical()
+                    .search(&cx, "garden", 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
             let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(response["event"], "rebuilt");
             assert_eq!(response["vectors_reused"], false);
             assert_eq!(response["selection"]["generation"]["sequence"], 42);
             assert_eq!(image(&old.selection.directory), before);
-            assert_eq!(fs::read(root.path().join("old.json")).unwrap(), receipt_before);
+            assert_eq!(
+                fs::read(root.path().join("old.json")).unwrap(),
+                receipt_before
+            );
         }
     });
 }
@@ -241,7 +320,13 @@ fn corrupt_sources_and_receipt_drift_refuse_before_loading_any_model() {
         drop(old.index);
         let receipt_path = root.path().join("old.json");
         let receipt_before = fs::read(&receipt_path).unwrap();
-        for fault in ["native.hybrid.json", "native.snapshot.json", "native.source.jsonl", "count", "generation"] {
+        for fault in [
+            "native.hybrid.json",
+            "native.snapshot.json",
+            "native.source.jsonl",
+            "count",
+            "generation",
+        ] {
             let path = if matches!(fault, "count" | "generation") {
                 receipt_path.clone()
             } else {
@@ -266,10 +351,15 @@ fn corrupt_sources_and_receipt_drift_refuse_before_loading_any_model() {
             let loads = AtomicUsize::new(0);
             let options = options(root.path(), "must-not-exist");
             let mut output = Vec::new();
-            assert!(rebuild_with_loader(&cx, &options, &mut output, |_, _| {
-                loads.fetch_add(1, Ordering::SeqCst);
-                Ok(old.models.clone())
-            }).await.is_err(), "{fault}");
+            assert!(
+                rebuild_with_loader(&cx, &options, &mut output, |_, _| {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(old.models.clone())
+                })
+                .await
+                .is_err(),
+                "{fault}"
+            );
             assert_eq!(loads.load(Ordering::SeqCst), 0, "{fault}");
             assert_no_candidate(&options, &output);
             assert_eq!(image(root.path()), before);
@@ -289,12 +379,22 @@ fn inference_failure_cancellation_and_abandoned_rebuild_never_save_a_receipt() {
             let fast = Provider::new("fresh-fast");
             let slow = Provider::new("fresh-quality");
             slow.mode.store(mode, Ordering::SeqCst);
-            let models = Models { fast, quality: Some(slow.clone()) };
+            let models = Models {
+                fast,
+                quality: Some(slow.clone()),
+            };
             let options = options(root.path(), &format!("failed-{mode}"));
             let mut output = Vec::new();
-            let mut future = Box::pin(rebuild_with_loader(&cx, &options, &mut output, |_, _| Ok(models)));
+            let mut future = Box::pin(rebuild_with_loader(&cx, &options, &mut output, |_, _| {
+                Ok(models)
+            }));
             if mode == 3 {
-                assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                assert!(
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
                 assert_eq!(slow.calls.load(Ordering::SeqCst), 1);
                 assert_eq!(slow.drops.load(Ordering::SeqCst), 0);
                 drop(future);
@@ -302,7 +402,10 @@ fn inference_failure_cancellation_and_abandoned_rebuild_never_save_a_receipt() {
             } else {
                 let error = future.await.unwrap_err();
                 if mode == 2 {
-                    assert!(matches!(error.downcast_ref::<SearchError>(), Some(SearchError::Cancelled { .. })));
+                    assert!(matches!(
+                        error.downcast_ref::<SearchError>(),
+                        Some(SearchError::Cancelled { .. })
+                    ));
                 }
             }
             assert!(output.is_empty());
@@ -316,12 +419,25 @@ fn inference_failure_cancellation_and_abandoned_rebuild_never_save_a_receipt() {
         let error = rebuild_with_loader(&cx, &options, &mut output, |_, _| {
             loads.fetch_add(1, Ordering::SeqCst);
             Ok(old.models.clone())
-        }).await.unwrap_err();
+        })
+        .await
+        .unwrap_err();
         cx.set_cancel_requested(false);
-        assert!(matches!(error.downcast_ref::<SearchError>(), Some(SearchError::Cancelled { .. })));
+        assert!(matches!(
+            error.downcast_ref::<SearchError>(),
+            Some(SearchError::Cancelled { .. })
+        ));
         assert_eq!(loads.load(Ordering::SeqCst), 0);
         assert_no_candidate(&options, &output);
-        assert_eq!(old.index.lexical().search(&cx, "garden", 10).await.unwrap().len(), 1);
+        assert_eq!(
+            old.index
+                .lexical()
+                .search(&cx, "garden", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     });
 }
 
@@ -336,7 +452,9 @@ fn exhausted_generation_cannot_wrap_or_load_models() {
         let error = rebuild_with_loader(&cx, &options, &mut output, |_, _| {
             loads.fetch_add(1, Ordering::SeqCst);
             Ok(old.models.clone())
-        }).await.unwrap_err();
+        })
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("sequence exhausted"));
         assert_eq!(loads.load(Ordering::SeqCst), 0);
         assert_no_candidate(&options, &output);
@@ -362,14 +480,21 @@ fn conflicting_and_aliased_destinations_cannot_modify_the_predecessor() {
             }
             let loads = AtomicUsize::new(0);
             let mut output = Vec::new();
-            assert!(rebuild_with_loader(&cx, &options, &mut output, |_, _| {
-                loads.fetch_add(1, Ordering::SeqCst);
-                Ok(old.models.clone())
-            }).await.is_err());
+            assert!(
+                rebuild_with_loader(&cx, &options, &mut output, |_, _| {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    Ok(old.models.clone())
+                })
+                .await
+                .is_err()
+            );
             assert_eq!(loads.load(Ordering::SeqCst), 0);
             assert!(output.is_empty());
             assert_eq!(image(&old.selection.directory), before);
-            assert_eq!(fs::read(root.path().join("old.json")).unwrap(), receipt_before);
+            assert_eq!(
+                fs::read(root.path().join("old.json")).unwrap(),
+                receipt_before
+            );
         }
         assert!(!root.path().join("new").exists());
         assert!(!alias.join("nested").exists());
@@ -394,13 +519,34 @@ fn failed_receipt_delivery_keeps_the_rebuilt_snapshot_and_the_old_live_reader() 
         let options = options(root.path(), "durable");
         let error = rebuild_with_loader(&cx, &options, &mut ClosedOutput, |_, _| {
             Ok(old.models.clone())
-        }).await.unwrap_err();
-        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::BrokenPipe);
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::BrokenPipe
+        );
         let selection = Selection::read(options.new_receipt.as_ref().unwrap()).unwrap();
         assert_eq!(selection.generation.sequence, 21);
         let fresh = selection.open(&cx, old.models).await.unwrap();
-        assert_eq!(fresh.lexical().search(&cx, "garden", 10).await.unwrap().len(), 1);
-        assert_eq!(old.index.lexical().search(&cx, "garden", 10).await.unwrap().len(), 1);
+        assert_eq!(
+            fresh
+                .lexical()
+                .search(&cx, "garden", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            old.index
+                .lexical()
+                .search(&cx, "garden", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
         assert_eq!(image(&old.selection.directory), before);
     });
 }
@@ -418,19 +564,26 @@ fn missing_models_topology_mismatch_and_loading_cancellation_create_nothing() {
                 assert!(required_quality);
                 match fault {
                     0 => Err(bad("required local models are unavailable")),
-                    1 => Ok(Models { fast: old.models.fast.clone(), quality: None }),
+                    1 => Ok(Models {
+                        fast: old.models.fast.clone(),
+                        quality: None,
+                    }),
                     _ => {
                         cx.set_cancel_requested(true);
                         Ok(old.models.clone())
                     }
                 }
-            }).await;
+            })
+            .await;
             cx.set_cancel_requested(false);
             let error = result.unwrap_err();
             if fault == 1 {
                 assert!(error.to_string().contains("model topology"));
             } else if fault == 2 {
-                assert!(matches!(error.downcast_ref::<SearchError>(), Some(SearchError::Cancelled { .. })));
+                assert!(matches!(
+                    error.downcast_ref::<SearchError>(),
+                    Some(SearchError::Cancelled { .. })
+                ));
             }
             assert_no_candidate(&options, &output);
             assert_eq!(image(&old.selection.directory), before);

@@ -10,16 +10,14 @@ use frankensearch_quill::{QuillConfig, QuillSearchIndex};
 use serde::{Deserialize, Serialize};
 
 use super::{NativeBuiltShardedIndex, NativeShardedReopenLimits};
-use crate::native_ann::builder::hybrid::{cohort, create_lexical};
+use crate::native_ann::builder::NativeIndexBuilder;
 use crate::native_ann::builder::hybrid::snapshot::{LexicalSeal, NativeHybridReopenLimits};
+use crate::native_ann::builder::hybrid::{cohort, create_lexical};
 use crate::native_ann::builder::snapshot::{
     Artifact, checked_directory, create_private_new, ensure_absent, read_selected,
     require_seal_platform, sync_directory,
 };
-use crate::native_ann::builder::NativeIndexBuilder;
-use crate::native_ann::{
-    NativeShardedProgressiveSearch, NativeShardedResult, checkpoint, invalid,
-};
+use crate::native_ann::{NativeShardedProgressiveSearch, NativeShardedResult, checkpoint, invalid};
 use crate::{Cx, Embedder, IndexableDocument, LexicalRead, Reranker, SearchError, SearchResult};
 
 const HYBRID_FILE: &str = "native.sharded-hybrid.json";
@@ -138,42 +136,71 @@ impl NativeBuiltShardedHybridIndex {
         if usize::try_from(lexical.doc_count()?).ok() != Some(vectors.document_count())
             || lexical.keeper_generation() != lexical_seal.generation()
         {
-            return Err(rejected("lexical_membership", "global lexical population differs from its source cohort"));
+            return Err(rejected(
+                "lexical_membership",
+                "global lexical population differs from its source cohort",
+            ));
         }
         // One pointer per source, not cloned bodies/metadata/vector images.
         let documents = vectors.documents().collect::<Vec<_>>();
         cohort::validate(cx, &lexical, &documents)?;
         drop(documents);
-        let sources: Vec<Arc<[IndexableDocument]>> = vectors.partitions.iter()
-            .map(|partition| Arc::clone(&partition.documents)).collect();
+        let sources: Vec<Arc<[IndexableDocument]>> = vectors
+            .partitions
+            .iter()
+            .map(|partition| Arc::clone(&partition.documents))
+            .collect();
         let text = Box::new(move |id: &str| {
             let ordinal = sources.partition_point(|documents| {
                 documents.last().is_some_and(|last| last.id.as_str() < id)
             });
             let documents = sources.get(ordinal)?;
-            let position = documents.binary_search_by(|document| document.id.as_str().cmp(id)).ok()?;
+            let position = documents
+                .binary_search_by(|document| document.id.as_str().cmp(id))
+                .ok()?;
             Some(documents[position].content.clone())
         });
         checkpoint(cx, "native_ann.sharded_hybrid.complete")?;
-        Ok(Self { vectors, lexical, lexical_seal, text })
+        Ok(Self {
+            vectors,
+            lexical,
+            lexical_seal,
+            text,
+        })
     }
 
     /// Original ordered partitions, sources and independent tier inventories.
     #[must_use]
-    pub const fn vectors(&self) -> &NativeBuiltShardedIndex { &self.vectors }
+    pub const fn vectors(&self) -> &NativeBuiltShardedIndex {
+        &self.vectors
+    }
 
     /// One unrefreshable global keyword reader, not per-partition BM25 scores.
     #[must_use]
-    pub fn lexical(&self) -> &dyn LexicalRead { &self.lexical }
+    pub fn lexical(&self) -> &dyn LexicalRead {
+        &self.lexical
+    }
 
     /// Fast and lexical retrieval with one query embedding across all partitions.
     ///
     /// # Errors
     /// Propagates existing sharded hybrid identity, query and hydration failures.
-    pub async fn search(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<NativeShardedResult>> {
-        self.vectors.fast.search_hybrid_text(
-            cx, self.vectors.partitions[0].fast.embedder(), &self.lexical, text, k,
-        ).await
+    pub async fn search(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        self.vectors
+            .fast
+            .search_hybrid_text(
+                cx,
+                self.vectors.partitions[0].fast.embedder(),
+                &self.lexical,
+                text,
+                k,
+            )
+            .await
     }
 
     /// Independent quality retrieval, not rescoring only the fast candidates.
@@ -182,14 +209,32 @@ impl NativeBuiltShardedHybridIndex {
     ///
     /// # Errors
     /// Propagates all configured retrieval, fusion and hydration failures.
-    pub async fn search_refined(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<NativeShardedResult>> {
+    pub async fn search_refined(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
         let first = &self.vectors.partitions[0];
         match (&self.vectors.quality, &first.quality) {
-            (Some(shards), Some(tier)) => self.vectors.fast.search_hybrid_refined_text(
-                cx, first.fast.embedder(), (shards, tier.embedder()), &self.lexical, text, k,
-            ).await,
+            (Some(shards), Some(tier)) => {
+                self.vectors
+                    .fast
+                    .search_hybrid_refined_text(
+                        cx,
+                        first.fast.embedder(),
+                        (shards, tier.embedder()),
+                        &self.lexical,
+                        text,
+                        k,
+                    )
+                    .await
+            }
             (None, None) => self.search(cx, text, k).await,
-            _ => Err(rejected("quality", "quality inventory and provider must travel together")),
+            _ => Err(rejected(
+                "quality",
+                "quality inventory and provider must travel together",
+            )),
         }
     }
 
@@ -197,13 +242,25 @@ impl NativeBuiltShardedHybridIndex {
     ///
     /// # Errors
     /// Refuses absent quality, including zero-result queries, and propagates errors.
-    pub async fn search_quality(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<NativeShardedResult>> {
+    pub async fn search_quality(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
         checkpoint(cx, "native_ann.sharded_hybrid.quality")?;
-        let shards = self.vectors.quality.as_ref()
+        let shards = self
+            .vectors
+            .quality
+            .as_ref()
             .ok_or_else(|| rejected("quality", "quality tier was not configured"))?;
-        let tier = self.vectors.partitions[0].quality.as_ref()
+        let tier = self.vectors.partitions[0]
+            .quality
+            .as_ref()
             .ok_or_else(|| rejected("quality", "quality provider was not configured"))?;
-        shards.search_hybrid_quality_text(cx, tier.embedder(), &self.lexical, text, k).await
+        shards
+            .search_hybrid_quality_text(cx, tier.embedder(), &self.lexical, text, k)
+            .await
     }
 
     /// Prepare the existing lazy sharded phase sequence without provider work.
@@ -211,13 +268,25 @@ impl NativeBuiltShardedHybridIndex {
     /// # Errors
     /// Refuses invalid identity, topology, candidate budgets or cancellation.
     pub fn progressive<'a>(
-        &'a self, cx: &'a Cx, text: &'a str, k: usize,
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
     ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
         let first = &self.vectors.partitions[0];
-        let quality = self.vectors.quality.as_ref().zip(first.quality.as_ref())
+        let quality = self
+            .vectors
+            .quality
+            .as_ref()
+            .zip(first.quality.as_ref())
             .map(|(shards, tier)| (shards, tier.embedder()));
         self.vectors.fast.search_hybrid_progressive(
-            cx, first.fast.embedder(), quality, &self.lexical, text, k,
+            cx,
+            first.fast.embedder(),
+            quality,
+            &self.lexical,
+            text,
+            k,
         )
     }
 
@@ -228,10 +297,15 @@ impl NativeBuiltShardedHybridIndex {
     /// # Errors
     /// Combines progressive admission and native reranker configuration errors.
     pub fn progressive_with_reranker<'a>(
-        &'a self, cx: &'a Cx, text: &'a str, k: usize,
-        reranker: &'a dyn Reranker, window: usize,
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        reranker: &'a dyn Reranker,
+        window: usize,
     ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
-        self.progressive(cx, text, k)?.with_reranker(reranker, self.text.as_ref(), window)
+        self.progressive(cx, text, k)?
+            .with_reranker(reranker, self.text.as_ref(), window)
     }
 
     /// Seal the global lexical view and the COMPLETE ordered vector inventory.
@@ -254,27 +328,46 @@ impl NativeBuiltShardedHybridIndex {
         let path = directory.join(HYBRID_FILE);
         ensure_absent(&path)?;
         let lexical_path = checked_directory(&directory.join("lexical"))?;
-        self.lexical_seal.verify(cx, &lexical_path, NativeHybridReopenLimits::default(), true)?;
+        self.lexical_seal
+            .verify(cx, &lexical_path, NativeHybridReopenLimits::default(), true)?;
         let vectors = self.vectors.seal_for_reopen(cx)?;
-        self.lexical_seal.verify(cx, &lexical_path, NativeHybridReopenLimits::default(), false)?;
+        self.lexical_seal.verify(
+            cx,
+            &lexical_path,
+            NativeHybridReopenLimits::default(),
+            false,
+        )?;
         sync_directory(&lexical_path)?;
         let manifest = Manifest {
-            schema: HYBRID_SCHEMA.to_owned(), generation: self.vectors.generation(),
+            schema: HYBRID_SCHEMA.to_owned(),
+            generation: self.vectors.generation(),
             documents: self.vectors.document_count(),
-            vectors: Artifact { byte_len: vectors.byte_len, sha256: vectors.sha256 },
+            vectors: Artifact {
+                byte_len: vectors.byte_len,
+                sha256: vectors.sha256,
+            },
             lexical: self.lexical_seal.clone(),
         };
-        let bytes = serde_json::to_vec(&manifest)
-            .map_err(|_| rejected("encoding", "cannot encode complete sharded hybrid descriptor"))?;
+        let bytes = serde_json::to_vec(&manifest).map_err(|_| {
+            rejected(
+                "encoding",
+                "cannot encode complete sharded hybrid descriptor",
+            )
+        })?;
         if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES {
-            return Err(rejected("descriptor_size", "hybrid descriptor exceeds its size bound"));
+            return Err(rejected(
+                "descriptor_size",
+                "hybrid descriptor exceeds its size bound",
+            ));
         }
         checkpoint(cx, "native_ann.sharded_hybrid.seal_commit")?;
         let mut file = create_private_new(&path)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         sync_directory(&directory)?;
-        if let Some(parent) = directory.parent() { sync_directory(parent)?; }
+        if let Some(parent) = directory.parent() {
+            sync_directory(parent)?;
+        }
         Ok(Artifact::from_bytes(&bytes).receipt())
     }
 
@@ -305,29 +398,55 @@ impl NativeBuiltShardedHybridIndex {
         checkpoint(cx, "native_ann.sharded_hybrid.open")?;
         limits.validate()?;
         let directory = checked_directory(directory.as_ref())?;
-        let bytes = read_selected(cx, &directory.join(HYBRID_FILE), Artifact {
-            byte_len: expected.byte_len, sha256: expected.sha256,
-        }, MAX_DESCRIPTOR_BYTES)?;
+        let bytes = read_selected(
+            cx,
+            &directory.join(HYBRID_FILE),
+            Artifact {
+                byte_len: expected.byte_len,
+                sha256: expected.sha256,
+            },
+            MAX_DESCRIPTOR_BYTES,
+        )?;
         let saved: Manifest = serde_json::from_slice(&bytes)
             .map_err(|_| rejected("schema", "malformed sharded hybrid descriptor"))?;
         if saved.schema != HYBRID_SCHEMA || saved.documents > limits.vectors.max_documents {
-            return Err(rejected("schema", "invalid sharded hybrid schema or source count"));
+            return Err(rejected(
+                "schema",
+                "invalid sharded hybrid schema or source count",
+            ));
         }
         saved.generation.validate()?;
         saved.vectors.validate()?;
         saved.lexical.validate(limits.lexical())?;
         let lexical_path = checked_directory(&directory.join("lexical"))?;
-        saved.lexical.verify(cx, &lexical_path, limits.lexical(), false)?;
+        saved
+            .lexical
+            .verify(cx, &lexical_path, limits.lexical(), false)?;
         let vectors = NativeBuiltShardedIndex::open_selected(
-            cx, &directory, &saved.vectors.receipt(), fast, quality, limits.vectors,
+            cx,
+            &directory,
+            &saved.vectors.receipt(),
+            fast,
+            quality,
+            limits.vectors,
         )?;
         if vectors.generation() != saved.generation || vectors.document_count() != saved.documents {
-            return Err(rejected("membership", "vector inventory differs from selected hybrid generation"));
+            return Err(rejected(
+                "membership",
+                "vector inventory differs from selected hybrid generation",
+            ));
         }
-        let response = Box::pin(QuillSearchIndex::open(cx, &lexical_path, QuillConfig::default())).await;
+        let response = Box::pin(QuillSearchIndex::open(
+            cx,
+            &lexical_path,
+            QuillConfig::default(),
+        ))
+        .await;
         checkpoint(cx, "native_ann.sharded_hybrid.lexical_opened")?;
         let lexical = response?;
-        saved.lexical.verify(cx, &lexical_path, limits.lexical(), false)?;
+        saved
+            .lexical
+            .verify(cx, &lexical_path, limits.lexical(), false)?;
         Self::from_readers(cx, vectors, lexical, saved.lexical)
     }
 }

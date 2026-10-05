@@ -2,6 +2,7 @@
 //! Selection is an explicit, caller-owned receipt, never directory discovery.
 
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 use std::collections::{BTreeSet, HashMap};
 use std::error::Error;
@@ -108,6 +109,7 @@ impl Mode {
 }
 
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct Options {
     command: Command,
     receipt: PathBuf,
@@ -147,7 +149,9 @@ impl Options {
             "update" => Command::Update,
             "rebuild" => Command::Rebuild,
             _ => {
-                return Err(bad("expected index, search, serve, update, or rebuild; use --help"));
+                return Err(bad(
+                    "expected index, search, serve, update, or rebuild; use --help",
+                ));
             }
         };
         let mut options = Self {
@@ -198,7 +202,8 @@ impl Options {
                 }
                 "--model-dir" => options.models = Some(PathBuf::from(value(&mut args)?)),
                 "--quality-backend" => {
-                    options.quality.backend = Some(models::QualityBackend::parse(&value(&mut args)?)?);
+                    options.quality.backend =
+                        Some(models::QualityBackend::parse(&value(&mut args)?)?);
                 }
                 "--quality-model-dir" => {
                     options.quality.directory = Some(PathBuf::from(value(&mut args)?));
@@ -224,7 +229,8 @@ impl Options {
                     options.limit = positive(&value(&mut args)?, 1_000)?;
                 }
                 "--timeout-ms" if matches!(command, Command::Search | Command::Serve) => {
-                    let milliseconds = value(&mut args)?.parse::<u64>()
+                    let milliseconds = value(&mut args)?
+                        .parse::<u64>()
                         .map_err(|_| bad("timeout must be an integer number of milliseconds"))?;
                     query::validate_timeout(Some(milliseconds))?;
                     options.timeout_ms = Some(milliseconds);
@@ -248,16 +254,25 @@ impl Options {
         if seen.contains("--rerank-window") && options.reranker_dir.is_none() {
             return Err(bad("--rerank-window requires --reranker-dir"));
         }
-        if command == Command::Search && options.reranker_dir.is_some() && options.mode != Mode::Full {
-            return Err(bad("reranking requires --mode full; primary-tier modes explicitly skip it"));
+        if command == Command::Search
+            && options.reranker_dir.is_some()
+            && options.mode != Mode::Full
+        {
+            return Err(bad(
+                "reranking requires --mode full; primary-tier modes explicitly skip it",
+            ));
         }
         if matches!(command, Command::Index | Command::Update | Command::Rebuild)
             && options.directory.is_none()
         {
-            return Err(bad("index/update/rebuild requires --index-dir pointing to a NEW directory"));
+            return Err(bad(
+                "index/update/rebuild requires --index-dir pointing to a NEW directory",
+            ));
         }
         if matches!(command, Command::Update | Command::Rebuild) && options.new_receipt.is_none() {
-            return Err(bad("update/rebuild requires --new-receipt pointing to a NEW file"));
+            return Err(bad(
+                "update/rebuild requires --new-receipt pointing to a NEW file",
+            ));
         }
         if command == Command::Search {
             let query = options
@@ -279,7 +294,9 @@ fn value(args: &mut impl Iterator<Item = String>) -> Result<String> {
 }
 
 fn positive(value: &str, maximum: usize) -> Result<usize> {
-    let value: usize = value.parse().map_err(|_| bad("expected a positive integer"))?;
+    let value: usize = value
+        .parse()
+        .map_err(|_| bad("expected a positive integer"))?;
     if value == 0 || value > maximum {
         return Err(bad("integer option is outside its supported range"));
     }
@@ -322,7 +339,9 @@ fn read_documents(reader: &mut impl BufRead) -> Result<Vec<IndexableDocument>> {
             .checked_add(count)
             .ok_or_else(|| bad("input byte count overflow"))?;
         if record.len() > MAX_RECORD_BYTES || total > MAX_INPUT_BYTES {
-            return Err(bad("input exceeds its 16 MiB record or 256 MiB stream limit"));
+            return Err(bad(
+                "input exceeds its 16 MiB record or 256 MiB stream limit",
+            ));
         }
         if record.iter().all(u8::is_ascii_whitespace) {
             continue;
@@ -382,7 +401,9 @@ struct Selection {
 impl Selection {
     fn read(path: &Path) -> Result<Self> {
         if !fs::symlink_metadata(path)?.is_file() {
-            return Err(bad("the trusted receipt must be a regular non-symlink file"));
+            return Err(bad(
+                "the trusted receipt must be a regular non-symlink file",
+            ));
         }
         let mut bytes = Vec::new();
         File::open(path)?
@@ -398,7 +419,9 @@ impl Selection {
             || !selection.directory.is_absolute()
             || selection.documents > MAX_DOCUMENTS
         {
-            return Err(bad("invalid selection schema, directory, or document count"));
+            return Err(bad(
+                "invalid selection schema, directory, or document count",
+            ));
         }
         selection.generation.validate()?;
         Ok(selection)
@@ -413,7 +436,9 @@ impl Selection {
                 .transpose()?
                 != self.quality_producer
         {
-            return Err(bad("local producers differ from the trusted selection; no model substitution is permitted"));
+            return Err(bad(
+                "local producers differ from the trusted selection; no model substitution is permitted",
+            ));
         }
         let expected = GenerationComponentReceiptV1 {
             byte_len: self.snapshot.byte_len,
@@ -430,7 +455,9 @@ impl Selection {
         if index.vectors().documents().len() != self.documents
             || index.vectors().fast().index().owner_witness().generation != self.generation
         {
-            return Err(bad("reopened generation differs from the trusted selection"));
+            return Err(bad(
+                "reopened generation differs from the trusted selection",
+            ));
         }
         Ok(index)
     }
@@ -448,9 +475,17 @@ fn new_path(path: &Path) -> Result<PathBuf> {
     // A NEW leaf can still corrupt an existing sealed ancestor's inventory.
     // Resolve parent aliases first and refuse known native/fsfs seal markers.
     for ancestor in parent.ancestors() {
-        for marker in ["native.hybrid.json", "native.snapshot.json", "FSFS-BUNDLE.json"] {
+        for marker in [
+            "native.hybrid.json",
+            "native.snapshot.json",
+            "FSFS-BUNDLE.json",
+        ] {
             match fs::symlink_metadata(ancestor.join(marker)) {
-                Ok(_) => return Err(bad("destination is inside a sealed index; choose a sibling path")),
+                Ok(_) => {
+                    return Err(bad(
+                        "destination is inside a sealed index; choose a sibling path",
+                    ));
+                }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
@@ -564,10 +599,17 @@ async fn search(
     filters: filter::Filters<'_>,
 ) -> Result<serde_json::Value> {
     validate_query(query)?;
-    filter::Query::prepare(index, cx, filters)?.search(cx, query, mode, limit).await
+    filter::Query::prepare(index, cx, filters)?
+        .search(cx, query, mode, limit)
+        .await
 }
 
-async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Option<BlockingPoolHandle>) -> Result<()> {
+async fn execute(
+    cx: &Cx,
+    options: Options,
+    output: &mut impl Write,
+    pool: Option<BlockingPoolHandle>,
+) -> Result<()> {
     match options.command {
         Command::Update => update::execute(cx, &options, output, pool).await,
         Command::Rebuild => update::rebuild(cx, &options, output, pool).await,
@@ -581,26 +623,37 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Optio
             let receipt = new_path(&options.receipt)?;
             // Freeze both destinations before reading stdin or initializing models.
             if receipt.starts_with(&directory) || directory.starts_with(&receipt) {
-                return Err(bad("the trusted receipt and immutable index must not overlap"));
+                return Err(bad(
+                    "the trusted receipt and immutable index must not overlap",
+                ));
             }
             let documents = match &options.input {
                 Some(path) => read_documents(&mut BufReader::new(File::open(path)?))?,
                 None => read_documents(&mut io::stdin().lock())?,
             };
             let models = models::load(
-                cx, options.models.as_deref(), !options.fast_only, &options.quality, pool,
+                cx,
+                options.models.as_deref(),
+                !options.fast_only,
+                &options.quality,
+                pool,
             )?;
             let (_index, selection) = build(cx, &options, &directory, documents, models).await?;
             save_selection(&selection, &receipt)?;
-            emit(output, &serde_json::json!({
-                "schema": SCHEMA, "ok": true, "event": "indexed", "receipt": receipt,
-                "selection": selection,
-            }))
+            emit(
+                output,
+                &serde_json::json!({
+                    "schema": SCHEMA, "ok": true, "event": "indexed", "receipt": receipt,
+                    "selection": selection,
+                }),
+            )
         }
         Command::Search | Command::Serve => {
             // Explicit local-only startup, once per process. Native inference
             // retains this caller-owned pool, including after live activation.
-            let rerank = options.reranker_dir.as_deref()
+            let rerank = options
+                .reranker_dir
+                .as_deref()
                 .map(|path| query::Rerank::load(cx, path, options.rerank_window, pool.clone()))
                 .transpose()?;
             let selection = Selection::read(&options.receipt)?;
@@ -656,13 +709,18 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Optio
                 {
                     Ok(())
                 } else {
-                    Err(bad("search did not complete all requested phases; see terminal frame"))
+                    Err(bad(
+                        "search did not complete all requested phases; see terminal frame",
+                    ))
                 };
             }
             let page = query::buffered(
                 &index,
                 cx,
-                options.query.as_deref().ok_or_else(|| bad("missing query"))?,
+                options
+                    .query
+                    .as_deref()
+                    .ok_or_else(|| bad("missing query"))?,
                 options.mode,
                 options.limit,
                 [None, options.filter.as_ref()],
@@ -720,14 +778,20 @@ fn bad(message: &str) -> Box<dyn Error + Send + Sync> {
 fn run() -> Result<()> {
     let args = std::env::args_os()
         .skip(1)
-        .map(|value| value.into_string().map_err(|_| bad("command arguments must be UTF-8")))
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| bad("command arguments must be UTF-8"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let Some(options) = Options::parse(args)? else {
         io::stdout().lock().write_all(HELP.as_bytes())?;
         return Ok(());
     };
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
-        return Err(bad("native selected snapshots currently require Linux or macOS"));
+        return Err(bad(
+            "native selected snapshots currently require Linux or macOS",
+        ));
     }
     let runtime = RuntimeBuilder::current_thread()
         .blocking_threads(0, 2)
@@ -735,7 +799,7 @@ fn run() -> Result<()> {
     let pool = runtime.blocking_handle();
     runtime.block_on(async move {
         let cx = Cx::current().ok_or_else(|| bad("runtime did not install a root context"))?;
-        execute(&cx, options, &mut io::stdout().lock(), pool).await
+        Box::pin(execute(&cx, options, &mut io::stdout().lock(), pool)).await
     })
 }
 
@@ -747,10 +811,7 @@ fn main() -> ExitCode {
             payload["schema"] = serde_json::json!(SCHEMA);
             payload["ok"] = serde_json::json!(false);
             payload["event"] = serde_json::json!("error");
-            let _ = emit(
-                &mut io::stderr().lock(),
-                &payload,
-            );
+            let _ = emit(&mut io::stderr().lock(), &payload);
             ExitCode::FAILURE
         }
     }

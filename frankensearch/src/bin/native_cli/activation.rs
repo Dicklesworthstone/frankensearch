@@ -7,7 +7,11 @@
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 use frankensearch::native_ann::builder::live::NativeHybridSnapshot;
 
-use super::*;
+use super::{NativeLiveHybridIndex, validate_id};
+use crate::{
+    ArtifactGenerationIdentityV1, Cx, Deserialize, GenerationComponentReceiptV1, MAX_DOCUMENTS,
+    Path, PathBuf, Result, SCHEMA, Selection, Write, bad, emit,
+};
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -44,28 +48,45 @@ async fn install(
     receipt: &Path,
     expected: ArtifactGenerationIdentityV1,
 ) -> Result<NativeHybridSnapshot> {
-    cx.checkpoint().map_err(|_| bad("native activation cancelled"))?;
+    cx.checkpoint()
+        .map_err(|_| bad("native activation cancelled"))?;
     expected.validate()?;
     if expected != base.generation() {
-        return Err(bad("expected_generation does not match the serving snapshot; no activation performed"));
+        return Err(bad(
+            "expected_generation does not match the serving snapshot; no activation performed",
+        ));
     }
-    let path = receipt.to_str().ok_or_else(|| bad("receipt path must be UTF-8"))?;
+    let path = receipt
+        .to_str()
+        .ok_or_else(|| bad("receipt path must be UTF-8"))?;
     if !receipt.is_absolute() || path.len() > 4096 || path.contains('\0') {
-        return Err(bad("activation requires an absolute NUL-free receipt path of at most 4096 bytes"));
+        return Err(bad(
+            "activation requires an absolute NUL-free receipt path of at most 4096 bytes",
+        ));
     }
     // Read exactly the controller's receipt. Never search for the highest
     // sequence, recalculate a missing digest or reinterpret a rejected cohort.
     let selection = Selection::read(receipt)?;
     if selection.generation.sequence <= base.generation().sequence {
-        return Err(bad("activation requires a strictly newer generation; rollback and same-generation replay are refused"));
+        return Err(bad(
+            "activation requires a strictly newer generation; rollback and same-generation replay are refused",
+        ));
     }
     let vectors = base.index().vectors();
     if vectors.fast().embedder().identity()?.fingerprint() != selection.fast_producer
-        || vectors.quality().map(|tier| {
-            tier.embedder().identity().map(|identity| identity.fingerprint())
-        }).transpose()? != selection.quality_producer
+        || vectors
+            .quality()
+            .map(|tier| {
+                tier.embedder()
+                    .identity()
+                    .map(|identity| identity.fingerprint())
+            })
+            .transpose()?
+            != selection.quality_producer
     {
-        return Err(bad("activation must preserve the retained producers and quality-tier presence"));
+        return Err(bad(
+            "activation must preserve the retained producers and quality-tier presence",
+        ));
     }
     let snapshot_receipt = GenerationComponentReceiptV1 {
         byte_len: selection.snapshot.byte_len,
@@ -80,7 +101,9 @@ async fn install(
     if admitted.documents().len() != selection.documents
         || admitted.fast().index().owner_witness().generation != selection.generation
     {
-        return Err(bad("admitted successor differs from the trusted receipt; serving selection unchanged"));
+        return Err(bad(
+            "admitted successor differs from the trusted receipt; serving selection unchanged",
+        ));
     }
     // install checks the *same predecessor Arc* under the cancel-aware write
     // lock. A concurrently prepared successor cannot win by sequence alone.
