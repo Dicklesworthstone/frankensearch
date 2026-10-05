@@ -203,3 +203,194 @@ fn fast_only_reopen_refuses_quality_queries_and_cancelled_builds_leave_no_destin
         assert!(!cancelled.exists());
     });
 }
+
+fn output_frames(bytes: &[u8]) -> Vec<serde_json::Value> {
+    bytes.split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+struct ObservedOutput {
+    bytes: Vec<u8>,
+    quality_calls: Arc<AtomicUsize>,
+    before_quality: usize,
+    initial_flushes: usize,
+}
+
+impl Write for ObservedOutput {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let frames = output_frames(&self.bytes);
+        let frame = frames.last().unwrap();
+        if frame["phase"] == "initial" {
+            assert_eq!(
+                self.quality_calls.load(Ordering::Relaxed),
+                self.before_quality,
+                "quality inference must not begin until Initial has been flushed",
+            );
+            self.initial_flushes += 1;
+        }
+        if frame["event"] == "terminal" {
+            self.before_quality = self.quality_calls.load(Ordering::Relaxed);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn warm_serve_flushes_initial_before_quality_and_survives_bad_requests() {
+    run_test_with_cx(|cx| async move {
+        let temporary = tempfile::tempdir().unwrap();
+        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+        let (providers, fast_calls, quality_calls) = fixture_models(true);
+        let (index, _) = build(&cx, &options, &temporary.path().join("index"), source(), providers)
+            .await
+            .unwrap();
+        let fast_before = fast_calls.load(Ordering::Relaxed);
+        let quality_before = quality_calls.load(Ordering::Relaxed);
+        let mut output = ObservedOutput {
+            bytes: Vec::new(),
+            quality_calls: Arc::clone(&quality_calls),
+            before_quality: quality_before,
+            initial_flushes: 0,
+        };
+        let mut input = Cursor::new(concat!(
+            "{invalid JSON}\n",
+            "{\"id\":\"a\",\"query\":\"retry network\"}\n",
+            "{\"id\":\"invalid\",\"query\":\"retry\",\"limit\":0}\n",
+            "{\"id\":\"b\",\"query\":\"garden flowers\"}\n",
+            "quit\n",
+            "{\"id\":\"never\",\"query\":\"must not run\"}\n"
+        ));
+        serve::run(&index, &cx, &mut input, &mut output, (Mode::Full, 2))
+            .await
+            .unwrap();
+        assert_eq!(output.initial_flushes, 2);
+        assert_eq!(fast_calls.load(Ordering::Relaxed), fast_before + 2);
+        assert_eq!(quality_calls.load(Ordering::Relaxed), quality_before + 2);
+        let frames = output_frames(&output.bytes);
+        assert_eq!(frames[0]["event"], "ready");
+        assert_eq!(frames[1]["status"], "failed");
+        for id in ["a", "b"] {
+            let request = frames.iter().filter(|frame| frame["id"] == id).collect::<Vec<_>>();
+            assert_eq!(request.len(), 4);
+            assert_eq!(request[0]["event"], "started");
+            assert_eq!(request[1]["phase"], "initial");
+            assert_eq!(request[1]["candidates"]["quality"], 0);
+            assert_eq!(request[2]["phase"], "refined");
+            assert!(request[2]["candidates"]["quality"].as_u64().unwrap() > 0);
+            assert_eq!(request[3]["status"], "complete");
+            for (seq, frame) in request.iter().enumerate() {
+                assert_eq!(frame["seq"], seq);
+                assert_eq!(frame["generation"], frames[0]["generation"]);
+            }
+        }
+        assert!(frames.iter().any(|frame| frame["id"] == "invalid" && frame["status"] == "failed"));
+        assert!(!frames.iter().any(|frame| frame["id"] == "never"));
+    });
+}
+
+struct FailingQuality {
+    inner: Arc<dyn Embedder>,
+    fail: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Embedder for FailingQuality {
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { self.inner.identity() }
+    fn dimension(&self) -> usize { self.inner.dimension() }
+    fn id(&self) -> &str { self.inner.id() }
+    fn model_name(&self) -> &str { self.inner.model_name() }
+    fn is_semantic(&self) -> bool { true }
+    fn category(&self) -> ModelCategory { self.inner.category() }
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            if self.fail.swap(false, Ordering::AcqRel) {
+                return Err(frankensearch::SearchError::InvalidConfig {
+                    field: "test.quality".to_owned(),
+                    value: "injected".to_owned(),
+                    reason: "one quality request failed".to_owned(),
+                });
+            }
+            self.inner.embed(cx, text).await
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn warm_serve_retains_initial_on_quality_failure_and_runs_the_next_query() {
+    run_test_with_cx(|cx| async move {
+        let temporary = tempfile::tempdir().unwrap();
+        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+        let (mut providers, _, _) = fixture_models(true);
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        providers.quality = Some(Arc::new(FailingQuality {
+            inner: providers.quality.take().unwrap(),
+            fail: Arc::clone(&fail),
+        }));
+        let (index, _) = build(&cx, &options, &temporary.path().join("index"), source(), providers)
+            .await
+            .unwrap();
+        fail.store(true, Ordering::Release);
+        let mut input = Cursor::new(concat!(
+            "{\"id\":\"first\",\"query\":\"retry network\"}\n",
+            "{\"id\":\"second\",\"query\":\"retry network\"}\n"
+        ));
+        let mut output = Vec::new();
+        serve::run(&index, &cx, &mut input, &mut output, (Mode::Full, 2)).await.unwrap();
+        let frames = output_frames(&output);
+        let first = frames.iter().filter(|frame| frame["id"] == "first").collect::<Vec<_>>();
+        assert_eq!(first[1]["phase"], "initial");
+        assert_eq!(first[2]["phase"], "refinement_failed");
+        assert_eq!(first[2]["results"], first[1]["results"]);
+        assert_eq!(first[3]["status"], "degraded");
+        assert_eq!(first[3]["ok"], false);
+        assert_eq!(first[3]["partial_results"], true);
+        let second = frames.iter().filter(|frame| frame["id"] == "second").collect::<Vec<_>>();
+        assert_eq!(second[2]["phase"], "refined");
+        assert_eq!(second[3]["status"], "complete");
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn broken_initial_delivery_stops_before_quality_inference() {
+    struct ClosedOutput {
+        writes: usize,
+    }
+    impl Write for ClosedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                Ok(bytes.len()) // Deliver Started, then fail the Initial frame.
+            } else {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed client"))
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    run_test_with_cx(|cx| async move {
+        let temporary = tempfile::tempdir().unwrap();
+        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+        let (providers, fast_calls, quality_calls) = fixture_models(true);
+        let (index, _) = build(&cx, &options, &temporary.path().join("index"), source(), providers)
+            .await
+            .unwrap();
+        let before = (fast_calls.load(Ordering::Relaxed), quality_calls.load(Ordering::Relaxed));
+        let request = serve::Request {
+            id: None, query: "retry".to_owned(), mode: None, limit: None,
+        };
+        let mut output = ClosedOutput { writes: 0 };
+        assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output)
+            .await.is_err());
+        assert_eq!(output.writes, 2, "no terminal write after failed delivery");
+        assert_eq!(fast_calls.load(Ordering::Relaxed), before.0 + 1);
+        assert_eq!(quality_calls.load(Ordering::Relaxed), before.1);
+    });
+}

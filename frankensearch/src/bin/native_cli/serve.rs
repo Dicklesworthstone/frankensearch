@@ -1,0 +1,234 @@
+//! Warm, sequential stdio serving of one explicitly selected native cohort.
+//! Every phase is flushed before the next phase is polled. No result cache,
+//! model reload, independent tier refresh, or detached request task is involved.
+
+use frankensearch::native_ann::{NativePhaseCandidates, NativeSearchPhase};
+
+use super::*;
+
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct Request {
+    pub(super) id: Option<String>,
+    pub(super) query: String,
+    pub(super) mode: Option<Mode>,
+    pub(super) limit: Option<usize>,
+}
+
+impl Request {
+    fn validate(&self) -> Result<()> {
+        validate_query(&self.query)?;
+        if self.id.as_ref().is_some_and(|id| id.len() > 256 || id.contains('\0')) {
+            return Err(bad("request id must be NUL-free and at most 256 bytes"));
+        }
+        if self.limit.is_some_and(|limit| limit == 0 || limit > 1_000) {
+            return Err(bad("request limit must be between 1 and 1000"));
+        }
+        Ok(())
+    }
+}
+
+// A failed output write may already have exposed part of a frame. It must end
+// the session, not be disguised as a recoverable query error followed by JSON.
+enum Failure {
+    Query(Box<dyn Error + Send + Sync>),
+    Delivery(Box<dyn Error + Send + Sync>),
+}
+
+struct Frames<'a, W> {
+    output: &'a mut W,
+    request: u64,
+    id: Option<&'a str>,
+    generation: ArtifactGenerationIdentityV1,
+    seq: u64,
+    partial: bool,
+}
+
+impl<W: Write> Frames<'_, W> {
+    fn send(&mut self, mut payload: serde_json::Value) -> Result<()> {
+        payload["schema"] = serde_json::json!(SCHEMA);
+        payload["request"] = serde_json::json!(self.request);
+        payload["id"] = serde_json::json!(self.id);
+        payload["seq"] = serde_json::json!(self.seq);
+        payload["generation"] = serde_json::json!(self.generation);
+        emit(self.output, &payload)?;
+        self.seq += 1;
+        Ok(())
+    }
+}
+
+async fn phases<W: Write>(
+    index: &NativeBuiltHybridIndex,
+    cx: &Cx,
+    request: &Request,
+    mode: Mode,
+    limit: usize,
+    frames: &mut Frames<'_, W>,
+) -> std::result::Result<bool, Failure> {
+    frames.send(serde_json::json!({
+        "event": "started", "ok": true, "mode": mode, "limit": limit,
+    })).map_err(Failure::Delivery)?;
+    if mode != Mode::Full {
+        let payload = search(index, cx, &request.query, mode, limit)
+            .await
+            .map_err(Failure::Query)?;
+        frames.send(payload).map_err(Failure::Delivery)?;
+        frames.partial = true;
+        return Ok(false);
+    }
+    let mut stream = index
+        .progressive(cx, &request.query, limit)
+        .map_err(|error| Failure::Query(error.into()))?;
+    let mut degraded = false;
+    while let Some(phase) = stream
+        .next_phase()
+        .await
+        .map_err(|error| Failure::Query(error.into()))?
+    {
+        let payload = match phase {
+            NativeSearchPhase::Initial { results, candidates } => {
+                result_frame("initial", results, candidates)
+            }
+            NativeSearchPhase::Refined { results, candidates } => {
+                result_frame("refined", results, candidates)
+            }
+            NativeSearchPhase::Reranked { results, candidates, evaluated } => {
+                let mut frame = result_frame("reranked", results, candidates);
+                frame["evaluated"] = serde_json::json!(evaluated);
+                frame
+            }
+            NativeSearchPhase::RefinementFailed { initial_results, error } => {
+                degraded = true;
+                serde_json::json!({
+                    "event": "results", "ok": false, "phase": "refinement_failed",
+                    "results": initial_results, "error": error.to_string(),
+                })
+            }
+            NativeSearchPhase::RerankFailed { previous_results, error } => {
+                degraded = true;
+                serde_json::json!({
+                    "event": "results", "ok": false, "phase": "rerank_failed",
+                    "results": previous_results, "error": error.to_string(),
+                })
+            }
+        };
+        frames.send(payload).map_err(Failure::Delivery)?;
+        frames.partial = true;
+    }
+    Ok(degraded)
+}
+
+fn result_frame(
+    phase: &str,
+    results: Vec<frankensearch::ScoredResult>,
+    candidates: NativePhaseCandidates,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event": "results", "ok": true, "phase": phase, "results": results,
+        "candidates": {
+            "fast": candidates.fast, "quality": candidates.quality, "lexical": candidates.lexical,
+        },
+    })
+}
+
+/// Returns false for a failed/degraded request that was fully reported. Output
+/// failure returns Err and must stop the process, even when more input exists.
+pub(super) async fn stream_one<W: Write>(
+    index: &NativeBuiltHybridIndex,
+    cx: &Cx,
+    request: &Request,
+    ordinal: u64,
+    defaults: (Mode, usize),
+    output: &mut W,
+) -> Result<bool> {
+    let mut frames = Frames {
+        output,
+        request: ordinal,
+        id: request.id.as_deref(),
+        generation: index.vectors().fast().index().owner_witness().generation,
+        seq: 0,
+        partial: false,
+    };
+    let mode = request.mode.unwrap_or(defaults.0);
+    let limit = request.limit.unwrap_or(defaults.1);
+    let result = match request.validate() {
+        Ok(()) => phases(index, cx, request, mode, limit, &mut frames).await,
+        Err(error) => Err(Failure::Query(error)),
+    };
+    match result {
+        Ok(degraded) => {
+            frames.send(serde_json::json!({
+                "event": "terminal", "ok": !degraded,
+                "status": if degraded { "degraded" } else { "complete" },
+                "partial_results": degraded && frames.partial,
+            }))?;
+            Ok(!degraded)
+        }
+        Err(Failure::Query(error)) => {
+            frames.send(serde_json::json!({
+                "event": "terminal", "ok": false, "status": "failed",
+                "partial_results": frames.partial, "error": error.to_string(),
+            }))?;
+            Ok(false)
+        }
+        Err(Failure::Delivery(error)) => Err(error),
+    }
+}
+
+pub(super) async fn run<R: BufRead, W: Write>(
+    index: &NativeBuiltHybridIndex,
+    cx: &Cx,
+    input: &mut R,
+    output: &mut W,
+    defaults: (Mode, usize),
+) -> Result<()> {
+    cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
+    emit(output, &serde_json::json!({
+        "schema": SCHEMA, "event": "ready", "ok": true,
+        "generation": index.vectors().fast().index().owner_witness().generation,
+        "documents": index.vectors().documents().len(),
+        "quality": index.vectors().quality().is_some(),
+        "fast_native_hnsw": index.vectors().fast().graph_path().is_some(),
+    }))?;
+    let mut line = Vec::new();
+    let mut ordinal = 0_u64;
+    loop {
+        // Standard input is a blocking read on the owning command lane. EOF
+        // exits normally. No preemptible idle read or detached input task is claimed.
+        cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
+        line.clear();
+        let count = (&mut *input)
+            .take(MAX_REQUEST_BYTES as u64 + 1)
+            .read_until(b'\n', &mut line)?;
+        cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
+        if count == 0 {
+            return Ok(());
+        }
+        if line.len() > MAX_REQUEST_BYTES {
+            return Err(bad("serve request exceeds 1 MiB; session stopped without draining input"));
+        }
+        let raw = line.trim_ascii();
+        if raw.is_empty() {
+            continue;
+        }
+        if raw == b"quit" || raw == b"exit" {
+            return Ok(());
+        }
+        ordinal = ordinal.checked_add(1).ok_or_else(|| bad("request ordinal exhausted"))?;
+        let request: Request = match serde_json::from_slice(raw) {
+            Ok(request) => request,
+            Err(error) => {
+                emit(output, &serde_json::json!({
+                    "schema": SCHEMA, "event": "terminal", "ok": false, "status": "failed",
+                    "request": ordinal, "id": null, "seq": 0, "partial_results": false,
+                    "generation": index.vectors().fast().index().owner_witness().generation,
+                    "error": format!("invalid request ({:?} at column {})", error.classify(), error.column()),
+                }))?;
+                continue;
+            }
+        };
+        let _complete = stream_one(index, cx, &request, ordinal, defaults, output).await?;
+    }
+}

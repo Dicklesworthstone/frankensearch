@@ -21,6 +21,9 @@ use frankensearch_embed::{DetectOptions, EmbedderStack};
 use frankensearch_index::native_hnsw::HnswParams;
 use serde::{Deserialize, Serialize};
 
+#[path = "native_cli/serve.rs"]
+mod serve;
+
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
 mod tests;
@@ -38,7 +41,8 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
-         [--mode full|fast|quality] [--limit N]\n\n\
+         [--mode full|fast|quality] [--limit N] [--stream]\n\
+  serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
 Omit --input to read stdin. Content is passed to the models without hidden\n\
 canonicalization; prepare/chunk documents explicitly. IDs must be unique.\n\
@@ -52,9 +56,10 @@ Stdout is JSON. This command does not change fsfs stores or CURRENT pointers.\n"
 enum Command {
     Index,
     Search,
+    Serve,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
     Full,
@@ -86,6 +91,7 @@ struct Options {
     batch_size: usize,
     fast_only: bool,
     exact: bool,
+    stream: bool,
 }
 
 impl Options {
@@ -100,7 +106,8 @@ impl Options {
         let command = match command.as_str() {
             "index" => Command::Index,
             "search" => Command::Search,
-            _ => return Err(bad("expected index or search; use --help")),
+            "serve" => Command::Serve,
+            _ => return Err(bad("expected index, search, or serve; use --help")),
         };
         let mut options = Self {
             command,
@@ -114,6 +121,7 @@ impl Options {
             batch_size: 16,
             fast_only: false,
             exact: false,
+            stream: false,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -126,6 +134,7 @@ impl Options {
             match flag.as_str() {
                 "--fast-only" if command == Command::Index => options.fast_only = true,
                 "--exact" if command == Command::Index => options.exact = true,
+                "--stream" if command == Command::Search => options.stream = true,
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
                 "--model-dir" => options.models = Some(PathBuf::from(value(&mut args)?)),
                 "--index-dir" if command == Command::Index => {
@@ -138,10 +147,10 @@ impl Options {
                     options.batch_size = positive(&value(&mut args)?, 256)?;
                 }
                 "--query" if command == Command::Search => options.query = Some(value(&mut args)?),
-                "--mode" if command == Command::Search => {
+                "--mode" if command != Command::Index => {
                     options.mode = Mode::parse(&value(&mut args)?)?;
                 }
-                "--limit" if command == Command::Search => {
+                "--limit" if command != Command::Index => {
                     options.limit = positive(&value(&mut args)?, 1_000)?;
                 }
                 _ => return Err(bad("unknown or inapplicable option; use --help")),
@@ -491,13 +500,45 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                 "selection": selection,
             }))
         }
-        Command::Search => {
+        Command::Search | Command::Serve => {
             let selection = Selection::read(&options.receipt)?;
             let models = load_models(
                 options.models.as_deref(),
                 selection.quality_producer.is_some(),
             )?;
             let index = selection.open(cx, models).await?;
+            if options.command == Command::Serve {
+                return serve::run(
+                    &index,
+                    cx,
+                    &mut io::stdin().lock(),
+                    output,
+                    (options.mode, options.limit),
+                )
+                .await;
+            }
+            if options.stream {
+                let request = serve::Request {
+                    id: None,
+                    query: options.query.ok_or_else(|| bad("missing query"))?,
+                    mode: Some(options.mode),
+                    limit: Some(options.limit),
+                };
+                return if serve::stream_one(
+                    &index,
+                    cx,
+                    &request,
+                    1,
+                    (options.mode, options.limit),
+                    output,
+                )
+                .await?
+                {
+                    Ok(())
+                } else {
+                    Err(bad("search did not complete all requested phases; see terminal frame"))
+                };
+            }
             let page = search(
                 &index,
                 cx,
