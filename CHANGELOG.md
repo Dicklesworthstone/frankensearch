@@ -330,6 +330,23 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
+## Unreleased changes after fsfs 1.12.2
+
+These changes landed after the 2026-10-05 publication of fsfs 1.12.2.
+
+- **A daemon socket path too long to bind moves to a short private
+  directory (bd-pwwdi).** fsfs 1.12.2 searches in process at once when the
+  default daemon socket is longer than Unix allows (on macOS, a user name of
+  15 or more characters), so those users had no warm daemon and paid the
+  model load on every search. The socket now goes to `fsfs-<uid>` under the
+  temp directory (per user on macOS, `/tmp` on Linux), created with mode
+  0700 and used only while it is a real directory owned by the user with no
+  group or other access; otherwise search still runs in process. With an
+  overlong runtime directory, a lite search took 0.15 s and then 0.07 s
+  through the daemon at `$TMPDIR/fsfs-1000`.
+
+---
+
 ## fsfs 1.12.2 — 2026-10-05
 
 [fsfs v1.12.2](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.2)

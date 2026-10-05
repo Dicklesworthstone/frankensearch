@@ -827,6 +827,52 @@ fn ensure_daemon_socket_path_fits(socket_path: &Path) -> SearchResult<()> {
     })
 }
 
+/// The default socket `file_name` under `preferred_dir`, or, when that path is
+/// too long to bind, the same name in a short private directory. Without one
+/// the long path is returned, and search runs in process at once
+/// ([`ensure_daemon_socket_path_fits`]).
+#[cfg(unix)]
+fn choose_daemon_socket_path(
+    preferred_dir: &Path,
+    file_name: &str,
+    fallback_dir: impl FnOnce() -> Option<PathBuf>,
+) -> PathBuf {
+    let preferred = preferred_dir.join(file_name);
+    if ensure_daemon_socket_path_fits(&preferred).is_ok() {
+        return preferred;
+    }
+    fallback_dir()
+        .map(|dir| dir.join(file_name))
+        .filter(|path| ensure_daemon_socket_path_fits(path).is_ok())
+        .unwrap_or(preferred)
+}
+
+/// `fsfs-<uid>` under the temp directory (per user on macOS, `/tmp` on Linux)
+/// for daemon sockets whose usual directory is too long.
+#[cfg(unix)]
+fn short_private_socket_dir() -> Option<PathBuf> {
+    private_socket_dir_in(&std::env::temp_dir())
+}
+
+/// Create `fsfs-<uid>` under `base` with mode 0700 and return it only while it
+/// is a real directory owned by this user with no group or other access, so a
+/// directory or symlink planted there by someone else is never used.
+#[cfg(unix)]
+fn private_socket_dir_in(base: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let uid = rustix::process::geteuid().as_raw();
+    let dir = base.join(format!("fsfs-{uid}"));
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(_) => return None,
+    }
+    let metadata = fs::symlink_metadata(&dir).ok()?;
+    (metadata.is_dir() && metadata.uid() == uid && metadata.permissions().mode() & 0o777 == 0o700)
+        .then_some(dir)
+}
+
 /// The query daemon closed or reset the connection, as opposed to a local
 /// transport fault.
 #[cfg(unix)]
@@ -9385,7 +9431,11 @@ impl FsfsRuntime {
             FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             FSFS_SEARCH_SERVE_STREAM_VERSION,
         );
-        Ok(socket_dir.join(format!("{index_stem}-{variant}.sock")))
+        Ok(choose_daemon_socket_path(
+            &socket_dir,
+            &format!("{index_stem}-{variant}.sock"),
+            short_private_socket_dir,
+        ))
     }
 
     /// Socket name suffix that separates daemons by quality model and serve
@@ -32093,6 +32143,62 @@ mod tests {
                 started.elapsed()
             );
         });
+    }
+
+    /// A default socket too long to bind moves to the short private directory
+    /// (bd-pwwdi), so a long macOS user name keeps a warm daemon; a short one
+    /// stays where it was, and without a usable fallback the long path is kept
+    /// for the in-process refusal.
+    #[cfg(unix)]
+    #[test]
+    fn overlong_default_daemon_socket_moves_to_a_short_private_directory() {
+        let temp = tempfile::tempdir().expect("socket dir tempdir");
+        let short_dir = temp.path().join("run");
+        let long_dir = temp.path().join("l".repeat(120));
+        let name = "fsfs-query-0123456789abcdef-01234567.sock";
+        let fallback = temp.path().join("fallback");
+        assert_eq!(
+            super::choose_daemon_socket_path(&short_dir, name, || unreachable!("no fallback needed")),
+            short_dir.join(name)
+        );
+        assert_eq!(
+            super::choose_daemon_socket_path(&long_dir, name, || Some(fallback.clone())),
+            fallback.join(name)
+        );
+        assert_eq!(
+            super::choose_daemon_socket_path(&long_dir, name, || None),
+            long_dir.join(name)
+        );
+        assert_eq!(
+            super::choose_daemon_socket_path(&long_dir, name, || Some(long_dir.clone())),
+            long_dir.join(name),
+            "a fallback that is itself too long is not used"
+        );
+    }
+
+    /// The fallback directory is created 0700 and refused when someone else
+    /// could have planted it: group or other access, or a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn private_socket_directory_is_refused_unless_private_and_real() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let uid = rustix::process::geteuid().as_raw();
+        let fresh = tempfile::tempdir().expect("fresh base");
+        let dir = super::private_socket_dir_in(fresh.path()).expect("created private dir");
+        assert_eq!(dir, fresh.path().join(format!("fsfs-{uid}")));
+        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(super::private_socket_dir_in(fresh.path()), Some(dir.clone()));
+
+        let shared = tempfile::tempdir().expect("shared base");
+        let planted = shared.path().join(format!("fsfs-{uid}"));
+        fs::create_dir(&planted).unwrap();
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(super::private_socket_dir_in(shared.path()), None);
+
+        let linked = tempfile::tempdir().expect("symlink base");
+        std::os::unix::fs::symlink(&dir, linked.path().join(format!("fsfs-{uid}"))).unwrap();
+        assert_eq!(super::private_socket_dir_in(linked.path()), None);
     }
 
     #[test]
