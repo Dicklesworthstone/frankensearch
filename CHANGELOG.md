@@ -330,9 +330,13 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
-## Unreleased changes after fsfs 1.12.2
+## fsfs 1.12.3 / frankensearch-tui 0.4.0 — release preparation
 
-These changes landed after the 2026-10-05 publication of fsfs 1.12.2.
+These changes landed after the 2026-10-05 publication of fsfs 1.12.2. The
+crates to publish are `frankensearch-tui` 0.4.0 (FrankenTUI 0.9 in its public
+API) and `frankensearch-fsfs` 1.12.3; the other library crates stay at their
+0.7.1-line versions. The fsfs binary also carries the complete-generation
+retention-race fixes from 8c48ab2d and 1f2a2563.
 
 - **Valid UTF-8 files are no longer quarantined when the encoding probe cuts
   a character.** The classifier checks a file's first 8 KiB, and a strict
