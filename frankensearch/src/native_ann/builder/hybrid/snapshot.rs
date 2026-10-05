@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use frankensearch_core::generation::GenerationComponentReceiptV1;
+use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
 use frankensearch_quill::{QuillConfig, QuillSearchIndex};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ use super::super::snapshot::{
 use super::super::{NativeBuiltIndex, NativeReopenLimits};
 use super::NativeBuiltHybridIndex;
 use crate::native_ann::{checkpoint, invalid};
-use crate::{Cx, Embedder, SearchError, SearchResult};
+use crate::{Cx, Embedder, IndexableDocument, SearchError, SearchResult};
 
 const HYBRID_FILE: &str = "native.hybrid.json";
 const HYBRID_SCHEMA: &str = "frankensearch.native-hybrid-snapshot.v1";
@@ -200,6 +200,59 @@ struct HybridSnapshot {
 }
 
 impl NativeBuiltHybridIndex {
+    /// Recover rebuild input from a trusted hybrid receipt despite search damage.
+    ///
+    /// Verifies the exact chain: caller receipt -> hybrid descriptor -> vector/
+    /// source descriptor -> complete source stream. No Quill, FSVI or graph file
+    /// is opened, mapped, repaired or trusted as query input. The lexical inventory
+    /// is schema/limit checked, not verified against the damaged directory. No
+    /// model is required and no inference runs. Ordinary `open_selected` remains
+    /// strict: it never calls this recovery path or returns a partial index.
+    ///
+    /// The returned generation and owned documents are the old cohort's rebuild
+    /// input only. Construct a fresh complete hybrid index with explicitly chosen
+    /// producers, then retain its new seal receipt. Recovery never installs or
+    /// publishes it, guesses a replacement receipt, discovers newer generations,
+    /// or changes an existing reader. Retain the trusted immutable-directory
+    /// contract during these bounded synchronous reads.
+    ///
+    /// # Errors
+    /// Refuses invalid receipts/descriptors, source hash or membership mismatch,
+    /// exceeded limits, I/O failures and cancellation. A partial source stream
+    /// is never returned; loss of the source/descriptor requires an external backup.
+    pub fn recover_selected_source(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeHybridReopenLimits,
+    ) -> SearchResult<(ArtifactGenerationIdentityV1, Vec<IndexableDocument>)> {
+        checkpoint(cx, "native_ann.hybrid_snapshot.recover_source")?;
+        limits.validate()?;
+        let directory = checked_directory(directory.as_ref())?;
+        let bytes = read_selected(
+            cx,
+            &directory.join(HYBRID_FILE),
+            Artifact {
+                byte_len: expected.byte_len,
+                sha256: expected.sha256,
+            },
+            MAX_DESCRIPTOR_BYTES,
+        )?;
+        let saved: HybridSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|_| rejected("schema", "malformed hybrid snapshot descriptor"))?;
+        if saved.schema != HYBRID_SCHEMA {
+            return Err(rejected("schema", "unsupported hybrid snapshot schema"));
+        }
+        saved.vectors.validate()?;
+        saved.lexical.validate(limits)?;
+        NativeBuiltIndex::recover_selected_source(
+            cx,
+            &directory,
+            &saved.vectors.receipt(),
+            limits.vectors,
+        )
+    }
+
     /// Seal the complete source/vector/Quill cohort for selected restart.
     ///
     /// Call this instead of separately sealing `vectors()`. This first checks
@@ -430,3 +483,6 @@ fn fingerprint_file(cx: &Cx, path: &Path, limit: u64) -> SearchResult<Artifact> 
 fn rejected(field: &str, reason: &str) -> SearchError {
     invalid(&format!("hybrid_snapshot.{field}"), "rejected", reason)
 }
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod recovery_tests;

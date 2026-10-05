@@ -158,6 +158,72 @@ struct Snapshot {
 }
 
 impl NativeBuiltIndex {
+    /// Recover the exact selected source cohort without opening any search artifact.
+    ///
+    /// This is an explicit rebuild input, NOT a degraded searchable index. It
+    /// authenticates the descriptor against the caller's trusted receipt, then
+    /// checks the source stream's hash, byte count, ordered unique IDs and exact
+    /// document count using the same reader as normal snapshot admission. The
+    /// returned generation identifies the source, not a newly published index.
+    /// Titles, metadata and prepared content are preserved without normalization.
+    ///
+    /// Missing or damaged FSVI/ANN artifacts do not prevent recovery. They are
+    /// neither opened nor reused, and the original providers need not be present.
+    /// No source file outside this selected snapshot is consulted. Feed these
+    /// documents into a fresh builder and seal/select its complete result; do
+    /// not relabel surviving vectors as belonging to another producer. A damaged
+    /// descriptor or source is an error, never permission to scan another cohort
+    /// or return the valid prefix of a corrupt stream.
+    ///
+    /// Input limits have their normal meaning; vector/graph limits are validated
+    /// but no vector/graph bytes are read. Work is synchronous and cancellation
+    /// aware at read boundaries. The existing trusted, immutable-directory
+    /// contract still applies; no writer fence, repair, deletion or authority
+    /// change is performed. Recovered documents own their data after this call.
+    ///
+    /// # Errors
+    /// Refuses invalid selection, schema, source integrity/membership, resource
+    /// limits, unsupported file objects, I/O failures and cancellation.
+    pub fn recover_selected_source(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeReopenLimits,
+    ) -> SearchResult<(ArtifactGenerationIdentityV1, Vec<IndexableDocument>)> {
+        checkpoint(cx, "native_ann.snapshot.recover_source")?;
+        limits.validate()?;
+        let directory = checked_directory(directory.as_ref())?;
+        let bytes = read_selected(
+            cx,
+            &directory.join(SNAPSHOT_FILE),
+            Artifact {
+                byte_len: expected.byte_len,
+                sha256: expected.sha256,
+            },
+            SNAPSHOT_MAX_BYTES,
+        )?;
+        let saved: Snapshot = serde_json::from_slice(&bytes)
+            .map_err(|_| rejected("schema", "malformed native snapshot descriptor"))?;
+        if saved.schema != SNAPSHOT_SCHEMA {
+            return Err(rejected("schema", "unsupported native snapshot schema"));
+        }
+        saved.generation.validate()?;
+        let count = usize::try_from(saved.documents)
+            .map_err(|_| rejected("documents", "document count does not fit this platform"))?;
+        if count > limits.max_documents {
+            return Err(rejected("documents", "selected source exceeds the document limit"));
+        }
+        let documents = read_sources(
+            cx,
+            &directory.join(SOURCE_FILE),
+            saved.source,
+            count,
+            limits,
+        )?;
+        checkpoint(cx, "native_ann.snapshot.source_recovered")?;
+        Ok((saved.generation, documents))
+    }
+
     /// Persist the retained source cohort and seal a small vector/source descriptor.
     ///
     /// Returns the exact descriptor receipt to retain in the caller's trusted
