@@ -10,6 +10,9 @@ use super::*;
 #[path = "activation.rs"]
 mod activation;
 
+#[path = "warm_update.rs"]
+mod warm_update;
+
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,12 +21,21 @@ pub(super) enum ActivationPermission {
     Enabled,
 }
 
+/// Startup-only grants to the trusted stdin controller. Activating a supplied
+/// receipt does not implicitly grant permission to create files or run indexing.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Controls {
+    pub(super) activation: bool,
+    pub(super) updates: bool,
+}
+
 // Unknown control fields cannot fall through into an unrestricted search.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Message {
     Search(Request),
     Control(activation::Request),
+    Update(warm_update::Request),
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,13 +246,13 @@ pub(super) async fn stream_one<W: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn run<R: BufRead, W: Write>(
+pub(super) async fn run_with_controls<R: BufRead, W: Write>(
     live: &NativeLiveHybridIndex,
     cx: &Cx,
     input: &mut R,
     output: &mut W,
     defaults: (Mode, usize),
-    allow_activation: bool,
+    controls: Controls,
     base_filter: Option<&filter::Filter>,
     policy: &query::Policy,
 ) -> Result<()> {
@@ -256,7 +268,9 @@ pub(super) async fn run<R: BufRead, W: Write>(
         "documents": index.vectors().documents().len(),
         "quality": index.vectors().quality().is_some(),
         "fast_native_hnsw": index.vectors().fast().graph_path().is_some(),
-        "activation_enabled": allow_activation,
+        "activation_enabled": controls.activation,
+        "updates_enabled": controls.updates,
+        "update_max_mutations": warm_update::MAX_MUTATIONS,
         "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),
         "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
@@ -310,9 +324,33 @@ pub(super) async fn run<R: BufRead, W: Write>(
                     stream_one(snapshot.index(), cx, &request, ordinal, defaults, output, base_filter, policy).await?;
             }
             Message::Control(request) => {
-                activation::execute(live, cx, &request, ordinal, allow_activation, output)
+                activation::execute(live, cx, &request, ordinal, controls.activation, output)
+                    .await?;
+            }
+            Message::Update(request) => {
+                warm_update::execute(live, cx, request, ordinal, controls.updates, output)
                     .await?;
             }
         }
     }
+}
+
+// Existing search/activation regression fixtures deliberately exercise the
+// non-writing server. Production callers must supply both grants explicitly.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run<R: BufRead, W: Write>(
+    live: &NativeLiveHybridIndex,
+    cx: &Cx,
+    input: &mut R,
+    output: &mut W,
+    defaults: (Mode, usize),
+    allow_activation: bool,
+    base_filter: Option<&filter::Filter>,
+    policy: &query::Policy,
+) -> Result<()> {
+    run_with_controls(
+        live, cx, input, output, defaults,
+        Controls { activation: allow_activation, updates: false }, base_filter, policy,
+    ).await
 }

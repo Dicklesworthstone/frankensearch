@@ -7,11 +7,11 @@ use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 
 use super::*;
 
-type Edits = BTreeMap<String, Option<IndexableDocument>>;
+pub(super) type Edits = BTreeMap<String, Option<IndexableDocument>>;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-enum Mutation {
+pub(super) enum Mutation {
     Upsert {
         id: String,
         content: String,
@@ -20,6 +20,37 @@ enum Mutation {
         metadata: HashMap<String, String>,
     },
     Delete { id: String },
+}
+
+fn admit_mutation(edits: &mut Edits, mutation: Mutation) -> Result<()> {
+    let (id, document) = match mutation {
+        Mutation::Upsert { id, content, title, metadata } => {
+            let mut document = IndexableDocument::new(id.clone(), content);
+            document.title = title;
+            document.metadata = metadata;
+            (id, Some(document))
+        }
+        Mutation::Delete { id } => (id, None),
+    };
+    if id.trim().is_empty() || id.contains('\0') || id.len() > usize::from(u16::MAX) {
+        return Err(bad("update IDs must be nonblank, NUL-free, and at most 65535 bytes"));
+    }
+    edits.insert(id, document);
+    if edits.len() > MAX_DOCUMENTS {
+        return Err(bad("update exceeds the distinct edited-document limit"));
+    }
+    Ok(())
+}
+
+/// The stdio server bounds the complete request before decoding this array.
+/// Reuse the JSONL command's validation and last-edit-wins semantics, including
+/// validation of overwritten records, rather than a second mutation language.
+pub(super) fn from_mutations(mutations: Vec<Mutation>) -> Result<Edits> {
+    let mut edits = BTreeMap::new();
+    for mutation in mutations {
+        admit_mutation(&mut edits, mutation)?;
+    }
+    Ok(edits)
 }
 
 pub(super) fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
@@ -49,32 +80,19 @@ pub(super) fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
                 error.classify(), error.column(),
             ))
         })?;
-        let (id, document) = match mutation {
-            Mutation::Upsert { id, content, title, metadata } => {
-                let mut document = IndexableDocument::new(id.clone(), content);
-                document.title = title;
-                document.metadata = metadata;
-                (id, Some(document))
-            }
-            Mutation::Delete { id } => (id, None),
-        };
-        if id.trim().is_empty() || id.contains('\0') || id.len() > usize::from(u16::MAX) {
-            return Err(bad("update IDs must be nonblank, NUL-free, and at most 65535 bytes"));
-        }
-        edits.insert(id, document);
-        if edits.len() > MAX_DOCUMENTS {
-            return Err(bad("update exceeds the distinct edited-document limit"));
-        }
+        admit_mutation(&mut edits, mutation)?;
     }
 }
 
 // Bound the final retained source cohort, not just the delta. Repeated updates
 // must not evade the CLI's source limits by adding a bounded batch every time.
-fn validate_final_cohort(cx: &Cx, index: &NativeBuiltHybridIndex, edits: &Edits) -> Result<()> {
+pub(super) fn validate_final_cohort(cx: &Cx, index: &NativeBuiltHybridIndex, edits: &Edits) -> Result<()> {
     let mut count = 0_usize;
     let mut bytes = 0_usize;
     let mut admit = |document: &IndexableDocument| -> Result<()> {
-        cx.checkpoint().map_err(|_| bad("native update cancelled"))?;
+        cx.checkpoint().map_err(|error| frankensearch::SearchError::Cancelled {
+            phase: "native_cli.update".to_owned(), reason: error.to_string(),
+        })?;
         let encoded = encode(document, MAX_RECORD_BYTES)?;
         count += 1;
         bytes = bytes.checked_add(encoded.len()).ok_or_else(|| bad("source byte count overflow"))?;

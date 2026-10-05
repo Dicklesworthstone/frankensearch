@@ -56,7 +56,7 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--mode full|fast|quality] [--limit N] [--stream] [--filter JSON]\n\
          [--timeout-ms N] [--reranker-dir DIR] [--rerank-window N]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
-         [--allow-activation] [--filter JSON] [--timeout-ms N]\n\
+         [--allow-activation] [--allow-updates] [--filter JSON] [--timeout-ms N]\n\
          [--reranker-dir DIR] [--rerank-window N]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
@@ -124,6 +124,7 @@ struct Options {
     exact: bool,
     stream: bool,
     activation: serve::ActivationPermission,
+    allow_updates: bool,
     filter: Option<filter::Filter>,
     timeout_ms: Option<u64>,
     reranker_dir: Option<PathBuf>,
@@ -165,6 +166,7 @@ impl Options {
             exact: false,
             stream: false,
             activation: serve::ActivationPermission::Disabled,
+            allow_updates: false,
             filter: None,
             timeout_ms: None,
             reranker_dir: None,
@@ -189,6 +191,7 @@ impl Options {
                 "--allow-activation" if command == Command::Serve => {
                     options.activation = serve::ActivationPermission::Enabled;
                 }
+                "--allow-updates" if command == Command::Serve => options.allow_updates = true,
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
                 "--new-receipt" if matches!(command, Command::Update | Command::Rebuild) => {
                     options.new_receipt = Some(PathBuf::from(value(&mut args)?));
@@ -615,13 +618,16 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Optio
             policy.rerank = rerank;
             if options.command == Command::Serve {
                 let live = serve::NativeLiveHybridIndex::new(cx, index)?;
-                return serve::run(
+                return serve::run_with_controls(
                     &live,
                     cx,
                     &mut io::stdin().lock(),
                     output,
                     (options.mode, options.limit),
-                    options.activation == serve::ActivationPermission::Enabled,
+                    serve::Controls {
+                        activation: options.activation == serve::ActivationPermission::Enabled,
+                        updates: options.allow_updates,
+                    },
                     options.filter.as_ref(),
                     &policy,
                 )
