@@ -788,7 +788,7 @@ fn lockable_pin_file(
 /// mount) locks the existing pin file read-only. A reader that cannot open it
 /// at all is refused rather than admitted unpinned: a writable collector in
 /// another process would otherwise be free to remove the generation (GH #60).
-/// A collector holding the exclusive pin causes WouldBlock, not an unbounded
+/// A collector holding the exclusive pin causes `WouldBlock`, not an unbounded
 /// wait inside an otherwise cancellation-aware reader admission.
 fn pin_generation(root: &Path, id: &str) -> SearchResult<Option<Arc<GenerationPin>>> {
     #[cfg(unix)]
@@ -1143,7 +1143,10 @@ mod tests {
                     if attempts == 1 {
                         assert_eq!(id, retired);
                         drop(publish(store, cx, "new"));
-                        assert_eq!(store.collect_retained(cx, 0)?.removed, [retired.clone()]);
+                        assert_eq!(
+                            store.collect_retained(cx, 0)?.removed,
+                            std::slice::from_ref(&retired)
+                        );
                     }
                     store.open_retained(cx, id, digest)
                 })
@@ -1254,9 +1257,7 @@ mod tests {
                 })
                 .unwrap_err();
             assert_eq!(attempts, 1);
-            assert!(
-                matches!(error, SearchError::Io(error) if error.kind() == ErrorKind::NotFound)
-            );
+            assert!(matches!(error, SearchError::Io(error) if error.kind() == ErrorKind::NotFound));
         });
     }
 
@@ -1324,12 +1325,12 @@ mod tests {
                         Err(SearchError::Io(error)) if error.kind() == ErrorKind::WouldBlock);
                     sender.send(refused).unwrap();
                 });
-                let received = receiver.recv_timeout(std::time::Duration::from_secs(5));
+                let refusal = receiver.recv_timeout(std::time::Duration::from_secs(5));
                 // Release even on timeout so reverting to blocking flock makes
                 // the assertion fail instead of hanging the entire test suite.
                 drop(exclusive);
                 reader.join().unwrap();
-                assert!(received.expect("reader admission waited for the exclusive pin"));
+                assert!(refusal.expect("reader admission waited for the exclusive pin"));
             });
             assert_eq!(store.active(&cx).unwrap().unwrap().id(), id);
         });

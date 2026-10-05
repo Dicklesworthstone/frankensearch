@@ -1290,7 +1290,7 @@ mod diagnostic_retention_tests {
                 drop(publish_bundle(&store, &cx));
                 let current = publish_bundle(&store, &cx);
                 let report = store.collect_retained(&cx, 0).unwrap();
-                assert_eq!(report.pinned, [old_id.clone()]);
+                assert_eq!(report.pinned, std::slice::from_ref(&old_id));
                 assert_eq!(report.removed.len(), 1);
                 assert_eq!(
                     fs::read_to_string(old_path.join("diagnostic-artifact")).unwrap(),
@@ -1377,7 +1377,10 @@ mod diagnostic_retention_tests {
             let result: SearchResult<()> = (|| {
                 let reader = runtime.open_complete_generation_diagnostics(&cx, root.path())?;
                 drop(publish_bundle(&store, &cx));
-                assert_eq!(store.collect_retained(&cx, 0)?.pinned, [old_id.clone()]);
+                assert_eq!(
+                    store.collect_retained(&cx, 0)?.pinned,
+                    std::slice::from_ref(&old_id)
+                );
                 assert_eq!(reader.generation.as_ref().unwrap().id(), old_id);
                 Err(complete_cli_error("diagnostic_test", "injected inspection failure"))
             })();
@@ -2490,7 +2493,10 @@ mod tests {
             fs::write(source.join("beta.md"), "sharedtoken successor document").unwrap();
             publish(&runtime, &cx, &root).await;
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
-            assert_eq!(store.collect_retained(&cx, 0).unwrap().pinned, [old_id.clone()]);
+            assert_eq!(
+                store.collect_retained(&cx, 0).unwrap().pinned,
+                std::slice::from_ref(&old_id)
+            );
             let status = reader.runtime.collect_status_payload().unwrap();
             assert_eq!(status.index.path, old_path.display().to_string());
             assert_eq!(sealed_inventory(&old_path), before);
