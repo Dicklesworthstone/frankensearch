@@ -135,7 +135,7 @@ impl NativeBuiltShardedHybridIndex {
         lexical_seal: LexicalSeal,
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.sharded_hybrid.admission")?;
-        if lexical.doc_count()? != vectors.document_count()
+        if usize::try_from(lexical.doc_count()?).ok() != Some(vectors.document_count())
             || lexical.keeper_generation() != lexical_seal.generation()
         {
             return Err(rejected("lexical_membership", "global lexical population differs from its source cohort"));

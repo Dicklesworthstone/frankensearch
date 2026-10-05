@@ -234,7 +234,7 @@ fn equal_counts_and_valid_lexical_files_cannot_mix_a_different_source_cut() {
                 _ => changed.id = "foreign".to_owned(),
             }
             let (writer, reader, seal) = create_lexical(&cx, &vectors.directory().join("lexical"), different.iter()).await.unwrap();
-            assert_eq!(reader.doc_count().unwrap(), vectors.document_count());
+            assert_eq!(usize::try_from(reader.doc_count().unwrap()).unwrap(), vectors.document_count());
             assert_eq!(reader.keeper_generation(), seal.generation());
             assert!(matches!(NativeBuiltShardedHybridIndex::from_readers(&cx, vectors, reader, seal),
                 Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.builder.lexical_source_join"));
