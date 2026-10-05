@@ -98,6 +98,7 @@ async fn phases<W: Write>(
     frames: &mut Frames<'_, W>,
     filters: filter::Filters<'_>,
     deadline: Option<&frankensearch::native_ann::builder::deadline::NativeSearchDeadline>,
+    rerank: Option<&query::Rerank>,
 ) -> std::result::Result<bool, Failure> {
     let scoped = query::within(cx, deadline, async {
         filter::Query::prepare(index, cx, filters)
@@ -106,6 +107,9 @@ async fn phases<W: Write>(
         "event": "started", "ok": true, "mode": mode, "limit": limit,
     });
     scoped.annotate(&mut started);
+    if let Some(rerank) = rerank {
+        rerank.annotate(&mut started);
+    }
     frames.send(started).map_err(Failure::Delivery)?;
     if mode != Mode::Full {
         let payload = query::within(cx, deadline, scoped.search(cx, &request.query, mode, limit))
@@ -115,9 +119,12 @@ async fn phases<W: Write>(
         frames.partial = true;
         return Ok(false);
     }
-    let mut stream = scoped
-        .progressive(cx, &request.query, limit)
-        .map_err(|error| Failure::Query(error.into()))?;
+    let mut stream = match rerank {
+        Some(rerank) => scoped.progressive_with_reranker(
+            cx, &request.query, limit, rerank.model.as_ref(), rerank.window,
+        ),
+        None => scoped.progressive(cx, &request.query, limit),
+    }.map_err(|error| Failure::Query(error.into()))?;
     let mut degraded = false;
     while !stream.is_finished() {
         // One deadline, not a renewed timeout per phase. Do not time output:
@@ -154,6 +161,9 @@ async fn phases<W: Write>(
             }
         };
         scoped.annotate(&mut payload);
+        if let Some(rerank) = rerank {
+            rerank.annotate(&mut payload);
+        }
         frames.send(payload).map_err(Failure::Delivery)?;
         frames.partial = true;
     }
@@ -200,7 +210,7 @@ pub(super) async fn stream_one<W: Write>(
         request.validate().map_err(Failure::Query)?;
         let deadline = policy.start(cx, request.timeout_ms).map_err(Failure::Query)?;
         phases(index, cx, request, mode, limit, &mut frames,
-            [base_filter, request.filter.as_ref()], deadline.as_ref()).await
+            [base_filter, request.filter.as_ref()], deadline.as_ref(), policy.reranker_for(mode)).await
     }.await;
     match result {
         Ok(degraded) => {
@@ -249,6 +259,8 @@ pub(super) async fn run<R: BufRead, W: Write>(
         "activation_enabled": allow_activation,
         "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),
+        "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
+        "rerank_window": policy.rerank.as_ref().map(|r| r.window),
     }))?;
     drop(initial);
     let mut line = Vec::new();

@@ -332,3 +332,53 @@ Deadlines use the caller-owned asupersync timer. They drop pending cooperative
 work and reject late synchronous completion, but cannot preempt a synchronous
 model/graph call, a blocked stdin read, or output. Output/activation are never
 wrapped in a timeout that could falsely claim visible effects were undone.
+
+## Native cross-encoder reranking
+
+Build with the existing optional reranker feature and explicitly select a local
+cross-encoder directory (not the embedding-model directory):
+
+```sh
+cargo build -p frankensearch --features hybrid,rerank --bin frankensearch-native --release
+./target/release/frankensearch-native search --receipt ./native-receipts/g1.json \
+  --query 'retry network requests' --reranker-dir /absolute/local/cross-encoder \
+  --rerank-window 50 --timeout-ms 5000 --stream
+./target/release/frankensearch-native serve --receipt ./native-receipts/g1.json \
+  --reranker-dir /absolute/local/cross-encoder --rerank-window 50 --timeout-ms 5000
+```
+
+This loads the existing pure-Rust `NativeReranker` once and attaches the command's
+asupersync blocking pool. There is no download, ONNX reranker substitution, or
+model loading per query/activation. A missing feature, model or blocking pool
+fails startup rather than silently disabling requested reranking. Model loading
+is startup work outside the per-query budget. The ordinary quality *embedder*
+is unchanged and may still use ONNX Runtime.
+
+Full-mode requests run Initial, any configured quality refinement, then native
+reranking of the retained retrieval window. A fast-only built cohort can also
+use full mode: Initial is followed directly by reranking. The first two pages
+are flushed before cross-encoder inference starts. The window defaults to 50
+and accepts 1..1000; it is independent of the displayed result limit. Native
+candidate budgeting grows to include the requested window. With a larger result
+limit, the existing native policy reranks the requested head and retains its
+unscored tail; no evaluated-count or whole-corpus relevance claim is made.
+
+Fast and quality-primary server requests deliberately skip the cross-encoder.
+One-shot `search --reranker-dir` therefore requires full mode instead of quietly
+ignoring an explicitly supplied reranker. Server readiness names the configured
+full-mode reranker/window. Individual requests cannot select arbitrary model
+paths, reload the provider, or enlarge the rerank window.
+
+The source text is the exact stored body from the query's pinned cohort, including
+after live activation. Server/request scopes apply before retrieval and also
+restrict the rerank inputs. No current filesystem body or unrelated text resolver
+is used. Native response validation retains document IDs, source evidence and row
+ownership; a malformed score envelope is a failure, not a partial reorder.
+
+A successful final phase is `reranked` with actual `evaluated` count. Empty pools
+skip the scorer; buffered output then retains the actual retrieval phase and
+reports `rerank_applied: false`. Buffered full-mode search fails when any required
+phase fails. Streaming emits `rerank_failed` with the exact preceding page and a
+`degraded` terminal, and the next request remains usable. The original total
+deadline includes reranking: expiry after Refined starts no scorer; late scoring
+never replaces the delivered page. Synchronous native work is not preemptible.

@@ -532,9 +532,13 @@ fn deadline_policy(milliseconds: u64) -> (Arc<asupersync::time::VirtualClock>, q
     let policy = query::Policy {
         maximum_ms: Some(milliseconds),
         timer: Some(asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock))),
+        ..query::Policy::default()
     };
     (clock, policy)
 }
+
+#[path = "rerank_tests.rs"]
+mod rerank_tests;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]

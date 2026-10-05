@@ -147,6 +147,20 @@ impl<'a> Query<'a> {
         self.annotate(&mut payload);
         Ok(payload)
     }
+
+    pub(super) fn progressive_with_reranker<'q>(
+        &'q self,
+        cx: &'q Cx,
+        text: &'q str,
+        limit: usize,
+        reranker: &'q dyn frankensearch::Reranker,
+        window: usize,
+    ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
+        match &self.scope {
+            Some(scope) => scope.progressive_with_reranker(cx, text, limit, reranker, window),
+            None => self.index.progressive_with_reranker(cx, text, limit, reranker, window),
+        }
+    }
 }
 
 #[cfg(test)]

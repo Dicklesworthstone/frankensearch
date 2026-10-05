@@ -12,6 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use asupersync::runtime::RuntimeBuilder;
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltHybridIndex, NativeIndexBuilder,
 };
@@ -51,9 +52,10 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
          [--mode full|fast|quality] [--limit N] [--stream] [--filter JSON]\n\
-         [--timeout-ms N]\n\
+         [--timeout-ms N] [--reranker-dir DIR] [--rerank-window N]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
-         [--allow-activation] [--filter JSON] [--timeout-ms N]\n\n\
+         [--allow-activation] [--filter JSON] [--timeout-ms N]\n\
+         [--reranker-dir DIR] [--rerank-window N]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
@@ -112,6 +114,8 @@ struct Options {
     activation: serve::ActivationPermission,
     filter: Option<filter::Filter>,
     timeout_ms: Option<u64>,
+    reranker_dir: Option<PathBuf>,
+    rerank_window: usize,
 }
 
 impl Options {
@@ -147,6 +151,8 @@ impl Options {
             activation: serve::ActivationPermission::Disabled,
             filter: None,
             timeout_ms: None,
+            reranker_dir: None,
+            rerank_window: 50,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -190,6 +196,12 @@ impl Options {
                     query::validate_timeout(Some(milliseconds))?;
                     options.timeout_ms = Some(milliseconds);
                 }
+                "--reranker-dir" if matches!(command, Command::Search | Command::Serve) => {
+                    options.reranker_dir = Some(PathBuf::from(value(&mut args)?));
+                }
+                "--rerank-window" if matches!(command, Command::Search | Command::Serve) => {
+                    options.rerank_window = positive(&value(&mut args)?, 1_000)?;
+                }
                 "--filter" if matches!(command, Command::Search | Command::Serve) => {
                     options.filter = Some(filter::Filter::parse(&value(&mut args)?)?);
                 }
@@ -198,6 +210,12 @@ impl Options {
         }
         if options.receipt.as_os_str().is_empty() {
             return Err(bad("--receipt is required"));
+        }
+        if seen.contains("--rerank-window") && options.reranker_dir.is_none() {
+            return Err(bad("--rerank-window requires --reranker-dir"));
+        }
+        if command == Command::Search && options.reranker_dir.is_some() && options.mode != Mode::Full {
+            return Err(bad("reranking requires --mode full; primary-tier modes explicitly skip it"));
         }
         if matches!(command, Command::Index | Command::Update) && options.directory.is_none() {
             return Err(bad("index/update requires --index-dir pointing to a NEW directory"));
@@ -518,7 +536,7 @@ async fn search(
     filter::Query::prepare(index, cx, filters)?.search(cx, query, mode, limit).await
 }
 
-async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<()> {
+async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Option<BlockingPoolHandle>) -> Result<()> {
     match options.command {
         Command::Update => update::execute(cx, &options, output).await,
         Command::Index => {
@@ -546,6 +564,11 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
             }))
         }
         Command::Search | Command::Serve => {
+            // Explicit local-only startup, once per process. Native inference
+            // retains this caller-owned pool, including after live activation.
+            let rerank = options.reranker_dir.as_deref()
+                .map(|path| query::Rerank::load(cx, path, options.rerank_window, pool))
+                .transpose()?;
             let selection = Selection::read(&options.receipt)?;
             let models = load_models(
                 options.models.as_deref(),
@@ -554,7 +577,8 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
             let index = selection.open(cx, models).await?;
             // Index/model admission is startup work. Each accepted query starts
             // its own total budget after that, before scoping or provider work.
-            let policy = query::Policy::new(cx, options.timeout_ms)?;
+            let mut policy = query::Policy::new(cx, options.timeout_ms)?;
+            policy.rerank = rerank;
             if options.command == Command::Serve {
                 let live = serve::NativeLiveHybridIndex::new(cx, index)?;
                 return serve::run(
@@ -595,15 +619,15 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                     Err(bad("search did not complete all requested phases; see terminal frame"))
                 };
             }
-            let deadline = policy.start(cx, None)?;
-            let page = query::within(cx, deadline.as_ref(), search(
+            let page = query::buffered(
                 &index,
                 cx,
                 options.query.as_deref().ok_or_else(|| bad("missing query"))?,
                 options.mode,
                 options.limit,
                 [None, options.filter.as_ref()],
-            ))
+                &policy,
+            )
             .await?;
             emit(output, &page)
         }
@@ -668,9 +692,10 @@ fn run() -> Result<()> {
     let runtime = RuntimeBuilder::current_thread()
         .blocking_threads(0, 2)
         .build()?;
+    let pool = runtime.blocking_handle();
     runtime.block_on(async move {
         let cx = Cx::current().ok_or_else(|| bad("runtime did not install a root context"))?;
-        execute(&cx, options, &mut io::stdout().lock()).await
+        execute(&cx, options, &mut io::stdout().lock(), pool).await
     })
 }
 
