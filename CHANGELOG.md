@@ -334,6 +334,19 @@ Historical adapter identities remain rejected by strict admission, and the
 
 These changes landed after the 2026-10-05 publication of fsfs 1.12.2.
 
+- **Valid UTF-8 files are no longer quarantined when the encoding probe cuts
+  a character.** The classifier checks a file's first 8 KiB, and a strict
+  UTF-8 check failed whenever a multi-byte character straddled that cut, so
+  the file was taken for an unknown 8-bit encoding and quarantined: never
+  indexed, with only `FSFS_TEXT_HEURISTIC_QUARANTINE` among the run's reason
+  codes. In Chinese or Japanese text, where most bytes belong to 3-byte
+  characters, that is about two thirds of documents longer than 8 KiB; on
+  the asupersync repository it dropped 11 Rust files and 2 Markdown files
+  that use box-drawing characters or em dashes. A probe that is a prefix of a
+  longer file may now end inside a character; a file that really ends inside
+  one is still refused. On a test tree, 1.12.2 indexed 1 of 4 such files and
+  found nothing for `キリン`; the fix indexes all 4 and finds the Japanese
+  document.
 - **A daemon socket path too long to bind moves to a short private
   directory (bd-pwwdi).** fsfs 1.12.2 searches in process at once when the
   default daemon socket is longer than Unix allows (on macOS, a user name of

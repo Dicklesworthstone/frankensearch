@@ -560,7 +560,7 @@ impl FileClassificationContractDefinition {
             };
         }
 
-        let utf8_valid = std::str::from_utf8(capped_probe).is_ok();
+        let utf8_valid = utf8_probe_is_valid(capped_probe, input.size_bytes > probe_len);
         if self.is_binary(&sniff_features, utf8_valid) {
             return FileClassificationDecision {
                 kind: FILE_CLASSIFICATION_DECISION_KIND.to_string(),
@@ -1140,6 +1140,17 @@ fn detect_bom(bytes: &[u8]) -> &'static str {
 }
 
 #[must_use]
+/// Whether `probe` is UTF-8. When it is a prefix of a longer file, a character
+/// cut off at its end is not an encoding error: the probe of valid UTF-8 text
+/// ends inside a multi-byte character whenever one straddles the cut, which
+/// quarantined about two thirds of CJK documents longer than the probe.
+fn utf8_probe_is_valid(probe: &[u8], is_prefix: bool) -> bool {
+    match std::str::from_utf8(probe) {
+        Ok(_) => true,
+        Err(error) => is_prefix && error.error_len().is_none(),
+    }
+}
+
 fn detect_encoding(
     _bytes: &[u8],
     sniff_features: &SniffFeatures,
@@ -1521,6 +1532,41 @@ mod tests {
         assert_eq!(decision.detected_encoding, "none");
         assert_eq!(decision.reason_code, "FSFS_CORRUPT_CHECKSUM_MISMATCH");
         assert!(decision.satisfies_contract());
+    }
+
+    /// A valid UTF-8 file longer than the probe whose probe ends inside a
+    /// multi-byte character is UTF-8 text, not an unknown 8-bit encoding: such
+    /// files were quarantined and never indexed. A file that really ends inside
+    /// a character is still refused.
+    #[test]
+    fn utf8_text_whose_probe_cuts_a_character_is_indexed() {
+        let contract = FileClassificationContractDefinition::default();
+        let probe = usize::try_from(contract.sniff_heuristics.max_probe_bytes).unwrap();
+        let mut boxed = "a".repeat(probe - 2);
+        boxed.push('─');
+        boxed.push_str(&"b".repeat(100));
+        let cjk = "東京の天気は晴れです。".repeat(probe / 30 + 10);
+        for (path, text) in [
+            ("src/box.rs", boxed.as_str()),
+            ("docs/日本語.md", cjk.as_str()),
+        ] {
+            assert!(
+                std::str::from_utf8(&text.as_bytes()[..probe]).is_err(),
+                "{path}"
+            );
+            let decision = contract.classify_bytes(path, text.as_bytes());
+            assert_eq!(decision.ingest_action, IngestAction::Index, "{path}");
+            assert_eq!(
+                decision.reason_code, "FSFS_TEXT_UTF8_HIGH_CONFIDENCE",
+                "{path}"
+            );
+            assert!(decision.satisfies_contract(), "{path}");
+        }
+
+        let cut_short = &boxed.as_bytes()[..probe];
+        let decision = contract.classify_bytes("src/box.rs", cut_short);
+        assert_eq!(decision.ingest_action, IngestAction::Quarantine);
+        assert_eq!(decision.reason_code, "FSFS_TEXT_HEURISTIC_QUARANTINE");
     }
 
     #[test]
