@@ -45,6 +45,7 @@ const MAX_POINTER_BYTES: u64 = 256;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARTIFACTS: usize = 100_000;
 const MAX_TREE_DEPTH: usize = 64;
+const MAX_ACTIVE_OPEN_ATTEMPTS: usize = 4;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// A canonical, stable root containing immutable generations and one pointer.
@@ -185,17 +186,59 @@ impl CompleteGenerationStore {
 
     /// Resolve one descriptor and verify exactly the files it authenticates.
     /// An invalid descriptor never falls back to scanning for another generation.
+    /// If publication and retention retire that descriptor's bundle before it
+    /// can be pinned, retry the newly selected descriptor a bounded number of
+    /// times. An admitted predecessor remains a valid result; successful opens
+    /// are not restarted merely because a newer generation has been published.
     ///
     /// # Errors
     /// Returns an error for malformed selection, missing/extra/changed artifacts,
-    /// cancellation, or unsupported filesystem objects.
+    /// cancellation, unsupported filesystem objects, or repeated selection churn.
     pub fn active(&self, cx: &Cx) -> SearchResult<Option<PublishedGeneration>> {
+        self.active_with_opener(cx, Self::open_retained)
+    }
+
+    fn active_with_opener<F>(
+        &self,
+        cx: &Cx,
+        mut open: F,
+    ) -> SearchResult<Option<PublishedGeneration>>
+    where
+        F: FnMut(&Self, &Cx, &str, &str) -> SearchResult<PublishedGeneration>,
+    {
         checkpoint(cx)?;
-        let Some(pointer) = read_pointer(&self.root)? else {
+        let Some(mut pointer) = read_pointer(&self.root)? else {
             return Ok(None);
         };
-        let (id, manifest_sha256) = decode_pointer(&pointer, &self.root)?;
-        self.open_retained(cx, &id, &manifest_sha256).map(Some)
+        for _ in 0..MAX_ACTIVE_OPEN_ATTEMPTS {
+            checkpoint(cx)?;
+            let (id, manifest_sha256) = decode_pointer(&pointer, &self.root)?;
+            let error = match open(self, cx, &id, &manifest_sha256) {
+                Ok(generation) => return Ok(Some(generation)),
+                Err(error) => error,
+            };
+            // Only a removed bundle or a collector's exclusive pin can be a
+            // publication race. Never retry corruption, permission failures or
+            // cancellation against a different generation and hide the error.
+            if !matches!(&error, SearchError::Io(source)
+                if matches!(source.kind(), ErrorKind::NotFound | ErrorKind::WouldBlock))
+            {
+                return Err(error);
+            }
+            checkpoint(cx)?;
+            let Some(selected) = read_pointer(&self.root)? else {
+                // Losing an observed selection is not an empty, healthy store.
+                return Err(error);
+            };
+            if selected == pointer {
+                return Err(error);
+            }
+            pointer = selected;
+        }
+        Err(SearchError::Io(std::io::Error::new(
+            ErrorKind::WouldBlock,
+            "complete-generation selection changed repeatedly before reader admission; retry the command",
+        )))
     }
 
     /// Check whether an already admitted generation is still selected.
@@ -557,10 +600,13 @@ impl CompleteGenerationStore {
     ///
     /// Holding the lease means no build is in progress, so an unsealed
     /// directory is an abandoned build, never a running one.
+    /// The selected bundle must pass full admission before anything is removed.
+    /// If selection is absent while sealed generations remain, preserve them
+    /// for explicit recovery rather than treating every bundle as garbage.
     ///
     /// # Errors
     /// Returns lease contention (a build is running), cancellation,
-    /// malformed-selection, or filesystem errors; generations removed before
+    /// absent/corrupt selection, or filesystem errors; generations removed before
     /// an error stay removed.
     pub fn collect_retained(
         &self,
@@ -570,7 +616,26 @@ impl CompleteGenerationStore {
         checkpoint(cx)?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation retention")?;
+        let expected_selection = read_pointer(&self.root)?;
+        let selected = self.active(cx)?;
         let plan = self.plan_retention(cx, keep_predecessors)?;
+        if read_pointer(&self.root)? != expected_selection
+            || plan.active.as_deref() != selected.as_ref().map(PublishedGeneration::id)
+        {
+            return Err(invalid(
+                &self.root,
+                "selection changed during retention admission; nothing was removed",
+            ));
+        }
+        if selected.is_none()
+            && (!plan.retained.is_empty()
+                || plan.reclaimable.iter().any(|generation| generation.sealed))
+        {
+            return Err(invalid(
+                &self.root,
+                "sealed generations remain without a selection; restore an explicit trusted generation before collection",
+            ));
+        }
         let parent = self.root.join(GENERATIONS);
         let mut report = RetentionReport::default();
         for generation in plan.reclaimable {
@@ -624,11 +689,13 @@ fn pin_name(id: &str) -> String {
 }
 
 #[cfg(unix)]
-fn no_follow_flag() -> std::io::Result<i32> {
-    i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).map_err(|_| {
+fn pin_open_flags() -> std::io::Result<i32> {
+    // A substituted FIFO must not block before require_regular_pin can refuse it.
+    let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+    i32::try_from(flags.bits()).map_err(|_| {
         std::io::Error::new(
             ErrorKind::Unsupported,
-            "O_NOFOLLOW does not fit the open(2) flag word on this target",
+            "reader pin flags do not fit the open(2) flag word on this target",
         )
     })
 }
@@ -676,7 +743,7 @@ fn open_pin_file(root: &Path, id: &str) -> std::io::Result<File> {
         .create(true)
         .truncate(false)
         .mode(0o644)
-        .custom_flags(no_follow_flag()?)
+        .custom_flags(pin_open_flags()?)
         .open(directory.join(pin_name(id)))?;
     require_regular_pin(file)
 }
@@ -689,7 +756,7 @@ fn open_existing_pin_read_only(root: &Path, id: &str) -> std::io::Result<File> {
     require_pin_directory(&directory)?;
     let file = OpenOptions::new()
         .read(true)
-        .custom_flags(no_follow_flag()?)
+        .custom_flags(pin_open_flags()?)
         .open(directory.join(pin_name(id)))?;
     require_regular_pin(file)
 }
@@ -721,6 +788,8 @@ fn lockable_pin_file(
 /// mount) locks the existing pin file read-only. A reader that cannot open it
 /// at all is refused rather than admitted unpinned: a writable collector in
 /// another process would otherwise be free to remove the generation (GH #60).
+/// A collector holding the exclusive pin causes WouldBlock, not an unbounded
+/// wait inside an otherwise cancellation-aware reader admission.
 fn pin_generation(root: &Path, id: &str) -> SearchResult<Option<Arc<GenerationPin>>> {
     #[cfg(unix)]
     {
@@ -739,7 +808,7 @@ fn pin_generation(root: &Path, id: &str) -> SearchResult<Option<Arc<GenerationPi
                 )));
             }
         };
-        rustix::fs::flock(&file, rustix::fs::FlockOperation::LockShared)
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared)
             .map_err(|errno| SearchError::Io(std::io::Error::from(errno)))?;
         Ok(Some(Arc::new(GenerationPin { _file: file })))
     }
@@ -1060,6 +1129,294 @@ fn invalid(path: &Path, detail: &str) -> SearchError {
 mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
+
+    #[test]
+    fn active_retries_when_publication_and_collection_win_before_the_pin() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let retired = publish(&store, &cx, "old").id().to_owned();
+            let mut attempts = 0;
+            let reader = store
+                .active_with_opener(&cx, |store, cx, id, digest| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        assert_eq!(id, retired);
+                        drop(publish(store, cx, "new"));
+                        assert_eq!(store.collect_retained(cx, 0)?.removed, [retired.clone()]);
+                    }
+                    store.open_retained(cx, id, digest)
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(store.active(&cx).unwrap(), Some(reader.clone()));
+            assert_eq!(
+                fs::read_to_string(reader.path().join("content.txt")).unwrap(),
+                "new"
+            );
+            assert!(!root.path().join(GENERATIONS).join(retired).exists());
+        });
+    }
+
+    #[test]
+    fn active_keeps_a_successfully_pinned_predecessor_during_publication() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let old = publish(&store, &cx, "old");
+            let mut attempts = 0;
+            let reader = store
+                .active_with_opener(&cx, |store, cx, id, digest| {
+                    attempts += 1;
+                    let pinned = store.open_retained(cx, id, digest)?;
+                    drop(publish(store, cx, "new"));
+                    assert!(store.collect_retained(cx, 0)?.removed.is_empty());
+                    Ok(pinned)
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(attempts, 1);
+            assert_eq!(reader, old);
+            assert!(!store.is_selected(&cx, &reader).unwrap());
+            assert_eq!(
+                fs::read_to_string(reader.path().join("content.txt")).unwrap(),
+                "old"
+            );
+        });
+    }
+
+    #[test]
+    fn active_never_retries_corruption_against_a_healthy_successor() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let old = publish(&store, &cx, "old");
+            let mut attempts = 0;
+            let error = store
+                .active_with_opener(&cx, |store, cx, id, digest| {
+                    attempts += 1;
+                    drop(publish(store, cx, "new"));
+                    fs::write(old.path().join("vector.idx"), "corrupt")?;
+                    store.open_retained(cx, id, digest)
+                })
+                .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert!(matches!(error, SearchError::IndexCorrupted { .. }));
+            assert!(store.active(&cx).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn active_does_not_retry_io_failures_without_a_different_selection() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "selected"));
+            for kind in [
+                ErrorKind::NotFound,
+                ErrorKind::WouldBlock,
+                ErrorKind::PermissionDenied,
+            ] {
+                let mut attempts = 0;
+                let error = store
+                    .active_with_opener(&cx, |_, _, _, _| {
+                        attempts += 1;
+                        Err(SearchError::Io(std::io::Error::new(
+                            kind,
+                            "injected I/O failure",
+                        )))
+                    })
+                    .unwrap_err();
+                assert_eq!(attempts, 1);
+                assert!(matches!(error, SearchError::Io(error) if error.kind() == kind));
+            }
+        });
+    }
+
+    #[test]
+    fn active_does_not_turn_a_lost_selection_into_an_empty_store() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "old"));
+            let mut attempts = 0;
+            let error = store
+                .active_with_opener(&cx, |store, cx, id, digest| {
+                    attempts += 1;
+                    drop(publish(store, cx, "new"));
+                    store.collect_retained(cx, 0)?;
+                    fs::rename(
+                        root.path().join(COMPLETE_GENERATION_POINTER),
+                        root.path().join("saved-selection"),
+                    )?;
+                    store.open_retained(cx, id, digest)
+                })
+                .unwrap_err();
+            assert_eq!(attempts, 1);
+            assert!(
+                matches!(error, SearchError::Io(error) if error.kind() == ErrorKind::NotFound)
+            );
+        });
+    }
+
+    #[test]
+    fn active_retries_are_bounded_even_when_every_selected_bundle_is_collected() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "initial"));
+            let mut attempts = 0;
+            let error = store
+                .active_with_opener(&cx, |store, cx, id, digest| {
+                    attempts += 1;
+                    drop(publish(store, cx, "successor"));
+                    store.collect_retained(cx, 0)?;
+                    store.open_retained(cx, id, digest)
+                })
+                .unwrap_err();
+            assert_eq!(attempts, MAX_ACTIVE_OPEN_ATTEMPTS);
+            assert!(
+                matches!(error, SearchError::Io(error) if error.kind() == ErrorKind::WouldBlock)
+            );
+            assert!(store.active(&cx).unwrap().is_some());
+            assert_eq!(generation_names(root.path()).len(), 1);
+        });
+    }
+
+    #[test]
+    fn active_checks_cancellation_before_retrying_a_new_selection() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "old"));
+            let mut attempts = 0;
+            let error = store
+                .active_with_opener(&cx, |store, cx, id, digest| {
+                    attempts += 1;
+                    drop(publish(store, cx, "new"));
+                    store.collect_retained(cx, 0)?;
+                    let result = store.open_retained(cx, id, digest);
+                    cx.set_cancel_requested(true);
+                    result
+                })
+                .unwrap_err();
+            cx.set_cancel_requested(false);
+            assert_eq!(attempts, 1);
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            assert!(store.active(&cx).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn a_collectors_exclusive_pin_does_not_block_reader_admission() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let id = publish(&store, &cx, "selected").id().to_owned();
+            let exclusive = exclusive_pin(root.path(), &id).unwrap().unwrap();
+            std::thread::scope(|scope| {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let pin_root = root.path();
+                let pin_id = id.as_str();
+                let reader = scope.spawn(move || {
+                    let refused = matches!(pin_generation(pin_root, pin_id),
+                        Err(SearchError::Io(error)) if error.kind() == ErrorKind::WouldBlock);
+                    sender.send(refused).unwrap();
+                });
+                let received = receiver.recv_timeout(std::time::Duration::from_secs(5));
+                // Release even on timeout so reverting to blocking flock makes
+                // the assertion fail instead of hanging the entire test suite.
+                drop(exclusive);
+                reader.join().unwrap();
+                assert!(received.expect("reader admission waited for the exclusive pin"));
+            });
+            assert_eq!(store.active(&cx).unwrap().unwrap().id(), id);
+        });
+    }
+
+    #[test]
+    fn collection_preserves_recovery_candidates_when_selection_is_not_admissible() {
+        run_test_with_cx(|cx| async move {
+            for fault in [
+                "artifact",
+                "manifest",
+                "bundle",
+                "selection",
+                "framing",
+                "digest",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+                let old = publish(&store, &cx, "recoverable");
+                let old_id = old.id().to_owned();
+                let old_digest = old.manifest_sha256().to_owned();
+                let old_path = old.path().to_path_buf();
+                drop(old);
+                let current = publish(&store, &cx, "current");
+                let current_path = current.path().to_path_buf();
+                let current_id = current.id().to_owned();
+                drop(current);
+                let pointer = root.path().join(COMPLETE_GENERATION_POINTER);
+                match fault {
+                    "artifact" => fs::write(current_path.join("vector.idx"), "corrupt").unwrap(),
+                    "manifest" => {
+                        fs::write(current_path.join(COMPLETE_GENERATION_MANIFEST), "corrupt")
+                            .unwrap();
+                    }
+                    "bundle" => {
+                        fs::rename(&current_path, root.path().join("saved-bundle")).unwrap();
+                    }
+                    "selection" => {
+                        fs::rename(&pointer, root.path().join("saved-selection")).unwrap();
+                    }
+                    "framing" => fs::write(&pointer, "not a selection").unwrap(),
+                    "digest" => {
+                        fs::write(
+                            &pointer,
+                            format!("{POINTER_MAGIC}\n{current_id}\n{}\n", "0".repeat(64)),
+                        )
+                        .unwrap();
+                    }
+                    _ => unreachable!("fixture fault"), // ubs:ignore — cfg(test) fixture assertion.
+                }
+                let before = generation_names(root.path());
+                for keep in [0, 2] {
+                    assert!(
+                        store.collect_retained(&cx, keep).is_err(),
+                        "{fault}, keep={keep}"
+                    );
+                    assert_eq!(
+                        generation_names(root.path()),
+                        before,
+                        "{fault}, keep={keep}"
+                    );
+                    assert_eq!(
+                        fs::read_to_string(old_path.join("content.txt")).unwrap(),
+                        "recoverable"
+                    );
+                }
+                assert!(store.open_retained(&cx, &old_id, &old_digest).is_ok());
+                drop(PublicationLease::acquire(root.path()).unwrap());
+            }
+        });
+    }
+
+    #[test]
+    fn collection_can_still_remove_abandoned_unsealed_first_builds() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            assert!(store.collect_retained(&cx, 0).unwrap().removed.is_empty());
+            let build = store.begin(&cx).unwrap();
+            let abandoned = build.id.clone();
+            write_bundle(build.path(), "never published");
+            drop(build);
+            assert!(store.active(&cx).unwrap().is_none());
+            assert_eq!(store.collect_retained(&cx, 0).unwrap().removed, [abandoned]);
+            assert!(generation_names(root.path()).is_empty());
+        });
+    }
 
     #[test]
     fn complete_watch_precommit_refusal_preserves_current_and_releases_the_lease() {
