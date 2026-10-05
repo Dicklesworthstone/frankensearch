@@ -19,11 +19,19 @@ use super::{
 use crate::adapters::format_emitter::{emit_envelope, meta_for_format};
 use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER, CompleteGenerationStore,
-    GenerationPublication, GenerationRetention, RETAINED_PREDECESSORS, RetentionPlan,
-    RetentionReport,
+    GenerationPublication, GenerationRetention, PublishedGeneration, RETAINED_PREDECESSORS,
+    RetentionPlan, RetentionReport,
 };
 use crate::output_schema::OutputEnvelope;
 use crate::{CliCommand, OutputFormat, ShutdownCoordinator};
+
+/// Keep the admitted bundle alive until every diagnostic read and output has
+/// completed. A copied index path alone does not retain its reader pin. Drop
+/// the runtime before the generation, matching the search reader's ownership.
+struct CompleteGenerationDiagnosticReader {
+    runtime: FsfsRuntime,
+    generation: Option<PublishedGeneration>,
+}
 
 /// What retention did after one publication, as its receipt reports it.
 #[derive(Debug)]
@@ -63,7 +71,13 @@ impl RetentionOutcome {
                 megabytes(plan.reclaimable.iter().map(|generation| generation.bytes).sum())
             ),
             Self::Off => "predecessors retained".to_owned(),
-            Self::Failed { error, .. } => format!("retention failed, every generation kept: {error}"),
+            Self::Failed { mode, error } => {
+                if *mode == GenerationRetention::Collect {
+                    format!("retention failed; collection may be partially applied: {error}")
+                } else {
+                    format!("retention failed; no generations removed: {error}")
+                }
+            }
         }
     }
 
@@ -91,6 +105,7 @@ impl RetentionOutcome {
             Self::Failed { mode, error } => serde_json::json!({
                 "mode": mode.as_str(),
                 "error": error,
+                "partial_collection_possible": *mode == GenerationRetention::Collect,
             }),
         }
     }
@@ -194,21 +209,11 @@ impl FsfsRuntime {
             #[cfg(unix)]
             CliCommand::Daemon => self.run_complete_generation_daemon(cx, &root).await,
             CliCommand::Status | CliCommand::Doctor => {
-                let store = CompleteGenerationStore::open(cx, &root)?;
-                // A first build that failed (say, on a missing model) leaves
-                // only staging behind. Status and doctor exist to diagnose
-                // exactly that, so they report the models and the absent index
-                // instead of refusing.
-                let described = store
-                    .active(cx)?
-                    .map_or_else(|| root.clone(), |selected| selected.path().to_path_buf());
-                let mut input = self.cli_input.clone();
-                input.index_dir = Some(described);
-                let reader_runtime = self.clone().with_cli_input(input);
+                let reader = self.open_complete_generation_diagnostics(cx, &root)?;
                 if self.cli_input.command == CliCommand::Status {
-                    reader_runtime.run_status_command()
+                    reader.runtime.run_status_command()
                 } else {
-                    reader_runtime.run_doctor_command()
+                    reader.runtime.run_doctor_command()
                 }
             }
             _ => Err(complete_cli_error(
@@ -216,6 +221,31 @@ impl FsfsRuntime {
                 "this command cannot mutate a complete-generation store in place; use a one-shot index rebuild, complete-generation watch, append-batch, delete, compact, flush, search, explain, tui, serve, daemon, status, or doctor",
             )),
         }
+    }
+
+    fn open_complete_generation_diagnostics(
+        &self,
+        cx: &Cx,
+        root: &Path,
+    ) -> SearchResult<CompleteGenerationDiagnosticReader> {
+        retained_search_checkpoint(cx)?;
+        let store = CompleteGenerationStore::open(cx, root)?;
+        let generation = store.active(cx)?;
+        // A failed first build can leave only staging. Status and doctor must
+        // still describe that absent index. Admit the inventory, not search
+        // resources: a missing model is diagnostic information, not a reason
+        // to load/download a model or refuse inspection of the store.
+        let described = generation
+            .as_ref()
+            .map_or_else(|| root.to_path_buf(), |selected| selected.path().to_path_buf());
+        let mut input = self.cli_input.clone();
+        input.index_dir = Some(described);
+        input.daemon = false;
+        retained_search_checkpoint(cx)?;
+        Ok(CompleteGenerationDiagnosticReader {
+            runtime: self.clone().with_cli_input(input),
+            generation,
+        })
     }
 
     /// Retain one complete generation for the dashboard's entire session, just
@@ -288,19 +318,17 @@ impl FsfsRuntime {
     }
 
     fn run_complete_generation_tui_status(&self, cx: &Cx, root: &Path) -> SearchResult<()> {
-        retained_search_checkpoint(cx)?;
         // Status needs the authenticated inventory, not semantic resource
         // admission or model loading. A missing model must remain visible
         // as status rather than prevent noninteractive TUI fallback.
-        let store = CompleteGenerationStore::open(cx, root)?;
-        let selected = store.active(cx)?.ok_or_else(|| {
-            complete_cli_error("selection", "no complete generation has been published")
-        })?;
-        let mut input = self.cli_input.clone();
-        input.index_dir = Some(selected.path().to_path_buf());
-        input.daemon = false;
-        retained_search_checkpoint(cx)?;
-        self.clone().with_cli_input(input).run_status_command()
+        let reader = self.open_complete_generation_diagnostics(cx, root)?;
+        if reader.generation.is_none() {
+            return Err(complete_cli_error(
+                "selection",
+                "no complete generation has been published",
+            ));
+        }
+        reader.runtime.run_status_command()
     }
 
     fn complete_generation_command_root(
@@ -458,7 +486,8 @@ impl FsfsRuntime {
                     store_root = %root.display(),
                     mode = mode.as_str(),
                     error = %error,
-                    "complete-generation retention failed; every generation was kept"
+                    partial_collection_possible = mode == GenerationRetention::Collect,
+                    "complete-generation retention failed"
                 );
                 RetentionOutcome::Failed {
                     mode,
@@ -1208,6 +1237,248 @@ pub(super) fn complete_cli_error(field: &str, reason: &str) -> SearchError {
         field: format!("complete_generation.{field}"),
         value: String::new(),
         reason: reason.to_owned(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod diagnostic_retention_tests {
+    use super::*;
+    use crate::{CliInput, FsfsConfig};
+    use asupersync::test_utils::run_test_with_cx;
+
+    fn diagnostic_runtime(root: &Path, command: CliCommand) -> FsfsRuntime {
+        let mut config = FsfsConfig::default();
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+        config.indexing.model_dir = root.join("missing-models").display().to_string();
+        "unavailable-diagnostic-model".clone_into(&mut config.indexing.quality_model);
+        let input = CliInput {
+            command,
+            index_dir: Some(root.to_path_buf()),
+            format: OutputFormat::Json,
+            ..CliInput::default()
+        };
+        let mut runtime = FsfsRuntime::new(config).with_cli_input(input);
+        runtime.generation_retention = GenerationRetention::Collect;
+        runtime
+    }
+
+    // These bundles exercise the real publication/pinning/retention protocol
+    // without requiring engine artifacts or downloading an embedding model.
+    fn publish_bundle(store: &CompleteGenerationStore, cx: &Cx) -> PublishedGeneration {
+        let build = store.begin(cx).unwrap();
+        fs::write(build.path().join("diagnostic-artifact"), "retained bytes").unwrap();
+        require_durable_publication(build.publish(cx, |_, _| Ok(())).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn diagnostics_pin_one_bundle_until_the_reader_is_dropped() {
+        run_test_with_cx(|cx| async move {
+            for command in [CliCommand::Status, CliCommand::Doctor, CliCommand::Tui] {
+                let root = tempfile::tempdir().unwrap();
+                let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+                let old = publish_bundle(&store, &cx);
+                let old_id = old.id().to_owned();
+                let old_path = old.path().to_path_buf();
+                drop(old);
+                let runtime = diagnostic_runtime(root.path(), command);
+                let reader = runtime
+                    .open_complete_generation_diagnostics(&cx, root.path())
+                    .unwrap();
+                assert_eq!(reader.runtime.cli_input.command, command);
+                assert_eq!(reader.runtime.cli_input.index_dir.as_deref(), Some(old_path.as_path()));
+                assert_eq!(runtime.cli_input.index_dir.as_deref(), Some(root.path()));
+                drop(publish_bundle(&store, &cx));
+                let current = publish_bundle(&store, &cx);
+                let report = store.collect_retained(&cx, 0).unwrap();
+                assert_eq!(report.pinned, [old_id.clone()]);
+                assert_eq!(report.removed.len(), 1);
+                assert_eq!(
+                    fs::read_to_string(old_path.join("diagnostic-artifact")).unwrap(),
+                    "retained bytes"
+                );
+                assert_eq!(reader.generation.as_ref().unwrap().id(), old_id);
+                assert!(!root.path().join("missing-models").exists());
+
+                drop(reader);
+                assert_eq!(store.collect_retained(&cx, 0).unwrap().removed, [old_id]);
+                assert!(!old_path.exists());
+                assert_eq!(store.active(&cx).unwrap(), Some(current));
+            }
+        });
+    }
+
+    #[test]
+    fn diagnostics_preserve_unpublished_store_fallback_without_loading_models() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let abandoned = build.path().to_path_buf();
+            drop(build);
+            for command in [CliCommand::Status, CliCommand::Doctor] {
+                let runtime = diagnostic_runtime(root.path(), command);
+                let reader = runtime
+                    .open_complete_generation_diagnostics(&cx, root.path())
+                    .unwrap();
+                assert!(reader.generation.is_none());
+                assert_eq!(reader.runtime.cli_input.index_dir.as_deref(), Some(root.path()));
+                assert!(abandoned.is_dir());
+                assert!(!root.path().join("missing-models").exists());
+                assert!(!root.path().join(COMPLETE_GENERATION_POINTER).exists());
+            }
+            let tui = diagnostic_runtime(root.path(), CliCommand::Tui);
+            assert!(matches!(
+                tui.run_complete_generation_tui_status(&cx, root.path()),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "complete_generation.selection"
+            ));
+            assert!(abandoned.is_dir());
+        });
+    }
+
+    #[test]
+    fn diagnostics_refuse_corruption_and_cancellation_without_fallback() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let selected = publish_bundle(&store, &cx);
+            let artifact = selected.path().join("diagnostic-artifact");
+            let pointer = fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let runtime = diagnostic_runtime(root.path(), CliCommand::Doctor);
+            fs::write(&artifact, "corrupt").unwrap();
+            assert!(matches!(
+                runtime.open_complete_generation_diagnostics(&cx, root.path()),
+                Err(SearchError::IndexCorrupted { .. })
+            ));
+            assert_eq!(fs::read_to_string(&artifact).unwrap(), "corrupt");
+            fs::write(&artifact, "retained bytes").unwrap();
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                runtime.open_complete_generation_diagnostics(&cx, root.path()),
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            assert_eq!(
+                fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(store.active(&cx).unwrap(), Some(selected));
+            assert!(!root.path().join("missing-models").exists());
+        });
+    }
+
+    #[test]
+    fn diagnostics_release_the_pin_when_inspection_returns_an_error() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let old_id = publish_bundle(&store, &cx).id().to_owned();
+            let runtime = diagnostic_runtime(root.path(), CliCommand::Status);
+            let result: SearchResult<()> = (|| {
+                let reader = runtime.open_complete_generation_diagnostics(&cx, root.path())?;
+                drop(publish_bundle(&store, &cx));
+                assert_eq!(store.collect_retained(&cx, 0)?.pinned, [old_id.clone()]);
+                assert_eq!(reader.generation.as_ref().unwrap().id(), old_id);
+                Err(complete_cli_error("diagnostic_test", "injected inspection failure"))
+            })();
+            assert!(matches!(result, Err(SearchError::InvalidConfig { .. })));
+            assert_eq!(store.collect_retained(&cx, 0).unwrap().removed, [old_id]);
+        });
+    }
+
+    #[test]
+    fn partial_retention_failure_does_not_claim_every_generation_was_kept() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let first = publish_bundle(&store, &cx).path().to_path_buf();
+            let second = publish_bundle(&store, &cx);
+            let second_id = second.id().to_owned();
+            let second_path = second.path().to_path_buf();
+            drop(second);
+            for _ in 0..RETAINED_PREDECESSORS {
+                drop(publish_bundle(&store, &cx));
+            }
+            let selected = publish_bundle(&store, &cx);
+            let pointer = fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap();
+            // Fault only the second reclaimable pin. The first removal must
+            // succeed before the second is refused by the no-follow open.
+            let pin = root.path().join("readers").join(format!("{second_id}.pin"));
+            let saved = root.path().join("saved-reader-pin");
+            fs::rename(&pin, &saved).unwrap();
+            std::os::unix::fs::symlink(&saved, &pin).unwrap();
+            let mut runtime = diagnostic_runtime(root.path(), CliCommand::Index);
+            let outcome = runtime.retire_superseded_generations(&cx, root.path());
+            assert!(matches!(&outcome, RetentionOutcome::Failed { .. }));
+            assert!(!first.exists(), "collection really made partial progress");
+            assert!(second_path.is_dir());
+            assert!(outcome.summary().contains("may be partially applied"));
+            assert_eq!(outcome.to_json()["partial_collection_possible"], true);
+
+            let mut output = Vec::new();
+            runtime
+                .emit_complete_generation_receipt(
+                    root.path(),
+                    &selected,
+                    "index",
+                    &outcome,
+                    &mut output,
+                )
+                .unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(receipt["ok"], true);
+            assert_eq!(receipt["data"]["publication"], "durable");
+            assert_eq!(receipt["data"]["generation_id"], selected.id());
+            assert_eq!(receipt["data"]["retention"]["partial_collection_possible"], true);
+            assert!(receipt["data"]["retention"]["error"].is_string());
+            runtime.cli_input.format = OutputFormat::Table;
+            output.clear();
+            runtime
+                .emit_complete_generation_receipt(
+                    root.path(),
+                    &selected,
+                    "index",
+                    &outcome,
+                    &mut output,
+                )
+                .unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("durable"));
+            assert!(text.contains("may be partially applied"));
+            assert!(!text.contains("every generation kept"));
+            assert_eq!(
+                fs::read(root.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(store.active(&cx).unwrap(), Some(selected.clone()));
+            // Repair only the injected fault and verify the next pass can
+            // finish cleanup; the prior failure released its publication lease.
+            fs::rename(&saved, &pin).unwrap();
+            let retry = runtime.retire_superseded_generations(&cx, root.path());
+            assert!(matches!(retry, RetentionOutcome::Collected(report)
+                if report.removed == [second_id]));
+            assert_eq!(store.active(&cx).unwrap(), Some(selected));
+        });
+    }
+
+    #[test]
+    fn retention_failure_receipts_distinguish_collect_from_read_only_modes() {
+        for mode in [
+            GenerationRetention::Collect,
+            GenerationRetention::Report,
+            GenerationRetention::Off,
+        ] {
+            let outcome = RetentionOutcome::Failed {
+                mode,
+                error: "injected failure".to_owned(),
+            };
+            let partial = mode == GenerationRetention::Collect;
+            let receipt = outcome.to_json();
+            assert_eq!(receipt["mode"], mode.as_str());
+            assert_eq!(receipt["error"], "injected failure");
+            assert_eq!(receipt["partial_collection_possible"], partial);
+            assert_eq!(outcome.summary().contains("no generations removed"), !partial);
+        }
     }
 }
 
@@ -2201,6 +2472,31 @@ mod tests {
                 assert!(output.is_empty());
                 assert!(!root.exists());
             }
+        });
+    }
+
+    #[test]
+    fn complete_status_reads_the_pinned_catalog_after_successor_publication() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            runtime.cli_input.command = CliCommand::Status;
+            let reader = runtime.open_complete_generation_diagnostics(&cx, &root).unwrap();
+            let old = reader.generation.as_ref().unwrap();
+            let old_id = old.id().to_owned();
+            let old_path = old.path().to_path_buf();
+            let before = sealed_inventory(&old_path);
+            fs::write(source.join("beta.md"), "sharedtoken successor document").unwrap();
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_eq!(store.collect_retained(&cx, 0).unwrap().pinned, [old_id.clone()]);
+            let status = reader.runtime.collect_status_payload().unwrap();
+            assert_eq!(status.index.path, old_path.display().to_string());
+            assert_eq!(sealed_inventory(&old_path), before);
+            assert_ne!(store.active(&cx).unwrap().unwrap().id(), old_id);
+            drop(reader);
+            assert_eq!(store.collect_retained(&cx, 0).unwrap().removed, [old_id]);
         });
     }
 
