@@ -268,7 +268,8 @@ fn warm_serve_flushes_initial_before_quality_and_survives_bad_requests() {
             "quit\n",
             "{\"id\":\"never\",\"query\":\"must not run\"}\n"
         ));
-        serve::run(&index, &cx, &mut input, &mut output, (Mode::Full, 2))
+        let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
+        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false)
             .await
             .unwrap();
         assert_eq!(output.initial_flushes, 2);
@@ -343,7 +344,8 @@ fn warm_serve_retains_initial_on_quality_failure_and_runs_the_next_query() {
             "{\"id\":\"second\",\"query\":\"retry network\"}\n"
         ));
         let mut output = Vec::new();
-        serve::run(&index, &cx, &mut input, &mut output, (Mode::Full, 2)).await.unwrap();
+        let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
+        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false).await.unwrap();
         let frames = output_frames(&output);
         let first = frames.iter().filter(|frame| frame["id"] == "first").collect::<Vec<_>>();
         assert_eq!(first[1]["phase"], "initial");
@@ -505,3 +507,6 @@ fn failed_and_cancelled_updates_do_not_modify_the_selected_predecessor() {
         assert!(reopened.vectors().document("new").is_none());
     });
 }
+
+#[path = "activation_tests.rs"]
+mod activation_tests;

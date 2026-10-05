@@ -45,7 +45,8 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
          [--mode full|fast|quality] [--limit N] [--stream]\n\
-  serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\n\
+  serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
+         [--allow-activation]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
@@ -101,6 +102,7 @@ struct Options {
     fast_only: bool,
     exact: bool,
     stream: bool,
+    activation: serve::ActivationPermission,
 }
 
 impl Options {
@@ -133,6 +135,7 @@ impl Options {
             fast_only: false,
             exact: false,
             stream: false,
+            activation: serve::ActivationPermission::Disabled,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -146,6 +149,9 @@ impl Options {
                 "--fast-only" if command == Command::Index => options.fast_only = true,
                 "--exact" if command == Command::Index => options.exact = true,
                 "--stream" if command == Command::Search => options.stream = true,
+                "--allow-activation" if command == Command::Serve => {
+                    options.activation = serve::ActivationPermission::Enabled;
+                }
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
                 "--new-receipt" if command == Command::Update => {
                     options.new_receipt = Some(PathBuf::from(value(&mut args)?));
@@ -538,12 +544,14 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
             )?;
             let index = selection.open(cx, models).await?;
             if options.command == Command::Serve {
+                let live = serve::NativeLiveHybridIndex::new(cx, index)?;
                 return serve::run(
-                    &index,
+                    &live,
                     cx,
                     &mut io::stdin().lock(),
                     output,
                     (options.mode, options.limit),
+                    options.activation == serve::ActivationPermission::Enabled,
                 )
                 .await;
             }

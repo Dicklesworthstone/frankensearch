@@ -1,12 +1,30 @@
-//! Warm, sequential stdio serving of one explicitly selected native cohort.
+//! Warm stdio serving with explicit whole-cohort activation between requests.
 //! Every phase is flushed before the next phase is polled. No result cache,
 //! model reload, independent tier refresh, or detached request task is involved.
 
 use frankensearch::native_ann::{NativePhaseCandidates, NativeSearchPhase};
+pub(super) use frankensearch::native_ann::builder::live::NativeLiveHybridIndex;
 
 use super::*;
 
+#[path = "activation.rs"]
+mod activation;
+
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ActivationPermission {
+    Disabled,
+    Enabled,
+}
+
+// Unknown control fields cannot fall through into an unrestricted search.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Message {
+    Search(Request),
+    Control(activation::Request),
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,14 +38,19 @@ pub(super) struct Request {
 impl Request {
     fn validate(&self) -> Result<()> {
         validate_query(&self.query)?;
-        if self.id.as_ref().is_some_and(|id| id.len() > 256 || id.contains('\0')) {
-            return Err(bad("request id must be NUL-free and at most 256 bytes"));
-        }
+        validate_id(self.id.as_deref())?;
         if self.limit.is_some_and(|limit| limit == 0 || limit > 1_000) {
             return Err(bad("request limit must be between 1 and 1000"));
         }
         Ok(())
     }
+}
+
+fn validate_id(id: Option<&str>) -> Result<()> {
+    if id.is_some_and(|id| id.len() > 256 || id.contains('\0')) {
+        return Err(bad("request id must be NUL-free and at most 256 bytes"));
+    }
+    Ok(())
 }
 
 // A failed output write may already have exposed part of a frame. It must end
@@ -178,20 +201,25 @@ pub(super) async fn stream_one<W: Write>(
 }
 
 pub(super) async fn run<R: BufRead, W: Write>(
-    index: &NativeBuiltHybridIndex,
+    live: &NativeLiveHybridIndex,
     cx: &Cx,
     input: &mut R,
     output: &mut W,
     defaults: (Mode, usize),
+    allow_activation: bool,
 ) -> Result<()> {
     cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
+    let initial = live.snapshot(cx).await?;
+    let index = initial.index();
     emit(output, &serde_json::json!({
         "schema": SCHEMA, "event": "ready", "ok": true,
         "generation": index.vectors().fast().index().owner_witness().generation,
         "documents": index.vectors().documents().len(),
         "quality": index.vectors().quality().is_some(),
         "fast_native_hnsw": index.vectors().fast().graph_path().is_some(),
+        "activation_enabled": allow_activation,
     }))?;
+    drop(initial);
     let mut line = Vec::new();
     let mut ordinal = 0_u64;
     loop {
@@ -217,18 +245,31 @@ pub(super) async fn run<R: BufRead, W: Write>(
             return Ok(());
         }
         ordinal = ordinal.checked_add(1).ok_or_else(|| bad("request ordinal exhausted"))?;
-        let request: Request = match serde_json::from_slice(raw) {
+        let message: Message = match serde_json::from_slice(raw) {
             Ok(request) => request,
             Err(error) => {
+                let snapshot = live.snapshot(cx).await?;
                 emit(output, &serde_json::json!({
                     "schema": SCHEMA, "event": "terminal", "ok": false, "status": "failed",
                     "request": ordinal, "id": null, "seq": 0, "partial_results": false,
-                    "generation": index.vectors().fast().index().owner_witness().generation,
+                    "generation": snapshot.generation(),
                     "error": format!("invalid request ({:?} at column {})", error.classify(), error.column()),
                 }))?;
                 continue;
             }
         };
-        let _complete = stream_one(index, cx, &request, ordinal, defaults, output).await?;
+        match message {
+            Message::Search(request) => {
+                // Pin once, through Initial, quality, hydration and terminal
+                // delivery. Never resolve the serving selection between phases.
+                let snapshot = live.snapshot(cx).await?;
+                let _complete =
+                    stream_one(snapshot.index(), cx, &request, ordinal, defaults, output).await?;
+            }
+            Message::Control(request) => {
+                activation::execute(live, cx, &request, ordinal, allow_activation, output)
+                    .await?;
+            }
+        }
     }
 }
