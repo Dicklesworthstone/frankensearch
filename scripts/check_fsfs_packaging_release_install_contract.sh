@@ -935,11 +935,26 @@ GLIBC_STUB
   if [[ "$status" -ne 0 && "$output" == *"install.verify.glibc_too_old"* \
     && "$output" == *"needs glibc 2.99"* \
     && ( "$output" == *"install.sh --from-source"* || "$output" == *"source build cannot help"* ) \
+    && "$output" != *"install.sh --lite"* \
     && "$output" != *"install.verify.version_mismatch"* ]] \
     && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]]; then
     echo "[installer][OK]   a glibc-too-new binary is diagnosed and preserves the incumbent"
   else
     echo "[installer][FAIL] glibc loader failure status=$status output=$output"
+    FAILURES=$((FAILURES + 1))
+  fi
+  # The standard profile also points to the static lite build, which needs no
+  # glibc; a lite install is never told to install lite.
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --version v9.9.9 \
+    --artifact-url "$glibc_archive" --checksum "$glibc_digest" --dest "$dest" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"install.verify.glibc_too_old"* \
+    && "$output" == *"install.sh --lite"* ]] \
+    && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]]; then
+    echo "[installer][OK]   a standard install below the glibc floor is pointed to --lite"
+  else
+    echo "[installer][FAIL] standard glibc loader failure status=$status output=$output"
     FAILURES=$((FAILURES + 1))
   fi
 

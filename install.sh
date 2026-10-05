@@ -585,6 +585,10 @@ verify_staged_binary() {
     else
       err "  A source build cannot help either: the bundled ONNX Runtime needs glibc 2.38 or newer (GH #62)."
     fi
+    # Lite is static MUSL and needs no glibc; it searches by keyword only.
+    if [ "$LITE" -eq 0 ]; then
+      err "  Or install the keyword-only lite build, which runs on any Linux: install.sh --lite"
+    fi
     return 1
   fi
   err "install.verify.version_mismatch: candidate must report ${BINARY_NAME} ${VERSION#v}. The existing fsfs installation was not replaced."

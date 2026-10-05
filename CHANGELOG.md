@@ -121,6 +121,7 @@ record their original qualification boundary.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [fsfs 1.12.2](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.2) | GitHub and crates.io publication (fsfs only) | 2026-10-05 | Lite builds index, watch and search by keyword; GNU binary built for glibc 2.39; TUI resize crash fixed; no 2 s wait for an unbindable daemon socket; read-only complete-generation readers keep their generation (#60); embedder identity rechecked around inference (#55) |
 | [frankensearch 0.7.1](https://crates.io/crates/frankensearch/0.7.1) / [fsfs 1.12.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.1) | GitHub and crates.io publication | 2026-10-03 | Minor release of all 13 crates plus the fsfs binary, including the Darwin daemon socket repair: progressive warm-daemon streaming, complete-generation CLI with bounded retention, CJK keyword bigrams, MiniLM at 256 tokens, contiguous Quill docids, watch/delete/append fixes, installer profile/offline fixes |
 | frankensearch 0.6.1 | crates.io publication + `frankensearch-v0.6.1` git tag | 2026-09-19 | Native ANN over sealed source cohorts, progressive lazy reranking, optional Tantivy lexical arm, cancellation-safe embedding leases, NEON/x86 reranker bit parity, Windows publication leases |
 | [frankensearch 0.6.0](https://crates.io/api/v1/crates/frankensearch/0.6.0) | crates.io publication + [git tag](https://github.com/Dicklesworthstone/frankensearch/tree/frankensearch-v0.6.0) | 2026-09-12 | Ten library crates share one source; Asupersync 0.5, FrankenSQLite 0.4, caller-owned shadow execution; no corresponding GitHub Release |
@@ -329,11 +330,26 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
-## fsfs 1.12.2 — release preparation
+## fsfs 1.12.2 — 2026-10-05
 
+[fsfs v1.12.2](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.2)
+and [frankensearch-fsfs 1.12.2](https://crates.io/crates/frankensearch-fsfs/1.12.2)
+are published from
+[`3bfb3754`](https://github.com/Dicklesworthstone/frankensearch/commit/3bfb37541a141d511e15a8f8ec56e306a6983233).
 These changes landed after the 2026-10-03 publication of fsfs 1.12.1 and the
 0.7.1 crates. Only `frankensearch-fsfs` changed, so 1.12.2 is an fsfs-only
 release; every library crate is unchanged from its 0.7.1-line version.
+
+The six binaries were built from that commit: GNU x86-64 inside Ubuntu 24.04
+(glibc floor 2.39), lite MUSL x86-64 and ARM64 with zig, and the three Darwin
+builds on Apple Silicon, where `cargo check --workspace --all-targets` also
+passed. Before publication, the release binaries ran a whole session (index,
+search, watch with an edit, delete, explain, status, doctor): the lite MUSL
+x86-64 and full GNU binaries natively, Darwin lite on ARM64 and under Rosetta,
+and lite ARM64 MUSL through QEMU. Search on an index written by 1.12.1 worked
+at once; the first `fsfs index` after upgrading re-embeds every file, because
+reuse evidence is bound to the binary that produced it. Assets carry SHA-256
+sidecars, build metadata and minisign signatures (verify with `minisign.pub`).
 
 - **The lite build can index and search (bd-636yz).** Every model-free lite
   binary through 1.12.1 (the musl and Intel macOS assets, `install.sh
@@ -398,7 +414,9 @@ release; every library crate is unchanged from its 0.7.1-line version.
   required and installed glibc versions. On glibc 2.38 or newer it suggests
   `install.sh --from-source`; below 2.38 it says a source build cannot help
   either, because the bundled ONNX Runtime archive itself needs glibc 2.38.
-  The existing installation is still left in place. Checked on Ubuntu 22.04
+  A standard install also points to `install.sh --lite`, the static build,
+  which needs no glibc and now works. The existing installation is still
+  left in place. Checked on Ubuntu 22.04
   (glibc 2.35) with the v1.10.0 standard archive.
 
 - **fsfs refuses an embedder whose identity changes during inference

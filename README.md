@@ -47,10 +47,12 @@ the pinned ONNX Runtime has no supported x86_64 Darwin distribution, so
 ordinary semantic installation fails with `unsupported_platform` and points to
 `--lite` instead of attempting a source build that cannot succeed.
 
-The fsfs 1.12.1 Linux x86-64 full archive requires glibc 2.43 or newer.
-Releases built with `scripts/build_fsfs_gnu_full_release.sh` (inside Ubuntu
-24.04) require glibc 2.39. A source build works from glibc 2.38, the floor of
-the bundled ONNX Runtime archive; older systems have no semantic build yet
+The Linux x86-64 full archive requires glibc 2.39 or newer (Ubuntu 24.04 and
+later) from fsfs 1.12.2, which is built inside Ubuntu 24.04 by
+`scripts/build_fsfs_gnu_full_release.sh`; 1.10.0 through 1.12.1 required 2.43.
+A source build works from glibc 2.38, the floor of the bundled ONNX Runtime
+archive; older systems have no semantic build yet and the installer points
+them to `--lite`
 ([#62](https://github.com/Dicklesworthstone/frankensearch/issues/62)). The standard installer
 provisions and verifies the two default search models, Potion and MiniLM,
 requiring roughly 621 MB. Install optional models separately with
