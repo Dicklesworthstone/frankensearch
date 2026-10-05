@@ -345,6 +345,13 @@ These changes landed after the 2026-10-05 publication of fsfs 1.12.2.
   overlong runtime directory, a lite search took 0.15 s and then 0.07 s
   through the daemon at `$TMPDIR/fsfs-1000`.
 
+- **FrankenTUI 0.9 ([#61](https://github.com/Dicklesworthstone/frankensearch/issues/61)).**
+  The nine `ftui-*` crates move from 0.7 to 0.9. 0.9 removed
+  `Backend::presenter`; since 1.12.2 every terminal UI already owns its
+  `ftui_render` presenter, so no source change was needed for the move.
+  `frankensearch-tui` exposes ftui key and modifier types in its public API,
+  so it becomes 0.4.0; ops and fsfs take a version bump at their next release.
+
 ---
 
 ## fsfs 1.12.2 — 2026-10-05
