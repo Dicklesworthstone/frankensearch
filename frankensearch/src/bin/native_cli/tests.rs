@@ -153,7 +153,7 @@ fn native_and_exact_builds_reopen_both_tiers_without_reembedding() {
             assert_eq!(index.vectors().fast().graph_path().is_some(), !exact);
             assert_eq!(index.vectors().quality().unwrap().graph_path().is_some(), !exact);
             save_selection(&selection, &receipt_path).unwrap();
-            let expected = search(&index, &cx, "retry network", Mode::Full, 2).await.unwrap();
+            let expected = search(&index, &cx, "retry network", Mode::Full, 2, [None, None]).await.unwrap();
             assert_eq!(expected["phase"], "refined");
             assert_eq!(expected["results"][0]["doc_id"], "retry.rs");
             drop(index);
@@ -163,13 +163,13 @@ fn native_and_exact_builds_reopen_both_tiers_without_reembedding() {
             assert_eq!(fast_calls.load(Ordering::Relaxed), counts.0);
             assert_eq!(quality_calls.load(Ordering::Relaxed), counts.1);
             assert_eq!(reopened.vectors().document("retry.rs").unwrap().metadata["language"], "rust");
-            let actual = search(&reopened, &cx, "retry network", Mode::Full, 2).await.unwrap();
+            let actual = search(&reopened, &cx, "retry network", Mode::Full, 2, [None, None]).await.unwrap();
             assert_eq!(actual, expected);
             let fast_before = fast_calls.load(Ordering::Relaxed);
-            search(&reopened, &cx, "retry network", Mode::Quality, 2).await.unwrap();
+            search(&reopened, &cx, "retry network", Mode::Quality, 2, [None, None]).await.unwrap();
             assert_eq!(fast_calls.load(Ordering::Relaxed), fast_before);
             let quality_before = quality_calls.load(Ordering::Relaxed);
-            search(&reopened, &cx, "retry network", Mode::Fast, 2).await.unwrap();
+            search(&reopened, &cx, "retry network", Mode::Fast, 2, [None, None]).await.unwrap();
             assert_eq!(quality_calls.load(Ordering::Relaxed), quality_before);
             assert!(new_path(&directory).is_err());
             assert!(save_selection(&selection, &receipt_path).is_err());
@@ -192,8 +192,8 @@ fn fast_only_reopen_refuses_quality_queries_and_cancelled_builds_leave_no_destin
             .await
             .unwrap();
         assert!(selection.quality_producer.is_none());
-        assert_eq!(search(&index, &cx, "retry", Mode::Full, 2).await.unwrap()["phase"], "initial");
-        assert!(search(&index, &cx, "retry", Mode::Quality, 2).await.is_err());
+        assert_eq!(search(&index, &cx, "retry", Mode::Full, 2, [None, None]).await.unwrap()["phase"], "initial");
+        assert!(search(&index, &cx, "retry", Mode::Quality, 2, [None, None]).await.is_err());
         drop(index);
         assert!(selection.open(&cx, providers.clone()).await.is_ok());
         let cancelled = temporary.path().join("cancelled");
@@ -269,7 +269,7 @@ fn warm_serve_flushes_initial_before_quality_and_survives_bad_requests() {
             "{\"id\":\"never\",\"query\":\"must not run\"}\n"
         ));
         let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
-        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false)
+        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None)
             .await
             .unwrap();
         assert_eq!(output.initial_flushes, 2);
@@ -345,7 +345,7 @@ fn warm_serve_retains_initial_on_quality_failure_and_runs_the_next_query() {
         ));
         let mut output = Vec::new();
         let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
-        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false).await.unwrap();
+        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None).await.unwrap();
         let frames = output_frames(&output);
         let first = frames.iter().filter(|frame| frame["id"] == "first").collect::<Vec<_>>();
         assert_eq!(first[1]["phase"], "initial");
@@ -386,10 +386,10 @@ fn broken_initial_delivery_stops_before_quality_inference() {
             .unwrap();
         let before = (fast_calls.load(Ordering::Relaxed), quality_calls.load(Ordering::Relaxed));
         let request = serve::Request {
-            id: None, query: "retry".to_owned(), mode: None, limit: None,
+            id: None, query: "retry".to_owned(), mode: None, limit: None, filter: None,
         };
         let mut output = ClosedOutput { writes: 0 };
-        assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output)
+        assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output, None)
             .await.is_err());
         assert_eq!(output.writes, 2, "no terminal write after failed delivery");
         assert_eq!(fast_calls.load(Ordering::Relaxed), before.0 + 1);
@@ -510,3 +510,6 @@ fn failed_and_cancelled_updates_do_not_modify_the_selected_predecessor() {
 
 #[path = "activation_tests.rs"]
 mod activation_tests;
+
+#[path = "filter_tests.rs"]
+mod filter_tests;

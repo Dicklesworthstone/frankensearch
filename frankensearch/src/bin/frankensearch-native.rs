@@ -27,6 +27,9 @@ mod serve;
 #[path = "native_cli/update.rs"]
 mod update;
 
+#[path = "native_cli/filter.rs"]
+mod filter;
+
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
 mod tests;
@@ -44,9 +47,9 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
-         [--mode full|fast|quality] [--limit N] [--stream]\n\
+         [--mode full|fast|quality] [--limit N] [--stream] [--filter JSON]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
-         [--allow-activation]\n\n\
+         [--allow-activation] [--filter JSON]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
@@ -103,6 +106,7 @@ struct Options {
     exact: bool,
     stream: bool,
     activation: serve::ActivationPermission,
+    filter: Option<filter::Filter>,
 }
 
 impl Options {
@@ -136,6 +140,7 @@ impl Options {
             exact: false,
             stream: false,
             activation: serve::ActivationPermission::Disabled,
+            filter: None,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -172,6 +177,9 @@ impl Options {
                 }
                 "--limit" if matches!(command, Command::Search | Command::Serve) => {
                     options.limit = positive(&value(&mut args)?, 1_000)?;
+                }
+                "--filter" if matches!(command, Command::Search | Command::Serve) => {
+                    options.filter = Some(filter::Filter::parse(&value(&mut args)?)?);
                 }
                 _ => return Err(bad("unknown or inapplicable option; use --help")),
             }
@@ -492,21 +500,10 @@ async fn search(
     query: &str,
     mode: Mode,
     limit: usize,
+    filters: filter::Filters<'_>,
 ) -> Result<serde_json::Value> {
     validate_query(query)?;
-    let (phase, results) = match mode {
-        Mode::Fast => ("initial", index.search(cx, query, limit).await?),
-        Mode::Quality => ("quality", index.search_quality(cx, query, limit).await?),
-        Mode::Full if index.vectors().quality().is_none() => {
-            ("initial", index.search(cx, query, limit).await?)
-        }
-        Mode::Full => ("refined", index.search_refined(cx, query, limit).await?),
-    };
-    Ok(serde_json::json!({
-        "schema": SCHEMA, "ok": true, "event": "results", "phase": phase,
-        "generation": index.vectors().fast().index().owner_witness().generation,
-        "results": results,
-    }))
+    filter::Query::prepare(index, cx, filters)?.search(cx, query, mode, limit).await
 }
 
 async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<()> {
@@ -552,6 +549,7 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                     output,
                     (options.mode, options.limit),
                     options.activation == serve::ActivationPermission::Enabled,
+                    options.filter.as_ref(),
                 )
                 .await;
             }
@@ -561,6 +559,7 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                     query: options.query.ok_or_else(|| bad("missing query"))?,
                     mode: Some(options.mode),
                     limit: Some(options.limit),
+                    filter: options.filter,
                 };
                 return if serve::stream_one(
                     &index,
@@ -569,6 +568,7 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                     1,
                     (options.mode, options.limit),
                     output,
+                    None,
                 )
                 .await?
                 {
@@ -583,6 +583,7 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                 options.query.as_deref().ok_or_else(|| bad("missing query"))?,
                 options.mode,
                 options.limit,
+                [None, options.filter.as_ref()],
             )
             .await?;
             emit(output, &page)

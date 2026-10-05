@@ -33,12 +33,16 @@ pub(super) struct Request {
     pub(super) query: String,
     pub(super) mode: Option<Mode>,
     pub(super) limit: Option<usize>,
+    pub(super) filter: Option<filter::Filter>,
 }
 
 impl Request {
     fn validate(&self) -> Result<()> {
         validate_query(&self.query)?;
         validate_id(self.id.as_deref())?;
+        if let Some(filter) = &self.filter {
+            filter.validate()?;
+        }
         if self.limit.is_some_and(|limit| limit == 0 || limit > 1_000) {
             return Err(bad("request limit must be between 1 and 1000"));
         }
@@ -89,19 +93,23 @@ async fn phases<W: Write>(
     mode: Mode,
     limit: usize,
     frames: &mut Frames<'_, W>,
+    filters: filter::Filters<'_>,
 ) -> std::result::Result<bool, Failure> {
-    frames.send(serde_json::json!({
+    let scoped = filter::Query::prepare(index, cx, filters).map_err(Failure::Query)?;
+    let mut started = serde_json::json!({
         "event": "started", "ok": true, "mode": mode, "limit": limit,
-    })).map_err(Failure::Delivery)?;
+    });
+    scoped.annotate(&mut started);
+    frames.send(started).map_err(Failure::Delivery)?;
     if mode != Mode::Full {
-        let payload = search(index, cx, &request.query, mode, limit)
+        let payload = scoped.search(cx, &request.query, mode, limit)
             .await
             .map_err(Failure::Query)?;
         frames.send(payload).map_err(Failure::Delivery)?;
         frames.partial = true;
         return Ok(false);
     }
-    let mut stream = index
+    let mut stream = scoped
         .progressive(cx, &request.query, limit)
         .map_err(|error| Failure::Query(error.into()))?;
     let mut degraded = false;
@@ -110,7 +118,7 @@ async fn phases<W: Write>(
         .await
         .map_err(|error| Failure::Query(error.into()))?
     {
-        let payload = match phase {
+        let mut payload = match phase {
             NativeSearchPhase::Initial { results, candidates } => {
                 result_frame("initial", results, candidates)
             }
@@ -137,6 +145,7 @@ async fn phases<W: Write>(
                 })
             }
         };
+        scoped.annotate(&mut payload);
         frames.send(payload).map_err(Failure::Delivery)?;
         frames.partial = true;
     }
@@ -165,6 +174,7 @@ pub(super) async fn stream_one<W: Write>(
     ordinal: u64,
     defaults: (Mode, usize),
     output: &mut W,
+    base_filter: Option<&filter::Filter>,
 ) -> Result<bool> {
     let mut frames = Frames {
         output,
@@ -177,7 +187,8 @@ pub(super) async fn stream_one<W: Write>(
     let mode = request.mode.unwrap_or(defaults.0);
     let limit = request.limit.unwrap_or(defaults.1);
     let result = match request.validate() {
-        Ok(()) => phases(index, cx, request, mode, limit, &mut frames).await,
+        Ok(()) => phases(index, cx, request, mode, limit, &mut frames,
+            [base_filter, request.filter.as_ref()]).await,
         Err(error) => Err(Failure::Query(error)),
     };
     match result {
@@ -207,8 +218,12 @@ pub(super) async fn run<R: BufRead, W: Write>(
     output: &mut W,
     defaults: (Mode, usize),
     allow_activation: bool,
+    base_filter: Option<&filter::Filter>,
 ) -> Result<()> {
     cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
+    if let Some(filter) = base_filter {
+        filter.validate()?;
+    }
     let initial = live.snapshot(cx).await?;
     let index = initial.index();
     emit(output, &serde_json::json!({
@@ -218,6 +233,7 @@ pub(super) async fn run<R: BufRead, W: Write>(
         "quality": index.vectors().quality().is_some(),
         "fast_native_hnsw": index.vectors().fast().graph_path().is_some(),
         "activation_enabled": allow_activation,
+        "default_filter_applied": base_filter.is_some(),
     }))?;
     drop(initial);
     let mut line = Vec::new();
@@ -264,7 +280,7 @@ pub(super) async fn run<R: BufRead, W: Write>(
                 // delivery. Never resolve the serving selection between phases.
                 let snapshot = live.snapshot(cx).await?;
                 let _complete =
-                    stream_one(snapshot.index(), cx, &request, ordinal, defaults, output).await?;
+                    stream_one(snapshot.index(), cx, &request, ordinal, defaults, output, base_filter).await?;
             }
             Message::Control(request) => {
                 activation::execute(live, cx, &request, ordinal, allow_activation, output)

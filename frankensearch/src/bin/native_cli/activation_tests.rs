@@ -87,7 +87,7 @@ fn activation_switches_every_query_arm_without_running_models_or_mutating_receip
                 bytes: Vec::new(), quality_calls: Arc::clone(&f.quality_calls),
                 before_quality: before.1, initial_flushes: 0,
             };
-            serve::run(&f.live, &cx, &mut queries, &mut output, (Mode::Full, 10), true)
+            serve::run(&f.live, &cx, &mut queries, &mut output, (Mode::Full, 10), true, None)
                 .await.unwrap();
             assert_eq!(counts(&f), (before.0 + 2, before.1 + 2));
             assert_eq!(output.initial_flushes, 2);
@@ -135,7 +135,7 @@ fn disabled_stale_malformed_and_damaged_activations_leave_the_old_cohort_queryab
         let mut disabled = activate(&f);
         disabled["receipt"] = serde_json::json!(root.path().join("not-present"));
         let mut output = Vec::new();
-        serve::run(&f.live, &cx, &mut input(&[disabled]), &mut output, (Mode::Full, 10), false)
+        serve::run(&f.live, &cx, &mut input(&[disabled]), &mut output, (Mode::Full, 10), false, None)
             .await.unwrap();
         assert!(output_frames(&output)[1]["error"].as_str().unwrap().contains("disabled"));
         for fault in ["count", "identity", "producer", "quality", "snapshot"] {
@@ -153,7 +153,7 @@ fn disabled_stale_malformed_and_damaged_activations_leave_the_old_cohort_queryab
             let mut request = activate(&f);
             request["receipt"] = serde_json::json!(path);
             output.clear();
-            serve::run(&f.live, &cx, &mut input(&[request]), &mut output, (Mode::Full, 10), true)
+            serve::run(&f.live, &cx, &mut input(&[request]), &mut output, (Mode::Full, 10), true, None)
                 .await.unwrap();
             let frames = output_frames(&output);
             assert_eq!(frames.len(), 2, "{fault}");
@@ -173,7 +173,7 @@ fn disabled_stale_malformed_and_damaged_activations_leave_the_old_cohort_queryab
             serde_json::json!({"op":"activate", "query":"must not become a search"}),
             serde_json::json!({"op":"status", "unknown":true}),
             activate(&f), activate(&f),
-        ]), &mut output, (Mode::Full, 10), true).await.unwrap();
+        ]), &mut output, (Mode::Full, 10), true, None).await.unwrap();
         let frames = output_frames(&output);
         assert!(frames[1]["error"].as_str().unwrap().contains("expected_generation"));
         assert!(frames[2]["error"].as_str().unwrap().contains("strictly newer"));
@@ -193,7 +193,7 @@ fn pending_progressive_query_retains_old_rows_after_successor_activation() {
         let old = f.live.snapshot(&cx).await.unwrap();
         let mut stream = old.index().progressive(&cx, "garden retry", 10).unwrap();
         assert!(matches!(stream.next_phase().await.unwrap(), Some(NativeSearchPhase::Initial { .. })));
-        serve::run(&f.live, &cx, &mut input(&[activate(&f)]), &mut Vec::new(), (Mode::Full, 10), true)
+        serve::run(&f.live, &cx, &mut input(&[activate(&f)]), &mut Vec::new(), (Mode::Full, 10), true, None)
             .await.unwrap();
         let Some(NativeSearchPhase::Refined { results, .. }) = stream.next_phase().await.unwrap() else {
             panic!("original query must refine"); // ubs:ignore — test assertion.
@@ -225,7 +225,7 @@ fn failed_activation_acknowledgement_stops_session_without_rollback() {
         let mut output = BrokenAck(0);
         assert!(serve::run(&f.live, &cx, &mut input(&[
             activate(&f), serde_json::json!({"query":"must not run"}),
-        ]), &mut output, (Mode::Full, 10), true).await.is_err());
+        ]), &mut output, (Mode::Full, 10), true, None).await.is_err());
         assert_eq!(output.0, 2, "no error frame after a possibly partial acknowledgement");
         assert_eq!(counts(&f), before);
         assert_eq!(f.live.snapshot(&cx).await.unwrap().generation(), f.next.generation);
@@ -248,12 +248,12 @@ fn cancellation_before_control_dispatch_cannot_install_a_successor() {
         let f = fixture(&cx, root.path(), true).await;
         let before = counts(&f);
         let result = serve::run(&f.live, &cx, &mut input(&[activate(&f)]),
-            &mut CancelAtReady(&cx), (Mode::Full, 10), true).await;
+            &mut CancelAtReady(&cx), (Mode::Full, 10), true, None).await;
         cx.set_cancel_requested(false);
         assert!(result.is_err());
         assert_eq!(f.live.snapshot(&cx).await.unwrap().generation(), f.old.generation);
         assert_eq!(counts(&f), before);
-        serve::run(&f.live, &cx, &mut input(&[activate(&f)]), &mut Vec::new(), (Mode::Full, 10), true)
+        serve::run(&f.live, &cx, &mut input(&[activate(&f)]), &mut Vec::new(), (Mode::Full, 10), true, None)
             .await.unwrap();
         assert_eq!(f.live.snapshot(&cx).await.unwrap().generation(), f.next.generation);
     });
