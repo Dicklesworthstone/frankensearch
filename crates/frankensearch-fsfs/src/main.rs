@@ -275,6 +275,7 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     if runtime_cli_input.watch {
         resolved_config.indexing.watch_mode = true;
     }
+    let resolved_offline = resolved_config.indexing.offline;
     let cli_quiet = runtime_cli_input.quiet;
     let app_runtime = FsfsRuntime::new(resolved_config)
         .with_cli_input(runtime_cli_input)
@@ -319,7 +320,10 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     // ── Startup version check (non-blocking) ──────────────────────────
     // Print a one-line update notice from cache. If the cache is expired
     // or missing, spawn a background thread to refresh it for next time.
-    // Disabled when FRANKENSEARCH_CHECK_UPDATES=0 or in quiet mode.
+    // Disabled when FRANKENSEARCH_CHECK_UPDATES=0 or in quiet mode. The
+    // refresh is an implicit request to the release host, so the resolved
+    // offline policy (`indexing.offline`, FRANKENSEARCH_OFFLINE, --offline)
+    // suppresses it; the cached notice may still print.
     let updates_disabled = env_map
         .get("FRANKENSEARCH_CHECK_UPDATES")
         .or_else(|| env_map.get("FSFS_CHECK_UPDATES"))
@@ -330,9 +334,10 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     if !updates_disabled && !cli_quiet && command != CliCommand::Update {
         let _ = maybe_print_update_notice(false);
         // If cache is expired or missing, refresh in background.
-        let needs_refresh = read_version_cache()
-            .as_ref()
-            .is_none_or(|c| !is_cache_valid(c));
+        let needs_refresh = !resolved_offline
+            && read_version_cache()
+                .as_ref()
+                .is_none_or(|c| !is_cache_valid(c));
         if needs_refresh {
             spawn_version_cache_refresh();
         }
