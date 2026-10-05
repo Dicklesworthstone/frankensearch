@@ -141,7 +141,26 @@ impl NativeSearchDeadline {
         }
     }
 
-    async fn run<T>(
+    /// Run caller-owned search work against this unchanged absolute deadline.
+    ///
+    /// This also covers primary-tier searches, scope preparation, and individual
+    /// progressive phase requests. Reuse the SAME deadline across phases; making
+    /// a new deadline would reset the query budget. No query or provider is
+    /// reconstructed, spawned, retried, or detached. A timed-out pending future
+    /// is dropped, and cancellation retains its original error classification.
+    /// Work already performed is not rolled back; use this for read-only query
+    /// work, not publication or output whose effects may already be visible.
+    ///
+    /// A caller driving phases owns previously delivered results and must stop
+    /// the phase sequence after an error. Prefer `progressive_before` when its
+    /// standard failure-page protocol fits the consumer. Delays between calls
+    /// consume the original budget. A synchronous poll cannot be preempted, but
+    /// its late completion is refused before it is returned to the caller.
+    ///
+    /// # Errors
+    /// Returns the original search error, cancellation, or `SearchTimeout`.
+    /// Expired work is never polled; the supplied timer must remain serviced.
+    pub async fn run<T>(
         &self,
         cx: &Cx,
         future: impl Future<Output = SearchResult<T>>,

@@ -306,3 +306,29 @@ cancellation before dispatch, and failed acknowledgement without rollback.
 Scope regressions cover selective pages in all query modes, empty scopes without
 inference, conjunctive metadata/ID restrictions, invalid-filter refusal, immutable
 server restrictions, and membership changes after live activation.
+
+## End-to-end query deadlines
+
+`search --timeout-ms N` and `serve --timeout-ms N` set a total query budget,
+from 1 to 600000 milliseconds. No option preserves unbounded retrieval. A
+server request may supply `timeout_ms`, but its effective budget is the minimum
+of that value and the server ceiling. Omitting or nulling it cannot disable the
+server ceiling; zero and out-of-range values are rejected.
+
+The same absolute deadline covers scope preparation, fast/quality retrieval,
+hydration, and all requested progressive phases. It starts after startup model
+and selected-index admission, not while loading a cold process or waiting on
+stdin. Time spent delivering an intermediate page consumes the remaining query
+budget. Expired work is not restarted on a new budget or a new generation.
+
+A timeout is reported as `status: "timed_out"`, `code: "search_timeout"`, with
+`elapsed_ms` and `budget_ms`. A stream that already delivered a page reports
+`partial_results: true`; that page remains valid and no late replacement page
+is emitted. The server can process its next query without reloading models or
+cancelling the shared context. Buffered search returns an error rather than
+claiming a partial page satisfied the requested query.
+
+Deadlines use the caller-owned asupersync timer. They drop pending cooperative
+work and reject late synchronous completion, but cannot preempt a synchronous
+model/graph call, a blocked stdin read, or output. Output/activation are never
+wrapped in a timeout that could falsely claim visible effects were undone.

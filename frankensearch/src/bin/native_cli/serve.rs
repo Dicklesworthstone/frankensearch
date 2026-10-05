@@ -34,12 +34,14 @@ pub(super) struct Request {
     pub(super) mode: Option<Mode>,
     pub(super) limit: Option<usize>,
     pub(super) filter: Option<filter::Filter>,
+    pub(super) timeout_ms: Option<u64>,
 }
 
 impl Request {
     fn validate(&self) -> Result<()> {
         validate_query(&self.query)?;
         validate_id(self.id.as_deref())?;
+        query::validate_timeout(self.timeout_ms)?;
         if let Some(filter) = &self.filter {
             filter.validate()?;
         }
@@ -86,6 +88,7 @@ impl<W: Write> Frames<'_, W> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn phases<W: Write>(
     index: &NativeBuiltHybridIndex,
     cx: &Cx,
@@ -94,15 +97,18 @@ async fn phases<W: Write>(
     limit: usize,
     frames: &mut Frames<'_, W>,
     filters: filter::Filters<'_>,
+    deadline: Option<&frankensearch::native_ann::builder::deadline::NativeSearchDeadline>,
 ) -> std::result::Result<bool, Failure> {
-    let scoped = filter::Query::prepare(index, cx, filters).map_err(Failure::Query)?;
+    let scoped = query::within(cx, deadline, async {
+        filter::Query::prepare(index, cx, filters)
+    }).await.map_err(Failure::Query)?;
     let mut started = serde_json::json!({
         "event": "started", "ok": true, "mode": mode, "limit": limit,
     });
     scoped.annotate(&mut started);
     frames.send(started).map_err(Failure::Delivery)?;
     if mode != Mode::Full {
-        let payload = scoped.search(cx, &request.query, mode, limit)
+        let payload = query::within(cx, deadline, scoped.search(cx, &request.query, mode, limit))
             .await
             .map_err(Failure::Query)?;
         frames.send(payload).map_err(Failure::Delivery)?;
@@ -113,11 +119,13 @@ async fn phases<W: Write>(
         .progressive(cx, &request.query, limit)
         .map_err(|error| Failure::Query(error.into()))?;
     let mut degraded = false;
-    while let Some(phase) = stream
-        .next_phase()
-        .await
-        .map_err(|error| Failure::Query(error.into()))?
-    {
+    while !stream.is_finished() {
+        // One deadline, not a renewed timeout per phase. Do not time output:
+        // delivery may already be visible and must never be reported undone.
+        let phase = query::within(cx, deadline, async {
+            stream.next_phase().await.map_err(Into::into)
+        }).await.map_err(Failure::Query)?;
+        let Some(phase) = phase else { break; };
         let mut payload = match phase {
             NativeSearchPhase::Initial { results, candidates } => {
                 result_frame("initial", results, candidates)
@@ -167,6 +175,7 @@ fn result_frame(
 
 /// Returns false for a failed/degraded request that was fully reported. Output
 /// failure returns Err and must stop the process, even when more input exists.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn stream_one<W: Write>(
     index: &NativeBuiltHybridIndex,
     cx: &Cx,
@@ -175,6 +184,7 @@ pub(super) async fn stream_one<W: Write>(
     defaults: (Mode, usize),
     output: &mut W,
     base_filter: Option<&filter::Filter>,
+    policy: &query::Policy,
 ) -> Result<bool> {
     let mut frames = Frames {
         output,
@@ -186,11 +196,12 @@ pub(super) async fn stream_one<W: Write>(
     };
     let mode = request.mode.unwrap_or(defaults.0);
     let limit = request.limit.unwrap_or(defaults.1);
-    let result = match request.validate() {
-        Ok(()) => phases(index, cx, request, mode, limit, &mut frames,
-            [base_filter, request.filter.as_ref()]).await,
-        Err(error) => Err(Failure::Query(error)),
-    };
+    let result = async {
+        request.validate().map_err(Failure::Query)?;
+        let deadline = policy.start(cx, request.timeout_ms).map_err(Failure::Query)?;
+        phases(index, cx, request, mode, limit, &mut frames,
+            [base_filter, request.filter.as_ref()], deadline.as_ref()).await
+    }.await;
     match result {
         Ok(degraded) => {
             frames.send(serde_json::json!({
@@ -201,16 +212,18 @@ pub(super) async fn stream_one<W: Write>(
             Ok(!degraded)
         }
         Err(Failure::Query(error)) => {
-            frames.send(serde_json::json!({
-                "event": "terminal", "ok": false, "status": "failed",
-                "partial_results": frames.partial, "error": error.to_string(),
-            }))?;
+            let mut terminal = query::failure(error.as_ref());
+            terminal["event"] = serde_json::json!("terminal");
+            terminal["ok"] = serde_json::json!(false);
+            terminal["partial_results"] = serde_json::json!(frames.partial);
+            frames.send(terminal)?;
             Ok(false)
         }
         Err(Failure::Delivery(error)) => Err(error),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run<R: BufRead, W: Write>(
     live: &NativeLiveHybridIndex,
     cx: &Cx,
@@ -219,6 +232,7 @@ pub(super) async fn run<R: BufRead, W: Write>(
     defaults: (Mode, usize),
     allow_activation: bool,
     base_filter: Option<&filter::Filter>,
+    policy: &query::Policy,
 ) -> Result<()> {
     cx.checkpoint().map_err(|_| bad("native serving cancelled"))?;
     if let Some(filter) = base_filter {
@@ -234,6 +248,7 @@ pub(super) async fn run<R: BufRead, W: Write>(
         "fast_native_hnsw": index.vectors().fast().graph_path().is_some(),
         "activation_enabled": allow_activation,
         "default_filter_applied": base_filter.is_some(),
+        "maximum_timeout_ms": policy.maximum_ms(),
     }))?;
     drop(initial);
     let mut line = Vec::new();
@@ -280,7 +295,7 @@ pub(super) async fn run<R: BufRead, W: Write>(
                 // delivery. Never resolve the serving selection between phases.
                 let snapshot = live.snapshot(cx).await?;
                 let _complete =
-                    stream_one(snapshot.index(), cx, &request, ordinal, defaults, output, base_filter).await?;
+                    stream_one(snapshot.index(), cx, &request, ordinal, defaults, output, base_filter, policy).await?;
             }
             Message::Control(request) => {
                 activation::execute(live, cx, &request, ordinal, allow_activation, output)

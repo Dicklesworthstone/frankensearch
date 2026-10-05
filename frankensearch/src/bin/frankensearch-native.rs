@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 #[path = "native_cli/serve.rs"]
 mod serve;
 
+#[path = "native_cli/query.rs"]
+mod query;
+
 #[path = "native_cli/update.rs"]
 mod update;
 
@@ -48,8 +51,9 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
          [--mode full|fast|quality] [--limit N] [--stream] [--filter JSON]\n\
+         [--timeout-ms N]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
-         [--allow-activation] [--filter JSON]\n\n\
+         [--allow-activation] [--filter JSON] [--timeout-ms N]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
@@ -107,6 +111,7 @@ struct Options {
     stream: bool,
     activation: serve::ActivationPermission,
     filter: Option<filter::Filter>,
+    timeout_ms: Option<u64>,
 }
 
 impl Options {
@@ -141,6 +146,7 @@ impl Options {
             stream: false,
             activation: serve::ActivationPermission::Disabled,
             filter: None,
+            timeout_ms: None,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -177,6 +183,12 @@ impl Options {
                 }
                 "--limit" if matches!(command, Command::Search | Command::Serve) => {
                     options.limit = positive(&value(&mut args)?, 1_000)?;
+                }
+                "--timeout-ms" if matches!(command, Command::Search | Command::Serve) => {
+                    let milliseconds = value(&mut args)?.parse::<u64>()
+                        .map_err(|_| bad("timeout must be an integer number of milliseconds"))?;
+                    query::validate_timeout(Some(milliseconds))?;
+                    options.timeout_ms = Some(milliseconds);
                 }
                 "--filter" if matches!(command, Command::Search | Command::Serve) => {
                     options.filter = Some(filter::Filter::parse(&value(&mut args)?)?);
@@ -540,6 +552,9 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                 selection.quality_producer.is_some(),
             )?;
             let index = selection.open(cx, models).await?;
+            // Index/model admission is startup work. Each accepted query starts
+            // its own total budget after that, before scoping or provider work.
+            let policy = query::Policy::new(cx, options.timeout_ms)?;
             if options.command == Command::Serve {
                 let live = serve::NativeLiveHybridIndex::new(cx, index)?;
                 return serve::run(
@@ -550,6 +565,7 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                     (options.mode, options.limit),
                     options.activation == serve::ActivationPermission::Enabled,
                     options.filter.as_ref(),
+                    &policy,
                 )
                 .await;
             }
@@ -560,6 +576,7 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                     mode: Some(options.mode),
                     limit: Some(options.limit),
                     filter: options.filter,
+                    timeout_ms: None,
                 };
                 return if serve::stream_one(
                     &index,
@@ -569,6 +586,7 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                     (options.mode, options.limit),
                     output,
                     None,
+                    &policy,
                 )
                 .await?
                 {
@@ -577,14 +595,15 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<(
                     Err(bad("search did not complete all requested phases; see terminal frame"))
                 };
             }
-            let page = search(
+            let deadline = policy.start(cx, None)?;
+            let page = query::within(cx, deadline.as_ref(), search(
                 &index,
                 cx,
                 options.query.as_deref().ok_or_else(|| bad("missing query"))?,
                 options.mode,
                 options.limit,
                 [None, options.filter.as_ref()],
-            )
+            ))
             .await?;
             emit(output, &page)
         }
@@ -659,11 +678,13 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            let mut payload = query::failure(error.as_ref());
+            payload["schema"] = serde_json::json!(SCHEMA);
+            payload["ok"] = serde_json::json!(false);
+            payload["event"] = serde_json::json!("error");
             let _ = emit(
                 &mut io::stderr().lock(),
-                &serde_json::json!({
-                    "schema": SCHEMA, "ok": false, "event": "error", "error": error.to_string(),
-                }),
+                &payload,
             );
             ExitCode::FAILURE
         }

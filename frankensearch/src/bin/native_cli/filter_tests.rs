@@ -53,9 +53,10 @@ fn selective_scope_fills_pages_before_fusion_in_fast_quality_and_progressive_rou
             let request = serve::Request {
                 id: None, query: "retry network".to_owned(), mode: None, limit: Some(2),
                 filter: Some(restricted),
+                timeout_ms: None,
             };
             let mut output = Vec::new();
-            assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output, None)
+            assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output, None, &query::Policy::default())
                 .await.unwrap());
             let frames = output_frames(&output);
             for frame in &frames {
@@ -96,9 +97,10 @@ fn empty_and_intersected_scopes_skip_inference_without_widening() {
             let request = serve::Request {
                 id: None, query: "retry".to_owned(), mode: None, limit: None,
                 filter: filters[1].cloned(),
+                timeout_ms: None,
             };
             let mut output = Vec::new();
-            assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 10), &mut output, filters[0])
+            assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 10), &mut output, filters[0], &query::Policy::default())
                 .await.unwrap());
             for frame in output_frames(&output) {
                 if let Some(results) = frame["results"].as_array() { assert!(results.is_empty()); }
@@ -143,7 +145,7 @@ fn server_default_scope_cannot_be_overridden_and_is_recomputed_after_activation(
         for message in messages { bytes.extend(encode(&message, MAX_OUTPUT_BYTES).unwrap()); }
         let before = (fast.load(Ordering::Relaxed), quality.load(Ordering::Relaxed));
         let mut output = Vec::new();
-        serve::run(&live, &cx, &mut Cursor::new(bytes), &mut output, (Mode::Full, 10), true, Some(&scope))
+        serve::run(&live, &cx, &mut Cursor::new(bytes), &mut output, (Mode::Full, 10), true, Some(&scope), &query::Policy::default())
             .await.unwrap();
         let frames = output_frames(&output);
         assert_eq!(frames[0]["default_filter_applied"], true);

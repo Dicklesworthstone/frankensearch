@@ -269,7 +269,7 @@ fn warm_serve_flushes_initial_before_quality_and_survives_bad_requests() {
             "{\"id\":\"never\",\"query\":\"must not run\"}\n"
         ));
         let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
-        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None)
+        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None, &query::Policy::default())
             .await
             .unwrap();
         assert_eq!(output.initial_flushes, 2);
@@ -345,7 +345,7 @@ fn warm_serve_retains_initial_on_quality_failure_and_runs_the_next_query() {
         ));
         let mut output = Vec::new();
         let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
-        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None).await.unwrap();
+        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None, &query::Policy::default()).await.unwrap();
         let frames = output_frames(&output);
         let first = frames.iter().filter(|frame| frame["id"] == "first").collect::<Vec<_>>();
         assert_eq!(first[1]["phase"], "initial");
@@ -386,10 +386,10 @@ fn broken_initial_delivery_stops_before_quality_inference() {
             .unwrap();
         let before = (fast_calls.load(Ordering::Relaxed), quality_calls.load(Ordering::Relaxed));
         let request = serve::Request {
-            id: None, query: "retry".to_owned(), mode: None, limit: None, filter: None,
+            id: None, query: "retry".to_owned(), mode: None, limit: None, filter: None, timeout_ms: None,
         };
         let mut output = ClosedOutput { writes: 0 };
-        assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output, None)
+        assert!(serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output, None, &query::Policy::default())
             .await.is_err());
         assert_eq!(output.writes, 2, "no terminal write after failed delivery");
         assert_eq!(fast_calls.load(Ordering::Relaxed), before.0 + 1);
@@ -513,3 +513,150 @@ mod activation_tests;
 
 #[path = "filter_tests.rs"]
 mod filter_tests;
+
+#[test]
+fn query_timeout_options_are_explicit_positive_and_search_only() {
+    assert_eq!(options(&["search", "--receipt", "r", "--query", "q", "--timeout-ms", "500"]).timeout_ms, Some(500));
+    assert_eq!(options(&["serve", "--receipt", "r", "--timeout-ms", "1000"]).timeout_ms, Some(1000));
+    for args in [
+        vec!["search", "--receipt", "r", "--query", "q", "--timeout-ms", "0"],
+        vec!["serve", "--receipt", "r", "--timeout-ms", "600001"],
+        vec!["index", "--receipt", "r", "--index-dir", "new", "--timeout-ms", "50"],
+    ] {
+        assert!(Options::parse(args.into_iter().map(str::to_owned)).is_err());
+    }
+}
+
+fn deadline_policy(milliseconds: u64) -> (Arc<asupersync::time::VirtualClock>, query::Policy) {
+    let clock = Arc::new(asupersync::time::VirtualClock::new());
+    let policy = query::Policy {
+        maximum_ms: Some(milliseconds),
+        timer: Some(asupersync::time::TimerDriverHandle::with_virtual_clock(Arc::clone(&clock))),
+    };
+    (clock, policy)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn bounded_buffered_search_keeps_all_modes_and_scopes_on_the_same_results() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+        let (models, fast, quality) = fixture_models(true);
+        let (index, _) = build(&cx, &options, &directory.path().join("index"), source(), models).await.unwrap();
+        let restriction = filter::Filter::parse(r#"{"ids":["retry.rs"]}"#).unwrap();
+        let (clock, policy) = deadline_policy(10);
+        for scope in [None, Some(&restriction)] {
+            for mode in [Mode::Fast, Mode::Quality, Mode::Full] {
+                let expected = search(&index, &cx, "retry", mode, 2, [None, scope]).await.unwrap();
+                let deadline = policy.start(&cx, None).unwrap();
+                let result = query::within(&cx, deadline.as_ref(),
+                    search(&index, &cx, "retry", mode, 2, [None, scope])).await.unwrap();
+                assert_eq!(result, expected);
+                let before = (fast.load(Ordering::SeqCst), quality.load(Ordering::SeqCst));
+                clock.advance(10_000_000);
+                let error = query::within(&cx, deadline.as_ref(),
+                    search(&index, &cx, "retry", mode, 2, [None, scope])).await.unwrap_err();
+                assert_eq!(query::failure(error.as_ref())["code"], "search_timeout");
+                assert_eq!((fast.load(Ordering::SeqCst), quality.load(Ordering::SeqCst)), before);
+            }
+        }
+        assert!(!cx.is_cancel_requested());
+    });
+}
+
+struct AdvancingQuality {
+    inner: Arc<dyn Embedder>,
+    clock: Arc<asupersync::time::VirtualClock>,
+    advance_once: Arc<AtomicUsize>,
+}
+
+impl Embedder for AdvancingQuality {
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { self.inner.identity() }
+    fn dimension(&self) -> usize { self.inner.dimension() }
+    fn id(&self) -> &str { self.inner.id() }
+    fn model_name(&self) -> &str { self.inner.model_name() }
+    fn is_semantic(&self) -> bool { self.inner.is_semantic() }
+    fn category(&self) -> ModelCategory { self.inner.category() }
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            let values = self.inner.embed(cx, text).await?;
+            self.clock.advance(self.advance_once.swap(0, Ordering::SeqCst) as u64);
+            Ok(values)
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn late_quality_preserves_initial_and_the_warm_server_accepts_the_next_request() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+        let (mut models, _, _) = fixture_models(true);
+        let (clock, policy) = deadline_policy(5);
+        let advance_once = Arc::new(AtomicUsize::new(0));
+        models.quality = Some(Arc::new(AdvancingQuality {
+            inner: models.quality.take().unwrap(), clock, advance_once: Arc::clone(&advance_once),
+        }));
+        let (index, selected) = build(&cx, &options, &directory.path().join("index"), source(), models).await.unwrap();
+        let live = serve::NativeLiveHybridIndex::new(&cx, index).unwrap();
+        advance_once.store(10_000_000, Ordering::SeqCst);
+        let mut input = Cursor::new(concat!(
+            "{\"id\":\"slow\",\"query\":\"retry\",\"timeout_ms\":1000,\"filter\":{\"ids\":[\"retry.rs\"]}}\n",
+            "{\"id\":\"next\",\"query\":\"retry\"}\n",
+        ));
+        let mut output = Vec::new();
+        serve::run(&live, &cx, &mut input, &mut output, (Mode::Full, 2), false, None, &policy).await.unwrap();
+        let frames = output_frames(&output);
+        let slow = frames.iter().filter(|f| f["id"] == "slow").collect::<Vec<_>>();
+        assert_eq!(slow.len(), 3, "no late Refined page");
+        assert_eq!(slow[1]["phase"], "initial");
+        assert_eq!(slow[1]["results"][0]["doc_id"], "retry.rs");
+        assert_eq!(slow[2]["status"], "timed_out");
+        assert_eq!(slow[2]["budget_ms"], 5, "request could not widen server ceiling");
+        assert_eq!(slow[2]["partial_results"], true);
+        let next = frames.iter().filter(|f| f["id"] == "next").collect::<Vec<_>>();
+        assert_eq!(next[2]["phase"], "refined");
+        assert_eq!(next[3]["status"], "complete");
+        assert_eq!(live.snapshot(&cx).await.unwrap().generation(), selected.generation);
+        assert!(!cx.is_cancel_requested());
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn time_spent_delivering_initial_cannot_grant_quality_a_new_budget() {
+    struct DelayedOutput {
+        bytes: Vec<u8>,
+        clock: Arc<asupersync::time::VirtualClock>,
+    }
+    impl Write for DelayedOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            if output_frames(&self.bytes).last().unwrap()["phase"] == "initial" {
+                self.clock.advance(10_000_000);
+            }
+            Ok(())
+        }
+    }
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+        let (models, _, quality) = fixture_models(true);
+        let (index, _) = build(&cx, &options, &directory.path().join("index"), source(), models).await.unwrap();
+        let quality_before = quality.load(Ordering::SeqCst);
+        let (clock, policy) = deadline_policy(10);
+        let mut output = DelayedOutput { bytes: Vec::new(), clock };
+        let request: serve::Request = serde_json::from_str(r#"{"query":"retry"}"#).unwrap();
+        assert!(!serve::stream_one(&index, &cx, &request, 1, (Mode::Full, 2), &mut output, None, &policy).await.unwrap());
+        assert_eq!(quality.load(Ordering::SeqCst), quality_before);
+        let frames = output_frames(&output.bytes);
+        assert_eq!(frames[1]["phase"], "initial");
+        assert_eq!(frames[2]["status"], "timed_out");
+        assert_eq!(frames[2]["partial_results"], true);
+    });
+}
