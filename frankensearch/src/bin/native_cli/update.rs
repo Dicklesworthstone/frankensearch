@@ -3,6 +3,8 @@
 
 use std::collections::BTreeMap;
 
+use frankensearch::native_ann::builder::NativeHybridReopenLimits;
+
 use super::*;
 
 type Edits = BTreeMap<String, Option<IndexableDocument>>;
@@ -165,3 +167,132 @@ pub(super) async fn execute(cx: &Cx, options: &Options, output: &mut impl Write)
         "receipt": receipt, "selection": selection,
     }))
 }
+
+/// Rebuild every search artifact from the authenticated retained source stream.
+/// This is deliberately distinct from update: no original model or search owner
+/// is required, no vectors are reused, and every new row binds its actual producer.
+pub(super) async fn rebuild(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+) -> Result<()> {
+    rebuild_with_loader(cx, options, output, load_models).await
+}
+
+async fn rebuild_with_loader<F>(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    load: F,
+) -> Result<()>
+where
+    F: FnOnce(Option<&Path>, bool) -> Result<Models>,
+{
+    rebuild_checkpoint(cx)?;
+    let previous = Selection::read(&options.receipt)?;
+    let old_root = fs::canonicalize(&previous.directory)?;
+    let directory = new_path(
+        options
+            .directory
+            .as_deref()
+            .ok_or_else(|| bad("missing new index directory"))?,
+    )?;
+    let receipt = new_path(
+        options
+            .new_receipt
+            .as_deref()
+            .ok_or_else(|| bad("missing --new-receipt"))?,
+    )?;
+    if directory.starts_with(&old_root)
+        || receipt.starts_with(&old_root)
+        || directory.starts_with(&receipt)
+        || receipt.starts_with(&directory)
+    {
+        return Err(bad("new destinations must be outside the predecessor and must not overlap"));
+    }
+    // Authenticate all source bytes before model loading, inference or candidate
+    // creation. Do not attempt ordinary reopen first: it must reject the very
+    // missing/corrupt derived artifacts this explicit rebuild is meant to replace.
+    let documents = recover_documents(cx, &previous)?;
+    let sequence = previous
+        .generation
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| bad("generation sequence exhausted"))?;
+    let generation = new_generation(sequence)?;
+    rebuild_checkpoint(cx)?;
+    // Like a fresh index, rebuild explicitly chooses a new model/storage policy.
+    // Both tiers are required by default, even if the old cohort was fast-only.
+    let models = load(options.models.as_deref(), !options.fast_only)?;
+    rebuild_checkpoint(cx)?;
+    if models.quality.is_some() == options.fast_only {
+        return Err(bad("loaded model topology disagrees with the explicit rebuild policy"));
+    }
+    let (_successor, selection) = build_with_generation(
+        cx, options, &directory, generation, documents, models,
+    )
+    .await?;
+    // A cancelled seal can leave inert evidence, but must not get a success
+    // receipt. No cancellation point follows saving the caller-visible receipt.
+    rebuild_checkpoint(cx)?;
+    save_selection(&selection, &receipt)?;
+    emit(output, &serde_json::json!({
+        "schema": SCHEMA, "ok": true, "event": "rebuilt",
+        "predecessor": previous.generation,
+        "recovery": "authenticated_retained_source",
+        "vectors_reused": false,
+        "receipt": receipt, "selection": selection,
+    }))
+}
+
+fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocument>> {
+    let mut limits = NativeHybridReopenLimits::default();
+    limits.vectors.max_source_bytes = MAX_INPUT_BYTES as u64;
+    limits.vectors.max_document_bytes = MAX_RECORD_BYTES as u64;
+    limits.vectors.max_documents = MAX_DOCUMENTS;
+    let (generation, documents) = NativeBuiltHybridIndex::recover_selected_source(
+        cx,
+        &selection.directory,
+        &GenerationComponentReceiptV1 {
+            byte_len: selection.snapshot.byte_len,
+            sha256: selection.snapshot.sha256,
+        },
+        limits,
+    )?;
+    if generation != selection.generation || documents.len() != selection.documents {
+        return Err(bad("recovered source differs from the trusted selection's generation or count"));
+    }
+    // A library snapshot can use a broader source-ID contract than this CLI.
+    // Reject it explicitly instead of silently dropping or renaming documents.
+    let mut bytes = 0_usize;
+    for document in &documents {
+        rebuild_checkpoint(cx)?;
+        if document.id.trim().is_empty()
+            || document.id.contains('\0')
+            || document.id.len() > usize::from(u16::MAX)
+        {
+            return Err(bad("recovered IDs must be nonblank, NUL-free, and at most 65535 bytes"));
+        }
+        let encoded = encode(document, MAX_RECORD_BYTES)?;
+        bytes = bytes
+            .checked_add(encoded.len())
+            .ok_or_else(|| bad("source byte count overflow"))?;
+        if bytes > MAX_INPUT_BYTES {
+            return Err(bad("the recovered source exceeds the encoded-byte limit"));
+        }
+    }
+    rebuild_checkpoint(cx)?;
+    Ok(documents)
+}
+
+fn rebuild_checkpoint(cx: &Cx) -> Result<()> {
+    cx.checkpoint().map_err(|_| frankensearch::SearchError::Cancelled {
+        phase: "native_cli.rebuild".to_owned(),
+        reason: "source rebuild cancelled".to_owned(),
+    })?;
+    Ok(())
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "rebuild_tests.rs"]
+mod rebuild_tests;

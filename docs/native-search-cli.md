@@ -382,3 +382,80 @@ phase fails. Streaming emits `rerank_failed` with the exact preceding page and a
 `degraded` terminal, and the next request remains usable. The original total
 deadline includes reranking: expiry after Refined starts no scorer; late scoring
 never replaces the delivered page. Synchronous native work is not preemptible.
+
+## Recover a damaged native index by rebuilding its selected sources
+
+Ordinary search, activation and incremental update still require every selected
+search artifact to be healthy. `rebuild` is an explicit alternative when an FSVI
+image, native graph or Quill artifact is missing/corrupt, or when replacing the
+embedding models requires regenerating all vectors:
+
+```sh
+./target/release/frankensearch-native rebuild \
+  --receipt ./native-receipts/g1.json \
+  --index-dir ./native-indexes/rebuilt-g2 \
+  --new-receipt ./native-receipts/rebuilt-g2.json \
+  --model-dir /absolute/path/to/installed/models
+./target/release/frankensearch-native search \
+  --receipt ./native-receipts/rebuilt-g2.json \
+  --model-dir /absolute/path/to/installed/models \
+  --query 'retry failed network requests'
+```
+
+The old receipt must be the original trusted selection. Recovery verifies the
+complete hash chain from that receipt through `native.hybrid.json` and
+`native.snapshot.json` to `native.source.jsonl`. Both descriptors and the entire
+source stream must survive intact: lengths, hash, ordered unique IDs, generation
+and document count are checked before model loading or candidate creation. A
+corrupt source or missing descriptor is refused, never salvaged as a valid prefix
+or replaced by another discovered generation. An external backup is required
+when this authentication chain is lost. Do not manufacture a replacement digest
+from a damaged directory to bypass this check.
+
+Rebuild needs no original model and opens none of the old FSVI, graph or Quill
+files. It uses the exact retained prepared bodies, titles and metadata, not the
+current filesystem or stdin. `--input` is deliberately invalid. All documents
+are re-embedded into a new FSVI v2 generation; native graphs and Quill are freshly
+built through the same complete builder and sealer as `index`. Nothing is copied
+from a damaged vector owner, and no old vector is relabelled with a new identity.
+The returned receipt records the actual new producing models.
+
+Like `index`, rebuild requires both local models by default. `--fast-only`
+explicitly chooses a successor without quality; this is NOT inferred from a
+missing model or the old topology. Storage is fresh F32 with default native-HNSW
+parameters/seed, or exact scan with `--exact`; unlike incremental `update`,
+rebuild does not inherit the old graph configuration. `--batch-size 1..256` is
+available. No model download, fallback or hidden source normalization occurs.
+
+The complete persisted source stream, including its header, must fit 256 MiB,
+with at most 100,000 documents and 16 MiB per encoded source record. The CLI's
+existing nonblank/NUL-free/length-bounded ID contract also applies. These bounds
+are checked before inference, not a claim about peak model or process memory.
+Rebuilding uses full-cohort inference, storage and graph work, not incremental
+reuse or a measured performance improvement.
+
+The new generation sequence is the authenticated source generation plus one;
+exhaustion is an error, never wraparound. Both output destinations must be new,
+outside the predecessor, and non-overlapping, including through parent aliases.
+The command seals the complete successor before creating its new receipt. It
+writes neither an old receipt nor a CURRENT pointer. Old readers keep their old
+cohort; existing live activation accepts a rebuilt successor only when its
+ordinary producer/topology/predecessor checks pass. Changing models or topology
+therefore requires reopening the server with the explicitly chosen new receipt.
+A higher sequence here is not a persistent antirollback floor or a decision
+between competing update branches.
+
+Success emits `event: "rebuilt"`, `recovery: "authenticated_retained_source"`,
+`vectors_reused: false`, the source `predecessor` identity, and the new selection
+and receipt path. Cancellation or a build failure leaves the original untouched
+and can leave an inert partial candidate, but creates no success receipt. A
+receipt-write/sync or output-delivery failure can leave new visible bytes; it is
+not an automatic rollback or a claim that the new snapshot was never written.
+Use fresh destinations for a failed attempt. No destructive cleanup is performed.
+
+Library consumers can recover the same owned source cohort without models via
+`NativeBuiltIndex::recover_selected_source` (vector/source receipt) or
+`NativeBuiltHybridIndex::recover_selected_source` (hybrid receipt), passing the
+existing explicit reopen limits. These return a source generation and documents,
+not a partially validated searchable index, and retain the trusted immutable-
+directory contract. The ordinary strict `open_selected` APIs are unchanged.

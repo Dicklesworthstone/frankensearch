@@ -58,15 +58,19 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--reranker-dir DIR] [--rerank-window N]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
+  rebuild --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
+          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
 Updates use op=upsert with those fields, or {\"op\":\"delete\",\"id\":\"...\"}.\n\
 The last update for an ID wins; every input record must be valid.\n\
 Omit --input to read stdin. Content is passed to the models without hidden\n\
 canonicalization; prepare/chunk documents explicitly. IDs must be unique.\n\
 Models are local-only; no downloads or hash fallback. Both tiers are required\n\
-unless index --fast-only is explicit. Native HNSW is used unless --exact.\n\
+unless index/rebuild --fast-only is explicit. Native HNSW is used unless --exact.\n\
 Index creates a new directory and a new trusted selection receipt. Keep that\n\
 receipt outside the immutable index; search never discovers or repairs one.\n\
+Rebuild authenticates retained sources without opening old search artifacts,\n\
+then re-embeds every document. It never reads stdin or reuses old vectors.\n\
 Stdout is JSON. This command does not change fsfs stores or CURRENT pointers.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +79,7 @@ enum Command {
     Search,
     Serve,
     Update,
+    Rebuild,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +137,10 @@ impl Options {
             "search" => Command::Search,
             "serve" => Command::Serve,
             "update" => Command::Update,
-            _ => return Err(bad("expected index, search, serve, or update; use --help")),
+            "rebuild" => Command::Rebuild,
+            _ => {
+                return Err(bad("expected index, search, serve, update, or rebuild; use --help"));
+            }
         };
         let mut options = Self {
             command,
@@ -163,24 +171,32 @@ impl Options {
                 return Err(bad("an option may only be supplied once"));
             }
             match flag.as_str() {
-                "--fast-only" if command == Command::Index => options.fast_only = true,
-                "--exact" if command == Command::Index => options.exact = true,
+                "--fast-only" if matches!(command, Command::Index | Command::Rebuild) => {
+                    options.fast_only = true;
+                }
+                "--exact" if matches!(command, Command::Index | Command::Rebuild) => {
+                    options.exact = true;
+                }
                 "--stream" if command == Command::Search => options.stream = true,
                 "--allow-activation" if command == Command::Serve => {
                     options.activation = serve::ActivationPermission::Enabled;
                 }
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
-                "--new-receipt" if command == Command::Update => {
+                "--new-receipt" if matches!(command, Command::Update | Command::Rebuild) => {
                     options.new_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--model-dir" => options.models = Some(PathBuf::from(value(&mut args)?)),
-                "--index-dir" if matches!(command, Command::Index | Command::Update) => {
+                "--index-dir"
+                    if matches!(command, Command::Index | Command::Update | Command::Rebuild) =>
+                {
                     options.directory = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--input" if matches!(command, Command::Index | Command::Update) => {
                     options.input = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--batch-size" if matches!(command, Command::Index | Command::Update) => {
+                "--batch-size"
+                    if matches!(command, Command::Index | Command::Update | Command::Rebuild) =>
+                {
                     options.batch_size = positive(&value(&mut args)?, 256)?;
                 }
                 "--query" if command == Command::Search => options.query = Some(value(&mut args)?),
@@ -217,11 +233,13 @@ impl Options {
         if command == Command::Search && options.reranker_dir.is_some() && options.mode != Mode::Full {
             return Err(bad("reranking requires --mode full; primary-tier modes explicitly skip it"));
         }
-        if matches!(command, Command::Index | Command::Update) && options.directory.is_none() {
-            return Err(bad("index/update requires --index-dir pointing to a NEW directory"));
+        if matches!(command, Command::Index | Command::Update | Command::Rebuild)
+            && options.directory.is_none()
+        {
+            return Err(bad("index/update/rebuild requires --index-dir pointing to a NEW directory"));
         }
-        if command == Command::Update && options.new_receipt.is_none() {
-            return Err(bad("update requires --new-receipt pointing to a NEW file"));
+        if matches!(command, Command::Update | Command::Rebuild) && options.new_receipt.is_none() {
+            return Err(bad("update/rebuild requires --new-receipt pointing to a NEW file"));
         }
         if command == Command::Search {
             let query = options
@@ -464,6 +482,19 @@ async fn build(
     models: Models,
 ) -> Result<(NativeBuiltHybridIndex, Selection)> {
     let generation = new_generation(1)?;
+    build_with_generation(cx, options, directory, generation, documents, models).await
+}
+
+// Fresh indexing and source recovery use one complete build/seal path. Recovery
+// supplies a strictly newer generation; it never calls the incremental reuse path.
+async fn build_with_generation(
+    cx: &Cx,
+    options: &Options,
+    directory: &Path,
+    generation: ArtifactGenerationIdentityV1,
+    documents: Vec<IndexableDocument>,
+    models: Models,
+) -> Result<(NativeBuiltHybridIndex, Selection)> {
     let fast_producer = models.fast.identity()?.fingerprint();
     let quality_producer = models
         .quality
@@ -539,6 +570,7 @@ async fn search(
 async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Option<BlockingPoolHandle>) -> Result<()> {
     match options.command {
         Command::Update => update::execute(cx, &options, output).await,
+        Command::Rebuild => update::rebuild(cx, &options, output).await,
         Command::Index => {
             let directory = new_path(
                 options
