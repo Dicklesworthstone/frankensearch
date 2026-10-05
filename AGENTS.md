@@ -390,15 +390,14 @@ be git-sourced and are now registry renames — keep the rename form, never the 
 
 `rerank` and `native` are exact aliases — there is no ONNX-only rerank lane, and
 `fastembed-reranker` also enables `native`. Published registry line as of
-2026-09-21: facade `frankensearch 0.6.1`, rerank `0.4.1`, fsfs `1.11.0`,
-ops/TUI `0.3.0`, and the other eight public members `0.3.1` (see CHANGELOG).
-Never republish a version that exists on the registry; bumps go forward only.
-All 13 archives in that family bind to source
-`7cc86150c08c22e5e1d4560a8e27a38b6733efae`, tagged `frankensearch-v0.6.1`.
-The latest downloadable fsfs binary remains `v1.10.0` from September 8 at
-`9c5d8867cbbc7edf696a24410a86af08402fc468`; newer crate publication does not
-qualify a new binary release. Verify later updates against the registry and
-GitHub release receipts. Embedder adapter and dependency-protocol updates
+2026-10-05: facade `frankensearch 0.7.1`, rerank `0.5.0`, TUI `0.3.1`,
+ops `0.4.0`, the other eight library members `0.4.0`, all from source
+`d1cb86e1848309fe39fb7c8c4c4d7356ebd878aa` (tags `crates-v0.7.1`, `v1.12.1`);
+and fsfs `1.12.2` alone from `3bfb37541a141d511e15a8f8ec56e306a6983233`
+(tag `v1.12.2`, the latest GitHub binary release, signed with the key in
+`minisign.pub`). Never republish a version that exists on the registry;
+bumps go forward only. Crate publication does not qualify a binary release.
+Verify later updates against the registry and GitHub release receipts. Embedder adapter and dependency-protocol updates
 change producer fingerprints; retain historical fixture checks and require
 explicit rebuilding of incompatible semantic indexes as described in CHANGELOG.
 
