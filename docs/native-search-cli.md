@@ -8,7 +8,8 @@ text. A later process opens that exact cohort using its saved receipt.
 This is an opt-in executable, not a change to `fsfs`'s default layout or a claim
 that the complete generation-authority migration is finished. It introduces no
 new indexing engine, runtime library, or model download service. The retrieval
-engines are native; the standard quality embedder still uses ONNX Runtime.
+engines are native; the standard quality embedder uses ONNX Runtime. The explicit
+`hybrid-native` profile below uses the existing native transformer instead.
 
 ## Build and index
 
@@ -43,6 +44,96 @@ long documents into deliberate source units for the selected models.
 
 The input limits are 16 MiB per encoded line, 256 MiB for the complete stream,
 and 100,000 documents. These bound input, not model scratch space or total RSS.
+
+## Native quality without the ONNX feature bundle
+
+The executable is also available with Quill, Model2Vec, and the existing native
+transformer backend, without enabling the `hybrid`/`fastembed` feature bundle:
+
+```sh
+cargo build -p frankensearch --no-default-features --features hybrid-native \
+  --bin frankensearch-native --release
+./target/release/frankensearch-native index \
+  --index-dir ./native-indexes/native-g1 --receipt ./native-receipts/native-g1.json \
+  --input ./documents.jsonl --model-dir /absolute/path/to/installed/models \
+  --quality-backend native-int8 --quality-model-dir /absolute/path/to/native-minilm
+./target/release/frankensearch-native search \
+  --receipt ./native-receipts/native-g1.json --query 'retry network requests' \
+  --model-dir /absolute/path/to/installed/models \
+  --quality-backend native-int8 --quality-model-dir /absolute/path/to/native-minilm \
+  --stream --timeout-ms 5000
+```
+
+`--model-dir` retains its ordinary fast-model cache-root meaning. A native
+`--quality-model-dir` names the **exact** verified weights/tokenizer directory,
+not another cache root. Choose one of these explicit `--quality-backend` values:
+
+| Backend | Selected quality producer |
+|---|---|
+| `onnx` | Existing local ONNX quality detection under `--model-dir`; default. |
+| `native-int8` | Registered English MiniLM L6 with native INT8 linear execution. |
+| `native-f32` | Registered English MiniLM L6 with native F32 linear execution. |
+| `native-multilingual` | Registered multilingual MiniLM L12 native producer. |
+
+All native choices require `--quality-model-dir` and the `native` or `rerank`
+feature. `hybrid-native` enables `model2vec`, `quill`, and `native`. The existing
+native loader verifies the registered model artifacts and executing producer
+certificate before returning a model. Native inference uses the command-owned
+asupersync blocking pool; no new runtime or inference engine is introduced.
+The INT8/F32 choice concerns transformer execution, not FSVI storage precision.
+
+The default backend remains `onnx` in **every** feature combination. A native-only
+binary therefore requires explicit native selection for a quality-enabled
+command. Adding a compiled backend cannot silently change the same command's
+producer. An unavailable feature, missing native directory, failed verification,
+or absent blocking pool is an error, never permission to use ONNX, another native
+profile, or hash control. `--quality-model-dir` is invalid for ONNX; explicit
+quality options are invalid on a fast-only build or selected fast-only cohort.
+
+The same options apply to `index`, `search`, `serve`, `update`, and `rebuild`.
+Use the original producer for ordinary reopen and incremental update. Native
+INT8, native F32, multilingual, and ONNX vectors are not interchangeable merely
+because their dimensions agree. The full producer fingerprint in the trusted
+selection and snapshot is still checked. A deliberate model/backend migration
+uses `rebuild` to re-embed all authenticated source documents into new files and
+a new receipt. Old receipts and live readers are not rewritten or relabelled.
+
+Warm serving retains both loaded models, including the native quality pool,
+through query phases and live activation. Activation cannot select a different
+backend or load a model from a request-supplied path. Native cross-encoder
+reranking can also be enabled with `--reranker-dir` in this profile; its directory
+is separate from the sentence embedder's directory. Startup model verification
+and loading remain synchronous and outside the per-query deadline.
+
+Cargo features are additive. Building with `hybrid`, `full`, `fastembed`, or an
+ONNX-enabled workspace member as well can still link ONNX. Inspect the isolated
+normal/build dependency graph with:
+
+```sh
+cargo tree -p frankensearch --no-default-features --features hybrid-native -e normal,build
+cargo test -p frankensearch --no-default-features --features hybrid-native \
+  --bin frankensearch-native models::tests
+```
+
+Explicit real-model command tests are marked ignored, not reported as passes
+without installed fixtures. Set `FRANKENSEARCH_NATIVE_CLI_MODEL_ROOT` to the
+Potion cache root and `MINILM_FIXTURE_DIR` to the verified native English model
+directory. Run the actual INT8 path with:
+
+```sh
+cargo test -p frankensearch --no-default-features --features hybrid-native \
+  --bin frankensearch-native models::real_model_tests::native_int8 -- --ignored --nocapture
+```
+
+Replace the test filter with `models::real_model_tests::native_f32` for F32 or
+`models::real_model_tests::native_multilingual` for multilingual. The latter uses
+`MULTILINGUAL_MINILM_FIXTURE_DIR` instead. These tests exercise actual native
+indexing, all three query modes, scoped progressive output, incremental update,
+rebuild, and retained predecessor reads. The INT8 test also refuses an F32
+producer on the same-dimensional original selection. Missing fixtures fail an
+explicitly requested test; there is no download or successful-skip fallback.
+This profile is not a numerical-equivalence, relevance, performance, complete
+platform-qualification, or no-C-toolchain claim.
 
 ## Reopen and search
 

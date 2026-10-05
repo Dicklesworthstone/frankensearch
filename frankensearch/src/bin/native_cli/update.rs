@@ -140,7 +140,12 @@ pub(super) async fn apply(
     Ok((successor, selection))
 }
 
-pub(super) async fn execute(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
+pub(super) async fn execute(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    pool: Option<BlockingPoolHandle>,
+) -> Result<()> {
     let previous = Selection::read(&options.receipt)?;
     let old_root = fs::canonicalize(&previous.directory)?;
     let directory = new_path(options.directory.as_deref().ok_or_else(|| bad("missing new index directory"))?)?;
@@ -157,7 +162,9 @@ pub(super) async fn execute(cx: &Cx, options: &Options, output: &mut impl Write)
         None => read_edits(&mut io::stdin().lock())?,
     };
     let edited_ids = edits.len();
-    let models = load_models(options.models.as_deref(), previous.quality_producer.is_some())?;
+    let models = models::load(
+        cx, options.models.as_deref(), previous.quality_producer.is_some(), &options.quality, pool,
+    )?;
     let index = previous.open(cx, models).await?;
     let (_successor, selection) = apply(cx, &previous, &index, &directory, edits, options.batch_size).await?;
     save_selection(&selection, &receipt)?;
@@ -175,8 +182,11 @@ pub(super) async fn rebuild(
     cx: &Cx,
     options: &Options,
     output: &mut impl Write,
+    pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
-    rebuild_with_loader(cx, options, output, load_models).await
+    rebuild_with_loader(cx, options, output, |root, quality| {
+        models::load(cx, root, quality, &options.quality, pool)
+    }).await
 }
 
 async fn rebuild_with_loader<F>(

@@ -47,6 +47,9 @@ download = ["frankensearch-embed/download"]
 api = ["frankensearch-embed/api"]
 semantic = ["hash", "model2vec", "fastembed"]
 hybrid = ["semantic", "lexical"]
+# Explicit native-quality executable/library profile; does not enable ONNX.
+# Features are additive: adding hybrid/full/fastembed still links those backends.
+hybrid-native = ["model2vec", "quill", "native"]
 persistent = ["hybrid", "storage"]
 durable = ["persistent", "durability"]
 full = ["durable", "rerank", "ann", "download", "graph", "api"]
@@ -92,7 +95,7 @@ sha2 = { workspace = true }
 [[bin]]
 name = "frankensearch-native"
 path = "src/bin/frankensearch-native.rs"
-required-features = ["hybrid"]
+required-features = ["quill"]
 
 [[test]]
 name = "integration"

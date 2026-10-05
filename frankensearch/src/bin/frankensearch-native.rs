@@ -18,7 +18,6 @@ use frankensearch::native_ann::builder::{
 };
 use frankensearch::{Cx, Embedder, IndexableDocument};
 use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
-use frankensearch_embed::{DetectOptions, EmbedderStack};
 use frankensearch_index::native_hnsw::HnswParams;
 use serde::{Deserialize, Serialize};
 
@@ -33,6 +32,9 @@ mod update;
 
 #[path = "native_cli/filter.rs"]
 mod filter;
+
+#[path = "native_cli/models.rs"]
+mod models;
 
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
@@ -60,6 +62,10 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
   rebuild --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
           [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\n\
+Quality options for every command:\n\
+  --quality-backend onnx|native-int8|native-f32|native-multilingual\n\
+  --quality-model-dir DIR (required for native; exact verified model directory)\n\
+The default backend is always onnx; native-only builds require explicit native selection.\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
 Updates use op=upsert with those fields, or {\"op\":\"delete\",\"id\":\"...\"}.\n\
 The last update for an ID wins; every input record must be valid.\n\
@@ -109,6 +115,7 @@ struct Options {
     directory: Option<PathBuf>,
     input: Option<PathBuf>,
     models: Option<PathBuf>,
+    quality: models::QualityOptions,
     query: Option<String>,
     mode: Mode,
     limit: usize,
@@ -149,6 +156,7 @@ impl Options {
             directory: None,
             input: None,
             models: None,
+            quality: models::QualityOptions::default(),
             query: None,
             mode: Mode::Full,
             limit: 10,
@@ -186,6 +194,12 @@ impl Options {
                     options.new_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--model-dir" => options.models = Some(PathBuf::from(value(&mut args)?)),
+                "--quality-backend" => {
+                    options.quality.backend = Some(models::QualityBackend::parse(&value(&mut args)?)?);
+                }
+                "--quality-model-dir" => {
+                    options.quality.directory = Some(PathBuf::from(value(&mut args)?));
+                }
                 "--index-dir"
                     if matches!(command, Command::Index | Command::Update | Command::Rebuild) =>
                 {
@@ -227,6 +241,7 @@ impl Options {
         if options.receipt.as_os_str().is_empty() {
             return Err(bad("--receipt is required"));
         }
+        options.quality.validate_usage(!options.fast_only)?;
         if seen.contains("--rerank-window") && options.reranker_dir.is_none() {
             return Err(bad("--rerank-window requires --reranker-dir"));
         }
@@ -340,24 +355,6 @@ fn read_documents(reader: &mut impl BufRead) -> Result<Vec<IndexableDocument>> {
 struct Models {
     fast: Arc<dyn Embedder>,
     quality: Option<Arc<dyn Embedder>>,
-}
-
-fn load_models(root: Option<&Path>, quality: bool) -> Result<Models> {
-    let policy = DetectOptions {
-        offline: Some(true),
-        ..DetectOptions::default()
-    };
-    let fast = EmbedderStack::auto_detect_fast_semantic_with_options(root, &policy)?.fast_arc();
-    let quality = if quality {
-        Some(
-            EmbedderStack::auto_detect_quality_with_options(root, &policy)?.ok_or_else(|| {
-                bad("the required local quality model is unavailable; install it or explicitly build --fast-only")
-            })?,
-        )
-    } else {
-        None
-    };
-    Ok(Models { fast, quality })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -569,8 +566,8 @@ async fn search(
 
 async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Option<BlockingPoolHandle>) -> Result<()> {
     match options.command {
-        Command::Update => update::execute(cx, &options, output).await,
-        Command::Rebuild => update::rebuild(cx, &options, output).await,
+        Command::Update => update::execute(cx, &options, output, pool).await,
+        Command::Rebuild => update::rebuild(cx, &options, output, pool).await,
         Command::Index => {
             let directory = new_path(
                 options
@@ -587,7 +584,9 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Optio
                 Some(path) => read_documents(&mut BufReader::new(File::open(path)?))?,
                 None => read_documents(&mut io::stdin().lock())?,
             };
-            let models = load_models(options.models.as_deref(), !options.fast_only)?;
+            let models = models::load(
+                cx, options.models.as_deref(), !options.fast_only, &options.quality, pool,
+            )?;
             let (_index, selection) = build(cx, &options, &directory, documents, models).await?;
             save_selection(&selection, &receipt)?;
             emit(output, &serde_json::json!({
@@ -599,12 +598,15 @@ async fn execute(cx: &Cx, options: Options, output: &mut impl Write, pool: Optio
             // Explicit local-only startup, once per process. Native inference
             // retains this caller-owned pool, including after live activation.
             let rerank = options.reranker_dir.as_deref()
-                .map(|path| query::Rerank::load(cx, path, options.rerank_window, pool))
+                .map(|path| query::Rerank::load(cx, path, options.rerank_window, pool.clone()))
                 .transpose()?;
             let selection = Selection::read(&options.receipt)?;
-            let models = load_models(
+            let models = models::load(
+                cx,
                 options.models.as_deref(),
                 selection.quality_producer.is_some(),
+                &options.quality,
+                pool,
             )?;
             let index = selection.open(cx, models).await?;
             // Index/model admission is startup work. Each accepted query starts
