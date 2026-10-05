@@ -297,6 +297,22 @@ mod loader_only {
             })
     }
 
+    /// The directory holding the active generation's files: `index` itself on
+    /// the legacy layout, or the generation `FSFS-CURRENT` names in a store of
+    /// complete generations (`FSFS_COMPLETE_GENERATIONS=1`), whose layout
+    /// inside is the same.
+    #[cfg(any(feature = "semantic-loaders", feature = "rerank"))]
+    fn active_generation_root(index: &Path) -> PathBuf {
+        let Ok(pointer) = fs::read_to_string(index.join("FSFS-CURRENT")) else {
+            return index.to_path_buf();
+        };
+        let id = pointer
+            .lines()
+            .nth(1)
+            .expect("FSFS-CURRENT names the active generation on its second line");
+        index.join("generations").join(id)
+    }
+
     #[cfg(feature = "semantic-loaders")]
     fn assert_index_completion(envelope: &Value, sentinel: &Value, count: usize, format: &str) {
         assert_eq!(envelope["ok"], true);
@@ -341,9 +357,10 @@ mod loader_only {
                 QUICKSTART_TIMEOUT,
             );
             assert_finished_successfully(format, &outcome);
-            let sentinel: Value =
-                serde_json::from_slice(&fs::read(index.join("index_sentinel.json")).unwrap())
-                    .unwrap();
+            let sentinel: Value = serde_json::from_slice(
+                &fs::read(active_generation_root(index).join("index_sentinel.json")).unwrap(),
+            )
+            .unwrap();
             if format == "table" {
                 assert!(outcome.stdout.starts_with("Discovered 10 file(s)"));
                 assert!(
@@ -391,7 +408,10 @@ mod loader_only {
                 _ => unreachable!(),
             };
             assert_index_completion(&envelope, &sentinel, QUICKSTART_DOCUMENT_COUNT, format);
-            let quality = VectorIndex::open_read_only(&index.join("vector/quality.fsvi")).unwrap();
+            let quality = VectorIndex::open_read_only(
+                &active_generation_root(index).join("vector/quality.fsvi"),
+            )
+            .unwrap();
             assert_eq!(
                 envelope["data"]["quality_generation"]["id"],
                 quality.embedder_id()
@@ -420,9 +440,11 @@ mod loader_only {
                 QUICKSTART_TIMEOUT,
             );
             let envelope = parse_success_envelope("empty index", &outcome);
-            let sentinel: Value =
-                serde_json::from_slice(&fs::read(empty_index.join("index_sentinel.json")).unwrap())
-                    .unwrap();
+            let sentinel: Value = serde_json::from_slice(
+                &fs::read(active_generation_root(&empty_index).join("index_sentinel.json"))
+                    .unwrap(),
+            )
+            .unwrap();
             assert_index_completion(&envelope, &sentinel, 0, format);
         }
         eprintln!(
@@ -459,7 +481,9 @@ mod loader_only {
             QUICKSTART_DOCUMENT_COUNT
         );
         assert!(
-            !fast_index.join("vector/quality.fsvi").exists(),
+            !active_generation_root(&fast_index)
+                .join("vector/quality.fsvi")
+                .exists(),
             "CLI must prevent quality generation even with both models installed"
         );
         for (label, extra_args, env) in [
@@ -924,13 +948,14 @@ mod loader_only {
         let quality = stack
             .quality_arc()
             .expect("actual quality comparison model");
-        let fast_index_path = index.join("vector/index.fsvi");
-        let quality_index_path = index.join("vector/quality.fsvi");
+        let generation = active_generation_root(index);
+        let fast_index_path = generation.join("vector/index.fsvi");
+        let quality_index_path = generation.join("vector/quality.fsvi");
         let fast_index =
             VectorIndex::open_read_only(&fast_index_path).expect("open actual fast generation");
         let quality_index = VectorIndex::open_read_only(&quality_index_path)
             .expect("open actual quality generation");
-        let lexical_root = index.join("lexical");
+        let lexical_root = generation.join("lexical");
         let lexical_pointer = frankensearch_quill::CurrentPointer::decode(
             &fs::read(lexical_root.join(frankensearch_quill::CURRENT_FILE_NAME)).unwrap(),
         )
@@ -1634,7 +1659,7 @@ mod loader_only {
             QUICKSTART_TIMEOUT,
         );
         parse_success_envelope("native index", &build);
-        let quality_path = index.join("vector/quality.fsvi");
+        let quality_path = active_generation_root(&index).join("vector/quality.fsvi");
         {
             let quality = VectorIndex::open_read_only(&quality_path).unwrap();
             assert_eq!(quality.embedder_id(), "minilm-384-native-f32");
@@ -2020,7 +2045,7 @@ mod loader_only {
         assert!(after_append.to_string().contains("second-castaway.md"));
 
         let before = [
-            fs::read(index.join("vector/index.fsvi")).unwrap(),
+            fs::read(active_generation_root(&index).join("vector/index.fsvi")).unwrap(),
             fs::read(&quality_path).unwrap(),
         ];
         fs::rename(&native_directory, models.join("native-fixture-preserved")).unwrap();
@@ -2082,7 +2107,7 @@ mod loader_only {
             );
             assert_eq!(
                 [
-                    fs::read(index.join("vector/index.fsvi")).unwrap(),
+                    fs::read(active_generation_root(&index).join("vector/index.fsvi")).unwrap(),
                     fs::read(&quality_path).unwrap()
                 ],
                 before
@@ -2198,7 +2223,7 @@ mod loader_only {
             QUICKSTART_TIMEOUT,
         );
         parse_success_envelope("multilingual index", &build);
-        let quality_path = index.join("vector/quality.fsvi");
+        let quality_path = active_generation_root(&index).join("vector/quality.fsvi");
         {
             let quality = VectorIndex::open_read_only(&quality_path).unwrap();
             assert_eq!(
@@ -3500,7 +3525,7 @@ mod loader_only {
             index_outcome.elapsed.as_millis()
         );
 
-        let sentinel_path = index.join("index_sentinel.json");
+        let sentinel_path = active_generation_root(&index).join("index_sentinel.json");
         let sentinel: Value = serde_json::from_slice(
             &fs::read(&sentinel_path).expect("read durable index completion sentinel"),
         )
@@ -3525,13 +3550,16 @@ mod loader_only {
             "all quickstart files must be durably indexed: {sentinel}"
         );
         assert!(
-            index.join("CURRENT").is_file() || index.join("lexical/CURRENT").is_file(),
+            active_generation_root(&index)
+                .join("lexical/CURRENT")
+                .is_file()
+                || index.join("CURRENT").is_file(),
             "the Quill lexical generation must publish a CURRENT pointer"
         );
         verify_index_output_formats(&fsfs, temp.path(), &corpus, &index);
         verify_fast_only_policy(&fsfs, temp.path(), &corpus, &index);
 
-        let vector_path = index.join("vector/index.fsvi");
+        let vector_path = active_generation_root(&index).join("vector/index.fsvi");
         let vector_index =
             VectorIndex::open_read_only(&vector_path).expect("inspect durable quickstart FSVI");
         assert_eq!(
@@ -3561,7 +3589,7 @@ mod loader_only {
         // The two-tier promise: a standard `fsfs index` with both registered
         // models present publishes a quality-tier generation beside the fast
         // one, in its own (384-d MiniLM) space, covering the same documents.
-        let quality_path = index.join("vector/quality.fsvi");
+        let quality_path = active_generation_root(&index).join("vector/quality.fsvi");
         assert!(
             quality_path.is_file(),
             "a standard index with the quality model present must publish {}",

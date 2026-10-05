@@ -299,10 +299,16 @@ impl FsfsRuntime {
         if fs::canonicalize(parent)? != root
             || path.extension().and_then(|extension| extension.to_str()) != Some("sock")
         {
-            return Err(complete_cli_error(
-                "daemon_socket",
-                "complete-generation sockets must end in .sock and live directly in the store root",
-            ));
+            // Name the refused path and the root it must live in: the shared
+            // helper leaves the value empty, which hid both.
+            return Err(SearchError::InvalidConfig {
+                field: "complete_generation.daemon_socket".to_owned(),
+                value: path.display().to_string(),
+                reason: format!(
+                    "complete-generation sockets must end in .sock and live directly in the store root {}",
+                    root.display()
+                ),
+            });
         }
         let name = path
             .file_name()
@@ -772,6 +778,38 @@ mod tests {
         assert!(BoundCompleteSocket::bind(path.clone()).is_err());
         assert!(!path.exists());
         assert_eq!(fs::read(outside).unwrap(), b"sentinel");
+    }
+
+    /// A daemon socket outside the store root is refused with the refused path
+    /// and the root it must live in; a name in the root is accepted.
+    #[test]
+    fn socket_outside_the_store_root_is_refused_with_its_path() {
+        let store = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(store.path()).unwrap();
+        let runtime_for = |socket: PathBuf| {
+            FsfsRuntime::new(crate::FsfsConfig::default()).with_cli_input(crate::CliInput {
+                daemon_socket: Some(socket),
+                ..crate::CliInput::default()
+            })
+        };
+        let outside = elsewhere.path().join("daemon.sock");
+        let error = runtime_for(outside.clone())
+            .complete_generation_socket_path(store.path())
+            .unwrap_err();
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { field, value, reason }
+                if field == "complete_generation.daemon_socket"
+                    && *value == outside.display().to_string()
+                    && reason.contains(&root.display().to_string())),
+            "{error:?}"
+        );
+        assert_eq!(
+            runtime_for(root.join("custom.sock"))
+                .complete_generation_socket_path(store.path())
+                .unwrap(),
+            root.join("custom.sock")
+        );
     }
 
     #[test]
