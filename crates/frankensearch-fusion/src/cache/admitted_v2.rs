@@ -10,6 +10,9 @@ use frankensearch_index::{FsviV2IdentityBinding, TwoTierIndex, TwoTierIndexPaths
 
 use super::{IndexCache, IndexOpenSpec, StalenessDetector, absolute_from};
 
+mod native;
+pub use native::{NativeCachePolicy, NativeCacheTier};
+
 fn rejected(field: &str, reason: &str) -> SearchError {
     SearchError::InvalidConfig {
         field: format!("index_cache.{field}"),
@@ -89,7 +92,7 @@ fn open_exact(
     Ok(index)
 }
 
-fn validate_admitted(index: &TwoTierIndex) -> SearchResult<()> {
+fn validate_retained(index: &TwoTierIndex) -> SearchResult<()> {
     let fast = index
         .fast_admitted_binding()
         .ok_or_else(|| rejected("replace", "the fast tier must retain exact v2 admission"))?;
@@ -117,10 +120,15 @@ fn validate_admitted(index: &TwoTierIndex) -> SearchResult<()> {
             "every selected tier must retain its validated bytes",
         ));
     }
+    Ok(())
+}
+
+fn validate_admitted(index: &TwoTierIndex) -> SearchResult<()> {
+    validate_retained(index)?;
     if index.has_native_fast_hnsw() || index.has_native_quality_hnsw() {
         return Err(rejected(
             "replace",
-            "this exact v2 cache cannot preserve native ANN policy across reload; use the native retained-owner lifecycle",
+            "this exact v2 cache cannot adopt native ANN implicitly; use open_admitted_v2_with_native with a persisted graph recipe",
         ));
     }
     Ok(())
@@ -131,7 +139,7 @@ fn validate_successor_bindings(
     fast: &FsviV2IdentityBinding,
     quality: Option<&FsviV2IdentityBinding>,
 ) -> SearchResult<()> {
-    validate_admitted(current)?;
+    validate_retained(current)?;
     if current.quality_admitted_binding().is_some() != quality.is_some() {
         return Err(rejected(
             "replace",
@@ -180,6 +188,16 @@ pub(super) fn validate_replacement(
         };
     }
     validate_admitted(candidate)?;
+    validate_retained_replacement(current, candidate)
+}
+
+// Native loaders share every original identity, generation, content and
+// coverage check. Only their separately admitted retrieval policy differs.
+fn validate_retained_replacement(
+    current: &TwoTierIndex,
+    candidate: &TwoTierIndex,
+) -> SearchResult<()> {
+    validate_retained(candidate)?;
     let fast = candidate
         .fast_admitted_binding()
         .ok_or_else(|| rejected("replace", "replacement cannot discard v2 admission"))?;
@@ -247,11 +265,12 @@ impl IndexCache {
             open_spec: IndexOpenSpec::Explicit(paths),
             state_dir,
             config,
+            native_reload: None,
         })
     }
 
     pub(super) fn open_for_reload(&self, current: &TwoTierIndex) -> SearchResult<TwoTierIndex> {
-        match current.fast_admitted_binding() {
+        let mut index = match current.fast_admitted_binding() {
             Some(fast) => {
                 let paths = self.index_paths().ok_or_else(|| {
                     rejected(
@@ -267,7 +286,14 @@ impl IndexCache {
                 )
             }
             None => self.open_spec.open(self.config.clone()),
+        }?;
+        if let Some(native) = &self.native_reload {
+            let paths = self.index_paths().ok_or_else(|| {
+                rejected("reload", "native reload requires explicit vector paths")
+            })?;
+            native.load(None, paths, &mut index)?;
         }
+        Ok(index)
     }
 
     /// Load a caller-selected v2 successor and install only against `expected`.
@@ -279,6 +305,9 @@ impl IndexCache {
     /// same-generation reload must retain byte/content/coverage witnesses exactly.
     /// Subsequent ordinary `reload()` uses the INSTALLED bindings, never the
     /// constructor's obsolete generation or fresh metadata discovered from disk.
+    /// An opted-in native cache loads all required graph/receipt pairs with its
+    /// frozen per-tier policy before installing anything. It never rebuilds a
+    /// graph or replaces a missing native arm with exact retrieval.
     ///
     /// No persistent authority is changed and no candidate/predecessor is deleted.
     /// The caller owns durable publication and stable artifact path replacement.
@@ -295,7 +324,13 @@ impl IndexCache {
         quality_binding: Option<&FsviV2IdentityBinding>,
     ) -> SearchResult<bool> {
         self.reload_admitted_v2_with(cx, expected, fast_binding, quality_binding, |paths| {
-            open_exact(paths, self.config.clone(), fast_binding, quality_binding)
+            let result = open_exact(paths, self.config.clone(), fast_binding, quality_binding);
+            checkpoint(cx)?;
+            let mut index = result?;
+            if let Some(native) = &self.native_reload {
+                native.load(Some(cx), paths, &mut index)?;
+            }
+            Ok(index)
         })
     }
 
@@ -318,7 +353,12 @@ impl IndexCache {
         validate_successor_bindings(expected, fast_binding, quality_binding)?;
         let result = load(paths);
         checkpoint(cx)?;
-        self.replace_admitted_v2_if_current(cx, expected, result?)
+        let candidate = result?;
+        if self.native_reload.is_some() {
+            self.install_loaded_native(Some(cx), expected, candidate)
+        } else {
+            self.replace_admitted_v2_if_current(cx, expected, candidate)
+        }
     }
 
     /// Install an already-admitted exact v2 candidate without reopening it.
@@ -329,6 +369,8 @@ impl IndexCache {
     /// Cancellation is checked after acquiring the lock and immediately before
     /// swapping. No cancellation checkpoint or fallible reopen follows success.
     /// Destruction of retired owners occurs after releasing the cache lock.
+    /// Native caches refuse this prebuilt entry point; use their cache-owned
+    /// selected reload to establish the graph recipe before installation.
     ///
     /// # Errors
     /// Returns cancellation, path or v2 contract errors. A stale predecessor is
@@ -344,6 +386,12 @@ impl IndexCache {
             return Ok(false);
         }
         // Resolve filesystem context outside the lock, matching legacy replace.
+        if self.native_reload.is_some() {
+            return Err(rejected(
+                "replace",
+                "native caches require cache-owned reload to admit every configured graph",
+            ));
+        }
         let base = std::env::current_dir()?;
         let candidate = Arc::new(candidate);
         let retired = {

@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 use frankensearch_index::{TwoTierIndex, TwoTierIndexPaths};
 
 mod admitted_v2;
+pub use admitted_v2::{NativeCachePolicy, NativeCacheTier};
 
 /// Sentinel file name written alongside indices after a successful build.
 pub const SENTINEL_FILENAME: &str = ".frankensearch_index_meta";
@@ -428,6 +429,8 @@ pub struct IndexCache {
     state_dir: PathBuf,
     /// Configuration for opening replacement indices.
     config: TwoTierConfig,
+    /// Immutable read-only native graph recipe; never changed by replacement.
+    native_reload: Option<NativeCachePolicy>,
 }
 
 impl IndexCache {
@@ -460,6 +463,7 @@ impl IndexCache {
             open_spec,
             state_dir,
             config,
+            native_reload: None,
         })
     }
 
@@ -501,6 +505,7 @@ impl IndexCache {
             open_spec,
             state_dir,
             config,
+            native_reload: None,
         })
     }
 
@@ -546,6 +551,8 @@ impl IndexCache {
     /// These legacy checks reject obvious drift; they do not attest the old
     /// vectors. Existing identity-enrichment bootstrap behavior is retained.
     /// Rejection preserves the installed index and in-flight reader snapshots.
+    /// Native caches require a cache-owned reload; an arbitrary prebuilt index
+    /// does not establish that the retained graph recipe was followed.
     pub fn replace(&self, new_index: TwoTierIndex) -> SearchResult<()> {
         self.replace_inner(None, new_index).map(|_| ())
     }
@@ -586,6 +593,13 @@ impl IndexCache {
             let mut guard = self.write_index();
             if expected.is_some_and(|snapshot| !Arc::ptr_eq(&guard, snapshot)) {
                 return Ok(false);
+            }
+            if self.native_reload.is_some() {
+                return Err(SearchError::InvalidConfig {
+                    field: "index_cache.replace".to_owned(),
+                    value: "native-policy".to_owned(),
+                    reason: "native caches require reload or reload_admitted_v2_if_current; prebuilt replacement cannot attest the retained graph recipe".to_owned(),
+                });
             }
             Self::validate_replacement(&guard, &candidate, &current_dir)?;
             std::mem::replace(&mut *guard, candidate)
@@ -649,6 +663,9 @@ impl IndexCache {
     /// installed while that I/O was in progress. For admitted v2 tiers, this
     /// reuses the installed bindings and refuses newly discovered generations;
     /// use [`Self::reload_admitted_v2_if_current`] with trusted successor bindings.
+    /// Native caches also reload every configured graph and its receipt with
+    /// the original parameters/seed. Missing or corrupt graphs never rebuild
+    /// themselves or silently switch the installed snapshot to exact retrieval.
     ///
     /// # Errors
     ///
@@ -666,7 +683,12 @@ impl IndexCache {
     ) -> SearchResult<()> {
         let expected = self.current();
         let candidate = load(&expected)?;
-        if !self.replace_if_current(&expected, candidate)? {
+        let installed = if self.native_reload.is_some() {
+            self.install_loaded_native(None, &expected, candidate)?
+        } else {
+            self.replace_if_current(&expected, candidate)?
+        };
+        if !installed {
             return Err(SearchError::InvalidConfig {
                 field: "index_cache.reload".to_owned(),
                 value: "superseded".to_owned(),
