@@ -7334,12 +7334,41 @@ impl FsfsRuntime {
             return entry;
         }
 
+        // Never delete an index root out from under a live fsfs writer: the
+        // compaction daemon holds the publication lease for its whole
+        // lifetime, and indexers and complete-generation builds hold it while
+        // they write. The lease is a kernel lock, so a lock file left behind
+        // by a crashed process does not block removal.
+        let index_root_lease = if target.target == "index_dir"
+            && target.kind == UninstallTargetKind::Directory
+            && metadata.is_dir()
+        {
+            match crate::lifecycle::PublicationLease::acquire(&normalized) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    "error".clone_into(&mut entry.status);
+                    entry.detail = Some(format!(
+                        "refusing to remove index_dir while its publication lease is unavailable: {error}"
+                    ));
+                    return entry;
+                }
+            }
+        } else {
+            None
+        };
+        // Windows lease handles deny deleting the held root and lock file, so
+        // there the lease only proves the root was idle; release it first.
+        #[cfg(not(unix))]
+        drop(index_root_lease);
+
         let deletion =
             if metadata.file_type().is_symlink() || target.kind == UninstallTargetKind::File {
                 fs::remove_file(&normalized)
             } else {
                 fs::remove_dir_all(&normalized)
             };
+        #[cfg(unix)]
+        drop(index_root_lease);
 
         match deletion {
             Ok(()) => {
@@ -45769,6 +45798,57 @@ mod tests {
                 .entries
                 .iter()
                 .any(|entry| { entry.target == "index_dir" && entry.status == "removed" })
+        );
+        assert!(!index_root.exists(), "index dir should be removed");
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn runtime_uninstall_refuses_index_dir_held_by_a_live_publication_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(index_root.join("vector")).expect("index dir");
+        fs::write(index_root.join("vector/index.fsvi"), b"fsvi").expect("index file");
+        // Drive only the index_dir entry: a confirmed full payload would also
+        // remove completions and agent hooks under the real home directory.
+        let target = super::UninstallTarget {
+            target: "index_dir".to_owned(),
+            kind: super::UninstallTargetKind::Directory,
+            path: index_root.clone(),
+            purge_only: false,
+        };
+
+        let live_writer = crate::lifecycle::PublicationLease::acquire(&index_root)
+            .expect("live writer holds the publication lease");
+        let entry = FsfsRuntime::apply_uninstall_target(&target, false, false);
+        assert_eq!(entry.status, "error", "{entry:?}");
+        assert!(
+            entry
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("publication lease")),
+            "busy refusal must name the lease: {entry:?}"
+        );
+        assert!(
+            index_root.join("vector/index.fsvi").is_file(),
+            "a refused uninstall must preserve the live writer's index"
+        );
+        live_writer
+            .fence("post-refused-uninstall")
+            .expect("a refused uninstall must not disturb the live holder");
+        drop(live_writer);
+
+        // A lock file and owner record left behind by a dead holder are not a
+        // live lease: only the kernel lock is authority.
+        fs::write(
+            index_root.join(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME),
+            "4294967 0\n",
+        )
+        .expect("stale owner record");
+        let entry = FsfsRuntime::apply_uninstall_target(&target, false, false);
+        assert_eq!(
+            entry.status, "removed",
+            "once the writer releases, uninstall removes the index: {entry:?}"
         );
         assert!(!index_root.exists(), "index dir should be removed");
     }
