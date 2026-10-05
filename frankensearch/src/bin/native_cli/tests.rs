@@ -51,7 +51,7 @@ fn documents_preserve_source_and_reject_the_entire_invalid_batch() {
     assert!(documents[1].content.is_empty());
     for invalid in [
         "{\"id\":\"x\",\"content\":\"first\"}\n{\"id\":\"x\",\"content\":\"second\"}",
-        "{\"id\":\" \t\",\"content\":\"invalid\"}",
+        "{\"id\":\"   \",\"content\":\"invalid\"}",
         "{\"id\":\"x\\u0000y\",\"content\":\"invalid\"}",
         "{\"id\":\"x\",\"content\":\"valid\"}\nnot JSON",
         "{\"id\":\"x\",\"content\":\"valid\",\"ignored_policy\":true}",
@@ -392,5 +392,116 @@ fn broken_initial_delivery_stops_before_quality_inference() {
         assert_eq!(output.writes, 2, "no terminal write after failed delivery");
         assert_eq!(fast_calls.load(Ordering::Relaxed), before.0 + 1);
         assert_eq!(quality_calls.load(Ordering::Relaxed), before.1);
+    });
+}
+
+#[test]
+fn update_admission_preserves_last_edit_wins_and_rejects_invalid_records() {
+    let options = options(&[
+        "update", "--receipt", "old", "--index-dir", "new", "--new-receipt", "new.json",
+    ]);
+    assert_eq!(options.command, Command::Update);
+    let edits = update::read_edits(&mut Cursor::new(concat!(
+        "{\"op\":\"upsert\",\"id\":\"a\",\"content\":\"first\"}\n",
+        "{\"op\":\"delete\",\"id\":\"a\"}\n",
+        "{\"op\":\"upsert\",\"id\":\"a\",\"content\":\"final\"}\n",
+        "{\"op\":\"delete\",\"id\":\"missing\"}"
+    ))).unwrap();
+    assert_eq!(edits.len(), 2);
+    assert_eq!(edits["a"].as_ref().unwrap().content, "final");
+    assert!(edits["missing"].is_none());
+    for input in [
+        "{\"op\":\"delete\",\"id\":\"\"}",
+        "{\"op\":\"delete\",\"id\":\"a\",\"content\":\"unexpected\"}",
+        "{\"op\":\"upsert\",\"id\":\"a\"}",
+        "{\"op\":\"delete\",\"id\":\"a\"}\ninvalid",
+    ] {
+        assert!(update::read_edits(&mut Cursor::new(input)).is_err());
+    }
+    assert!(Options::parse([
+        "update", "--receipt", "old", "--index-dir", "new",
+    ].map(str::to_owned)).is_err());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_update_reuses_unchanged_vectors_and_keeps_old_readers() {
+    run_test_with_cx(|cx| async move {
+        let temporary = tempfile::tempdir().unwrap();
+        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+        let (models, fast_calls, quality_calls) = fixture_models(true);
+        let (old, old_selection) = build(&cx, &options, &temporary.path().join("old"), source(), models.clone())
+            .await.unwrap();
+        let before_fast = fs::read(old.vectors().fast().vector_path()).unwrap();
+        let before_quality = fs::read(old.vectors().quality().unwrap().vector_path()).unwrap();
+        assert!(new_path(&old.vectors().directory().join("nested-index")).is_err());
+        let alias = temporary.path().join("old-alias");
+        std::os::unix::fs::symlink(old.vectors().directory(), &alias).unwrap();
+        assert!(new_path(&alias.join("nested-receipt.json")).is_err());
+        assert!(new_path(&temporary.path().join("new-sibling")).is_ok());
+        let counts = (fast_calls.load(Ordering::Relaxed), quality_calls.load(Ordering::Relaxed));
+        let edits = update::read_edits(&mut Cursor::new(concat!(
+            "{\"op\":\"upsert\",\"id\":\"retry.rs\",\"content\":\"retry network requests with backoff\",\"title\":\"Updated title\",\"metadata\":{\"version\":\"two\"}}\n",
+            "{\"op\":\"delete\",\"id\":\"garden.md\"}\n",
+            "{\"op\":\"upsert\",\"id\":\"river.md\",\"content\":\"river currents\"}\n"
+        ))).unwrap();
+        let (new, selection) = update::apply(
+            &cx, &old_selection, &old, &temporary.path().join("new"), edits, 8,
+        ).await.unwrap();
+        assert_eq!(selection.generation.sequence, old_selection.generation.sequence + 1);
+        assert_eq!(fast_calls.load(Ordering::Relaxed), counts.0 + 1);
+        assert_eq!(quality_calls.load(Ordering::Relaxed), counts.1 + 1);
+        assert!(new.vectors().document("garden.md").is_none());
+        assert_eq!(new.vectors().document("retry.rs").unwrap().metadata["version"], "two");
+        assert_eq!(new.vectors().document("retry.rs").unwrap().title.as_deref(), Some("Updated title"));
+        assert!(new.lexical().search(&cx, "garden", 10).await.unwrap().is_empty());
+        assert_eq!(old.lexical().search(&cx, "garden", 10).await.unwrap().len(), 1);
+        assert_eq!(new.lexical().search(&cx, "river", 10).await.unwrap().len(), 1);
+        assert!(old.vectors().document("river.md").is_none());
+        assert_eq!(fs::read(old.vectors().fast().vector_path()).unwrap(), before_fast);
+        assert_eq!(fs::read(old.vectors().quality().unwrap().vector_path()).unwrap(), before_quality);
+        drop(new);
+        let receipt = temporary.path().join("new.json");
+        save_selection(&selection, &receipt).unwrap();
+        let reopened = Selection::read(&receipt).unwrap().open(&cx, models).await.unwrap();
+        assert_eq!(reopened.vectors().documents().len(), 2);
+        assert_eq!(reopened.lexical().search(&cx, "river", 10).await.unwrap().len(), 1);
+        assert_eq!(old.lexical().search(&cx, "garden", 10).await.unwrap().len(), 1);
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn failed_and_cancelled_updates_do_not_modify_the_selected_predecessor() {
+    run_test_with_cx(|cx| async move {
+        let temporary = tempfile::tempdir().unwrap();
+        let options = options(&["index", "--index-dir", "unused", "--receipt", "unused"]);
+        let (mut models, _, _) = fixture_models(true);
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        models.quality = Some(Arc::new(FailingQuality {
+            inner: models.quality.take().unwrap(), fail: Arc::clone(&fail),
+        }));
+        let (old, selection) = build(&cx, &options, &temporary.path().join("old"), source(), models.clone())
+            .await.unwrap();
+        let receipt = temporary.path().join("old.json");
+        save_selection(&selection, &receipt).unwrap();
+        let before = fs::read(&receipt).unwrap();
+        let vectors = fs::read(old.vectors().fast().vector_path()).unwrap();
+        let changes = || update::read_edits(&mut Cursor::new(
+            "{\"op\":\"upsert\",\"id\":\"new\",\"content\":\"river\"}\n"
+        )).unwrap();
+        fail.store(true, Ordering::Release);
+        assert!(update::apply(&cx, &selection, &old, &temporary.path().join("failed"), changes(), 8)
+            .await.is_err());
+        cx.set_cancel_requested(true);
+        let cancelled = temporary.path().join("cancelled");
+        assert!(update::apply(&cx, &selection, &old, &cancelled, changes(), 8).await.is_err());
+        cx.set_cancel_requested(false);
+        assert!(!cancelled.exists());
+        assert_eq!(fs::read(&receipt).unwrap(), before);
+        assert_eq!(fs::read(old.vectors().fast().vector_path()).unwrap(), vectors);
+        let reopened = Selection::read(&receipt).unwrap().open(&cx, models).await.unwrap();
+        assert_eq!(reopened.vectors().documents().len(), 2);
+        assert!(reopened.vectors().document("new").is_none());
     });
 }

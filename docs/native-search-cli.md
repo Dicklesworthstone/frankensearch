@@ -87,7 +87,7 @@ JSON line, and reads one JSON request per line from stdin:
 {"id":"q2","query":"spring garden","mode":"quality"}
 ```
 
-Each request emits `started`, one or more `results`, and a `terminal` frame.
+Each admitted request emits `started`, one or more `results`, and a `terminal` frame.
 Frames carry the client `id`, server `request` ordinal, per-request `seq` starting
 at zero, and actual retained `generation`. Full mode flushes Initial before
 polling independent quality refinement. Initial's candidate counts report zero
@@ -116,11 +116,58 @@ requested result phase. The native phase engine adds no implicit deadlines:
 checkpoint cancellation does not preempt synchronous graph/model work or an
 idle blocking stdin read. This is not the `fsfs` stream-protocol schema.
 
+## Incremental upsert and delete
+
+```sh
+cat > ./changes.jsonl <<'JSONL'
+{"op":"upsert","id":"retry.rs","content":"Retry failed network requests with exponential backoff.","title":"Updated network notes","metadata":{"language":"rust","version":"two"}}
+{"op":"delete","id":"garden.md"}
+{"op":"upsert","id":"queues.rs","content":"A bounded queue applies backpressure to producers."}
+JSONL
+./target/release/frankensearch-native update \
+  --receipt ./native-receipts/g1.json \
+  --index-dir ./native-indexes/g2 \
+  --new-receipt ./native-receipts/g2.json \
+  --input ./changes.jsonl \
+  --model-dir /absolute/path/to/installed/models
+./target/release/frankensearch-native serve --receipt ./native-receipts/g2.json
+```
+
+Updates reopen the trusted predecessor and use its `NativeIndexUpdate` builder.
+The last operation for an ID wins; deleting an absent ID is a no-op. An upsert
+replaces the complete source document, including title and metadata. A rename
+is an explicit delete plus upsert. All records, even superseded records, must
+be valid. Unknown operations/fields, invalid IDs, malformed input, or an
+oversized final source cohort reject the update.
+
+Unchanged content reuses the admitted vector in each eligible tier. A title or
+metadata-only change therefore updates Quill and retained text without running
+embedding inference again. New or changed content is embedded by the original
+providers. Tier presence, precision, native graph parameters and seed are
+inherited; update cannot silently replace a model or remove quality.
+
+Only inference is incremental: source serialization, FSVI images, native graphs
+and Quill are rebuilt as a complete successor. This is not an O(delta) indexing
+or memory claim. The final source cohort is bounded to 100,000 documents,
+16 MiB per serialized document line, and 256 MiB in total, so repeated bounded
+deltas cannot grow it beyond the executable's limits. `--batch-size` remains
+available. Empty/no-op batches still build a new receipted generation.
+
+The old generation and receipt are never overwritten. The successor receives a
+strictly greater sequence and a fresh nonce, and is sealed before its NEW receipt
+is saved. The command reports the predecessor, distinct edited-ID count and
+successor selection; the edit count is not an inference count. An existing
+server continues using its old complete cohort. Restart it with the new receipt
+to observe additions, replacements and deletions. There is no implicit live
+activation or automatic choice between concurrently built successors.
+
 ## Selection and lifetime contract
 
 Both the generation directory and receipt must be NEW paths under existing
 parents. Neither is overwritten. The receipt is outside the immutable generation
-and stores the exact hybrid-snapshot byte receipt, generation identity, document
+and new destinations beneath a known native or fsfs sealed ancestor are refused,
+including through parent aliases. The receipt stores the exact hybrid-snapshot
+byte receipt, generation identity, document
 count and producing-model fingerprints. Reopening verifies the selected source,
 vector, graph and Quill cohort through `NativeBuiltHybridIndex::open_selected`;
 missing, changed or wrong-producer artifacts are errors, not fallback triggers.
@@ -150,5 +197,7 @@ receipt reuse, corruption refusal, cancellation, input admission and bounded
 output. Additional warm-server tests observe the actual Initial output flush
 before any quality inference, exercise multiple requests on retained models,
 preserve Initial on an injected quality failure, and stop after a broken Initial
-delivery without starting quality. They are not real-model relevance or
-performance measurements.
+delivery without starting quality. Update tests check last-edit-wins admission,
+per-tier inference reuse, metadata replacement, deletion from Quill, persisted
+successor reopening, old-reader preservation, cancellation and quality failure.
+They are not real-model relevance or performance measurements.

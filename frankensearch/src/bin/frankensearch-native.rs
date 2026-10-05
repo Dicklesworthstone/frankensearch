@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 #[path = "native_cli/serve.rs"]
 mod serve;
 
+#[path = "native_cli/update.rs"]
+mod update;
+
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
 mod tests;
@@ -43,7 +46,11 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
          [--mode full|fast|quality] [--limit N] [--stream]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\n\
+  update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
+         [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
+Updates use op=upsert with those fields, or {\"op\":\"delete\",\"id\":\"...\"}.\n\
+The last update for an ID wins; every input record must be valid.\n\
 Omit --input to read stdin. Content is passed to the models without hidden\n\
 canonicalization; prepare/chunk documents explicitly. IDs must be unique.\n\
 Models are local-only; no downloads or hash fallback. Both tiers are required\n\
@@ -57,6 +64,7 @@ enum Command {
     Index,
     Search,
     Serve,
+    Update,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +90,7 @@ impl Mode {
 struct Options {
     command: Command,
     receipt: PathBuf,
+    new_receipt: Option<PathBuf>,
     directory: Option<PathBuf>,
     input: Option<PathBuf>,
     models: Option<PathBuf>,
@@ -107,11 +116,13 @@ impl Options {
             "index" => Command::Index,
             "search" => Command::Search,
             "serve" => Command::Serve,
-            _ => return Err(bad("expected index, search, or serve; use --help")),
+            "update" => Command::Update,
+            _ => return Err(bad("expected index, search, serve, or update; use --help")),
         };
         let mut options = Self {
             command,
             receipt: PathBuf::new(),
+            new_receipt: None,
             directory: None,
             input: None,
             models: None,
@@ -136,21 +147,24 @@ impl Options {
                 "--exact" if command == Command::Index => options.exact = true,
                 "--stream" if command == Command::Search => options.stream = true,
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
+                "--new-receipt" if command == Command::Update => {
+                    options.new_receipt = Some(PathBuf::from(value(&mut args)?));
+                }
                 "--model-dir" => options.models = Some(PathBuf::from(value(&mut args)?)),
-                "--index-dir" if command == Command::Index => {
+                "--index-dir" if matches!(command, Command::Index | Command::Update) => {
                     options.directory = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--input" if command == Command::Index => {
+                "--input" if matches!(command, Command::Index | Command::Update) => {
                     options.input = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--batch-size" if command == Command::Index => {
+                "--batch-size" if matches!(command, Command::Index | Command::Update) => {
                     options.batch_size = positive(&value(&mut args)?, 256)?;
                 }
                 "--query" if command == Command::Search => options.query = Some(value(&mut args)?),
-                "--mode" if command != Command::Index => {
+                "--mode" if matches!(command, Command::Search | Command::Serve) => {
                     options.mode = Mode::parse(&value(&mut args)?)?;
                 }
-                "--limit" if command != Command::Index => {
+                "--limit" if matches!(command, Command::Search | Command::Serve) => {
                     options.limit = positive(&value(&mut args)?, 1_000)?;
                 }
                 _ => return Err(bad("unknown or inapplicable option; use --help")),
@@ -159,8 +173,11 @@ impl Options {
         if options.receipt.as_os_str().is_empty() {
             return Err(bad("--receipt is required"));
         }
-        if command == Command::Index && options.directory.is_none() {
-            return Err(bad("index requires --index-dir pointing to a NEW directory"));
+        if matches!(command, Command::Index | Command::Update) && options.directory.is_none() {
+            return Err(bad("index/update requires --index-dir pointing to a NEW directory"));
+        }
+        if command == Command::Update && options.new_receipt.is_none() {
+            return Err(bad("update requires --new-receipt pointing to a NEW file"));
         }
         if command == Command::Search {
             let query = options
@@ -365,7 +382,19 @@ fn new_path(path: &Path) -> Result<PathBuf> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let path = fs::canonicalize(parent)?.join(name);
+    let parent = fs::canonicalize(parent)?;
+    // A NEW leaf can still corrupt an existing sealed ancestor's inventory.
+    // Resolve parent aliases first and refuse known native/fsfs seal markers.
+    for ancestor in parent.ancestors() {
+        for marker in ["native.hybrid.json", "native.snapshot.json", "FSFS-BUNDLE.json"] {
+            match fs::symlink_metadata(ancestor.join(marker)) {
+                Ok(_) => return Err(bad("destination is inside a sealed index; choose a sibling path")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    let path = parent.join(name);
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
         Err(error) => Err(error.into()),
@@ -476,6 +505,7 @@ async fn search(
 
 async fn execute(cx: &Cx, options: Options, output: &mut impl Write) -> Result<()> {
     match options.command {
+        Command::Update => update::execute(cx, &options, output).await,
         Command::Index => {
             let directory = new_path(
                 options
