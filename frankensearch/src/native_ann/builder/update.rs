@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::sharded::NativeBuiltShardedIndex;
 use super::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltIndex, NativeBuiltTier,
     NativeIndexBuilder, TierPlan, checkpoint, invalid,
@@ -19,6 +20,8 @@ use frankensearch_index::{ValidatedFsviBytes, VectorIndexWriter};
 
 #[cfg(feature = "quill")]
 use super::NativeBuiltHybridIndex;
+#[cfg(feature = "quill")]
+use super::sharded::NativeBuiltShardedHybridIndex;
 
 /// Pending upserts/deletes against one immutable source/vector cohort.
 ///
@@ -39,7 +42,10 @@ use super::NativeBuiltHybridIndex;
 /// update. A caller must seal/select the completed successor through its existing
 /// publication policy. Source, vector and graph rebuilding still have their
 /// ordinary full-cohort memory and I/O costs; only inference is incremental.
-/// Construct with [`NativeBuiltIndex::begin_update`].
+/// Construct with [`NativeBuiltIndex::begin_update`] or
+/// [`NativeBuiltShardedIndex::begin_update`]. Either source layout may produce
+/// an ordinary or partitioned successor. Repartitioning preserves inference
+/// reuse by source identity, not the old partition or physical row ordinal.
 pub struct NativeIndexUpdate {
     builder: NativeIndexBuilder,
     edits: BTreeMap<String, Option<IndexableDocument>>,
@@ -63,8 +69,50 @@ impl NativeBuiltIndex {
         directory: impl AsRef<Path>,
         generation: ArtifactGenerationIdentityV1,
     ) -> SearchResult<NativeIndexUpdate> {
+        NativeIndexUpdate::from_partitions(cx, directory, generation, std::slice::from_ref(self))
+    }
+}
+
+impl NativeBuiltShardedIndex {
+    /// Prepare source edits against every partition of this retained cohort.
+    ///
+    /// The returned update owns source and vector pins, not references to this
+    /// handle or paths it must reopen. All partitions must have the same
+    /// per-tier producer, precision and graph policy to inherit; mixed policies
+    /// are refused rather than silently choosing one. No files or models start.
+    /// Use `build_sharded` or `build_sharded_hybrid` to choose new partition sizes,
+    /// or explicitly `build`/`build_hybrid` to coalesce into one ordinary cohort.
+    ///
+    /// # Errors
+    /// Refuses non-newer generations, drift, mixed policies, inconsistent source
+    /// membership or cancellation before staging any successor files.
+    pub fn begin_update(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+    ) -> SearchResult<NativeIndexUpdate> {
+        NativeIndexUpdate::from_partitions(cx, directory, generation, self.partitions())
+    }
+}
+
+impl NativeIndexUpdate {
+    fn from_partitions(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        partitions: &[NativeBuiltIndex],
+    ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.update.prepare")?;
-        if generation.sequence <= self.fast.index.owner_witness().generation.sequence {
+        let first = partitions.first().ok_or_else(|| {
+            invalid(
+                "update.inventory",
+                "empty",
+                "a retained predecessor must have an owner",
+            )
+        })?;
+        let predecessor = first.fast.index.owner_witness().generation;
+        if generation.sequence <= predecessor.sequence {
             return Err(invalid(
                 "update.generation",
                 "not-newer",
@@ -72,26 +120,68 @@ impl NativeBuiltIndex {
             ));
         }
         let mut builder =
-            NativeIndexBuilder::new(directory, generation, Arc::clone(&self.fast.embedder))?;
-        builder.fast = retained_plan(&self.fast)?;
-        builder.quality = self.quality.as_ref().map(retained_plan).transpose()?;
+            NativeIndexBuilder::new(directory, generation, Arc::clone(&first.fast.embedder))?;
+        builder.fast = retained_plan(&first.fast)?;
+        builder.quality = first.quality.as_ref().map(retained_plan).transpose()?;
         // Admit the new generation binding even when no changed documents will
         // need inference. An empty successor is not an identity bypass.
         builder.fast.binding(&generation)?;
         if let Some(quality) = &builder.quality {
             quality.binding(&generation)?;
         }
-        builder.reuse = Some(ReuseSource {
-            documents: Arc::clone(&self.documents),
-            fast: ReuseTier::new(cx, &self.fast, &self.documents)?,
-            quality: self
-                .quality
-                .as_ref()
-                .map(|tier| ReuseTier::new(cx, tier, &self.documents))
-                .transpose()?,
-        });
+        let mut retained = Vec::with_capacity(partitions.len());
+        let mut previous_id: Option<&str> = None;
+        for partition in partitions {
+            checkpoint(cx, "native_ann.update.partition")?;
+            if partition.fast.index.owner_witness().generation != predecessor
+                || partition.quality.is_some() != builder.quality.is_some()
+                || (partition.documents.is_empty() && partitions.len() != 1)
+            {
+                return Err(invalid(
+                    "update.inventory",
+                    "mismatch",
+                    "all predecessor partitions must share one generation and tier topology",
+                ));
+            }
+            admit_retained_policy(&builder.fast, &partition.fast)?;
+            if let (Some(plan), Some(tier)) = (&builder.quality, &partition.quality) {
+                if tier.index.owner_witness().generation != predecessor {
+                    return Err(invalid(
+                        "update.inventory",
+                        "generation",
+                        "quality belongs to another generation",
+                    ));
+                }
+                admit_retained_policy(plan, tier)?;
+            }
+            for document in partition.documents.iter() {
+                checkpoint(cx, "native_ann.update.partition_sources")?;
+                if document.id.is_empty()
+                    || previous_id.is_some_and(|id| id >= document.id.as_str())
+                {
+                    return Err(invalid(
+                        "update.source_join",
+                        "order",
+                        "retained sources must be nonempty IDs in strictly increasing order",
+                    ));
+                }
+                previous_id = Some(&document.id);
+            }
+            retained.push(ReusePartition {
+                documents: Arc::clone(&partition.documents),
+                fast: ReuseTier::new(cx, &partition.fast, &partition.documents)?,
+                quality: partition
+                    .quality
+                    .as_ref()
+                    .map(|tier| ReuseTier::new(cx, tier, &partition.documents))
+                    .transpose()?,
+            });
+        }
+        builder.reuse = Some(Arc::new(ReuseSource {
+            partitions: retained,
+        }));
         checkpoint(cx, "native_ann.update.prepared")?;
-        Ok(NativeIndexUpdate {
+        Ok(Self {
             builder,
             edits: BTreeMap::new(),
         })
@@ -180,6 +270,25 @@ impl NativeIndexUpdate {
         Box::pin(self.prepare(cx)?.build(cx)).await
     }
 
+    /// Repartition the edited source cohort without re-embedding unchanged rows.
+    ///
+    /// The ordinary builder recreates all vector images and graphs. Reuse looks
+    /// up the exact ID/content/producer/precision in the shared predecessor
+    /// inventory, independent of both old and new shard boundaries. All child
+    /// builds must succeed; no admitted prefix or live selection is returned.
+    /// Empty output retains one identity-bearing partition. Choose a new root.
+    ///
+    /// # Errors
+    /// Includes the ordinary update and `build_sharded` input, shard-count,
+    /// inference, artifact, cancellation and destination errors.
+    pub async fn build_sharded(
+        self,
+        cx: &Cx,
+        max_documents_per_shard: usize,
+    ) -> SearchResult<NativeBuiltShardedIndex> {
+        Box::pin(self.prepare(cx)?.build_sharded(cx, max_documents_per_shard)).await
+    }
+
     /// Build a complete successor source/vector/Quill cohort from these edits.
     ///
     /// Vector inference is incremental, but Quill is rebuilt from the complete
@@ -194,6 +303,28 @@ impl NativeIndexUpdate {
     #[cfg(feature = "quill")]
     pub async fn build_hybrid(self, cx: &Cx) -> SearchResult<NativeBuiltHybridIndex> {
         Box::pin(self.prepare(cx)?.build_hybrid(cx)).await
+    }
+
+    /// Rebuild edited vector partitions and one global Quill/source cohort.
+    ///
+    /// Uses the existing complete sharded hybrid builder and its exact lexical
+    /// census. Deleted IDs and old text cannot survive in one component. Old
+    /// readers keep their old cohort; the caller separately seals/selects this
+    /// complete successor. Only inference is incremental, not artifact writes.
+    ///
+    /// # Errors
+    /// Includes all required vector, graph, lexical and source admission errors.
+    #[cfg(feature = "quill")]
+    pub async fn build_sharded_hybrid(
+        self,
+        cx: &Cx,
+        max_documents_per_shard: usize,
+    ) -> SearchResult<NativeBuiltShardedHybridIndex> {
+        Box::pin(
+            self.prepare(cx)?
+                .build_sharded_hybrid(cx, max_documents_per_shard),
+        )
+        .await
     }
 
     fn prepare(mut self, cx: &Cx) -> SearchResult<NativeIndexBuilder> {
@@ -213,7 +344,7 @@ impl NativeIndexUpdate {
             )
         })?;
         let mut documents = Vec::new();
-        for previous in source.documents.iter() {
+        for previous in source.documents() {
             checkpoint(cx, "native_ann.update.merge_source")?;
             match self.edits.remove(previous.id.as_str()) {
                 Some(Some(document)) => documents.push(document),
@@ -252,13 +383,68 @@ impl NativeBuiltHybridIndex {
     }
 }
 
-pub(super) struct ReuseSource {
-    documents: Arc<[IndexableDocument]>,
-    pub(super) fast: ReuseTier,
-    pub(super) quality: Option<ReuseTier>,
+#[cfg(feature = "quill")]
+impl NativeBuiltShardedHybridIndex {
+    /// Stage edits against the exact source/vector cohort behind this Quill view.
+    ///
+    /// Finish with `build_sharded_hybrid` to reconstruct the complete global
+    /// lexical population with the edited vector partitions. Existing progressive
+    /// queries continue borrowing their original complete object.
+    ///
+    /// # Errors
+    /// Has the same admission errors as `NativeBuiltShardedIndex::begin_update`.
+    pub fn begin_update(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+    ) -> SearchResult<NativeIndexUpdate> {
+        self.vectors().begin_update(cx, directory, generation)
+    }
 }
 
-pub(super) struct ReuseTier {
+pub(super) struct ReuseSource {
+    // Shared by ALL successor children: no repeated source-body, vector-slab,
+    // or physical-row-map copies when repartitioning the predecessor.
+    partitions: Vec<ReusePartition>,
+}
+
+struct ReusePartition {
+    documents: Arc<[IndexableDocument]>,
+    fast: ReuseTier,
+    quality: Option<ReuseTier>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ReuseRole {
+    Fast,
+    Quality,
+}
+
+impl ReuseSource {
+    fn documents(&self) -> impl Iterator<Item = &IndexableDocument> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.documents.iter())
+    }
+
+    fn find(&self, id: &str) -> Option<(&ReusePartition, usize)> {
+        let ordinal = self.partitions.partition_point(|partition| {
+            partition
+                .documents
+                .last()
+                .is_some_and(|last| last.id.as_str() < id)
+        });
+        let partition = self.partitions.get(ordinal)?;
+        let position = partition
+            .documents
+            .binary_search_by(|document| document.id.as_str().cmp(id))
+            .ok()?;
+        Some((partition, position))
+    }
+}
+
+struct ReuseTier {
     owner: Arc<ValidatedFsviBytes>,
     physical_rows: Vec<usize>,
     producer_fingerprint: String,
@@ -313,40 +499,47 @@ impl TierPlan {
         cx: &Cx,
         writer: &mut VectorIndexWriter,
         documents: &[IndexableDocument],
-        reuse: Option<(&ReuseSource, &ReuseTier)>,
+        reuse: Option<(&ReuseSource, ReuseRole)>,
     ) -> SearchResult<()> {
-        let Some((source, tier)) = reuse else {
+        let Some((source, role)) = reuse else {
             return self.write_batch(cx, writer, documents).await;
         };
         checkpoint(cx, "native_ann.update.before_batch")?;
         self.admit(self.embedder.identity()?)?;
-        if self.identity.fingerprint() != tier.producer_fingerprint {
-            return Err(invalid(
-                "update.producer",
-                "changed",
-                "reused vectors require the original complete producer identity",
-            ));
-        }
-        if self.precision != tier.precision {
-            return self.write_batch(cx, writer, documents).await;
-        }
+        let producer = self.identity.fingerprint();
         let mut changed = Vec::new();
         for document in documents {
             checkpoint(cx, "native_ann.update.reuse_row")?;
-            let previous = source
-                .documents
-                .binary_search_by(|previous| previous.id.cmp(&document.id))
-                .ok()
-                .filter(|&position| source.documents[position].content == document.content);
-            if let Some(position) = previous {
-                let physical = tier.physical_rows[position];
-                let vector = tier.owner.vector_at_f32(physical)?;
-                // F16 -> F32 -> the SAME F16 storage is exact. F32 rows also
-                // retain their bits; no normalized or rank-derived score is used.
-                writer.write_record(document.id.as_str(), &vector)?;
-            } else {
-                changed.push(document.clone());
+            if let Some((partition, position)) = source.find(&document.id) {
+                let tier = match role {
+                    ReuseRole::Fast => &partition.fast,
+                    ReuseRole::Quality => partition.quality.as_ref().ok_or_else(|| {
+                        invalid(
+                            "update.source_join",
+                            "quality",
+                            "missing retained quality owner",
+                        )
+                    })?,
+                };
+                if producer != tier.producer_fingerprint {
+                    return Err(invalid(
+                        "update.producer",
+                        "changed",
+                        "reused vectors require the original complete producer identity",
+                    ));
+                }
+                if self.precision == tier.precision
+                    && partition.documents[position].content == document.content
+                {
+                    let physical = tier.physical_rows[position];
+                    let vector = tier.owner.vector_at_f32(physical)?;
+                    // F16 -> F32 -> the SAME F16 storage is exact. Changed
+                    // precision re-embeds instead of promoting rounded values.
+                    writer.write_record(document.id.as_str(), &vector)?;
+                    continue;
+                }
             }
+            changed.push(document.clone());
         }
         if !changed.is_empty() {
             self.write_batch(cx, writer, &changed).await?;
@@ -354,6 +547,33 @@ impl TierPlan {
         checkpoint(cx, "native_ann.update.after_batch")?;
         self.admit(self.embedder.identity()?)
     }
+}
+
+fn admit_retained_policy(reference: &TierPlan, tier: &NativeBuiltTier) -> SearchResult<()> {
+    let actual = retained_plan(tier)?;
+    reference.admit(&actual.identity)?;
+    let same_retrieval = match (reference.retrieval, actual.retrieval) {
+        (NativeBuildRetrieval::Exact, NativeBuildRetrieval::Exact) => true,
+        (
+            NativeBuildRetrieval::Hnsw {
+                params: left,
+                seed: left_seed,
+            },
+            NativeBuildRetrieval::Hnsw {
+                params: right,
+                seed: right_seed,
+            },
+        ) => left == right && left_seed == right_seed,
+        _ => false,
+    };
+    if reference.precision != actual.precision || !same_retrieval {
+        return Err(invalid(
+            "update.partition_policy",
+            "mixed",
+            "inheritance requires uniform per-tier precision and graph policy across partitions",
+        ));
+    }
+    Ok(())
 }
 
 fn retained_plan(tier: &NativeBuiltTier) -> SearchResult<TierPlan> {
@@ -1185,5 +1405,581 @@ mod tests {
             assert!(!path.join("lexical").exists());
             assert_eq!(old.lexical().doc_count().unwrap(), 5);
         });
+    }
+
+    mod sharded_updates {
+        use super::*;
+
+        fn assert_same_shards(actual: &NativeBuiltShardedIndex, expected: &NativeBuiltShardedIndex) {
+            assert_eq!(actual.document_count(), expected.document_count());
+            assert_eq!(actual.partitions().len(), expected.partitions().len());
+            for (actual, expected) in actual.partitions().iter().zip(expected.partitions()) {
+                assert_same_tier(actual.fast(), expected.fast());
+                match (actual.quality(), expected.quality()) {
+                    (Some(actual), Some(expected)) => assert_same_tier(actual, expected),
+                    (None, None) => {}
+                    _ => panic!("required tier topology changed"),
+                }
+                for (actual, expected) in actual.documents().iter().zip(expected.documents()) {
+                    assert_eq!(actual.id, expected.id);
+                    assert_eq!(actual.content, expected.content);
+                    assert_eq!(actual.title, expected.title);
+                    assert_eq!(actual.metadata, expected.metadata);
+                }
+            }
+        }
+
+        #[test]
+        fn repartitioned_updates_match_cold_builds_and_embed_only_three_changed_bodies() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for ann in [false, true] {
+                    for precision in [NativeBuildPrecision::F16, NativeBuildPrecision::F32] {
+                        let dir = tempfile::tempdir().unwrap();
+                        let fast = Provider::new("fast", 2);
+                        let quality = Provider::new("quality", 3);
+                        let old = builder(&dir.path().join("old"), &fast, &quality)
+                            .with_fast_storage(precision, graph(ann))
+                            .with_quality_storage(NativeBuildPrecision::F32, graph(!ann))
+                            .unwrap()
+                            .build_sharded(&cx, 2)
+                            .await
+                            .unwrap();
+                        assert_eq!(old.partitions().len(), 3);
+                        let old_bytes: Vec<_> = old
+                            .partitions()
+                            .iter()
+                            .map(|part| {
+                                (
+                                    std::fs::read(part.fast().vector_path()).unwrap(),
+                                    std::fs::read(part.quality().unwrap().vector_path()).unwrap(),
+                                )
+                            })
+                            .collect();
+                        let revised = IndexableDocument::new("a", "fractional")
+                            .with_title("new title")
+                            .with_metadata("revision", "2");
+                        let next = old
+                            .begin_update(&cx, dir.path().join("next"), generation(2))
+                            .unwrap()
+                            .delete_document("c")
+                            .upsert_documents([
+                                revised.clone(),
+                                IndexableDocument::new("aa", "diagonal"),
+                                IndexableDocument::new("b", "horizontal"),
+                                IndexableDocument::new("d", "vertical"),
+                            ])
+                            .with_batch_size(2)
+                            .unwrap()
+                            .build_sharded(&cx, 3)
+                            .await
+                            .unwrap();
+                        assert_eq!(next.partitions().len(), 2);
+                        assert_eq!(fast.submitted.load(Ordering::SeqCst), 8);
+                        assert_eq!(quality.submitted.load(Ordering::SeqCst), 8);
+                        // This unchanged row crossed a partition boundary. A
+                        // shard-local reuse lookup would unnecessarily embed it.
+                        assert!(old.partitions()[2].document("z-fast").is_some());
+                        assert!(next.partitions()[1].document("z-fast").is_some());
+                        let cold = NativeIndexBuilder::new(
+                            dir.path().join("cold"),
+                            generation(2),
+                            fast.clone(),
+                        )
+                        .unwrap()
+                        .with_quality_embedder(quality.clone())
+                        .unwrap()
+                        .with_fast_storage(precision, graph(ann))
+                        .with_quality_storage(NativeBuildPrecision::F32, graph(!ann))
+                        .unwrap()
+                        .add_documents([
+                            revised,
+                            IndexableDocument::new("aa", "diagonal"),
+                            IndexableDocument::new("b", "horizontal"),
+                            IndexableDocument::new("d", "vertical"),
+                            IndexableDocument::new("x", "diagonal"),
+                            IndexableDocument::new("z-fast", "horizontal"),
+                        ])
+                        .build_sharded(&cx, 3)
+                        .await
+                        .unwrap();
+                        assert_same_shards(&next, &cold);
+                        assert_eq!(
+                            old.search_fast(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                            "b"
+                        );
+                        assert_eq!(
+                            next.search_fast(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                            "d"
+                        );
+                        assert_eq!(
+                            next.search_quality(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                            "d"
+                        );
+                        for (part, (fast_bytes, quality_bytes)) in
+                            old.partitions().iter().zip(old_bytes)
+                        {
+                            assert_eq!(
+                                std::fs::read(part.fast().vector_path()).unwrap(),
+                                fast_bytes
+                            );
+                            assert_eq!(
+                                std::fs::read(part.quality().unwrap().vector_path()).unwrap(),
+                                quality_bytes
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn repartitioning_and_coalescing_keep_owned_sources_after_old_paths_disappear() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("fast", 2);
+                let quality = Provider::new("quality", 3);
+                let path = dir.path().join("old");
+                let old = builder(&path, &fast, &quality)
+                    .build_sharded(&cx, 1)
+                    .await
+                    .unwrap();
+                let pending = old
+                    .begin_update(&cx, dir.path().join("next"), generation(2))
+                    .unwrap();
+                std::fs::rename(&path, dir.path().join("archived")).unwrap();
+                drop(old);
+                fast.fault.store(FAIL, Ordering::SeqCst);
+                quality.fault.store(FAIL, Ordering::SeqCst);
+                let next = pending.build_sharded(&cx, 4).await.unwrap();
+                assert_eq!(next.partitions().len(), 2);
+                let single = next
+                    .begin_update(&cx, dir.path().join("single"), generation(3))
+                    .unwrap()
+                    .build(&cx)
+                    .await
+                    .unwrap();
+                let split = single
+                    .begin_update(&cx, dir.path().join("split"), generation(4))
+                    .unwrap()
+                    .build_sharded(&cx, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(split.partitions().len(), 3);
+                assert_eq!(split.document_count(), 5);
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(
+                    split.search_quality(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                    "b"
+                );
+            });
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[test]
+        fn metadata_edits_delete_all_and_restart_retain_exact_empty_topology() {
+            use crate::native_ann::builder::sharded::NativeShardedReopenLimits;
+
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("fast", 2);
+                let quality = Provider::new("quality", 3);
+                let old = builder(&dir.path().join("old"), &fast, &quality)
+                    .build_sharded(&cx, 2)
+                    .await
+                    .unwrap();
+                fast.fault.store(FAIL, Ordering::SeqCst);
+                quality.fault.store(FAIL, Ordering::SeqCst);
+                let next = old
+                    .begin_update(&cx, dir.path().join("metadata"), generation(2))
+                    .unwrap()
+                    .upsert_document(
+                        IndexableDocument::new("b", "vertical").with_title("changed title"),
+                    )
+                    .upsert_document(IndexableDocument::new("temporary", "never embedded"))
+                    .delete_document("temporary")
+                    .delete_document("absent")
+                    .build_sharded(&cx, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    next.document("b").unwrap().title.as_deref(),
+                    Some("changed title")
+                );
+                let mut update = next
+                    .begin_update(&cx, dir.path().join("empty"), generation(3))
+                    .unwrap();
+                for document in documents() {
+                    update = update.delete_document(document.id);
+                }
+                let empty = update.build_sharded(&cx, 2).await.unwrap();
+                assert_eq!(empty.document_count(), 0);
+                assert_eq!(empty.partitions().len(), 1);
+                assert!(empty.quality().is_some());
+                let receipt = empty.seal_for_reopen(&cx).unwrap();
+                let reopened = NativeBuiltShardedIndex::open_selected(
+                    &cx,
+                    empty.directory(),
+                    &receipt,
+                    fast.clone(),
+                    Some(quality.clone()),
+                    NativeShardedReopenLimits::default(),
+                )
+                .unwrap();
+                assert_eq!(reopened.document_count(), 0);
+                assert!(
+                    reopened
+                        .search_quality(&cx, "vertical", 10)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                fast.fault.store(OK, Ordering::SeqCst);
+                quality.fault.store(OK, Ordering::SeqCst);
+                let restored = reopened
+                    .begin_update(&cx, dir.path().join("restored"), generation(4))
+                    .unwrap()
+                    .upsert_document(IndexableDocument::new("new", "vertical"))
+                    .build_sharded(&cx, 2)
+                    .await
+                    .unwrap();
+                assert_eq!(restored.document_count(), 1);
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 6);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 6);
+                assert!(old.document("b").is_some());
+            });
+        }
+
+        #[test]
+        fn changed_precision_reembeds_only_its_tier_even_across_new_boundaries() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("fast", 2);
+                let quality = Provider::new("quality", 3);
+                let old = builder(&dir.path().join("old"), &fast, &quality)
+                    .with_fast_storage(NativeBuildPrecision::F16, graph(false))
+                    .build_sharded(&cx, 2)
+                    .await
+                    .unwrap();
+                quality.fault.store(FAIL, Ordering::SeqCst);
+                let next = old
+                    .begin_update(&cx, dir.path().join("next"), generation(2))
+                    .unwrap()
+                    .with_fast_storage(NativeBuildPrecision::F32, graph(true))
+                    .build_sharded(&cx, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 10);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                for part in next.partitions() {
+                    assert!(part.fast().graph_path().is_some());
+                    assert!(part.quality().unwrap().graph_path().is_none());
+                }
+                let owner = &next.partitions()[0].fast.index.owner;
+                assert_eq!(owner.doc_id_at(0).unwrap(), "a");
+                assert_eq!(owner.vector_at_f32(0).unwrap(), fast.values("fractional"));
+            });
+        }
+
+        #[test]
+        fn invalid_sources_shard_limits_and_late_provider_drift_precede_creation() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("fast", 2);
+                let quality = Provider::new("quality", 3);
+                let old = builder(&dir.path().join("old"), &fast, &quality)
+                    .build_sharded(&cx, 2)
+                    .await
+                    .unwrap();
+                let path = dir.path().join("rejected");
+                assert!(old.begin_update(&cx, &path, generation(1)).is_err());
+                for fault in ["size", "empty", "count", "bytes", "drift"] {
+                    let update = old.begin_update(&cx, &path, generation(2)).unwrap();
+                    let result = match fault {
+                        "size" => update.build_sharded(&cx, 0).await,
+                        "empty" => update.delete_document("").build_sharded(&cx, 2).await,
+                        "count" => {
+                            update
+                                .upsert_documents((0..1025).map(|i| {
+                                    IndexableDocument::new(format!("new-{i:04}"), "vertical")
+                                }))
+                                .build_sharded(&cx, 1)
+                                .await
+                        }
+                        "bytes" => {
+                            update
+                                .with_max_batch_input_bytes(3)
+                                .unwrap()
+                                .build_sharded(&cx, 2)
+                                .await
+                        }
+                        _ => {
+                            quality.fault.store(IDENTITY_DRIFT, Ordering::SeqCst);
+                            update.build_sharded(&cx, 2).await
+                        }
+                    };
+                    quality.fault.store(OK, Ordering::SeqCst);
+                    assert!(result.is_err(), "{fault}");
+                    assert!(!path.exists(), "{fault}");
+                    assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                    assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                }
+                cx.set_cancel_requested(true);
+                let result = old.begin_update(&cx, &path, generation(2));
+                cx.set_cancel_requested(false);
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                assert!(!path.exists());
+            });
+        }
+
+        #[test]
+        fn last_partition_failure_or_drop_never_returns_a_successful_prefix() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for fault in [FAIL, FOREIGN, CANCEL, PENDING] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let fast = Provider::new("fast", 2);
+                    let quality = Provider::new("quality", 3);
+                    let old = builder(&dir.path().join("old"), &fast, &quality)
+                        .build_sharded(&cx, 2)
+                        .await
+                        .unwrap();
+                    let path = dir.path().join("failed");
+                    let update = old
+                        .begin_update(&cx, &path, generation(2))
+                        .unwrap()
+                        .upsert_document(IndexableDocument::new("zz-new", "vertical"));
+                    quality.fault.store(fault, Ordering::SeqCst);
+                    if fault == PENDING {
+                        let drops = quality.drops.load(Ordering::SeqCst);
+                        let mut pending = Box::pin(update.build_sharded(&cx, 2));
+                        assert!(
+                            pending
+                                .as_mut()
+                                .poll(&mut Context::from_waker(Waker::noop()))
+                                .is_pending()
+                        );
+                        assert_eq!(
+                            old.search_quality(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                            "b"
+                        );
+                        drop(pending);
+                        assert_eq!(quality.drops.load(Ordering::SeqCst), drops + 1);
+                    } else {
+                        let result = update.build_sharded(&cx, 2).await;
+                        assert!(result.is_err());
+                        if fault == CANCEL {
+                            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                            cx.set_cancel_requested(false);
+                        }
+                    }
+                    // Earlier children really completed; no test that fails
+                    // immediately can discharge the partial-inventory contract.
+                    assert!(path.join("shard-000000/fast.fsvi").is_file());
+                    assert!(path.join("shard-000001/quality.fsvi").is_file());
+                    assert!(!path.join("native.sharded.json").exists());
+                    assert!(!path.join("native.sharded-hybrid.json").exists());
+                    assert_eq!(old.document_count(), 5);
+                    assert!(old.document("zz-new").is_none());
+                    quality.fault.store(OK, Ordering::SeqCst);
+                    let retry = old
+                        .begin_update(&cx, dir.path().join("retry"), generation(2))
+                        .unwrap()
+                        .upsert_document(IndexableDocument::new("zz-new", "vertical"))
+                        .build_sharded(&cx, 2)
+                        .await
+                        .unwrap();
+                    assert_eq!(retry.document_count(), 6);
+                }
+            });
+        }
+
+        #[test]
+        fn every_retained_partition_policy_is_checked_before_staging() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for fault in [
+                    "precision",
+                    "graph",
+                    "producer",
+                    "generation",
+                    "order",
+                    "drift",
+                ] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let fast = Provider::new("fast", 2);
+                    let other =
+                        Provider::new(if fault == "producer" { "other" } else { "fast" }, 2);
+                    let first =
+                        NativeIndexBuilder::new(dir.path().join("a"), generation(1), fast.clone())
+                            .unwrap()
+                            .add_document(IndexableDocument::new("a", "horizontal"))
+                            .build(&cx)
+                            .await
+                            .unwrap();
+                    let mut last = NativeIndexBuilder::new(
+                        dir.path().join("b"),
+                        generation(if fault == "generation" { 2 } else { 1 }),
+                        other.clone(),
+                    )
+                    .unwrap()
+                    .add_document(IndexableDocument::new(
+                        if fault == "order" { "a" } else { "b" },
+                        "vertical",
+                    ));
+                    if fault == "precision" {
+                        last = last.with_fast_storage(NativeBuildPrecision::F16, graph(false));
+                    }
+                    if fault == "graph" {
+                        last = last.with_fast_storage(NativeBuildPrecision::F32, graph(true));
+                    }
+                    let last = last.build(&cx).await.unwrap();
+                    if fault == "drift" {
+                        other.fault.store(IDENTITY_DRIFT, Ordering::SeqCst);
+                    }
+                    let path = dir.path().join("next");
+                    // Private constructor receives individually valid, retained
+                    // owners. It must not trust only the first partition.
+                    assert!(
+                        NativeIndexUpdate::from_partitions(
+                            &cx,
+                            &path,
+                            generation(3),
+                            &[first, last],
+                        )
+                        .is_err(),
+                        "{fault}"
+                    );
+                    assert!(!path.exists());
+                    assert_eq!(fast.submitted.load(Ordering::SeqCst), 1);
+                    assert_eq!(other.submitted.load(Ordering::SeqCst), 1);
+                }
+            });
+        }
+
+        #[cfg(all(feature = "quill", any(target_os = "linux", target_os = "macos")))]
+        #[test]
+        fn hybrid_updates_replace_global_lexical_membership_and_preserve_old_phases() {
+            use crate::native_ann::NativeShardedSearchPhase;
+            use crate::native_ann::builder::sharded::NativeShardedHybridReopenLimits;
+
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("fast", 2);
+                let quality = Provider::new("quality", 3);
+                let old =
+                    NativeIndexBuilder::new(dir.path().join("old"), generation(1), fast.clone())
+                        .unwrap()
+                        .with_quality_embedder(quality.clone())
+                        .unwrap()
+                        .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                        .add_documents([
+                            IndexableDocument::new("a", "retained common"),
+                            IndexableDocument::new("b", "obsolete common")
+                                .with_metadata("revision", "old"),
+                            IndexableDocument::new("c", "removed common"),
+                        ])
+                        .build_sharded_hybrid(&cx, 2)
+                        .await
+                        .unwrap();
+                let mut phases = old.progressive(&cx, "obsolete", 1).unwrap();
+                let Some(NativeShardedSearchPhase::Initial { results, .. }) =
+                    phases.next_phase().await.unwrap()
+                else {
+                    panic!("initial phase missing");
+                };
+                assert_eq!(results[0].result.doc_id, "b");
+                let path = dir.path().join("next");
+                let next = old
+                    .begin_update(&cx, &path, generation(2))
+                    .unwrap()
+                    .delete_document("c")
+                    .upsert_documents([
+                        IndexableDocument::new("b", "replacement common")
+                            .with_metadata("revision", "new"),
+                        IndexableDocument::new("d", "arrival common"),
+                    ])
+                    .build_sharded_hybrid(&cx, 1)
+                    .await
+                    .unwrap();
+                assert_eq!(next.vectors().partitions().len(), 3);
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                for query in ["obsolete", "removed"] {
+                    assert!(
+                        next.lexical()
+                            .search(&cx, query, 10)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                assert_eq!(
+                    next.lexical().search(&cx, "arrival", 10).await.unwrap()[0].doc_id,
+                    "d"
+                );
+                assert_eq!(
+                    next.vectors().document("b").unwrap().metadata["revision"],
+                    "new"
+                );
+                let Some(NativeShardedSearchPhase::Refined { results, .. }) =
+                    phases.next_phase().await.unwrap()
+                else {
+                    panic!("old query lost its required quality phase");
+                };
+                assert_eq!(results[0].result.doc_id, "b");
+                assert!(results[0].result.lexical_score.is_some());
+                assert_eq!(
+                    old.vectors().document("b").unwrap().metadata["revision"],
+                    "old"
+                );
+                assert_eq!(
+                    old.lexical().search(&cx, "removed", 10).await.unwrap()[0].doc_id,
+                    "c"
+                );
+                let receipt = next.seal_for_reopen(&cx).unwrap();
+                drop(next);
+                let reopened = NativeBuiltShardedHybridIndex::open_selected(
+                    &cx,
+                    &path,
+                    &receipt,
+                    fast.clone(),
+                    Some(quality.clone()),
+                    NativeShardedHybridReopenLimits::default(),
+                )
+                .await
+                .unwrap();
+                assert!(reopened.vectors().document("c").is_none());
+                for hit in reopened.search_refined(&cx, "replacement", 10).await.unwrap() {
+                    assert!(hit.result.index.is_none());
+                    if let Some(row) = hit.fast_row {
+                        assert_eq!(
+                            reopened.vectors().partitions()[row.shard]
+                                .fast
+                                .index
+                                .owner
+                                .doc_id_at(usize::try_from(row.physical_row).unwrap())
+                                .unwrap(),
+                            hit.result.doc_id
+                        );
+                    }
+                    if let Some(row) = hit.quality_row {
+                        assert_eq!(
+                            reopened.vectors().partitions()[row.shard]
+                                .quality
+                                .as_ref()
+                                .unwrap()
+                                .index
+                                .owner
+                                .doc_id_at(usize::try_from(row.physical_row).unwrap())
+                                .unwrap(),
+                            hit.result.doc_id
+                        );
+                    }
+                }
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+            });
+        }
     }
 }

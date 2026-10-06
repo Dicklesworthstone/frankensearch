@@ -43,7 +43,7 @@ pub mod sharded;
 
 mod update;
 pub use update::NativeIndexUpdate;
-use update::ReuseSource;
+use update::{ReuseRole, ReuseSource};
 
 #[cfg(feature = "quill")]
 mod hybrid;
@@ -212,7 +212,7 @@ pub struct NativeIndexBuilder {
     max_batch_input_bytes: Option<usize>,
     split_failed_batches: bool,
     documents: Vec<IndexableDocument>,
-    reuse: Option<ReuseSource>,
+    reuse: Option<Arc<ReuseSource>>,
 }
 
 impl NativeIndexBuilder {
@@ -421,14 +421,14 @@ impl NativeIndexBuilder {
                     cx,
                     &mut fast_writer,
                     batch,
-                    self.reuse.as_ref().map(|source| (source, &source.fast)),
+                    self.reuse.as_deref().map(|source| (source, ReuseRole::Fast)),
                 )
                 .await?;
             if let (Some(tier), Some(writer)) = (&self.quality, &mut quality_writer) {
                 let reuse = self
                     .reuse
-                    .as_ref()
-                    .and_then(|source| source.quality.as_ref().map(|quality| (source, quality)));
+                    .as_deref()
+                    .map(|source| (source, ReuseRole::Quality));
                 tier.write_batch_reusing(cx, writer, batch, reuse).await?;
             }
             batch_start = batch_end;

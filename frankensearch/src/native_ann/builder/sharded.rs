@@ -118,7 +118,7 @@ impl NativeIndexBuilder {
     ///
     /// # Errors
     /// Rejects zero partition size, more than 1024 partitions, invalid sources,
-    /// producer drift, unsupported reuse, and ordinary build/admission failures.
+    /// producer drift, and ordinary build/admission failures.
     pub async fn build_sharded(
         mut self,
         cx: &Cx,
@@ -137,10 +137,10 @@ impl NativeIndexBuilder {
             .len()
             .div_ceil(max_documents_per_shard)
             .max(1);
-        if count > MAX_NATIVE_BUILD_SHARDS || self.reuse.is_some() {
+        if count > MAX_NATIVE_BUILD_SHARDS {
             return Err(rejected(
                 "partition_count",
-                "shard limit exceeded or unpartitioned reuse supplied",
+                "shard limit exceeded",
             ));
         }
         for tier in std::iter::once(&self.fast).chain(self.quality.iter()) {
@@ -165,7 +165,9 @@ impl NativeIndexBuilder {
                 max_batch_input_bytes: self.max_batch_input_bytes,
                 split_failed_batches: self.split_failed_batches,
                 documents: documents.by_ref().take(max_documents_per_shard).collect(),
-                reuse: None,
+                // Every successor partition shares one admitted predecessor
+                // inventory. Source IDs, not old shard ordinals, select reuse.
+                reuse: self.reuse.as_ref().map(Arc::clone),
             };
             partitions.push(Box::pin(builder.build(cx)).await?);
         }
