@@ -96,11 +96,22 @@ impl BoundCompleteSocket {
                 source: Box::new(io::Error::from(source)),
             },
         )?;
-        // Never steal a socket from a legacy/non-cooperating server. In
-        // particular, a successful lock is not proof that an existing socket
-        // is stale. Crash recovery requires explicitly removing a verified
-        // stale endpoint, not an unbounded connect probe or blind unlink.
+        // Never steal a socket from a legacy/non-cooperating server: a
+        // successful lock alone is not proof that an existing socket is
+        // stale. A crashed daemon, or a reboot, leaves its socket behind; it
+        // is replaced only once verified stale. The lock rules out a
+        // cooperating owner, one refused connect rules out any listener, and
+        // nobody can bind a path while it exists. Any other file stays.
         match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_socket() && control::refuses_connections(&path) =>
+            {
+                fs::remove_file(&path)?;
+                tracing::info!(
+                    socket = %path.display(),
+                    "removed a verified stale complete-generation daemon socket"
+                );
+            }
             Ok(_) => {
                 return Err(complete_cli_error(
                     "daemon_socket",
@@ -770,6 +781,22 @@ mod tests {
         let inode = fs::metadata(&socket).unwrap().ino();
         assert!(BoundCompleteSocket::bind(socket.clone()).is_err());
         assert_eq!(fs::metadata(socket).unwrap().ino(), inode);
+    }
+
+    /// A socket left by a crashed daemon (or a reboot) has no listener; a new
+    /// daemon replaces it instead of refusing to start until someone deletes
+    /// it. Live listeners and other files stay untouched (test above).
+    #[test]
+    fn socket_startup_replaces_only_a_verified_stale_endpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("search.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        assert!(path.exists(), "the endpoint outlives its listener");
+        assert!(control::refuses_connections(&path));
+        let owner = BoundCompleteSocket::bind(path.clone()).expect("a stale endpoint is replaced");
+        assert!(!control::refuses_connections(&path), "the new owner listens");
+        drop(owner);
+        assert!(!path.exists());
     }
 
     #[test]

@@ -831,22 +831,44 @@ impl FsfsRuntime {
                 // A plain search defaults to daemon transport. With no
                 // query daemon serving this store, search in process as the
                 // legacy layout does. A named --daemon-socket still fails closed.
-                let serving = self.cli_input.daemon_socket.is_some()
-                    || match fs::symlink_metadata(self.complete_generation_socket_path(root)?) {
+                let named = self.cli_input.daemon_socket.is_some();
+                let socket = self.complete_generation_socket_path(root)?;
+                let serving = named
+                    || match fs::symlink_metadata(&socket) {
                         Ok(_) => true,
                         Err(error) if error.kind() == ErrorKind::NotFound => false,
                         Err(error) => return Err(error.into()),
                     };
-                if serving && self.cli_input.stream {
-                    return self
-                        .stream_complete_generation_daemon(cx, root, query, limit, writer)
-                        .await;
-                }
                 if serving {
-                    let payload = self
-                        .query_complete_generation_daemon(cx, root, query, limit)
-                        .await?;
-                    return self.emit_complete_search_payload(payload, started, writer);
+                    let forwarded = if self.cli_input.stream {
+                        self.stream_complete_generation_daemon(cx, root, query, limit, writer)
+                            .await
+                            .map(|()| None)
+                    } else {
+                        self.query_complete_generation_daemon(cx, root, query, limit)
+                            .await
+                            .map(Some)
+                    };
+                    match forwarded {
+                        Ok(Some(payload)) => {
+                            return self.emit_complete_search_payload(payload, started, writer);
+                        }
+                        Ok(None) => return Ok(()),
+                        // A crashed daemon or a reboot leaves the store-root
+                        // socket with no listener, and the daemon never
+                        // unlinks a socket it did not create. A refused
+                        // connect means nothing received the request or wrote
+                        // output, so search in process as when no socket exists.
+                        Err(SearchError::Io(error))
+                            if !named && error.kind() == ErrorKind::ConnectionRefused =>
+                        {
+                            tracing::warn!(
+                                socket = %socket.display(),
+                                "complete-generation daemon socket has no listener; searching in process"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
             #[cfg(not(unix))]
@@ -1964,6 +1986,48 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert!(line.contains(&selected.path().display().to_string()), "{line}");
+        });
+    }
+
+    /// A crashed daemon, or a reboot, leaves the store-root socket with no
+    /// listener. A plain search then searches in process, as when no socket
+    /// exists, instead of failing until someone removes the file. A named
+    /// --daemon-socket still fails closed.
+    #[test]
+    fn complete_search_falls_back_in_process_on_a_stale_store_socket() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let socket = runtime.complete_generation_socket_path(&root).unwrap();
+            drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());
+            assert!(socket.exists(), "the socket file outlives its listener");
+
+            let mut search = search_runtime(&runtime);
+            search.cli_input.daemon = true;
+            let mut output = Vec::new();
+            search
+                .run_complete_generation_search_with_writer(&cx, &root, &mut output)
+                .await
+                .expect("a stale default socket falls back to in-process search");
+            let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(envelope["ok"], true);
+            assert!(
+                envelope["data"]["hits"]
+                    .as_array()
+                    .is_some_and(|hits| !hits.is_empty()),
+                "{envelope}"
+            );
+
+            search.cli_input.daemon_socket = Some(socket.clone());
+            let error = search
+                .run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, SearchError::Io(io) if io.kind() == ErrorKind::ConnectionRefused),
+                "{error:?}"
+            );
         });
     }
 

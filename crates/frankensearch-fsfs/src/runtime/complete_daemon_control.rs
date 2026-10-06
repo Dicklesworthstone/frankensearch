@@ -181,6 +181,20 @@ pub(super) async fn connect(
     }
 }
 
+/// Whether nothing listens at the Unix socket `path`: one non-blocking
+/// connect is refused outright. A live listener, even with a full backlog,
+/// accepts the connection or reports EAGAIN, never ECONNREFUSED.
+pub(super) fn refuses_connections(path: &Path) -> bool {
+    let (Ok(address), Ok(socket)) = (rustix::net::SocketAddrUnix::new(path), client_socket())
+    else {
+        return false;
+    };
+    matches!(
+        rustix::net::connect(&socket, &address),
+        Err(rustix::io::Errno::CONNREFUSED)
+    )
+}
+
 fn client_socket() -> io::Result<rustix::fd::OwnedFd> {
     use rustix::net::{AddressFamily, SocketType};
 
