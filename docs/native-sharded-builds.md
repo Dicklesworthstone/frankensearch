@@ -75,8 +75,9 @@ trusted and immutable; this is not descriptor-relative hostile-writer safety.
 
 The vector/source handle alone does not certify an independently supplied keyword
 reader. Use the complete hybrid API below for a joined lexical/source cohort.
-Neither API provides a sharded mutation protocol or changes the CLI/default fsfs
-layout. Ordinary unpartitioned formats and admission contracts stay unchanged.
+Source edits and repartitioning use the shared update API described below. These
+library APIs do not change the CLI/default fsfs layout. Ordinary unpartitioned
+formats and admission contracts stay unchanged.
 
 ## One global lexical population with partitioned vectors
 
@@ -166,3 +167,77 @@ cargo test -p frankensearch --features quill --lib native_ann::builder::sharded:
 The deterministic identified providers exercise the real vector/graph writers,
 selected restart and shard queries. They do not establish semantic relevance,
 real-model throughput, ANN recall, or platform qualification.
+
+## Incremental inference across repartitioned successors
+
+Both `NativeBuiltShardedIndex::begin_update` and
+`NativeBuiltShardedHybridIndex::begin_update` return the existing
+`NativeIndexUpdate`, not a separate mutation language or vector merge engine.
+Upserts replace a complete source record; the last edit for an ID wins. A delete
+removes that ID from every successor component. Deleting an absent ID is a no-op.
+IDs must remain nonempty. The caller supplies a valid generation identity whose
+sequence is strictly higher than the predecessor's; exhaustion cannot wrap into
+a valid successor.
+
+```rust,ignore
+// old is an admitted NativeBuiltShardedHybridIndex; next_generation comes
+// from the caller's publication protocol, with a strictly higher sequence.
+let next = old.begin_update(&cx, &new_directory, next_generation)?
+    .upsert_document(
+        IndexableDocument::new("src/client.rs", "prepared replacement body")
+            .with_metadata("revision", "2"),
+    )
+    .delete_document("obsolete.md")
+    .with_batch_size(16)?
+    .with_max_batch_input_bytes(1024 * 1024)?
+    .build_sharded_hybrid(&cx, 5_000)
+    .await?;
+let receipt = next.seal_for_reopen(&cx)?;
+// Select this receipt separately. Existing queries on old keep their cohort.
+```
+
+Every old partition's generation, sources, producer, vector membership and
+storage policy is admitted before staging. Per-tier precision, graph parameters
+and seed must be uniform across the retained inventory to inherit; a mixed
+inventory is refused instead of silently choosing its first partition's policy.
+The original producing models and tier presence cannot change through update.
+`with_fast_storage`/`with_quality_storage` can explicitly change successor storage:
+a precision change re-embeds that entire tier rather than promoting rounded F16
+values to alleged original F32 output. Changing only graph policy needs no new
+embedding when the source, producer and precision still agree.
+
+Reuse follows exact source ID, prepared content, complete producer identity and
+storage precision. It does not follow the old partition number, a physical row
+number in another owner, current filesystem content, or title/metadata equality.
+A metadata/title-only edit therefore rebuilds source and Quill without inference.
+A rename (delete plus new-ID upsert) is deliberately re-embedded. Repartitioning
+may move every surviving document while retaining eligible vectors in both tiers.
+One shared predecessor inventory retains original source arrays and vector owners;
+the source-ID-to-physical-row maps are built once, not copied for every new shard.
+An owned pending update remains valid after dropping the original vector handle
+or moving its old path: it never reopens old vectors to perform reuse.
+
+Choose `build_sharded` for vector/source output, or `build_sharded_hybrid` for
+complete global Quill plus partitioned vectors. The chosen positive partition
+size applies to the final source cohort, with the existing 1024-partition ceiling.
+Deleting everything keeps one empty, identity-bearing partition and the required
+tier topology without inference. The same update can explicitly `build` or
+`build_hybrid` to coalesce into an ordinary single cohort; an ordinary cohort's
+update can conversely build a sharded successor. Existing selected-reopen formats
+work unchanged for the selected output layout.
+
+All successor source/vector images, graphs and global Quill are rebuilt. The final
+source records are cloned/moved as before; all predecessor owners remain resident
+while needed. This is incremental inference, not O(changed-bytes) writes, immutable
+file reuse, a memory bound, or a measured speedup. A failure in the last partition,
+required quality tier or lexical stage returns no complete successor. Cancellation
+or dropping pending work retains the predecessor and may leave incomplete new
+files; nothing is automatically removed, adopted or overwritten. Use a fresh root.
+Sealing, trusted receipt selection, live installation, and disk retention remain
+separate caller responsibilities. There is no new sharded CLI or durable authority.
+
+Focused update regressions (including the existing ordinary-update contracts):
+
+```sh
+cargo test -p frankensearch --features quill --lib native_ann::builder::update
+```
