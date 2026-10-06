@@ -29,7 +29,10 @@ FSFS_COMPLETE_GENERATIONS=1 fsfs index /work/source \
 ```
 
 The success payload identifies the generation, its path and inventory digest,
-and reports `publication: "durable"`. If the pointer rename succeeds but its
+and reports `publication: "durable"`. It also carries every field of the
+legacy-layout index payload (file counts, `semantic_indexed_files`,
+`index_size_bytes`, embedding outcomes, `meta.duration_ms`), with `index_root`
+naming the selected generation. If the pointer rename succeeds but its
 following directory synchronization fails, the command returns an error that
 explicitly says the new generation is already visible and durability is
 uncertain. It does not restore the old pointer or claim the build was aborted.
@@ -94,7 +97,12 @@ fsfs daemon --index-dir /work/search-store --config /work/fsfs.toml --stop
 ```
 
 The first command stays in the foreground and listens at
-`/work/search-store/fsfs-query.sock`; zero disables idle expiry. Each connection
+`/work/search-store/fsfs-query.sock`; zero disables idle expiry. Sockets must
+live directly in the store root, so a store whose socket path exceeds the Unix
+limit (107 bytes on Linux, 103 on macOS) cannot serve; the daemon refuses it
+before binding and names the path. Search still works there in process.
+SIGINT or SIGTERM stops the daemon with exit status 0 and removes its socket; a
+second stop signal forces exit 130. Each connection
 accepts one newline-terminated query; plain queries return a buffered response. The stop
 command addresses that socket and remains usable if the generation selection is
 damaged. It does not start a replacement daemon or repair the selection.

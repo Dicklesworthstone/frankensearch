@@ -158,7 +158,10 @@ requests as described in [complete-generation serving](complete-generation-rebui
 Legacy watcher migration remains outside this workflow. Restart reuse beyond the
 Linux proof described above remains process-local. Ctrl-C cancellation is wired
 through the existing shutdown coordinator; no hard real-time latency is claimed
-for synchronous native operations or indexing work.
+for synchronous native operations or indexing work. The first SIGINT or SIGTERM
+stops the watch cleanly with exit status 0, as on the legacy layout: every
+publication before it has printed its receipt, and an unpublished candidate is
+discarded for the next watch to catch up. A second stop signal forces exit 130.
 
 ## Validation
 

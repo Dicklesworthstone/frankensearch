@@ -2901,6 +2901,72 @@ mod loader_only {
         }
     }
 
+    /// Each vector tier in `generation_root` holds exactly one live row per
+    /// expected file, encoding that file's current text, and no WAL rows.
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    fn assert_vector_tiers_encode_current_files(
+        model_root: &Path,
+        generation_root: &Path,
+        corpus: &Path,
+        expected_ids: &[&str],
+    ) {
+        let stack = frankensearch_embed::EmbedderStack::auto_detect_with_options(
+            Some(model_root),
+            &frankensearch_embed::DetectOptions {
+                offline: Some(true),
+            },
+        )
+        .expect("load verified models for durable vector comparison");
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .unwrap();
+        for (file, embedder) in [
+            ("vector/index.fsvi", stack.fast_arc()),
+            (
+                "vector/quality.fsvi",
+                stack.quality_arc().expect("quality comparison model"),
+            ),
+        ] {
+            let vectors = VectorIndex::open_read_only(&generation_root.join(file))
+                .expect("reopen watched vector tier");
+            let hits = vectors
+                .search_top_k(&vec![1.0; vectors.dimension()], 10, None)
+                .expect("enumerate live tier");
+            let mut ids = hits
+                .iter()
+                .map(|hit| hit.doc_id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            assert_eq!(ids, expected_ids, "{file}");
+            assert_eq!(vectors.wal_record_count(), 0, "{file}: no WAL rows remain");
+            let corpus = corpus.to_path_buf();
+            let expected = scheduler.block_on(scheduler.handle().spawn(async move {
+                use frankensearch_core::Canonicalizer as _;
+                let cx = asupersync::Cx::current().expect("owned comparison context");
+                let mut expected = Vec::new();
+                for id in ids {
+                    let text = frankensearch_core::DefaultCanonicalizer::default()
+                        .canonicalize(&fs::read_to_string(corpus.join(&id)).unwrap());
+                    expected.push((id, embedder.embed(&cx, &text).await.unwrap()));
+                }
+                expected
+            }));
+            for (id, expected) in expected {
+                let hit = hits.iter().find(|hit| hit.doc_id == id).unwrap();
+                let stored = vectors.vector_at_f32(hit.index as usize).unwrap();
+                assert_eq!(stored.len(), expected.len());
+                assert!(
+                    stored
+                        .iter()
+                        .zip(expected)
+                        .all(|(a, b)| (a - b).abs() < 0.001),
+                    "{file}: {id} does not encode the current file after f16 quantization"
+                );
+            }
+        }
+    }
+
     #[cfg(all(unix, feature = "semantic-loaders"))]
     #[test]
     #[ignore = "real-model watch handoff; requires the pinned model cache and semantic E2E opt-in"]
@@ -3052,69 +3118,12 @@ mod loader_only {
 
         // Fresh handles must contain exactly one live row per file in BOTH
         // vector spaces. Query execution below verifies the lexical arm too.
-        let stack = frankensearch_embed::EmbedderStack::auto_detect_with_options(
-            Some(&fsfs.model_root),
-            &frankensearch_embed::DetectOptions {
-                offline: Some(true),
-            },
-        )
-        .expect("load verified models for durable vector comparison");
-        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
-            .blocking_threads(0, 2)
-            .build()
-            .unwrap();
-        for (file, embedder) in [
-            ("vector/index.fsvi", stack.fast_arc()),
-            (
-                "vector/quality.fsvi",
-                stack.quality_arc().expect("quality comparison model"),
-            ),
-        ] {
-            let vectors =
-                VectorIndex::open_read_only(&index.join(file)).expect("reopen watched vector tier");
-            let hits = vectors
-                .search_top_k(&vec![1.0; vectors.dimension()], 10, None)
-                .expect("enumerate live tier");
-            let mut ids = hits
-                .iter()
-                .map(|hit| hit.doc_id.clone())
-                .collect::<Vec<_>>();
-            ids.sort();
-            assert_eq!(
-                ids,
-                ["astronomy.md", "database.md", "handoff.md", "live.md"],
-                "{file}"
-            );
-            assert_eq!(
-                vectors.wal_record_count(),
-                0,
-                "{file}: graceful shutdown must compact"
-            );
-            let corpus = corpus.clone();
-            let expected = scheduler.block_on(scheduler.handle().spawn(async move {
-                use frankensearch_core::Canonicalizer as _;
-                let cx = asupersync::Cx::current().expect("owned comparison context");
-                let mut expected = Vec::new();
-                for id in ids {
-                    let text = frankensearch_core::DefaultCanonicalizer::default()
-                        .canonicalize(&fs::read_to_string(corpus.join(&id)).unwrap());
-                    expected.push((id, embedder.embed(&cx, &text).await.unwrap()));
-                }
-                expected
-            }));
-            for (id, expected) in expected {
-                let hit = hits.iter().find(|hit| hit.doc_id == id).unwrap();
-                let stored = vectors.vector_at_f32(hit.index as usize).unwrap();
-                assert_eq!(stored.len(), expected.len());
-                assert!(
-                    stored
-                        .iter()
-                        .zip(expected)
-                        .all(|(a, b)| (a - b).abs() < 0.001),
-                    "{file}: {id} does not encode the current file after f16 quantization"
-                );
-            }
-        }
+        assert_vector_tiers_encode_current_files(
+            &fsfs.model_root,
+            &index,
+            &corpus,
+            &["astronomy.md", "database.md", "handoff.md", "live.md"],
+        );
         let config = temp.path().join("watch-search.toml");
         // Functional coverage uses an explicit budget, not a latency claim.
         fs::write(&config, "[search]\nquality_timeout_ms = 5000\n").unwrap();
@@ -3194,6 +3203,291 @@ mod loader_only {
             "[default-build-e2e] stage=watch-handoff event=verified startup_create=true startup_modify=true live_create=true live_modify=true lexical=true fast=true quality=true post_exit=true"
         );
         Ok(())
+    }
+
+    /// The complete-generation layout's watch, judged by what a user sees:
+    /// independent searches succeed while it runs (the legacy layout refuses
+    /// them with its map lock), each edit becomes searchable through a
+    /// published generation, SIGTERM stops it cleanly, and the selected
+    /// generation's vectors encode the final files.
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[test]
+    #[ignore = "real-model complete-generation watch; requires the pinned model cache and semantic E2E opt-in"]
+    fn complete_generation_watch_serves_search_and_publishes_live_edits() -> Result<(), String> {
+        log_binary_profile("real-model-complete-watch");
+        if std::env::var("FRANKENSEARCH_REQUIRE_SEMANTIC_E2E").as_deref() != Ok("1") {
+            return Err(
+                "set FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 for real-model watch validation"
+                    .to_owned(),
+            );
+        }
+        let model_root = configured_model_root();
+        verify_pinned_model_cache(&model_root)?;
+        let temp = tempfile::tempdir().expect("complete watch fixture");
+        let fsfs = IsolatedFsfs::new(temp.path(), model_root);
+        let corpus = temp.path().join("corpus");
+        let index = temp.path().join("index");
+        fs::create_dir_all(&corpus).expect("watch corpus");
+        fs::write(corpus.join("database.md"), "Oldquartz database transactions preserve atomicity using rollback and durable journals.").unwrap();
+        fs::write(
+            corpus.join("astronomy.md"),
+            "Astronomers measure starlight to classify distant galaxies and planets.",
+        )
+        .unwrap();
+        let corpus_arg = corpus.to_str().unwrap();
+        let index_arg = index.to_str().unwrap();
+        let initial = fsfs.run_with_env(
+            temp.path(),
+            "complete-watch-initial-index",
+            [
+                "index",
+                corpus_arg,
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FSFS_COMPLETE_GENERATIONS", "1")],
+        );
+        let envelope = parse_success_envelope("complete watch initial index", &initial);
+        assert_eq!(envelope["data"]["indexed_files"], 2);
+        assert!(
+            index.join("FSFS-CURRENT").is_file(),
+            "the complete-generation layout was selected"
+        );
+
+        let stdout_path = fsfs.log_root.join("complete-watch.stdout.log");
+        let stderr_path = fsfs.log_root.join("complete-watch.stderr.log");
+        let mut watch = WatchChild(
+            fsfs.command(temp.path())
+                .args([
+                    "index",
+                    corpus_arg,
+                    "--watch",
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "jsonl",
+                ])
+                .env("FSFS_COMPLETE_GENERATIONS", "1")
+                .env("RUST_LOG", "info")
+                .stdout(File::create(&stdout_path).unwrap())
+                .stderr(File::create(&stderr_path).unwrap())
+                .spawn()
+                .expect("spawn real complete-generation watcher"),
+        );
+        let needle = "\"generation_complete\":true";
+        let output = wait_for_watch_output(&mut watch, &stdout_path, needle, 1, QUICKSTART_TIMEOUT);
+        let first: Value = serde_json::from_str(
+            output
+                .lines()
+                .find(|line| line.contains(needle))
+                .expect("a publication receipt line"),
+        )
+        .expect("watch publication receipt");
+        assert_eq!(first["meta"]["command"], "watch");
+        assert_eq!(first["data"]["indexed_files"], 2);
+        assert_eq!(
+            first["data"]["index_root"],
+            first["data"]["generation_path"]
+        );
+
+        // Searches are separate processes on the store the watcher holds.
+        // Polling them is the visibility criterion: one edit can publish more
+        // than once, so receipt counts cannot say which edit a search sees.
+        let lexical_paths = |label: &str, query: &str| -> Vec<String> {
+            let outcome = fsfs.run(
+                temp.path(),
+                label,
+                [
+                    "search",
+                    query,
+                    "--fast-only",
+                    "--no-daemon",
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "json",
+                    "--limit",
+                    "10",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            parse_success_envelope(label, &outcome)["data"]["hits"]
+                .as_array()
+                .expect("search hits")
+                .iter()
+                .filter(|hit| hit["lexical_rank"].is_number())
+                .map(|hit| hit["path"].as_str().expect("hit path").to_owned())
+                .collect()
+        };
+        let mut await_search = |label: &str, query: &str, path: &str, present: bool| {
+            let started = Instant::now();
+            loop {
+                let paths = lexical_paths(label, query);
+                if paths.iter().any(|hit| hit == path) == present {
+                    eprintln!(
+                        "[default-build-e2e] stage=complete-watch {label} visible_after_ms={}",
+                        started.elapsed().as_millis()
+                    );
+                    return;
+                }
+                assert!(
+                    watch.0.try_wait().expect("poll watcher").is_none(),
+                    "watcher exited during {label}"
+                );
+                assert!(
+                    started.elapsed() < QUICKSTART_TIMEOUT,
+                    "{label}: {path} present={present} not reached for {query:?}; last hits {paths:?}"
+                );
+                thread::sleep(Duration::from_millis(200));
+            }
+        };
+        await_search("during-watch", "Oldquartz", "database.md", true);
+        fs::write(
+            corpus.join("live.md"),
+            "Liveamber handles transient failures with bounded retries and exponential backoff.",
+        )
+        .unwrap();
+        await_search("live-create", "Liveamber", "live.md", true);
+        fs::write(corpus.join("live.md"), "Livemalachite restores service after failures using bounded retries and exponential backoff.").unwrap();
+        await_search("live-modify", "Livemalachite", "live.md", true);
+        await_search("live-modify-old-text", "Liveamber", "live.md", false);
+        fs::remove_file(corpus.join("astronomy.md")).unwrap();
+        await_search("live-delete", "Astronomers", "astronomy.md", false);
+
+        let status = terminate_and_wait(&mut watch, "complete watch");
+        let stdout = fs::read_to_string(&stdout_path).unwrap();
+        let stderr = fs::read_to_string(&stderr_path).unwrap();
+        eprintln!(
+            "[default-build-e2e] stage=complete-watch-shutdown status={status} stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            status.success(),
+            "graceful complete watcher shutdown failed"
+        );
+        drop(watch);
+
+        assert_vector_tiers_encode_current_files(
+            &fsfs.model_root,
+            &active_generation_root(&index),
+            &corpus,
+            &["database.md", "live.md"],
+        );
+        let config = temp.path().join("complete-watch-search.toml");
+        // Functional coverage uses an explicit budget, not a latency claim.
+        fs::write(&config, "[search]\nquality_timeout_ms = 5000\n").unwrap();
+        let outcome = fsfs.run(
+            temp.path(),
+            "complete-watch-refined",
+            [
+                "search",
+                "how livemalachite restores service after failures",
+                "--no-daemon",
+                "--config",
+                config.to_str().unwrap(),
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+                "--limit",
+                "10",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        let result = parse_success_envelope("complete watch refined search", &outcome);
+        assert_eq!(result["data"]["phase"], "refined", "{result}");
+        let hit = result["data"]["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["path"] == "live.md")
+            .expect("watched document in actual search results");
+        assert!(hit["lexical_rank"].is_number(), "{hit}");
+        assert!(hit["semantic_rank"].is_number(), "{hit}");
+
+        // The store's own daemon answers a plain search, which forwards
+        // whenever the store socket exists and does not fall back once it
+        // does, and it also stops cleanly on SIGTERM.
+        let socket = index.join("fsfs-query.sock");
+        let mut daemon = WatchChild(
+            fsfs.command(temp.path())
+                .args(["daemon", "--index-dir", index_arg, "--idle-timeout-ms", "0"])
+                .stdout(File::create(fsfs.log_root.join("complete-daemon.stdout.log")).unwrap())
+                .stderr(File::create(fsfs.log_root.join("complete-daemon.stderr.log")).unwrap())
+                .spawn()
+                .expect("spawn complete-generation daemon"),
+        );
+        let listen_started = Instant::now();
+        while !socket.exists() {
+            assert!(
+                daemon.0.try_wait().expect("poll daemon").is_none(),
+                "daemon exited before listening"
+            );
+            assert!(
+                listen_started.elapsed() < QUICKSTART_TIMEOUT,
+                "daemon did not listen at {}",
+                socket.display()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        let forwarded = fsfs.run(
+            temp.path(),
+            "complete-daemon-search",
+            [
+                "search",
+                "how livemalachite restores service after failures",
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+                "--limit",
+                "10",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        let result = parse_success_envelope("complete daemon search", &forwarded);
+        assert!(
+            result["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|hit| hit["path"] == "live.md"),
+            "{result}"
+        );
+        let status = terminate_and_wait(&mut daemon, "complete daemon");
+        assert!(
+            status.success(),
+            "graceful complete daemon shutdown failed: {status}"
+        );
+        assert!(!socket.exists(), "the daemon removes its own socket");
+        drop(daemon);
+        eprintln!(
+            "[default-build-e2e] stage=complete-watch event=verified search_during_watch=true live_create=true live_modify=true live_delete=true fast=true quality=true post_exit=true daemon=true"
+        );
+        Ok(())
+    }
+
+    /// Send SIGTERM to an owned child and wait for its exit status.
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    fn terminate_and_wait(child: &mut WatchChild, label: &str) -> std::process::ExitStatus {
+        let signal = Command::new("kill")
+            .args(["-TERM", &child.0.id().to_string()])
+            .status()
+            .expect("signal own child");
+        assert!(signal.success());
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.0.try_wait().expect("poll graceful shutdown") {
+                return status;
+            }
+            assert!(
+                started.elapsed() < FAILURE_TIMEOUT,
+                "{label} shutdown timed out"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(feature = "semantic-loaders")]

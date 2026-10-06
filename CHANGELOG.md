@@ -331,6 +331,21 @@ Historical adapter identities remain rejected by strict admission, and the
 
 ---
 
+## Unreleased (after fsfs 1.12.3)
+
+These changes are on `main` and not yet in a published binary or crate.
+
+### Changed
+
+- **The complete-generation `fsfs index` receipt is a superset of the legacy one.** Under `FSFS_COMPLETE_GENERATIONS=1` the payload now also carries `semantic_indexed_files`, `semantic_deferred_files`, `embedding_retries`, `embedding_failures`, `index_size_bytes`, `fast_window_coverage` and `meta.duration_ms`, and its table output prints the legacy `Discovered …` and `Indexed … in N ms (index size M bytes)` lines. `index_root` names the selected generation in every complete-generation receipt: publication renames only the selection pointer, so the directory a build wrote is the readable index.
+
+### Fixed
+
+- **A complete-generation watch, daemon or server stops cleanly on SIGINT or SIGTERM.** The first stop signal ended these commands with a `cancelled` error envelope (naming `fsfs.complete_generation.search`) and exit status 130. They now exit 0, as on the legacy layout. A watch's earlier publications have already printed their receipts, and an unpublished candidate is discarded. A daemon removes its socket. A second stop signal still forces exit 130, and a cancellation not requested by a stop signal still reports its error.
+- **A complete-generation daemon refuses a store root too deep for a Unix socket.** Its socket must live in the store root. When that path exceeded `sun_path`, the daemon created its lock file, then failed with the raw `path must be shorter than SUN_LEN` error and left the lock behind. It now refuses before locking, naming the path, its length and the limit. Search is unaffected; it runs in process.
+
+---
+
 ## fsfs 1.12.3 / frankensearch-tui 0.4.0 — 2026-10-05
 
 [fsfs v1.12.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.3),

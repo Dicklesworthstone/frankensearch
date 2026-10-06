@@ -186,10 +186,11 @@ impl FsfsRuntime {
                     .await
             }
             #[cfg(unix)]
-            CliCommand::Watch | CliCommand::Index => {
+            CliCommand::Watch | CliCommand::Index => graceful_stop(
                 self.run_complete_generation_watch_with_writer(cx, &root, &mut stdout)
-                    .await
-            }
+                    .await,
+                shutdown,
+            ),
             CliCommand::Search => {
                 self.run_complete_generation_search_with_writer(cx, &root, &mut stdout)
                     .await
@@ -214,9 +215,13 @@ impl FsfsRuntime {
                     .await
             }
             #[cfg(unix)]
-            CliCommand::Serve => self.run_complete_generation_serve(cx, &root).await,
+            CliCommand::Serve => {
+                graceful_stop(self.run_complete_generation_serve(cx, &root).await, shutdown)
+            }
             #[cfg(unix)]
-            CliCommand::Daemon => self.run_complete_generation_daemon(cx, &root).await,
+            CliCommand::Daemon => {
+                graceful_stop(self.run_complete_generation_daemon(cx, &root).await, shutdown)
+            }
             CliCommand::Status | CliCommand::Doctor => {
                 let reader = self.open_complete_generation_diagnostics(cx, &root)?;
                 if self.cli_input.command == CliCommand::Status {
@@ -1287,6 +1292,40 @@ fn complete_entry_exists(path: &Path) -> SearchResult<bool> {
     }
 }
 
+/// A stop signal is how a watch, daemon or server ends. The first SIGINT or
+/// SIGTERM requests a graceful shutdown, which cancels the command's context.
+/// A watch's publications before it already printed their receipts and an
+/// in-flight candidate is discarded unpublished; a server releases its socket.
+/// That cancellation is a clean exit, as it is on the legacy layout. A forced
+/// second signal, a shutdown requested by an error, or any other cancellation
+/// keeps its error.
+#[cfg(unix)]
+fn graceful_stop(
+    result: SearchResult<()>,
+    shutdown: Option<&ShutdownCoordinator>,
+) -> SearchResult<()> {
+    use crate::ShutdownReason;
+
+    let requested_stop = shutdown.and_then(|shutdown| {
+        (shutdown.is_shutting_down() && !shutdown.is_force_exit_requested())
+            .then(|| shutdown.current_reason())
+            .flatten()
+            .filter(|reason| {
+                matches!(
+                    reason,
+                    ShutdownReason::Signal(_) | ShutdownReason::UserRequest
+                )
+            })
+    });
+    match (result, requested_stop) {
+        (Err(SearchError::Cancelled { .. }), Some(reason)) => {
+            tracing::info!(?reason, "complete-generation command stopped on request");
+            Ok(())
+        }
+        (result, _) => result,
+    }
+}
+
 pub(super) fn complete_cli_error(field: &str, reason: &str) -> SearchError {
     SearchError::InvalidConfig {
         field: format!("complete_generation.{field}"),
@@ -1519,6 +1558,45 @@ mod diagnostic_retention_tests {
                 if report.removed == [second_id]));
             assert_eq!(store.active(&cx).unwrap(), Some(selected));
         });
+    }
+
+    #[test]
+    fn only_a_requested_stop_turns_a_cancelled_command_into_a_clean_exit() {
+        use crate::ShutdownReason;
+
+        let cancelled = || -> SearchResult<()> {
+            Err(SearchError::Cancelled {
+                phase: "fsfs.complete_generation.search".to_owned(),
+                reason: "retained-generation search cancelled".to_owned(),
+            })
+        };
+        let coordinator = |reason: Option<ShutdownReason>| {
+            let coordinator = ShutdownCoordinator::new();
+            if let Some(reason) = reason {
+                coordinator.request_shutdown(reason);
+            }
+            coordinator
+        };
+        for reason in [ShutdownReason::Signal(15), ShutdownReason::UserRequest] {
+            let stopping = coordinator(Some(reason));
+            assert!(graceful_stop(cancelled(), Some(&stopping)).is_ok());
+            // A real failure during shutdown is still reported.
+            let failure = complete_cli_error("watch", "injected failure");
+            assert!(graceful_stop(Err(failure), Some(&stopping)).is_err());
+        }
+        let failed = coordinator(Some(ShutdownReason::Error("pressure".to_owned())));
+        let running = coordinator(None);
+        for shutdown in [None, Some(&running), Some(&failed)] {
+            assert!(matches!(
+                graceful_stop(cancelled(), shutdown),
+                Err(SearchError::Cancelled { .. })
+            ));
+        }
+        let forced = coordinator(None);
+        forced.process_signal_for_test(15);
+        forced.process_signal_for_test(15);
+        assert!(forced.is_force_exit_requested());
+        assert!(graceful_stop(cancelled(), Some(&forced)).is_err());
     }
 
     #[test]
