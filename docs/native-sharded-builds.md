@@ -241,3 +241,74 @@ Focused update regressions (including the existing ordinary-update contracts):
 ```sh
 cargo test -p frankensearch --features quill --lib native_ann::builder::update
 ```
+
+## Live complete-shard selection and external activation
+
+`native_ann::builder::sharded::live::NativeLiveShardedHybridIndex` owns one
+complete sharded hybrid head. `snapshot(&cx)` returns a cheap shared
+`NativeShardedSnapshot`, not a copied collection of bodies or vector images.
+Its `index()` exposes the original complete read-only cohort for progressive
+and reranked queries. Hold that same snapshot through every phase and all
+interpretation of `fast_row` and `quality_row`; replacing the head can change
+every partition ordinal. The live `search`, `search_refined`, and `search_quality`
+conveniences return `NativeShardedResults` containing both the page and its pin.
+
+```rust,ignore
+use frankensearch::native_ann::builder::sharded::live::NativeLiveShardedHybridIndex;
+
+let live = NativeLiveShardedHybridIndex::new(&cx, admitted_initial)?;
+let old = live.snapshot(&cx).await?;
+let candidate = old.begin_update(&cx, &new_directory, next_generation)?
+    .upsert_document(revised_document)
+    .delete_document("obsolete-id")
+    .with_batch_size(16)?
+    .build(&cx, 5_000).await?;
+// Persist candidate.index().seal_for_reopen(&cx)? under the caller's
+// publication protocol when durability is required, before installing it.
+let current = live.install(&cx, &candidate).await?;
+// old continues reading its original sources and exact shard coordinates.
+```
+
+Building reuses the existing incremental-inference update and complete global
+Quill construction. No selection lock is held during building, inference,
+retrieval, hydration or destruction. Install holds a short asupersync write lock
+and compares the exact predecessor Arc, not just a sequence number. A competing
+or foreign candidate is refused even if it has a larger sequence or identical
+bytes. Rebuild from a fresh snapshot after a stale refusal; neither the old
+candidate nor a successful winner is rewritten. The final cancellation check
+precedes installation, so late cancellation cannot turn a visible swap into an
+alleged abort. Cancelled/dropped waiters do not consume a candidate.
+
+A successor produced in another process can use the same live installation path:
+
+```rust,ignore
+let old = live.snapshot(&cx).await?;
+let candidate = old.prepare_selected(
+    &cx, &selected_directory, &trusted_hybrid_receipt,
+    NativeShardedHybridReopenLimits::default(),
+).await?;
+let current = live.install(&cx, &candidate).await?;
+```
+
+This reuses the actual retained model instances without inference or loading a
+replacement model. The original receipt authenticates every selected source,
+vector, graph and lexical artifact under the normal aggregate/per-file limits
+and stored-source census. A missing late partition, bad graph, false receipt,
+changed same-dimensional producer, quality-topology change, or non-newer
+generation returns no candidate. Reopening does not discover newer directories,
+recompute an expected digest, repair anything, or fall back to exact retrieval.
+Preparation pins its original predecessor even if a concurrent installer wins;
+install rechecks that precise pin after preparation succeeds.
+
+All selection here is process-local. A receipt proves selected bytes, not an
+external writer lineage or persistent antirollback floor. Restart still requires
+an explicitly trusted receipt. Keep old mapped files immutable and present while
+readers live; neither installation nor dropping a handle authorizes garbage
+collection. The library creates no runtime or background tasks, and synchronous
+filesystem/graph work is not preemptible. This does not add sharded CLI commands
+or change fsfs's generation authority. Source/vector/graph/Quill builders,
+query engines, and persisted formats remain the existing implementations.
+
+```sh
+cargo test -p frankensearch --features quill --lib native_ann::builder::sharded::live
+```

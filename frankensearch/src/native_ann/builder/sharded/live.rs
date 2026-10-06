@@ -34,10 +34,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use asupersync::sync::{RwLock, RwLockError};
-use frankensearch_core::generation::ArtifactGenerationIdentityV1;
+use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
 
 use super::super::{NativeBuildPrecision, NativeBuildRetrieval, NativeIndexUpdate};
-use super::{NativeBuiltShardedHybridIndex, NativeBuiltShardedIndex};
+use super::{
+    NativeBuiltShardedHybridIndex, NativeBuiltShardedIndex, NativeShardedHybridReopenLimits,
+};
 use crate::native_ann::{NativeShardedResult, checkpoint, invalid};
 use crate::{Cx, IndexableDocument, SearchError, SearchResult};
 
@@ -245,6 +247,51 @@ impl NativeShardedSnapshot {
             base: self.clone(),
             update,
         })
+    }
+
+    /// Prepare an externally selected complete successor with the retained models.
+    ///
+    /// The caller supplies the original trusted hybrid receipt, not a digest
+    /// computed from an unknown directory. Every partition, configured graph,
+    /// source record and global lexical artifact passes the existing strict
+    /// selected-reopen admission, including aggregate resource limits and the
+    /// lexical/source census. Missing ANN never becomes exact fallback.
+    ///
+    /// Reuses the actual retained model instances and performs no inference,
+    /// file mutation, repair, discovery or loading of replacement models. The
+    /// complete old selection remains available while admission suspends or
+    /// fails. Preparation alone cannot activate a generation; install still
+    /// compares this same predecessor pin, even if another writer won meanwhile.
+    /// Partition count, boundaries and storage policy may change; original
+    /// producing identities and required quality presence may not.
+    ///
+    /// The receipt authorizes selected bytes, not external publication lineage.
+    /// Durable writer fencing, rollback floors and file retention remain with
+    /// the caller. Filesystem and graph work are synchronous on the polling lane;
+    /// the caller owns blocking/CPU placement. This method spawns no worker.
+    ///
+    /// # Errors
+    /// Propagates strict reopen/admission errors, cancellation and resource
+    /// limits; refuses non-newer generations and any producing identity change.
+    pub async fn prepare_selected(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path> + Send,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeShardedHybridReopenLimits,
+    ) -> SearchResult<NativeShardedCandidate> {
+        checkpoint(cx, "native_ann.sharded_live.prepare_selected")?;
+        let original = &self.index.vectors().partitions()[0];
+        let next = NativeBuiltShardedHybridIndex::open_selected(
+            cx,
+            directory,
+            expected,
+            Arc::clone(&original.fast.embedder),
+            original.quality.as_ref().map(|tier| Arc::clone(&tier.embedder)),
+            limits,
+        )
+        .await?;
+        NativeShardedCandidate::new(cx, self.clone(), next)
     }
 }
 

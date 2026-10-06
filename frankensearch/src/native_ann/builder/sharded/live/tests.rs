@@ -449,3 +449,229 @@ fn invalid_generations_partition_sizes_and_empty_successors_keep_identity_contra
         assert_eq!(old.index().vectors().document_count(), 4);
     });
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_activation_retains_models_and_rejects_stale_replay_after_repartitioning() {
+    run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (live, fast, quality) = fixture(&cx, root.path(), ann).await;
+            let old = live.snapshot(&cx).await.unwrap();
+            let path = root.path().join("selected");
+            let candidate = old
+                .begin_update(&cx, &path, generation(2))
+                .unwrap()
+                .delete_document("b")
+                .upsert_document(IndexableDocument::new("new", "arrival vertical"))
+                .build(&cx, 1)
+                .await
+                .unwrap();
+            let receipt = candidate.index().seal_for_reopen(&cx).unwrap();
+            drop(candidate);
+            let before = image(&path);
+            let counts = (
+                fast.documents.load(Ordering::SeqCst),
+                quality.documents.load(Ordering::SeqCst),
+            );
+            let limits = NativeShardedHybridReopenLimits::default();
+            let selected = old.prepare_selected(&cx, &path, &receipt, limits).await.unwrap();
+            let late = old.prepare_selected(&cx, &path, &receipt, limits).await.unwrap();
+            assert_eq!(selected.index().vectors().partitions().len(), 4);
+            for partition in selected.index().vectors().partitions() {
+                let original = &old.index().vectors().partitions()[0];
+                assert!(Arc::ptr_eq(&partition.fast.embedder, &original.fast.embedder));
+                assert!(Arc::ptr_eq(
+                    &partition.quality.as_ref().unwrap().embedder,
+                    &original.quality.as_ref().unwrap().embedder,
+                ));
+            }
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                (
+                    fast.documents.load(Ordering::SeqCst),
+                    quality.documents.load(Ordering::SeqCst),
+                ),
+                counts
+            );
+            assert!(Arc::ptr_eq(&live.snapshot(&cx).await.unwrap().index, &old.index));
+            let current = live.install(&cx, &selected).await.unwrap();
+            assert_refusal(
+                live.install(&cx, &late).await.unwrap_err(),
+                "native_ann.sharded_live.expected_current",
+            );
+            assert!(Arc::ptr_eq(&live.snapshot(&cx).await.unwrap().index, &current.index));
+            let page = live.search_refined(&cx, "arrival", 4).await.unwrap();
+            assert!(page.results.iter().any(|hit| hit.result.doc_id == "new"));
+            assert!(page.results.iter().all(|hit| hit.result.doc_id != "b"));
+            assert_rows(&page.snapshot, &page.results);
+            assert!(old.index().vectors().document("b").is_some());
+            assert_refusal(
+                current.prepare_selected(&cx, &path, &receipt, limits).await.unwrap_err(),
+                "native_ann.sharded_live.generation",
+            );
+            let restarted = NativeBuiltShardedHybridIndex::open_selected(
+                &cx, &path, &receipt, fast.clone(), Some(quality.clone()), limits,
+            ).await.unwrap();
+            let restarted = NativeLiveShardedHybridIndex::new(&cx, restarted).unwrap();
+            let page = restarted.search_quality(&cx, "arrival", 4).await.unwrap();
+            assert_eq!(page.snapshot.generation(), current.generation());
+            assert_rows(&page.snapshot, &page.results);
+            assert_eq!(image(&path), before);
+        }
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_admission_requires_late_artifacts_and_aggregate_limits_before_installation() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let (live, fast, quality) = fixture(&cx, root.path(), true).await;
+        let old = live.snapshot(&cx).await.unwrap();
+        let path = root.path().join("selected");
+        let candidate = old.begin_update(&cx, &path, generation(2)).unwrap()
+            .upsert_document(IndexableDocument::new("z", "vertical"))
+            .build(&cx, 1).await.unwrap();
+        let receipt = candidate.index().seal_for_reopen(&cx).unwrap();
+        let last = candidate.index().vectors().partitions().last().unwrap();
+        let artifacts = [
+            last.fast().vector_path().to_path_buf(),
+            last.fast().graph_path().unwrap().to_path_buf(),
+            last.directory().join("native.source.jsonl"),
+            path.join("lexical"),
+        ];
+        drop(candidate);
+        let before = image(&path);
+        let limits = NativeShardedHybridReopenLimits::default();
+        for (ordinal, artifact) in artifacts.iter().enumerate() {
+            let saved = root.path().join(format!("saved-artifact-{ordinal}"));
+            fs::rename(artifact, &saved).unwrap();
+            assert!(old.prepare_selected(&cx, &path, &receipt, limits).await.is_err());
+            assert!(Arc::ptr_eq(&live.snapshot(&cx).await.unwrap().index, &old.index));
+            fs::rename(saved, artifact).unwrap();
+        }
+        let mut wrong = receipt;
+        wrong.sha256[0] ^= 1;
+        assert!(old.prepare_selected(&cx, &path, &wrong, limits).await.is_err());
+        for fault in 0..3 {
+            let mut limited = limits;
+            match fault {
+                0 => limited.vectors.max_documents = 4,
+                1 => limited.vectors.max_shards = 1,
+                _ => limited.vectors.max_artifact_bytes = 1,
+            }
+            assert!(old.prepare_selected(&cx, &path, &receipt, limited).await.is_err());
+            assert!(Arc::ptr_eq(&live.snapshot(&cx).await.unwrap().index, &old.index));
+        }
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            old.prepare_selected(&cx, root.path().join("not-created"), &receipt, limits).await,
+            Err(SearchError::Cancelled { .. })
+        ));
+        cx.set_cancel_requested(false);
+        assert!(!root.path().join("not-created").exists());
+        let counts = (
+            fast.documents.load(Ordering::SeqCst),
+            quality.documents.load(Ordering::SeqCst),
+        );
+        let selected = old.prepare_selected(&cx, &path, &receipt, limits).await.unwrap();
+        live.install(&cx, &selected).await.unwrap();
+        assert_eq!(image(&path), before);
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+        assert_eq!((fast.documents.load(Ordering::SeqCst), quality.documents.load(Ordering::SeqCst)), counts);
+    });
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn selected_topology_producer_and_rollback_failures_leave_the_complete_head_untouched() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let (live, fast, quality) = fixture(&cx, root.path(), false).await;
+        let old = live.snapshot(&cx).await.unwrap();
+        let old_receipt = old.index().seal_for_reopen(&cx).unwrap();
+        let foreign = Provider::new("same-dimension-other-producer", 2);
+        for (name, provider, required_quality) in [
+            ("foreign", &foreign, Some(&quality)),
+            ("missing-quality", &fast, None),
+        ] {
+            let path = root.path().join(name);
+            let other = build(&cx, &path, 2, provider, required_quality, false).await;
+            let receipt = other.seal_for_reopen(&cx).unwrap();
+            drop(other);
+            assert!(old.prepare_selected(
+                &cx, &path, &receipt, NativeShardedHybridReopenLimits::default(),
+            ).await.is_err());
+            assert!(Arc::ptr_eq(&live.snapshot(&cx).await.unwrap().index, &old.index));
+        }
+        let candidate = old.begin_update(&cx, root.path().join("next"), generation(2)).unwrap()
+            .delete_document("b").build(&cx, 1).await.unwrap();
+        let current = live.install(&cx, &candidate).await.unwrap();
+        assert_refusal(
+            current.prepare_selected(
+                &cx, old.index().vectors().directory(), &old_receipt,
+                NativeShardedHybridReopenLimits::default(),
+            ).await.unwrap_err(),
+            "native_ann.sharded_live.generation",
+        );
+        assert!(Arc::ptr_eq(&live.snapshot(&cx).await.unwrap().index, &current.index));
+        assert!(current.index().vectors().document("b").is_none());
+        assert!(old.index().vectors().document("b").is_some());
+    });
+}
+
+#[test]
+fn old_reranking_keeps_source_text_and_both_row_maps_after_live_replacement() {
+    use std::sync::Mutex;
+    use crate::{RerankDocument, RerankScore, Reranker};
+
+    #[derive(Default)]
+    struct Scorer {
+        seen: Mutex<Vec<(String, String)>>,
+    }
+    impl Reranker for Scorer {
+        fn id(&self) -> &'static str { "sharded-live-test-reranker" }
+        fn model_name(&self) -> &str { self.id() }
+        fn rerank<'a>(
+            &'a self, _cx: &'a Cx, _query: &'a str, documents: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
+            Box::pin(async move {
+                *self.seen.lock().unwrap() = documents.iter()
+                    .map(|document| (document.doc_id.clone(), document.text.clone())).collect();
+                Ok(documents.iter().enumerate().map(|(original_rank, document)| RerankScore {
+                    doc_id: document.doc_id.clone(), original_rank,
+                    score: if document.doc_id == "b" { 1.0 } else { 0.0 }, raw_logit: None,
+                }).collect())
+            })
+        }
+    }
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let (live, _, _) = fixture(&cx, root.path(), true).await;
+        let old = live.snapshot(&cx).await.unwrap();
+        let scorer = Scorer::default();
+        let mut phases = old.index().progressive_with_reranker(&cx, "vertical", 1, &scorer, 4).unwrap();
+        assert!(matches!(phases.next_phase().await.unwrap(), Some(NativeShardedSearchPhase::Initial { .. })));
+        assert!(matches!(phases.next_phase().await.unwrap(), Some(NativeShardedSearchPhase::Refined { .. })));
+        assert!(scorer.seen.lock().unwrap().is_empty(), "reranking must still be lazy");
+        let next = old.begin_update(&cx, root.path().join("next"), generation(2)).unwrap()
+            .delete_document("b")
+            .upsert_document(IndexableDocument::new("a", "replacement vertical"))
+            .build(&cx, 1).await.unwrap();
+        let current = live.install(&cx, &next).await.unwrap();
+        let Some(NativeShardedSearchPhase::Reranked { results, evaluated, .. }) =
+            phases.next_phase().await.unwrap() else { panic!("retained rerank phase"); };
+        assert_eq!(evaluated, 4);
+        assert_eq!(results[0].result.doc_id, "b");
+        assert_rows(&old, &results);
+        let seen: BTreeMap<_, _> = scorer.seen.lock().unwrap().iter().cloned().collect();
+        assert_eq!(seen["a"], "horizontal");
+        assert_eq!(seen["b"], "legacytoken vertical");
+        assert!(current.index().vectors().document("b").is_none());
+        assert_eq!(current.index().vectors().document("a").unwrap().content, "replacement vertical");
+        assert!(phases.next_phase().await.unwrap().is_none());
+    });
+}
