@@ -386,3 +386,261 @@ fn ordinary_output_remains_ordinary_through_the_shared_command_dispatch() {
         }
     });
 }
+
+async fn successor(
+    cx: &Cx,
+    root: &Path,
+    index: &NativeBuiltShardedHybridIndex,
+) -> (NativeBuiltShardedHybridIndex, Selection, std::path::PathBuf) {
+    let mut revised = index.vectors().document("public-a").unwrap().clone();
+    revised.metadata.insert("tenant".to_owned(), "private".to_owned());
+    let generation = new_generation(index.vectors().generation().sequence + 1).unwrap();
+    let next = index.begin_update(cx, root.join("successor"), generation).unwrap()
+        .upsert_document(revised)
+        .delete_document("public-last")
+        .upsert_document(IndexableDocument::new("public-arrived", "needle arrival")
+            .with_metadata("tenant", "public"))
+        .build_sharded_hybrid(cx, 5).await.unwrap();
+    let receipt = next.seal_for_reopen(cx).unwrap();
+    let first = &next.vectors().partitions()[0];
+    let selected = Selection {
+        schema: SELECTION_SCHEMA.to_owned(),
+        directory: next.vectors().directory().to_path_buf(), generation,
+        snapshot: SnapshotReceipt { byte_len: receipt.byte_len, sha256: receipt.sha256 },
+        documents: next.vectors().document_count(),
+        fast_producer: first.fast().embedder().identity().unwrap().fingerprint(),
+        quality_producer: first.quality().map(|tier| tier.embedder().identity().unwrap().fingerprint()),
+    };
+    let path = root.join("successor.json");
+    save_selection(&selected, &path).unwrap();
+    (next, selected, path)
+}
+
+fn messages(values: &[serde_json::Value]) -> std::io::Cursor<Vec<u8>> {
+    let mut input = Vec::new();
+    for value in values { input.extend(encode(value, 1024 * 1024).unwrap()); }
+    std::io::Cursor::new(input)
+}
+
+fn activation(old: &Selection, receipt: &Path) -> serde_json::Value {
+    serde_json::json!({"op": "activate", "id": "activate", "receipt": receipt,
+        "expected_generation": old.generation})
+}
+
+#[test]
+fn warm_sharded_server_activates_complete_successors_and_refreshes_scopes_without_model_loading() {
+    use frankensearch::native_ann::builder::sharded::live::NativeLiveShardedHybridIndex;
+    run_test_with_cx(|cx| async move {
+        for exact in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut opts = options(); opts.exact = exact;
+            let (models, fast, quality) = models();
+            let (index, selected) = build(&cx, &opts, &root.path().join("initial"), documents(), models, 2).await.unwrap();
+            let (next, next_selection, receipt) = successor(&cx, root.path(), &index).await;
+            let receipt_bytes = fs::read(&receipt).unwrap();
+            let submissions = (fast.submitted.load(Ordering::SeqCst), quality.submitted.load(Ordering::SeqCst));
+            drop(next);
+            let live = NativeLiveShardedHybridIndex::new(&cx, index).unwrap();
+            let old = live.snapshot(&cx).await.unwrap();
+            let mut input = messages(&[
+                serde_json::json!({"id": "before", "query": "needle", "limit": 100}),
+                activation(&selected, &receipt),
+                serde_json::json!({"id": "after", "query": "needle", "mode": "quality", "limit": 100}),
+                serde_json::json!({"op": "status", "id": "status"}),
+                activation(&selected, &receipt),
+                serde_json::json!({"id": "again", "query": "needle", "limit": 100}),
+            ]);
+            let base_filter = filter::Filter::parse(r#"{"metadata":{"tenant":"public"}}"#).unwrap();
+            let mut output = Vec::new();
+            serve::run_with_controls(&live, &cx, &mut input, &mut output, (Mode::Full, 10),
+                serve::Controls { activation: true, updates: false }, Some(&base_filter),
+                &query::Policy::default()).await.unwrap();
+            let frames = frames(&output);
+            assert_eq!(frames[0]["event"], "ready");
+            assert_eq!(frames[0]["layout"], "sharded");
+            assert_eq!(frames[0]["partitions"], 8);
+            assert_eq!(frames[0]["fast_native_hnsw"], !exact);
+            assert_eq!(frames[0]["updates_enabled"], false);
+            let current = live.snapshot(&cx).await.unwrap();
+            assert_eq!(current.generation(), next_selection.generation);
+            for frame in frames.iter().filter(|frame| frame["event"] == "results") {
+                let before = frame["id"] == "before";
+                assert_eq!(frame["generation"], serde_json::to_value(if before { selected.generation } else { next_selection.generation }).unwrap());
+                assert_eq!(frame["scope"]["eligible_documents"], if before { 4 } else { 3 });
+                assert_eq!(frame["results"].as_array().unwrap().len(), if before { 4 } else { 3 });
+                assert_rows(if before { old.index() } else { current.index() }, frame);
+                if !before {
+                    assert!(frame["results"].as_array().unwrap().iter().all(|hit|
+                        hit["doc_id"] != "public-a" && hit["doc_id"] != "public-last"));
+                }
+            }
+            let activations = frames.iter().filter(|frame| frame["operation"] == "activate").collect::<Vec<_>>();
+            assert_eq!(activations.len(), 2);
+            assert_eq!(activations[0]["selection_changed"], true);
+            assert_eq!(activations[0]["partitions"], 4);
+            assert_eq!(activations[1]["ok"], false);
+            assert_eq!(activations[1]["selection_changed"], false);
+            assert_eq!(fast.queries.load(Ordering::SeqCst), 2);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), 3);
+            assert_eq!(fast.submitted.load(Ordering::SeqCst), submissions.0);
+            assert_eq!(quality.submitted.load(Ordering::SeqCst), submissions.1);
+            assert_eq!(fs::read(&receipt).unwrap(), receipt_bytes);
+            assert!(old.index().vectors().document("public-last").is_some());
+            assert!(current.index().vectors().document("public-last").is_none());
+        }
+    });
+}
+
+#[test]
+fn sharded_controls_fail_closed_before_paths_and_invalid_messages_do_not_become_queries() {
+    use frankensearch::native_ann::builder::sharded::live::NativeLiveShardedHybridIndex;
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let (models, fast, _) = models();
+        let (index, selected) = build(&cx, &options(), &root.path().join("index"), documents(), models, 3).await.unwrap();
+        let live = NativeLiveShardedHybridIndex::new(&cx, index).unwrap();
+        let mut output = Vec::new();
+        let mut input = messages(&[serde_json::json!({"query":"needle"})]);
+        assert!(serve::run_with_controls(&live, &cx, &mut input, &mut output, (Mode::Full, 1),
+            serve::Controls { activation: false, updates: true }, None, &query::Policy::default()).await.is_err());
+        assert_eq!(input.position(), 0);
+        assert!(output.is_empty());
+        let absent = root.path().join("missing.json");
+        let mut input = messages(&[
+            activation(&selected, &absent),
+            serde_json::json!({"op":"update", "id":"denied", "expected_generation":selected.generation,
+                "index_dir":root.path().join("must-not-exist"), "new_receipt":root.path().join("must-not-exist.json"),
+                "changes":[{"op":"upsert", "id":"new", "content":"needle"}]}),
+            serde_json::json!({"op":"activate", "query":"needle"}),
+            serde_json::json!({"query":"needle", "mode":"fast"}),
+        ]);
+        serve::run_with_controls(&live, &cx, &mut input, &mut output, (Mode::Full, 1),
+            serve::Controls::default(), None, &query::Policy::default()).await.unwrap();
+        let frames = frames(&output);
+        assert!(frames[1]["error"].as_str().unwrap().contains("activation is disabled"));
+        assert_eq!(frames[2]["operation"], "update");
+        assert_eq!(frames[2]["id"], "denied");
+        assert_eq!(frames[2]["selection_changed"], false);
+        assert_eq!(frames[3]["ok"], false);
+        assert_eq!(frames.last().unwrap()["status"], "complete");
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 1);
+        assert_eq!(live.snapshot(&cx).await.unwrap().generation(), selected.generation);
+        assert!(!root.path().join("must-not-exist").exists());
+        assert!(!root.path().join("must-not-exist.json").exists());
+    });
+}
+
+#[test]
+fn sharded_activation_refuses_missing_late_artifacts_and_then_recovers_without_partial_install() {
+    use frankensearch::native_ann::builder::sharded::live::NativeLiveShardedHybridIndex;
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let (models, fast, quality) = models();
+        let (index, selected) = build(&cx, &options(), &root.path().join("initial"), documents(), models, 2).await.unwrap();
+        let (next, next_selection, receipt) = successor(&cx, root.path(), &index).await;
+        let last = next.vectors().partitions().last().unwrap().quality().unwrap().vector_path().to_path_buf();
+        drop(next);
+        let saved = root.path().join("saved-quality");
+        fs::rename(&last, &saved).unwrap();
+        let live = NativeLiveShardedHybridIndex::new(&cx, index).unwrap();
+        let mut output = Vec::new();
+        serve::run_with_controls(&live, &cx, &mut messages(&[
+            activation(&selected, &receipt), serde_json::json!({"op":"status"}),
+        ]), &mut output, (Mode::Full, 1), serve::Controls { activation: true, updates: false },
+            None, &query::Policy::default()).await.unwrap();
+        let failed = frames(&output);
+        assert_eq!(failed[1]["ok"], false);
+        assert_eq!(failed[1]["selection_changed"], false);
+        assert_eq!(failed[2]["generation"], serde_json::to_value(selected.generation).unwrap());
+        fs::rename(&saved, &last).unwrap();
+        let mut repaired = Vec::new();
+        serve::run_with_controls(&live, &cx, &mut messages(&[activation(&selected, &receipt)]),
+            &mut repaired, (Mode::Full, 1), serve::Controls { activation: true, updates: false },
+            None, &query::Policy::default()).await.unwrap();
+        assert_eq!(frames(&repaired)[1]["ok"], true);
+        assert_eq!(live.snapshot(&cx).await.unwrap().generation(), next_selection.generation);
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+        assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn sharded_activation_lost_acknowledgement_never_rolls_back_or_consumes_another_request() {
+    use frankensearch::native_ann::builder::sharded::live::NativeLiveShardedHybridIndex;
+    struct BrokenActivationOutput { writes: usize }
+    impl Write for BrokenActivationOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            let frame: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            if frame["operation"] == "activate" {
+                assert_eq!(frame["ok"], true);
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "lost acknowledgement"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let (models, fast, _) = models();
+        let (index, selected) = build(&cx, &options(), &root.path().join("initial"), documents(), models, 2).await.unwrap();
+        let (next, next_selection, receipt) = successor(&cx, root.path(), &index).await;
+        drop(next);
+        let live = NativeLiveShardedHybridIndex::new(&cx, index).unwrap();
+        let activate = activation(&selected, &receipt);
+        let expected_read = encode(&activate, 1024 * 1024).unwrap().len() as u64;
+        let mut input = messages(&[activate, serde_json::json!({"query":"needle"})]);
+        let mut output = BrokenActivationOutput { writes: 0 };
+        assert!(serve::run_with_controls(&live, &cx, &mut input, &mut output, (Mode::Full, 1),
+            serve::Controls { activation: true, updates: false }, None, &query::Policy::default()).await.is_err());
+        assert_eq!(output.writes, 2, "no contradictory error appended after failed success delivery");
+        assert_eq!(input.position(), expected_read);
+        assert_eq!(live.snapshot(&cx).await.unwrap().generation(), next_selection.generation);
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+        let mut replay = Vec::new();
+        serve::run_with_controls(&live, &cx, &mut messages(&[
+            activation(&selected, &receipt), serde_json::json!({"op":"status"}),
+        ]), &mut replay, (Mode::Full, 1), serve::Controls { activation: true, updates: false },
+            None, &query::Policy::default()).await.unwrap();
+        let replay = frames(&replay);
+        assert_eq!(replay[1]["selection_changed"], false);
+        assert_eq!(replay[2]["generation"], serde_json::to_value(next_selection.generation).unwrap());
+    });
+}
+
+#[test]
+fn sharded_external_activation_never_rebinds_an_inflight_scoped_rerank() {
+    use frankensearch::native_ann::builder::sharded::live::NativeLiveShardedHybridIndex;
+    use frankensearch::native_ann::NativeShardedSearchPhase;
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let (models, _, _) = models();
+        let (index, selected) = build(&cx, &options(), &root.path().join("initial"), documents(), models, 2).await.unwrap();
+        let (next, _, receipt) = successor(&cx, root.path(), &index).await;
+        drop(next);
+        let live = NativeLiveShardedHybridIndex::new(&cx, index).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let scope = old.index().scope(&cx, |doc| Ok(doc.metadata["tenant"] == "public")).unwrap();
+        let scorer = Scorer::default();
+        let mut phases = scope.progressive_with_reranker(&cx, "needle", 1, &scorer, 4).unwrap();
+        assert!(matches!(phases.next_phase().await.unwrap(), Some(NativeShardedSearchPhase::Initial { .. })));
+        let mut output = Vec::new();
+        serve::run_with_controls(&live, &cx, &mut messages(&[activation(&selected, &receipt)]),
+            &mut output, (Mode::Full, 1), serve::Controls { activation: true, updates: false },
+            None, &query::Policy::default()).await.unwrap();
+        assert_eq!(frames(&output)[1]["ok"], true);
+        assert!(matches!(phases.next_phase().await.unwrap(), Some(NativeShardedSearchPhase::Refined { .. })));
+        let Some(NativeShardedSearchPhase::Reranked { results, .. }) = phases.next_phase().await.unwrap() else {
+            panic!("old query's final stage must remain available");
+        };
+        assert_eq!(results[0].result.doc_id, "public-last");
+        let page = serde_json::json!({"results": crate::cohort::Rows::from(results)});
+        assert_rows(old.index(), &page);
+        let current = live.snapshot(&cx).await.unwrap();
+        assert!(current.index().vectors().document("public-last").is_none());
+        let seen = scorer.seen.lock().unwrap();
+        for input in seen.iter() {
+            assert_eq!(input.text, scope.document(&input.doc_id).unwrap().content);
+        }
+    });
+}

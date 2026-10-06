@@ -43,6 +43,9 @@ mod cohort;
 #[path = "native_cli/sharded.rs"]
 mod sharded;
 
+#[path = "native_cli/live.rs"]
+mod live;
+
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
 mod tests;
@@ -712,12 +715,9 @@ async fn execute(
             let mut policy = query::Policy::new(cx, options.timeout_ms)?;
             policy.rerank = rerank;
             if options.command == Command::Serve {
-                let sharded::Opened::Single(index) = index else {
-                    return Err(bad("sharded warm serving is not supported by this command yet"));
-                };
-                let live = serve::NativeLiveHybridIndex::new(cx, *index)?;
+                let live = live::Serving::new(cx, index)?;
                 return serve::run_with_controls(
-                    &live,
+                    live.borrow(),
                     cx,
                     &mut io::stdin().lock(),
                     output,

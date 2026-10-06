@@ -136,7 +136,7 @@ impl Rerank {
 /// not described as reranked when the native engine correctly skipped inference.
 #[allow(clippy::too_many_arguments)]
 pub async fn buffered<'i>(
-    index: impl Into<cohort::Index<'i>>,
+    index: impl Into<cohort::Index<'i>> + Send,
     cx: &Cx,
     text: &str,
     mode: Mode,
