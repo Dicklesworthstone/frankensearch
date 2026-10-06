@@ -3,11 +3,12 @@
 //! model reload, independent tier refresh, or detached request task is involved.
 
 pub use frankensearch::native_ann::builder::live::NativeLiveHybridIndex;
-use frankensearch::native_ann::{NativePhaseCandidates, NativeSearchPhase};
+use frankensearch::native_ann::NativePhaseCandidates;
+use super::cohort::Phase as NativeSearchPhase;
 
 use super::{
-    ArtifactGenerationIdentityV1, BufRead, Cx, Deserialize, Error, Mode, NativeBuiltHybridIndex,
-    Read, Result, SCHEMA, Write, bad, emit, filter, query, validate_query,
+    ArtifactGenerationIdentityV1, BufRead, Cx, Deserialize, Error, Mode,
+    Read, Result, SCHEMA, Write, bad, cohort, emit, filter, query, validate_query,
 };
 
 #[path = "activation.rs"]
@@ -105,7 +106,7 @@ impl<W: Write> Frames<'_, W> {
 
 #[allow(clippy::too_many_arguments)]
 async fn phases<W: Write>(
-    index: &NativeBuiltHybridIndex,
+    index: cohort::Index<'_>,
     cx: &Cx,
     request: &Request,
     mode: Mode,
@@ -116,7 +117,7 @@ async fn phases<W: Write>(
     rerank: Option<&query::Rerank>,
 ) -> std::result::Result<bool, Failure> {
     let scoped = query::within(cx, deadline, async {
-        filter::Query::prepare(index, cx, filters)
+        cohort::Prepared::prepare(index, cx, filters)
     })
     .await
     .map_err(Failure::Query)?;
@@ -213,7 +214,7 @@ async fn phases<W: Write>(
 
 fn result_frame(
     phase: &str,
-    results: &[frankensearch::ScoredResult],
+    results: &cohort::Rows,
     candidates: NativePhaseCandidates,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -227,8 +228,8 @@ fn result_frame(
 /// Returns false for a failed/degraded request that was fully reported. Output
 /// failure returns Err and must stop the process, even when more input exists.
 #[allow(clippy::too_many_arguments)]
-pub async fn stream_one<W: Write>(
-    index: &NativeBuiltHybridIndex,
+pub async fn stream_one<'i, W: Write>(
+    index: impl Into<cohort::Index<'i>>,
     cx: &Cx,
     request: &Request,
     ordinal: u64,
@@ -237,11 +238,12 @@ pub async fn stream_one<W: Write>(
     base_filter: Option<&filter::Filter>,
     policy: &query::Policy,
 ) -> Result<bool> {
+    let index = index.into();
     let mut frames = Frames {
         output,
         request: ordinal,
         id: request.id.as_deref(),
-        generation: index.vectors().fast().index().owner_witness().generation,
+        generation: index.generation(),
         seq: 0,
         partial: false,
     };

@@ -68,7 +68,7 @@ impl Filter {
         Ok(())
     }
 
-    fn matches(&self, document: &IndexableDocument) -> bool {
+    pub(super) fn matches(&self, document: &IndexableDocument) -> bool {
         self.ids
             .as_ref()
             .is_none_or(|ids| ids.contains(&document.id))

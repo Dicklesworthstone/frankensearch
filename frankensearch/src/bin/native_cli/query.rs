@@ -9,10 +9,11 @@ use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use asupersync::time::TimerDriverHandle;
 use frankensearch::SearchError;
 use frankensearch::native_ann::builder::deadline::NativeSearchDeadline;
-use frankensearch::{Reranker, native_ann::NativeSearchPhase};
+use frankensearch::Reranker;
+use super::cohort::Phase as NativeSearchPhase;
 
 use super::{
-    Arc, Cx, Error, Mode, NativeBuiltHybridIndex, Path, Result, SCHEMA, bad, filter, search,
+    Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, search,
     validate_query,
 };
 
@@ -134,8 +135,8 @@ impl Rerank {
 /// The phase label comes from the phase actually delivered, so an empty pool is
 /// not described as reranked when the native engine correctly skipped inference.
 #[allow(clippy::too_many_arguments)]
-pub async fn buffered(
-    index: &NativeBuiltHybridIndex,
+pub async fn buffered<'i>(
+    index: impl Into<cohort::Index<'i>>,
     cx: &Cx,
     text: &str,
     mode: Mode,
@@ -143,13 +144,20 @@ pub async fn buffered(
     filters: filter::Filters<'_>,
     policy: &Policy,
 ) -> Result<serde_json::Value> {
+    let index = index.into();
     let deadline = policy.start(cx, None)?;
     within(cx, deadline.as_ref(), async {
         let Some(rerank) = policy.reranker_for(mode) else {
-            return search(index, cx, text, mode, limit, filters).await;
+            if let cohort::Index::Single(index) = index {
+                return search(index, cx, text, mode, limit, filters).await;
+            }
+            validate_query(text)?;
+            return cohort::Prepared::prepare(index, cx, filters)?
+                .search(cx, text, mode, limit)
+                .await;
         };
         validate_query(text)?;
-        let scoped = filter::Query::prepare(index, cx, filters)?;
+        let scoped = cohort::Prepared::prepare(index, cx, filters)?;
         let mut stream = scoped.progressive_with_reranker(
             cx,
             text,
@@ -170,7 +178,7 @@ pub async fn buffered(
             };
             final_page = Some(serde_json::json!({
                 "schema": SCHEMA, "event": "results", "ok": true,
-                "generation": index.vectors().fast().index().owner_witness().generation,
+                "generation": index.generation(),
                 "phase": phase, "results": results, "evaluated": evaluated,
                 "rerank_applied": phase == "reranked",
             }));

@@ -37,6 +37,12 @@ mod filter;
 #[path = "native_cli/models.rs"]
 mod models;
 
+#[path = "native_cli/cohort.rs"]
+mod cohort;
+
+#[path = "native_cli/sharded.rs"]
+mod sharded;
+
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
 mod tests;
@@ -52,7 +58,7 @@ const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\
-         [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
+         [--model-dir DIR] [--fast-only] [--exact] [--batch-size N] [--shard-size N]\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
          [--mode full|fast|quality] [--limit N] [--stream] [--filter JSON]\n\
          [--timeout-ms N] [--reranker-dir DIR] [--rerank-window N]\n\
@@ -122,6 +128,7 @@ struct Options {
     mode: Mode,
     limit: usize,
     batch_size: usize,
+    shard_size: Option<usize>,
     fast_only: bool,
     exact: bool,
     stream: bool,
@@ -166,6 +173,7 @@ impl Options {
             mode: Mode::Full,
             limit: 10,
             batch_size: 16,
+            shard_size: None,
             fast_only: false,
             exact: false,
             stream: false,
@@ -220,6 +228,9 @@ impl Options {
                     if matches!(command, Command::Index | Command::Update | Command::Rebuild) =>
                 {
                     options.batch_size = positive(&value(&mut args)?, 256)?;
+                }
+                "--shard-size" if command == Command::Index => {
+                    options.shard_size = Some(positive(&value(&mut args)?, MAX_DOCUMENTS)?);
                 }
                 "--query" if command == Command::Search => options.query = Some(value(&mut args)?),
                 "--mode" if matches!(command, Command::Search | Command::Serve) => {
@@ -415,7 +426,7 @@ impl Selection {
         let selection: Self = serde_json::from_slice(&bytes).map_err(|_| {
             bad("invalid selection receipt; use the original successful index receipt")
         })?;
-        if selection.schema != SELECTION_SCHEMA
+        if !matches!(selection.schema.as_str(), SELECTION_SCHEMA | sharded::SELECTION_SCHEMA)
             || !selection.directory.is_absolute()
             || selection.documents > MAX_DOCUMENTS
         {
@@ -428,18 +439,10 @@ impl Selection {
     }
 
     async fn open(&self, cx: &Cx, models: Models) -> Result<NativeBuiltHybridIndex> {
-        if models.fast.identity()?.fingerprint() != self.fast_producer
-            || models
-                .quality
-                .as_ref()
-                .map(|model| model.identity().map(|identity| identity.fingerprint()))
-                .transpose()?
-                != self.quality_producer
-        {
-            return Err(bad(
-                "local producers differ from the trusted selection; no model substitution is permitted",
-            ));
+        if self.schema != SELECTION_SCHEMA {
+            return Err(bad("this receipt selects a sharded layout, not an ordinary native index"));
         }
+        self.admit_models(&models)?;
         let expected = GenerationComponentReceiptV1 {
             byte_len: self.snapshot.byte_len,
             sha256: self.snapshot.sha256,
@@ -461,6 +464,22 @@ impl Selection {
         }
         Ok(index)
     }
+
+    fn admit_models(&self, models: &Models) -> Result<()> {
+        if models.fast.identity()?.fingerprint() != self.fast_producer
+            || models
+                .quality
+                .as_ref()
+                .map(|model| model.identity().map(|identity| identity.fingerprint()))
+                .transpose()?
+                != self.quality_producer
+        {
+            return Err(bad(
+                "local producers differ from the trusted selection; no model substitution is permitted",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn new_path(path: &Path) -> Result<PathBuf> {
@@ -478,6 +497,8 @@ fn new_path(path: &Path) -> Result<PathBuf> {
         for marker in [
             "native.hybrid.json",
             "native.snapshot.json",
+            "native.sharded.json",
+            "native.sharded-hybrid.json",
             "FSFS-BUNDLE.json",
         ] {
             match fs::symlink_metadata(ancestor.join(marker)) {
@@ -536,6 +557,34 @@ async fn build_with_generation(
         .as_ref()
         .map(|model| model.identity().map(|identity| identity.fingerprint()))
         .transpose()?;
+    let index = configured_builder(options, directory, generation, documents, models)?
+        .build_hybrid(cx)
+        .await?;
+    let snapshot = index.seal_for_reopen(cx)?;
+    let selection = Selection {
+        schema: SELECTION_SCHEMA.to_owned(),
+        directory: index.vectors().directory().to_path_buf(),
+        generation,
+        snapshot: SnapshotReceipt {
+            byte_len: snapshot.byte_len,
+            sha256: snapshot.sha256,
+        },
+        documents: index.vectors().documents().len(),
+        fast_producer,
+        quality_producer,
+    };
+    Ok((index, selection))
+}
+
+// Both layouts use the same model, precision, graph and input-batch policy.
+// The library owns the actual partitioning, complete build and admission.
+fn configured_builder(
+    options: &Options,
+    directory: &Path,
+    generation: ArtifactGenerationIdentityV1,
+    documents: Vec<IndexableDocument>,
+    models: Models,
+) -> Result<NativeIndexBuilder> {
     let retrieval = if options.exact {
         NativeBuildRetrieval::Exact
     } else {
@@ -554,21 +603,7 @@ async fn build_with_generation(
             .with_quality_embedder(quality)?
             .with_quality_storage(NativeBuildPrecision::F32, retrieval)?;
     }
-    let index = builder.build_hybrid(cx).await?;
-    let snapshot = index.seal_for_reopen(cx)?;
-    let selection = Selection {
-        schema: SELECTION_SCHEMA.to_owned(),
-        directory: index.vectors().directory().to_path_buf(),
-        generation,
-        snapshot: SnapshotReceipt {
-            byte_len: snapshot.byte_len,
-            sha256: snapshot.sha256,
-        },
-        documents: index.vectors().documents().len(),
-        fast_producer,
-        quality_producer,
-    };
-    Ok((index, selection))
+    Ok(builder)
 }
 
 fn save_selection(selection: &Selection, path: &Path) -> Result<()> {
@@ -631,6 +666,9 @@ async fn execute(
                 Some(path) => read_documents(&mut BufReader::new(File::open(path)?))?,
                 None => read_documents(&mut io::stdin().lock())?,
             };
+            if let Some(size) = options.shard_size {
+                sharded::validate_size(size, documents.len())?;
+            }
             let models = models::load(
                 cx,
                 options.models.as_deref(),
@@ -638,7 +676,11 @@ async fn execute(
                 &options.quality,
                 pool,
             )?;
-            let (_index, selection) = build(cx, &options, &directory, documents, models).await?;
+            let selection = if let Some(size) = options.shard_size {
+                sharded::build(cx, &options, &directory, documents, models, size).await?.1
+            } else {
+                build(cx, &options, &directory, documents, models).await?.1
+            };
             save_selection(&selection, &receipt)?;
             emit(
                 output,
@@ -664,13 +706,16 @@ async fn execute(
                 &options.quality,
                 pool,
             )?;
-            let index = selection.open(cx, models).await?;
+            let index = sharded::Opened::open(cx, &selection, models).await?;
             // Index/model admission is startup work. Each accepted query starts
             // its own total budget after that, before scoping or provider work.
             let mut policy = query::Policy::new(cx, options.timeout_ms)?;
             policy.rerank = rerank;
             if options.command == Command::Serve {
-                let live = serve::NativeLiveHybridIndex::new(cx, index)?;
+                let sharded::Opened::Single(index) = index else {
+                    return Err(bad("sharded warm serving is not supported by this command yet"));
+                };
+                let live = serve::NativeLiveHybridIndex::new(cx, *index)?;
                 return serve::run_with_controls(
                     &live,
                     cx,
@@ -696,7 +741,7 @@ async fn execute(
                     timeout_ms: None,
                 };
                 return if serve::stream_one(
-                    &index,
+                    index.borrow(),
                     cx,
                     &request,
                     1,
@@ -715,7 +760,7 @@ async fn execute(
                 };
             }
             let page = query::buffered(
-                &index,
+                index.borrow(),
                 cx,
                 options
                     .query
