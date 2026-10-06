@@ -2137,6 +2137,10 @@ struct FsfsIndexPayload {
     /// counting overlap. A complete generation can intentionally cap a file.
     #[serde(skip_serializing_if = "Option::is_none")]
     fast_window_coverage: Option<FastWindowCoveragePayload>,
+    /// Files discovery skipped by policy, the count the table summary's
+    /// "Discovered" line reports; `skipped_files` adds content skips.
+    #[serde(skip)]
+    policy_skipped_files: usize,
     /// Inputs actually consumed by this run, including its final batch. Kept
     /// in memory for the retained publisher; never left as a live checkpoint
     /// in a completed generation or exposed through the CLI payload.
@@ -18505,6 +18509,7 @@ impl FsfsRuntime {
             vector_generation: published_vector,
             quality_generation: published_quality,
             fast_window_coverage: FastWindowCoveragePayload::from_checkpoint(&checkpoint),
+            policy_skipped_files: stats.skipped_files,
             input_checkpoint: checkpoint,
         };
         if retain_legacy_reuse && generation_complete {

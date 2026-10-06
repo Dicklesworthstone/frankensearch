@@ -12,9 +12,10 @@ use frankensearch_core::{SearchError, SearchResult};
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
 use super::{
-    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsRuntime,
-    FtuiSession, InterfaceMode, SearchDashboardState, SearchExecutionFlags, iso_timestamp_now,
-    pressure_timestamp_ms, retained_search_checkpoint, validate_retained_catalog_path,
+    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload,
+    FsfsRuntime, FtuiSession, InterfaceMode, SearchDashboardState, SearchExecutionFlags,
+    iso_timestamp_now, pressure_timestamp_ms, retained_search_checkpoint,
+    validate_retained_catalog_path,
 };
 use crate::adapters::format_emitter::{emit_envelope, meta_for_format};
 use crate::generation_store::{
@@ -31,6 +32,14 @@ use crate::{CliCommand, OutputFormat, ShutdownCoordinator};
 struct CompleteGenerationDiagnosticReader {
     runtime: FsfsRuntime,
     generation: Option<PublishedGeneration>,
+}
+
+/// The build summary a legacy `fsfs index` reports (semantic counts, index
+/// size, embedding outcomes) and the command's wall time, for an `index`
+/// receipt.
+pub(super) struct IndexBuildReport {
+    summary: FsfsIndexPayload,
+    elapsed_ms: u64,
 }
 
 /// What retention did after one publication, as its receipt reports it.
@@ -445,10 +454,22 @@ impl FsfsRuntime {
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
-        let generation =
-            require_durable_publication(self.rebuild_retained_generation(cx, root).await?)?;
+        let started = Instant::now();
+        let (publication, summary) = self.rebuild_retained_generation_with_summary(cx, root).await?;
+        let generation = require_durable_publication(publication)?;
         let retention = self.retire_superseded_generations(cx, root);
-        self.emit_complete_generation_receipt(root, &generation, "index", &retention, writer)
+        let build = IndexBuildReport {
+            summary,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        self.emit_complete_generation_receipt(
+            root,
+            &generation,
+            "index",
+            &retention,
+            Some(&build),
+            writer,
+        )
     }
 
     /// Apply the configured retention after a durable publication (bd-2op1d).
@@ -503,10 +524,34 @@ impl FsfsRuntime {
         generation: &crate::generation_store::PublishedGeneration,
         command: &str,
         retention: &RetentionOutcome,
+        build: Option<&IndexBuildReport>,
         writer: &mut W,
     ) -> SearchResult<()> {
         if self.cli_input.format == OutputFormat::Table {
-            if let Some(sentinel) = Self::read_index_sentinel(generation.path())? {
+            // The legacy summary lines. The build ran quietly, so its
+            // discovery line is reported here, after the fact.
+            if let Some(build) = build {
+                let sentinel = &build.summary.generation;
+                if !self.cli_input.quiet {
+                    writeln!(
+                        writer,
+                        "Discovered {} file(s) under {} ({} skipped by policy)",
+                        sentinel.discovered_files,
+                        sentinel.target_root,
+                        build.summary.policy_skipped_files,
+                    )?;
+                }
+                writeln!(
+                    writer,
+                    "Indexed {} file(s) (discovered {}, skipped {}) into {} in {} ms (index size {} bytes)",
+                    sentinel.indexed_files,
+                    sentinel.discovered_files,
+                    sentinel.skipped_files,
+                    generation.path().display(),
+                    build.elapsed_ms,
+                    build.summary.index_size_bytes,
+                )?;
+            } else if let Some(sentinel) = Self::read_index_sentinel(generation.path())? {
                 writeln!(
                     writer,
                     "Indexed {} file(s) (discovered {}, skipped {})",
@@ -521,9 +566,13 @@ impl FsfsRuntime {
                 retention.summary(),
             )?;
         } else {
+            // index_root keeps its legacy meaning, the directory holding the
+            // index: the selected generation. A sentinel carried into an
+            // appended generation can still name its predecessor.
             let mut payload = serde_json::json!({
                 "generation_id": generation.id(),
                 "generation_path": generation.path(),
+                "index_root": generation.path(),
                 "store_root": root,
                 "manifest_sha256": generation.manifest_sha256(),
                 "publication": "durable",
@@ -532,29 +581,33 @@ impl FsfsRuntime {
                 "quality_generation": Self::inspect_published_quality_generation(generation.path()),
                 "retention": retention.to_json(),
             });
-            // The build summary a legacy index reports (file counts, bytes,
-            // reason codes), read back from the sealed generation. Its
-            // index_root named the staging directory, not a readable index.
-            if let (Some(sentinel), Some(fields)) = (
-                Self::read_index_sentinel(generation.path())?,
-                payload.as_object_mut(),
-            ) && let serde_json::Value::Object(summary) =
-                serde_json::to_value(sentinel).map_err(|source| SearchError::SubsystemError {
+            // The build summary a legacy index reports: from this build when
+            // it ran here, else the sealed generation's file counts, bytes and
+            // reason codes. Generation fields above take precedence.
+            let to_receipt_value = |value: serde_json::Result<serde_json::Value>| {
+                value.map_err(|source| SearchError::SubsystemError {
                     subsystem: "fsfs.complete_generation.receipt",
                     source: Box::new(source),
-                })?
+                })
+            };
+            let summary = match build {
+                Some(build) => Some(to_receipt_value(serde_json::to_value(&build.summary))?),
+                None => Self::read_index_sentinel(generation.path())?
+                    .map(|sentinel| to_receipt_value(serde_json::to_value(sentinel)))
+                    .transpose()?,
+            };
+            if let (Some(serde_json::Value::Object(summary)), Some(fields)) =
+                (summary, payload.as_object_mut())
             {
                 for (key, value) in summary {
-                    if key != "index_root" {
-                        fields.entry(key).or_insert(value);
-                    }
+                    fields.entry(key).or_insert(value);
                 }
             }
-            let envelope = OutputEnvelope::success(
-                payload,
-                meta_for_format(command, self.cli_input.format),
-                iso_timestamp_now(),
-            );
+            let mut meta = meta_for_format(command, self.cli_input.format);
+            if let Some(build) = build {
+                meta = meta.with_duration_ms(build.elapsed_ms);
+            }
+            let envelope = OutputEnvelope::success(payload, meta, iso_timestamp_now());
             emit_envelope(&envelope, self.cli_input.format, writer)?;
             if !matches!(
                 self.cli_input.format,
@@ -637,6 +690,7 @@ impl FsfsRuntime {
                     generation,
                     "append-batch",
                     retention,
+                    None,
                     writer,
                 );
             }
@@ -690,6 +744,7 @@ impl FsfsRuntime {
                 &generation,
                 "compact",
                 &retention,
+                None,
                 writer,
             );
         }
@@ -1425,6 +1480,7 @@ mod diagnostic_retention_tests {
                     &selected,
                     "index",
                     &outcome,
+                    None,
                     &mut output,
                 )
                 .unwrap();
@@ -1442,6 +1498,7 @@ mod diagnostic_retention_tests {
                     &selected,
                     "index",
                     &outcome,
+                    None,
                     &mut output,
                 )
                 .unwrap();
@@ -1759,6 +1816,75 @@ mod tests {
             assert_eq!(sealed_inventory(predecessor.path()), before);
             assert_eq!(sealed_inventory(successor.path()), successor_before);
             assert!(!root.join(FSFS_EXPLAIN_SESSION_FILE).exists());
+        });
+    }
+
+    #[test]
+    fn complete_index_receipt_is_a_superset_of_the_legacy_index_receipt() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            let mut legacy_input = runtime.cli_input.clone();
+            legacy_input.index_dir = Some(directory.path().join("legacy"));
+            let legacy = runtime
+                .clone()
+                .with_cli_input(legacy_input)
+                .run_one_shot_index_scaffold_internal(
+                    &cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+            let mut bytes = Vec::new();
+            legacy.emit(OutputFormat::Json, 42, &mut bytes).unwrap();
+            let legacy: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+            let receipt = publish(&runtime, &cx, &root).await;
+            assert!(receipt["meta"]["duration_ms"].is_u64());
+            let data = receipt["data"].as_object().unwrap();
+            for (key, value) in legacy["data"].as_object().unwrap() {
+                assert!(data.contains_key(key), "complete receipt lacks {key}");
+                if value.is_u64() && !matches!(key.as_str(), "index_size_bytes" | "generated_at_ms")
+                {
+                    assert_eq!(&data[key], value, "{key} differs from the legacy receipt");
+                }
+            }
+            assert_eq!(data["indexed_files"], 1);
+            assert!(data["index_size_bytes"].as_u64().unwrap() > 0);
+            assert_eq!(data["index_root"], data["generation_path"]);
+
+            // The table summary keeps the legacy line consumers parse, naming
+            // the published generation.
+            runtime.cli_input.format = OutputFormat::Table;
+            runtime.cli_input.quiet = false;
+            let mut output = Vec::new();
+            runtime
+                .run_complete_generation_index_with_writer(&cx, &root, &mut output)
+                .await
+                .unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.starts_with("Discovered 1 file(s) under "), "{text}");
+            let line = text.lines().find(|line| line.starts_with("Indexed ")).unwrap();
+            let tokens = line.split_whitespace().collect::<Vec<_>>();
+            let after = |marker: &str| {
+                tokens
+                    .iter()
+                    .position(|token| *token == marker)
+                    .and_then(|at| tokens.get(at + 1))
+                    .and_then(|token| token.parse::<u64>().ok())
+            };
+            assert_eq!(tokens[1], "1");
+            assert!(after("in").is_some(), "{line}");
+            assert!(after("size").is_some_and(|bytes| bytes > 0), "{line}");
+            let selected = CompleteGenerationStore::open(&cx, &root)
+                .unwrap()
+                .active(&cx)
+                .unwrap()
+                .unwrap();
+            assert!(line.contains(&selected.path().display().to_string()), "{line}");
         });
     }
 
@@ -2546,10 +2672,10 @@ mod tests {
                 "{data}"
             );
             assert!(data["quality_generation"].is_null(), "the fixture is fast-only");
-            assert!(
-                data.get("index_root").is_none(),
-                "the build's staging directory is not a readable index"
-            );
+            // Publication renames only the selection pointer: the directory a
+            // build wrote is the selected generation, a readable index.
+            assert_eq!(data["index_root"], data["generation_path"], "{data}");
+            assert!(Path::new(data["index_root"].as_str().unwrap()).is_dir());
         });
     }
 

@@ -183,12 +183,13 @@ impl FsfsRuntime {
     /// Execute the original indexer with an optional independently copied seed.
     /// The outer retained builder still owns model admission, source precommit,
     /// sealing, publication and cancellation. A failed candidate stays inert.
+    /// Returns the build summary the legacy `fsfs index` command reports.
     pub(super) async fn run_retained_index_with_reuse(
         &self,
         cx: &Cx,
         store: &CompleteGenerationStore,
         candidate_root: &Path,
-    ) -> SearchResult<()> {
+    ) -> SearchResult<FsfsIndexPayload> {
         execution::prepare(cx).await?;
         seed_candidate(cx, self, store, candidate_root)?;
         let payload = Box::pin(self.run_one_shot_index_scaffold_internal(
@@ -202,7 +203,7 @@ impl FsfsRuntime {
         Self::validate_search_generation_at_root(candidate_root, SearchExecutionMode::Full)?;
         let receipt = completed_receipt(self, candidate_root, &payload)?;
         write_receipt(cx, candidate_root, &receipt)?;
-        Ok(())
+        Ok(payload)
     }
 }
 

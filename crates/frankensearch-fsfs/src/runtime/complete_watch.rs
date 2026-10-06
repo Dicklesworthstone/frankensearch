@@ -653,7 +653,8 @@ impl CompleteWatchSession {
                 drop(changes);
                 Ok(())
             })
-            .await?;
+            .await?
+            .0;
         Ok(Some((observed, publication)))
     }
 
@@ -778,7 +779,14 @@ impl FsfsRuntime {
         }
         self.watch_retained_generations(cx, root, |generation| {
             let retention = self.retire_superseded_generations(cx, root);
-            self.emit_complete_generation_receipt(root, generation, "watch", &retention, writer)
+            self.emit_complete_generation_receipt(
+                root,
+                generation,
+                "watch",
+                &retention,
+                None,
+                writer,
+            )
         })
         .await
     }

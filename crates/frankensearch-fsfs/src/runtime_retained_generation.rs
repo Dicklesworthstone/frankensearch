@@ -365,6 +365,19 @@ impl FsfsRuntime {
     ) -> SearchResult<crate::generation_store::GenerationPublication> {
         self.rebuild_retained_generation_with_precommit(cx, store_root, |_| Ok(()))
             .await
+            .map(|(publication, _)| publication)
+    }
+
+    /// [`Self::rebuild_retained_generation`] plus the build summary the legacy
+    /// `fsfs index` receipt reports (counts, index size, embedding outcomes).
+    #[allow(clippy::future_not_send)]
+    async fn rebuild_retained_generation_with_summary(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+    ) -> SearchResult<(crate::generation_store::GenerationPublication, FsfsIndexPayload)> {
+        self.rebuild_retained_generation_with_precommit(cx, store_root, |_| Ok(()))
+            .await
     }
 
     // Source authority is checked after sealing, without replacing the real
@@ -375,7 +388,7 @@ impl FsfsRuntime {
         cx: &Cx,
         store_root: &Path,
         precommit: F,
-    ) -> SearchResult<crate::generation_store::GenerationPublication>
+    ) -> SearchResult<(crate::generation_store::GenerationPublication, FsfsIndexPayload)>
     where
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
@@ -404,7 +417,8 @@ impl FsfsRuntime {
         // unrelated runtime with no blocking pool.
         let mut candidate = self.clone().with_cli_input(input);
         candidate.config.indexing.watch_mode = false;
-        Box::pin(candidate.run_retained_index_with_reuse(cx, &store, build.path())).await?;
+        let summary =
+            Box::pin(candidate.run_retained_index_with_reuse(cx, &store, build.path())).await?;
         reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
 
         // An indexing command can return success with deferred semantic rows.
@@ -421,11 +435,12 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
-        build.publish_with_precommit(
+        let publication = build.publish_with_precommit(
             cx,
             |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
             precommit,
-        )
+        )?;
+        Ok((publication, summary))
     }
 
     /// Insert or replace the supplied JSONL documents in a complete successor.
