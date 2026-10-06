@@ -62,14 +62,23 @@ impl<'a> Index<'a> {
         let first = self.first();
         Ok((
             first.fast().embedder().identity()?.fingerprint(),
-            first.quality().map(|tier| tier.embedder().identity().map(|identity| identity.fingerprint())).transpose()?,
+            first
+                .quality()
+                .map(|tier| {
+                    tier.embedder()
+                        .identity()
+                        .map(|identity| identity.fingerprint())
+                })
+                .transpose()?,
         ))
     }
 
     pub fn all_native_hnsw(self, quality: bool) -> bool {
         let present = |partition: &frankensearch::native_ann::builder::NativeBuiltIndex| {
             if quality {
-                partition.quality().is_some_and(|tier| tier.graph_path().is_some())
+                partition
+                    .quality()
+                    .is_some_and(|tier| tier.graph_path().is_some())
             } else {
                 partition.fast().graph_path().is_some()
             }
@@ -120,7 +129,10 @@ impl<'a> Prepared<'a> {
         }
         let scope = if filters.iter().any(Option::is_some) {
             Some(index.scope(cx, |document| {
-                Ok(filters.iter().flatten().all(|filter| filter.matches(document)))
+                Ok(filters
+                    .iter()
+                    .flatten()
+                    .all(|filter| filter.matches(document)))
             })?)
         } else {
             // Do not scan source membership for an unfiltered query.
@@ -312,20 +324,42 @@ pub enum Phase {
 impl From<NativeSearchPhase> for Phase {
     fn from(phase: NativeSearchPhase) -> Self {
         match phase {
-            NativeSearchPhase::Initial { results, candidates } => Self::Initial {
-                results: Rows::Single(results), candidates,
+            NativeSearchPhase::Initial {
+                results,
+                candidates,
+            } => Self::Initial {
+                results: Rows::Single(results),
+                candidates,
             },
-            NativeSearchPhase::Refined { results, candidates } => Self::Refined {
-                results: Rows::Single(results), candidates,
+            NativeSearchPhase::Refined {
+                results,
+                candidates,
+            } => Self::Refined {
+                results: Rows::Single(results),
+                candidates,
             },
-            NativeSearchPhase::Reranked { results, candidates, evaluated } => Self::Reranked {
-                results: Rows::Single(results), candidates, evaluated,
+            NativeSearchPhase::Reranked {
+                results,
+                candidates,
+                evaluated,
+            } => Self::Reranked {
+                results: Rows::Single(results),
+                candidates,
+                evaluated,
             },
-            NativeSearchPhase::RefinementFailed { initial_results, error } => Self::RefinementFailed {
-                initial_results: Rows::Single(initial_results), error,
+            NativeSearchPhase::RefinementFailed {
+                initial_results,
+                error,
+            } => Self::RefinementFailed {
+                initial_results: Rows::Single(initial_results),
+                error,
             },
-            NativeSearchPhase::RerankFailed { previous_results, error } => Self::RerankFailed {
-                previous_results: Rows::Single(previous_results), error,
+            NativeSearchPhase::RerankFailed {
+                previous_results,
+                error,
+            } => Self::RerankFailed {
+                previous_results: Rows::Single(previous_results),
+                error,
             },
         }
     }
@@ -334,20 +368,42 @@ impl From<NativeSearchPhase> for Phase {
 impl From<NativeShardedSearchPhase> for Phase {
     fn from(phase: NativeShardedSearchPhase) -> Self {
         match phase {
-            NativeShardedSearchPhase::Initial { results, candidates } => Self::Initial {
-                results: results.into(), candidates,
+            NativeShardedSearchPhase::Initial {
+                results,
+                candidates,
+            } => Self::Initial {
+                results: results.into(),
+                candidates,
             },
-            NativeShardedSearchPhase::Refined { results, candidates } => Self::Refined {
-                results: results.into(), candidates,
+            NativeShardedSearchPhase::Refined {
+                results,
+                candidates,
+            } => Self::Refined {
+                results: results.into(),
+                candidates,
             },
-            NativeShardedSearchPhase::Reranked { results, candidates, evaluated } => Self::Reranked {
-                results: results.into(), candidates, evaluated,
+            NativeShardedSearchPhase::Reranked {
+                results,
+                candidates,
+                evaluated,
+            } => Self::Reranked {
+                results: results.into(),
+                candidates,
+                evaluated,
             },
-            NativeShardedSearchPhase::RefinementFailed { initial_results, error } => Self::RefinementFailed {
-                initial_results: initial_results.into(), error,
+            NativeShardedSearchPhase::RefinementFailed {
+                initial_results,
+                error,
+            } => Self::RefinementFailed {
+                initial_results: initial_results.into(),
+                error,
             },
-            NativeShardedSearchPhase::RerankFailed { previous_results, error } => Self::RerankFailed {
-                previous_results: previous_results.into(), error,
+            NativeShardedSearchPhase::RerankFailed {
+                previous_results,
+                error,
+            } => Self::RerankFailed {
+                previous_results: previous_results.into(),
+                error,
             },
         }
     }

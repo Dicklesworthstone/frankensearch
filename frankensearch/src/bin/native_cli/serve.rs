@@ -2,13 +2,13 @@
 //! Every phase is flushed before the next phase is polled. No result cache,
 //! model reload, independent tier refresh, or detached request task is involved.
 
-pub use frankensearch::native_ann::builder::live::NativeLiveHybridIndex;
-use frankensearch::native_ann::NativePhaseCandidates;
 use super::cohort::Phase as NativeSearchPhase;
+use frankensearch::native_ann::NativePhaseCandidates;
+pub use frankensearch::native_ann::builder::live::NativeLiveHybridIndex;
 
 use super::{
-    ArtifactGenerationIdentityV1, BufRead, Cx, Deserialize, Error, Mode,
-    Read, Result, SCHEMA, Write, bad, cohort, emit, filter, live, query, validate_query,
+    ArtifactGenerationIdentityV1, BufRead, Cx, Deserialize, Error, Mode, Read, Result, SCHEMA,
+    Write, bad, cohort, emit, filter, live, query, validate_query,
 };
 
 #[path = "activation.rs"]
@@ -304,7 +304,9 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
     cx.checkpoint()
         .map_err(|_| bad("native serving cancelled"))?;
     if controls.updates && matches!(live, live::Live::Sharded(_)) {
-        return Err(bad("sharded source updates are not exposed by the stdin protocol yet; use a complete library-built successor and --allow-activation"));
+        return Err(bad(
+            "sharded source updates are not exposed by the stdin protocol yet; use a complete library-built successor and --allow-activation",
+        ));
     }
     if let Some(filter) = base_filter {
         filter.validate()?;
@@ -312,19 +314,19 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
     let initial = live.snapshot(cx).await?;
     let index = initial.index();
     let mut ready = serde_json::json!({
-            "schema": SCHEMA, "event": "ready", "ok": true,
-            "generation": index.generation(),
-            "documents": index.document_count(),
-            "quality": index.has_quality(),
-            "fast_native_hnsw": index.all_native_hnsw(false),
-            "activation_enabled": controls.activation,
-            "updates_enabled": controls.updates,
-            "update_max_mutations": warm_update::MAX_MUTATIONS,
-            "default_filter_applied": base_filter.is_some(),
-            "maximum_timeout_ms": policy.maximum_ms(),
-            "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
-            "rerank_window": policy.rerank.as_ref().map(|r| r.window),
-        });
+        "schema": SCHEMA, "event": "ready", "ok": true,
+        "generation": index.generation(),
+        "documents": index.document_count(),
+        "quality": index.has_quality(),
+        "fast_native_hnsw": index.all_native_hnsw(false),
+        "activation_enabled": controls.activation,
+        "updates_enabled": controls.updates,
+        "update_max_mutations": warm_update::MAX_MUTATIONS,
+        "default_filter_applied": base_filter.is_some(),
+        "maximum_timeout_ms": policy.maximum_ms(),
+        "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
+        "rerank_window": policy.rerank.as_ref().map(|r| r.window),
+    });
     index.annotate(&mut ready);
     emit(output, &ready)?;
     drop(initial);
@@ -399,21 +401,25 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
             Message::Update(request) => {
                 match live {
                     live::Live::Single(live) => {
-                        warm_update::execute(live, cx, request, ordinal, controls.updates, output).await?;
+                        warm_update::execute(live, cx, request, ordinal, controls.updates, output)
+                            .await?;
                     }
                     live::Live::Sharded(_) => {
                         // Grant was refused at startup. Never let an update
                         // request fall through to search or inspect its paths.
                         let snapshot = live.snapshot(cx).await?;
                         let warm_update::Request::Update { id, .. } = request;
-                        emit(output, &serde_json::json!({
-                            "schema": SCHEMA, "event": "terminal", "operation": "update",
-                            "ok": false, "status": "failed", "request": ordinal,
-                            "id": id.as_deref().filter(|id| validate_id(Some(id)).is_ok()),
-                            "seq": 0, "partial_results": false,
-                            "generation": snapshot.generation(), "selection_changed": false,
-                            "error": "sharded source updates are not enabled in this protocol; activate a complete selected successor",
-                        }))?;
+                        emit(
+                            output,
+                            &serde_json::json!({
+                                "schema": SCHEMA, "event": "terminal", "operation": "update",
+                                "ok": false, "status": "failed", "request": ordinal,
+                                "id": id.as_deref().filter(|id| validate_id(Some(id)).is_ok()),
+                                "seq": 0, "partial_results": false,
+                                "generation": snapshot.generation(), "selection_changed": false,
+                                "error": "sharded source updates are not enabled in this protocol; activate a complete selected successor",
+                            }),
+                        )?;
                     }
                 }
             }

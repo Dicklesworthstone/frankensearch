@@ -23,9 +23,13 @@ pub enum Opened {
 impl Opened {
     pub async fn open(cx: &Cx, selection: &Selection, models: Models) -> Result<Self> {
         match selection.schema.as_str() {
-            super::SELECTION_SCHEMA => Ok(Self::Single(Box::new(selection.open(cx, models).await?))),
+            super::SELECTION_SCHEMA => {
+                Ok(Self::Single(Box::new(selection.open(cx, models).await?)))
+            }
             SELECTION_SCHEMA => Ok(Self::Sharded(Box::new(open(cx, selection, models).await?))),
-            _ => Err(bad("unknown selected layout; no discovery or fallback is permitted")),
+            _ => Err(bad(
+                "unknown selected layout; no discovery or fallback is permitted",
+            )),
         }
     }
 
@@ -39,10 +43,14 @@ impl Opened {
 
 pub fn validate_size(size: usize, documents: usize) -> Result<()> {
     if size == 0 || size > MAX_DOCUMENTS || documents > MAX_DOCUMENTS {
-        return Err(bad("shard size must be between 1 and 100000; corpus limit is 100000 documents"));
+        return Err(bad(
+            "shard size must be between 1 and 100000; corpus limit is 100000 documents",
+        ));
     }
     if documents.div_ceil(size).max(1) > MAX_NATIVE_BUILD_SHARDS {
-        return Err(bad("the requested shard size would exceed the 1024-partition limit"));
+        return Err(bad(
+            "the requested shard size would exceed the 1024-partition limit",
+        ));
     }
     Ok(())
 }
@@ -58,7 +66,9 @@ pub async fn build(
     validate_size(size, documents.len())?;
     let generation = new_generation(1)?;
     let fast_producer = models.fast.identity()?.fingerprint();
-    let quality_producer = models.quality.as_ref()
+    let quality_producer = models
+        .quality
+        .as_ref()
         .map(|model| model.identity().map(|identity| identity.fingerprint()))
         .transpose()?;
     let index = configured_builder(options, directory, generation, documents, models)?
@@ -71,7 +81,10 @@ pub async fn build(
         schema: SELECTION_SCHEMA.to_owned(),
         directory: index.vectors().directory().to_path_buf(),
         generation,
-        snapshot: SnapshotReceipt { byte_len: snapshot.byte_len, sha256: snapshot.sha256 },
+        snapshot: SnapshotReceipt {
+            byte_len: snapshot.byte_len,
+            sha256: snapshot.sha256,
+        },
         documents: index.vectors().document_count(),
         fast_producer,
         quality_producer,
@@ -85,7 +98,9 @@ pub async fn open(
     models: Models,
 ) -> Result<NativeBuiltShardedHybridIndex> {
     if selection.schema != SELECTION_SCHEMA || selection.documents > MAX_DOCUMENTS {
-        return Err(bad("expected a bounded, explicit sharded selection receipt"));
+        return Err(bad(
+            "expected a bounded, explicit sharded selection receipt",
+        ));
     }
     selection.admit_models(&models)?;
     let expected = GenerationComponentReceiptV1 {
@@ -95,12 +110,20 @@ pub async fn open(
     let mut limits = NativeShardedHybridReopenLimits::default();
     limits.vectors.max_documents = MAX_DOCUMENTS;
     let index = NativeBuiltShardedHybridIndex::open_selected(
-        cx, &selection.directory, &expected, models.fast, models.quality, limits,
-    ).await?;
+        cx,
+        &selection.directory,
+        &expected,
+        models.fast,
+        models.quality,
+        limits,
+    )
+    .await?;
     if index.vectors().generation() != selection.generation
         || index.vectors().document_count() != selection.documents
     {
-        return Err(bad("reopened shard inventory differs from its trusted selection"));
+        return Err(bad(
+            "reopened shard inventory differs from its trusted selection",
+        ));
     }
     Ok(index)
 }

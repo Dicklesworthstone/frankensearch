@@ -429,8 +429,10 @@ impl Selection {
         let selection: Self = serde_json::from_slice(&bytes).map_err(|_| {
             bad("invalid selection receipt; use the original successful index receipt")
         })?;
-        if !matches!(selection.schema.as_str(), SELECTION_SCHEMA | sharded::SELECTION_SCHEMA)
-            || !selection.directory.is_absolute()
+        if !matches!(
+            selection.schema.as_str(),
+            SELECTION_SCHEMA | sharded::SELECTION_SCHEMA
+        ) || !selection.directory.is_absolute()
             || selection.documents > MAX_DOCUMENTS
         {
             return Err(bad(
@@ -443,7 +445,9 @@ impl Selection {
 
     async fn open(&self, cx: &Cx, models: Models) -> Result<NativeBuiltHybridIndex> {
         if self.schema != SELECTION_SCHEMA {
-            return Err(bad("this receipt selects a sharded layout, not an ordinary native index"));
+            return Err(bad(
+                "this receipt selects a sharded layout, not an ordinary native index",
+            ));
         }
         self.admit_models(&models)?;
         let expected = GenerationComponentReceiptV1 {
@@ -680,7 +684,9 @@ async fn execute(
                 pool,
             )?;
             let selection = if let Some(size) = options.shard_size {
-                sharded::build(cx, &options, &directory, documents, models, size).await?.1
+                sharded::build(cx, &options, &directory, documents, models, size)
+                    .await?
+                    .1
             } else {
                 build(cx, &options, &directory, documents, models).await?.1
             };

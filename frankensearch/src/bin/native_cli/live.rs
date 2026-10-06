@@ -2,18 +2,18 @@
 //! These variants never install parts independently or implement another lock,
 //! publisher, source transaction, model loader or rollback authority.
 
+use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 use frankensearch::native_ann::builder::live::{
     NativeHybridCandidate, NativeHybridSnapshot, NativeLiveHybridIndex,
 };
+use frankensearch::native_ann::builder::sharded::NativeShardedHybridReopenLimits;
 use frankensearch::native_ann::builder::sharded::live::{
     NativeLiveShardedHybridIndex, NativeShardedCandidate, NativeShardedSnapshot,
 };
-use frankensearch::native_ann::builder::sharded::NativeShardedHybridReopenLimits;
-use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 
 use super::{
-    ArtifactGenerationIdentityV1, Cx, GenerationComponentReceiptV1, MAX_DOCUMENTS,
-    Result, Selection, bad, cohort, sharded,
+    ArtifactGenerationIdentityV1, Cx, GenerationComponentReceiptV1, MAX_DOCUMENTS, Result,
+    Selection, bad, cohort, sharded,
 };
 
 pub enum Serving {
@@ -24,10 +24,12 @@ pub enum Serving {
 impl Serving {
     pub fn new(cx: &Cx, index: sharded::Opened) -> Result<Self> {
         match index {
-            sharded::Opened::Single(index) => Ok(Self::Single(NativeLiveHybridIndex::new(cx, *index)?)),
-            sharded::Opened::Sharded(index) => {
-                Ok(Self::Sharded(NativeLiveShardedHybridIndex::new(cx, *index)?))
+            sharded::Opened::Single(index) => {
+                Ok(Self::Single(NativeLiveHybridIndex::new(cx, *index)?))
             }
+            sharded::Opened::Sharded(index) => Ok(Self::Sharded(
+                NativeLiveShardedHybridIndex::new(cx, *index)?,
+            )),
         }
     }
 
@@ -73,7 +75,9 @@ impl Live<'_> {
             (Self::Sharded(live), Candidate::Sharded(candidate)) => {
                 Ok(Snapshot::Sharded(live.install(cx, candidate).await?))
             }
-            _ => Err(bad("activation cannot change the live handle's selected layout")),
+            _ => Err(bad(
+                "activation cannot change the live handle's selected layout",
+            )),
         }
     }
 }
@@ -107,20 +111,34 @@ impl Snapshot {
             Self::Single(snapshot) if selection.schema == super::SELECTION_SCHEMA => {
                 let mut limits = NativeHybridReopenLimits::default();
                 limits.vectors.max_documents = MAX_DOCUMENTS;
-                Candidate::Single(snapshot.prepare_selected(cx, &selection.directory, &expected, limits).await?)
+                Candidate::Single(
+                    snapshot
+                        .prepare_selected(cx, &selection.directory, &expected, limits)
+                        .await?,
+                )
             }
             Self::Sharded(snapshot) if selection.schema == sharded::SELECTION_SCHEMA => {
                 let mut limits = NativeShardedHybridReopenLimits::default();
                 limits.vectors.max_documents = MAX_DOCUMENTS;
-                Candidate::Sharded(snapshot.prepare_selected(cx, &selection.directory, &expected, limits).await?)
+                Candidate::Sharded(
+                    snapshot
+                        .prepare_selected(cx, &selection.directory, &expected, limits)
+                        .await?,
+                )
             }
-            _ => return Err(bad("activation requires a receipt for the same selected layout")),
+            _ => {
+                return Err(bad(
+                    "activation requires a receipt for the same selected layout",
+                ));
+            }
         };
         let admitted = candidate.index();
         if admitted.generation() != selection.generation
             || admitted.document_count() != selection.documents
         {
-            return Err(bad("admitted successor differs from the trusted receipt; serving selection unchanged"));
+            return Err(bad(
+                "admitted successor differs from the trusted receipt; serving selection unchanged",
+            ));
         }
         Ok(candidate)
     }

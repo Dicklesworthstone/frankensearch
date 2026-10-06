@@ -5,16 +5,15 @@
 use std::future::Future;
 use std::time::Duration;
 
+use super::cohort::Phase as NativeSearchPhase;
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use asupersync::time::TimerDriverHandle;
+use frankensearch::Reranker;
 use frankensearch::SearchError;
 use frankensearch::native_ann::builder::deadline::NativeSearchDeadline;
-use frankensearch::Reranker;
-use super::cohort::Phase as NativeSearchPhase;
 
 use super::{
-    Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, search,
-    validate_query,
+    Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, search, validate_query,
 };
 
 pub const MAX_TIMEOUT_MS: u64 = 600_000;

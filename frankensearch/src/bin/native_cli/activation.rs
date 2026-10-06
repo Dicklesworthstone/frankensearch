@@ -6,8 +6,8 @@
 
 use super::validate_id;
 use crate::{
-    ArtifactGenerationIdentityV1, Cx, Deserialize,
-    Path, PathBuf, Result, SCHEMA, Selection, Write, bad, emit, live,
+    ArtifactGenerationIdentityV1, Cx, Deserialize, Path, PathBuf, Result, SCHEMA, Selection, Write,
+    bad, emit, live,
 };
 
 #[derive(Debug, Deserialize)]
@@ -70,9 +70,7 @@ async fn install(
         ));
     }
     let (fast_producer, quality_producer) = base.index().producers()?;
-    if fast_producer != selection.fast_producer
-        || quality_producer != selection.quality_producer
-    {
+    if fast_producer != selection.fast_producer || quality_producer != selection.quality_producer {
         return Err(bad(
             "activation must preserve the retained producers and quality-tier presence",
         ));
