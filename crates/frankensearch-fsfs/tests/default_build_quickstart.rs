@@ -3224,7 +3224,7 @@ mod loader_only {
         parse_success_envelope("doctor producer index", &indexed);
 
         for (tier, filename) in [("fast", "index.fsvi"), ("quality", "quality.fsvi")] {
-            let source = index.join("vector").join(filename);
+            let source = active_generation_root(&index).join("vector").join(filename);
             let original = fs::read(&source).expect("real indexed vectors");
             let reader = VectorIndex::open_read_only(&source).expect("real generation reader");
             assert!(
