@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::NativeBuiltHybridIndex;
+use super::sharded::NativeBuiltShardedHybridIndex;
 use crate::native_ann::{NativeProgressiveSearch, NativeSearchPhase, checkpoint, invalid};
 use crate::{
     Cx, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead, Reranker,
@@ -15,6 +16,9 @@ use crate::{
 };
 
 type ScopedText<'a> = dyn Fn(&str) -> Option<String> + Send + Sync + 'a;
+
+/// Source scopes over complete partitioned vector and global lexical cohorts.
+pub mod sharded;
 
 /// A reusable query scope frozen from the source documents of one retained build.
 ///
@@ -82,7 +86,7 @@ impl NativeBuiltHybridIndex {
         Ok(NativeScopedHybridIndex {
             index: self,
             lexical: ScopedLexical {
-                index: self,
+                index: ScopeSource::Single(self),
                 allowed,
             },
             text,
@@ -254,8 +258,38 @@ async fn collect(mut stream: NativeProgressiveSearch<'_>) -> SearchResult<Vec<Sc
 // This adapter can ONLY wrap the private unrefreshable reader belonging to a
 // complete built/reopened cohort. Do not generalize it to arbitrary LexicalRead:
 // repeated search_candidates calls on a mutable reader could mix generations.
+enum ScopeSource<'a> {
+    Single(&'a NativeBuiltHybridIndex),
+    Sharded(&'a NativeBuiltShardedHybridIndex),
+}
+
+impl ScopeSource<'_> {
+    fn lexical(&self) -> &dyn LexicalRead {
+        match self {
+            Self::Single(index) => index.lexical(),
+            Self::Sharded(index) => index.lexical(),
+        }
+    }
+
+    fn document_count(&self) -> usize {
+        match self {
+            Self::Single(index) => index.vectors().documents().len(),
+            Self::Sharded(index) => index.vectors().document_count(),
+        }
+    }
+
+    fn document(&self, id: &str) -> Option<&IndexableDocument> {
+        match self {
+            Self::Single(index) => index.vectors().document(id),
+            Self::Sharded(index) => index.vectors().document(id),
+        }
+    }
+}
+
+// The closed source enum is intentional: arbitrary refreshable lexical readers
+// cannot enter this adapter. Both variants own an admitted, immutable cohort.
 struct ScopedLexical<'a> {
-    index: &'a NativeBuiltHybridIndex,
+    index: ScopeSource<'a>,
     allowed: Arc<BTreeSet<String>>,
 }
 
@@ -293,7 +327,7 @@ impl LexicalRead for ScopedLexical<'_> {
             if target == 0 {
                 return Ok(LexicalCandidateBatch::eager(Vec::new()));
             }
-            let ceiling = self.index.vectors().documents().len();
+            let ceiling = self.index.document_count();
             let mut width = limit.min(ceiling);
             loop {
                 checkpoint(cx, "native_ann.scope.lexical_window")?;
@@ -318,7 +352,6 @@ impl LexicalRead for ScopedLexical<'_> {
                     if !result.score.is_finite()
                         || self
                             .index
-                            .vectors()
                             .document(result.doc_id.as_str())
                             .is_none()
                         || !seen.insert(result.doc_id.as_str())
@@ -392,6 +425,8 @@ impl LexicalRead for ScopedLexical<'_> {
 
 #[cfg(test)]
 mod tests {
+    mod sharded_tests;
+
     use super::*;
     use std::future::Future;
     use std::sync::Mutex;

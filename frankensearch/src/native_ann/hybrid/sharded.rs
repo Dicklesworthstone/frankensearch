@@ -1,6 +1,6 @@
 //! Hybrid and lazy progressive retrieval over independently sharded tiers.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
@@ -203,6 +203,7 @@ impl NativeShardSet {
             k,
             budget: candidate_budget(k)?,
             reranker: None,
+            allowed_documents: None,
             state: State::Initial,
         })
     }
@@ -241,10 +242,56 @@ pub struct NativeShardedProgressiveSearch<'a> {
     k: usize,
     budget: usize,
     reranker: Option<RerankRequest<'a>>,
+    allowed_documents: Option<&'a BTreeSet<String>>,
     state: State,
 }
 
 impl<'a> NativeShardedProgressiveSearch<'a> {
+    // Only a complete source-scoped owner supplies this frozen membership and
+    // its equally scoped immutable lexical adapter. Public raw readers cannot
+    // attach a vector-only filter and silently leave the keyword lane unscoped.
+    pub(crate) fn with_allowed_documents(
+        mut self,
+        allowed: &'a BTreeSet<String>,
+    ) -> SearchResult<Self> {
+        checkpoint(self.cx, "native_ann.shards.scope_configuration")?;
+        if !matches!(self.state, State::Initial) {
+            return Err(invalid(
+                "shards.scope.configuration",
+                "started",
+                "freeze source membership before requesting any phase",
+            ));
+        }
+        self.allowed_documents = Some(allowed);
+        Ok(self)
+    }
+
+    async fn vector_candidates(
+        &self,
+        shards: &NativeShardSet,
+        embedder: &dyn Embedder,
+    ) -> SearchResult<Vec<NativeShardHit>> {
+        match self.allowed_documents {
+            Some(allowed) => {
+                shards
+                    .search_text_filtered(
+                        self.cx,
+                        embedder,
+                        self.text,
+                        self.budget,
+                        None,
+                        |id| allowed.contains(id),
+                    )
+                    .await
+            }
+            None => {
+                shards
+                    .search_text(self.cx, embedder, self.text, self.budget, None)
+                    .await
+            }
+        }
+    }
+
     /// Add one lazy cross-encoder stage over the globally fused candidate window.
     ///
     /// The model runs once across the tier, not once per partition. `top_k`
@@ -342,7 +389,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
 
     async fn initial(&mut self) -> SearchResult<NativeShardedSearchPhase> {
         let is_hash = admit_tiers(self.cx, self.fast, self.fast_embedder, self.quality)?;
-        if self.k == 0 {
+        if self.k == 0 || self.allowed_documents.is_some_and(BTreeSet::is_empty) {
             return Ok(NativeShardedSearchPhase::Initial {
                 results: Vec::new(),
                 candidates: NativePhaseCandidates::default(),
@@ -350,11 +397,22 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         }
         let (fast, batch) = join_sources(
             self.cx,
-            self.fast
-                .search_text(self.cx, self.fast_embedder, self.text, self.budget, None),
+            self.vector_candidates(self.fast, self.fast_embedder),
             checked_lexical(self.cx, self.lexical, self.text, self.budget),
         )
         .await?;
+        if let Some(allowed) = self.allowed_documents {
+            for result in batch.results() {
+                checkpoint(self.cx, "native_ann.shards.lexical_scope")?;
+                if !allowed.contains(result.doc_id.as_str()) {
+                    return Err(invalid(
+                        "shards.scope.lexical",
+                        "excluded",
+                        "lexical and vector candidates must share the frozen source scope",
+                    ));
+                }
+            }
+        }
         let candidates = NativePhaseCandidates {
             fast: fast.len(),
             quality: 0,
@@ -400,9 +458,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
                 "refinement requires its admitted quality tier",
             )
         })?;
-        let quality = quality
-            .search_text(self.cx, embedder, self.text, self.budget, None)
-            .await?;
+        let quality = self.vector_candidates(quality, embedder).await?;
         let candidates = NativePhaseCandidates {
             fast: pending.fast.len(),
             quality: quality.len(),
