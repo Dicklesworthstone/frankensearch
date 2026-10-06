@@ -21552,13 +21552,7 @@ impl FsfsRuntime {
         let mount_overrides = self.config.discovery.mount_override_map();
         let mount_table = MountTable::new(read_system_mounts(), &mount_overrides);
 
-        let mut walker = WalkBuilder::new(target_root);
-        walker.follow_links(self.config.discovery.follow_symlinks);
-        walker.git_ignore(true);
-        walker.git_global(true);
-        walker.git_exclude(true);
-        walker.hidden(false);
-        walker.standard_filters(true);
+        let walker = index_discovery_walker(target_root, &self.config.discovery);
 
         for entry in walker.build() {
             control.checkpoint(cx, "index.discovery", false)?;
@@ -28376,6 +28370,21 @@ fn is_ignorable_index_walk_error(error: &std::io::Error) -> bool {
             | std::io::ErrorKind::PermissionDenied
             | std::io::ErrorKind::Interrupted
     )
+}
+
+/// The walker `fsfs index` discovers sources with: `.gitignore` inside a
+/// repository, global and repository excludes, `.ignore` files and hidden
+/// entries are skipped (`standard_filters` re-enables `hidden`). Anything that
+/// decides whether the sources changed must look at this same tree.
+fn index_discovery_walker(target_root: &Path, discovery: &crate::config::DiscoveryConfig) -> WalkBuilder {
+    let mut walker = WalkBuilder::new(target_root);
+    walker.follow_links(discovery.follow_symlinks);
+    walker.git_ignore(true);
+    walker.git_global(true);
+    walker.git_exclude(true);
+    walker.hidden(false);
+    walker.standard_filters(true);
+    walker
 }
 
 const fn map_degradation_override(
@@ -40522,7 +40531,6 @@ mod tests {
     #[test]
     fn lexical_only_watch_retries_a_refused_membership_publication() {
         use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
-        use std::os::unix::fs::PermissionsExt;
 
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -40568,10 +40576,15 @@ mod tests {
             assert_eq!(indexed_files(), 1);
 
             fs::write(project.join("src/new.rs"), "pub fn new_ocelot() {}\n").expect("write");
-            // The keyword engine and the manifests live in subdirectories; the
-            // sentinel that completes a membership publication is written in
-            // the index root itself.
-            fs::set_permissions(&index_root, fs::Permissions::from_mode(0o555)).unwrap();
+            // Refuse the sentinel write that completes a membership
+            // publication: a non-empty directory where the sentinel goes
+            // cannot be replaced by a file, even by root, which ignores the
+            // permission bits a read-only index root would rely on.
+            let sentinel = index_root.join(super::FSFS_SENTINEL_FILE);
+            let saved = fs::read(&sentinel).unwrap();
+            fs::remove_file(&sentinel).unwrap();
+            fs::create_dir(&sentinel).unwrap();
+            fs::write(sentinel.join("occupied"), b"").unwrap();
             let refused = ingest
                 .apply_batch(
                     &cx,
@@ -40582,7 +40595,9 @@ mod tests {
                     }],
                 )
                 .await;
-            fs::set_permissions(&index_root, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::remove_file(sentinel.join("occupied")).unwrap();
+            fs::remove_dir(&sentinel).unwrap();
+            fs::write(&sentinel, saved).unwrap();
             assert!(refused.is_err(), "the sentinel write was refused: {refused:?}");
             assert_eq!(indexed_files(), 1, "the refused publication did not complete");
 

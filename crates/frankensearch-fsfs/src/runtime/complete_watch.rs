@@ -18,7 +18,10 @@ use frankensearch_core::{SearchError, SearchResult};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
-use super::{FsfsRuntime, retained_search_checkpoint, validate_retained_catalog_path};
+use super::{
+    FsfsRuntime, index_discovery_walker, retained_search_checkpoint,
+    validate_retained_catalog_path,
+};
 use crate::OutputFormat;
 use crate::config::{DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision};
 use crate::generation_store::{
@@ -260,6 +263,13 @@ impl SourceRoot {
                 "the watched source is excluded by discovery policy; refusing an empty replacement",
             ));
         }
+        // Only what `fsfs index` would discover counts as source: an edit to a
+        // gitignored or hidden file must not look like a change and rebuild.
+        let discoverable: BTreeSet<PathBuf> = index_discovery_walker(&self.path, discovery)
+            .build()
+            .filter_map(Result::ok)
+            .map(ignore::DirEntry::into_path)
+            .collect();
         let mut stamps = BTreeMap::new();
         let mut directories = BTreeMap::new();
         let mut visited = BTreeSet::new();
@@ -287,6 +297,9 @@ impl SourceRoot {
                 let path = entry.path();
                 before_entry(&path)?;
                 retained_search_checkpoint(cx)?;
+                if !discoverable.contains(&path) {
+                    continue;
+                }
                 let link = fs::symlink_metadata(&path).map_err(observation_io)?;
                 let is_symlink = link.is_symlink();
                 if is_symlink && !discovery.follow_symlinks {
@@ -950,6 +963,56 @@ mod tests {
                 &observed,
                 Some(&observed)
             ));
+        });
+    }
+
+    /// The observation covers exactly what `fsfs index` discovers. Edits to
+    /// gitignored or hidden files neither change it nor touch it, so they do
+    /// not rebuild and republish an unchanged corpus; tracked edits still do.
+    #[test]
+    fn complete_watch_ignores_gitignored_and_hidden_files_like_the_indexer() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let source = SourceRoot::open(fs::canonicalize(directory.path()).unwrap()).unwrap();
+            let root = source.path.clone();
+            fs::create_dir(root.join(".git")).unwrap();
+            fs::create_dir(root.join("logs")).unwrap();
+            fs::create_dir(root.join(".cache")).unwrap();
+            fs::write(root.join(".gitignore"), "logs/\n*.tmp\n").unwrap();
+            let tracked = root.join("tracked.md");
+            fs::write(&tracked, "tracked prose").unwrap();
+            let ignored = [
+                root.join("logs/run.log"),
+                root.join("scratch.tmp"),
+                root.join(".cache/state.md"),
+            ];
+            for path in &ignored {
+                fs::write(path, "ignored v1").unwrap();
+            }
+            let discovery = DiscoveryConfig::default();
+            let before = source.observe(&cx, &discovery).unwrap();
+            assert_eq!(
+                before.stamps.keys().collect::<Vec<_>>(),
+                [&tracked]
+            );
+
+            for path in &ignored {
+                fs::write(path, "ignored v2, a different length").unwrap();
+            }
+            assert_eq!(source.observe(&cx, &discovery).unwrap(), before);
+            let mut changes = Changes::default();
+            changes.record(Instant::now(), false);
+            for path in &ignored {
+                changes.record_path(path);
+            }
+            assert!(!touches_observed_files(
+                changes.dirty.as_ref().unwrap(),
+                &before,
+                Some(&before)
+            ));
+
+            fs::write(&tracked, "tracked prose, edited").unwrap();
+            assert_ne!(source.observe(&cx, &discovery).unwrap(), before);
         });
     }
 

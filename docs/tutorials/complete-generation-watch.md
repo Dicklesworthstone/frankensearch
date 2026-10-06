@@ -51,7 +51,10 @@ rescan indication, missing path, or hint overflow forces reconciliation instead
 of silently losing change evidence. Ordinary access events do not trigger builds.
 
 Source observation reuses the public discovery and mount policy used by ordinary
-indexing. It collects device/inode, byte length, nanosecond modification time and
+indexing, and admits only entries the indexer's walker discovers: files that
+`.gitignore` (inside a repository), `.ignore` or global excludes skip, and hidden
+entries, are not observed, so editing them never triggers a build. It collects
+device/inode, byte length, nanosecond modification time and
 change time during traversal, not in a second stat pass over an older listing.
 Cancellation is checked before and after each lazy directory entry. Opened
 directory identities are checked again before accepting the observation, and the
