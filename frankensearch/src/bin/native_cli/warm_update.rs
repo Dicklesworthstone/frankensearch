@@ -4,13 +4,14 @@
 //! by a later error. This does not implement a durable CURRENT authority or GC.
 
 use frankensearch::SearchError;
-use frankensearch::native_ann::builder::live::{NativeHybridCandidate, NativeHybridSnapshot};
+use frankensearch::native_ann::builder::live::NativeHybridSnapshot;
 
-use super::{NativeLiveHybridIndex, validate_id};
+#[cfg(test)]
+use super::NativeLiveHybridIndex;
+use super::validate_id;
 use crate::{
-    ArtifactGenerationIdentityV1, Cx, Deserialize, MAX_RECORD_BYTES, Path, PathBuf, Result, SCHEMA,
-    SELECTION_SCHEMA, Selection, SnapshotReceipt, Write, bad, emit, fs, new_generation, new_path,
-    query, save_selection, update,
+    ArtifactGenerationIdentityV1, Cx, Deserialize, Path, PathBuf, Result, SCHEMA, Selection,
+    Write, bad, emit, fs, live, new_generation, new_path, query, save_selection, sharded, update,
 };
 
 pub(super) const MAX_MUTATIONS: usize = 1_000;
@@ -25,11 +26,12 @@ pub(super) enum Request {
         index_dir: PathBuf,
         new_receipt: PathBuf,
         changes: Vec<update::Mutation>,
+        shard_size: Option<usize>,
     },
 }
 
 struct Prepared {
-    candidate: NativeHybridCandidate,
+    candidate: live::Candidate,
     selection: Selection,
     receipt: PathBuf,
     edited_ids: usize,
@@ -87,6 +89,24 @@ async fn prepare(
     changes: Vec<update::Mutation>,
     progress: &mut Progress,
 ) -> Result<Prepared> {
+    let base = live::Snapshot::Single(base.clone());
+    prepare_with_partition(
+        &base, cx, expected, directory, receipt, changes, None, progress,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_with_partition(
+    base: &live::Snapshot,
+    cx: &Cx,
+    expected: ArtifactGenerationIdentityV1,
+    directory: &Path,
+    receipt: &Path,
+    changes: Vec<update::Mutation>,
+    shard_size: Option<usize>,
+    progress: &mut Progress,
+) -> Result<Prepared> {
     checkpoint(cx)?;
     expected.validate()?;
     progress.previous = Some(base.generation());
@@ -98,15 +118,19 @@ async fn prepare(
     if changes.is_empty() || changes.len() > MAX_MUTATIONS {
         return Err(bad("an update must contain between 1 and 1000 mutations"));
     }
+    update::validate_partition_policy(matches!(base, live::Snapshot::Sharded(_)), shard_size)?;
     // Validate every operation, including overwritten entries, before touching
     // any path or starting a model. Final-cohort limits also apply to growth.
     let edits = update::from_mutations(changes)?;
-    update::validate_final_cohort(cx, base.index(), &edits)?;
+    let count = update::validate_final_cohort(cx, base.index(), &edits)?;
+    if let Some(size) = shard_size {
+        sharded::validate_size(size, count)?;
+    }
     validate_destination(directory)?;
     validate_destination(receipt)?;
     let directory = new_path(directory)?;
     let receipt = new_path(receipt)?;
-    let old_root = fs::canonicalize(base.index().vectors().directory())?;
+    let old_root = fs::canonicalize(update::source_directory(base.index()))?;
     if directory.starts_with(&old_root)
         || receipt.starts_with(&old_root)
         || directory.starts_with(&receipt)
@@ -124,47 +148,15 @@ async fn prepare(
     progress.candidate = Some(generation);
     progress.receipt = Some(receipt.clone());
     let edited_ids = edits.len();
-    let vectors = base.index().vectors();
-    let fast_producer = vectors.fast().embedder().identity()?.fingerprint();
-    let quality_producer = vectors
-        .quality()
-        .map(|tier| {
-            tier.embedder()
-                .identity()
-                .map(|identity| identity.fingerprint())
-        })
-        .transpose()?;
     // No receipt is read and no model is loaded here. The original snapshot
     // supplies the only models, sources, precision and graph policy permitted.
-    let mut transaction = base
-        .begin_update(cx, &directory, generation)?
-        .with_batch_size(BATCH_SIZE)?
-        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
-    for (id, document) in edits {
-        checkpoint(cx)?;
-        transaction = match document {
-            Some(document) => transaction.upsert_document(document),
-            None => transaction.delete_document(id),
-        };
-    }
     progress.stage = "building";
-    let candidate = transaction.build(cx).await?;
+    let candidate = base
+        .prepare_update(cx, &directory, generation, edits, BATCH_SIZE, shard_size)
+        .await?;
     checkpoint(cx)?;
     progress.stage = "sealing";
-    let snapshot = candidate.index().seal_for_reopen(cx)?;
-    let vectors = candidate.index().vectors();
-    let selection = Selection {
-        schema: SELECTION_SCHEMA.to_owned(),
-        directory: vectors.directory().to_path_buf(),
-        generation,
-        snapshot: SnapshotReceipt {
-            byte_len: snapshot.byte_len,
-            sha256: snapshot.sha256,
-        },
-        documents: vectors.documents().len(),
-        fast_producer,
-        quality_producer,
-    };
+    let selection = update::seal_selection(cx, candidate.index())?;
     checkpoint(cx)?;
     progress.stage = "sealed";
     Ok(Prepared {
@@ -175,12 +167,13 @@ async fn prepare(
     })
 }
 
-async fn commit(
+async fn commit<'l>(
     prepared: &Prepared,
-    live: &NativeLiveHybridIndex,
+    live: impl Into<live::Live<'l>> + Send,
     cx: &Cx,
     progress: &mut Progress,
-) -> Result<NativeHybridSnapshot> {
+) -> Result<live::Snapshot> {
+    let live = live.into();
     checkpoint(cx)?;
     progress.stage = "writing_receipt";
     progress.receipt_state = "uncertain";
@@ -196,20 +189,22 @@ async fn commit(
     Ok(installed)
 }
 
-pub(super) async fn execute<W: Write>(
-    live: &NativeLiveHybridIndex,
+pub(super) async fn execute<'l, W: Write>(
+    live: impl Into<live::Live<'l>> + Send,
     cx: &Cx,
     request: Request,
     ordinal: u64,
     allowed: bool,
     output: &mut W,
 ) -> Result<()> {
+    let live = live.into();
     let Request::Update {
         id,
         expected_generation,
         index_dir,
         new_receipt,
         changes,
+        shard_size,
     } = request;
     let mut progress = Progress::default();
     let result: Result<serde_json::Value> = async {
@@ -219,17 +214,30 @@ pub(super) async fn execute<W: Write>(
             return Err(bad("updates are disabled; start serve with --allow-updates for a trusted writing controller"));
         }
         let base = live.snapshot(cx).await?;
-        let prepared = prepare(
-            &base, cx, expected_generation, &index_dir, &new_receipt, changes, &mut progress,
-        ).await?;
+        let prepared = match &base {
+            live::Snapshot::Single(base) => {
+                update::validate_partition_policy(false, shard_size)?;
+                prepare(
+                    base, cx, expected_generation, &index_dir, &new_receipt, changes, &mut progress,
+                ).await?
+            }
+            live::Snapshot::Sharded(_) => {
+                prepare_with_partition(
+                    &base, cx, expected_generation, &index_dir, &new_receipt, changes,
+                    shard_size, &mut progress,
+                ).await?
+            }
+        };
         let installed = commit(&prepared, live, cx, &mut progress).await?;
-        Ok(serde_json::json!({
+        let mut payload = serde_json::json!({
             "ok": true, "status": "complete", "generation": installed.generation(),
             "previous_generation": base.generation(), "selection_changed": true,
             "receipt": prepared.receipt, "receipt_state": "durable",
             "selection": prepared.selection, "edited_ids": prepared.edited_ids,
             "stage": "installed",
-        }))
+        });
+        installed.index().annotate(&mut payload);
+        Ok(payload)
     }.await;
     let mut payload = match result {
         Ok(payload) => payload,
@@ -264,3 +272,7 @@ pub(super) async fn execute<W: Write>(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "warm_update_tests.rs"]
 mod tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "warm_update_sharded_tests.rs"]
+mod sharded_tests;

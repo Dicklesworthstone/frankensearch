@@ -540,4 +540,4 @@ mod rebuild_tests;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "update_sharded_tests.rs"]
-mod sharded_tests;
+pub(crate) mod sharded_tests;

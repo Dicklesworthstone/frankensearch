@@ -879,26 +879,32 @@ fn sharded_controls_fail_closed_before_paths_and_invalid_messages_do_not_become_
         .unwrap();
         let live = NativeLiveShardedHybridIndex::new(&cx, index).unwrap();
         let mut output = Vec::new();
-        let mut input = messages(&[serde_json::json!({"query":"needle"})]);
-        assert!(
-            serve::run_with_controls(
-                &live,
-                &cx,
-                &mut input,
-                &mut output,
-                (Mode::Full, 1),
-                serve::Controls {
-                    activation: false,
-                    updates: true
-                },
-                None,
-                &query::Policy::default()
-            )
-            .await
-            .is_err()
-        );
+        let mut input = messages(&[]);
+        // The explicit writing grant is now supported. Merely starting the
+        // server performs no transaction and does not also grant activation.
+        serve::run_with_controls(
+            &live,
+            &cx,
+            &mut input,
+            &mut output,
+            (Mode::Full, 1),
+            serve::Controls {
+                activation: false,
+                updates: true,
+            },
+            None,
+            &query::Policy::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(input.position(), 0);
-        assert!(output.is_empty());
+        let startup = frames(&output);
+        assert_eq!(startup.len(), 1);
+        assert_eq!(startup[0]["event"], "ready");
+        assert_eq!(startup[0]["updates_enabled"], true);
+        assert_eq!(startup[0]["activation_enabled"], false);
+        assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
+        output.clear();
         let absent = root.path().join("missing.json");
         let mut input = messages(&[
             activation(&selected, &absent),

@@ -12,8 +12,8 @@ use frankensearch::native_ann::builder::sharded::live::{
 };
 
 use super::{
-    ArtifactGenerationIdentityV1, Cx, GenerationComponentReceiptV1, MAX_DOCUMENTS, Result,
-    Selection, bad, cohort, sharded,
+    ArtifactGenerationIdentityV1, Cx, GenerationComponentReceiptV1, MAX_DOCUMENTS,
+    MAX_RECORD_BYTES, Path, Result, Selection, bad, cohort, sharded, update,
 };
 
 pub enum Serving {
@@ -98,6 +98,54 @@ impl Snapshot {
 
     pub fn generation(&self) -> ArtifactGenerationIdentityV1 {
         self.index().generation()
+    }
+
+    /// Delegate edits to the original layout's complete live-update builder.
+    /// The native candidate retains this exact predecessor; neither preparing
+    /// nor sealing it authorizes a stale install. Models and row reuse remain
+    /// owned by the library, without path reopening or another mutation engine.
+    pub async fn prepare_update(
+        &self,
+        cx: &Cx,
+        directory: &Path,
+        generation: ArtifactGenerationIdentityV1,
+        edits: update::Edits,
+        batch_size: usize,
+        shard_size: Option<usize>,
+    ) -> Result<Candidate> {
+        update::validate_partition_policy(matches!(self, Self::Sharded(_)), shard_size)?;
+        match self {
+            Self::Single(base) => {
+                let mut transaction = base
+                    .begin_update(cx, directory, generation)?
+                    .with_batch_size(batch_size)?
+                    .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+                for (id, document) in edits {
+                    transaction = match document {
+                        Some(document) => transaction.upsert_document(document),
+                        None => transaction.delete_document(id),
+                    };
+                }
+                Ok(Candidate::Single(transaction.build(cx).await?))
+            }
+            Self::Sharded(base) => {
+                let mut transaction = base
+                    .begin_update(cx, directory, generation)?
+                    .with_batch_size(batch_size)?
+                    .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+                for (id, document) in edits {
+                    transaction = match document {
+                        Some(document) => transaction.upsert_document(document),
+                        None => transaction.delete_document(id),
+                    };
+                }
+                Ok(Candidate::Sharded(
+                    transaction
+                        .build(cx, shard_size.ok_or_else(|| bad("missing shard size"))?)
+                        .await?,
+                ))
+            }
+        }
     }
 
     /// Reuse the native selected-reopen API's original retained models and

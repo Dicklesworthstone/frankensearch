@@ -13,11 +13,11 @@ use std::io::Cursor;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Waker};
 
-struct Provider {
+pub(crate) struct Provider {
     identity: EmbeddingIdentityBundleV1,
-    submitted: AtomicUsize,
-    fault: AtomicUsize,
-    drops: AtomicUsize,
+    pub(crate) submitted: AtomicUsize,
+    pub(crate) fault: AtomicUsize,
+    pub(crate) drops: AtomicUsize,
 }
 
 impl Provider {
@@ -91,16 +91,16 @@ fn source() -> Vec<IndexableDocument> {
     ].map(|(id, body)| IndexableDocument::new(id, body).with_metadata("version", "old")).into()
 }
 
-struct Fixture {
-    root: tempfile::TempDir,
-    index: NativeBuiltShardedHybridIndex,
-    selection: Selection,
-    fast: Arc<Provider>,
-    quality: Option<Arc<Provider>>,
+pub(crate) struct Fixture {
+    pub(crate) root: tempfile::TempDir,
+    pub(crate) index: NativeBuiltShardedHybridIndex,
+    pub(crate) selection: Selection,
+    pub(crate) fast: Arc<Provider>,
+    pub(crate) quality: Option<Arc<Provider>>,
 }
 
 impl Fixture {
-    fn models(&self) -> Models {
+    pub(crate) fn models(&self) -> Models {
         Models {
             fast: self.fast.clone(),
             quality: self.quality.as_ref().map(|model| model.clone() as Arc<dyn Embedder>),
@@ -126,7 +126,7 @@ impl Fixture {
     }
 }
 
-async fn fixture(cx: &Cx, graphs: bool, quality: bool) -> Fixture {
+pub(crate) async fn fixture(cx: &Cx, graphs: bool, quality: bool) -> Fixture {
     let root = tempfile::tempdir().unwrap();
     let fast = Provider::new("update-cli-fast", 2);
     let quality = quality.then(|| Provider::new("update-cli-quality", 3));

@@ -303,11 +303,6 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
     let live = live.into();
     cx.checkpoint()
         .map_err(|_| bad("native serving cancelled"))?;
-    if controls.updates && matches!(live, live::Live::Sharded(_)) {
-        return Err(bad(
-            "sharded source updates are not exposed by the stdin protocol yet; use a complete library-built successor and --allow-activation",
-        ));
-    }
     if let Some(filter) = base_filter {
         filter.validate()?;
     }
@@ -399,29 +394,8 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                     .await?;
             }
             Message::Update(request) => {
-                match live {
-                    live::Live::Single(live) => {
-                        warm_update::execute(live, cx, request, ordinal, controls.updates, output)
-                            .await?;
-                    }
-                    live::Live::Sharded(_) => {
-                        // Grant was refused at startup. Never let an update
-                        // request fall through to search or inspect its paths.
-                        let snapshot = live.snapshot(cx).await?;
-                        let warm_update::Request::Update { id, .. } = request;
-                        emit(
-                            output,
-                            &serde_json::json!({
-                                "schema": SCHEMA, "event": "terminal", "operation": "update",
-                                "ok": false, "status": "failed", "request": ordinal,
-                                "id": id.as_deref().filter(|id| validate_id(Some(id)).is_ok()),
-                                "seq": 0, "partial_results": false,
-                                "generation": snapshot.generation(), "selection_changed": false,
-                                "error": "sharded source updates are not enabled in this protocol; activate a complete selected successor",
-                            }),
-                        )?;
-                    }
-                }
+                warm_update::execute(live, cx, request, ordinal, controls.updates, output)
+                    .await?;
             }
         }
     }

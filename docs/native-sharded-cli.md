@@ -69,7 +69,7 @@ No coordinate is synthesized for a lane that did not retrieve the document.
 Unpartitioned queries retain their existing output fields and shapes.
 
 Partitioned indexing, buffered/streamed search and warm serving with explicit
-external activation and one-shot source updates are supported. Source recovery
+external activation, one-shot source updates and opt-in warm updates are supported. Source recovery
 for partitioned receipts is not yet enabled here. The corresponding library
 lifecycle APIs remain available. This does not change default fsfs behavior or its generation
 authority, create a durable CURRENT selector, establish persistent antirollback,
@@ -131,11 +131,11 @@ Output failure after activation stops input consumption without undoing the
 installed generation or adding a contradictory failure frame. Reconcile a lost
 acknowledgement through status rather than replaying a stale predecessor.
 
-Activation grants no source-writing permission. `--allow-updates` is currently
-refused for a sharded server before emitting ready, and update controls without
-that grant perform no path access or inference. The ordinary server's source
-transaction protocol is unchanged. All activation remains process-local: no
-durable CURRENT switch, restart selector or persistent antirollback is added.
+Activation grants no source-writing permission. `--allow-updates` separately
+enables the source transaction protocol described below; without that grant,
+update controls perform no path access or inference. All activation remains
+process-local: no durable CURRENT switch, restart selector or persistent
+antirollback is added.
 
 ## Source updates and deliberate repartitioning
 
@@ -187,4 +187,63 @@ Neither action establishes persistent CURRENT authority or authorizes collection
 ```sh
 cargo test -p frankensearch --features hybrid --bin frankensearch-native \
   update::sharded_tests
+```
+
+## Warm source transactions
+
+A sharded `serve --allow-updates` accepts the existing `op: "update"` control
+with one additional required field, `shard_size`. It is a per-transaction value,
+not a server startup flag or an inference from the old partition occupancy.
+Ordinary single-cohort update controls continue to omit it; supplying it on an
+ordinary server is refused rather than silently changing its layout.
+
+```sh
+frankensearch-native serve \
+  --receipt /absolute/receipts/g1.json \
+  --model-dir /absolute/models \
+  --allow-updates
+```
+
+Send a JSONL object containing `op: "update"`, an optional request `id`, the exact
+`expected_generation` object from ready/status (including its real nonce), NEW
+absolute `index_dir` and `new_receipt` paths, `shard_size: 2500`, and a `changes`
+array. Each change uses the same upsert/delete language as the one-shot command.
+The existing 1 MiB request bound and 1–1,000 mutation bound remain. Last edit per
+ID wins; invalid overwritten operations, unknown fields, empty changes, wrong
+predecessors and invalid partition policies do not become queries or successful
+partial transactions. The final source and partition limits include every
+unchanged survivor, not just the delta, and precede candidate creation.
+
+The original retained model instances and source/vector owners feed the native
+live-update builder. No receipt is reopened or replacement model loaded during
+preparation. It builds every required successor tier and one global Quill index,
+seals the complete hybrid inventory, then creates and syncs the new receipt.
+Only afterward does the existing native live selector compare the exact
+predecessor object and install the completed successor. A higher sequence does
+not authorize overwriting a competing update. New queries acquire the new cohort;
+old scopes, progressive queries and rerankers keep their original text and rows.
+The acknowledgement includes the installed generation, new selection receipt,
+`layout: "sharded"`, partition count and number of distinct edited IDs.
+
+The common ordinary/sharded failure receipt records effects before attempting
+them. `receipt_state: "not_started"` means receipt persistence was not attempted;
+`"uncertain"` means creation/write/sync was attempted and its outcome needs
+inspection; `"durable"` with `saved_not_installed: true` means the saved candidate
+survives a refused or cancelled install. Candidate files are never automatically
+deleted. The final cancellation check precedes installation. A failed output
+write after successful installation stops the session without undoing the swap
+or appending a contradictory failure frame. Inspect status and the named receipt
+to reconcile a lost acknowledgement, rather than replaying a stale predecessor.
+
+This is a trusted writing-controller interface. Search filters are not mutation
+authorization; `--allow-updates` does not grant `--allow-activation` or vice versa.
+Serving remains sequential: building delays later input requests. Query deadlines
+do not time out a transaction that may already have persisted effects. Only
+embedding inference is reused; artifact images and global Quill are fully rebuilt.
+Restart still requires an explicitly selected receipt, and there is no durable
+CURRENT authority, garbage collector, model migration or throughput claim here.
+
+```sh
+cargo test -p frankensearch --features hybrid --bin frankensearch-native \
+  serve::warm_update
 ```
