@@ -3354,6 +3354,9 @@ mod loader_only {
         fs::write(corpus.join("live.md"), "Livemalachite restores service after failures using bounded retries and exponential backoff.").unwrap();
         await_search("live-modify", "Livemalachite", "live.md", true);
         await_search("live-modify-old-text", "Liveamber", "live.md", false);
+        // The deletion check below is only meaningful if this query finds
+        // the file while it exists.
+        await_search("delete-control", "Astronomers", "astronomy.md", true);
         fs::remove_file(corpus.join("astronomy.md")).unwrap();
         await_search("live-delete", "Astronomers", "astronomy.md", false);
 

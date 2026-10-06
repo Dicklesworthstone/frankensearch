@@ -1294,8 +1294,9 @@ fn complete_entry_exists(path: &Path) -> SearchResult<bool> {
 
 /// A stop signal is how a watch, daemon or server ends. The first SIGINT or
 /// SIGTERM requests a graceful shutdown, which cancels the command's context.
-/// A watch's publications before it already printed their receipts and an
-/// in-flight candidate is discarded unpublished; a server releases its socket.
+/// A watch's publications before it already printed their receipts, and a
+/// build it interrupts stays unpublished (an abandoned build for retention to
+/// reclaim); a daemon releases its socket.
 /// That cancellation is a clean exit, as it is on the legacy layout. A forced
 /// second signal, a shutdown requested by an error, or any other cancellation
 /// keeps its error.

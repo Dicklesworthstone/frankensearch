@@ -160,8 +160,9 @@ Linux proof described above remains process-local. Ctrl-C cancellation is wired
 through the existing shutdown coordinator; no hard real-time latency is claimed
 for synchronous native operations or indexing work. The first SIGINT or SIGTERM
 stops the watch cleanly with exit status 0, as on the legacy layout: every
-publication before it has printed its receipt, and an unpublished candidate is
-discarded for the next watch to catch up. A second stop signal forces exit 130.
+publication before it has printed its receipt. A build it interrupts is never
+published; it stays on disk as an abandoned build until the next retention pass
+reclaims it, and the next watch catches up. A second stop signal forces exit 130.
 
 ## Validation
 

@@ -1139,11 +1139,11 @@ fn detect_bom(bytes: &[u8]) -> &'static str {
     }
 }
 
-#[must_use]
 /// Whether `probe` is UTF-8. When it is a prefix of a longer file, a character
 /// cut off at its end is not an encoding error: the probe of valid UTF-8 text
 /// ends inside a multi-byte character whenever one straddles the cut, which
 /// quarantined about two thirds of CJK documents longer than the probe.
+#[must_use]
 fn utf8_probe_is_valid(probe: &[u8], is_prefix: bool) -> bool {
     match std::str::from_utf8(probe) {
         Ok(_) => true,
@@ -1151,6 +1151,7 @@ fn utf8_probe_is_valid(probe: &[u8], is_prefix: bool) -> bool {
     }
 }
 
+#[must_use]
 fn detect_encoding(
     _bytes: &[u8],
     sniff_features: &SniffFeatures,

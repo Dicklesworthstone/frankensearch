@@ -864,15 +864,25 @@ fn short_private_socket_dir() -> Option<PathBuf> {
 /// directory or symlink planted there by someone else is never used.
 #[cfg(unix)]
 fn private_socket_dir_in(base: &Path) -> Option<PathBuf> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    use std::os::unix::fs::DirBuilderExt;
 
-    let uid = rustix::process::geteuid().as_raw();
-    let dir = base.join(format!("fsfs-{uid}"));
+    let dir = base.join(format!("fsfs-{}", rustix::process::geteuid().as_raw()));
     match fs::DirBuilder::new().mode(0o700).create(&dir) {
         Ok(()) => {}
         Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
         Err(_) => return None,
     }
+    existing_private_socket_dir_in(base)
+}
+
+/// `fsfs-<uid>` under `base` if it already exists and passes the checks of
+/// [`private_socket_dir_in`]; never creates it.
+#[cfg(unix)]
+fn existing_private_socket_dir_in(base: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let uid = rustix::process::geteuid().as_raw();
+    let dir = base.join(format!("fsfs-{uid}"));
     let metadata = fs::symlink_metadata(&dir).ok()?;
     (metadata.is_dir() && metadata.uid() == uid && metadata.permissions().mode() & 0o777 == 0o700)
         .then_some(dir)
@@ -3333,8 +3343,12 @@ impl LexicalOnlyWatchIngest {
             }
         }
         // The manifests describe published rows, so they follow the commit.
-        if self.membership_changed.swap(false, Ordering::SeqCst) {
-            self.membership.publish()?;
+        // A failed publish stays owed to the next batch.
+        if self.membership_changed.swap(false, Ordering::SeqCst)
+            && let Err(error) = self.membership.publish()
+        {
+            self.membership_changed.store(true, Ordering::SeqCst);
+            return Err(error);
         }
         Ok(count)
     }
@@ -14700,16 +14714,31 @@ impl FsfsRuntime {
 
     /// Sockets a quiesce asks to shut down: the explicit `--daemon-socket`, or
     /// the legacy name plus every `fsfs-query-<index>-*.sock` in the daemon
-    /// directory.
+    /// directory and in the short private directory a daemon falls back to
+    /// when its usual socket path is too long to bind.
     #[cfg(unix)]
     fn quiesce_daemon_socket_paths(&self) -> SearchResult<Vec<PathBuf>> {
+        self.quiesce_daemon_socket_paths_with_fallback(existing_private_socket_dir_in(
+            &std::env::temp_dir(),
+        ))
+    }
+
+    #[cfg(unix)]
+    fn quiesce_daemon_socket_paths_with_fallback(
+        &self,
+        fallback_dir: Option<PathBuf>,
+    ) -> SearchResult<Vec<PathBuf>> {
         if let Some(path) = self.cli_input.daemon_socket.as_deref() {
             return Ok(vec![absolutize_path(path)?]);
         }
         let mut paths = vec![self.legacy_daemon_socket_path()?];
         let (socket_dir, index_stem) = self.default_daemon_socket_stem()?;
         let prefix = format!("{index_stem}-");
-        if let Ok(entries) = fs::read_dir(&socket_dir) {
+        let fallback_dir = fallback_dir.filter(|dir| *dir != socket_dir);
+        for dir in std::iter::once(&socket_dir).chain(fallback_dir.as_ref()) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 let is_socket_name = path.extension().is_some_and(|ext| ext == "sock");
@@ -35871,6 +35900,56 @@ mod tests {
         );
     }
 
+    /// A daemon whose usual socket path was too long listens in the short
+    /// private directory instead; a quiesce before a mutation must reach it
+    /// there, or it keeps the map lock the mutation needs.
+    #[cfg(unix)]
+    #[test]
+    fn quiesce_reaches_daemons_in_the_short_private_fallback_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_for = |root: &Path| {
+            fs::create_dir_all(root).expect("index root");
+            FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(root.to_path_buf()),
+                ..CliInput::default()
+            })
+        };
+        let runtime = runtime_for(&temp.path().join("index"));
+        let (_, stem) = runtime.default_daemon_socket_stem().unwrap();
+        let (_, other_stem) = runtime_for(&temp.path().join("other"))
+            .default_daemon_socket_stem()
+            .unwrap();
+        let base = temp.path().join("tmp");
+        fs::create_dir(&base).unwrap();
+        assert_eq!(super::existing_private_socket_dir_in(&base), None);
+        assert!(
+            fs::read_dir(&base).unwrap().next().is_none(),
+            "the lookup never creates the directory"
+        );
+        let fallback = super::private_socket_dir_in(&base).expect("private fallback directory");
+        assert_eq!(
+            super::existing_private_socket_dir_in(&base),
+            Some(fallback.clone())
+        );
+        let fallen_back = fallback.join(format!("{stem}-00000000.sock"));
+        let other_index = fallback.join(format!("{other_stem}-00000000.sock"));
+        let not_a_socket_name = fallback.join(format!("{stem}-00000000.lock"));
+        for path in [&fallen_back, &other_index, &not_a_socket_name] {
+            fs::write(path, b"").unwrap();
+        }
+
+        let without = runtime
+            .quiesce_daemon_socket_paths_with_fallback(None)
+            .unwrap();
+        assert!(!without.contains(&fallen_back), "{without:?}");
+        let paths = runtime
+            .quiesce_daemon_socket_paths_with_fallback(Some(fallback))
+            .unwrap();
+        assert!(paths.contains(&fallen_back), "{paths:?}");
+        assert!(!paths.contains(&other_index), "{paths:?}");
+        assert!(!paths.contains(&not_a_socket_name), "{paths:?}");
+    }
+
     #[cfg(unix)]
     fn futures_lite_block_on<F: Future>(future: F) -> F::Output {
         // run_test_with_cx already drives the executor; nested block_on is not
@@ -40434,6 +40513,83 @@ mod tests {
                 manifests.keys().map(String::as_str).collect::<Vec<_>>(),
                 ["src/keep.rs"]
             );
+        });
+    }
+
+    /// A manifest publication refused after a batch's keyword commit stays
+    /// owed: the next batch publishes it even when that batch changes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn lexical_only_watch_retries_a_refused_membership_publication() {
+        use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+        use std::os::unix::fs::PermissionsExt;
+
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let project = temp.path().join("project");
+            fs::create_dir_all(project.join("src")).expect("create project source dir");
+            fs::write(project.join("src/keep.rs"), "pub fn keep_quokka() {}\n").expect("write");
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = ".frankensearch".to_owned();
+            let index_root = project.join(".frankensearch");
+            let runtime = FsfsRuntime::new(config)
+                .with_lexical_only_indexing()
+                .with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                });
+            Box::pin(runtime.run_one_shot_index_scaffold_internal(
+                &cx,
+                CliCommand::Index,
+                |_| Ok(()),
+                false,
+                false,
+            ))
+            .await
+            .expect("lexical-only index");
+            let ingest = runtime
+                .build_lexical_only_watch_ingest(&cx, &index_root)
+                .await
+                .expect("lexical-only watch ingest");
+            let indexed_files = || {
+                FsfsRuntime::read_index_sentinel(&index_root)
+                    .expect("read sentinel")
+                    .expect("sentinel")
+                    .indexed_files
+            };
+            let keys = || {
+                FsfsRuntime::read_matching_manifest_generation(&index_root)
+                    .expect("read manifests")
+                    .expect("matching manifests")
+                    .into_keys()
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(indexed_files(), 1);
+
+            fs::write(project.join("src/new.rs"), "pub fn new_ocelot() {}\n").expect("write");
+            // The keyword engine and the manifests live in subdirectories; the
+            // sentinel that completes a membership publication is written in
+            // the index root itself.
+            fs::set_permissions(&index_root, fs::Permissions::from_mode(0o555)).unwrap();
+            let refused = ingest
+                .apply_batch(
+                    &cx,
+                    &[WatchIngestOp::Upsert {
+                        file_key: "src/new.rs".to_owned(),
+                        revision: 2,
+                        ingestion_class: IngestionClass::FullSemanticLexical,
+                    }],
+                )
+                .await;
+            fs::set_permissions(&index_root, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(refused.is_err(), "the sentinel write was refused: {refused:?}");
+            assert_eq!(indexed_files(), 1, "the refused publication did not complete");
+
+            let changed = ingest.apply_batch(&cx, &[]).await.expect("empty batch");
+            assert_eq!(changed, 0);
+            assert_eq!(indexed_files(), 2, "the owed publication completed");
+            assert_eq!(keys(), ["src/keep.rs", "src/new.rs"]);
         });
     }
 
