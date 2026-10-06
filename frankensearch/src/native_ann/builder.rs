@@ -421,7 +421,9 @@ impl NativeIndexBuilder {
                     cx,
                     &mut fast_writer,
                     batch,
-                    self.reuse.as_deref().map(|source| (source, ReuseRole::Fast)),
+                    self.reuse
+                        .as_deref()
+                        .map(|source| (source, ReuseRole::Fast)),
                 )
                 .await?;
             if let (Some(tier), Some(writer)) = (&self.quality, &mut quality_writer) {

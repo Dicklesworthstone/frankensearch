@@ -350,10 +350,7 @@ impl LexicalRead for ScopedLexical<'_> {
                 for result in batch.results() {
                     checkpoint(cx, "native_ann.scope.lexical_candidate")?;
                     if !result.score.is_finite()
-                        || self
-                            .index
-                            .document(result.doc_id.as_str())
-                            .is_none()
+                        || self.index.document(result.doc_id.as_str()).is_none()
                         || !seen.insert(result.doc_id.as_str())
                     {
                         return Err(invalid(

@@ -1410,7 +1410,10 @@ mod tests {
     mod sharded_updates {
         use super::*;
 
-        fn assert_same_shards(actual: &NativeBuiltShardedIndex, expected: &NativeBuiltShardedIndex) {
+        fn assert_same_shards(
+            actual: &NativeBuiltShardedIndex,
+            expected: &NativeBuiltShardedIndex,
+        ) {
             assert_eq!(actual.document_count(), expected.document_count());
             assert_eq!(actual.partitions().len(), expected.partitions().len());
             for (actual, expected) in actual.partitions().iter().zip(expected.partitions()) {
@@ -1950,7 +1953,11 @@ mod tests {
                 .await
                 .unwrap();
                 assert!(reopened.vectors().document("c").is_none());
-                for hit in reopened.search_refined(&cx, "replacement", 10).await.unwrap() {
+                for hit in reopened
+                    .search_refined(&cx, "replacement", 10)
+                    .await
+                    .unwrap()
+                {
                     assert!(hit.result.index.is_none());
                     if let Some(row) = hit.fast_row {
                         assert_eq!(

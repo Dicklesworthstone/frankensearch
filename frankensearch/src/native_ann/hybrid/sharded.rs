@@ -250,6 +250,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
     // Only a complete source-scoped owner supplies this frozen membership and
     // its equally scoped immutable lexical adapter. Public raw readers cannot
     // attach a vector-only filter and silently leave the keyword lane unscoped.
+    #[cfg(feature = "quill")]
     pub(crate) fn with_allowed_documents(
         mut self,
         allowed: &'a BTreeSet<String>,
@@ -274,14 +275,9 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         match self.allowed_documents {
             Some(allowed) => {
                 shards
-                    .search_text_filtered(
-                        self.cx,
-                        embedder,
-                        self.text,
-                        self.budget,
-                        None,
-                        |id| allowed.contains(id),
-                    )
+                    .search_text_filtered(self.cx, embedder, self.text, self.budget, None, |id| {
+                        allowed.contains(id)
+                    })
                     .await
             }
             None => {

@@ -134,7 +134,14 @@ impl NativeScopedShardedHybridIndex<'_> {
         };
         vectors
             .fast()
-            .search_hybrid_progressive(cx, first.fast().embedder(), quality, &self.lexical, text, k)?
+            .search_hybrid_progressive(
+                cx,
+                first.fast().embedder(),
+                quality,
+                &self.lexical,
+                text,
+                k,
+            )?
             .with_allowed_documents(&self.lexical.allowed)
     }
 

@@ -142,10 +142,7 @@ impl NativeIndexBuilder {
             .div_ceil(max_documents_per_shard)
             .max(1);
         if count > MAX_NATIVE_BUILD_SHARDS {
-            return Err(rejected(
-                "partition_count",
-                "shard limit exceeded",
-            ));
+            return Err(rejected("partition_count", "shard limit exceeded"));
         }
         for tier in std::iter::once(&self.fast).chain(self.quality.iter()) {
             tier.binding(&self.generation)?;

@@ -287,7 +287,10 @@ impl NativeShardedSnapshot {
             directory,
             expected,
             Arc::clone(&original.fast.embedder),
-            original.quality.as_ref().map(|tier| Arc::clone(&tier.embedder)),
+            original
+                .quality
+                .as_ref()
+                .map(|tier| Arc::clone(&tier.embedder)),
             limits,
         )
         .await?;
@@ -452,7 +455,11 @@ impl NativeLiveShardedUpdate {
         cx: &Cx,
         max_documents_per_shard: usize,
     ) -> SearchResult<NativeShardedCandidate> {
-        let next = Box::pin(self.update.build_sharded_hybrid(cx, max_documents_per_shard)).await?;
+        let next = Box::pin(
+            self.update
+                .build_sharded_hybrid(cx, max_documents_per_shard),
+        )
+        .await?;
         NativeShardedCandidate::new(cx, self.base, next)
     }
 }
