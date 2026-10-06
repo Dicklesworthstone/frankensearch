@@ -1,0 +1,75 @@
+diff --git a/crates/frankensearch-quill/Cargo.toml b/crates/frankensearch-quill/Cargo.toml
+--- a/crates/frankensearch-quill/Cargo.toml
++++ b/crates/frankensearch-quill/Cargo.toml
+@@ -60,2 +60,2 @@
+ [target.'cfg(unix)'.dependencies]
+-rustix = { version = "1.1.5", features = ["fs", "process"] }
++rustix = { version = "1.1.5", features = ["fs", "process", "time"] }
+diff --git a/crates/frankensearch-quill/src/lib.rs b/crates/frankensearch-quill/src/lib.rs
+--- a/crates/frankensearch-quill/src/lib.rs
++++ b/crates/frankensearch-quill/src/lib.rs
+@@ -30,3 +30,4 @@
+ pub mod query;
+ pub mod quiver;
++mod read_open_receipts;
+ pub mod schema;
+diff --git a/crates/frankensearch-quill/src/config.rs b/crates/frankensearch-quill/src/config.rs
+--- a/crates/frankensearch-quill/src/config.rs
++++ b/crates/frankensearch-quill/src/config.rs
+@@ -139,2 +139,11 @@
+     pub quarantine_on_unrepairable: bool,
++    /// Optional existing owner-private directory for read-only local receipts.
++    ///
++    /// None is strict and remains the default. Only QuillSearchIndex open and
++    /// refresh consult this field; writers, recovery and maintenance ignore it.
++    /// Receipts reuse only a successful file-prefix check. Section checks stay
++    /// active. Metadata-preserving faults still require a strict open. Cache
++    /// data must be outside the index; unsupported storage verifies in full.
++    /// See [`crate::KeeperSnapshot::open_with_local_receipts`].
++    pub read_open_receipt_directory: Option<std::path::PathBuf>,
+ }
+@@ -163,4 +172,5 @@
+             max_visibility_lag_ms: DEFAULT_MAX_VISIBILITY_LAG_MS,
+             quarantine_on_unrepairable: false,
++            read_open_receipt_directory: None,
+         }
+     }
+@@ -302,4 +312,5 @@
+                 max_visibility_lag_ms: 1_000,
+                 quarantine_on_unrepairable: false,
++                read_open_receipt_directory: None,
+             }
+         );
+diff --git a/crates/frankensearch-quill/src/keeper.rs b/crates/frankensearch-quill/src/keeper.rs
+--- a/crates/frankensearch-quill/src/keeper.rs
++++ b/crates/frankensearch-quill/src/keeper.rs
+@@ -60,1 +60,3 @@
++mod receipt_admission;
++
+ pub use crate::stats::{SegmentStats, SegmentStatsProvider};
+@@ -14000,2 +14002,4 @@
+ #[cfg(test)]
+ mod tests {
++    #[cfg(target_os = "linux")]
++    include!("keeper/receipt_regressions.rs");
+diff --git a/crates/frankensearch-quill/src/index.rs b/crates/frankensearch-quill/src/index.rs
+--- a/crates/frankensearch-quill/src/index.rs
++++ b/crates/frankensearch-quill/src/index.rs
+@@ -11529,1 +11529,8 @@
+-        let snapshot = spawn_blocking(move || KeeperSnapshot::open(open_directory, schema)).await?;
++        let receipt_directory = config.read_open_receipt_directory.clone();
++        let snapshot = spawn_blocking(move || match receipt_directory {
++            Some(cache) => {
++                KeeperSnapshot::open_with_local_receipts(open_directory, schema, cache)
++            }
++            None => KeeperSnapshot::open(open_directory, schema),
++        })
++        .await?;
+@@ -11661,1 +11668,6 @@
+-        let snapshot = spawn_blocking(move || KeeperSnapshot::open(directory, schema)).await?;
++        let receipt_directory = self.reader.config.read_open_receipt_directory.clone();
++        let snapshot = spawn_blocking(move || match receipt_directory {
++            Some(cache) => KeeperSnapshot::open_with_local_receipts(directory, schema, cache),
++            None => KeeperSnapshot::open(directory, schema),
++        })
++        .await?;
