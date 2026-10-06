@@ -28723,7 +28723,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::task::Poll;
     use std::thread;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
 
     use asupersync::Cx;
     use asupersync::runtime::RuntimeBuilder;
@@ -32867,30 +32867,13 @@ mod tests {
         );
     }
 
-    static NEXT_UNIQUE_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
-
-    fn unique_test_dir(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let sequence = NEXT_UNIQUE_TEST_DIR.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!(
-            "fsfs_test_{label}_{}_{nanos}_{sequence}",
-            std::process::id()
-        ))
-    }
-
+    /// An atomically reserved private fixture directory, removed with its
+    /// contents when the guard drops (panics included); bind it for the test.
     #[cfg(unix)]
-    fn reserve_unique_test_dir(label: &str) -> std::io::Result<PathBuf> {
-        loop {
-            let path = unique_test_dir(label);
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(path),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
+    fn reserve_unique_test_dir(label: &str) -> std::io::Result<tempfile::TempDir> {
+        tempfile::Builder::new()
+            .prefix(&format!("fsfs_test_{label}_"))
+            .tempdir()
     }
 
     /// Execute a fixture script this test just wrote.
@@ -32916,24 +32899,26 @@ mod tests {
     /// which is exactly what a sibling thread's forked-but-not-yet-exec'd
     /// child produced on the 2026-09-02 gate.
     #[cfg(unix)]
-    fn write_busy_executable(tag: &str) -> (PathBuf, fs::File) {
+    /// The fixture directory guard, the executable in it, and its still-open
+    /// write handle; keep the guard bound until the test is done.
+    fn write_busy_executable(tag: &str) -> (tempfile::TempDir, PathBuf, fs::File) {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
         let dir = reserve_unique_test_dir(tag)
             .expect("busy-executable fixture directory should be atomically reservable");
-        let binary = dir.join("fsfs-busy");
+        let binary = dir.path().join("fsfs-busy");
         let mut writer = fs::File::create(&binary).unwrap();
         writer.write_all(b"#!/bin/sh\necho busy-ok\n").unwrap();
         writer.sync_all().unwrap();
         fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-        (binary, writer)
+        (dir, binary, writer)
     }
 
     #[cfg(unix)]
     #[test]
     fn spawn_verifying_executable_retries_until_the_image_is_closed_for_writing() {
-        let (binary, writer) = write_busy_executable("etxtbsy_retry");
+        let (_fixture_dir, binary, writer) = write_busy_executable("etxtbsy_retry");
 
         // Prove the fixture reproduces the race before trusting the retry.
         let busy = Command::new(&binary).output();
@@ -32957,7 +32942,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_verifying_executable_reports_a_writer_that_never_closes() {
-        let (binary, writer) = write_busy_executable("etxtbsy_exhausted");
+        let (_fixture_dir, binary, writer) = write_busy_executable("etxtbsy_exhausted");
 
         let started = std::time::Instant::now();
         let result = super::spawn_verifying_executable(&binary, &["version"]);
@@ -32981,12 +32966,14 @@ mod tests {
     where
         F: FnOnce(PathBuf) -> T,
     {
-        let base_dir = unique_test_dir(label);
-        let _ = fs::create_dir_all(&base_dir);
+        // Removed when the guard drops, even if `f` panics.
+        let base = tempfile::Builder::new()
+            .prefix(&format!("fsfs_test_{label}_"))
+            .tempdir()
+            .expect("create backup fixture directory");
+        let base_dir = base.path().to_path_buf();
         let backup_dir = base_dir.join("backups");
-        let result = super::with_backup_dir_override(backup_dir, || f(base_dir.clone()));
-        let _ = fs::remove_dir_all(&base_dir);
-        result
+        super::with_backup_dir_override(backup_dir, || f(base_dir.clone()))
     }
 
     fn test_dashboard_status_payload() -> FsfsStatusPayload {
@@ -51471,7 +51458,7 @@ mod tests {
         // but fails on `--version` flag, proving we use the subcommand.
         let dir = reserve_unique_test_dir("version_subcmd")
             .expect("version-subcommand fixture directory should be atomically reservable");
-        let binary = dir.join("fsfs-verify-subcmd");
+        let binary = dir.path().join("fsfs-verify-subcmd");
         fs::write(
             &binary,
             b"#!/bin/sh\nif [ \"$1\" = \"version\" ]; then echo \"fsfs 0.99.0\"; exit 0; fi\nexit 1\n",
@@ -51510,7 +51497,7 @@ mod tests {
     fn verify_binary_returning_valid_version_output_passes() {
         let dir = reserve_unique_test_dir("valid_version")
             .expect("valid-version fixture directory should be atomically reservable");
-        let binary = dir.join("fsfs-valid");
+        let binary = dir.path().join("fsfs-valid");
         fs::write(&binary, b"#!/bin/sh\necho \"fsfs 1.2.3\"\n").unwrap();
 
         use std::os::unix::fs::PermissionsExt;
@@ -51528,7 +51515,7 @@ mod tests {
     fn verify_binary_returning_error_fails_gracefully() {
         let dir = reserve_unique_test_dir("error_version")
             .expect("error-version fixture directory should be atomically reservable");
-        let binary = dir.join("fsfs-broken");
+        let binary = dir.path().join("fsfs-broken");
         fs::write(&binary, b"#!/bin/sh\necho \"segfault\" >&2\nexit 139\n").unwrap();
 
         use std::os::unix::fs::PermissionsExt;

@@ -3683,7 +3683,6 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_core::SearchError;
     use proptest::prelude::*;
@@ -3697,6 +3696,15 @@ mod tests {
 
     fn home() -> &'static Path {
         Path::new("/home/tester")
+    }
+
+    /// A fresh directory under the temp root, removed with its contents when
+    /// the guard drops (panics included); bind it for the whole test.
+    fn temp_fixture(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create config fixture directory")
     }
 
     #[test]
@@ -4543,11 +4551,8 @@ mod tests {
 
     #[test]
     fn load_from_sources_expands_tilde_config_path() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let home_dir = std::env::temp_dir().join(format!("fsfs-config-home-{unique}"));
+        let guard = temp_fixture("fsfs-config-home-");
+        let home_dir = guard.path().to_path_buf();
         let config_file = home_dir
             .join(".config")
             .join("frankensearch")
@@ -4813,11 +4818,8 @@ mod tests {
 
     #[test]
     fn layered_sources_apply_project_over_user() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("fsfs-config-layer-{unique}"));
+        let guard = temp_fixture("fsfs-config-layer-");
+        let root = guard.path().to_path_buf();
         let project = root.join("repo");
         let project_config = project.join(".frankensearch").join("config.toml");
         let user_config = root
@@ -4889,11 +4891,8 @@ mod tests {
                 .contains("/frankensearch/config.toml")
         );
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("fsfs-default-paths-{unique}"));
+        let guard = temp_fixture("fsfs-default-paths-");
+        let root = guard.path().to_path_buf();
         let workspace = root.join("workspace");
         fs::create_dir_all(&workspace).expect("mkdir workspace");
         fs::create_dir_all(root.join(".git")).expect("mkdir .git");
@@ -4917,11 +4916,8 @@ mod tests {
 
     #[test]
     fn project_config_path_walks_up_to_git_root() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("fsfs-git-root-{unique}"));
+        let guard = temp_fixture("fsfs-git-root-");
+        let root = guard.path().to_path_buf();
         let nested = root.join("deep").join("inside").join("repo");
         fs::create_dir_all(&nested).expect("mkdir nested");
         fs::create_dir_all(root.join(".git")).expect("mkdir .git");
@@ -4932,11 +4928,8 @@ mod tests {
 
     #[test]
     fn project_config_path_accepts_worktree_git_file() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("fsfs-worktree-root-{unique}"));
+        let guard = temp_fixture("fsfs-worktree-root-");
+        let root = guard.path().to_path_buf();
         let nested = root.join("subdir");
         fs::create_dir_all(&nested).expect("mkdir nested");
         fs::write(root.join(".git"), "gitdir: /tmp/virtual/gitdir\n").expect("write .git file");
