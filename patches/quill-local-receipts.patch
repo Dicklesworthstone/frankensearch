@@ -16,25 +16,32 @@ diff --git a/crates/frankensearch-quill/src/lib.rs b/crates/frankensearch-quill/
 diff --git a/crates/frankensearch-quill/src/config.rs b/crates/frankensearch-quill/src/config.rs
 --- a/crates/frankensearch-quill/src/config.rs
 +++ b/crates/frankensearch-quill/src/config.rs
-@@ -139,2 +139,11 @@
+@@ -138,3 +138,18 @@
+     /// and backfill path.
      pub quarantine_on_unrepairable: bool,
 +    /// Optional existing owner-private directory for read-only local receipts.
 +    ///
-+    /// None is strict and remains the default. Only QuillSearchIndex open and
-+    /// refresh consult this field; writers, recovery and maintenance ignore it.
-+    /// Receipts reuse only a successful file-prefix check. Section checks stay
-+    /// active. Metadata-preserving faults still require a strict open. Cache
-+    /// data must be outside the index; unsupported storage verifies in full.
++    /// `None` is strict and remains the default. Only [`crate::QuillSearchIndex`]
++    /// open and refresh consult this field. Writers, recovery and maintenance
++    /// continue using strict Keeper admission even when this field is set.
++    ///
++    /// Receipts reuse a prior successful file-prefix check; lazy section checks
++    /// remain active. They require supported local Linux storage and immutable
++    /// published files. Metadata-preserving faults are outside this policy's
++    /// guarantee: reopen with `None` to verify the file bytes again.
++    ///
++    /// The directory must already exist, be owner-private and be outside the
++    /// index. Unusable caches and unsupported storage fall back to full checks.
 +    /// See [`crate::KeeperSnapshot::open_with_local_receipts`].
 +    pub read_open_receipt_directory: Option<std::path::PathBuf>,
  }
-@@ -163,4 +172,5 @@
+@@ -163,4 +178,5 @@
              max_visibility_lag_ms: DEFAULT_MAX_VISIBILITY_LAG_MS,
              quarantine_on_unrepairable: false,
 +            read_open_receipt_directory: None,
          }
      }
-@@ -302,4 +312,5 @@
+@@ -302,4 +318,5 @@
                  max_visibility_lag_ms: 1_000,
                  quarantine_on_unrepairable: false,
 +                read_open_receipt_directory: None,
@@ -55,7 +62,60 @@ diff --git a/crates/frankensearch-quill/src/keeper.rs b/crates/frankensearch-qui
 diff --git a/crates/frankensearch-quill/src/index.rs b/crates/frankensearch-quill/src/index.rs
 --- a/crates/frankensearch-quill/src/index.rs
 +++ b/crates/frankensearch-quill/src/index.rs
-@@ -11529,1 +11529,8 @@
+@@ -11470,1 +11470,14 @@
+ impl QuillSearchIndex {
++    /// Actual prefix hashes in this handle's current snapshot, for regressions.
++    #[cfg(test)]
++    pub(crate) fn authenticated_file_witness_hash_count(&self) -> u64 {
++        self.reader
++            .published_snapshot
++            .load()
++            .keeper_snapshot()
++            .segments()
++            .iter()
++            .map(RecoveredSegment::authenticated_file_witness_hash_count)
++            .sum()
++    }
++
+@@ -11485,30 +11499,9 @@
+         config: QuillConfig,
+     ) -> Result<Self, QuillIndexError> {
+-        validate_config(&config)?;
+-        validate_non_durable_quarantine(&config)?;
+-        check_cancel(cx, "read-only index open")?;
+-        let directory = directory.into();
+-        let open_directory = directory.clone();
+-        let snapshot =
+-            spawn_blocking(move || KeeperSnapshot::open(open_directory, DEFAULT_SCHEMA)).await?;
+-        check_cancel(cx, "read-only index open")?;
+-        let generation = snapshot.loaded_manifest().manifest.generation;
+-        let publication_read_state = PublicationReadState::new(generation)?;
+-        let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
+-        Ok(Self {
+-            reader: QuillReader {
+-                parser: Some(DefaultQueryParser::new(DEFAULT_SCHEMA)?),
+-                config,
+-                schema: DEFAULT_SCHEMA,
+-                published_snapshot,
+-                publication_read_state,
+-                #[cfg(test)]
+-                publication_read_pause: Arc::default(),
+-                #[cfg(feature = "conformance-internals")]
+-                conformance_controller: Arc::default(),
+-            },
+-            directory,
+-        })
++        // Keep both public constructors on one admission path. A configuration
++        // must not silently stop taking effect when a caller uses the default
++        // schema instead of spelling that same schema explicitly.
++        Self::open_with_schema(cx, directory, DEFAULT_SCHEMA, config).await
+     }
+ 
+     /// Open the latest published snapshot of an index built on `schema`.
+@@ -11526,7 +11517,14 @@
+         check_cancel(cx, "read-only index open")?;
+         let directory = directory.into();
+         let open_directory = directory.clone();
 -        let snapshot = spawn_blocking(move || KeeperSnapshot::open(open_directory, schema)).await?;
 +        let receipt_directory = config.read_open_receipt_directory.clone();
 +        let snapshot = spawn_blocking(move || match receipt_directory {
@@ -65,7 +125,12 @@ diff --git a/crates/frankensearch-quill/src/index.rs b/crates/frankensearch-quil
 +            None => KeeperSnapshot::open(open_directory, schema),
 +        })
 +        .await?;
-@@ -11661,1 +11668,6 @@
+         check_cancel(cx, "read-only index open")?;
+         let generation = snapshot.loaded_manifest().manifest.generation;
+         let publication_read_state = PublicationReadState::new(generation)?;
+@@ -11659,6 +11658,11 @@
+         // otherwise fail every refresh with a manifest schema mismatch.
+         let schema = self.reader.schema;
 -        let snapshot = spawn_blocking(move || KeeperSnapshot::open(directory, schema)).await?;
 +        let receipt_directory = self.reader.config.read_open_receipt_directory.clone();
 +        let snapshot = spawn_blocking(move || match receipt_directory {
@@ -73,3 +138,93 @@ diff --git a/crates/frankensearch-quill/src/index.rs b/crates/frankensearch-quil
 +            None => KeeperSnapshot::open(directory, schema),
 +        })
 +        .await?;
+         check_cancel(cx, "read-only index refresh")?;
+ 
+         Ok(self
+diff --git a/crates/frankensearch-quill/src/keeper/receipt_regressions.rs b/crates/frankensearch-quill/src/keeper/receipt_regressions.rs
+--- a/crates/frankensearch-quill/src/keeper/receipt_regressions.rs
++++ b/crates/frankensearch-quill/src/keeper/receipt_regressions.rs
+@@ -238,10 +238,83 @@
+ #[test]
+ fn local_receipts_are_not_persisted_when_another_segment_fails() -> TestResult {
+     let (_root, index, cache, encoded) = local_receipt_fixture()?;
+     let missing = encoded_identity_test_segment(0xea502, 100, &[Some("not-on-disk")])?;
+     write_manifest(&index.join("MANIFEST"), &durable_test_manifest(1,
+         vec![manifest_segment(&encoded, 1), manifest_segment(&missing, 2)]))?;
+     assert!(eager_local_open(&index, &cache).is_err());
+     assert!(!cache.join("read-open-receipts-v3").exists());
+     Ok(())
+ }
++
++#[test]
++fn public_readers_share_receipt_policy_on_open_and_refresh() -> TestResult {
++    use crate::{QuillConfig, QuillSearchIndex};
++
++    let (_root, index, cache, encoded) = local_receipt_fixture()?;
++    // Exercise the actual public default policy, not the eager private helper.
++    // ctime cannot safely be backdated. Let this tiny immutable tmpfs fixture
++    // pass the production 60-second stability floor; never skip the hit case.
++    std::thread::sleep(Duration::from_secs(61));
++    let config = QuillConfig {
++        read_open_receipt_directory: Some(cache.clone()),
++        ..QuillConfig::default()
++    };
++    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build()?;
++    runtime.block_on(async {
++        let cx = Cx::for_request();
++        let initial = QuillSearchIndex::open(&cx, &index, config.clone()).await?;
++        assert_eq!(initial.authenticated_file_witness_hash_count(), 1);
++        assert!(cache.join("read-open-receipts-v3").is_file());
++
++        let explicit = QuillSearchIndex::open_with_schema(
++            &cx, &index, DEFAULT_SCHEMA, config.clone(),
++        )
++        .await?;
++        assert_eq!(explicit.authenticated_file_witness_hash_count(), 0);
++        let ordinary = QuillSearchIndex::open(&cx, &index, config).await?;
++        assert_eq!(ordinary.authenticated_file_witness_hash_count(), 0,
++            "default-schema open must not silently bypass the configured receipts");
++        let strict = QuillSearchIndex::open(&cx, &index, QuillConfig::default()).await?;
++        assert_eq!(strict.authenticated_file_witness_hash_count(), 1,
++            "a warm receipt must not bypass an explicitly strict open");
++        for reader in [&initial, &explicit, &ordinary, &strict] {
++            assert_eq!(reader.keeper_generation(), 1);
++            assert_eq!(reader.doc_count()?, 2);
++        }
++
++        // Publish a new MANIFEST reusing the immutable segment. No in-place
++        // segment write occurs while any reader owns its memory mapping.
++        write_manifest(
++            &index.join("MANIFEST"),
++            &durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]),
++        )?;
++        for reader in [&explicit, &ordinary] {
++            assert!(reader.refresh(&cx).await?);
++            assert_eq!(reader.keeper_generation(), 2);
++            assert_eq!(reader.authenticated_file_witness_hash_count(), 0,
++                "refresh must retain the admission policy of both constructors");
++        }
++        assert!(strict.refresh(&cx).await?);
++        assert_eq!(strict.keeper_generation(), 2);
++        assert_eq!(strict.authenticated_file_witness_hash_count(), 1);
++        assert_eq!(initial.keeper_generation(), 1,
++            "another handle's refresh must not move the retained snapshot");
++
++        // A damaged proof changes neither data nor authority: admission must
++        // fully hash the real file and may then replace the advisory proof.
++        std::fs::write(cache.join("read-open-receipts-v3"), b"damaged-proof")?;
++        write_manifest(
++            &index.join("MANIFEST"),
++            &durable_test_manifest(3, vec![manifest_segment(&encoded, 1)]),
++        )?;
++        assert!(ordinary.refresh(&cx).await?);
++        assert_eq!(ordinary.keeper_generation(), 3);
++        assert_eq!(ordinary.authenticated_file_witness_hash_count(), 1);
++        assert_eq!(ordinary.doc_count()?, 2);
++        assert!(explicit.refresh(&cx).await?);
++        assert_eq!(explicit.authenticated_file_witness_hash_count(), 0);
++        assert!(!ordinary.refresh(&cx).await?,
++            "an unchanged retained publication still requires no reopen");
++        Ok(())
++    })
++}
