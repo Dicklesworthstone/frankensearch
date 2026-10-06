@@ -27,6 +27,10 @@ mod hybrid;
 #[cfg(feature = "quill")]
 pub use hybrid::{NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits};
 
+/// Live whole-inventory snapshots and stale-safe repartitioned updates.
+#[cfg(feature = "quill")]
+pub mod live;
+
 const SNAPSHOT_FILE: &str = "native.sharded.json";
 const SNAPSHOT_SCHEMA: &str = "frankensearch.native-sharded-source-vector.v1";
 const MAX_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
