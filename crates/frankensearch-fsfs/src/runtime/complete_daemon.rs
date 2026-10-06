@@ -20,8 +20,10 @@ use frankensearch_core::{SearchError, SearchResult};
 use serde::Serialize;
 
 use super::super::{
-    FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES,
-    SearchExecutionFlags, SearchServeRequest, daemon_socket_path_capacity,
+    FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_CONNECT_MAX_ATTEMPTS,
+    FSFS_DAEMON_CONNECT_RETRY_DELAY_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS,
+    FSFS_DAEMON_REQUEST_MAX_BYTES, SearchExecutionFlags, SearchServeRequest,
+    daemon_socket_path_capacity,
 };
 use super::{
     FsfsRuntime, complete_cli_error, emit_complete_serve_line, pressure_timestamp_ms,
@@ -148,7 +150,101 @@ impl Drop for BoundCompleteSocket {
     }
 }
 
+/// Polls whether a started daemon process has already exited.
+pub(super) type DaemonExited = Box<dyn FnMut() -> io::Result<bool> + Send>;
+
+/// What a test installs in place of the detached daemon process.
+#[cfg(test)]
+pub(super) type TestDaemonSpawner = Box<dyn FnMut(&Path) -> Option<DaemonExited>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests cannot start the test binary as the daemon; with no spawner
+    /// installed, nothing is started.
+    static TEST_DAEMON_SPAWNER: std::cell::RefCell<Option<TestDaemonSpawner>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Installs a test spawner for this thread until the guard drops.
+#[cfg(test)]
+pub(super) struct TestDaemonSpawnerGuard;
+
+#[cfg(test)]
+impl TestDaemonSpawnerGuard {
+    pub(super) fn install(spawner: TestDaemonSpawner) -> Self {
+        TEST_DAEMON_SPAWNER.with(|slot| *slot.borrow_mut() = Some(spawner));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDaemonSpawnerGuard {
+    fn drop(&mut self) {
+        TEST_DAEMON_SPAWNER.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
 impl FsfsRuntime {
+    /// Start this store's daemon as a legacy search starts its warm daemon,
+    /// and report whether it accepts connections within the startup window.
+    /// Model loading often outlasts the window on the first search, which then
+    /// runs in process while the daemon finishes starting; later searches
+    /// forward to it. A daemon that exits early (no models, a lost lock race,
+    /// a refused socket path) ends the wait at once, and a failed spawn only
+    /// costs the in-process search it was going to run anyway.
+    pub(super) async fn start_complete_generation_daemon(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        socket: &Path,
+    ) -> SearchResult<bool> {
+        if socket.as_os_str().len() >= daemon_socket_path_capacity() {
+            return Ok(false);
+        }
+        let mut exited = match self.spawn_complete_generation_daemon(root) {
+            Ok(Some(exited)) => exited,
+            Ok(None) => return Ok(false),
+            Err(error) => {
+                tracing::warn!(%error, "could not start the complete-generation daemon; searching in process");
+                return Ok(false);
+            }
+        };
+        for _ in 0..FSFS_DAEMON_CONNECT_MAX_ATTEMPTS {
+            retained_search_checkpoint(cx)?;
+            if fs::symlink_metadata(socket).is_ok() && !control::refuses_connections(socket) {
+                return Ok(true);
+            }
+            if exited().unwrap_or(true) {
+                return Ok(false);
+            }
+            asupersync::time::sleep(
+                cx.now(),
+                Duration::from_millis(FSFS_DAEMON_CONNECT_RETRY_DELAY_MS),
+            )
+            .await;
+        }
+        Ok(false)
+    }
+
+    #[cfg(not(test))]
+    fn spawn_complete_generation_daemon(&self, root: &Path) -> SearchResult<Option<DaemonExited>> {
+        let mut child = self.spawn_detached_fsfs([
+            "daemon".into(),
+            "--index-dir".into(),
+            root.into(),
+            "--idle-timeout-ms".into(),
+            FSFS_DAEMON_IDLE_TIMEOUT_MS.to_string().into(),
+        ])?;
+        Ok(Some(Box::new(move || Ok(child.try_wait()?.is_some()))))
+    }
+
+    // Same signature as the process spawner it stands in for.
+    #[cfg(test)]
+    #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
+    fn spawn_complete_generation_daemon(&self, root: &Path) -> SearchResult<Option<DaemonExited>> {
+        Ok(TEST_DAEMON_SPAWNER.with(|slot| slot.borrow_mut().as_mut().and_then(|spawn| spawn(root))))
+    }
+
     /// Serve one buffered or progressive request per connection until cancellation or idle
     /// expiry. No detached worker owns a reader, socket, or request after return.
     pub(super) async fn run_complete_generation_daemon(
@@ -781,6 +877,88 @@ mod tests {
         let inode = fs::metadata(&socket).unwrap().ino();
         assert!(BoundCompleteSocket::bind(socket.clone()).is_err());
         assert_eq!(fs::metadata(socket).unwrap().ino(), inode);
+    }
+
+    /// Starting the store's daemon succeeds once its socket accepts, ends at
+    /// once when the started process has already exited, and starts nothing
+    /// without a spawner or for a socket path too long to bind.
+    #[test]
+    fn starting_the_store_daemon_waits_only_for_a_live_process() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = FsfsRuntime::new(crate::FsfsConfig::default());
+            let socket = directory.path().join("fsfs-query.sock");
+
+            // No spawner installed: nothing starts and nothing waits.
+            let started = Instant::now();
+            assert!(
+                !runtime
+                    .start_complete_generation_daemon(&cx, directory.path(), &socket)
+                    .await
+                    .unwrap()
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+
+            // A daemon that binds its socket is ready.
+            let calls = Rc::new(Cell::new(0));
+            let listener = Rc::new(std::cell::RefCell::new(None));
+            {
+                let (calls, listener, bind_at) = (calls.clone(), listener.clone(), socket.clone());
+                let _guard = TestDaemonSpawnerGuard::install(Box::new(move |_root| {
+                    calls.set(calls.get() + 1);
+                    *listener.borrow_mut() = Some(UnixListener::bind(&bind_at).unwrap());
+                    Some(Box::new(|| Ok(false)) as DaemonExited)
+                }));
+                assert!(
+                    runtime
+                        .start_complete_generation_daemon(&cx, directory.path(), &socket)
+                        .await
+                        .unwrap()
+                );
+            }
+            assert_eq!(calls.get(), 1);
+            drop(listener.borrow_mut().take());
+            fs::remove_file(&socket).unwrap();
+
+            // A process that already exited ends the wait well inside the window.
+            {
+                let _guard = TestDaemonSpawnerGuard::install(Box::new(|_root| {
+                    Some(Box::new(|| Ok(true)) as DaemonExited)
+                }));
+                let started = Instant::now();
+                assert!(
+                    !runtime
+                        .start_complete_generation_daemon(&cx, directory.path(), &socket)
+                        .await
+                        .unwrap()
+                );
+                assert!(started.elapsed() < Duration::from_millis(500));
+            }
+
+            // A socket path too long to bind starts nothing.
+            let mut long = directory.path().to_path_buf();
+            while long.join("fsfs-query.sock").as_os_str().len() <= daemon_socket_path_capacity() {
+                long.push("deep-store-segment");
+            }
+            let calls = Rc::new(Cell::new(0));
+            {
+                let calls = calls.clone();
+                let _guard = TestDaemonSpawnerGuard::install(Box::new(move |_root| {
+                    calls.set(calls.get() + 1);
+                    None
+                }));
+                assert!(
+                    !runtime
+                        .start_complete_generation_daemon(&cx, &long, &long.join("fsfs-query.sock"))
+                        .await
+                        .unwrap()
+                );
+            }
+            assert_eq!(calls.get(), 0);
+        });
     }
 
     /// A socket left by a crashed daemon (or a reboot) has no listener; a new

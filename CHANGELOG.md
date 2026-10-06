@@ -335,6 +335,10 @@ Historical adapter identities remain rejected by strict admission, and the
 
 These changes are on `main` and not yet in a published binary or crate.
 
+### Added
+
+- **A complete-generation search starts the store's warm daemon.** On the legacy layout a plain `fsfs search` starts a detached query daemon, so later searches skip model loading. The complete-generation layout only forwarded to a daemon someone had started by hand and otherwise searched in process every time. It now starts `fsfs daemon` for the store the same way (detached, 10-minute idle timeout) and forwards once it accepts. The first search runs in process while the daemon loads, and a daemon that exits early ends the wait at once. `--no-daemon`, a named `--daemon-socket`, `--expand`, and a socket path too long to bind start nothing.
+
 ### Changed
 
 - **The complete-generation `fsfs index` receipt is a superset of the legacy one.** Under `FSFS_COMPLETE_GENERATIONS=1` the payload now also carries `semantic_indexed_files`, `semantic_deferred_files`, `embedding_retries`, `embedding_failures`, `index_size_bytes`, `fast_window_coverage` and `meta.duration_ms`, and its table output prints the legacy `Discovered …` and `Indexed … in N ms (index size M bytes)` lines. The `index` and `watch` receipts report `index_root` as the selected generation: publication renames only the selection pointer, so the directory a build wrote is the readable index.

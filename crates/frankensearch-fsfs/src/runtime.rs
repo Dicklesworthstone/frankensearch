@@ -9346,29 +9346,44 @@ impl FsfsRuntime {
 
     #[cfg(unix)]
     fn spawn_search_daemon(&self, socket_path: &Path) -> SearchResult<()> {
-        use std::os::unix::process::CommandExt;
-
         if let Some(parent) = socket_path.parent()
             && !parent.as_os_str().is_empty()
         {
             fs::create_dir_all(parent)?;
         }
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "serve".into(),
+            "--daemon-socket".into(),
+            socket_path.into(),
+            "--idle-timeout-ms".into(),
+            FSFS_DAEMON_IDLE_TIMEOUT_MS.to_string().into(),
+            "--format".into(),
+            "jsonl".into(),
+        ];
+        if let Some(index_dir) = self.cli_input.index_dir.as_deref() {
+            args.push("--index-dir".into());
+            args.push(index_dir.into());
+        }
+        self.spawn_detached_fsfs(args)?;
+        Ok(())
+    }
+
+    /// Start this executable with `args` plus the caller's config, verbosity
+    /// and color flags, detached from the calling command and with no stdio.
+    #[cfg(unix)]
+    fn spawn_detached_fsfs(
+        &self,
+        args: impl IntoIterator<Item = std::ffi::OsString>,
+    ) -> SearchResult<std::process::Child> {
+        use std::os::unix::process::CommandExt;
+
         let binary_path = std::env::current_exe().map_err(SearchError::Io)?;
         let mut command = Command::new(binary_path);
         command
-            .arg("serve")
-            .arg("--daemon-socket")
-            .arg(socket_path)
-            .arg("--idle-timeout-ms")
-            .arg(FSFS_DAEMON_IDLE_TIMEOUT_MS.to_string())
-            .arg("--format")
-            .arg("jsonl")
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(index_dir) = self.cli_input.index_dir.as_deref() {
-            command.arg("--index-dir").arg(index_dir);
-        }
         if let Some(config_path) = self.cli_input.overrides.config_path.as_deref() {
             command.arg("--config").arg(config_path);
         }
@@ -9420,8 +9435,7 @@ impl FsfsRuntime {
             });
         }
 
-        command.spawn().map_err(SearchError::Io)?;
-        Ok(())
+        command.spawn().map_err(SearchError::Io)
     }
 
     #[cfg(unix)]
@@ -50245,13 +50259,16 @@ mod tests {
         let mut config = FsfsConfig::default();
         config.indexing.model_dir = temp.path().join("models").display().to_string();
         config.indexing.offline = true;
+        // An index in the working directory (the package root, which can hold
+        // a stray .frankensearch from a manual run) must not shape the hint.
+        config.storage.index_dir = temp.path().join("index").display().to_string();
         let runtime = FsfsRuntime::new(config);
 
         let mode_hint = runtime
             .search_mode_hint()
             .expect("loader-capable mode hint")
             .expect("empty model cache must produce recovery guidance");
-        assert!(mode_hint.contains("fsfs download-models"));
+        assert!(mode_hint.contains("fsfs download-models"), "{mode_hint}");
         assert!(!mode_hint.contains("lacks semantic model loaders"));
         assert!(!mode_hint.contains("--features"));
         assert_eq!(
