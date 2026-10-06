@@ -1957,6 +1957,7 @@ dependencies = [
  "ftui-widgets",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

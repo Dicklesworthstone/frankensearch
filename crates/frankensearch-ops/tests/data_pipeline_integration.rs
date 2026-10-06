@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_ops::storage::SummaryWindow;
@@ -84,12 +83,16 @@ fn apply_pipeline_batches(
     Ok(last_result)
 }
 
-fn temp_ops_db_path(test_name: &str) -> std::path::PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("wall clock should be >= unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("frankensearch-ops-{test_name}-{nanos}.sqlite3"))
+/// A database path inside a fresh temp directory. Dropping the guard removes
+/// the database and every sidecar the engine writes next to it; bind it for
+/// the whole test.
+fn temp_ops_db_path(test_name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("frankensearch-ops-{test_name}-"))
+        .tempdir()
+        .expect("create temp ops db dir");
+    let path = dir.path().join("ops.sqlite3");
+    (dir, path)
 }
 
 #[test]
@@ -619,7 +622,7 @@ fn pipeline_recovers_after_restart_with_telemetry_gap() {
     let split = run.batches.len() / 2;
     let early = &run.batches[..split];
     let late = &run.batches[split + 1..];
-    let storage_path = temp_ops_db_path("restart-gap");
+    let (_db_dir, storage_path) = temp_ops_db_path("restart-gap");
     let storage_config = OpsStorageConfig {
         db_path: storage_path,
         busy_timeout_ms: 25,
@@ -687,7 +690,7 @@ fn pipeline_restart_with_empty_late_segment_is_noop() {
         "late segment should be intentionally empty"
     );
 
-    let storage_path = temp_ops_db_path("restart-empty-late");
+    let (_db_dir, storage_path) = temp_ops_db_path("restart-empty-late");
     let storage_config = OpsStorageConfig {
         db_path: storage_path,
         busy_timeout_ms: 25,
