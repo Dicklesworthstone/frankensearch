@@ -811,8 +811,7 @@ const fn daemon_spawn_suppressed() -> bool {
 /// name is enough to reach the limit under `~/Library/Caches`.
 #[cfg(unix)]
 fn ensure_daemon_socket_path_fits(socket_path: &Path) -> SearchResult<()> {
-    let capacity =
-        std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let capacity = daemon_socket_path_capacity();
     let length = socket_path.as_os_str().len();
     if length < capacity {
         return Ok(());
@@ -825,6 +824,12 @@ fn ensure_daemon_socket_path_fits(socket_path: &Path) -> SearchResult<()> {
             capacity - 1
         ),
     })
+}
+
+/// Bytes `sun_path` holds, including its terminating NUL.
+#[cfg(unix)]
+const fn daemon_socket_path_capacity() -> usize {
+    std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path)
 }
 
 /// The default socket `file_name` under `preferred_dir`, or, when that path is

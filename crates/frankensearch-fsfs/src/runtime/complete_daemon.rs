@@ -21,7 +21,7 @@ use serde::Serialize;
 
 use super::super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES,
-    SearchExecutionFlags, SearchServeRequest,
+    SearchExecutionFlags, SearchServeRequest, daemon_socket_path_capacity,
 };
 use super::{
     FsfsRuntime, complete_cli_error, emit_complete_serve_line, pressure_timestamp_ms,
@@ -61,6 +61,21 @@ struct BoundCompleteSocket {
 
 impl BoundCompleteSocket {
     fn bind(path: PathBuf) -> SearchResult<Self> {
+        // The socket must live in its store root, so a root too deep for
+        // sun_path cannot serve. Refuse before creating the lock, instead of
+        // leaving it behind on bind()'s raw "shorter than SUN_LEN" error.
+        let capacity = daemon_socket_path_capacity();
+        let length = path.as_os_str().len();
+        if length >= capacity {
+            return Err(SearchError::InvalidConfig {
+                field: "complete_generation.daemon_socket".to_owned(),
+                value: path.display().to_string(),
+                reason: format!(
+                    "the socket path is {length} bytes, but Unix sockets allow at most {}; complete-generation sockets live in the store root, so serve a store at a shorter path",
+                    capacity - 1
+                ),
+            });
+        }
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -810,6 +825,29 @@ mod tests {
                 .unwrap(),
             root.join("custom.sock")
         );
+    }
+
+    #[test]
+    fn store_root_too_deep_for_a_unix_socket_is_refused_before_locking() {
+        let store = tempfile::tempdir().unwrap();
+        let mut root = fs::canonicalize(store.path()).unwrap();
+        while root.join("fsfs.sock").as_os_str().len() <= daemon_socket_path_capacity() {
+            root.push("deep-store-segment");
+        }
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("fsfs.sock");
+        let Err(error) = BoundCompleteSocket::bind(path.clone()) else {
+            panic!("an overlong socket path must not bind"); // ubs:ignore — cfg(test) assertion.
+        };
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { field, value, reason }
+                if field == "complete_generation.daemon_socket"
+                    && *value == path.display().to_string()
+                    && reason.contains("store root")),
+            "{error:?}"
+        );
+        assert!(!path.with_extension("lock").exists(), "no lock is left behind");
+        assert!(!path.exists());
     }
 
     #[test]
