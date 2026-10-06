@@ -1701,9 +1701,8 @@ fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
     use fsqlite_types::cx::Cx;
@@ -2081,28 +2080,60 @@ mod tests {
         assert_eq!(restored, payload);
     }
 
-    fn temp_path(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-durability-{prefix}-{}-{nanos}.bin",
-            std::process::id()
-        ))
+    /// A test path that owns a fresh temp directory. The directory, and every
+    /// sidecar, backup or staging file the protector writes into it, is
+    /// removed when the guard drops, including when the test panics.
+    pub(super) struct ScratchPath {
+        _root: tempfile::TempDir,
+        path: PathBuf,
     }
 
-    fn temp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-durability-dir-{prefix}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    impl ScratchPath {
+        /// The temp directory itself, named `{name_prefix}XXXXXX`.
+        pub(super) fn dir(name_prefix: &str) -> Self {
+            let root = Self::root(name_prefix);
+            let path = root.path().to_path_buf();
+            Self { _root: root, path }
+        }
+
+        /// A not-yet-created `file_name` inside a fresh temp directory.
+        pub(super) fn file(name_prefix: &str, file_name: &str) -> Self {
+            let root = Self::root(name_prefix);
+            let path = root.path().join(file_name);
+            Self { _root: root, path }
+        }
+
+        fn root(name_prefix: &str) -> tempfile::TempDir {
+            tempfile::Builder::new()
+                .prefix(name_prefix)
+                .tempdir()
+                .expect("create temp dir")
+        }
+    }
+
+    impl std::ops::Deref for ScratchPath {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for ScratchPath {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    fn temp_path(prefix: &str) -> ScratchPath {
+        ScratchPath::file(
+            &format!("frankensearch-durability-{prefix}-"),
+            &format!("{prefix}.bin"),
+        )
+    }
+
+    fn temp_dir(prefix: &str) -> ScratchPath {
+        ScratchPath::dir(&format!("frankensearch-durability-dir-{prefix}-"))
     }
 
     fn test_config() -> DurabilityConfig {
@@ -2340,7 +2371,7 @@ mod tests {
         let log_dir = temp_dir("repair-log");
         let metrics = Arc::new(crate::metrics::DurabilityMetrics::default());
         let pipeline_config = RepairPipelineConfig {
-            repair_log_dir: Some(log_dir.clone()),
+            repair_log_dir: Some(log_dir.to_path_buf()),
             ..RepairPipelineConfig::default()
         };
         let protector = FileProtector::new_with_pipeline_config(
@@ -2682,9 +2713,6 @@ mod tests {
             verify_report.results.is_empty(),
             "symlinks must be skipped during verification scans"
         );
-
-        let _ = std::fs::remove_file(link_path);
-        let _ = std::fs::remove_file(external_target);
     }
 
     #[test]
@@ -2733,13 +2761,12 @@ mod tests {
 // scenarios that exercise the full durability pipeline across components.
 #[cfg(test)]
 mod e2e_tests {
-    use std::path::PathBuf;
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
     use fsqlite_types::cx::Cx;
 
+    use super::tests::ScratchPath;
     use super::{FileHealth, FileProtector, FileRecoveryOutcome, RepairPipelineConfig};
     use crate::config::DurabilityConfig;
     use crate::fsvi_protector::{FsviProtector, FsviVerifyResult};
@@ -2821,28 +2848,15 @@ mod e2e_tests {
         }
     }
 
-    fn temp_path(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-e2e-{prefix}-{}-{nanos}.bin",
-            std::process::id()
-        ))
+    fn temp_path(prefix: &str) -> ScratchPath {
+        ScratchPath::file(
+            &format!("frankensearch-e2e-{prefix}-"),
+            &format!("{prefix}.bin"),
+        )
     }
 
-    fn temp_dir(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-e2e-dir-{prefix}-{}-{nanos}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    fn temp_dir(prefix: &str) -> ScratchPath {
+        ScratchPath::dir(&format!("frankensearch-e2e-dir-{prefix}-"))
     }
 
     fn test_config() -> DurabilityConfig {
@@ -3254,7 +3268,7 @@ mod e2e_tests {
         let log_dir = temp_dir("e2e-repair-log");
         let metrics = Arc::new(DurabilityMetrics::default());
         let pipeline_config = RepairPipelineConfig {
-            repair_log_dir: Some(log_dir.clone()),
+            repair_log_dir: Some(log_dir.to_path_buf()),
             ..RepairPipelineConfig::default()
         };
         let protector = FileProtector::new_with_pipeline_config(
@@ -3311,7 +3325,6 @@ mod e2e_tests {
 
         let read_back = std::fs::read(&path).expect("read back");
         assert_eq!(read_back, payload);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3324,7 +3337,6 @@ mod e2e_tests {
 
         let read_back = std::fs::read(&path).expect("read back");
         assert_eq!(read_back, b"second");
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

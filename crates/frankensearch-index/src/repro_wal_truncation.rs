@@ -1,20 +1,12 @@
 #[cfg(test)]
 mod tests {
     use crate::Quantization;
+    use crate::test_fixtures::TempFixturePath;
     use crate::wal::{WalEntry, append_wal_batch, read_wal};
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_wal_path(name: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-wal-repro-{name}-{}-{now}.fsvi.wal",
-            std::process::id()
-        ))
+    fn temp_wal_path(name: &str) -> TempFixturePath {
+        TempFixturePath::new(&format!("wal-repro-{name}"), "index.fsvi.wal")
     }
 
     fn make_entry(doc_id: &str, base: f32, dim: usize) -> WalEntry {
@@ -99,7 +91,5 @@ mod tests {
         );
         assert_eq!(loaded_final[0].doc_id, "doc-a");
         assert_eq!(loaded_final[1].doc_id, "doc-c");
-
-        fs::remove_file(&path).ok();
     }
 }

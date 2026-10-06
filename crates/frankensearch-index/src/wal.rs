@@ -1468,18 +1468,11 @@ impl Drop for WalWriterLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::TempFixturePath;
     use frankensearch_core::generation::EmbeddingIdentityBundleV1;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_wal_path(name: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-wal-{name}-{}-{now}.fsvi.wal",
-            std::process::id()
-        ))
+    fn temp_wal_path(name: &str) -> TempFixturePath {
+        TempFixturePath::new(&format!("wal-{name}"), "index.fsvi.wal")
     }
 
     fn make_entry(doc_id: &str, base: f32, dim: usize) -> WalEntry {
@@ -1555,7 +1548,7 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn freeze_test_timestamps(path: &Path) {
-        let timestamp = UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_321);
+        let timestamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_321);
         let file = OpenOptions::new()
             .read(true)
             .open(path)
@@ -2089,8 +2082,6 @@ mod tests {
         assert_eq!(loaded[1].doc_id, "doc-1");
         assert!((loaded[0].embedding[0] - 1.0).abs() < 0.01);
         assert!((loaded[1].embedding[0] - 2.0).abs() < 0.01);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2123,8 +2114,6 @@ mod tests {
         assert_eq!(loaded[0].doc_id, "doc-0");
         assert_eq!(loaded[1].doc_id, "doc-1");
         assert_eq!(loaded[2].doc_id, "doc-2");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2152,8 +2141,6 @@ mod tests {
         let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1, "only the good batch should survive");
         assert_eq!(loaded[0].doc_id, "doc-good");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2193,8 +2180,6 @@ mod tests {
             "corrupted second batch should be discarded"
         );
         assert_eq!(loaded[0].doc_id, "doc-good");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2219,8 +2204,6 @@ mod tests {
 
         let result = read_wal(&path, 8, Quantization::F16);
         assert!(result.is_err());
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2237,8 +2220,6 @@ mod tests {
             (loaded[0].embedding[0] - 0.123_456).abs() < f32::EPSILON,
             "f32 should round-trip exactly"
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2309,7 +2290,6 @@ mod tests {
         std::fs::write(&path, [0u8; 10]).unwrap();
         let (loaded, _, _) = read_wal(&path, 4, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2329,7 +2309,6 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("magic"));
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2350,7 +2329,6 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("version"));
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2370,7 +2348,6 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("quantization"));
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2395,7 +2372,6 @@ mod tests {
         assert!(result.is_err());
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("CRC"));
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2405,7 +2381,6 @@ mod tests {
         append_wal_batch(&path, &[], dim, Quantization::F16, 0, false).unwrap();
         let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert!(loaded.is_empty());
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2481,7 +2456,6 @@ mod tests {
             err.to_string().contains("doc_id_length"),
             "error should mention doc_id_length: {err}"
         );
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2505,7 +2479,6 @@ mod tests {
             err.to_string().contains("dimension"),
             "error should mention dimension: {err}"
         );
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2546,7 +2519,6 @@ mod tests {
         let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-sync");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2584,7 +2556,6 @@ mod tests {
 
         let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 2);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2610,7 +2581,6 @@ mod tests {
         let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-good");
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2629,7 +2599,6 @@ mod tests {
         // F16 has ~3 decimal digits of precision
         assert!((loaded[0].embedding[0] - 0.123_456).abs() < 0.001);
         assert!((loaded[0].embedding[1] + 0.987_654).abs() < 0.001);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2648,7 +2617,6 @@ mod tests {
         assert!((loaded[0].embedding[0] - val).abs() < f32::EPSILON);
         assert!((loaded[0].embedding[1] + val).abs() < f32::EPSILON);
         assert!(loaded[0].embedding[2].abs() < f32::EPSILON);
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -2673,7 +2641,6 @@ mod tests {
         let (loaded, _, _) = read_wal(&path, dim, Quantization::F16).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].doc_id, "doc-0");
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── bd-vbzm tests end ───
@@ -2765,8 +2732,6 @@ mod tests {
             vec!["doc-first", "doc-second"],
             "both acknowledged batches must survive arbitration"
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     /// Exercise the kernel's real duplicated-open-description behavior, the
@@ -2982,10 +2947,5 @@ mod tests {
             torn,
             "the quarantine must preserve the corrupt bytes verbatim"
         );
-
-        for stale in quarantined {
-            std::fs::remove_file(stale).ok();
-        }
-        std::fs::remove_file(&path).ok();
     }
 }

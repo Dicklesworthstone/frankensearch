@@ -5,7 +5,7 @@
 //! two-tier availability logging must fire once per state transition, not
 //! once per query.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use frankensearch_core::{TwoTierConfig, ZeroSignalReason};
@@ -13,19 +13,13 @@ use frankensearch_index::{TwoTierIndex, VectorIndex};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn temp_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir()
-        .join("frankensearch_zero_signal_test")
-        .join(format!(
-            "{name}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+/// A private temporary directory, removed with its contents when the guard
+/// drops, even on panic.
+fn temp_dir(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("frankensearch-index-zero-signal-{name}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 const DIM: usize = 4;
@@ -44,7 +38,7 @@ fn classify(index: &VectorIndex, query: &[f32], k: usize) -> Option<ZeroSignalRe
 #[test]
 fn vector_index_lifecycle_classifies_every_state_across_restarts() {
     let dir = temp_dir("lifecycle");
-    let path = dir.join("index.fsvi");
+    let path = dir.path().join("index.fsvi");
 
     // Stage 1: created, never held a record.
     VectorIndex::create(&path, "test-embedder", DIM)
@@ -192,9 +186,9 @@ impl tracing::Subscriber for LaneEventCollector {
 }
 
 /// Build a two-tier directory whose fast index has every record tombstoned.
-fn build_all_tombstoned_dir(name: &str) -> PathBuf {
+fn build_all_tombstoned_dir(name: &str) -> tempfile::TempDir {
     let dir = temp_dir(name);
-    let fast_path = dir.join("vector.fast.idx");
+    let fast_path = dir.path().join("vector.fast.idx");
     let mut writer = VectorIndex::create(&fast_path, "test-embedder", DIM).expect("create writer");
     writer.write_record("doc-a", &E1).expect("write doc-a");
     writer.write_record("doc-b", &E2).expect("write doc-b");
@@ -212,7 +206,7 @@ fn open_two_tier(dir: &Path) -> TwoTierIndex {
 #[test]
 fn repeated_empty_searches_log_one_transition_not_a_storm() {
     let dir = build_all_tombstoned_dir("storm");
-    let index = open_two_tier(&dir);
+    let index = open_two_tier(dir.path());
     let collector = LaneEventCollector::default();
 
     tracing::subscriber::with_default(collector.clone(), || {
@@ -268,7 +262,7 @@ fn each_reopened_generation_logs_its_own_transition_once() {
         // once-per-transition bound is per generation, so each logs once —
         // and repeats within a generation still stay silent.
         for _ in 0..2 {
-            let index = open_two_tier(&dir);
+            let index = open_two_tier(dir.path());
             for _ in 0..3 {
                 let classified = index
                     .search_fast_classified(&E1, 3)

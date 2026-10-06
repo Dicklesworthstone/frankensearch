@@ -1833,23 +1833,15 @@ fn parse_parallel_search_env(value: Option<&str>) -> bool {
 mod tests {
     use std::collections::HashSet;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::test_fixtures::TempFixturePath;
     use crate::{Quantization, VectorIndex};
     use frankensearch_core::PredicateFilter;
     use proptest::prelude::*;
 
-    fn temp_index_path(name: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-index-search-{name}-{}-{now}.fsvi",
-            std::process::id()
-        ))
+    fn temp_index_path(name: &str) -> TempFixturePath {
+        TempFixturePath::new(&format!("search-{name}"), "index.fsvi")
     }
 
     fn write_index(path: &std::path::Path, rows: &[(&str, Vec<f32>)]) -> SearchResult<()> {
@@ -2148,7 +2140,6 @@ mod tests {
             for hit in &hits {
                 prop_assert!(seen_indices.insert(hit.index));
             }
-            let _ = fs::remove_file(&path);
         }
 
         #[test]
@@ -2179,7 +2170,6 @@ mod tests {
                 prop_assert_eq!(left.index, right.index);
                 prop_assert!((left.score - right.score).abs() <= 1e-6);
             }
-            let _ = fs::remove_file(&path);
         }
     }
 
@@ -3578,8 +3568,6 @@ mod tests {
         let hits = index.search_top_k(&query, 2, None).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "doc-a");
-
-        fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -3598,8 +3586,6 @@ mod tests {
         let hits = index.search_top_k(&query, 10, Some(&filter)).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-b");
-
-        fs::remove_file(&path).ok();
     }
 
     // ─── bd-2k3d tests end ────────────────────────────────────────────

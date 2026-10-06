@@ -146,12 +146,11 @@ impl LexicalRead for StubLexical {
 
 const DIM: usize = 4;
 
-fn build_test_index() -> Arc<TwoTierIndex> {
-    // Use a leaked TempDir so the directory survives for the test's lifetime
-    // without needing to thread a handle through every call site.
-    let dir = Box::leak(Box::new(tempfile::tempdir().expect("create test tempdir")))
-        .path()
-        .join("index");
+/// The index and the guard that removes its directory; keep the guard bound
+/// for as long as the index is used.
+fn build_test_index() -> (tempfile::TempDir, Arc<TwoTierIndex>) {
+    let temp = tempfile::tempdir().expect("create test tempdir");
+    let dir = temp.path().join("index");
     let mut builder =
         TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create test index");
     builder.set_fast_embedder_id("stub-fast");
@@ -171,7 +170,7 @@ fn build_test_index() -> Arc<TwoTierIndex> {
             .add_record(format!("doc-{i}"), &vec, Some(&vec))
             .expect("add record");
     }
-    Arc::new(builder.finish().expect("finish test index"))
+    (temp, Arc::new(builder.finish().expect("finish test index")))
 }
 
 // ─── Search Result Collector ───────────────────────────────────────────────
@@ -422,8 +421,12 @@ async fn check_determinism(
 
 // ─── Searcher Builder ──────────────────────────────────────────────────────
 
-fn build_searcher_for_lane(lane: &InteractionLane) -> (TwoTierSearcher, Arc<TwoTierIndex>) {
-    let index = build_test_index();
+/// The searcher, its index and the guard that removes the index directory;
+/// keep the guard bound while either is used.
+fn build_searcher_for_lane(
+    lane: &InteractionLane,
+) -> (TwoTierSearcher, Arc<TwoTierIndex>, tempfile::TempDir) {
+    let (index_dir, index) = build_test_index();
     let fast = Arc::new(StubEmbedder::new("fast", DIM));
     let quality = Arc::new(StubEmbedder::new("quality", DIM));
     // Keep lexical present without letting identifier/short-keyword queries
@@ -441,7 +444,7 @@ fn build_searcher_for_lane(lane: &InteractionLane) -> (TwoTierSearcher, Arc<TwoT
         .with_quality_embedder(quality)
         .with_lexical(lexical);
 
-    (searcher, index)
+    (searcher, index, index_dir)
 }
 
 // ─── Per-Lane Tests ────────────────────────────────────────────────────────
@@ -449,7 +452,7 @@ fn build_searcher_for_lane(lane: &InteractionLane) -> (TwoTierSearcher, Arc<TwoT
 /// Runs the full oracle suite for a lane across all its fixture queries.
 async fn run_full_lane_test(cx: &Cx, lane_id: &str) -> LaneTestReport {
     let lane = lane_by_id(lane_id).expect("lane not found");
-    let (searcher, _index) = build_searcher_for_lane(&lane);
+    let (searcher, _index, _index_dir) = build_searcher_for_lane(&lane);
     let queries = queries_for_lane(&lane);
     let k = 5;
 
@@ -727,7 +730,7 @@ fn determinism_oracle_runs_for_all_lanes() {
     run_test_with_cx(|cx| async move {
         let catalog = lane_catalog();
         for lane in &catalog {
-            let (searcher, _index) = build_searcher_for_lane(lane);
+            let (searcher, _index, _index_dir) = build_searcher_for_lane(lane);
             let queries = queries_for_lane(lane);
             if let Some(first_query) = queries.first() {
                 let query_text = first_query.query_for_lane(lane.query_slice.include_negated);
@@ -836,7 +839,7 @@ fn phase_oracles_match_lane_expected_phase() {
     run_test_with_cx(|cx| async move {
         // Test a lane expecting InitialThenRefined.
         let lane = lane_by_id("baseline").unwrap();
-        let (searcher, _) = build_searcher_for_lane(&lane);
+        let (searcher, _, _index_dir) = build_searcher_for_lane(&lane);
         let report = run_lane_oracles(&cx, &lane, &searcher, "rust ownership", 5).await;
 
         let phase_verdicts: Vec<&OracleVerdict> = report
@@ -864,7 +867,7 @@ fn phase_oracles_match_lane_expected_phase() {
 fn breaker_lane_accepts_graceful_degradation() {
     run_test_with_cx(|cx| async move {
         let lane = lane_by_id("breaker_adaptive_feedback").unwrap();
-        let (searcher, _) = build_searcher_for_lane(&lane);
+        let (searcher, _, _index_dir) = build_searcher_for_lane(&lane);
         let report = run_lane_oracles(&cx, &lane, &searcher, "machine learning models", 5).await;
 
         // Phase 2 may or may not fire — both Refined and RefinementFailed are acceptable.

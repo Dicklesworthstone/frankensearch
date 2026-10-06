@@ -733,7 +733,6 @@ fn into_ranked_hits(
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -746,25 +745,16 @@ mod tests {
     use crate::normalize::NormalizationMethod;
     use crate::searcher::TwoTierSearcher;
 
-    static NEXT_INDEX_FIXTURE: AtomicU64 = AtomicU64::new(0);
-
     // Reserve the directory atomically: parallel tests share both PID and
     // TMPDIR, and a wall-clock timestamp is not a uniqueness primitive.
-    // Retained directories from an earlier process incarnation are skipped,
-    // never reopened as a writable fixture for the current test.
-    fn reserve_index_fixture_dir() -> io::Result<PathBuf> {
-        loop {
-            let sequence = NEXT_INDEX_FIXTURE.fetch_add(1, Ordering::Relaxed);
-            let candidate = std::env::temp_dir().join(format!(
-                "frankensearch-federated-test-{}-{sequence}",
-                std::process::id()
-            ));
-            match std::fs::create_dir(&candidate) {
-                Ok(()) => return Ok(candidate),
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-        }
+    // mkdtemp never reopens an existing directory as a writable fixture, and
+    // the returned guard removes the directory when the test drops it,
+    // panics included.
+    fn reserve_index_fixture_dir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("frankensearch-federated-test-")
+            .tempdir()
+            .expect("reserve federated test fixture")
     }
 
     struct StubEmbedder {
@@ -979,62 +969,71 @@ mod tests {
         }
     }
 
-    fn build_index(records: &[(&str, &[f32])]) -> Arc<TwoTierIndex> {
-        let dir = reserve_index_fixture_dir().expect("reserve federated test fixture");
+    /// A searcher together with the guard owning its index directory; keep
+    /// the guard bound for as long as the searcher is used.
+    type SearcherFixture = (tempfile::TempDir, Arc<TwoTierSearcher>);
+
+    fn build_index(records: &[(&str, &[f32])]) -> (tempfile::TempDir, Arc<TwoTierIndex>) {
+        let dir = reserve_index_fixture_dir();
         let mut builder =
-            TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+            TwoTierIndex::create(dir.path(), TwoTierConfig::default()).expect("create index");
         builder.set_fast_embedder_id("stub-fast");
         for (doc_id, vector) in records {
             builder
                 .add_fast_record((*doc_id).to_owned(), vector)
                 .expect("add record");
         }
-        Arc::new(builder.finish().expect("finish index"))
+        let index = Arc::new(builder.finish().expect("finish index"));
+        (dir, index)
     }
 
-    fn build_searcher(records: &[(&str, &[f32])]) -> Arc<TwoTierSearcher> {
+    fn build_searcher(records: &[(&str, &[f32])]) -> SearcherFixture {
         let dimension = records.first().map_or(1, |(_, vector)| vector.len());
-        let index = build_index(records);
+        let (dir, index) = build_index(records);
         let embedder: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("stub-fast", dimension));
-        Arc::new(TwoTierSearcher::new(
+        let searcher = Arc::new(TwoTierSearcher::new(
             index,
             embedder,
             TwoTierConfig::default(),
-        ))
+        ));
+        (dir, searcher)
     }
 
-    fn build_pending_searcher(records: &[(&str, &[f32])]) -> Arc<TwoTierSearcher> {
+    fn build_pending_searcher(records: &[(&str, &[f32])]) -> SearcherFixture {
         let dimension = records.first().map_or(1, |(_, vector)| vector.len());
-        let index = build_index(records);
+        let (dir, index) = build_index(records);
         let embedder: Arc<dyn Embedder> = Arc::new(PendingEmbedder::new("stub-pending", dimension));
-        Arc::new(TwoTierSearcher::new(
+        let searcher = Arc::new(TwoTierSearcher::new(
             index,
             embedder,
             TwoTierConfig::default(),
-        ))
+        ));
+        (dir, searcher)
     }
 
-    fn build_failing_searcher(records: &[(&str, &[f32])]) -> Arc<TwoTierSearcher> {
+    fn build_failing_searcher(records: &[(&str, &[f32])]) -> SearcherFixture {
         let dimension = records.first().map_or(1, |(_, vector)| vector.len());
-        let index = build_index(records);
+        let (dir, index) = build_index(records);
         let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder::new("stub-failing", dimension));
-        Arc::new(TwoTierSearcher::new(
+        let searcher = Arc::new(TwoTierSearcher::new(
             index,
             embedder,
             TwoTierConfig::default(),
-        ))
+        ));
+        (dir, searcher)
     }
 
-    fn build_yielding_searcher(records: &[(&str, &[f32])]) -> Arc<TwoTierSearcher> {
+    fn build_yielding_searcher(records: &[(&str, &[f32])]) -> SearcherFixture {
         let dimension = records.first().map_or(1, |(_, vector)| vector.len());
-        let index = build_index(records);
+        let (dir, index) = build_index(records);
         let embedder: Arc<dyn Embedder> =
             Arc::new(YieldingEmbedder::new("stub-yielding", dimension, 32));
-        Arc::new(TwoTierSearcher::new(
+        let searcher = Arc::new(TwoTierSearcher::new(
             index,
             embedder,
             TwoTierConfig::default(),
-        ))
+        ));
+        (dir, searcher)
     }
 
     /// bd-3zh67 red proof: an out-of-the-box `FederatedSearcher` must return
@@ -1042,8 +1041,8 @@ mod tests {
     #[test]
     fn default_config_returns_results_from_all_healthy_shards() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let fast = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
-            let slow = build_yielding_searcher(&[("doc-slow", &[1.0, 0.0])]);
+            let (_fast_dir, fast) = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
+            let (_slow_dir, slow) = build_yielding_searcher(&[("doc-slow", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .add_index("fast", fast, 1.0)
@@ -1073,9 +1072,9 @@ mod tests {
     #[test]
     fn coverage_reports_failed_and_timed_out_shards() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let healthy = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
-            let failing = build_failing_searcher(&[("doc-failing", &[1.0, 0.0])]);
-            let pending = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
+            let (_healthy_dir, healthy) = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
+            let (_failing_dir, failing) = build_failing_searcher(&[("doc-failing", &[1.0, 0.0])]);
+            let (_pending_dir, pending) = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1116,7 +1115,8 @@ mod tests {
     #[test]
     fn single_index_returns_ranked_hits() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[("doc-a", &[1.0, 0.0]), ("doc-b", &[0.2, 0.0])]);
+            let (_index_dir, index) =
+                build_searcher(&[("doc-a", &[1.0, 0.0]), ("doc-b", &[0.2, 0.0])]);
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
                     fusion_method: FederatedFusion::Rrf { k: 60.0 },
@@ -1139,8 +1139,10 @@ mod tests {
     #[test]
     fn weighted_score_respects_index_weights() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index_a = build_searcher(&[("shared", &[1.0, 0.0]), ("a-only", &[0.8, 0.0])]);
-            let index_b = build_searcher(&[("b-only", &[1.0, 0.0]), ("shared", &[0.2, 0.0])]);
+            let (_index_a_dir, index_a) =
+                build_searcher(&[("shared", &[1.0, 0.0]), ("a-only", &[0.8, 0.0])]);
+            let (_index_b_dir, index_b) =
+                build_searcher(&[("b-only", &[1.0, 0.0]), ("shared", &[0.2, 0.0])]);
 
             let config = FederatedConfig {
                 fusion_method: FederatedFusion::WeightedScore {
@@ -1177,9 +1179,9 @@ mod tests {
     #[test]
     fn weighted_score_normalizes_disparate_shard_scales() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let large_scale =
+            let (_large_scale_dir, large_scale) =
                 build_searcher(&[("large-top", &[100.0, 0.0]), ("large-low", &[50.0, 0.0])]);
-            let small_scale =
+            let (_small_scale_dir, small_scale) =
                 build_searcher(&[("small-top", &[1.0, 0.0]), ("small-low", &[0.5, 0.0])]);
 
             let federated = FederatedSearcher::new()
@@ -1215,12 +1217,12 @@ mod tests {
             // The low-relevance decoys point away from the query direction but
             // keep a nonzero norm: the index writer rejects zero-norm
             // embeddings outright (bd-tqhc), since they can never match.
-            let index_a = build_searcher(&[
+            let (_index_a_dir, index_a) = build_searcher(&[
                 ("a-only", &[1.0, 0.0]),
                 ("shared", &[0.9, 0.0]),
                 ("a-low", &[0.05, 1.0]),
             ]);
-            let index_b = build_searcher(&[
+            let (_index_b_dir, index_b) = build_searcher(&[
                 ("b-only", &[1.0, 0.0]),
                 ("shared", &[0.9, 0.0]),
                 ("b-low", &[0.05, 1.0]),
@@ -1249,8 +1251,8 @@ mod tests {
     #[test]
     fn zero_weight_disables_index_contribution() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index_a = build_searcher(&[("a-only", &[1.0, 0.0])]);
-            let index_b = build_searcher(&[("b-only", &[1.0, 0.0])]);
+            let (_index_a_dir, index_a) = build_searcher(&[("a-only", &[1.0, 0.0])]);
+            let (_index_b_dir, index_b) = build_searcher(&[("b-only", &[1.0, 0.0])]);
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
                     fusion_method: FederatedFusion::WeightedScore {
@@ -1278,8 +1280,8 @@ mod tests {
             // timer semantics. A bounded positive budget lets the synchronous
             // shard complete while the intentionally pending shard times out.
             let timeout_ms = 80_u64;
-            let fast = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
-            let pending = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
+            let (_fast_dir, fast) = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
+            let (_pending_dir, pending) = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1308,8 +1310,8 @@ mod tests {
     #[test]
     fn failed_shard_does_not_abort_when_min_indices_met() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let healthy = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
-            let failing = build_failing_searcher(&[("doc-failing", &[1.0, 0.0])]);
+            let (_healthy_dir, healthy) = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
+            let (_failing_dir, failing) = build_failing_searcher(&[("doc-failing", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1333,8 +1335,8 @@ mod tests {
     #[test]
     fn underlying_error_is_preserved_when_all_shards_fail() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let first = build_failing_searcher(&[("doc-first", &[1.0, 0.0])]);
-            let second = build_failing_searcher(&[("doc-second", &[1.0, 0.0])]);
+            let (_first_dir, first) = build_failing_searcher(&[("doc-first", &[1.0, 0.0])]);
+            let (_second_dir, second) = build_failing_searcher(&[("doc-second", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1356,8 +1358,8 @@ mod tests {
     #[test]
     fn filtered_shard_can_yield_zero_hits_without_failing() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let full = build_searcher(&[("doc-full", &[1.0, 0.0])]);
-            let filtered = build_searcher(&[("doc-filtered", &[1.0, 0.0])]);
+            let (_full_dir, full) = build_searcher(&[("doc-full", &[1.0, 0.0])]);
+            let (_filtered_dir, filtered) = build_searcher(&[("doc-filtered", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1387,9 +1389,12 @@ mod tests {
     #[test]
     fn comb_mnz_tracks_all_source_indices_for_duplicate_doc() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index_a = build_searcher(&[("shared", &[1.0, 0.0]), ("a-only", &[1.0, 0.0])]);
-            let index_b = build_searcher(&[("shared", &[1.0, 0.0]), ("b-only", &[1.0, 0.0])]);
-            let index_c = build_searcher(&[("shared", &[1.0, 0.0]), ("c-only", &[1.0, 0.0])]);
+            let (_index_a_dir, index_a) =
+                build_searcher(&[("shared", &[1.0, 0.0]), ("a-only", &[1.0, 0.0])]);
+            let (_index_b_dir, index_b) =
+                build_searcher(&[("shared", &[1.0, 0.0]), ("b-only", &[1.0, 0.0])]);
+            let (_index_c_dir, index_c) =
+                build_searcher(&[("shared", &[1.0, 0.0]), ("c-only", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1419,9 +1424,9 @@ mod tests {
     #[test]
     fn max_indices_limits_scatter_fanout() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let first = build_searcher(&[("doc-first", &[1.0, 0.0])]);
-            let second = build_searcher(&[("doc-second", &[1.0, 0.0])]);
-            let third = build_searcher(&[("doc-third", &[1.0, 0.0])]);
+            let (_first_dir, first) = build_searcher(&[("doc-first", &[1.0, 0.0])]);
+            let (_second_dir, second) = build_searcher(&[("doc-second", &[1.0, 0.0])]);
+            let (_third_dir, third) = build_searcher(&[("doc-third", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1454,7 +1459,7 @@ mod tests {
     #[test]
     fn empty_query_returns_empty_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[("doc-a", &[1.0, 0.0])]);
+            let (_index_dir, index) = build_searcher(&[("doc-a", &[1.0, 0.0])]);
             let federated = FederatedSearcher::new().add_index("primary", index, 1.0);
             let results = federated.search(&cx, "", 10, |_| None).await.unwrap().hits;
             assert!(results.is_empty());
@@ -1464,7 +1469,7 @@ mod tests {
     #[test]
     fn zero_limit_returns_empty_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[("doc-a", &[1.0, 0.0])]);
+            let (_index_dir, index) = build_searcher(&[("doc-a", &[1.0, 0.0])]);
             let federated = FederatedSearcher::new().add_index("primary", index, 1.0);
             let results = federated
                 .search(&cx, "query", 0, |_| None)
@@ -1547,9 +1552,11 @@ mod tests {
     fn scatter_gather_runs_shard_timeouts_concurrently() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let timeout_ms = 80_u64;
-            let fast = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
-            let pending_a = build_pending_searcher(&[("doc-pending-a", &[1.0, 0.0])]);
-            let pending_b = build_pending_searcher(&[("doc-pending-b", &[1.0, 0.0])]);
+            let (_fast_dir, fast) = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
+            let (_pending_a_dir, pending_a) =
+                build_pending_searcher(&[("doc-pending-a", &[1.0, 0.0])]);
+            let (_pending_b_dir, pending_b) =
+                build_pending_searcher(&[("doc-pending-b", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1587,8 +1594,8 @@ mod tests {
     fn scatter_gather_returns_early_when_wait_for_indices_is_satisfied() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let timeout_ms = 200_u64;
-            let fast = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
-            let pending = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
+            let (_fast_dir, fast) = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
+            let (_pending_dir, pending) = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
 
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -1691,7 +1698,7 @@ mod tests {
 
     #[test]
     fn federated_searcher_len_after_add() {
-        let index = build_searcher(&[("doc", &[1.0, 0.0])]);
+        let (_index_dir, index) = build_searcher(&[("doc", &[1.0, 0.0])]);
         let searcher = FederatedSearcher::new()
             .add_index("a", Arc::clone(&index), 1.0)
             .add_index("b", Arc::clone(&index), 0.5)
@@ -1783,7 +1790,8 @@ mod tests {
     #[test]
     fn rrf_with_k_zero_produces_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[("doc-a", &[1.0, 0.0]), ("doc-b", &[0.5, 0.0])]);
+            let (_index_dir, index) =
+                build_searcher(&[("doc-a", &[1.0, 0.0]), ("doc-b", &[0.5, 0.0])]);
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
                     fusion_method: FederatedFusion::Rrf { k: 0.0 },
@@ -1892,13 +1900,13 @@ mod tests {
     fn delayed_shard_cannot_change_the_top_one_cutoff() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for delay_heavy in [false, true] {
-                let heavy = if delay_heavy {
+                let (_heavy_dir, heavy) = if delay_heavy {
                     build_yielding_searcher(&[("shared", &[1.0, 0.0])])
                 } else {
                     build_searcher(&[("shared", &[1.0, 0.0])])
                 };
-                let light = build_searcher(&[("shared", &[1.0, 0.0])]);
-                let competitor = build_searcher(&[("competitor", &[1.0, 0.0])]);
+                let (_light_dir, light) = build_searcher(&[("shared", &[1.0, 0.0])]);
+                let (_competitor_dir, competitor) = build_searcher(&[("competitor", &[1.0, 0.0])]);
                 let federated = FederatedSearcher::new()
                     .with_config(FederatedConfig {
                         fusion_method: FederatedFusion::Rrf { k: 0.0 },
@@ -1925,7 +1933,7 @@ mod tests {
     #[test]
     fn duplicate_dispatched_names_are_rejected_before_gathering() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let pending = build_pending_searcher(&[("doc", &[1.0, 0.0])]);
+            let (_pending_dir, pending) = build_pending_searcher(&[("doc", &[1.0, 0.0])]);
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
                     per_index_timeout_ms: 0,
@@ -1948,7 +1956,7 @@ mod tests {
     #[test]
     fn undispatched_duplicate_does_not_change_the_selected_fanout() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let (_index_dir, index) = build_searcher(&[("doc", &[1.0, 0.0])]);
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
                     max_indices: 1,
@@ -1966,8 +1974,8 @@ mod tests {
     #[test]
     fn indexed_text_filters_equal_ids_using_the_originating_store() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let keep = build_searcher(&[("shared", &[1.0, 0.0])]);
-            let drop = build_yielding_searcher(&[("shared", &[1.0, 0.0])]);
+            let (_keep_dir, keep) = build_searcher(&[("shared", &[1.0, 0.0])]);
+            let (_drop_dir, drop) = build_yielding_searcher(&[("shared", &[1.0, 0.0])]);
             let stores = std::collections::BTreeMap::from([
                 (
                     "keep".to_owned(),
@@ -2002,7 +2010,8 @@ mod tests {
     #[test]
     fn indexed_text_preserves_shared_provider_results_and_global_fusion() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[("shared", &[1.0, 0.0]), ("excluded", &[0.5, 0.5])]);
+            let (_index_dir, index) =
+                build_searcher(&[("shared", &[1.0, 0.0]), ("excluded", &[0.5, 0.5])]);
             let texts = std::collections::BTreeMap::from([
                 ("shared".to_owned(), "keep".to_owned()),
                 ("excluded".to_owned(), "dropme".to_owned()),
@@ -2034,7 +2043,7 @@ mod tests {
     #[test]
     fn indexed_text_never_reads_an_undispatched_store() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let (_index_dir, index) = build_searcher(&[("doc", &[1.0, 0.0])]);
             let calls = AtomicU64::new(0);
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
@@ -2062,7 +2071,7 @@ mod tests {
     #[test]
     fn indexed_text_noop_queries_do_not_access_stores() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_searcher(&[("doc", &[1.0, 0.0])]);
+            let (_index_dir, index) = build_searcher(&[("doc", &[1.0, 0.0])]);
             let federated = FederatedSearcher::new().add_index("primary", index, 1.0);
             for (query, limit) in [("", 10), ("query -dropme", 0)] {
                 let response = federated

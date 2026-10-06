@@ -1,23 +1,42 @@
 //! Integration tests for FSVI binary format: write/read roundtrip, CRC validation,
 //! WAL lifecycle, tombstone/vacuum, compaction, and search correctness.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use frankensearch_index::{Quantization, VectorIndex};
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-fn temp_index_path(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join("frankensearch_test");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir.join(format!("{name}.fsvi"))
+/// An index path in its own private temporary directory; the directory (WAL
+/// sidecar included) is removed when the guard drops, even on panic.
+struct TempIndexPath {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
 }
 
-fn cleanup(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    // Also clean WAL sidecar if present.
-    let wal_path = path.with_extension("fsvi.wal");
-    let _ = std::fs::remove_file(&wal_path);
+impl std::ops::Deref for TempIndexPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl AsRef<Path> for TempIndexPath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn temp_index_path(name: &str) -> TempIndexPath {
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("frankensearch-index-{name}-"))
+        .tempdir()
+        .expect("create temp dir");
+    TempIndexPath {
+        path: directory.path().join(format!("{name}.fsvi")),
+        _directory: directory,
+    }
 }
 
 /// Normalize an f32 vector to unit length.
@@ -34,7 +53,6 @@ fn normalize(v: &[f32]) -> Vec<f32> {
 #[test]
 fn write_and_read_f16_single_record() {
     let path = temp_index_path("single_f16");
-    cleanup(&path);
 
     let dim = 8;
     let embedding = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
@@ -63,14 +81,11 @@ fn write_and_read_f16_single_record() {
             "f16 roundtrip error too large: orig={orig}, recovered={recovered}"
         );
     }
-
-    cleanup(&path);
 }
 
 #[test]
 fn write_and_read_f32_roundtrip() {
     let path = temp_index_path("f32_roundtrip");
-    cleanup(&path);
 
     let dim = 4;
     let embedding = vec![1.5, -2.3, 0.001, 99.99];
@@ -88,14 +103,11 @@ fn write_and_read_f32_roundtrip() {
     // F32 should round-trip exactly.
     let recovered = index.vector_at_f32(0).unwrap();
     assert_eq!(recovered, embedding);
-
-    cleanup(&path);
 }
 
 #[test]
 fn write_multiple_records_preserves_all() {
     let path = temp_index_path("multi_records");
-    cleanup(&path);
 
     let dim = 4;
     let records: Vec<(&str, Vec<f32>)> = vec![
@@ -124,8 +136,6 @@ fn write_multiple_records_preserves_all() {
     let mut expected_ids: Vec<String> = records.iter().map(|(id, _)| (*id).to_owned()).collect();
     expected_ids.sort();
     assert_eq!(found_ids, expected_ids);
-
-    cleanup(&path);
 }
 
 // ─── Metadata ─────────────────────────────────────────────────────────────────
@@ -133,7 +143,6 @@ fn write_multiple_records_preserves_all() {
 #[test]
 fn metadata_fields_are_preserved() {
     let path = temp_index_path("metadata");
-    cleanup(&path);
 
     let mut writer = VectorIndex::create_with_revision(
         &path,
@@ -153,8 +162,6 @@ fn metadata_fields_are_preserved() {
     assert_eq!(meta.dimension, 128);
     assert_eq!(meta.quantization, Quantization::F16);
     assert_eq!(meta.record_count, 1);
-
-    cleanup(&path);
 }
 
 // ─── Error Handling ───────────────────────────────────────────────────────────
@@ -162,7 +169,6 @@ fn metadata_fields_are_preserved() {
 #[test]
 fn open_nonexistent_file_returns_not_found() {
     let path = temp_index_path("nonexistent_12345");
-    cleanup(&path);
 
     let result = VectorIndex::open(&path);
     assert!(result.is_err());
@@ -188,7 +194,6 @@ fn zero_dimension_returns_invalid_config() {
 #[test]
 fn dimension_mismatch_on_write_is_rejected() {
     let path = temp_index_path("dim_mismatch");
-    cleanup(&path);
 
     let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
     // Correct dimension works.
@@ -199,14 +204,11 @@ fn dimension_mismatch_on_write_is_rejected() {
         format!("{err:?}").contains("DimensionMismatch"),
         "expected DimensionMismatch, got: {err:?}"
     );
-
-    cleanup(&path);
 }
 
 #[test]
 fn non_finite_embedding_is_rejected() {
     let path = temp_index_path("non_finite");
-    cleanup(&path);
 
     let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
     let err = writer
@@ -224,8 +226,6 @@ fn non_finite_embedding_is_rejected() {
         format!("{err:?}").contains("non-finite"),
         "expected non-finite rejection, got: {err:?}"
     );
-
-    cleanup(&path);
 }
 
 // ─── Empty Index ──────────────────────────────────────────────────────────────
@@ -233,7 +233,6 @@ fn non_finite_embedding_is_rejected() {
 #[test]
 fn empty_index_roundtrip() {
     let path = temp_index_path("empty");
-    cleanup(&path);
 
     let writer = VectorIndex::create(&path, "empty-emb", 16).unwrap();
     writer.finish().unwrap();
@@ -244,8 +243,6 @@ fn empty_index_roundtrip() {
     assert_eq!(index.tombstone_count(), 0);
     assert!(!index.needs_vacuum());
     assert!(!index.needs_compaction());
-
-    cleanup(&path);
 }
 
 // ─── WAL Append + Compact Lifecycle ───────────────────────────────────────────
@@ -253,7 +250,6 @@ fn empty_index_roundtrip() {
 #[test]
 fn wal_append_and_compact() {
     let path = temp_index_path("wal_lifecycle");
-    cleanup(&path);
 
     // Create an initial index with 2 records.
     let dim = 4;
@@ -291,14 +287,11 @@ fn wal_append_and_compact() {
     assert_eq!(reopened.record_count(), 4);
     assert_eq!(reopened.wal_record_count(), 0);
     drop(reopened);
-
-    cleanup(&path);
 }
 
 #[test]
 fn wal_append_dimension_mismatch() {
     let path = temp_index_path("wal_dim_mismatch");
-    cleanup(&path);
 
     let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
     writer.write_record("x", &[1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -310,14 +303,11 @@ fn wal_append_dimension_mismatch() {
         format!("{err:?}").contains("DimensionMismatch"),
         "expected DimensionMismatch on WAL append, got: {err:?}"
     );
-
-    cleanup(&path);
 }
 
 #[test]
 fn compact_empty_wal_is_noop() {
     let path = temp_index_path("compact_noop");
-    cleanup(&path);
 
     let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
     writer.write_record("x", &[1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -327,8 +317,6 @@ fn compact_empty_wal_is_noop() {
     let stats = index.compact().unwrap();
     assert_eq!(stats.wal_records, 0);
     assert_eq!(stats.total_records_after, 1);
-
-    cleanup(&path);
 }
 
 // ─── Tombstone + Vacuum ──────────────────────────────────────────────────────
@@ -336,7 +324,6 @@ fn compact_empty_wal_is_noop() {
 #[test]
 fn soft_delete_and_vacuum() {
     let path = temp_index_path("tombstone_vacuum");
-    cleanup(&path);
 
     let dim = 4;
     let mut writer =
@@ -374,14 +361,11 @@ fn soft_delete_and_vacuum() {
     assert_eq!(stats.tombstones_removed, 1);
     assert_eq!(index.tombstone_count(), 0);
     assert_eq!(index.record_count(), 2);
-
-    cleanup(&path);
 }
 
 #[test]
 fn vacuum_empty_index_is_noop() {
     let path = temp_index_path("vacuum_empty");
-    cleanup(&path);
 
     let writer = VectorIndex::create(&path, "test", 4).unwrap();
     writer.finish().unwrap();
@@ -391,8 +375,6 @@ fn vacuum_empty_index_is_noop() {
     assert_eq!(stats.records_before, 0);
     assert_eq!(stats.records_after, 0);
     assert_eq!(stats.tombstones_removed, 0);
-
-    cleanup(&path);
 }
 
 // ─── Search Correctness ──────────────────────────────────────────────────────
@@ -400,7 +382,6 @@ fn vacuum_empty_index_is_noop() {
 #[test]
 fn search_returns_closest_vector() {
     let path = temp_index_path("search_closest");
-    cleanup(&path);
 
     let dim = 4;
     // Use unit vectors as "documents" so cosine similarity = dot product.
@@ -435,14 +416,11 @@ fn search_returns_closest_vector() {
         results[0].doc_id, "east",
         "east should be closest to [0.1, 0.9, 0, 0]"
     );
-
-    cleanup(&path);
 }
 
 #[test]
 fn search_respects_limit() {
     let path = temp_index_path("search_limit");
-    cleanup(&path);
 
     let dim = 4;
     let mut writer =
@@ -466,14 +444,11 @@ fn search_respects_limit() {
 
     let results = index.search_top_k(&query, 100, None).unwrap();
     assert_eq!(results.len(), 10, "should return all 10 when limit > count");
-
-    cleanup(&path);
 }
 
 #[test]
 fn search_on_empty_index_returns_empty() {
     let path = temp_index_path("search_empty");
-    cleanup(&path);
 
     let writer = VectorIndex::create(&path, "test", 4).unwrap();
     writer.finish().unwrap();
@@ -481,14 +456,11 @@ fn search_on_empty_index_returns_empty() {
     let index = VectorIndex::open(&path).unwrap();
     let results = index.search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None).unwrap();
     assert_eq!(results, [] as [frankensearch_core::types::VectorHit; 0]);
-
-    cleanup(&path);
 }
 
 #[test]
 fn search_dimension_mismatch_is_error() {
     let path = temp_index_path("search_dim_err");
-    cleanup(&path);
 
     let mut writer = VectorIndex::create(&path, "test", 4).unwrap();
     writer.write_record("x", &[1.0, 0.0, 0.0, 0.0]).unwrap();
@@ -500,8 +472,6 @@ fn search_dimension_mismatch_is_error() {
         format!("{err:?}").contains("DimensionMismatch"),
         "expected DimensionMismatch, got: {err:?}"
     );
-
-    cleanup(&path);
 }
 
 // ─── WAL entries are searchable before compaction ─────────────────────────────
@@ -509,7 +479,6 @@ fn search_dimension_mismatch_is_error() {
 #[test]
 fn wal_entries_are_searchable_before_compaction() {
     let path = temp_index_path("wal_search");
-    cleanup(&path);
 
     let dim = 4;
     let mut writer =
@@ -533,8 +502,6 @@ fn wal_entries_are_searchable_before_compaction() {
         results[0].doc_id, "wal-doc",
         "WAL entry should be searchable and rank highest"
     );
-
-    cleanup(&path);
 }
 
 // ─── CRC Validation ──────────────────────────────────────────────────────────
@@ -542,7 +509,6 @@ fn wal_entries_are_searchable_before_compaction() {
 #[test]
 fn corrupted_header_is_detected() {
     let path = temp_index_path("corrupt_header");
-    cleanup(&path);
 
     // Write a valid index.
     let mut writer = VectorIndex::create(&path, "crc", 4).unwrap();
@@ -566,14 +532,11 @@ fn corrupted_header_is_detected() {
             || err_msg.contains("crc"),
         "expected corruption/CRC error, got: {err_msg}"
     );
-
-    cleanup(&path);
 }
 
 #[test]
 fn truncated_file_is_detected() {
     let path = temp_index_path("truncated");
-    cleanup(&path);
 
     let mut writer = VectorIndex::create(&path, "trunc", 4).unwrap();
     writer.write_record("x", &[1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -585,8 +548,6 @@ fn truncated_file_is_detected() {
 
     let result = VectorIndex::open(&path);
     assert!(result.is_err(), "truncated file should fail to open");
-
-    cleanup(&path);
 }
 
 // ─── Batch Operations ────────────────────────────────────────────────────────
@@ -594,7 +555,6 @@ fn truncated_file_is_detected() {
 #[test]
 fn soft_delete_batch() {
     let path = temp_index_path("batch_delete");
-    cleanup(&path);
 
     let dim = 4;
     let mut writer =
@@ -612,14 +572,11 @@ fn soft_delete_batch() {
         .unwrap();
     assert_eq!(deleted, 2, "should delete 2 existing docs");
     assert_eq!(index.tombstone_count(), 2);
-
-    cleanup(&path);
 }
 
 #[test]
 fn append_batch_via_wal() {
     let path = temp_index_path("wal_batch");
-    cleanup(&path);
 
     let dim = 4;
     let writer =
@@ -634,8 +591,6 @@ fn append_batch_via_wal() {
     ];
     index.append_batch(&entries).unwrap();
     assert_eq!(index.wal_record_count(), 3);
-
-    cleanup(&path);
 }
 
 // ─── Needs Compaction Heuristics ─────────────────────────────────────────────
@@ -643,7 +598,6 @@ fn append_batch_via_wal() {
 #[test]
 fn needs_compaction_threshold() {
     let path = temp_index_path("compact_heuristic");
-    cleanup(&path);
 
     let dim = 4;
     let mut writer =
@@ -661,8 +615,6 @@ fn needs_compaction_threshold() {
         index.needs_compaction(),
         "WAL ratio 1.0 > 0.10 → should need compaction"
     );
-
-    cleanup(&path);
 }
 
 // ─── f16 vs f32 Quantization Search Consistency ──────────────────────────────
@@ -679,7 +631,6 @@ fn f16_and_f32_search_produce_same_ranking() {
 
     // Write f16 index.
     let path_f16 = temp_index_path("quant_f16");
-    cleanup(&path_f16);
     let mut w16 =
         VectorIndex::create_with_revision(&path_f16, "q", "", dim, Quantization::F16).unwrap();
     for (id, emb) in &docs {
@@ -689,7 +640,6 @@ fn f16_and_f32_search_produce_same_ranking() {
 
     // Write f32 index.
     let path_f32 = temp_index_path("quant_f32");
-    cleanup(&path_f32);
     let mut w32 =
         VectorIndex::create_with_revision(&path_f32, "q", "", dim, Quantization::F32).unwrap();
     for (id, emb) in &docs {
@@ -710,7 +660,4 @@ fn f16_and_f32_search_produce_same_ranking() {
         ranking_f16, ranking_f32,
         "f16 and f32 should produce the same ranking order"
     );
-
-    cleanup(&path_f16);
-    cleanup(&path_f32);
 }

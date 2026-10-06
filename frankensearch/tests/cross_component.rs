@@ -12,7 +12,7 @@
 //! 7. Config validation interactions
 
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use frankensearch::TwoTierIndexPaths;
 use frankensearch_core::canonicalize::DefaultCanonicalizer;
@@ -40,22 +40,19 @@ use frankensearch_index::{
     Quantization, TwoTierIndex, VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME,
     VectorIndex,
 };
+use tempfile::TempDir;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Test helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn temp_dir(name: &str) -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "frankensearch-xcomp-{name}-{}-{now}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+/// A fresh directory that is removed when the returned guard drops, so a
+/// test (passing or panicking) leaves nothing behind under the temp root.
+fn temp_dir(name: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("frankensearch-xcomp-{name}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 fn write_fast_index(dir: &std::path::Path, records: &[(&str, Vec<f32>)]) {
@@ -135,11 +132,11 @@ fn fsvi_roundtrip_preserves_search_ranking() {
     let v_low = normalize_vec(&[0.0, 0.0, 0.1, 0.9]);
 
     write_fast_index(
-        &dir,
+        dir.path(),
         &[("high", v_high.clone()), ("mid", v_mid), ("low", v_low)],
     );
 
-    let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+    let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open");
     let query = normalize_vec(&[1.0, 0.0, 0.0, 0.0]);
     let hits = index.search_fast(&query, 3).expect("search");
 
@@ -171,9 +168,9 @@ fn fsvi_f16_quantization_error_bounded_at_384d() {
     let v1 = normalize_vec(&v1);
     let v2 = normalize_vec(&v2);
 
-    write_fast_index(&dir, &[("doc-a", v1.clone()), ("doc-b", v2)]);
+    write_fast_index(dir.path(), &[("doc-a", v1.clone()), ("doc-b", v2)]);
 
-    let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+    let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open");
     let hits = index.search_fast(&v1, 2).expect("search");
 
     // Self-similarity should be close to 1.0
@@ -203,10 +200,10 @@ fn two_tier_index_fast_and_quality_alignment() {
         ),
     ];
 
-    write_fast_index(&dir, &fast_records);
-    write_quality_index(&dir, &quality_records);
+    write_fast_index(dir.path(), &fast_records);
+    write_quality_index(dir.path(), &quality_records);
 
-    let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+    let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open");
     assert!(index.has_quality_index());
 
     // Fast search
@@ -226,8 +223,8 @@ fn two_tier_index_fast_and_quality_alignment() {
 #[test]
 fn embedder_named_explicit_paths_search_and_reopen_without_copying() {
     let dir = temp_dir("embedder-explicit-layout");
-    let fast_path = dir.join("index-fnv1a-384.fsvi");
-    let quality_path = dir.join("index-minilm-384.fsvi");
+    let fast_path = dir.path().join("index-fnv1a-384.fsvi");
+    let quality_path = dir.path().join("index-minilm-384.fsvi");
     let mut fast_a = vec![0.0; 384];
     let mut fast_b = vec![0.0; 384];
     fast_a[0] = 1.0;
@@ -270,8 +267,8 @@ fn embedder_named_explicit_paths_search_and_reopen_without_copying() {
         reopened.search_fast(&query, 2).expect("search")[0].doc_id,
         "doc-a"
     );
-    assert!(!dir.join(VECTOR_INDEX_FAST_FILENAME).exists());
-    assert!(!dir.join(VECTOR_INDEX_QUALITY_FILENAME).exists());
+    assert!(!dir.path().join(VECTOR_INDEX_FAST_FILENAME).exists());
+    assert!(!dir.path().join(VECTOR_INDEX_QUALITY_FILENAME).exists());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -606,7 +603,7 @@ fn cache_detects_staleness_after_index_growth() {
         ("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0])),
         ("doc-b", normalize_vec(&[0.0, 1.0, 0.0, 0.0])),
     ];
-    write_fast_index(&dir, &records);
+    write_fast_index(dir.path(), &records);
 
     // Write sentinel matching current index
     IndexSentinel {
@@ -619,11 +616,11 @@ fn cache_detects_staleness_after_index_growth() {
         fast_dimension: 4,
         quality_dimension: None,
     }
-    .write_to(&dir)
+    .write_to(dir.path())
     .unwrap();
 
     let cache = IndexCache::open(
-        &dir,
+        dir.path(),
         TwoTierConfig::default(),
         Box::new(SentinelFileDetector::new().with_expected_count(5)),
     )
@@ -643,7 +640,7 @@ fn cache_reload_updates_search_results() {
 
     // Initial index: doc-a scores highest for [1,0,0,0]
     write_fast_index(
-        &dir,
+        dir.path(),
         &[
             ("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0])),
             ("doc-b", normalize_vec(&[0.0, 1.0, 0.0, 0.0])),
@@ -651,7 +648,7 @@ fn cache_reload_updates_search_results() {
     );
 
     let cache = IndexCache::open(
-        &dir,
+        dir.path(),
         TwoTierConfig::default(),
         Box::new(SentinelFileDetector::new()),
     )
@@ -664,7 +661,7 @@ fn cache_reload_updates_search_results() {
 
     // Rebuild index with doc-c as the best match
     write_fast_index(
-        &dir,
+        dir.path(),
         &[
             ("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0])),
             ("doc-c", normalize_vec(&[0.0, 1.0, 0.0, 0.0])), // replaces doc-b
@@ -684,7 +681,10 @@ fn cache_reload_updates_search_results() {
 #[test]
 fn cache_sentinel_hash_change_detects_staleness() {
     let dir = temp_dir("cache-hash-change");
-    write_fast_index(&dir, &[("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0]))]);
+    write_fast_index(
+        dir.path(),
+        &[("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0]))],
+    );
 
     IndexSentinel {
         version: SENTINEL_VERSION,
@@ -696,11 +696,11 @@ fn cache_sentinel_hash_change_detects_staleness() {
         fast_dimension: 4,
         quality_dimension: None,
     }
-    .write_to(&dir)
+    .write_to(dir.path())
     .unwrap();
 
     let cache = IndexCache::open(
-        &dir,
+        dir.path(),
         TwoTierConfig::default(),
         Box::new(SentinelFileDetector::new().with_expected_hash("sha256:bbb")),
     )
@@ -717,9 +717,12 @@ fn cache_sentinel_hash_change_detects_staleness() {
 #[test]
 fn dimension_mismatch_from_search_through_index() {
     let dir = temp_dir("dim-mismatch");
-    write_fast_index(&dir, &[("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0]))]);
+    write_fast_index(
+        dir.path(),
+        &[("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0]))],
+    );
 
-    let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+    let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open");
 
     // Query with wrong dimension (8 instead of 4)
     let wrong_query = vec![1.0; 8];
@@ -761,17 +764,20 @@ fn index_not_found_propagates_through_cache() {
 #[test]
 fn corrupted_sentinel_returns_config_error() {
     let dir = temp_dir("corrupt-sentinel");
-    write_fast_index(&dir, &[("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0]))]);
+    write_fast_index(
+        dir.path(),
+        &[("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0]))],
+    );
 
     // Write invalid JSON as sentinel
     std::fs::write(
-        dir.join(".frankensearch_index_meta"),
+        dir.path().join(".frankensearch_index_meta"),
         "this is not valid json",
     )
     .expect("write corrupt sentinel");
 
     let cache = IndexCache::open(
-        &dir,
+        dir.path(),
         TwoTierConfig::default(),
         Box::new(SentinelFileDetector::new()),
     )
@@ -981,10 +987,10 @@ fn hash_embedder_vectors_survive_fsvi_roundtrip() {
 
     // Write to FSVI index
     let dir = temp_dir("hash-embed-roundtrip");
-    write_fast_index(&dir, &[("doc-1", v1.clone()), ("doc-2", v2)]);
+    write_fast_index(dir.path(), &[("doc-1", v1.clone()), ("doc-2", v2)]);
 
     // Search should find doc-1 closer to its own embedding
-    let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+    let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open");
     let hits = index.search_fast(&v1, 2).expect("search");
     assert_eq!(hits[0].doc_id, "doc-1");
     assert!(hits[0].score > hits[1].score);
@@ -1123,7 +1129,7 @@ fn score_calibration_maps_rrf_scores_to_probabilities() {
 fn isotonic_calibration_improves_ece_on_search_outputs() {
     let dir = temp_dir("calibration-search-output");
     write_fast_index(
-        &dir,
+        dir.path(),
         &[
             ("doc-a", normalize_vec(&[1.0, 0.0, 0.0, 0.0])),
             ("doc-b", normalize_vec(&[0.9, 0.1, 0.0, 0.0])),
@@ -1131,7 +1137,7 @@ fn isotonic_calibration_improves_ece_on_search_outputs() {
             ("doc-d", normalize_vec(&[0.2, 0.8, 0.0, 0.0])),
         ],
     );
-    let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
+    let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open");
     let query = normalize_vec(&[1.0, 0.0, 0.0, 0.0]);
     let hits = index.search_fast(&query, 4).expect("search");
 

@@ -4065,43 +4065,16 @@ mod tests {
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
     use proptest::prelude::*;
-    use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::path::Path;
 
-    fn test_run_nonce() -> u128 {
-        static RUN_NONCE: OnceLock<u128> = OnceLock::new();
-        *RUN_NONCE.get_or_init(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_nanos())
-        })
+    fn temp_index_path(name: &str) -> crate::test_fixtures::TempFixturePath {
+        crate::test_fixtures::TempFixturePath::new(&format!("in-memory-{name}"), "index.fsvi")
     }
 
-    fn temp_index_path(name: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nonce = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        let dir = std::env::temp_dir().join("frankensearch_in_memory_tests");
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir.join(format!(
-            "{name}-{}-{}-{nonce}.fsvi",
-            std::process::id(),
-            test_run_nonce()
-        ))
-    }
-
-    fn owned_temp_dir(name: &str) -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nonce = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        let parent = std::env::temp_dir().join("frankensearch_in_memory_tests");
-        std::fs::create_dir_all(&parent).expect("create temp parent");
-        let dir = parent.join(format!(
-            "{name}-{}-{}-{nonce}",
-            std::process::id(),
-            test_run_nonce()
-        ));
-        std::fs::create_dir(&dir).expect("create unique owned temp directory");
-        dir
+    /// A unique, existing private directory, removed with its contents when
+    /// the returned guard drops (including on panic).
+    fn owned_temp_dir(name: &str) -> tempfile::TempDir {
+        crate::test_fixtures::temp_fixture_dir(&format!("in-memory-{name}"))
     }
 
     #[cfg(target_os = "linux")]
@@ -4116,11 +4089,6 @@ mod tests {
         file.write_all(bytes)
             .expect("write a unique owned test file");
         file.sync_all().expect("sync a unique owned test file");
-    }
-
-    fn cleanup(path: &Path) {
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(path.with_extension("fsvi.wal"));
     }
 
     fn make_normalized_vec(dim: usize, seed: f32) -> Vec<f32> {
@@ -4266,7 +4234,6 @@ mod tests {
     #[test]
     fn from_fsvi_matches_file_backed_search() {
         let path = temp_index_path("from_fsvi");
-        cleanup(&path);
 
         let dim = 32;
         let docs = 64usize;
@@ -4309,8 +4276,6 @@ mod tests {
         // Verify vectors were loaded in quantized form and still round-trip.
         let recovered = memory_index.vector_at_f32(0).unwrap();
         assert_eq!(recovered.len(), dim);
-
-        cleanup(&path);
     }
 
     // ─── Embedding-space identity (bd-9xuj T2-C3) ───────────────────────────
@@ -4418,7 +4383,8 @@ mod tests {
         // snapshots the containing directory and fails closed with
         // `DirectoryChangedDuringRead` when sibling test files churn it, so
         // the shared test temp dir is not a legal admission site.
-        let dir = owned_temp_dir("admitted_v2_space_identity");
+        let owned = owned_temp_dir("admitted_v2_space_identity");
+        let dir = owned.path();
         let path = dir.join("admitted_v2_space_identity.fsvi");
         let dim = 8;
         let (doc_ids, vectors) = identity_rows(dim, 4);
@@ -4460,7 +4426,8 @@ mod tests {
         // Use a private directory because v2 admission snapshots the parent;
         // sidecar publication and discovery must share that same held-directory
         // model without test-suite sibling churn or cross-process path reuse.
-        let dir = owned_temp_dir("admitted_v2_residual_product");
+        let owned = owned_temp_dir("admitted_v2_residual_product");
+        let dir = owned.path();
         let path = dir.join("index.fsvi");
         let cache_dir = dir.join("residual-cache");
         std::fs::create_dir(&cache_dir).expect("create owned cache directory");
@@ -4569,7 +4536,8 @@ mod tests {
         )
         .expect("finite public-writer source");
         bind_test_residual_source(&mut index);
-        let directory = owned_temp_dir("exact_residual_writer_capability");
+        let owned = owned_temp_dir("exact_residual_writer_capability");
+        let directory = owned.path();
         let destination = directory.join("sidecar.fsrs");
 
         reset_exact_residual_sidecar_build_count();
@@ -4588,7 +4556,7 @@ mod tests {
             "public writer must acquire publication capability before deriving a sidecar"
         );
         assert_eq!(
-            std::fs::read_dir(&directory)
+            std::fs::read_dir(directory)
                 .expect("inspect private writer directory")
                 .count(),
             0,
@@ -4599,7 +4567,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn valid_exact_residual_candidate_attaches_and_prunes_without_publication_capability() {
-        let directory = owned_temp_dir("exact_residual_read_only_candidate");
+        let owned = owned_temp_dir("exact_residual_read_only_candidate");
+        let directory = owned.path();
         let source_path = directory.join("index.fsvi");
         let cache_dir = directory.join("residual-cache");
         std::fs::create_dir(&cache_dir).expect("create private cache directory");
@@ -4684,7 +4653,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn exact_residual_capability_failure_precedes_empty_cache_derivation() {
-        let directory = owned_temp_dir("exact_residual_empty_capability");
+        let owned = owned_temp_dir("exact_residual_empty_capability");
+        let directory = owned.path();
         let source_path = directory.join("index.fsvi");
         let cache_dir = directory.join("residual-cache");
         std::fs::create_dir(&cache_dir).expect("create empty private cache directory");
@@ -4737,7 +4707,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn exact_residual_corrupt_candidate_derives_nothing_when_publication_is_unavailable() {
-        let directory = owned_temp_dir("exact_residual_corrupt_capability");
+        let owned = owned_temp_dir("exact_residual_corrupt_capability");
+        let directory = owned.path();
         let source_path = directory.join("index.fsvi");
         let cache_dir = directory.join("residual-cache");
         std::fs::create_dir(&cache_dir).expect("create private corrupt-candidate cache directory");
@@ -4811,7 +4782,8 @@ mod tests {
         // Each hostile directory is private and create-only. When either
         // deterministic budget is reached, cache use and publication are both
         // skipped; the exact flat product remains available.
-        let dir = owned_temp_dir("admitted_v2_residual_cache_budget");
+        let owned = owned_temp_dir("admitted_v2_residual_cache_budget");
+        let dir = owned.path();
         let source_path = dir.join("index.fsvi");
         let dimension = 35;
         let (doc_ids, vectors) = identity_rows(dimension, 17);
@@ -4912,7 +4884,6 @@ mod tests {
         // load as the typed None state (the C4 seams route it as
         // LegacyUnidentified) — never a fabricated fingerprint.
         let path = temp_index_path("from_fsvi_legacy_v1");
-        cleanup(&path);
         let dim = 8;
         let mut writer = crate::VectorIndex::create(&path, "legacy-embedder", dim)
             .expect("create legacy v1 writer");
@@ -4931,7 +4902,6 @@ mod tests {
             !index.space_identity_is_attested(),
             "a v1 header attests nothing (C4-write guards 2+8)"
         );
-        cleanup(&path);
     }
 
     #[test]
@@ -4942,7 +4912,6 @@ mod tests {
         // stays `Some("")` (what the header says), distinct from the `None`
         // of a bare-vector build (no header at all).
         let path = temp_index_path("from_fsvi_embedder_identity");
-        cleanup(&path);
         let dim = 8;
         let mut writer = crate::VectorIndex::create_with_revision(
             &path,
@@ -4965,11 +4934,9 @@ mod tests {
             None,
             "id strings never synthesize a space identity"
         );
-        cleanup(&path);
 
         // Empty-revision v1 header: kept verbatim as Some("").
         let path = temp_index_path("from_fsvi_empty_revision");
-        cleanup(&path);
         let mut writer = crate::VectorIndex::create(&path, "legacy-embedder", dim)
             .expect("create legacy v1 writer");
         writer
@@ -4983,7 +4950,6 @@ mod tests {
             Some(""),
             "an empty header revision is the header's content, not absence"
         );
-        cleanup(&path);
     }
 
     #[test]
@@ -5016,12 +4982,8 @@ mod tests {
         // id/revision strings alongside the space fingerprint C3 already
         // preserves. Own directory: admission fails closed with
         // DirectoryChangedDuringRead when sibling test files churn the dir.
-        let dir = std::env::temp_dir()
-            .join("frankensearch_in_memory_tests")
-            .join("admitted_v2_embedder_identity_dir");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create isolated admission dir");
-        let path = dir.join("admitted_v2_embedder_identity.fsvi");
+        let dir = owned_temp_dir("admitted_v2_embedder_identity_dir");
+        let path = dir.path().join("admitted_v2_embedder_identity.fsvi");
         let dim = 8;
         let (doc_ids, vectors) = identity_rows(dim, 3);
         let rows: Vec<(String, Vec<f32>)> = doc_ids.into_iter().zip(vectors).collect();
@@ -5037,7 +4999,6 @@ mod tests {
         assert_eq!(index.embedder_id(), Some("v2-embedder-model"));
         assert_eq!(index.embedder_revision(), Some("explicit-test-v1"));
         assert_eq!(index.space_fingerprint_hex(), Some(expected_space.as_str()));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5184,25 +5145,17 @@ mod tests {
 
         // from_dir loads through the v1-only pathname loader: absence stays
         // typed through the directory path — no tier identity is fabricated.
-        static DIR_NONCE: AtomicU64 = AtomicU64::new(0);
-        let nonce = DIR_NONCE.fetch_add(1, AtomicOrdering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join("frankensearch_in_memory_tests")
-            .join(format!("two_tier_space_identity-{nonce}"));
-        // Scrub any stale state a previously interrupted run left behind.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create two-tier dir");
-        let fast_path = dir.join(crate::two_tier::VECTOR_INDEX_FAST_FILENAME);
+        let dir = owned_temp_dir("two_tier_space_identity");
+        let fast_path = dir.path().join(crate::two_tier::VECTOR_INDEX_FAST_FILENAME);
         let mut writer = crate::VectorIndex::create(&fast_path, "legacy-fast", dim)
             .expect("create legacy v1 fast tier");
         writer
             .write_record("doc-0", &make_normalized_vec(dim, 1.0))
             .expect("write v1 row");
         writer.finish().expect("finish v1 fast tier");
-        let loaded = InMemoryTwoTierIndex::from_dir(&dir).expect("load v1 two-tier dir");
+        let loaded = InMemoryTwoTierIndex::from_dir(dir.path()).expect("load v1 two-tier dir");
         assert_eq!(loaded.fast_space_fingerprint_hex(), None);
         assert_eq!(loaded.quality_space_fingerprint_hex(), None);
-        let _ = std::fs::remove_dir_all(&dir);
 
         // new(): a composed two-tier without a quality index has no
         // quality-tier space to verify against — typed absence again.
@@ -6645,7 +6598,8 @@ mod tests {
         )
         .expect("finite sidecar source");
         bind_test_residual_source(&mut index);
-        let dir = owned_temp_dir("exact_residual_public_io");
+        let owned = owned_temp_dir("exact_residual_public_io");
+        let dir = owned.path();
         let sidecar_path = dir.join("sidecar.fsrs");
         let occupied_path = dir.join("occupied.fsrs");
         let raced_path = dir.join("raced.fsrs");
@@ -6692,7 +6646,7 @@ mod tests {
             b"incumbent destination"
         );
         assert_eq!(
-            std::fs::read_dir(&dir)
+            std::fs::read_dir(dir)
                 .expect("inspect owned public-I/O directory")
                 .count(),
             2,
@@ -6735,7 +6689,7 @@ mod tests {
                 .expect("winner remains descriptor-admissible")
         );
         assert!(
-            std::fs::read_dir(&dir)
+            std::fs::read_dir(dir)
                 .expect("read test parent")
                 .flatten()
                 .count()

@@ -594,11 +594,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::process;
     use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         SCHEMA_VERSION, bootstrap, current_version, current_version_optional, storage_error,
@@ -763,14 +760,13 @@ mod tests {
 
     #[test]
     fn bootstrap_migrates_populated_v7_queue_without_losing_claim_state() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after unix epoch")
-            .as_nanos();
-        let db_path = std::env::temp_dir().join(format!(
-            "frankensearch-schema-v7-claims-{}-{nanos}.sqlite3",
-            process::id()
-        ));
+        // Dropping the directory guard removes the database and every engine
+        // sidecar next to it, including when the test panics.
+        let db_dir = tempfile::Builder::new()
+            .prefix("frankensearch-schema-v7-claims-")
+            .tempdir()
+            .expect("create temp db dir");
+        let db_path = db_dir.path().join("v7-claims.sqlite3");
         let open = || {
             AsyncConnection::open_sync(db_path.to_string_lossy().into_owned())
                 .expect("migration database should open")
@@ -959,14 +955,13 @@ mod tests {
     fn concurrent_bootstrap_on_disk_is_race_safe() {
         const THREADS: usize = 6;
 
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after unix epoch")
-            .as_nanos();
-        let db_path = std::env::temp_dir().join(format!(
-            "frankensearch-schema-bootstrap-{}-{nanos}.sqlite3",
-            process::id()
-        ));
+        // Dropping the directory guard removes the database and every engine
+        // sidecar next to it, including when the test panics.
+        let db_dir = tempfile::Builder::new()
+            .prefix("frankensearch-schema-bootstrap-")
+            .tempdir()
+            .expect("create temp db dir");
+        let db_path = db_dir.path().join("bootstrap.sqlite3");
 
         let barrier = Arc::new(Barrier::new(THREADS));
         let (tx, rx) = mpsc::channel::<i64>();
@@ -1044,16 +1039,6 @@ mod tests {
             versions.iter().all(|version| *version == SCHEMA_VERSION),
             "all concurrent bootstraps should resolve to latest schema"
         );
-
-        let db_path_display = db_path.display().to_string();
-        let cleanup_targets = [
-            db_path,
-            PathBuf::from(format!("{db_path_display}.wal")),
-            PathBuf::from(format!("{db_path_display}.shm")),
-        ];
-        for target in cleanup_targets {
-            let _ = std::fs::remove_file(target);
-        }
     }
 
     // ── Schema version constant ─────────────────────────────────────────

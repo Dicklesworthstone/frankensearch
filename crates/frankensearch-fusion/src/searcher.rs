@@ -4667,20 +4667,25 @@ mod tests {
         }
     }
 
+    /// A uniquely named fixture directory under the system temp dir, removed
+    /// with its contents when the returned guard drops — at the end of the
+    /// test, panics included. Index builders return the guard next to the
+    /// index; tests keep it bound (`let (_index_dir, index) = ..`) for as
+    /// long as the index is in use.
+    fn fixture_tempdir(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir()
+            .expect("create temp dir")
+    }
+
     /// Index crafted so the quality tier disagrees with the fast tier:
     /// `doc-c` is weak on cosine-fast (0.6) but exact on quality (1.0), so a
     /// full-pool refinement must promote it past the Initial page boundary.
-    fn build_promotion_index() -> Arc<TwoTierIndex> {
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-searcher-promo-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+    fn build_promotion_index() -> (tempfile::TempDir, Arc<TwoTierIndex>) {
+        let dir = fixture_tempdir("frankensearch-searcher-promo-");
         let mut builder =
-            TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+            TwoTierIndex::create(dir.path(), TwoTierConfig::default()).expect("create index");
         builder.set_fast_embedder_id("stub-fast");
         builder.set_quality_embedder_id("stub-quality");
         let docs: [(&str, [f32; 4], [f32; 4]); 4] = [
@@ -4697,13 +4702,14 @@ mod tests {
                 .add_quality_record(id.to_string(), quality)
                 .expect("add quality record");
         }
-        Arc::new(builder.finish().expect("finish index"))
+        let index = Arc::new(builder.finish().expect("finish index"));
+        (dir, index)
     }
 
     #[test]
     fn refined_promotes_quality_candidates_beyond_displayed_top_k() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_promotion_index();
+            let (_index_dir, index) = build_promotion_index();
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let config = TwoTierConfig {
@@ -4758,7 +4764,7 @@ mod tests {
     #[test]
     fn refined_ordering_requires_lexical_re_fusion() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_promotion_index();
+            let (_index_dir, index) = build_promotion_index();
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let config = TwoTierConfig {
@@ -5002,8 +5008,9 @@ mod tests {
                     .is_empty(),
                 "the raw query names an unknown field"
             );
+            let (_index_dir, index) = build_test_index(4);
             let searcher = TwoTierSearcher::new(
-                build_test_index(4),
+                index,
                 Arc::new(StubEmbedder::new("fast", 4)),
                 TwoTierConfig::default(),
             )
@@ -5024,17 +5031,10 @@ mod tests {
         });
     }
 
-    fn build_test_index(dimension: usize) -> Arc<TwoTierIndex> {
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-searcher-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+    fn build_test_index(dimension: usize) -> (tempfile::TempDir, Arc<TwoTierIndex>) {
+        let dir = fixture_tempdir("frankensearch-searcher-test-");
         let mut builder =
-            TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+            TwoTierIndex::create(dir.path(), TwoTierConfig::default()).expect("create index");
         builder.set_fast_embedder_id("stub-fast");
         for i in 0..10 {
             let mut vec = vec![0.0; dimension];
@@ -5043,21 +5043,15 @@ mod tests {
                 .add_fast_record(format!("doc-{i}"), &vec)
                 .expect("add record");
         }
-        Arc::new(builder.finish().expect("finish index"))
+        let index = Arc::new(builder.finish().expect("finish index"));
+        (dir, index)
     }
 
     /// Build a test index with both fast and quality vectors.
-    fn build_test_index_with_quality(dimension: usize) -> Arc<TwoTierIndex> {
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-searcher-test-qual-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+    fn build_test_index_with_quality(dimension: usize) -> (tempfile::TempDir, Arc<TwoTierIndex>) {
+        let dir = fixture_tempdir("frankensearch-searcher-test-qual-");
         let mut builder =
-            TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+            TwoTierIndex::create(dir.path(), TwoTierConfig::default()).expect("create index");
         builder.set_fast_embedder_id("stub-fast");
         builder.set_quality_embedder_id("stub-quality");
         for i in 0..10 {
@@ -5070,7 +5064,8 @@ mod tests {
                 .add_quality_record(format!("doc-{i}"), &vec)
                 .expect("add quality record");
         }
-        Arc::new(builder.finish().expect("finish index"))
+        let index = Arc::new(builder.finish().expect("finish index"));
+        (dir, index)
     }
 
     // ─── Owner-backed activation fixtures (bd-ctzo) ─────────────────────
@@ -5296,17 +5291,21 @@ mod tests {
         .expect("valid FSVI v2 binding")
     }
 
-    fn owner_backed_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-ctzo-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// Owner-backed fixture directory: removed with its contents when the
+    /// guard drops (end of test, panics included). Derefs to `Path` so tests
+    /// keep writing `&dir` and `dir.join(..)`.
+    struct OwnerBackedDir(tempfile::TempDir);
+
+    impl std::ops::Deref for OwnerBackedDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            self.0.path()
+        }
+    }
+
+    fn owner_backed_dir(label: &str) -> OwnerBackedDir {
+        OwnerBackedDir(fixture_tempdir(&format!("frankensearch-ctzo-{label}-")))
     }
 
     fn write_v2_tier(
@@ -5491,7 +5490,7 @@ mod tests {
     #[test]
     fn legacy_unidentified_index_stays_searchable_without_any_identity() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             assert!(
                 index.fast_admitted_binding().is_none(),
                 "the fixture is only meaningful while the index is legacy-unidentified"
@@ -5713,7 +5712,7 @@ mod tests {
 
     /// Reopen each production layout with independent 4D fast and 6D quality
     /// spaces. The quality-only document cannot be discovered by fast rescoring.
-    fn query_admission_index(layout: &str) -> Arc<TwoTierIndex> {
+    fn query_admission_index(layout: &str) -> (OwnerBackedDir, Arc<TwoTierIndex>) {
         let dir = owner_backed_dir(layout);
         let fast_rows: &[(&str, &[f32])] = &[
             ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
@@ -5742,7 +5741,7 @@ mod tests {
             let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).unwrap();
             assert!(index.fast_admitted_binding().is_none());
             assert!(!index.fast_embedder_revision().is_empty());
-            return Arc::new(index);
+            return (dir, Arc::new(index));
         }
         let fast_binding = artifact_binding("response-fast", 4, 79);
         let quality_binding = artifact_binding("response-quality", 6, 79);
@@ -5765,7 +5764,7 @@ mod tests {
         } else {
             assert_eq!(layout, "exact-v2");
         }
-        Arc::new(index)
+        (dir, Arc::new(index))
     }
 
     fn query_admission_embedder(tier: &str) -> IdentityCountingEmbedder {
@@ -5789,7 +5788,7 @@ mod tests {
         const QUERY: &str = "find the quality document beyond the fast pool";
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for layout in ["stamped-v1", "exact-v2", "native-v2"] {
-                let index = query_admission_index(layout);
+                let (_index_dir, index) = query_admission_index(layout);
                 for cached in [false, true] {
                     let fast = Arc::new(
                         query_admission_embedder("fast")
@@ -5884,7 +5883,7 @@ mod tests {
         const QUERY: &str = "find the quality document beyond the fast pool";
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for layout in ["stamped-v1", "exact-v2", "native-v2"] {
-                let index = query_admission_index(layout);
+                let (_index_dir, index) = query_admission_index(layout);
                 for tier in ["fast", "quality"] {
                     for cached in [false, true] {
                         for fault in [
@@ -6024,7 +6023,7 @@ mod tests {
     fn query_producer_drift_during_suspension_refuses_late_success_and_failure() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for layout in ["stamped-v1", "exact-v2", "native-v2"] {
-                let index = query_admission_index(layout);
+                let (_index_dir, index) = query_admission_index(layout);
                 for tier in ["fast", "quality"] {
                     for cached in [false, true] {
                         for provider_fails in [false, true] {
@@ -6116,7 +6115,7 @@ mod tests {
     #[test]
     fn captured_quality_identity_cannot_change_in_the_initial_callback() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = query_admission_index("exact-v2");
+            let (_index_dir, index) = query_admission_index("exact-v2");
             let fast = Arc::new(query_admission_embedder("fast"));
             let mut quality = query_admission_embedder("quality");
             let mut replacement = quality.identity.clone();
@@ -6173,7 +6172,7 @@ mod tests {
                         BoundResponseAction::CancelAndReturnTypedError,
                     ] {
                         asupersync::test_utils::run_test_with_cx(|cx| async move {
-                            let index = query_admission_index(layout);
+                            let (_index_dir, index) = query_admission_index(layout);
                             let mut cancelled =
                                 query_admission_embedder(tier).with_async_bound_response();
                             cancelled.bound_action = Some(action);
@@ -6252,7 +6251,7 @@ mod tests {
                     "malformed",
                     "refused",
                 ] {
-                    let index = query_admission_index("exact-v2");
+                    let (_index_dir, index) = query_admission_index("exact-v2");
                     let mut refused = query_admission_embedder(tier);
                     match fault {
                         "dimension" => refused.reported_dimension = Some(refused.vector.len() + 1),
@@ -6313,11 +6312,9 @@ mod tests {
                 let mut provider = query_admission_embedder("fast");
                 provider.identity_refusal = Some(field);
                 let provider = Arc::new(provider);
-                let searcher = TwoTierSearcher::new(
-                    build_test_index(4),
-                    provider.clone(),
-                    TwoTierConfig::default(),
-                );
+                let (_index_dir, index) = build_test_index(4);
+                let searcher =
+                    TwoTierSearcher::new(index, provider.clone(), TwoTierConfig::default());
                 let outcome = searcher.search_collect(&cx, "query", 3).await;
                 if field == "embedder.identity" {
                     assert!(!outcome.unwrap().0.is_empty());
@@ -6642,8 +6639,6 @@ mod tests {
                 Some(None),
                 "a quality-only document has no fast-tier row and must say so"
             );
-
-            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 
@@ -6651,7 +6646,8 @@ mod tests {
     fn native_fast_and_both_tiers_preserve_progressive_hybrid_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for with_quality in [false, true] {
-                let dir = owner_backed_dir("native-fast-progressive")
+                let fixture_dir = owner_backed_dir("native-fast-progressive");
+                let dir = fixture_dir
                     .canonicalize()
                     .expect("native persistence requires a canonical fixture root");
                 let fast_binding = artifact_binding("native-progressive-fast", 4, 67);
@@ -6753,7 +6749,8 @@ mod tests {
                             // Only the artifact generation differs in these
                             // stale fixtures: models, vectors, parameters, and
                             // construction seeds match the serving generation.
-                            let stale_dir = owner_backed_dir("native-progressive-stale")
+                            let stale_fixture_dir = owner_backed_dir("native-progressive-stale");
+                            let stale_dir = stale_fixture_dir
                                 .canonicalize()
                                 .expect("native persistence requires a canonical fixture root");
                             let mut stale = owner_backed_two_tier_index(
@@ -7478,7 +7475,7 @@ mod tests {
     #[test]
     fn search_empty_query_returns_no_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -7496,7 +7493,7 @@ mod tests {
     #[test]
     fn search_zero_k_returns_no_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -7513,7 +7510,7 @@ mod tests {
     #[test]
     fn search_with_hits_leaves_zero_signal_unset() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -7567,7 +7564,7 @@ mod tests {
         }
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder = Arc::new(ZeroEmbedder { dimension: 4 });
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -7621,7 +7618,7 @@ mod tests {
         }
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(ZeroQueryEmbedder);
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
@@ -7665,7 +7662,7 @@ mod tests {
     #[test]
     fn negation_excluding_every_candidate_classifies_as_filter() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -7695,7 +7692,7 @@ mod tests {
     #[test]
     fn search_whitespace_query_returns_no_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -7719,7 +7716,7 @@ mod tests {
     #[test]
     fn search_fast_only_yields_initial_phase() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -7761,8 +7758,9 @@ mod tests {
     #[test]
     fn deferred_lexical_metadata_hydrates_in_every_lane_via_the_pinned_batch() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_hybrid_index_dir, hybrid_index) = build_test_index(4);
             let hybrid = TwoTierSearcher::new(
-                build_test_index(4),
+                hybrid_index,
                 Arc::new(StubEmbedder::new("fast", 4)),
                 TwoTierConfig::default(),
             )
@@ -7785,8 +7783,9 @@ mod tests {
                     == Some("hydrated")
             }));
 
+            let (_fallback_index_dir, fallback_index) = build_test_index(4);
             let fallback = TwoTierSearcher::new(
-                build_test_index(4),
+                fallback_index,
                 Arc::new(FailingEmbedder),
                 TwoTierConfig::default(),
             )
@@ -7811,7 +7810,7 @@ mod tests {
     #[test]
     fn search_with_quality_yields_two_phases() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
 
@@ -7894,7 +7893,7 @@ mod tests {
         let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("post_initial_cancellation"));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -7984,7 +7983,7 @@ mod tests {
         ));
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("quality_embed_cancellation"));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -8208,7 +8207,7 @@ mod tests {
         let text_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("post_refined_cancellation"));
@@ -8271,7 +8270,7 @@ mod tests {
         let rerank_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("post_reranker_cancellation"));
@@ -8327,8 +8326,9 @@ mod tests {
     fn public_search_refined_callback_cancellation_stops_before_rerank() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let adapter = Arc::new(RecordingHostAdapter::new("completion_cancellation"));
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let searcher = TwoTierSearcher::new(
-                build_test_index_with_quality(4),
+                index,
                 Arc::new(StubEmbedder::new("fast", 4)),
                 TwoTierConfig::default(),
             )
@@ -8386,7 +8386,7 @@ mod tests {
         let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
                 .with_quality_embedder(quality);
@@ -8433,7 +8433,7 @@ mod tests {
     #[test]
     fn refined_phase_metrics_report_actual_fused_count() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4); // 10 docs in fixture index
+            let (_index_dir, index) = build_test_index_with_quality(4); // 10 docs in fixture index
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -8470,7 +8470,7 @@ mod tests {
     #[test]
     fn initial_phase_metrics_report_fast_index_scope() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4); // 10 docs in fixture index
+            let (_index_dir, index) = build_test_index(4); // 10 docs in fixture index
             let expected_doc_count = index.doc_count();
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
@@ -8508,7 +8508,7 @@ mod tests {
     #[test]
     fn fast_only_config_skips_quality() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
 
@@ -8533,7 +8533,7 @@ mod tests {
     #[test]
     fn phase_gate_can_preempt_quality_phase() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let mut phase_gate = PhaseGate::new(PhaseGateConfig {
@@ -8568,7 +8568,7 @@ mod tests {
     #[test]
     fn phase_gate_updates_after_refinement_and_can_skip_later_queries() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -8611,7 +8611,7 @@ mod tests {
     #[test]
     fn search_params_override_plumbs_through_phase1_vector_scan() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index.clone(), fast, TwoTierConfig::default())
                 .with_search_params(SearchParams {
@@ -8636,7 +8636,7 @@ mod tests {
     #[test]
     fn graph_ranking_enabled_stub_is_noop() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let config = TwoTierConfig {
@@ -8677,7 +8677,7 @@ mod tests {
     #[test]
     fn lexical_short_circuit_skips_vector_scan_for_short_keywords() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
@@ -8713,7 +8713,7 @@ mod tests {
     #[test]
     fn lexical_short_circuit_keeps_natural_language_hybrid() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let expected_doc_count = index.doc_count();
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
@@ -8744,7 +8744,7 @@ mod tests {
     #[test]
     fn lexical_short_circuit_allows_non_semantic_natural_language_when_saturated() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("custom-hash", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
@@ -8803,7 +8803,7 @@ mod tests {
     #[test]
     fn graph_ranking_with_document_graph_can_add_graph_only_candidate() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let config = TwoTierConfig {
                 graph_ranking_enabled: true,
@@ -8848,7 +8848,7 @@ mod tests {
     #[test]
     fn graph_ranking_candidates_respect_negation_filters() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let config = TwoTierConfig {
                 graph_ranking_enabled: true,
@@ -8934,7 +8934,7 @@ mod tests {
         let mut docs: Vec<String> = Vec::new();
         let sink = &mut docs;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, config);
             let searcher = match graph {
@@ -8965,10 +8965,12 @@ mod tests {
 
     // ─── Phase-1 score corrections: hubness demotion + smoothing (bd-kdjr) ──────────────────
 
-    fn pool_searcher(config: TwoTierConfig) -> TwoTierSearcher {
-        let index = build_test_index(4);
+    /// The searcher comes with the guard owning its index directory; keep it
+    /// bound while the searcher is in use.
+    fn pool_searcher(config: TwoTierConfig) -> (tempfile::TempDir, TwoTierSearcher) {
+        let (index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
-        TwoTierSearcher::new(index, fast, config)
+        (index_dir, TwoTierSearcher::new(index, fast, config))
     }
 
     fn vhit(index: u32, score: f32, doc_id: &str) -> VectorHit {
@@ -8995,8 +8997,9 @@ mod tests {
             vhit(4, 0.9, "doc-4"),
             vhit(1, 0.1, "doc-1"),
         ];
-        let searcher = pool_searcher(TwoTierConfig::default())
-            .with_hubness_table(Arc::from(vec![0.0, 0.0, 0.0, 0.0, 1.0].as_slice()));
+        let (_index_dir, searcher) = pool_searcher(TwoTierConfig::default());
+        let searcher =
+            searcher.with_hubness_table(Arc::from(vec![0.0, 0.0, 0.0, 0.0, 1.0].as_slice()));
 
         let out = searcher.correct_phase1_pool(hits.clone());
 
@@ -9017,7 +9020,8 @@ mod tests {
             hubness_beta: 0.5,
             ..TwoTierConfig::default()
         };
-        let searcher = pool_searcher(config).with_hubness_table(Arc::from(r_d.as_slice()));
+        let (_index_dir, searcher) = pool_searcher(config);
+        let searcher = searcher.with_hubness_table(Arc::from(r_d.as_slice()));
 
         // doc-4 leads on raw score (tie with doc-0, earlier position).
         let hits = vec![
@@ -9058,7 +9062,8 @@ mod tests {
             neighbor_smoothing_alpha: 0.5,
             ..TwoTierConfig::default()
         };
-        let searcher = pool_searcher(config)
+        let (_index_dir, searcher) = pool_searcher(config);
+        let searcher = searcher
             .with_hubness_table(Arc::from(vec![0.0, 0.0, 0.0, 0.0, 1.0].as_slice()))
             .with_document_graph(Arc::new(graph));
 
@@ -9093,7 +9098,7 @@ mod tests {
         let mut docs: Vec<String> = Vec::new();
         let sink = &mut docs;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, config);
             let searcher = match hubness {
@@ -9220,7 +9225,7 @@ mod tests {
     #[test]
     fn quality_timeout_emits_refinement_failed_with_timeout_error() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(PendingEmbedder::new("quality-pending", 4));
             let config = TwoTierConfig {
@@ -9266,7 +9271,7 @@ mod tests {
     #[test]
     fn fast_embed_failure_with_lexical_degrades_gracefully() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
 
@@ -9299,7 +9304,7 @@ mod tests {
     #[test]
     fn non_semantic_fast_embedder_short_circuits_to_lexical() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
@@ -9350,7 +9355,7 @@ mod tests {
     #[test]
     fn non_semantic_fast_embedder_without_lexical_marks_vector_control() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -9409,7 +9414,7 @@ mod tests {
         let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -9455,7 +9460,7 @@ mod tests {
     #[test]
     fn hash_control_with_quality_attached_is_still_vector_control() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast: Arc<dyn Embedder> = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -9477,7 +9482,7 @@ mod tests {
     #[test]
     fn fast_embed_failure_without_lexical_returns_error() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
 
@@ -9506,7 +9511,7 @@ mod tests {
     #[test]
     fn fast_embed_failure_with_quality_configured_skips_refinement() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
             let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("quality", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
@@ -9555,7 +9560,7 @@ mod tests {
     #[test]
     fn fast_embed_cancellation_propagates_even_with_lexical() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(CancelledEmbedder);
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
@@ -9573,7 +9578,7 @@ mod tests {
     #[test]
     fn lexical_cancellation_propagates() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder = Arc::new(StubEmbedder::new("fast", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(CancelledLexical);
             let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default())
@@ -9591,7 +9596,7 @@ mod tests {
     #[test]
     fn search_collect_returns_best_results() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
 
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
@@ -9606,7 +9611,7 @@ mod tests {
     #[test]
     fn search_collect_rejects_negations_without_text_provider() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
 
@@ -9625,7 +9630,7 @@ mod tests {
     #[test]
     fn search_collect_with_text_applies_negations() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
 
@@ -9649,7 +9654,7 @@ mod tests {
     #[test]
     fn exclusion_filters_semantic_results_case_insensitive() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
 
@@ -9685,7 +9690,7 @@ mod tests {
     #[test]
     fn exclusion_filters_lexical_and_semantic_candidates_before_fusion() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
@@ -9727,7 +9732,7 @@ mod tests {
     #[test]
     fn exclusion_can_eliminate_all_results_without_error() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
 
@@ -9755,7 +9760,7 @@ mod tests {
     #[test]
     fn exclusion_full_pipeline_rust_unsafe_returns_safe_docs() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let searcher =
@@ -9814,7 +9819,7 @@ mod tests {
     #[test]
     fn exclusion_filter_hydrates_each_semantic_candidate_once() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
             let hydrated_candidates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -9938,7 +9943,7 @@ mod tests {
     #[test]
     fn refined_phase_uses_zero_fast_score_for_lexical_only_candidates() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
@@ -10062,7 +10067,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_initial_and_refined_search_events() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -10128,7 +10133,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_refinement_failed_search_event() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(PendingEmbedder::new("quality-pending", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -10200,7 +10205,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_fast_and_quality_embedding_events() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -10285,7 +10290,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_lifecycle_and_resource_events_with_runtime_hooks() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -10379,7 +10384,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_failed_fast_embedding_event() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -10426,7 +10431,7 @@ mod tests {
     #[test]
     fn live_search_stream_health_reflects_emitted_search_events() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -10451,7 +10456,7 @@ mod tests {
     #[test]
     fn metrics_track_query_class() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
 
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
@@ -10468,7 +10473,7 @@ mod tests {
 
     #[test]
     fn debug_impl_works() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
         let debug_str = format!("{searcher:?}");
@@ -10479,7 +10484,7 @@ mod tests {
     #[test]
     fn metrics_exporter_receives_search_and_embedding_callbacks() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let exporter = Arc::new(RecordingExporter::default());
@@ -10511,7 +10516,7 @@ mod tests {
     #[test]
     fn metrics_exporter_receives_degradation_errors() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let (_index_dir, index) = build_test_index(4);
             let embedder: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
             let exporter = Arc::new(RecordingExporter::default());
@@ -10732,7 +10737,7 @@ mod tests {
         let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls.clone()));
 
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let searcher =
             TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_embedding_cache(64);
 
@@ -10768,7 +10773,7 @@ mod tests {
         let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls));
         let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
 
-        let index = build_test_index_with_quality(4);
+        let (_index_dir, index) = build_test_index_with_quality(4);
         // quality set BEFORE cache — both should be wrapped
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality)
@@ -10800,7 +10805,7 @@ mod tests {
         let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls));
         let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
 
-        let index = build_test_index_with_quality(4);
+        let (_index_dir, index) = build_test_index_with_quality(4);
         // cache set BEFORE quality — quality should still be auto-wrapped
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_embedding_cache(64)
@@ -10830,7 +10835,7 @@ mod tests {
         let fast_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls.clone()));
 
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let searcher =
             TwoTierSearcher::new(index, fast, TwoTierConfig::default()).with_embedding_cache(64);
 
@@ -11538,7 +11543,7 @@ mod tests {
 
     #[test]
     fn builder_with_lexical_sets_lexical() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_lexical(Arc::new(StubLexical));
@@ -11564,8 +11569,9 @@ mod tests {
         let hits = [lex_hit("a", 10.0), lex_hit("b", 1.0)]; // peaked → high NQC (cv ≈ 0.818)
 
         // Default OFF: fields neutral, effective weight == base.
+        let (_off_index_dir, off_index) = build_test_index(4);
         let off = TwoTierSearcher::new(
-            build_test_index(4),
+            off_index,
             Arc::new(StubEmbedder::new("f", 4)),
             TwoTierConfig::default(),
         );
@@ -11573,8 +11579,9 @@ mod tests {
         assert!((off.effective_semantic_weight(&hits) - off.rrf_semantic_weight).abs() < 1e-12);
 
         // Enabled but not warmed up: an empty sketch is neutral with no score scan.
+        let (_empty_index_dir, empty_index) = build_test_index(4);
         let empty = TwoTierSearcher::new(
-            build_test_index(4),
+            empty_index,
             Arc::new(StubEmbedder::new("f", 4)),
             TwoTierConfig::default(),
         )
@@ -11588,8 +11595,9 @@ mod tests {
         // Enabled: the query NQC is above every sampled value (percentile 1.0), so
         // dense_weight(beta=0.5) = clip(1 − 0.5·1) = 0.5 → the dense weight is halved.
         let weight = NqcDenseWeight::from_sample(&[0.1, 0.2, 0.3]);
+        let (_on_index_dir, on_index) = build_test_index(4);
         let on = TwoTierSearcher::new(
-            build_test_index(4),
+            on_index,
             Arc::new(StubEmbedder::new("f", 4)),
             TwoTierConfig::default(),
         )
@@ -11619,8 +11627,9 @@ mod tests {
             explanation: None,
             metadata: None,
         };
+        let (_index_dir, index) = build_test_index(4);
         let searcher = TwoTierSearcher::new(
-            build_test_index(4),
+            index,
             Arc::new(StubEmbedder::new("f", 4)),
             TwoTierConfig::default(),
         )
@@ -11648,7 +11657,7 @@ mod tests {
 
     #[test]
     fn builder_without_lexical() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
         let debug = format!("{searcher:?}");
@@ -11657,7 +11666,7 @@ mod tests {
 
     #[test]
     fn builder_with_host_adapter_shows_in_debug() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let adapter = Arc::new(RecordingHostAdapter::new("test-project"));
         let searcher =
@@ -11685,7 +11694,7 @@ mod tests {
                 "dummy-reranker"
             }
         }
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_reranker(Arc::new(DummyReranker));
@@ -11695,7 +11704,7 @@ mod tests {
 
     #[test]
     fn should_run_quality_false_when_fast_only() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let quality = Arc::new(StubEmbedder::new("quality", 4));
         let config = TwoTierConfig {
@@ -11708,7 +11717,7 @@ mod tests {
 
     #[test]
     fn should_run_quality_false_when_no_quality_embedder() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
         assert!(!searcher.should_run_quality());
@@ -11716,7 +11725,7 @@ mod tests {
 
     #[test]
     fn should_run_quality_false_when_quality_index_is_unavailable() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let quality = Arc::new(StubEmbedder::new("quality", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -11726,7 +11735,7 @@ mod tests {
 
     #[test]
     fn should_run_quality_true_when_quality_embedder_and_not_fast_only() {
-        let index = build_test_index_with_quality(4);
+        let (_index_dir, index) = build_test_index_with_quality(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let quality = Arc::new(StubEmbedder::new("quality", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -11736,7 +11745,7 @@ mod tests {
 
     #[test]
     fn should_run_quality_false_when_fast_embedder_is_hash_control() {
-        let index = build_test_index_with_quality(4);
+        let (_index_dir, index) = build_test_index_with_quality(4);
         let fast = Arc::new(NonSemanticEmbedder::new("fnv1a-test", 4));
         let quality = Arc::new(StubEmbedder::new("quality", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -11746,7 +11755,7 @@ mod tests {
 
     #[test]
     fn live_search_stream_initially_empty() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
         let health = searcher.live_search_stream_health();
@@ -11758,7 +11767,7 @@ mod tests {
 
     #[test]
     fn debug_shows_quality_embedder_id() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let quality = Arc::new(StubEmbedder::new("my-quality", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -11769,7 +11778,7 @@ mod tests {
 
     #[test]
     fn debug_shows_none_quality_when_not_set() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
         let debug = format!("{searcher:?}");
@@ -11779,7 +11788,7 @@ mod tests {
     #[test]
     fn search_collect_with_text_returns_refined_when_quality_available() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index_with_quality(4);
+            let (_index_dir, index) = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -11799,7 +11808,7 @@ mod tests {
 
     #[test]
     fn with_runtime_metrics_collector_replaces_default() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let custom_collector = Arc::new(RuntimeMetricsCollector::default());
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -11814,7 +11823,7 @@ mod tests {
 
     #[test]
     fn with_live_search_stream_emitter_replaces_default() {
-        let index = build_test_index(4);
+        let (_index_dir, index) = build_test_index(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let custom_emitter = Arc::new(LiveSearchStreamEmitter::default());
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())

@@ -740,8 +740,6 @@ impl IndexCache {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use frankensearch_index::{
         Quantization, TwoTierIndex, TwoTierIndexPaths, VECTOR_INDEX_FAST_FILENAME,
         VECTOR_INDEX_QUALITY_FILENAME, VectorIndex,
@@ -749,17 +747,32 @@ mod tests {
 
     use super::*;
 
-    fn temp_dir(name: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-cache-{name}-{}-{now}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+    /// A uniquely named temporary directory, removed with its contents when
+    /// the guard drops — at the end of the test, panics included. Derefs to
+    /// [`Path`] so tests keep writing `&dir` and `dir.join(..)`.
+    struct TempTestDir(tempfile::TempDir);
+
+    impl TempTestDir {
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    impl std::ops::Deref for TempTestDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            self.path()
+        }
+    }
+
+    fn temp_dir(name: &str) -> TempTestDir {
+        TempTestDir(
+            tempfile::Builder::new()
+                .prefix(&format!("frankensearch-cache-{name}-"))
+                .tempdir()
+                .expect("create temp dir"),
+        )
     }
 
     fn write_fast_index(dir: &Path, records: &[(&str, Vec<f32>)]) {
@@ -1297,7 +1310,7 @@ mod tests {
             .arg("--exact")
             .arg(TEST_NAME)
             .arg("--nocapture")
-            .env(CHILD_ROOT_ENV, &root)
+            .env(CHILD_ROOT_ENV, root.path())
             .status()
             .expect("run isolated cwd-change child");
         assert!(status.success(), "cwd-change child failed: {status}");
@@ -1350,13 +1363,14 @@ mod tests {
         let cache = IndexCache::open(&dir, config, Box::new(SentinelFileDetector::new()))
             .expect("open cache");
 
-        assert_eq!(cache.dir(), dir);
+        assert_eq!(cache.dir(), dir.path());
         assert!((cache.config().rrf_k - 99.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn cache_missing_dir_returns_error() {
-        let dir = std::env::temp_dir().join("frankensearch-cache-nonexistent-xyz");
+        let root = temp_dir("nonexistent");
+        let dir = root.join("missing");
         let err = IndexCache::open(
             &dir,
             TwoTierConfig::default(),

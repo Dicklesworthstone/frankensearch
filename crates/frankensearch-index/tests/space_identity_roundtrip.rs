@@ -27,16 +27,30 @@ use frankensearch_core::generation::{
 use frankensearch_core::{BoundQueryEmbedding, SearchError, SpaceIdentityAdmission};
 use frankensearch_index::{FsviV2IdentityBinding, VectorIndex};
 
-fn temp_index_path(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join("frankensearch_space_identity_roundtrip");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir.join(format!("{name}.fsvi"))
+/// An index path in its own private temporary directory; the directory (WAL
+/// sidecar included) is removed when the guard drops, even on panic.
+struct TempIndexPath {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
 }
 
-fn cleanup(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    let wal_path = path.with_extension("fsvi.wal");
-    let _ = std::fs::remove_file(&wal_path);
+impl std::ops::Deref for TempIndexPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn temp_index_path(name: &str) -> TempIndexPath {
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("frankensearch-index-{name}-"))
+        .tempdir()
+        .expect("create temp dir");
+    TempIndexPath {
+        path: directory.path().join(format!("{name}.fsvi")),
+        _directory: directory,
+    }
 }
 
 /// Lowercase hex encoding of raw fingerprint bytes (test-local; the crate's
@@ -69,7 +83,6 @@ fn fsvi_v2_identity(model_id: &str, dimension: u32) -> EmbeddingIdentityBundleV1
 #[test]
 fn create_v2_roundtrip_joins_and_certifies_through_real_artifact() -> Result<(), String> {
     let path = temp_index_path("create_v2_conformance");
-    cleanup(&path);
     let dim = 8_usize;
 
     // WRITE: the actual production v2 writer path.
@@ -166,6 +179,5 @@ fn create_v2_roundtrip_joins_and_certifies_through_real_artifact() -> Result<(),
     };
     assert_eq!(field, "query_embedding.quality.space_identity");
 
-    cleanup(&path);
     Ok(())
 }

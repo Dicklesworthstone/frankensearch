@@ -3670,19 +3670,13 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use super::*;
+    use crate::test_fixtures::TempFixturePath;
 
-    fn temp_index_dir(label: &str) -> PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-two-tier-{label}-{}-{timestamp}",
-            std::process::id()
-        ))
+    /// A not-yet-existing index directory inside a private temporary
+    /// directory that is removed when the returned guard drops.
+    fn temp_index_dir(label: &str) -> TempFixturePath {
+        TempFixturePath::new(&format!("two-tier-{label}"), "index")
     }
 
     fn write_index_file(path: &Path, rows: &[(&str, &[f32])]) -> SearchResult<()> {
@@ -6262,8 +6256,6 @@ mod tests {
         assert_eq!(reopened.quality_space_fingerprint_hex(), None);
         assert!(reopened.fast_declared_identity().is_none());
         assert!(reopened.quality_declared_identity().is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6308,7 +6300,6 @@ mod tests {
         assert_eq!(field, "quality_identity.space.dimension");
         assert_eq!(value, "16");
 
-        let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
 
@@ -6331,8 +6322,6 @@ mod tests {
         assert!(!index.has_quality_index());
         assert_eq!(index.quality_space_fingerprint_hex(), None);
         assert!(index.quality_declared_identity().is_none());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6351,8 +6340,6 @@ mod tests {
         assert!(index.quality_declared_identity().is_none());
         assert_eq!(index.fast_embedder_revision(), "");
         assert_eq!(index.quality_embedder_revision(), Some(""));
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6430,8 +6417,6 @@ mod tests {
                 .expect("legacy lookup missing")
                 .is_none()
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6710,8 +6695,6 @@ mod tests {
             .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
             .expect("search admitted v2 fast tier");
         assert_eq!(hits[0].doc_id, "doc-b");
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6751,8 +6734,6 @@ mod tests {
         assert!(!reopened.fast_identity_is_attested());
         assert!(!reopened.quality_identity_is_attested());
         assert_eq!(reopened.fast_space_fingerprint_hex(), None);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6783,8 +6764,6 @@ mod tests {
             ),
             "got {error:?}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -6813,8 +6792,6 @@ mod tests {
             ),
             "got {error:?}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     // ─── C4-write r2: retained sealed owners + read-only observation ─────
@@ -6875,8 +6852,6 @@ mod tests {
             index.fast_space_fingerprint_hex(),
             Some(crate::fingerprint_hex(&fast_owner.identity_v2().space_fingerprint).as_str())
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Required test (iv): after admission, replacing the underlying file
@@ -6932,8 +6907,6 @@ mod tests {
         );
         assert_eq!(owner.row(0).expect("row 0").doc_id(), "doc-a");
         assert_eq!(index.doc_count(), 2);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C2, the mutation classes `admitted_owner_reads_survive_path_replacement`
@@ -7030,8 +7003,6 @@ mod tests {
         );
         assert_owner_intact("after unlink, descriptor reuse, and re-creation");
         drop(decoy_handle);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C3: fast and quality owners are independent even when their identities
@@ -7104,8 +7075,6 @@ mod tests {
             "doc-b",
             "the fast tier keeps serving its own vectors"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C5 + C2 refresh: a refused candidate leaves the retained owner
@@ -7237,8 +7206,6 @@ mod tests {
                 .any(|hit| hit.doc_id == "doc-c"),
             "generation one has no doc-c; the reader must not observe the successor"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C2 residual (bd-r6lwt): TRUE concurrency, not two sequentially opened
@@ -7443,8 +7410,6 @@ mod tests {
             "a concurrent successor install must not mutate a live predecessor's owner"
         );
         assert_eq!(reader_index.doc_count(), 2);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C2 residual (bd-r6lwt): DROP ORDER between the owner's byte image and
@@ -7525,8 +7490,6 @@ mod tests {
             "the byte image must be unchanged and fully readable after the owner \
              that admitted it is gone"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C2 residual (bd-r6lwt): ANN sidecar validation against a RETAINED
@@ -7657,8 +7620,6 @@ mod tests {
                 .doc_id,
             "doc-c"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C5, the partial-install case: a refresh whose FAST tier admits but
@@ -7743,8 +7704,6 @@ mod tests {
                 .any(|hit| hit.doc_id == "doc-c"),
             "the successor's doc-c must not be observable after a refused refresh"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C3, the enumerated mismatch classes, driven through the two-tier open
@@ -7905,8 +7864,6 @@ mod tests {
             .is_err(),
             "generation mismatch must be refused"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// C6, discharged structurally rather than with a compile-fail harness
@@ -7964,9 +7921,6 @@ mod tests {
             TwoTierIndex::open(&v2_dir, TwoTierConfig::default()).is_err(),
             "a v2 artifact must not be reachable through the v1 opener"
         );
-
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&v2_dir);
     }
 
     /// Build a bound query embedding in the same SPACE as an artifact's
@@ -8956,8 +8910,6 @@ mod tests {
             "rescoring a fast-selected pool can never surface doc-quality-only; that is \
              precisely why direct quality retrieval and the union are first-class operations"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// bd-ctzo C1/C3: every identity join happens at activation, before any
@@ -9105,9 +9057,6 @@ mod tests {
             ),
             "got {error:?}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
-        let _ = fs::remove_dir_all(&legacy_dir);
     }
 
     /// bd-ctzo C4: coverage is reconstructed from the retained owner's own
@@ -9188,8 +9137,6 @@ mod tests {
                 contributed_candidates: 0,
             }
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9202,7 +9149,6 @@ mod tests {
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open v1");
         assert!(index.fast_admitted_owner().is_none());
         assert!(index.quality_admitted_owner().is_none());
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Byte-for-byte fixture snapshot of one artifact and (optionally) its
@@ -9286,8 +9232,6 @@ mod tests {
         assert_eq!(metadata.record_count, 1);
         assert!(metadata.identity_v2.is_some());
         assert_eq!(tier_snapshot(&v2_path), v2_snapshot);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// NO-GO item 2 repair, stale-WAL half: `VectorIndex::open` DELETES a
@@ -9362,8 +9306,6 @@ mod tests {
             snapshot,
             "artifact and WAL must be byte-identical after observation"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// NO-GO item 2 repair, corrupt-trailer half: `VectorIndex::open`
@@ -9416,8 +9358,6 @@ mod tests {
              (VectorIndex::open does)"
         );
         assert_eq!(tier_snapshot(&path), snapshot);
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9441,7 +9381,6 @@ mod tests {
             ),
             "got {observation:?}"
         );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Write-side WAL hygiene: a builder rewrite of a tier removes the
@@ -9481,8 +9420,6 @@ mod tests {
             !ids.iter().any(|id| id == "wal-resident" || id == "old-doc"),
             "no row from the replaced generation may leak into the rebuild: {ids:?}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Directory entries under `dir` whose names carry the sibling staging
@@ -9640,7 +9577,5 @@ mod tests {
             Vec::<String>::new(),
             "no staged replacement survives a successful finish()"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 }

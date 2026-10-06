@@ -204,14 +204,16 @@ impl LexicalRead for StaticLexical {
     }
 }
 
-fn async_index(tag: &str, with_quality: bool) -> Arc<TwoTierIndex> {
+/// The index and the directory guard that removes its files when the caller
+/// is done with both; bind the guard for as long as the index is used.
+fn async_index(tag: &str, with_quality: bool) -> (tempfile::TempDir, Arc<TwoTierIndex>) {
     // mkdtemp, not pid + clock nanos, which parallel tests can share.
     let dir = tempfile::Builder::new()
         .prefix(&format!("fsx-parity-{tag}-"))
         .tempdir()
-        .expect("unique parity index directory")
-        .keep();
-    let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+        .expect("unique parity index directory");
+    let mut builder =
+        TwoTierIndex::create(dir.path(), TwoTierConfig::default()).expect("create index");
     builder.set_fast_embedder_id("parity-fast");
     if with_quality {
         builder.set_quality_embedder_id("parity-quality");
@@ -226,7 +228,7 @@ fn async_index(tag: &str, with_quality: bool) -> Arc<TwoTierIndex> {
                 .expect("add quality record");
         }
     }
-    Arc::new(builder.finish().expect("finish index"))
+    (dir, Arc::new(builder.finish().expect("finish index")))
 }
 
 fn run_async(
@@ -245,7 +247,7 @@ fn run_async_with_quality_index(
     k: usize,
     with_quality: bool,
 ) -> (Vec<ScoredResult>, TwoTierMetrics) {
-    let index = async_index(tag, with_quality);
+    let (_index_dir, index) = async_index(tag, with_quality);
     let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
         id: "parity-fast",
         vector: query_vec.to_vec(),
@@ -351,12 +353,13 @@ fn seeded_async_search(
     config: &TwoTierConfig,
     k: usize,
 ) -> (Vec<ScoredResult>, TwoTierMetrics) {
+    // Removed when this function returns; the index is used only in here.
     let dir = tempfile::Builder::new()
         .prefix("fsx-parity-seeded-")
         .tempdir()
-        .expect("unique parity index directory")
-        .keep();
-    let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+        .expect("unique parity index directory");
+    let mut builder =
+        TwoTierIndex::create(dir.path(), TwoTierConfig::default()).expect("create index");
     builder.set_fast_embedder_id("parity-fast");
     builder.set_quality_embedder_id("parity-quality");
     for (id, fast, quality) in docs {
@@ -398,7 +401,7 @@ fn run_async_with_lexical(
     query_vec: &[f32],
     k: usize,
 ) -> (Vec<ScoredResult>, TwoTierMetrics) {
-    let index = async_index("lexical", true);
+    let (_index_dir, index) = async_index("lexical", true);
     let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
         id: "parity-fast",
         vector: query_vec.to_vec(),
@@ -475,7 +478,7 @@ fn phase_snapshots(
         .search_iter(&tiered_query(query_vec), 4)
         .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
         .collect();
-    let index = async_index("phase-snapshots", with_quality);
+    let (_index_dir, index) = async_index("phase-snapshots", with_quality);
     let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
         id: "parity-fast",
         vector: query_vec.to_vec(),
@@ -512,7 +515,7 @@ fn lexical_phase_snapshots(query_vec: &[f32], config: TwoTierConfig) -> ParitySn
         .search_iter(&tiered_query(query_vec), 3)
         .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
         .collect();
-    let index = async_index("lexical-phase-snapshots", true);
+    let (_index_dir, index) = async_index("lexical-phase-snapshots", true);
     let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
         id: "parity-fast",
         vector: query_vec.to_vec(),
@@ -554,7 +557,7 @@ fn phase_labels(
         .search_iter(&tiered_query(query_vec), 4)
         .map(|phase| phase_label(&phase))
         .collect();
-    let index = async_index("quality-index-phase", with_quality);
+    let (_index_dir, index) = async_index("quality-index-phase", with_quality);
     let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
         id: "parity-fast",
         vector: query_vec.to_vec(),

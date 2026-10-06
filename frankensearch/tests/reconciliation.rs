@@ -10,9 +10,7 @@
 //! 4. Daemon fallback embedder — `DaemonFallbackEmbedder` integration with indexing
 //! 5. Hash embedder pipeline — end-to-end embed → index → search → verify
 
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch::prelude::*;
 use frankensearch::{
@@ -23,22 +21,19 @@ use frankensearch_core::DaemonClient;
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::traits::Embedder;
 use frankensearch_index::{Quantization, VECTOR_INDEX_FAST_FILENAME};
+use tempfile::TempDir;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn temp_dir(name: &str) -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "frankensearch-reconcile-{name}-{}-{now}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+/// A fresh directory that is removed when the returned guard drops, so a
+/// test (passing or panicking) leaves nothing behind under the temp root.
+fn temp_dir(name: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("frankensearch-reconcile-{name}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 const SAMPLE_DOCS: &[(&str, &str)] = &[
@@ -65,14 +60,14 @@ fn quill_read_only_refresh_catches_up_across_multiple_generations() {
         let directory = temp_dir("quill-reader-generation-catch-up");
         let writer = frankensearch::QuillIndex::create(
             &cx,
-            &directory,
+            directory.path(),
             frankensearch::QuillConfig::default(),
         )
         .await
         .expect("create durable Quill writer");
         let reader = frankensearch::QuillSearchIndex::open(
             &cx,
-            &directory,
+            directory.path(),
             frankensearch::QuillConfig::default(),
         )
         .await
@@ -261,7 +256,7 @@ fn registry_has_rerankers() {
 #[test]
 fn registry_hash_always_available() {
     let dir = temp_dir("registry-hash");
-    let registry = EmbedderRegistry::new(&dir);
+    let registry = EmbedderRegistry::new(dir.path());
     let available = registry.available();
     assert!(
         available.iter().any(|e| e.name.starts_with("hash")),
@@ -273,7 +268,7 @@ fn registry_hash_always_available() {
 #[test]
 fn registry_best_available_falls_back_to_hash() {
     let dir = temp_dir("registry-best");
-    let registry = EmbedderRegistry::new(&dir);
+    let registry = EmbedderRegistry::new(dir.path());
     let best = registry.best_available();
     // Without ML model files, best should be the hash/fnv1a embedder
     assert!(
@@ -286,7 +281,7 @@ fn registry_best_available_falls_back_to_hash() {
 #[test]
 fn registry_get_by_name_and_id() {
     let dir = temp_dir("registry-get");
-    let registry = EmbedderRegistry::new(&dir);
+    let registry = EmbedderRegistry::new(dir.path());
 
     // By name
     let minilm = registry.get("minilm");
@@ -302,7 +297,7 @@ fn registry_get_by_name_and_id() {
 #[test]
 fn registry_bakeoff_eligible_excludes_baselines() {
     let dir = temp_dir("registry-bakeoff");
-    let registry = EmbedderRegistry::new(&dir);
+    let registry = EmbedderRegistry::new(dir.path());
     let eligible = registry.bakeoff_eligible();
 
     // No baselines in eligible list
@@ -392,7 +387,7 @@ fn search_pipeline_works_without_daemon() {
         let hash = HashEmbedder::default_256();
 
         // Build index with hash embedder
-        let path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let path = dir.path().join(VECTOR_INDEX_FAST_FILENAME);
         let mut writer = VectorIndex::create_with_revision(
             &path,
             hash.id(),
@@ -409,7 +404,8 @@ fn search_pipeline_works_without_daemon() {
 
         // Search with the same embedder — no daemon involved, pure local pipeline
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
         let (results, metrics) = searcher
             .search_collect(&cx, "database indexing lookups", 3)
@@ -433,7 +429,7 @@ fn hash_embed_index_search_roundtrip() {
         let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
         let stack = EmbedderStack::from_parts(fast, None);
 
-        let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
+        let mut builder = IndexBuilder::new(dir.path()).with_embedder_stack(stack);
         for (id, text) in SAMPLE_DOCS {
             builder = builder.add_document(*id, *text);
         }
@@ -443,7 +439,8 @@ fn hash_embed_index_search_roundtrip() {
         assert_eq!(stats.error_count, 0);
 
         // Search
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
         let (results, _) = searcher
@@ -490,14 +487,15 @@ fn canonicalized_search_matches_uncanonicalized() {
             ("md2", "Machine learning needs large datasets"),
             ("md3", "## Distributed Systems\nConsensus algorithms"),
         ];
-        let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
+        let mut builder = IndexBuilder::new(dir.path()).with_embedder_stack(stack);
         for (id, text) in docs {
             builder = builder.add_document(*id, *text);
         }
         builder.build(&cx).await.unwrap();
 
         // Search with plain text query
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
         let (results, _) = searcher

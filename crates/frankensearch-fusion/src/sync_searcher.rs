@@ -1429,7 +1429,6 @@ mod tests {
     use frankensearch_core::ScoreSource;
     use frankensearch_core::generation::EmbeddingIdentityBundleV1;
     use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     /// Bind one synthetic vector to an explicitly synthetic identity.
     ///
@@ -1525,9 +1524,9 @@ mod tests {
         // proof by an observable result, not a private-field assertion.
         const CORPUS_ROWS: usize = 10_002;
         let dir = temp_dir("residual-default-product-route");
-        let source_path = dir.join("source.fsvi");
-        let cache_dir = dir.join("residual-cache");
-        let unavailable_cache = dir.join("residual-cache-is-a-file");
+        let source_path = dir.path().join("source.fsvi");
+        let cache_dir = dir.path().join("residual-cache");
+        let unavailable_cache = dir.path().join("residual-cache-is-a-file");
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1656,28 +1655,14 @@ mod tests {
         );
     }
 
-    fn temp_dir(label: &str) -> std::path::PathBuf {
-        static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
-        for _ in 0..1024 {
-            let nonce = TEMP_NONCE.fetch_add(1, AtomicOrdering::Relaxed);
-            let dir = std::env::temp_dir().join(format!(
-                "frankensearch-sync-dbp10-{label}-{}-{}-{nonce}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
-            match std::fs::create_dir(&dir) {
-                Ok(()) => return dir,
-                // Falling out of the match is the next attempt: this arm is the
-                // last statement in the loop body, so an explicit `continue`
-                // says nothing the control flow does not already say.
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => panic!("create unique temp dir: {error}"),
-            }
-        }
-        panic!("exhausted unique temp directory names")
+    /// A uniquely named temporary directory (mkdtemp reserves the name
+    /// atomically), removed with its contents when the returned guard drops —
+    /// at the end of the test, panics included.
+    fn temp_dir(label: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("frankensearch-sync-dbp10-{label}-"))
+            .tempdir()
+            .expect("create unique temp dir")
     }
 
     fn make_index() -> Arc<InMemoryTwoTierIndex> {
@@ -1832,7 +1817,7 @@ mod tests {
     fn an_attested_tier_refuses_a_foreign_space_query() {
         let dir = temp_dir("attested-refusal");
         let (fast, fast_identity) = attested_tier(
-            &dir,
+            dir.path(),
             "vector.fast.idx",
             "dbp10-fast",
             11,
@@ -1865,8 +1850,6 @@ mod tests {
             ),
             "got {error:?}"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-ctzo C2 on the sync path: with an ATTESTED quality tier the refined
@@ -1876,7 +1859,7 @@ mod tests {
     fn an_attested_quality_tier_reaches_a_document_outside_the_fast_pool() {
         let dir = temp_dir("attested-union");
         let (fast, fast_identity) = attested_tier(
-            &dir,
+            dir.path(),
             "vector.fast.idx",
             "dbp10-union-fast",
             21,
@@ -1888,7 +1871,7 @@ mod tests {
         // The quality tier holds a document the FAST TIER DOES NOT CONTAIN.
         // No rescoring of a fast-selected pool can produce it.
         let (quality, quality_identity) = attested_tier(
-            &dir,
+            dir.path(),
             "vector.quality.idx",
             "dbp10-union-quality",
             21,
@@ -1923,8 +1906,6 @@ mod tests {
             quality_only.fast_score, None,
             "the fast tier never saw it, so it has no fast evidence"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// bd-dbp10 acceptance 3: a legacy tier carries no identity to join

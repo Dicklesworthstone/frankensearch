@@ -13,9 +13,9 @@
 //! 6. Error propagation (empty queries, dimension mismatches)
 //! 7. Rank changes across phases
 
+#[cfg(all(feature = "model2vec", feature = "fastembed"))]
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
 use frankensearch::prelude::*;
@@ -28,30 +28,27 @@ use frankensearch_core::types::SearchPhase;
 use frankensearch_index::{
     Quantization, VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME,
 };
+use tempfile::TempDir;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn temp_dir(name: &str) -> PathBuf {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "frankensearch-integ-{name}-{}-{now}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+/// A fresh directory that is removed when the returned guard drops, so a
+/// test (passing or panicking) leaves nothing behind under the temp root.
+fn temp_dir(name: &str) -> TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("frankensearch-integ-{name}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 /// Build an index from text documents using `HashEmbedder`, returning the dir.
-fn build_hash_index(name: &str, docs: &[(&str, &str)]) -> (PathBuf, usize) {
+fn build_hash_index(name: &str, docs: &[(&str, &str)]) -> (TempDir, usize) {
     let dir = temp_dir(name);
     let embedder = HashEmbedder::default_256();
     let dim = embedder.dimension();
-    let path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+    let path = dir.path().join(VECTOR_INDEX_FAST_FILENAME);
     let mut writer = VectorIndex::create_with_revision(
         &path,
         embedder.id(),
@@ -117,11 +114,11 @@ impl Embedder for SemanticStubEmbedder {
 }
 
 /// Build a two-tier index with semantic test doubles (not hash control).
-fn build_two_tier_stub_index(name: &str, docs: &[(&str, &str)]) -> PathBuf {
+fn build_two_tier_stub_index(name: &str, docs: &[(&str, &str)]) -> TempDir {
     let dir = temp_dir(name);
     let docs = docs.to_vec();
     asupersync::test_utils::run_test_with_cx(|cx| {
-        let dir = dir.clone();
+        let dir = dir.path().to_path_buf();
         async move {
             let stack = EmbedderStack::from_parts(
                 Arc::new(SemanticStubEmbedder::new("stub-fast", 8)) as Arc<dyn Embedder>,
@@ -144,13 +141,13 @@ fn build_two_tier_stub_index(name: &str, docs: &[(&str, &str)]) -> PathBuf {
 }
 
 /// Build a two-tier index with separate fast (256d) and quality (384d) embeddings.
-fn build_two_tier_hash_index(name: &str, docs: &[(&str, &str)]) -> PathBuf {
+fn build_two_tier_hash_index(name: &str, docs: &[(&str, &str)]) -> TempDir {
     let dir = temp_dir(name);
     let fast = HashEmbedder::default_256();
     let quality = HashEmbedder::default_384();
 
     // Fast index
-    let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+    let fast_path = dir.path().join(VECTOR_INDEX_FAST_FILENAME);
     let mut fw = VectorIndex::create_with_revision(
         &fast_path,
         fast.id(),
@@ -166,7 +163,7 @@ fn build_two_tier_hash_index(name: &str, docs: &[(&str, &str)]) -> PathBuf {
     fw.finish().expect("finish fast");
 
     // Quality index
-    let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+    let quality_path = dir.path().join(VECTOR_INDEX_QUALITY_FILENAME);
     let mut qw = VectorIndex::create_with_revision(
         &quality_path,
         quality.id(),
@@ -279,7 +276,8 @@ const TEST_CORPUS: &[(&str, &str)] = &[
 fn basic_search_returns_results() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("basic-search", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
@@ -299,7 +297,8 @@ fn basic_search_returns_results() {
 fn search_results_are_relevant() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("relevance", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
@@ -339,7 +338,8 @@ fn search_with_corpus_of_100_documents() {
             .collect();
 
         let (dir, _) = build_hash_index("corpus-100", &doc_refs);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
@@ -362,7 +362,8 @@ fn search_with_corpus_of_100_documents() {
 fn fast_only_mode_yields_only_initial_phase() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("fast-only", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let config = TwoTierConfig {
@@ -398,7 +399,8 @@ fn fast_only_mode_yields_only_initial_phase() {
 fn two_tier_search_yields_initial_then_refined() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let dir = build_two_tier_stub_index("two-tier-phases", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
 
         let fast: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-fast", 8));
         let quality: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-quality", 16));
@@ -437,7 +439,8 @@ fn two_tier_search_yields_initial_then_refined() {
 fn initial_phase_results_are_valid() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("initial-valid", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
@@ -484,7 +487,8 @@ fn persist_and_reopen_returns_same_results() {
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         // First search
-        let index1 = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open1"));
+        let index1 =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open1"));
         let searcher1 =
             TwoTierSearcher::new(index1, Arc::clone(&embedder), TwoTierConfig::default());
         let (results1, _) = searcher1
@@ -495,7 +499,8 @@ fn persist_and_reopen_returns_same_results() {
         // Drop everything, reopen
         drop(searcher1);
 
-        let index2 = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open2"));
+        let index2 =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open2"));
         let searcher2 =
             TwoTierSearcher::new(index2, Arc::clone(&embedder), TwoTierConfig::default());
         let (results2, _) = searcher2
@@ -524,7 +529,7 @@ fn index_builder_creates_searchable_index() {
         let fast = Arc::new(HashEmbedder::default_256()) as Arc<dyn Embedder>;
         let stack = EmbedderStack::from_parts(fast, None);
 
-        let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
+        let mut builder = IndexBuilder::new(dir.path()).with_embedder_stack(stack);
         for (id, text) in TEST_CORPUS {
             builder = builder.add_document(*id, *text);
         }
@@ -535,7 +540,8 @@ fn index_builder_creates_searchable_index() {
         assert!(!stats.has_quality_index);
 
         // Now search the built index
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
         let (results, _) = searcher
@@ -561,7 +567,7 @@ fn index_builder_with_two_tier() {
         let quality = Arc::new(HashEmbedder::default_384()) as Arc<dyn Embedder>;
         let stack = EmbedderStack::from_parts(fast, Some(quality));
 
-        let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
+        let mut builder = IndexBuilder::new(dir.path()).with_embedder_stack(stack);
         for (id, text) in TEST_CORPUS {
             builder = builder.add_document(*id, *text);
         }
@@ -580,7 +586,8 @@ fn index_builder_with_two_tier() {
 fn leftover_hash_quality_index_is_not_refined() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let dir = build_two_tier_hash_index("hash-quality-not-refined", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         assert!(
             index.has_quality_index(),
             "fixture still writes a hash quality file so the searcher must refuse it"
@@ -614,7 +621,8 @@ fn leftover_hash_quality_index_is_not_refined() {
 fn quality_weight_affects_refined_ranking() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let dir = build_two_tier_stub_index("quality-weight", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
 
         let fast: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-fast", 8));
         let quality: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-quality", 16));
@@ -656,7 +664,8 @@ fn quality_weight_affects_refined_ranking() {
 fn different_k_values_respected() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("k-values", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
@@ -687,7 +696,7 @@ fn optimized_config_can_drive_searcher_for_multiple_queries() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("optimized-config-smoke", TEST_CORPUS);
         let config = TwoTierConfig::optimized();
-        let index = Arc::new(TwoTierIndex::open(&dir, config.clone()).expect("open"));
+        let index = Arc::new(TwoTierIndex::open(dir.path(), config.clone()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
         let searcher = TwoTierSearcher::new(index, embedder, config);
 
@@ -715,7 +724,8 @@ fn optimized_config_can_drive_searcher_for_multiple_queries() {
 fn concurrent_searches_on_shared_index() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("concurrent", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
         let searcher = Arc::new(TwoTierSearcher::new(
             index,
@@ -768,7 +778,8 @@ fn concurrent_searches_on_shared_index() {
 fn empty_query_returns_empty_results() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("empty-query", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
@@ -788,7 +799,8 @@ fn empty_query_returns_empty_results() {
 fn zero_k_returns_empty_results() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("zero-k", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
@@ -807,7 +819,7 @@ fn index_builder_empty_documents_rejected() {
         let stack = EmbedderStack::from_parts(fast, None);
 
         let err = Box::pin(
-            IndexBuilder::new(&dir)
+            IndexBuilder::new(dir.path())
                 .with_embedder_stack(stack)
                 .build(&cx),
         )
@@ -829,7 +841,8 @@ fn index_builder_empty_documents_rejected() {
 fn refined_phase_reports_rank_changes() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let dir = build_two_tier_stub_index("rank-changes", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
 
         let fast: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-fast", 8));
         let quality: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-quality", 16));
@@ -862,7 +875,8 @@ fn refined_phase_reports_rank_changes() {
 fn metrics_capture_both_phases() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let dir = build_two_tier_stub_index("metrics-phases", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
 
         let fast: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-fast", 8));
         let quality: Arc<dyn Embedder> = Arc::new(SemanticStubEmbedder::new("stub-quality", 16));
@@ -906,7 +920,8 @@ fn metrics_capture_both_phases() {
 fn search_is_deterministic() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let (dir, _) = build_hash_index("determinism", TEST_CORPUS);
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
@@ -951,7 +966,7 @@ fn config_roundtrip_produces_consistent_search() {
         let json = serde_json::to_string(&config).unwrap();
         let decoded: TwoTierConfig = serde_json::from_str(&json).unwrap();
 
-        let index = Arc::new(TwoTierIndex::open(&dir, decoded.clone()).expect("open"));
+        let index = Arc::new(TwoTierIndex::open(dir.path(), decoded.clone()).expect("open"));
         let embedder: Arc<dyn Embedder> = Arc::new(HashEmbedder::default_256());
 
         let searcher = TwoTierSearcher::new(index, embedder, decoded);
@@ -978,7 +993,7 @@ fn index_builder_reports_progress() {
         let progress_calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let progress_clone = Arc::clone(&progress_calls);
 
-        let mut builder = IndexBuilder::new(&dir)
+        let mut builder = IndexBuilder::new(dir.path())
             .with_embedder_stack(stack)
             .with_batch_size(5)
             .with_progress(move |p| {
@@ -1074,7 +1089,7 @@ fn real_models_two_tier_search_yields_refined_through_the_public_api() {
     runtime.block_on(async move {
         let cx = Cx::current().expect("runtime installs caller context");
         let dir = temp_dir("real-models-two-tier");
-        let mut builder = IndexBuilder::new(&dir).with_embedder_stack(stack);
+        let mut builder = IndexBuilder::new(dir.path()).with_embedder_stack(stack);
         for (id, text) in TEST_CORPUS {
             builder = builder.add_document(*id, *text);
         }
@@ -1085,12 +1100,13 @@ fn real_models_two_tier_search_yields_refined_through_the_public_api() {
         assert_eq!(stats.embedder_availability, TwoTierAvailability::Full);
         assert!(stats.has_quality_index, "the quality tier must be written");
         assert!(
-            dir.join(VECTOR_INDEX_QUALITY_FILENAME).is_file(),
+            dir.path().join(VECTOR_INDEX_QUALITY_FILENAME).is_file(),
             "quality tier artifact missing under {}",
-            dir.display()
+            dir.path().display()
         );
 
-        let index = Arc::new(TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open"));
+        let index =
+            Arc::new(TwoTierIndex::open(dir.path(), TwoTierConfig::default()).expect("open"));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality);
         let mut phases = Vec::new();

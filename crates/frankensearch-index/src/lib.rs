@@ -6414,23 +6414,66 @@ pub const fn next_publication_nonce(current: u16) -> u16 {
     if current == u16::MAX { 1 } else { current + 1 }
 }
 
+/// Self-removing temporary fixture paths for this crate's unit tests
+/// (bd-hsffx).
+///
+/// Every fixture lives in its own private [`tempfile::TempDir`], so the
+/// directory and everything a test writes into it (`.wal` siblings, sidecars,
+/// staging and replacement files) is removed when the guard drops — including
+/// when the test panics.
+#[cfg(test)]
+mod test_fixtures {
+    use std::ops::Deref;
+    use std::path::{Path, PathBuf};
+
+    /// A fresh private directory named `frankensearch-index-<name>-XXXXXX`.
+    pub fn temp_fixture_dir(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("frankensearch-index-{name}-"))
+            .tempdir()
+            .expect("create private temporary fixture directory")
+    }
+
+    /// A not-yet-existing `file_name` inside its own private temporary
+    /// directory. Derefs to [`Path`], so `&fixture` goes wherever a `&Path`
+    /// is expected; bind it to a local that outlives every use of the path.
+    #[derive(Debug)]
+    pub struct TempFixturePath {
+        path: PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    impl TempFixturePath {
+        pub fn new(name: &str, file_name: &str) -> Self {
+            let directory = temp_fixture_dir(name);
+            Self {
+                path: directory.path().join(file_name),
+                _directory: directory,
+            }
+        }
+    }
+
+    impl Deref for TempFixturePath {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for TempFixturePath {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn temp_index_path(name: &str) -> PathBuf {
-        static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let serial = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let directory = std::env::temp_dir().join(format!(
-            "frankensearch-index-{name}-{}-{now}-{serial}",
-            std::process::id(),
-        ));
-        fs::create_dir(&directory).expect("create private index fixture directory");
-        directory.join("index.fsvi")
+    fn temp_index_path(name: &str) -> test_fixtures::TempFixturePath {
+        test_fixtures::TempFixturePath::new(name, "index.fsvi")
     }
 
     fn sample_vector(base: f32, dim: usize) -> Vec<f32> {
@@ -6596,7 +6639,7 @@ mod tests {
     fn write_v2_fixture(
         name: &str,
         binding: FsviV2IdentityBinding,
-    ) -> (PathBuf, FsviV2IdentityBinding) {
+    ) -> (test_fixtures::TempFixturePath, FsviV2IdentityBinding) {
         let path = temp_index_path(name);
         let expected = binding.clone();
         let mut writer = VectorIndex::create_v2(&path, binding).expect("create v2 writer");
@@ -9088,8 +9131,6 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-b");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9108,8 +9149,6 @@ mod tests {
                 .expect("missing soft delete")
         );
         assert_eq!(index.tombstone_count(), 0);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9133,8 +9172,6 @@ mod tests {
             .expect("batch delete");
         assert_eq!(deleted, 2);
         assert_eq!(index.tombstone_count(), 2);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9161,8 +9198,6 @@ mod tests {
         index.soft_delete("doc-2").expect("delete 2");
         assert_eq!(index.tombstone_count(), 3);
         assert!(index.needs_vacuum());
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9205,8 +9240,6 @@ mod tests {
             .expect("post-vacuum search");
         assert_eq!(post_hits.len(), 2);
         assert!(post_hits.iter().all(|hit| hit.doc_id != "doc-b"));
-
-        std::fs::remove_file(&path).ok();
     }
 
     /// The lazy int8/4-bit slabs quantize the main-vector region at first
@@ -9294,8 +9327,6 @@ mod tests {
             "4-bit slab survived compact() and cannot see the merged WAL resident"
         );
         assert!(zz_hits[0].score > 0.9);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9358,8 +9389,6 @@ mod tests {
             hits.iter()
                 .all(|hit| !deleted_ids.contains(hit.doc_id.as_str()))
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9398,8 +9427,6 @@ mod tests {
             custom_flag,
             "non-tombstone bits must remain untouched",
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9427,8 +9454,6 @@ mod tests {
             .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
             .expect("search after reopen");
         assert!(hits.iter().all(|hit| hit.doc_id != "doc-a"));
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9488,9 +9513,6 @@ mod tests {
                 "live id must be present",
             );
         }
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -9530,9 +9552,6 @@ mod tests {
         assert!(post_compact.iter().all(|hit| hit.doc_id != "doc-a"));
         assert!(post_compact.iter().any(|hit| hit.doc_id == "doc-b"));
         assert!(post_compact.iter().any(|hit| hit.doc_id == "doc-c"));
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -9555,8 +9574,6 @@ mod tests {
         assert_eq!(stats.records_after, 2);
         assert_eq!(stats.tombstones_removed, 0);
         assert_eq!(index.record_count(), 2);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9585,8 +9602,6 @@ mod tests {
             hits.is_empty(),
             "search with all deleted should return nothing"
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9618,8 +9633,6 @@ mod tests {
             .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
             .expect("search");
         assert!(hits.is_empty());
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── WAL integration tests ─────────────────────────────────────────
@@ -9722,10 +9735,6 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "wal-0", "WAL entry should rank first");
-
-        // Cleanup.
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     /// bd-cnby1: a v1 rebuild via bare create+finish over an existing index
@@ -9805,10 +9814,6 @@ mod tests {
             "bd-cnby1: the deliberately dropped document must stay dropped"
         );
         drop(installed);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(&replacement_path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     /// A replacement whose compaction generation collides with the
@@ -9847,10 +9852,6 @@ mod tests {
             "acknowledged WAL record must survive a refused install"
         );
         drop(survivor);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(&replacement_path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     /// The correct-by-construction path: a replacement built with the
@@ -9900,8 +9901,6 @@ mod tests {
             !wal::wal_path_for(&path).exists(),
             "a healthy install leaves no sidecar residue"
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9942,8 +9941,6 @@ mod tests {
             .search_top_k(&[1.0, 1.0, 0.0, 0.0], 10, None)
             .expect("search replacement");
         assert!(hits.is_empty(), "old WAL entries must not be resurrected");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9971,9 +9968,6 @@ mod tests {
             .search_top_k(&[1.0, 1.0, 1.0, 1.0], 10, None)
             .expect("search");
         assert_eq!(hits.len(), 4, "all 4 vectors should be returned");
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10011,8 +10005,6 @@ mod tests {
             .search_top_k(&[1.0, 1.0, 1.0, 1.0], 10, None)
             .expect("search");
         assert_eq!(hits.len(), 3);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -10042,9 +10034,6 @@ mod tests {
             .append("wal-0", &sample_vector(0.2, dim))
             .expect("append");
         assert!(index.needs_compaction());
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10075,9 +10064,6 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "wal-0");
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10101,8 +10087,6 @@ mod tests {
             0,
             "failed append should not persist"
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -10120,8 +10104,6 @@ mod tests {
         let stats = index.compact().expect("compact empty WAL");
         assert_eq!(stats.wal_records, 0);
         assert_eq!(stats.total_records_after, 1);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -10148,9 +10130,6 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "wal-perfect");
         assert!(hits[0].score > hits[1].score);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10181,9 +10160,6 @@ mod tests {
             "WAL shadows main — only WAL entry should appear"
         );
         assert_eq!(hits[0].doc_id, "doc-a");
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10216,9 +10192,6 @@ mod tests {
         assert_eq!(hits.len(), 5);
         // The main-0 (base=1.0) should rank near the top with query [1.0, ...].
         assert!(hits.iter().any(|h| h.doc_id == "main-0"));
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10262,9 +10235,6 @@ mod tests {
             // All scores should be positive (dot product of positive vectors).
             assert!(hits.iter().all(|h| h.score > 0.0));
         }
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10305,9 +10275,6 @@ mod tests {
             .search_top_k(&sample_vector(1.0, dim), 100, None)
             .expect("search");
         assert_eq!(hits.len(), 6);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     /// Minimal `tracing` subscriber that records every WARN-or-worse event
@@ -10401,9 +10368,6 @@ mod tests {
         let reopened = VectorIndex::open(&path).expect("reopen");
         assert_eq!(reopened.record_count(), 3);
         assert_eq!(reopened.wal_record_count(), 1);
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     /// A main-generation tombstone is an in-place write through the shared
@@ -10439,9 +10403,6 @@ mod tests {
             after > before,
             "an in-place tombstone must advance the file's mtime: before={before:?} after={after:?}"
         );
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     /// A `RaptorQ` sidecar encodes exact bytes; every write that changes the
@@ -10495,9 +10456,6 @@ mod tests {
         );
 
         drop(index);
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(&sidecar).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10531,9 +10489,6 @@ mod tests {
             .search_top_k(&[0.0, 1.0, 0.0, 0.0], 10, None)
             .expect("search after reopen");
         assert!(reopened_hits.iter().all(|hit| hit.doc_id != "wal-only"));
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10571,9 +10526,6 @@ mod tests {
             "doc-a should not be searchable from main or WAL"
         );
         assert!(hits.iter().any(|hit| hit.doc_id == "doc-b"));
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -10607,8 +10559,6 @@ mod tests {
         assert_eq!(stats.wal_records, 1);
         assert_eq!(stats.total_records_after, 1);
         assert_eq!(index.record_count(), 1);
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── Quantization edge cases ────────────────────────────────────────
@@ -10755,7 +10705,6 @@ mod tests {
         writer.finish().unwrap();
         let index = VectorIndex::open(&path).unwrap();
         assert_eq!(index.embedder_revision(), "");
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── VectorIndexWriter rejection cases ──────────────────────────────
@@ -10867,8 +10816,6 @@ mod tests {
             err.contains("truncated") || err.contains("too small") || err.contains("extends"),
             "expected truncation error, got: {err}"
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── FSVI constants ─────────────────────────────────────────────────
@@ -10944,8 +10891,6 @@ mod tests {
         let mut direct = Vec::new();
         index.extend_vector_at_f16(0, &mut direct).unwrap();
         assert_eq!(direct, f16_vec);
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── vector_at_f16 on f32 index (converts) ─────────────────────────
@@ -10975,8 +10920,6 @@ mod tests {
         let mut direct = Vec::new();
         index.extend_vector_at_f16(0, &mut direct).unwrap();
         assert_eq!(direct, f16_vec);
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── metadata accessor ──────────────────────────────────────────────
@@ -10998,8 +10941,6 @@ mod tests {
         assert_eq!(meta.quantization, Quantization::F32);
         assert_eq!(meta.record_count, 1);
         assert_eq!(meta.vectors_offset % 64, 0);
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── is_deleted accessor ────────────────────────────────────────────
@@ -11013,8 +10954,6 @@ mod tests {
 
         let index = VectorIndex::open(&path).unwrap();
         assert!(!index.is_deleted(0));
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── tombstone_ratio empty index ────────────────────────────────────
@@ -11028,8 +10967,6 @@ mod tests {
         let index = VectorIndex::open(&path).unwrap();
         assert!(index.tombstone_ratio().abs() < f64::EPSILON);
         assert!(!index.needs_vacuum());
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── WalConfig default ──────────────────────────────────────────────
@@ -11057,8 +10994,6 @@ mod tests {
         let recovered = index.vector_at_f32(0).unwrap();
         assert_eq!(recovered, original, "f32 must roundtrip exactly");
         assert_eq!(index.embedder_revision(), "rev-42");
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── Header CRC corruption by flipping data byte ────────────────────
@@ -11082,8 +11017,6 @@ mod tests {
             err.contains("CRC") || err.contains("crc"),
             "expected CRC error, got: {err}"
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── bd-1fh4 tests begin ──────────────────────────────────────────
@@ -11131,8 +11064,6 @@ mod tests {
         let index = VectorIndex::open(&path).unwrap();
         let debug = format!("{index:?}");
         assert!(debug.contains("VectorIndex"));
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -11159,9 +11090,6 @@ mod tests {
             fsync_on_write: false,
         });
         assert!(index.needs_compaction());
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -11173,8 +11101,6 @@ mod tests {
         let index = VectorIndex::open(&path).unwrap();
         assert!(index.find_index_by_doc_hash(0xDEAD_BEEF).is_none());
         assert!(index.find_index_by_doc_hash(0).is_none());
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -11196,8 +11122,6 @@ mod tests {
         assert!(results[0].is_some(), "alpha should be found");
         assert!(results[1].is_none(), "gamma should be missing");
         assert!(results[2].is_some(), "beta should be found");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -11209,8 +11133,6 @@ mod tests {
         let mut index = VectorIndex::open(&path).unwrap();
         index.append_batch(&[]).unwrap();
         assert_eq!(index.wal_record_count(), 0);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -11250,8 +11172,6 @@ mod tests {
         assert!(index.soft_delete("doc").unwrap(), "first delete");
         assert!(!index.soft_delete("doc").unwrap(), "second delete");
         assert!(!index.soft_delete("doc").unwrap(), "third delete");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -11551,9 +11471,6 @@ mod tests {
         // with 21 main records, 1 WAL entry → ratio ~0.048 < 0.90.
         index.append("wal-2", &sample_vector(0.3, dim)).unwrap();
         assert!(!index.needs_compaction());
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -11580,8 +11497,6 @@ mod tests {
         readonly.set_readonly(true);
         if fs::set_permissions(wal_dir, readonly).is_err() {
             // Sandboxed environments may not allow permission changes; skip.
-            std::fs::remove_file(&path).ok();
-            std::fs::remove_file(wal::wal_path_for(&path)).ok();
             return;
         }
 
@@ -11598,8 +11513,6 @@ mod tests {
         // is physically impossible on that worker (the source of intermittent,
         // worker-dependent flakiness in this test).
         if result.is_ok() {
-            std::fs::remove_file(&path).ok();
-            std::fs::remove_file(wal::wal_path_for(&path)).ok();
             return;
         }
 
@@ -11617,9 +11530,6 @@ mod tests {
         let hits = index.search_top_k(&[0.0, 1.0, 0.0, 0.0], 10, None).unwrap();
         assert!(hits.iter().any(|h| h.doc_id == "wal-a"));
         assert!(hits.iter().any(|h| h.doc_id == "wal-b"));
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
     // ─── Regression: Duplicate entries on compaction crash ──────────────
@@ -11689,10 +11599,6 @@ mod tests {
         for hit in &hits {
             println!("Hit: {} score={}", hit.doc_id, hit.score);
         }
-
-        // Clean up
-        let _ = fs::remove_file(&path);
-        let _ = wal::remove_wal(&wal::wal_path_for(&path));
 
         // Assert failure
         let hit_count = hits.len();

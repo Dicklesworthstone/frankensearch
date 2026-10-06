@@ -3343,7 +3343,7 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::rc::Rc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
 
     #[cfg(feature = "hnsw-patch-ab")]
     use hnsw_rs_034::prelude::{
@@ -3352,6 +3352,7 @@ mod tests {
 
     use super::*;
     use crate::Quantization;
+    use crate::test_fixtures::TempFixturePath;
 
     #[derive(Debug)]
     struct GraphRepairProbe {
@@ -3378,15 +3379,12 @@ mod tests {
         }
     }
 
-    fn temp_path(label: &str, extension: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-hnsw-{label}-{}-{now}.{extension}",
-            std::process::id()
-        ))
+    /// `<label>.<extension>` inside its own private temporary directory,
+    /// removed (with any sidecars, generations and save locks) on drop. The
+    /// file stem stays the label, so sidecar basenames remain distinct per
+    /// label exactly as before.
+    fn temp_path(label: &str, extension: &str) -> TempFixturePath {
+        TempFixturePath::new(&format!("hnsw-{label}"), &format!("{label}.{extension}"))
     }
 
     fn lcg_next(state: &mut u64) -> u32 {
@@ -4609,7 +4607,7 @@ mod tests {
     #[test]
     fn borrowed_source_fallback_survives_path_rename_after_open() {
         let source_path = temp_path("borrowed-source-before-rename", "fsvi");
-        let renamed_path = temp_path("borrowed-source-after-rename", "fsvi");
+        let renamed_path = source_path.with_file_name("borrowed-source-after-rename.fsvi");
         let source =
             write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]]).expect("source");
         let ann =
@@ -6205,7 +6203,7 @@ mod tests {
             .arg("--exact")
             .arg(TEST_NAME)
             .arg("--nocapture")
-            .env(CHILD_ROOT_ENV, &root)
+            .env(CHILD_ROOT_ENV, root.as_os_str())
             .status()
             .expect("run isolated malformed-parser child");
         assert!(
@@ -6859,7 +6857,6 @@ mod tests {
             }
             writer.finish().expect("finish v2 source");
             let bytes = std::fs::read(&path).expect("read v2 source");
-            let _ = std::fs::remove_file(&path);
             crate::ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(bytes), &binding)
                 .expect("admit v2 source")
         };

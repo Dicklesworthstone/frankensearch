@@ -1,19 +1,11 @@
 #[cfg(test)]
 mod tests {
+    use crate::test_fixtures::TempFixturePath;
     use crate::{Quantization, VectorIndex};
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_index_path(name: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-index-repro-{name}-{}-{now}.fsvi",
-            std::process::id()
-        ))
+    fn temp_index_path(name: &str) -> TempFixturePath {
+        TempFixturePath::new(&format!("repro-{name}"), "index.fsvi")
     }
 
     #[test]
@@ -72,8 +64,5 @@ mod tests {
             hits.iter().any(|h| h.doc_id == "doc-a"),
             "doc-a should still be searchable (via WAL) after failed soft_delete"
         );
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_dir(&wal_path);
     }
 }

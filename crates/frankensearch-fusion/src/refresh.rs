@@ -2306,18 +2306,41 @@ mod tests {
             .unwrap();
     }
 
-    /// Create a temporary directory with a unique name.
-    fn temp_index_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-refresh-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// A uniquely named temporary directory, removed with its contents when
+    /// the guard drops — at the end of the test, panics included. Derefs to
+    /// [`Path`] so tests keep writing `&dir` and `dir.join(..)`.
+    struct TempIndexDir(tempfile::TempDir);
+
+    impl TempIndexDir {
+        fn path(&self) -> &Path {
+            self.0.path()
+        }
+    }
+
+    impl std::ops::Deref for TempIndexDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            self.path()
+        }
+    }
+
+    /// Lets `RefreshWorkerConfig::new(&dir)` (`impl Into<PathBuf>`) take the guard.
+    impl AsRef<std::ffi::OsStr> for TempIndexDir {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.path().as_os_str()
+        }
+    }
+
+    /// Create a temporary directory with a unique name; it is removed when
+    /// the returned guard drops, so bind it for the whole test.
+    fn temp_index_dir(label: &str) -> TempIndexDir {
+        TempIndexDir(
+            tempfile::Builder::new()
+                .prefix(&format!("frankensearch-refresh-test-{label}-"))
+                .tempdir()
+                .unwrap(),
+        )
     }
 
     /// Seed an initial index on disk (required for `IndexCache::open`).
@@ -2955,7 +2978,7 @@ mod tests {
         let dir = temp_index_dir("accessor");
         let queue = make_queue(10);
         let (worker, _cache, _embedder) = make_worker(queue, &dir, 256);
-        assert_eq!(worker.index_dir(), dir.as_path());
+        assert_eq!(worker.index_dir(), dir.path());
     }
 
     #[test]
@@ -3437,7 +3460,12 @@ mod tests {
         bundle: &EmbeddingIdentityBundleV1,
         rows: &[(&str, Vec<f32>)],
         sequence: u64,
-    ) -> (PathBuf, Arc<IndexCache>, FsviV2IdentityBinding, PathBuf) {
+    ) -> (
+        TempIndexDir,
+        Arc<IndexCache>,
+        FsviV2IdentityBinding,
+        PathBuf,
+    ) {
         let dir = temp_index_dir(label);
         let cache = make_cache_with_fallback_seed(&dir, V2_DIM);
         let binding = v2_binding(bundle, sequence);

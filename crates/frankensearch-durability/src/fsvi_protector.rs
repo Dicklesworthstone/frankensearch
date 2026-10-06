@@ -469,9 +469,8 @@ impl FsviProtector {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
     use fsqlite_types::cx::Cx;
@@ -610,15 +609,35 @@ mod tests {
         }
     }
 
-    fn temp_path(prefix: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-fsvi-{prefix}-{}-{nanos}.fsvi",
-            std::process::id()
-        ))
+    /// An FSVI path inside a fresh temp directory. The directory, with every
+    /// sidecar, backup or staging file the protector writes next to the FSVI,
+    /// is removed when the guard drops, including when the test panics.
+    struct ScratchPath {
+        _root: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl std::ops::Deref for ScratchPath {
+        type Target = Path;
+
+        fn deref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<Path> for ScratchPath {
+        fn as_ref(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    fn temp_path(prefix: &str) -> ScratchPath {
+        let root = tempfile::Builder::new()
+            .prefix(&format!("frankensearch-fsvi-{prefix}-"))
+            .tempdir()
+            .expect("create temp dir");
+        let path = root.path().join(format!("{prefix}.fsvi"));
+        ScratchPath { _root: root, path }
     }
 
     fn make_protector() -> FsviProtector {
@@ -877,10 +896,6 @@ mod tests {
         // Verify
         let verify = protector.verify(&path).expect("verify");
         assert_eq!(verify, FsviVerifyResult::Intact);
-
-        // Clean up
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&result.sidecar_path);
     }
 
     #[test]
@@ -891,8 +906,6 @@ mod tests {
         std::fs::write(&path, b"data").expect("write");
         let verify = protector.verify(&path).expect("verify");
         assert_eq!(verify, FsviVerifyResult::NoSidecar);
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -902,7 +915,7 @@ mod tests {
 
         let payload = vec![88_u8; 512];
         std::fs::write(&path, &payload).expect("write payload");
-        let protection = protector.protect_atomic(&path).expect("protect");
+        protector.protect_atomic(&path).expect("protect");
 
         std::fs::remove_file(&path).expect("remove source");
 
@@ -919,11 +932,6 @@ mod tests {
 
         let verify_after = protector.verify(&path).expect("verify restored");
         assert_eq!(verify_after, FsviVerifyResult::Intact);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&protection.sidecar_path);
-        let backup = PathBuf::from(format!("{}.corrupted", path.display()));
-        let _ = std::fs::remove_file(&backup);
     }
 
     #[test]
@@ -946,9 +954,6 @@ mod tests {
             matches!(verify, FsviVerifyResult::Corrupted { repairable: false }),
             "expected unrepairable corruption, got {verify:?}"
         );
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&result.sidecar_path);
     }
 
     #[test]
@@ -959,7 +964,7 @@ mod tests {
         let payload = vec![99_u8; 700];
         std::fs::write(&path, &payload).expect("write payload");
 
-        let protection = protector.protect_atomic(&path).expect("protect");
+        protector.protect_atomic(&path).expect("protect");
 
         // Corrupt the file
         std::fs::write(&path, vec![0_u8; 700]).expect("corrupt");
@@ -980,12 +985,6 @@ mod tests {
         // Content is restored
         let restored = std::fs::read(&path).expect("read restored");
         assert_eq!(restored, payload);
-
-        // Clean up
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&protection.sidecar_path);
-        let backup = PathBuf::from(format!("{}.corrupted", path.display()));
-        let _ = std::fs::remove_file(&backup);
     }
 
     #[test]
@@ -995,7 +994,7 @@ mod tests {
 
         let payload = vec![55_u8; 500];
         std::fs::write(&path, &payload).expect("write");
-        let protection = protector.protect_atomic(&path).expect("protect");
+        protector.protect_atomic(&path).expect("protect");
 
         // Healthy file
         assert!(protector.verify_and_repair(&path).expect("healthy"));
@@ -1007,12 +1006,6 @@ mod tests {
         // Verify content restored
         let restored = std::fs::read(&path).expect("read");
         assert_eq!(restored, payload);
-
-        // Clean up
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&protection.sidecar_path);
-        let backup = PathBuf::from(format!("{}.corrupted", path.display()));
-        let _ = std::fs::remove_file(&backup);
     }
 
     #[test]
@@ -1025,10 +1018,6 @@ mod tests {
 
         let snap = protector.metrics_snapshot();
         assert!(snap.encode_ops >= 1);
-
-        let sidecar = FsviProtector::sidecar_path(&path);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&sidecar);
     }
 
     #[test]
@@ -1051,10 +1040,6 @@ mod tests {
 
         let verify = protector.verify(&path).expect("verify after replace");
         assert_eq!(verify, FsviVerifyResult::Intact);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&sidecar);
-        let _ = std::fs::remove_file(PathBuf::from(format!("{}.bak", sidecar.display())));
     }
 
     // ─── bd-c2u4 tests begin ───
@@ -1194,8 +1179,6 @@ mod tests {
         assert!(err.is_err());
         let err_str = format!("{}", err.unwrap_err());
         assert!(err_str.contains("no .fec sidecar"));
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1207,8 +1190,6 @@ mod tests {
 
         let result = protector.verify_and_repair(&path).expect("should succeed");
         assert!(!result, "no sidecar should return Ok(false)");
-
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1224,9 +1205,6 @@ mod tests {
         assert_eq!(result.source_size, 1024);
         assert!(result.source_hash != 0);
         assert!(!result.encode_time.is_zero() || result.encode_time == std::time::Duration::ZERO);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&result.sidecar_path);
     }
 
     #[test]
@@ -1243,10 +1221,6 @@ mod tests {
             (result.overhead_ratio - 0.0).abs() < f32::EPSILON,
             "empty file should have 0.0 overhead_ratio"
         );
-
-        let sidecar = FsviProtector::sidecar_path(&path);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&sidecar);
     }
 
     #[test]
@@ -1256,7 +1230,7 @@ mod tests {
 
         let payload = vec![77_u8; 600];
         std::fs::write(&path, &payload).expect("write");
-        let protection = protector.protect_atomic(&path).expect("protect");
+        protector.protect_atomic(&path).expect("protect");
 
         // Corrupt
         std::fs::write(&path, vec![0_u8; 600]).expect("corrupt");
@@ -1267,11 +1241,6 @@ mod tests {
             "corrupted vs repaired hashes should differ"
         );
         assert!(repair.bytes_written > 0);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&protection.sidecar_path);
-        let backup = PathBuf::from(format!("{}.corrupted", path.display()));
-        let _ = std::fs::remove_file(&backup);
     }
 
     #[test]
@@ -1291,11 +1260,6 @@ mod tests {
             hash1, hash2,
             "different payloads should produce different hashes"
         );
-
-        let sidecar = FsviProtector::sidecar_path(&path);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&sidecar);
-        let _ = std::fs::remove_file(PathBuf::from(format!("{}.bak", sidecar.display())));
     }
 
     #[test]
@@ -1314,11 +1278,6 @@ mod tests {
             "expected at least 3 encode ops, got {}",
             snap.encode_ops
         );
-
-        let sidecar = FsviProtector::sidecar_path(&path);
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&sidecar);
-        let _ = std::fs::remove_file(PathBuf::from(format!("{}.bak", sidecar.display())));
     }
 
     #[test]

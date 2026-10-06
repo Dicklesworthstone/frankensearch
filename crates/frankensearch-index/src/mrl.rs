@@ -675,23 +675,14 @@ impl VectorIndex {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     use frankensearch_core::PredicateFilter;
 
     use super::*;
+    use crate::test_fixtures::TempFixturePath;
     use crate::{Quantization, VectorIndex};
 
-    fn temp_index_path(name: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-index-mrl-{name}-{}-{now}.fsvi",
-            std::process::id()
-        ))
+    fn temp_index_path(name: &str) -> TempFixturePath {
+        TempFixturePath::new(&format!("mrl-{name}"), "index.fsvi")
     }
 
     fn write_index(path: &std::path::Path, rows: &[(&str, Vec<f32>)]) -> SearchResult<()> {
@@ -767,8 +758,6 @@ mod tests {
         assert_eq!(stats.scan_dims, 8);
         assert!(!stats.fell_back_to_full);
         assert!(stats.candidates_rescored > 0);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -815,8 +804,6 @@ mod tests {
             mrl, exact,
             "parallel MRL scan (rescore-all) must equal the exact full-dim top-k"
         );
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Fallback to full search when search_dims >= dimension ────────
@@ -847,8 +834,6 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(stats.fell_back_to_full);
         assert_eq!(stats.scan_dims, dim);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -873,8 +858,6 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert!(stats.fell_back_to_full);
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── search_dims = 0 → error ──────────────────────────────────────
@@ -899,8 +882,6 @@ mod tests {
             .mrl_search(&query, 1, &config, None)
             .expect_err("should reject search_dims=0");
         assert!(matches!(err, SearchError::InvalidConfig { .. }));
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Empty index ──────────────────────────────────────────────────
@@ -927,8 +908,6 @@ mod tests {
             .mrl_search(&query, 10, &config, None)
             .expect("mrl search");
         assert!(hits.is_empty());
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Single vector ────────────────────────────────────────────────
@@ -954,8 +933,6 @@ mod tests {
             .expect("mrl search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "sole-doc");
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Dimension mismatch ───────────────────────────────────────────
@@ -986,8 +963,6 @@ mod tests {
                 found: 4
             }
         ));
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── MRL search matches standard search on same top-1 ────────────
@@ -1022,8 +997,6 @@ mod tests {
             .expect("mrl search");
 
         assert_eq!(standard[0].doc_id, mrl[0].doc_id);
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── SIMD-aligned dims (multiple of 8) ────────────────────────────
@@ -1050,8 +1023,6 @@ mod tests {
             .expect("mrl search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "doc-a");
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Non-aligned search_dims (remainder handling) ─────────────────
@@ -1081,8 +1052,6 @@ mod tests {
             .expect("mrl search");
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "doc-a");
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Filter integration ───────────────────────────────────────────
@@ -1115,8 +1084,6 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.doc_id != "doc-a"));
         assert_eq!(hits[0].doc_id, "doc-b");
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1152,8 +1119,6 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-a");
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Tombstoned records excluded ──────────────────────────────────
@@ -1184,8 +1149,6 @@ mod tests {
 
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-b");
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── WAL entries participate in MRL search ────────────────────────
@@ -1213,9 +1176,6 @@ mod tests {
 
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].doc_id, "doc-wal");
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(crate::wal::wal_path_for(&path)).ok();
     }
 
     // ── rescore_top_k = 0 → defaults to 3x limit ────────────────────
@@ -1294,8 +1254,6 @@ mod tests {
             .mrl_search(&query, 0, &config, None)
             .expect("mrl search");
         assert!(hits.is_empty());
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Verify truncated scan uses only search_dims ──────────────────
@@ -1341,8 +1299,6 @@ mod tests {
         assert_eq!(hits[0].doc_id, "doc-a");
         assert_eq!(stats.scan_dims, 4);
         assert!(!stats.fell_back_to_full);
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ── Multiple results ordered by rescore ───────────────────────────
@@ -1381,8 +1337,6 @@ mod tests {
                 pair[1].score
             );
         }
-
-        std::fs::remove_file(&path).ok();
     }
 
     // ─── bd-2c7e tests begin ───
@@ -1734,8 +1688,6 @@ mod tests {
         assert_eq!(hits[0].doc_id, "doc-a");
         assert!(!stats.fell_back_to_full);
         assert_eq!(stats.scan_dims, 8);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1767,9 +1719,6 @@ mod tests {
 
         assert!(hits.iter().all(|h| h.doc_id != "doc-wal-skip"));
         assert!(hits.iter().any(|h| h.doc_id == "doc-wal-keep"));
-
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_file(crate::wal::wal_path_for(&path)).ok();
     }
 
     #[test]
@@ -1801,8 +1750,6 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(stats.candidates_rescored <= 2);
         assert!(!stats.fell_back_to_full);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1829,8 +1776,6 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(stats.rescore_dims, 12);
         assert_eq!(stats.scan_dims, 4);
-
-        std::fs::remove_file(&path).ok();
     }
 
     #[test]

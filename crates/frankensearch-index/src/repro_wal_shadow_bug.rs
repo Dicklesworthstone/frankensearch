@@ -1,19 +1,11 @@
 #[cfg(test)]
 mod tests {
+    use crate::test_fixtures::TempFixturePath;
     use crate::{Quantization, VectorIndex};
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_index_path(name: &str) -> PathBuf {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        std::env::temp_dir().join(format!(
-            "frankensearch-wal-shadow-repro-{name}-{}-{now}.fsvi",
-            std::process::id()
-        ))
+    fn temp_index_path(name: &str) -> TempFixturePath {
+        TempFixturePath::new(&format!("wal-shadow-repro-{name}"), "index.fsvi")
     }
 
     /// A WAL append that reuses a sealed record's `doc_id` supersedes that
@@ -47,9 +39,6 @@ mod tests {
             "sealed main record leaked past its WAL supersession: score {}",
             hits[0].score
         );
-
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(crate::wal::wal_path_for(&path));
     }
 
     fn crash_window_index(quantization: Quantization) -> (tempfile::TempDir, VectorIndex) {

@@ -154,17 +154,17 @@ impl LexicalRead for StubLexical {
 
 const DIM: usize = 4;
 
-fn build_test_index() -> Arc<TwoTierIndex> {
+fn build_test_index() -> (tempfile::TempDir, Arc<TwoTierIndex>) {
     // A mkdtemp directory, not pid + clock nanos: parallel tests in this binary
     // read the same clock value and then built into one directory, and the
-    // second finish met the first one's generation (seen under load).
+    // second finish met the first one's generation (seen under load). The
+    // returned guard removes it when the test drops it, panics included.
     let dir = tempfile::Builder::new()
         .prefix("frankensearch-integ-interaction-")
         .tempdir()
-        .expect("unique test index directory")
-        .keep();
+        .expect("unique test index directory");
     let mut builder =
-        TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create test index");
+        TwoTierIndex::create(dir.path(), TwoTierConfig::default()).expect("create test index");
     builder.set_fast_embedder_id("stub-fast");
     builder.set_quality_embedder_id("stub-quality");
     for i in 0..10 {
@@ -179,14 +179,15 @@ fn build_test_index() -> Arc<TwoTierIndex> {
             .add_record(format!("doc-{i}"), &vec, Some(&vec))
             .expect("add record");
     }
-    Arc::new(builder.finish().expect("finish test index"))
+    let index = Arc::new(builder.finish().expect("finish test index"));
+    (dir, index)
 }
 
 fn build_searcher_for_lane(
     lane: &InteractionLane,
     tiebreak: Option<RrfTiebreak>,
-) -> (TwoTierSearcher, Arc<TwoTierIndex>) {
-    let index = build_test_index();
+) -> (TwoTierSearcher, Arc<TwoTierIndex>, tempfile::TempDir) {
+    let (index_dir, index) = build_test_index();
     let fast = Arc::new(StubEmbedder::new("fast", DIM));
     let quality = Arc::new(StubEmbedder::new("quality", DIM));
     // Keep lexical present without letting identifier/short-keyword queries
@@ -207,7 +208,7 @@ fn build_searcher_for_lane(
         searcher
     };
 
-    (searcher, index)
+    (searcher, index, index_dir)
 }
 
 #[derive(Debug, Default)]
@@ -418,7 +419,7 @@ async fn run_template_driven_test_with_tiebreak(
 ) -> (LaneTestReport, LaneOracleTemplate) {
     let lane = lane_by_id(lane_id).expect("lane not found");
     let template = oracle_template_for_lane(&lane);
-    let (searcher, _index) = build_searcher_for_lane(&lane, tiebreak);
+    let (searcher, _index, _index_dir) = build_searcher_for_lane(&lane, tiebreak);
     let queries = queries_for_lane(&lane);
     let k = 5;
 
@@ -1533,7 +1534,7 @@ fn initial_then_refined_lanes_always_produce_phase2() {
         );
 
         for lane in refined_lanes {
-            let (searcher, _) = build_searcher_for_lane(lane, None);
+            let (searcher, _, _index_dir) = build_searcher_for_lane(lane, None);
             let queries = queries_for_lane(lane);
             if let Some(fq) = queries.first() {
                 let query = fq.query_for_lane(lane.query_slice.include_negated);
@@ -1578,7 +1579,7 @@ fn maybe_refined_lanes_tolerate_both_outcomes() {
         );
 
         for lane in maybe_lanes {
-            let (searcher, _) = build_searcher_for_lane(lane, None);
+            let (searcher, _, _index_dir) = build_searcher_for_lane(lane, None);
             let queries = queries_for_lane(lane);
             if let Some(fq) = queries.first() {
                 let query = fq.query_for_lane(lane.query_slice.include_negated);

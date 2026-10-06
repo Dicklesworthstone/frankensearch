@@ -24,7 +24,6 @@
 //! `ValidatedFsviBytes::from_arc` owner, so the matrix exercises the shipping
 //! parse/validate path rather than a test-local reimplementation of it.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use frankensearch_core::SearchError;
@@ -77,19 +76,19 @@ const EMPTY_ID_DETAIL: &str = "v2 document ids must not be empty";
 const ID_BOUNDS_DETAIL: &str = "v2 document id extends beyond the bound string table";
 const UNSUPPORTED_FLAGS_DETAIL: &str = "uses unsupported flags";
 
-fn temp_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join("frankensearch_fsvi_v2_corruption_matrix");
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
-
-fn temp_index_path(name: &str) -> PathBuf {
-    temp_dir().join(format!("{name}-{}.fsvi", std::process::id()))
+/// A private temporary directory for one fixture, removed with its contents
+/// when the guard drops, even on panic.
+fn temp_fixture_dir(name: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("frankensearch-index-v2-corruption-{name}-"))
+        .tempdir()
+        .expect("create temp dir")
 }
 
 /// A wide-dimension fixture, needed to reach the slab-SIZE product overflow.
 fn wide_fixture(name: &str, dimension: usize) -> (FsviV2IdentityBinding, Vec<u8>) {
-    let path = temp_index_path(name);
+    let directory = temp_fixture_dir(name);
+    let path = directory.path().join("index.fsvi");
     let identity = binding(
         "v2-corruption-matrix-wide",
         u32::try_from(dimension).expect("dimension fits u32"),
@@ -107,7 +106,6 @@ fn wide_fixture(name: &str, dimension: usize) -> (FsviV2IdentityBinding, Vec<u8>
     }
     writer.finish().expect("finish wide v2 fixture");
     let bytes = std::fs::read(&path).expect("read wide v2 fixture");
-    let _ = std::fs::remove_file(&path);
     (identity, bytes)
 }
 
@@ -135,7 +133,8 @@ fn fixture(name: &str) -> (FsviV2IdentityBinding, Vec<u8>) {
 /// addition can only overflow when that product exceeds the 64-byte alignment
 /// granularity, because the largest aligned offset is `u64::MAX - 63`.
 fn fixture_with_records(name: &str, records: usize) -> (FsviV2IdentityBinding, Vec<u8>) {
-    let path = temp_index_path(name);
+    let directory = temp_fixture_dir(name);
+    let path = directory.path().join("index.fsvi");
     let identity = binding("v2-corruption-matrix", 4, 21, 0xc1);
     let mut writer =
         VectorIndex::create_v2(&path, identity.clone()).expect("create v2 fixture writer");
@@ -148,7 +147,6 @@ fn fixture_with_records(name: &str, records: usize) -> (FsviV2IdentityBinding, V
     }
     writer.finish().expect("finish v2 fixture");
     let bytes = std::fs::read(&path).expect("read v2 fixture");
-    let _ = std::fs::remove_file(&path);
     (identity, bytes)
 }
 

@@ -558,10 +558,8 @@ where
 mod tests {
     use std::panic::{self, AssertUnwindSafe};
     use std::path::{Path, PathBuf};
-    use std::process;
     use std::sync::{Arc, Barrier, mpsc};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch_core::{SearchError, SearchResult};
     use fsqlite::FrankenError;
@@ -573,40 +571,29 @@ mod tests {
 
     use super::{Storage, StorageConfig};
 
+    /// A database path inside a fresh temp directory. Dropping the guard
+    /// removes the directory, and with it every sidecar the engine writes next
+    /// to the database (WAL, SHM, wal-cert, namespace gates, migration state),
+    /// including when the test panics.
     struct TempDbPath {
+        _dir: tempfile::TempDir,
         path: PathBuf,
     }
 
     impl TempDbPath {
         fn new(tag: &str) -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after unix epoch")
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "frankensearch-storage-{tag}-{}-{nanos}.sqlite3",
-                process::id()
-            ));
-            Self { path }
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("frankensearch-storage-{tag}-"))
+                .tempdir()
+                .expect("create temp db dir");
+            let path = dir.path().join(format!("{tag}.sqlite3"));
+            Self { _dir: dir, path }
         }
 
         fn config(&self) -> StorageConfig {
             StorageConfig {
                 db_path: self.path.clone(),
                 ..StorageConfig::default()
-            }
-        }
-    }
-
-    impl Drop for TempDbPath {
-        fn drop(&mut self) {
-            for suffix in ["", "-wal", "-shm"] {
-                let candidate = if suffix.is_empty() {
-                    self.path.clone()
-                } else {
-                    PathBuf::from(format!("{}{}", self.path.display(), suffix))
-                };
-                let _ = std::fs::remove_file(candidate);
             }
         }
     }

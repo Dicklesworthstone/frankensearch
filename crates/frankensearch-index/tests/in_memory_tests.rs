@@ -1,7 +1,6 @@
 //! Integration tests for in-memory vector and two-tier index APIs.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, VectorHit};
@@ -9,17 +8,30 @@ use frankensearch_index::{
     InMemoryTwoTierIndex, InMemoryVectorIndex, Quantization, SearchParams, VectorIndex,
 };
 
-fn temp_index_path(name: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join("frankensearch_in_memory_integration_tests");
-    std::fs::create_dir_all(&dir).expect("create test dir");
-    dir.join(format!("{name}-{nonce}.fsvi"))
+/// An index path in its own private temporary directory; the directory (WAL
+/// sidecar included) is removed when the guard drops, even on panic.
+struct TempIndexPath {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
 }
 
-fn cleanup(path: &Path) {
-    let _ = std::fs::remove_file(path);
-    let _ = std::fs::remove_file(path.with_extension("fsvi.wal"));
+impl std::ops::Deref for TempIndexPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn temp_index_path(name: &str) -> TempIndexPath {
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("frankensearch-index-{name}-"))
+        .tempdir()
+        .expect("create test dir");
+    TempIndexPath {
+        path: directory.path().join("index.fsvi"),
+        _directory: directory,
+    }
 }
 
 fn normalize(values: Vec<f32>) -> Vec<f32> {
@@ -46,7 +58,6 @@ fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
 #[test]
 fn from_fsvi_matches_file_backed_top_k() {
     let path = temp_index_path("from_fsvi_parity");
-    cleanup(&path);
 
     let dim = 64;
     let doc_count = 96usize;
@@ -90,8 +101,6 @@ fn from_fsvi_matches_file_backed_top_k() {
             memory.score
         );
     }
-
-    cleanup(&path);
 }
 
 #[test]
