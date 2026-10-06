@@ -16,9 +16,7 @@ use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
-use super::super::super::{
-    FSFS_DAEMON_RESPONSE_MAX_BYTES, LiveRetainedSearchReader, SearchExecutionMode,
-};
+use super::super::super::{FSFS_DAEMON_RESPONSE_MAX_BYTES, LiveRetainedSearchReader};
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FsfsRuntime, PeerOutcome, SearchExecutionFlags,
     complete_cli_error, control, encode_response, pressure_timestamp_ms,
@@ -331,12 +329,15 @@ async fn execute(
     query_runtime.cli_input.overrides.rerank = Some(query_runtime.config.search.rerank);
     query_runtime.config.search.explain = request.search.explain;
     query_runtime.cli_input.overrides.explain = Some(request.search.explain);
+    // The daemon applies its own degradation override to every client, as
+    // the legacy query daemon does.
+    let mode = session.reader.search_mode()?;
     let mut phases = Box::pin(
         query_runtime.execute_search_phase_artifacts_with_mode_using_resources(
             cx,
             &request.search.query,
             request.search.limit,
-            SearchExecutionMode::Full,
+            mode,
             &mut session.reader.resources,
             SearchExecutionFlags {
                 include_snippets: true,

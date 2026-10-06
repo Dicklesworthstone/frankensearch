@@ -18,6 +18,13 @@ Provision verified semantic models as for ordinary indexing. This route does not
 turn a missing model into a hash fallback, bypass producer checks, or repair old
 vectors merely because a new model is installed.
 
+The model-free lite build (`--no-default-features`, the MUSL and Intel macOS
+release assets) publishes lexical-only generations with no vector tier. As on
+the legacy layout, its searches run lexical-only, `append-batch` and `delete`
+change keyword rows and membership only, and `compact` reports nothing to
+compact and publishes nothing. `pressure.degradation_override` narrows or
+refuses searches here as it does on the legacy layout.
+
 ## Build and query
 
 Opt in for the initial build (the longer `FRANKENSEARCH_COMPLETE_GENERATIONS`

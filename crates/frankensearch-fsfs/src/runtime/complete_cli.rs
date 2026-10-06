@@ -737,29 +737,38 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         let (publication, mut payload) = self.compact_retained_generation(cx, root).await?;
-        let generation = require_durable_publication(publication)?;
-        let retention = self.retire_superseded_generations(cx, root);
+        let generation = publication.map(require_durable_publication).transpose()?;
+        let retention = generation
+            .as_ref()
+            .map(|_| self.retire_superseded_generations(cx, root));
         if self.cli_input.format == OutputFormat::Table {
+            let (Some(generation), Some(retention)) = (&generation, &retention) else {
+                writeln!(writer, "{}", Self::lexical_only_compact_report().0)?;
+                return writer.flush().map_err(SearchError::Io);
+            };
             writeln!(
                 writer,
                 "Compacted all present vector tiers into an isolated successor"
             )?;
             return self.emit_complete_generation_receipt(
                 root,
-                &generation,
+                generation,
                 "compact",
-                &retention,
+                retention,
                 None,
                 writer,
             );
         }
-        payload["retention"] = retention.to_json();
-        payload["generation_id"] = serde_json::json!(generation.id());
-        payload["generation_path"] = serde_json::json!(generation.path());
-        payload["store_root"] = serde_json::json!(root);
-        payload["manifest_sha256"] = serde_json::json!(generation.manifest_sha256());
-        payload["publication"] = serde_json::json!("durable");
-        payload["generation_complete"] = serde_json::json!(true);
+        payload["generation_changed"] = serde_json::json!(generation.is_some());
+        if let (Some(generation), Some(retention)) = (&generation, &retention) {
+            payload["retention"] = retention.to_json();
+            payload["generation_id"] = serde_json::json!(generation.id());
+            payload["generation_path"] = serde_json::json!(generation.path());
+            payload["store_root"] = serde_json::json!(root);
+            payload["manifest_sha256"] = serde_json::json!(generation.manifest_sha256());
+            payload["publication"] = serde_json::json!("durable");
+            payload["generation_complete"] = serde_json::json!(true);
+        }
         let envelope = OutputEnvelope::success(
             payload,
             meta_for_format("compact", self.cli_input.format),
@@ -937,13 +946,14 @@ impl FsfsRuntime {
                 )
                 .await;
         }
+        let mode = reader.search_mode()?;
         let mut artifacts = reader
             .runtime
             .execute_search_phase_artifacts_with_mode_using_resources(
                 cx,
                 query,
                 limit,
-                super::SearchExecutionMode::Full,
+                mode,
                 &mut reader.resources,
                 SearchExecutionFlags {
                     include_snippets: true,
@@ -1014,13 +1024,14 @@ impl FsfsRuntime {
                 }
                 Ok(())
             };
+            let mode = reader.search_mode()?;
             let original = reader
                 .runtime
                 .execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
                     limit,
-                    super::SearchExecutionMode::Full,
+                    mode,
                     &mut reader.resources,
                     SearchExecutionFlags {
                         include_snippets: true,
@@ -1096,6 +1107,7 @@ impl FsfsRuntime {
         queries: &[crate::query_expansion::ExpandedQuery],
     ) -> SearchResult<crate::output_schema::SearchPayload> {
         retained_search_checkpoint(cx)?;
+        let mode = reader.search_mode()?;
         if queries.len() <= 1 {
             let mut artifacts = reader
                 .runtime
@@ -1103,7 +1115,7 @@ impl FsfsRuntime {
                     cx,
                     query,
                     limit,
-                    super::SearchExecutionMode::Full,
+                    mode,
                     &mut reader.resources,
                     SearchExecutionFlags {
                         include_snippets: true,
@@ -1139,7 +1151,7 @@ impl FsfsRuntime {
         Self::validate_search_generation_fingerprint(
             &reader.resources.index_root,
             &fingerprint,
-            super::SearchExecutionMode::Full,
+            mode,
         )?;
         let mut payload = Self::fuse_expanded_payloads(
             query,
@@ -1725,6 +1737,19 @@ mod tests {
         runtime.clone().with_cli_input(input)
     }
 
+    async fn search_under_override(
+        runtime: &FsfsRuntime,
+        cx: &Cx,
+        root: &Path,
+        mode: crate::config::DegradationOverrideMode,
+    ) -> SearchResult<serde_json::Value> {
+        let mut search = search_runtime(runtime);
+        search.config.pressure.degradation_override = mode;
+        let mut output = Vec::new();
+        Box::pin(search.run_complete_generation_search_with_writer(cx, root, &mut output)).await?;
+        Ok(serde_json::from_slice(&output).unwrap())
+    }
+
     async fn publish(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> serde_json::Value {
         let mut output = Vec::new();
         runtime
@@ -2063,6 +2088,158 @@ mod tests {
             assert!(
                 matches!(&error, SearchError::Io(io) if io.kind() == ErrorKind::ConnectionRefused),
                 "{error:?}"
+            );
+        });
+    }
+
+    /// As on the legacy layout (`degradation_override_caps_search_and_pauses_writes`),
+    /// a search runs in the mode `pressure.degradation_override` allows:
+    /// lexical-only drops the semantic lane (and opens no vector tier),
+    /// metadata-only and paused refuse. A build without semantic loaders runs
+    /// every search lexical-only the same way.
+    #[test]
+    fn complete_search_runs_in_the_mode_the_degradation_override_allows() {
+        use crate::config::DegradationOverrideMode;
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let refused_by_override = |error: &SearchError| {
+                matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == "pressure.degradation_override")
+            };
+
+            let auto = search_under_override(&runtime, &cx, &root, DegradationOverrideMode::Auto)
+                .await
+                .unwrap();
+            assert_ne!(auto["data"]["skip_reason"], "lexical_only", "{auto}");
+            assert!(auto["data"]["vector_generation_id"].is_string(), "{auto}");
+            let lexical = search_under_override(
+                &runtime,
+                &cx,
+                &root,
+                DegradationOverrideMode::ForceLexicalOnly,
+            )
+            .await
+            .unwrap();
+            assert_eq!(lexical["data"]["skip_reason"], "lexical_only", "{lexical}");
+            // The lexical-only reader never opened the vector tier.
+            assert!(lexical["data"]["vector_generation_id"].is_null(), "{lexical}");
+            let hits = lexical["data"]["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 1, "{lexical}");
+            assert!(
+                hits.iter().all(|hit| hit
+                    .get("semantic_rank")
+                    .is_none_or(serde_json::Value::is_null)),
+                "{lexical}"
+            );
+            let refused = search_under_override(
+                &runtime,
+                &cx,
+                &root,
+                DegradationOverrideMode::ForceMetadataOnly,
+            )
+            .await
+            .unwrap_err();
+            assert!(refused_by_override(&refused), "{refused:?}");
+
+            // The library reader applies its opening runtime's override too.
+            let mut paused = search_runtime(&runtime);
+            paused.config.pressure.degradation_override = DegradationOverrideMode::ForcePaused;
+            let refused = paused
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap()
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap_err();
+            assert!(refused_by_override(&refused), "{refused:?}");
+            let mut lexical_reader = search_runtime(&runtime);
+            lexical_reader.config.pressure.degradation_override =
+                DegradationOverrideMode::ForceLexicalOnly;
+            let payloads = lexical_reader
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap()
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap();
+            let last = payloads.last().unwrap();
+            assert_eq!(last.skip_reason.as_deref(), Some("lexical_only"));
+            assert_eq!(last.hits.len(), 1);
+        });
+    }
+
+    /// A build without semantic loaders publishes lexical-only generations (no
+    /// vector tier). Its searches run lexical-only and serve them; `append-batch`
+    /// adds keyword rows and the successor stays lexical-only; `compact` has
+    /// nothing to do and publishes nothing, all as on the legacy layout. A
+    /// semantic search still refuses the generation, as on the legacy layout.
+    #[test]
+    fn complete_lexical_only_generation_serves_search_append_and_compact() {
+        use crate::config::DegradationOverrideMode::{Auto, ForceLexicalOnly};
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let receipt = publish(&runtime.clone().with_lexical_only_indexing(), &cx, &root).await;
+            assert!(receipt["data"]["vector_generation"].is_null(), "{receipt}");
+            let served = search_under_override(&runtime, &cx, &root, ForceLexicalOnly)
+                .await
+                .unwrap();
+            assert_eq!(served["data"]["hits"][0]["path"], "alpha.md", "{served}");
+            let missing = search_under_override(&runtime, &cx, &root, Auto)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(missing, SearchError::IndexNotFound { .. }),
+                "{missing:?}"
+            );
+
+            let batch = directory.path().join("append.jsonl");
+            fs::write(&batch, r#"{"id":"notes/kiwi.md","text":"sharedtoken kiwi birds"}"#)
+                .unwrap();
+            let mut append = runtime.clone();
+            append.cli_input.command = CliCommand::AppendBatch;
+            append.cli_input.input_file = Some(batch);
+            let mut output = Vec::new();
+            Box::pin(append.run_complete_generation_append_batch_with_writer(
+                &cx,
+                &root,
+                &mut output,
+            ))
+            .await
+            .unwrap();
+            let appended: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(appended["data"]["appended"], 1, "{appended}");
+            assert_eq!(appended["data"]["generation_changed"], true, "{appended}");
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let active = store.active(&cx).unwrap().unwrap();
+            assert!(FsfsRuntime::is_lexical_only_generation(active.path()));
+            let served = search_under_override(&runtime, &cx, &root, ForceLexicalOnly)
+                .await
+                .unwrap();
+            let mut paths = served["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hit| hit["path"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            paths.sort_unstable();
+            assert_eq!(paths, ["alpha.md", "notes/kiwi.md"], "{served}");
+
+            let mut output = Vec::new();
+            Box::pin(runtime.run_complete_generation_compact_with_writer(&cx, &root, &mut output))
+                .await
+                .unwrap();
+            let compacted: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(compacted["data"]["lexical_only"], true, "{compacted}");
+            assert_eq!(compacted["data"]["generation_changed"], false, "{compacted}");
+            assert_eq!(
+                store.active(&cx).unwrap().unwrap().id(),
+                active.id(),
+                "nothing was published"
             );
         });
     }

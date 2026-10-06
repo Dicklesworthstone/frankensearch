@@ -45,7 +45,9 @@
 #   quickstart scripts/check_fsfs_executable_quickstart.sh against the freshly built binary
 #   lite       the model-free `--no-default-features` binary (every musl and Intel macOS
 #              release asset) indexes, searches and deletes lexically from a pristine
-#              home; it shipped through 1.12.1 unable to index or search (bd-636yz)
+#              home; it shipped through 1.12.1 unable to index or search (bd-636yz).
+#              It also appends and compacts on the complete-generation layout, which
+#              it could index but not search through 1.12.3
 #
 # Environment:
 #   QUALITY_GATE_STAGES        comma list to run (default: stock stages plus quill;
@@ -243,6 +245,55 @@ sys.exit(not (d["skip_reason"] == "lexical_only" and d["hits"] and d["hits"][0][
 d = json.load(sys.stdin)["data"]
 sys.exit(bool(d["hits"]))'; then
     printf 'lite search after delete still matched:\n%s\n' "$out"
+    return 1
+  fi
+  # The complete-generation layout: through 1.12.3 a lite build indexed into it,
+  # but search and compact refused the generation for its missing vector tier
+  # and append-batch for its missing embedder.
+  lite_complete() {
+    (cd "$work/proj" && env -i HOME="$work/home" PATH=/usr/bin:/bin TMPDIR="$TMPDIR" \
+      XDG_RUNTIME_DIR="$work/rt" FSFS_COMPLETE_GENERATIONS=1 \
+      "$work/fsfs" "$@" --index-dir "$work/store" --format json 2>&1)
+  }
+  if ! out="$(lite_complete index .)" \
+    || ! printf '%s' "$out" | python3 -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+sys.exit(not (d["publication"] == "durable" and d["indexed_files"] == 2 and d["vector_generation"] is None))'; then
+    printf 'lite complete-generation index failed:\n%s\n' "$out"
+    return 1
+  fi
+  if ! out="$(lite_complete search quokka --no-daemon)" \
+    || ! printf '%s' "$out" | python3 -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+sys.exit(not (d["skip_reason"] == "lexical_only" and d["hits"] and d["hits"][0]["path"] == "src/lib.rs"))'; then
+    printf 'lite complete-generation search failed:\n%s\n' "$out"
+    return 1
+  fi
+  printf '%s\n' '{"id":"notes/kiwi.md","text":"Kiwi birds cannot fly."}' >"$work/append.jsonl"
+  if ! out="$(lite_complete append-batch --file "$work/append.jsonl")" \
+    || ! out="$(lite_complete search kiwi --no-daemon)" \
+    || ! printf '%s' "$out" | python3 -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+sys.exit(not (d["hits"] and d["hits"][0]["path"] == "notes/kiwi.md"))'; then
+    printf 'lite complete-generation append-batch failed:\n%s\n' "$out"
+    return 1
+  fi
+  if ! out="$(lite_complete compact)" \
+    || ! printf '%s' "$out" | python3 -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+sys.exit(not (d["lexical_only"] and not d["generation_changed"]))'; then
+    printf 'lite complete-generation compact failed:\n%s\n' "$out"
+    return 1
+  fi
+  if ! out="$(lite_complete delete src/lib.rs)"; then
+    printf 'lite complete-generation delete failed:\n%s\n' "$out"
+    return 1
+  fi
+  if ! out="$(lite_complete search quokka --no-daemon)" \
+    || ! printf '%s' "$out" | python3 -c 'import json,sys
+d = json.load(sys.stdin)["data"]
+sys.exit(bool(d["hits"]))'; then
+    printf 'lite complete-generation search after delete still matched:\n%s\n' "$out"
     return 1
   fi
   rm -rf "$work"

@@ -77,13 +77,14 @@ impl RetainedSearchReader {
         sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPayload>> {
         retained_search_checkpoint(cx)?;
+        let mode = self.search_mode()?;
         let artifacts = Box::pin(
             self.runtime
                 .execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
                     limit,
-                    SearchExecutionMode::Full,
+                    mode,
                     &mut self.resources,
                     SearchExecutionFlags {
                         include_snippets: true,
@@ -97,6 +98,17 @@ impl RetainedSearchReader {
             .into_iter()
             .map(|artifact| artifact.payload)
             .collect())
+    }
+
+    /// The mode a search on this reader runs in, as for a legacy CLI search:
+    /// hybrid, narrowed by the opening runtime's `pressure.degradation_override`
+    /// (which may also refuse search), and lexical-only in a build without
+    /// semantic loaders, whose generations carry no vector tier.
+    fn search_mode(&self) -> SearchResult<SearchExecutionMode> {
+        degraded_search_mode(
+            self.runtime.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )
     }
 }
 
@@ -278,8 +290,9 @@ impl FsfsRuntime {
 
     /// Resolve and open the selected complete generation once for repeated reads.
     ///
-    /// Bundle hashes are verified before the ordinary full-search admission and
-    /// resource opens. Missing or corrupt selection is an error, never an excuse
+    /// Bundle hashes are verified before the ordinary search admission and
+    /// resource opens, in the mode the runtime's searches run in (lexical-only
+    /// opens no vector tier). Missing or corrupt selection is an error, never an excuse
     /// to fall back to a legacy index or an arbitrary generation directory.
     /// The source store follows the cooperative immutable-directory contract of
     /// `CompleteGenerationStore`; callers must not modify its sealed files.
@@ -322,12 +335,21 @@ impl FsfsRuntime {
         // Retained readers never start a daemon or write a socket/cache under
         // an immutable generation, even when their caller originated in a CLI.
         runtime.cli_input.daemon = false;
+        // Open what this reader's searches read. A lexical-only search (a build
+        // without semantic loaders, or `force_lexical_only`) neither maps nor
+        // admits the vector tiers, as on the legacy layout. An override that
+        // refuses search opens the least; each search then reports the refusal.
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )
+        .unwrap_or(SearchExecutionMode::LexicalOnly);
         let resources = Box::pin(
             runtime.prepare_search_execution_resources_at_root_with_modes(
                 cx,
                 generation.path(),
-                SearchExecutionMode::Full,
-                SearchExecutionMode::Full,
+                mode,
+                mode,
             ),
         )
         .await?;
@@ -449,7 +471,8 @@ impl FsfsRuntime {
     /// vector tier must admit its real producer before embedding; missing or
     /// incompatible quality support refuses the whole batch. Bounded canonical
     /// input drives vectors and catalog identity; complete lexical text remains
-    /// searchable, including content beyond the models' input budget.
+    /// searchable, including content beyond the models' input budget. A
+    /// lexical-only generation has no vector tier and gains keyword rows only.
     /// No source directory is scanned or changed. Empty input publishes nothing.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn append_retained_generation(
@@ -502,7 +525,18 @@ impl FsfsRuntime {
                 )
             })?;
 
-        let window_maximum = Self::fast_window_policy_at_root(predecessor.path())?;
+        // A lexical-only predecessor (built without semantic loaders) has no
+        // vector tier: as on the legacy layout, only keyword rows and membership
+        // change, and nothing is embedded.
+        let lexical_only = Self::is_lexical_only_generation(predecessor.path());
+        let window_maximum = if lexical_only {
+            for id in documents.keys() {
+                semantic_windows::validate_source_id(id)?;
+            }
+            1
+        } else {
+            Self::fast_window_policy_at_root(predecessor.path())?
+        };
         let mut window_plans = BTreeMap::new();
         if window_maximum > 1 {
             for (id, document) in &documents {
@@ -525,8 +559,10 @@ impl FsfsRuntime {
         // Use the same producer-resolution and admission checks as the ordinary
         // appender. Do not borrow a different tier's identity or manufacture
         // vectors from copied producer labels. No mutable mapping spans inference.
-        let fast_embedder = self.resolve_fast_embedder()?;
-        let fast_identity = {
+        let fast = if lexical_only {
+            None
+        } else {
+            let fast_embedder = self.resolve_fast_embedder()?;
             let index =
                 VectorIndex::open_read_only(&predecessor.path().join(FSFS_VECTOR_INDEX_FILE))?;
             semantic_windows::load_mapping(predecessor.path(), &index)?;
@@ -539,7 +575,7 @@ impl FsfsRuntime {
                     reason: "the fast producer identity changed during admission".to_owned(),
                 });
             }
-            identity
+            Some((fast_embedder, identity))
         };
         let quality = if predecessor
             .path()
@@ -572,25 +608,27 @@ impl FsfsRuntime {
         let mut fast_entries = Vec::with_capacity(documents.len());
         let mut quality_entries = Vec::new();
         for (id, document) in &documents {
-            let texts = match window_plans.get(id) {
-                Some(plan) => plan.texts(&document.lexical_text)?,
-                None => vec![document.embedding_text.as_str()],
-            };
-            for (ordinal, text) in texts.into_iter().enumerate() {
-                retained_search_checkpoint(cx)?;
-                let response = fast_embedder.embed_bound(cx, text).await;
-                retained_search_checkpoint(cx)?;
-                let embedding = response?;
-                embedding.validate()?;
-                if embedding.identity != fast_identity {
-                    return Err(SearchError::UnverifiableRemoteSpace {
-                        producer: "fsfs.append_batch.fast".to_owned(),
-                        reason:
-                            "the returned fast embedding does not carry the admitted producer identity"
-                                .to_owned(),
-                    });
+            if let Some((fast_embedder, fast_identity)) = fast.as_ref() {
+                let texts = match window_plans.get(id) {
+                    Some(plan) => plan.texts(&document.lexical_text)?,
+                    None => vec![document.embedding_text.as_str()],
+                };
+                for (ordinal, text) in texts.into_iter().enumerate() {
+                    retained_search_checkpoint(cx)?;
+                    let response = fast_embedder.embed_bound(cx, text).await;
+                    retained_search_checkpoint(cx)?;
+                    let embedding = response?;
+                    embedding.validate()?;
+                    if &embedding.identity != fast_identity {
+                        return Err(SearchError::UnverifiableRemoteSpace {
+                            producer: "fsfs.append_batch.fast".to_owned(),
+                            reason:
+                                "the returned fast embedding does not carry the admitted producer identity"
+                                    .to_owned(),
+                        });
+                    }
+                    fast_entries.push((semantic_windows::row_id(id, ordinal), embedding.values));
                 }
-                fast_entries.push((semantic_windows::row_id(id, ordinal), embedding.values));
             }
             if let Some((embedder, identity)) = quality.as_ref() {
                 retained_search_checkpoint(cx)?;
@@ -624,6 +662,11 @@ impl FsfsRuntime {
         }
         let candidate_lease = crate::lifecycle::PublicationLease::acquire(build.path())?;
         let timestamp = pressure_timestamp_ms();
+        let ingestion_class = if lexical_only {
+            IngestionClass::LexicalOnly
+        } else {
+            IngestionClass::FullSemanticLexical
+        };
         candidate_lease.fence("complete-generation append lexical mutation")?;
         let lexical_mutations = documents
             .iter()
@@ -631,7 +674,7 @@ impl FsfsRuntime {
                 LexicalMutation::upsert(
                     id.clone(),
                     timestamp,
-                    IngestionClass::FullSemanticLexical,
+                    ingestion_class,
                     document.lexical_text.clone(),
                     "append_batch",
                 )
@@ -641,7 +684,11 @@ impl FsfsRuntime {
             .apply_one_shot_lexical_mutations(cx, build.path(), &lexical_mutations)
             .await?;
         for (relative, embedder, entries) in [
-            (FSFS_VECTOR_INDEX_FILE, Some(&fast_embedder), &fast_entries),
+            (
+                FSFS_VECTOR_INDEX_FILE,
+                fast.as_ref().map(|(embedder, _)| embedder),
+                &fast_entries,
+            ),
             (
                 FSFS_VECTOR_QUALITY_INDEX_FILE,
                 quality.as_ref().map(|(embedder, _)| embedder),
@@ -705,7 +752,9 @@ impl FsfsRuntime {
                     created_at,
                     revision.max(created_at),
                 ))?;
-                storage.mark_embedded(id, fast_embedder.id())?;
+                if let Some((embedder, _)) = fast.as_ref() {
+                    storage.mark_embedded(id, embedder.id())?;
+                }
                 if let Some((embedder, _)) = quality.as_ref() {
                     storage.mark_embedded(id, embedder.id())?;
                 }
@@ -717,8 +766,7 @@ impl FsfsRuntime {
                 IndexManifestEntry {
                     file_key: id.clone(),
                     revision,
-                    ingestion_class: ingestion_class_label(IngestionClass::FullSemanticLexical)
-                        .to_owned(),
+                    ingestion_class: ingestion_class_label(ingestion_class).to_owned(),
                     canonical_bytes: u64::try_from(document.embedding_text.len())
                         .unwrap_or(u64::MAX),
                     reason_code: "append_batch".to_owned(),
@@ -997,14 +1045,15 @@ impl FsfsRuntime {
     /// Compact both vector tiers into a complete successor while old readers
     /// keep their original files. Counts and timings use the ordinary compact
     /// command's payload fields; the caller reports success only after checking
-    /// the returned publication outcome.
+    /// the returned publication outcome. A lexical-only selection has nothing
+    /// to compact and returns no publication.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn compact_retained_generation(
         &self,
         cx: &Cx,
         store_root: &Path,
     ) -> SearchResult<(
-        crate::generation_store::GenerationPublication,
+        Option<crate::generation_store::GenerationPublication>,
         serde_json::Value,
     )> {
         use crate::generation_store::CompleteGenerationStore;
@@ -1012,6 +1061,15 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
         let store = CompleteGenerationStore::open(cx, store_root)?;
+        // A lexical-only generation (built without semantic loaders) has no
+        // vector tier to compact, and its keyword index merges itself: as on
+        // the legacy layout there is nothing to do, so nothing is published.
+        if store
+            .active(cx)?
+            .is_some_and(|active| Self::is_lexical_only_generation(active.path()))
+        {
+            return Ok((None, Self::lexical_only_compact_report().1));
+        }
         let build = store.begin(cx)?;
         let mut input = self.cli_input.clone();
         input.index_dir = Some(build.path().to_path_buf());
@@ -1076,7 +1134,7 @@ impl FsfsRuntime {
         let publication = build.publish(cx, |_, path| {
             Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
         })?;
-        Ok((publication, payload))
+        Ok((Some(publication), payload))
     }
 }
 
@@ -2478,7 +2536,7 @@ mod retained_delete_tests {
                 .compact_retained_generation(&cx, &root)
                 .await
                 .unwrap();
-            let GenerationPublication::Durable(next) = publication else {
+            let Some(GenerationPublication::Durable(next)) = publication else {
                 panic!("compaction must publish durably"); // ubs:ignore — cfg(test) assertion.
             };
             assert_ne!(next.id(), predecessor.id());

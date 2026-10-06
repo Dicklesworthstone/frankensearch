@@ -20385,8 +20385,14 @@ impl FsfsRuntime {
     /// `fsfs compact` on a lexical-only generation: no vector tier holds a WAL
     /// or tombstones, and the keyword index merges its own segments.
     fn run_lexical_only_compact_command(&self) -> SearchResult<()> {
-        self.emit_command_payload(
-            "compact",
+        let (summary, payload) = Self::lexical_only_compact_report();
+        self.emit_command_payload("compact", summary, payload)
+    }
+
+    /// What `fsfs compact` reports, on either layout, for a lexical-only
+    /// generation: its table line and its JSON payload.
+    fn lexical_only_compact_report() -> (&'static str, serde_json::Value) {
+        (
             "nothing to compact: this lexical-only generation has no vector tiers, and its keyword index merges itself",
             serde_json::json!({
                 "main_records_before": 0,
