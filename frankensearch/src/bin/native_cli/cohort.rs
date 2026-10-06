@@ -37,7 +37,49 @@ impl<'a> From<&'a NativeBuiltShardedHybridIndex> for Index<'a> {
     }
 }
 
-impl Index<'_> {
+impl<'a> Index<'a> {
+    fn first(self) -> &'a frankensearch::native_ann::builder::NativeBuiltIndex {
+        match self {
+            Self::Single(index) => index.vectors(),
+            // Native shard admission requires an identity-bearing first
+            // partition, including an explicitly empty complete cohort.
+            Self::Sharded(index) => &index.vectors().partitions()[0],
+        }
+    }
+
+    pub fn document_count(self) -> usize {
+        match self {
+            Self::Single(index) => index.vectors().documents().len(),
+            Self::Sharded(index) => index.vectors().document_count(),
+        }
+    }
+
+    pub fn has_quality(self) -> bool {
+        self.first().quality().is_some()
+    }
+
+    pub fn producers(self) -> SearchResult<(String, Option<String>)> {
+        let first = self.first();
+        Ok((
+            first.fast().embedder().identity()?.fingerprint(),
+            first.quality().map(|tier| tier.embedder().identity().map(|identity| identity.fingerprint())).transpose()?,
+        ))
+    }
+
+    pub fn all_native_hnsw(self, quality: bool) -> bool {
+        let present = |partition: &frankensearch::native_ann::builder::NativeBuiltIndex| {
+            if quality {
+                partition.quality().is_some_and(|tier| tier.graph_path().is_some())
+            } else {
+                partition.fast().graph_path().is_some()
+            }
+        };
+        match self {
+            Self::Single(index) => present(index.vectors()),
+            Self::Sharded(index) => index.vectors().partitions().iter().all(present),
+        }
+    }
+
     pub fn generation(self) -> ArtifactGenerationIdentityV1 {
         match self {
             Self::Single(index) => index.vectors().fast().index().owner_witness().generation,

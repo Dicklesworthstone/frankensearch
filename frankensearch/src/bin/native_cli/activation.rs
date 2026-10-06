@@ -4,13 +4,10 @@
 //! owner starts `serve --allow-activation`. No path is read on a refused request.
 //! Existing native live admission owns producer joins and atomic installation.
 
-use frankensearch::native_ann::builder::NativeHybridReopenLimits;
-use frankensearch::native_ann::builder::live::NativeHybridSnapshot;
-
-use super::{NativeLiveHybridIndex, validate_id};
+use super::validate_id;
 use crate::{
-    ArtifactGenerationIdentityV1, Cx, Deserialize, GenerationComponentReceiptV1, MAX_DOCUMENTS,
-    Path, PathBuf, Result, SCHEMA, Selection, Write, bad, emit,
+    ArtifactGenerationIdentityV1, Cx, Deserialize,
+    Path, PathBuf, Result, SCHEMA, Selection, Write, bad, emit, live,
 };
 
 #[derive(Debug, Deserialize)]
@@ -42,12 +39,12 @@ impl Request {
 }
 
 async fn install(
-    live: &NativeLiveHybridIndex,
-    base: &NativeHybridSnapshot,
+    live: live::Live<'_>,
+    base: &live::Snapshot,
     cx: &Cx,
     receipt: &Path,
     expected: ArtifactGenerationIdentityV1,
-) -> Result<NativeHybridSnapshot> {
+) -> Result<live::Snapshot> {
     cx.checkpoint()
         .map_err(|_| bad("native activation cancelled"))?;
     expected.validate()?;
@@ -72,47 +69,23 @@ async fn install(
             "activation requires a strictly newer generation; rollback and same-generation replay are refused",
         ));
     }
-    let vectors = base.index().vectors();
-    if vectors.fast().embedder().identity()?.fingerprint() != selection.fast_producer
-        || vectors
-            .quality()
-            .map(|tier| {
-                tier.embedder()
-                    .identity()
-                    .map(|identity| identity.fingerprint())
-            })
-            .transpose()?
-            != selection.quality_producer
+    let (fast_producer, quality_producer) = base.index().producers()?;
+    if fast_producer != selection.fast_producer
+        || quality_producer != selection.quality_producer
     {
         return Err(bad(
             "activation must preserve the retained producers and quality-tier presence",
         ));
     }
-    let snapshot_receipt = GenerationComponentReceiptV1 {
-        byte_len: selection.snapshot.byte_len,
-        sha256: selection.snapshot.sha256,
-    };
-    let mut limits = NativeHybridReopenLimits::default();
-    limits.vectors.max_documents = MAX_DOCUMENTS;
-    let candidate = base
-        .prepare_selected(cx, &selection.directory, &snapshot_receipt, limits)
-        .await?;
-    let admitted = candidate.index().vectors();
-    if admitted.documents().len() != selection.documents
-        || admitted.fast().index().owner_witness().generation != selection.generation
-    {
-        return Err(bad(
-            "admitted successor differs from the trusted receipt; serving selection unchanged",
-        ));
-    }
+    let candidate = base.prepare_selected(cx, &selection).await?;
     // install checks the *same predecessor Arc* under the cancel-aware write
     // lock. A concurrently prepared successor cannot win by sequence alone.
     // There is no cancellation point after successful installation.
-    Ok(live.install(cx, &candidate).await?)
+    live.install(cx, &candidate).await
 }
 
 pub(super) async fn execute<W: Write>(
-    live: &NativeLiveHybridIndex,
+    live: live::Live<'_>,
     cx: &Cx,
     request: &Request,
     ordinal: u64,
@@ -134,18 +107,20 @@ pub(super) async fn execute<W: Write>(
     }.await;
     let payload = match outcome {
         Ok(snapshot) => {
-            let vectors = snapshot.index().vectors();
-            serde_json::json!({
+            let index = snapshot.index();
+            let mut payload = serde_json::json!({
                 "schema": SCHEMA, "event": "terminal", "operation": request.operation(),
                 "ok": true, "status": "complete", "request": ordinal,
                 "id": request.id(), "seq": 0, "partial_results": false,
                 "generation": snapshot.generation(), "previous_generation": base.generation(),
                 "selection_changed": matches!(request, Request::Activate { .. }),
                 "activation_scope": "process_local", "activation_enabled": allow_activation,
-                "documents": vectors.documents().len(), "quality": vectors.quality().is_some(),
-                "fast_native_hnsw": vectors.fast().graph_path().is_some(),
-                "quality_native_hnsw": vectors.quality().is_some_and(|tier| tier.graph_path().is_some()),
-            })
+                "documents": index.document_count(), "quality": index.has_quality(),
+                "fast_native_hnsw": index.all_native_hnsw(false),
+                "quality_native_hnsw": index.all_native_hnsw(true),
+            });
+            index.annotate(&mut payload);
+            payload
         }
         Err(error) => serde_json::json!({
             "schema": SCHEMA, "event": "terminal", "operation": request.operation(),

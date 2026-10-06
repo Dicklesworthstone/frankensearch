@@ -68,10 +68,10 @@ complete generation; a rank number is never a physical row or partition number.
 No coordinate is synthesized for a lane that did not retrieve the document.
 Unpartitioned queries retain their existing output fields and shapes.
 
-This increment supports partitioned indexing and buffered/streamed search.
-Warm serving, command-level mutation and source recovery for partitioned
-receipts are not yet enabled here. The corresponding library lifecycle APIs
-remain available. This does not change default fsfs behavior or its generation
+Partitioned indexing, buffered/streamed search and warm serving with explicit
+external activation are supported. Command-level source mutation and source
+recovery for partitioned receipts are not yet enabled here. The corresponding
+library lifecycle APIs remain available. This does not change default fsfs behavior or its generation
 authority, create a durable CURRENT selector, establish persistent antirollback,
 or authorize removing predecessors.
 
@@ -87,3 +87,52 @@ Focused deterministic regressions (no model files required):
 cargo test -p frankensearch --features hybrid --bin frankensearch-native \
   sharded::tests
 ```
+
+## Warm serving and activation
+
+`serve --receipt SHARDED_JSON` opens every selected partition and the global
+Quill reader once, then reuses those owners and the loaded models for subsequent
+JSONL requests. It uses the same bounded input loop, query parser, filter
+intersection, progressive framing, total deadlines and output-failure policy as
+the ordinary server. There is no separate sharded network service or protocol.
+
+```sh
+frankensearch-native serve \
+  --receipt /absolute/receipts/g1.json \
+  --model-dir /absolute/models \
+  --allow-activation --timeout-ms 5000
+```
+
+The existing `op: "status"` control reports the current generation, document
+count and required quality presence, plus `layout: "sharded"` and `partitions`.
+The native-HNSW booleans are true only when every partition of that tier has a
+graph; they do not mean that a mixed native/exact tier is wholly native.
+
+An `op: "activate"` request requires the complete exact `expected_generation`
+from ready/status (including its actual nonce) and the absolute path of a trusted
+successor receipt. Activation is refused unless `--allow-activation` was given.
+The selected receipt must use the same layout and original per-tier producers.
+Prepare a higher-generation successor through the existing sharded library
+update/seal APIs, retaining its complete hybrid receipt; ordinary `index` starts
+a fresh generation sequence and does not imply successor lineage.
+
+Admission reopens all selected sources, vectors, native graphs and global
+Quill through the original loaded models and resource limits. It does not run
+inference, discover directories, change models, repair missing shards or fall
+back to an ordinary index. The exact-predecessor live API installs the complete
+candidate only after admission. Failed admission leaves the old head available;
+a concurrently superseded predecessor is refused at installation.
+
+Each query pins once through final delivery. Its scope, reranker text and both
+row maps remain on that generation after activation. Subsequent queries obtain
+the successor and recompute requested source scopes. Serving is sequential, so
+admission delays later stdin requests; this is not a concurrent request server.
+Output failure after activation stops input consumption without undoing the
+installed generation or adding a contradictory failure frame. Reconcile a lost
+acknowledgement through status rather than replaying a stale predecessor.
+
+Activation grants no source-writing permission. `--allow-updates` is currently
+refused for a sharded server before emitting ready, and update controls without
+that grant perform no path access or inference. The ordinary server's source
+transaction protocol is unchanged. All activation remains process-local: no
+durable CURRENT switch, restart selector or persistent antirollback is added.

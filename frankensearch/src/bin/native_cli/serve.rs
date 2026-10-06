@@ -8,7 +8,7 @@ use super::cohort::Phase as NativeSearchPhase;
 
 use super::{
     ArtifactGenerationIdentityV1, BufRead, Cx, Deserialize, Error, Mode,
-    Read, Result, SCHEMA, Write, bad, cohort, emit, filter, query, validate_query,
+    Read, Result, SCHEMA, Write, bad, cohort, emit, filter, live, query, validate_query,
 };
 
 #[path = "activation.rs"]
@@ -229,7 +229,7 @@ fn result_frame(
 /// failure returns Err and must stop the process, even when more input exists.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_one<'i, W: Write>(
-    index: impl Into<cohort::Index<'i>>,
+    index: impl Into<cohort::Index<'i>> + Send,
     cx: &Cx,
     request: &Request,
     ordinal: u64,
@@ -290,8 +290,8 @@ pub async fn stream_one<'i, W: Write>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn run_with_controls<R: BufRead, W: Write>(
-    live: &NativeLiveHybridIndex,
+pub async fn run_with_controls<'l, R: BufRead, W: Write>(
+    live: impl Into<live::Live<'l>> + Send,
     cx: &Cx,
     input: &mut R,
     output: &mut W,
@@ -300,21 +300,23 @@ pub async fn run_with_controls<R: BufRead, W: Write>(
     base_filter: Option<&filter::Filter>,
     policy: &query::Policy,
 ) -> Result<()> {
+    let live = live.into();
     cx.checkpoint()
         .map_err(|_| bad("native serving cancelled"))?;
+    if controls.updates && matches!(live, live::Live::Sharded(_)) {
+        return Err(bad("sharded source updates are not exposed by the stdin protocol yet; use a complete library-built successor and --allow-activation"));
+    }
     if let Some(filter) = base_filter {
         filter.validate()?;
     }
     let initial = live.snapshot(cx).await?;
     let index = initial.index();
-    emit(
-        output,
-        &serde_json::json!({
+    let mut ready = serde_json::json!({
             "schema": SCHEMA, "event": "ready", "ok": true,
-            "generation": index.vectors().fast().index().owner_witness().generation,
-            "documents": index.vectors().documents().len(),
-            "quality": index.vectors().quality().is_some(),
-            "fast_native_hnsw": index.vectors().fast().graph_path().is_some(),
+            "generation": index.generation(),
+            "documents": index.document_count(),
+            "quality": index.has_quality(),
+            "fast_native_hnsw": index.all_native_hnsw(false),
             "activation_enabled": controls.activation,
             "updates_enabled": controls.updates,
             "update_max_mutations": warm_update::MAX_MUTATIONS,
@@ -322,8 +324,9 @@ pub async fn run_with_controls<R: BufRead, W: Write>(
             "maximum_timeout_ms": policy.maximum_ms(),
             "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
             "rerank_window": policy.rerank.as_ref().map(|r| r.window),
-        }),
-    )?;
+        });
+    index.annotate(&mut ready);
+    emit(output, &ready)?;
     drop(initial);
     let mut request_line = Vec::new();
     let mut ordinal = 0_u64;
@@ -394,7 +397,25 @@ pub async fn run_with_controls<R: BufRead, W: Write>(
                     .await?;
             }
             Message::Update(request) => {
-                warm_update::execute(live, cx, request, ordinal, controls.updates, output).await?;
+                match live {
+                    live::Live::Single(live) => {
+                        warm_update::execute(live, cx, request, ordinal, controls.updates, output).await?;
+                    }
+                    live::Live::Sharded(_) => {
+                        // Grant was refused at startup. Never let an update
+                        // request fall through to search or inspect its paths.
+                        let snapshot = live.snapshot(cx).await?;
+                        let warm_update::Request::Update { id, .. } = request;
+                        emit(output, &serde_json::json!({
+                            "schema": SCHEMA, "event": "terminal", "operation": "update",
+                            "ok": false, "status": "failed", "request": ordinal,
+                            "id": id.as_deref().filter(|id| validate_id(Some(id)).is_ok()),
+                            "seq": 0, "partial_results": false,
+                            "generation": snapshot.generation(), "selection_changed": false,
+                            "error": "sharded source updates are not enabled in this protocol; activate a complete selected successor",
+                        }))?;
+                    }
+                }
             }
         }
     }
