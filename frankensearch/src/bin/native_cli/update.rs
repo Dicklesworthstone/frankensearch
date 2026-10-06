@@ -4,13 +4,14 @@
 use std::collections::BTreeMap;
 
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
+use frankensearch::native_ann::builder::sharded::NativeBuiltShardedHybridIndex;
 
 use super::{
     BlockingPoolHandle, BufRead, BufReader, Cx, Deserialize, File, GenerationComponentReceiptV1,
     HashMap, IndexableDocument, MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECORD_BYTES, Models,
     NativeBuiltHybridIndex, Options, Path, Read, Result, SCHEMA, SELECTION_SCHEMA, Selection,
-    SnapshotReceipt, Write, bad, build_with_generation, emit, encode, fs, io, models,
-    new_generation, new_path, save_selection,
+    SnapshotReceipt, Write, bad, build_with_generation, cohort, emit, encode, fs, io, models,
+    new_generation, new_path, save_selection, sharded,
 };
 
 pub type Edits = BTreeMap<String, Option<IndexableDocument>>;
@@ -104,7 +105,13 @@ pub fn read_edits(reader: &mut impl BufRead) -> Result<Edits> {
 
 // Bound the final retained source cohort, not just the delta. Repeated updates
 // must not evade the CLI's source limits by adding a bounded batch every time.
-pub fn validate_final_cohort(cx: &Cx, index: &NativeBuiltHybridIndex, edits: &Edits) -> Result<()> {
+pub fn validate_final_cohort<'a>(
+    cx: &Cx,
+    index: impl Into<cohort::Index<'a>>,
+    edits: &Edits,
+) -> Result<usize> {
+    update_checkpoint(cx)?;
+    let index = index.into();
     let mut count = 0_usize;
     let mut bytes = 0_usize;
     let mut admit = |document: &IndexableDocument| -> Result<()> {
@@ -125,7 +132,14 @@ pub fn validate_final_cohort(cx: &Cx, index: &NativeBuiltHybridIndex, edits: &Ed
         }
         Ok(())
     };
-    for previous in index.vectors().documents() {
+    // Iterate the complete source inventory, not just its first partition.
+    // The iterator borrows bodies; input accounting does not clone the corpus.
+    let documents: Box<dyn Iterator<Item = &'a IndexableDocument> + 'a> = match index {
+        cohort::Index::Single(index) => Box::new(index.vectors().documents().iter()),
+        cohort::Index::Sharded(index) => Box::new(index.vectors().documents()),
+    };
+    for previous in documents {
+        update_checkpoint(cx)?;
         match edits.get(&previous.id) {
             Some(Some(document)) => admit(document)?,
             Some(None) => {}
@@ -133,12 +147,118 @@ pub fn validate_final_cohort(cx: &Cx, index: &NativeBuiltHybridIndex, edits: &Ed
         }
     }
     for (id, document) in edits {
-        if index.vectors().document(id).is_none()
+        update_checkpoint(cx)?;
+        let previous = match index {
+            cohort::Index::Single(index) => index.vectors().document(id),
+            cohort::Index::Sharded(index) => index.vectors().document(id),
+        };
+        if previous.is_none()
             && let Some(document) = document
         {
             admit(document)?;
         }
     }
+    update_checkpoint(cx)?;
+    Ok(count)
+}
+
+/// Partition policy is explicit for each sharded transaction. The original
+/// requested capacity is not encoded by occupied partition lengths, especially
+/// after delete-all, so never guess a capacity from the first partition.
+pub fn validate_partition_policy(sharded: bool, size: Option<usize>) -> Result<()> {
+    match (sharded, size) {
+        (true, Some(size)) => super::sharded::validate_size(size, 0),
+        (true, None) => Err(bad("a sharded update requires an explicit shard size")),
+        (false, None) => Ok(()),
+        (false, Some(_)) => Err(bad("shard size cannot change an ordinary update's layout")),
+    }
+}
+
+pub fn source_directory<'a>(index: cohort::Index<'a>) -> &'a Path {
+    match index {
+        cohort::Index::Single(index) => index.vectors().directory(),
+        cohort::Index::Sharded(index) => index.vectors().directory(),
+    }
+}
+
+/// Persist the completed hybrid inventory, never a vector-only child. Both
+/// command and warm transactions obtain their receipt from this same boundary.
+pub fn seal_selection(cx: &Cx, index: cohort::Index<'_>) -> Result<Selection> {
+    update_checkpoint(cx)?;
+    let (fast_producer, quality_producer) = index.producers()?;
+    let (schema, snapshot) = match index {
+        cohort::Index::Single(index) => (SELECTION_SCHEMA, index.seal_for_reopen(cx)?),
+        cohort::Index::Sharded(index) => (sharded::SELECTION_SCHEMA, index.seal_for_reopen(cx)?),
+    };
+    update_checkpoint(cx)?;
+    Ok(Selection {
+        schema: schema.to_owned(),
+        directory: source_directory(index).to_path_buf(),
+        generation: index.generation(),
+        snapshot: SnapshotReceipt {
+            byte_len: snapshot.byte_len,
+            sha256: snapshot.sha256,
+        },
+        documents: index.document_count(),
+        fast_producer,
+        quality_producer,
+    })
+}
+
+pub async fn apply_sharded(
+    cx: &Cx,
+    previous: &Selection,
+    index: &NativeBuiltShardedHybridIndex,
+    directory: &Path,
+    edits: Edits,
+    batch_size: usize,
+    shard_size: usize,
+) -> Result<(NativeBuiltShardedHybridIndex, Selection)> {
+    update_checkpoint(cx)?;
+    if previous.schema != sharded::SELECTION_SCHEMA
+        || index.vectors().generation() != previous.generation
+        || index.vectors().document_count() != previous.documents
+        || cohort::Index::Sharded(index).producers()?
+            != (
+                previous.fast_producer.clone(),
+                previous.quality_producer.clone(),
+            )
+    {
+        return Err(bad(
+            "update source does not match the selected sharded predecessor",
+        ));
+    }
+    let count = validate_final_cohort(cx, index, &edits)?;
+    sharded::validate_size(shard_size, count)?;
+    let sequence = previous
+        .generation
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| bad("generation sequence exhausted"))?;
+    let mut transaction = index
+        .begin_update(cx, directory, new_generation(sequence)?)?
+        .with_batch_size(batch_size)?
+        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+    for (id, document) in edits {
+        update_checkpoint(cx)?;
+        transaction = match document {
+            Some(document) => transaction.upsert_document(document),
+            None => transaction.delete_document(id),
+        };
+    }
+    // Reuse is by source identity, content and per-tier producer/precision,
+    // independent of changes to shard boundaries. Global Quill is rebuilt.
+    let successor = transaction.build_sharded_hybrid(cx, shard_size).await?;
+    let selection = seal_selection(cx, (&successor).into())?;
+    Ok((successor, selection))
+}
+
+fn update_checkpoint(cx: &Cx) -> Result<()> {
+    cx.checkpoint()
+        .map_err(|error| frankensearch::SearchError::Cancelled {
+            phase: "native_cli.update".to_owned(),
+            reason: error.to_string(),
+        })?;
     Ok(())
 }
 
@@ -195,7 +315,24 @@ pub async fn execute(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    execute_with_loader(cx, options, output, |root, quality| {
+        models::load(cx, root, quality, &options.quality, pool)
+    })
+    .await
+}
+
+async fn execute_with_loader<F>(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    load: F,
+) -> Result<()>
+where
+    F: FnOnce(Option<&Path>, bool) -> Result<Models>,
+{
+    update_checkpoint(cx)?;
     let previous = Selection::read(&options.receipt)?;
+    validate_partition_policy(previous.schema == sharded::SELECTION_SCHEMA, options.shard_size)?;
     let old_root = fs::canonicalize(&previous.directory)?;
     let directory = new_path(
         options
@@ -223,16 +360,30 @@ pub async fn execute(
         None => read_edits(&mut io::stdin().lock())?,
     };
     let edited_ids = edits.len();
-    let models = models::load(
-        cx,
-        options.models.as_deref(),
-        previous.quality_producer.is_some(),
-        &options.quality,
-        pool,
-    )?;
-    let index = previous.open(cx, models).await?;
-    let (_successor, selection) =
-        apply(cx, &previous, &index, &directory, edits, options.batch_size).await?;
+    update_checkpoint(cx)?;
+    let models = load(options.models.as_deref(), previous.quality_producer.is_some())?;
+    let index = sharded::Opened::open(cx, &previous, models).await?;
+    let selection = match &index {
+        sharded::Opened::Single(index) => {
+            apply(cx, &previous, index, &directory, edits, options.batch_size)
+                .await?
+                .1
+        }
+        sharded::Opened::Sharded(index) => {
+            apply_sharded(
+                cx,
+                &previous,
+                index,
+                &directory,
+                edits,
+                options.batch_size,
+                options.shard_size.ok_or_else(|| bad("missing shard size"))?,
+            )
+            .await?
+            .1
+        }
+    };
+    update_checkpoint(cx)?;
     save_selection(&selection, &receipt)?;
     emit(
         output,
@@ -386,3 +537,7 @@ fn rebuild_checkpoint(cx: &Cx) -> Result<()> {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "rebuild_tests.rs"]
 mod rebuild_tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "update_sharded_tests.rs"]
+mod sharded_tests;

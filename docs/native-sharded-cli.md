@@ -69,9 +69,9 @@ No coordinate is synthesized for a lane that did not retrieve the document.
 Unpartitioned queries retain their existing output fields and shapes.
 
 Partitioned indexing, buffered/streamed search and warm serving with explicit
-external activation are supported. Command-level source mutation and source
-recovery for partitioned receipts are not yet enabled here. The corresponding
-library lifecycle APIs remain available. This does not change default fsfs behavior or its generation
+external activation and one-shot source updates are supported. Source recovery
+for partitioned receipts is not yet enabled here. The corresponding library
+lifecycle APIs remain available. This does not change default fsfs behavior or its generation
 authority, create a durable CURRENT selector, establish persistent antirollback,
 or authorize removing predecessors.
 
@@ -112,7 +112,7 @@ An `op: "activate"` request requires the complete exact `expected_generation`
 from ready/status (including its actual nonce) and the absolute path of a trusted
 successor receipt. Activation is refused unless `--allow-activation` was given.
 The selected receipt must use the same layout and original per-tier producers.
-Prepare a higher-generation successor through the existing sharded library
+Prepare a higher-generation successor with `update` below or the sharded library
 update/seal APIs, retaining its complete hybrid receipt; ordinary `index` starts
 a fresh generation sequence and does not imply successor lineage.
 
@@ -136,3 +136,55 @@ refused for a sharded server before emitting ready, and update controls without
 that grant perform no path access or inference. The ordinary server's source
 transaction protocol is unchanged. All activation remains process-local: no
 durable CURRENT switch, restart selector or persistent antirollback is added.
+
+## Source updates and deliberate repartitioning
+
+`update` accepts the same JSONL upsert/delete language for an explicitly selected
+sharded receipt. Supply `--shard-size` for each sharded update; the capacity
+originally requested at index time is not recorded in occupied partition lengths,
+especially after deleting everything. No capacity is guessed and no layout change
+is inferred. Ordinary updates continue to omit `--shard-size` and retain their
+existing single-cohort implementation.
+
+```sh
+frankensearch-native update \
+  --receipt /absolute/receipts/g1.json \
+  --index-dir /absolute/indexes/g2 \
+  --new-receipt /absolute/receipts/g2.json \
+  --input /absolute/changes.jsonl \
+  --model-dir /absolute/models \
+  --shard-size 2500 --batch-size 16
+```
+
+The old receipt must admit every source/vector/graph/Quill artifact and the original
+per-tier producers before update inference begins. The complete final source set,
+including unchanged survivors in all partitions, must fit the command's document,
+record and encoded-byte limits and the 1,024-partition ceiling before candidate
+creation. The last edit per ID wins, but overwritten malformed operations are
+still errors. No model substitution, failed-shard omission or quality fallback
+is permitted. Use the original explicit quality-backend options when applicable.
+
+The existing native update engine reuses vectors by source ID, exact prepared
+content, producer identity and precision, not old shard position. Unchanged bodies
+can move between partitions without inference; title/metadata-only edits update
+source and global Quill without re-embedding. Inserts and changed bodies are
+embedded once per required tier. Precision and graph policy are inherited from
+the admitted predecessor. Deleting everything retains one empty identity-bearing
+partition and can be followed by an ordinary sharded update after restart.
+
+Every source/vector image, graph and the global Quill index is rebuilt in the new
+directory. Only inference is incremental; this is not O(changed-bytes) writing or
+a measured speedup. The new complete hybrid receipt is saved and synced before a
+successful `updated` response. Old files, receipts and readers remain untouched.
+Cancellation or a required late-stage failure can leave inert candidate files,
+but never a partial-index success receipt. Failed output after receipt persistence
+does not undo that saved generation. Use fresh destinations for retries.
+
+This command does not activate a running server. Its receipt can be supplied to
+the existing opt-in activation control, or used for a fresh search/server process.
+Neither action establishes persistent CURRENT authority or authorizes collection.
+
+```sh
+cargo test -p frankensearch --features hybrid --bin frankensearch-native \
+  update::sharded_tests
+```

@@ -69,7 +69,8 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--allow-activation] [--allow-updates] [--filter JSON] [--timeout-ms N]\n\
          [--reranker-dir DIR] [--rerank-window N]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
-         [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\n\
+         [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\
+         [--shard-size N (required for sharded receipts)]\n\n\
   rebuild --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
           [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\n\
 Quality options for every command:\n\
@@ -232,7 +233,7 @@ impl Options {
                 {
                     options.batch_size = positive(&value(&mut args)?, 256)?;
                 }
-                "--shard-size" if command == Command::Index => {
+                "--shard-size" if matches!(command, Command::Index | Command::Update) => {
                     options.shard_size = Some(positive(&value(&mut args)?, MAX_DOCUMENTS)?);
                 }
                 "--query" if command == Command::Search => options.query = Some(value(&mut args)?),
