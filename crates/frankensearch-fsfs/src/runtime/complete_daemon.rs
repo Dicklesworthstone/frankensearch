@@ -21,9 +21,8 @@ use serde::Serialize;
 
 use super::super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_CONNECT_MAX_ATTEMPTS,
-    FSFS_DAEMON_CONNECT_RETRY_DELAY_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS,
-    FSFS_DAEMON_REQUEST_MAX_BYTES, SearchExecutionFlags, SearchServeRequest,
-    daemon_socket_path_capacity,
+    FSFS_DAEMON_CONNECT_RETRY_DELAY_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES,
+    SearchExecutionFlags, SearchServeRequest, daemon_socket_path_capacity,
 };
 use super::{
     FsfsRuntime, complete_cli_error, emit_complete_serve_line, pressure_timestamp_ms,
@@ -380,12 +379,9 @@ impl FsfsRuntime {
                         }
                     };
                     if forwarding::is_forwarded(&bytes) {
-                        // Filters and policy stay on the request's own runtime,
-                        // but its refresh may move the session to a newer
-                        // generation, after which the buffered lane's refresh
-                        // reports no change. Cached replies belong to the
-                        // generation they were computed on: drop them then.
-                        let selected = session.reader.generation().manifest_sha256().to_owned();
+                        // Forwarded and raw requests share the same admitted
+                        // generation and bounded hot cache. The forwarder clears
+                        // it before using a newly selected generation.
                         let result = Box::pin(forwarding::serve(
                             cx,
                             self,
@@ -393,11 +389,9 @@ impl FsfsRuntime {
                             &mut peer,
                             &bytes,
                             peer_timeout,
+                            cache_enabled.then_some(cache),
                         ))
                         .await;
-                        if session.reader.generation().manifest_sha256() != selected {
-                            cache.clear();
-                        }
                         match result {
                             Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                             Err(error) => {
@@ -413,6 +407,7 @@ impl FsfsRuntime {
                         &mut peer,
                         peer_timeout,
                         &bytes,
+                        |request| self.complete_request_delivery_budget(request),
                         |request, output| async move {
                             // A cached request must pass selection admission too.
                             // Refresh never swaps on failure and we never consult
@@ -496,6 +491,18 @@ impl FsfsRuntime {
         }
     }
 
+    fn complete_request_delivery_budget(&self, request: &SearchServeRequest) -> Duration {
+        Self::search_daemon_delivery_budget(
+            request
+                .quality_timeout_ms
+                .unwrap_or(self.config.search.quality_timeout_ms),
+            request.rerank.unwrap_or(self.config.search.rerank),
+            request
+                .rerank_timeout_ms
+                .unwrap_or(self.config.search.rerank_timeout_ms),
+        )
+    }
+
     pub(super) fn complete_generation_socket_path(&self, root: &Path) -> SearchResult<PathBuf> {
         let root = fs::canonicalize(root)?;
         let path = self.cli_input.daemon_socket.as_ref().map_or_else(
@@ -573,7 +580,7 @@ where
     Fut: Future<Output = SearchResult<Option<T>>>,
 {
     let bytes = read_request(cx, peer, timeout).await?;
-    serve_peer_bytes(cx, peer, timeout, &bytes, execute).await
+    serve_peer_bytes(cx, peer, timeout, &bytes, |_| timeout, execute).await
 }
 
 async fn serve_peer_bytes<T, F, Fut>(
@@ -581,6 +588,7 @@ async fn serve_peer_bytes<T, F, Fut>(
     peer: &mut UnixStream,
     timeout: Duration,
     bytes: &[u8],
+    execution_budget: impl FnOnce(&SearchServeRequest) -> Duration,
     execute: F,
 ) -> SearchResult<PeerOutcome>
 where
@@ -614,6 +622,7 @@ where
             error.to_string(),
         ))?,
         Ok((request, stream)) => {
+            let search_timeout = execution_budget(&request);
             let query = request.query.clone();
             let mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
             if stream {
@@ -627,7 +636,7 @@ where
                     let output = streaming::PhaseWriter::new(peer)?;
                     let result = run_request(
                         cx,
-                        timeout,
+                        search_timeout,
                         streaming::drive(cx, &output, execute(request, Some(output.clone()))),
                     )
                     .await;
@@ -650,7 +659,7 @@ where
                 }
             } else {
                 retained_search_checkpoint(cx)?;
-                match run_request(cx, timeout, execute(request, None)).await {
+                match run_request(cx, search_timeout, execute(request, None)).await {
                     Ok(Some(response)) => match encode_response(&response) {
                         Ok(bytes) => bytes,
                         Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
@@ -943,6 +952,60 @@ mod tests {
         });
     }
 
+    #[test]
+    fn raw_request_delivery_budget_preserves_startup_and_request_overrides() {
+        let mut config = crate::FsfsConfig::default();
+        config.search.quality_timeout_ms = 12_000;
+        config.search.rerank = true;
+        config.search.rerank_timeout_ms = 18_000;
+        let runtime = FsfsRuntime::new(config);
+        let (mut request, _) = parse_request(b"{\"query\":\"budget\"}").unwrap();
+        assert_eq!(
+            runtime.complete_request_delivery_budget(&request),
+            Duration::from_secs(60)
+        );
+        request.quality_timeout_ms = Some(9_000);
+        request.rerank = Some(false);
+        assert_eq!(
+            runtime.complete_request_delivery_budget(&request),
+            Duration::from_secs(39)
+        );
+        request.rerank = Some(true);
+        request.rerank_timeout_ms = Some(1_000);
+        assert_eq!(
+            runtime.complete_request_delivery_budget(&request),
+            Duration::from_secs(40)
+        );
+    }
+
+    #[test]
+    fn raw_search_compute_budget_can_outlast_its_transport_deadline() {
+        run_test_with_cx(|cx| async move {
+            let runtime = FsfsRuntime::new(crate::FsfsConfig::default());
+            let transport_timeout = Duration::from_millis(100);
+            let (client, mut server) = pair(b"{\"query\":\"slow search\"}\n");
+            let bytes = read_request(&cx, &mut server, transport_timeout)
+                .await
+                .unwrap();
+            serve_peer_bytes(
+                &cx,
+                &mut server,
+                transport_timeout,
+                &bytes,
+                |request| runtime.complete_request_delivery_budget(request),
+                |_, _| async {
+                    // Computation is allowed past the short framing deadline;
+                    // the same deadline still bounds the final response write.
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(200)).await;
+                    Ok(Some(serde_json::json!({"ok": true})))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(response(client)["ok"], true);
+        });
+    }
+
     fn pair(request: &[u8]) -> (UnixStream, UnixStream) {
         let (mut client, server) = UnixStream::pair().unwrap();
         client
@@ -1092,7 +1155,10 @@ mod tests {
         assert!(path.exists(), "the endpoint outlives its listener");
         assert!(control::refuses_connections(&path));
         let owner = BoundCompleteSocket::bind(path.clone()).expect("a stale endpoint is replaced");
-        assert!(!control::refuses_connections(&path), "the new owner listens");
+        assert!(
+            !control::refuses_connections(&path),
+            "the new owner listens"
+        );
         drop(owner);
         assert!(!path.exists());
     }
@@ -1137,9 +1203,8 @@ mod tests {
                 ..crate::CliInput::default()
             })
         };
-        let resolve = |socket: PathBuf| {
-            runtime_for(socket).complete_generation_socket_path(store.path())
-        };
+        let resolve =
+            |socket: PathBuf| runtime_for(socket).complete_generation_socket_path(store.path());
         assert_eq!(
             resolve(root.join("custom.sock")).unwrap(),
             root.join("custom.sock")
@@ -1178,7 +1243,10 @@ mod tests {
             "{error}"
         );
         assert!(!generations.join("daemon.lock").exists());
-        assert!(!elsewhere.path().join("missing").exists(), "no directory is created");
+        assert!(
+            !elsewhere.path().join("missing").exists(),
+            "no directory is created"
+        );
     }
 
     #[test]
@@ -1200,7 +1268,10 @@ mod tests {
                     && reason.contains("--daemon-socket")),
             "{error:?}"
         );
-        assert!(!path.with_extension("lock").exists(), "no lock is left behind");
+        assert!(
+            !path.with_extension("lock").exists(),
+            "no lock is left behind"
+        );
         assert!(!path.exists());
     }
 

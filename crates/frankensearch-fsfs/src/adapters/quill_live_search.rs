@@ -68,6 +68,27 @@ impl QuillLiveSearchSession {
         self.session.tracker()
     }
 
+    /// Query belonging to the current logical subscription.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        self.session.query()
+    }
+
+    /// Change the query without discarding the admitted read-only Quill reader.
+    ///
+    /// Identical queries are no-ops. A changed query resets the logical stream:
+    /// its next successful poll emits a sequence-one snapshot, including an
+    /// empty snapshot when nothing matches, even if no index was published.
+    /// The host must reset its consumer before accepting that new stream. This
+    /// operation does no I/O or indexing; the next poll still checks selection
+    /// and admits any replacement through the ordinary complete-bundle path.
+    ///
+    /// # Errors
+    /// Cancellation or a blank query leaves the current subscription unchanged.
+    pub fn set_query(&mut self, cx: &Cx, query: impl Into<String>) -> SearchResult<bool> {
+        self.session.set_query(cx, query)
+    }
+
     /// Admit any replacement and deliver a native result update to the host.
     ///
     /// Admission awaits Quill through the caller's runtime. The underlying
@@ -515,6 +536,120 @@ mod tests {
             let decoded: QuillLiveSearchFrame = serde_json::from_slice(&output).unwrap();
             assert_eq!(frame, decoded);
             assert_eq!(session.tracker().sequence(), 1);
+        });
+    }
+
+    #[test]
+    fn native_query_changes_reuse_the_reader_and_emit_query_specific_snapshots() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let generation = publish(
+                &cx,
+                &store,
+                &[
+                    IndexableDocument::new("a", "alpha").with_metadata("path", "alpha.rs"),
+                    IndexableDocument::new("b", "beta").with_metadata("path", "beta.rs"),
+                ],
+            )
+            .await;
+            let pointer = fs::read(store.root().join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut session = session(store.clone());
+            session.poll(&cx, Instant::now()).await.unwrap();
+            let reader = Arc::clone(
+                &session
+                    .session
+                    .source_mut()
+                    .admitted
+                    .as_ref()
+                    .unwrap()
+                    .reader,
+            );
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "a");
+            assert!(session.set_query(&cx, "beta").unwrap());
+            assert_eq!(session.query(), "beta");
+            let mut output = Vec::new();
+            let frame = session
+                .poll_ndjson(&cx, Instant::now(), &mut output)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.query, "beta");
+            assert_eq!(frame.sequence, 1);
+            assert!(frame.previous_generation.is_none());
+            assert!(frame.generation.starts_with(generation.id()));
+            assert!(matches!(frame.event, LiveSearchEvent::Snapshot { .. }));
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "b");
+            assert_eq!(
+                session.tracker().results()[0].hit.item.as_ref().unwrap()["path"],
+                "beta.rs"
+            );
+            let decoded: QuillLiveSearchFrame = serde_json::from_slice(&output).unwrap();
+            assert_eq!(decoded.query, "beta");
+            assert!(Arc::ptr_eq(
+                &reader,
+                &session
+                    .session
+                    .source_mut()
+                    .admitted
+                    .as_ref()
+                    .unwrap()
+                    .reader,
+            ));
+            session.set_query(&cx, "unmatchedword").unwrap();
+            let empty = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
+            assert_eq!(empty.sequence, 1);
+            assert_eq!(empty.result_count, 0);
+            assert!(matches!(empty.event,
+                LiveSearchEvent::Snapshot { results } if results.is_empty()));
+            assert_eq!(
+                fs::read(store.root().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+        });
+    }
+
+    #[test]
+    fn native_retarget_rejection_keeps_the_original_subscription() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            publish(&cx, &store, &[IndexableDocument::new("a", "alpha")]).await;
+            let mut session = session(store);
+            session.poll(&cx, Instant::now()).await.unwrap();
+            assert!(!session.set_query(&cx, "alpha").unwrap());
+            assert!(session.set_query(&cx, "  ").is_err());
+            cx.set_cancel_requested(true);
+            let cancelled = session.set_query(&cx, "beta");
+            cx.set_cancel_requested(false);
+            assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+            assert_eq!(session.query(), "alpha");
+            assert_eq!(session.tracker().sequence(), 1);
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "a");
+            assert!(session.poll(&cx, Instant::now()).await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn native_retarget_admits_a_successor_instead_of_searching_the_old_bundle() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            publish(&cx, &store, &[IndexableDocument::new("old", "alpha")]).await;
+            let mut session = session(store.clone());
+            session.poll(&cx, Instant::now()).await.unwrap();
+            session.set_query(&cx, "beta").unwrap();
+            let successor = publish(
+                &cx,
+                &store,
+                &[IndexableDocument::new("new", "beta")],
+            )
+            .await;
+            let frame = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
+            assert_eq!(frame.query, "beta");
+            assert_eq!(frame.sequence, 1);
+            assert!(frame.generation.starts_with(successor.id()));
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "new");
         });
     }
 }

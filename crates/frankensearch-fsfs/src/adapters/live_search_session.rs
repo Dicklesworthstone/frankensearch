@@ -95,7 +95,7 @@ struct ReadyRefresh<T> {
 pub struct LiveSearchSession<S: LiveSearchSource> {
     source: S,
     query: String,
-    limit: usize,
+    config: LiveSearchConfig,
     tracker: LiveSearchTracker<S::Item>,
     refresh: LiveSearchRefreshConfig,
     pending: Option<PendingRefresh<S::Snapshot>>,
@@ -137,7 +137,7 @@ impl<S: LiveSearchSource> LiveSearchSession<S> {
         Ok(Self {
             source,
             query,
-            limit: config.max_results,
+            config,
             tracker,
             refresh,
             pending: None,
@@ -154,6 +154,40 @@ impl<S: LiveSearchSource> LiveSearchSession<S> {
     #[must_use]
     pub const fn tracker(&self) -> &LiveSearchTracker<S::Item> {
         &self.tracker
+    }
+
+    /// Query belonging to the current logical subscription.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Start a different logical subscription while retaining the same source.
+    ///
+    /// Returns false for an identical query without changing its baseline or
+    /// pending refresh. A different query starts at sequence zero; its next
+    /// successful poll emits a full snapshot immediately, even on the same
+    /// physical generation. Backend resources, result limits, score thresholds
+    /// and monotone poll-clock admission are retained. No I/O or inference runs
+    /// here, and rapid changes coalesce naturally until the caller polls again.
+    ///
+    /// The caller must reset its consumer for the new logical subscription;
+    /// never append its sequence-one snapshot to an old delta chain. This does
+    /// not authorize retrying a transport after a partial write or failed flush.
+    ///
+    /// # Errors
+    /// Cancellation or an invalid query leaves the existing subscription intact.
+    pub fn set_query(&mut self, cx: &Cx, query: impl Into<String>) -> SearchResult<bool> {
+        checkpoint(cx)?;
+        let query = query.into();
+        if query == self.query {
+            return Ok(false);
+        }
+        let tracker = LiveSearchTracker::new(query.clone(), self.config).map_err(live_error)?;
+        self.query = query;
+        self.tracker = tracker;
+        self.pending = None;
+        Ok(true)
     }
 
     /// Drive one refresh for an in-process consumer, without sleeping.
@@ -256,9 +290,12 @@ impl<S: LiveSearchSource> LiveSearchSession<S> {
         if !ready {
             return Ok(None);
         }
-        let hits = self
-            .source
-            .search(cx, &pending.observed.snapshot, &self.query, self.limit)?;
+        let hits = self.source.search(
+            cx,
+            &pending.observed.snapshot,
+            &self.query,
+            self.config.max_results,
+        )?;
         // A source can finish work just as cancellation arrives. Never publish
         // that result after observing cancellation at the operation boundary.
         checkpoint(cx)?;
@@ -758,6 +795,170 @@ mod tests {
             assert_eq!(current.snapshot, second);
             let new = source.search(&cx, &current.snapshot, "query", 20).unwrap();
             assert_eq!(new[0].item, "new");
+        });
+    }
+
+    // Keep the original fixed-query fixtures intact. This independent source
+    // records the actual query sent to the backend after each transition.
+    struct QuerySource {
+        generation: String,
+        score: f64,
+        queries: Vec<(String, usize)>,
+    }
+
+    impl LiveSearchSource for QuerySource {
+        type Snapshot = String;
+        type Item = String;
+
+        fn snapshot(
+            &mut self,
+            _: &Cx,
+        ) -> SearchResult<Option<CommittedLiveSearchSnapshot<String>>> {
+            Ok(Some(CommittedLiveSearchSnapshot {
+                generation: self.generation.clone(),
+                snapshot: self.generation.clone(),
+            }))
+        }
+
+        fn search(
+            &mut self,
+            _: &Cx,
+            snapshot: &String,
+            query: &str,
+            limit: usize,
+        ) -> SearchResult<Vec<LiveSearchHit<String>>> {
+            assert_eq!(snapshot, &self.generation);
+            self.queries.push((query.to_owned(), limit));
+            Ok(vec![LiveSearchHit {
+                doc_id: query.to_owned(),
+                score: self.score,
+                item: query.to_owned(),
+            }])
+        }
+    }
+
+    fn query_session() -> LiveSearchSession<QuerySource> {
+        LiveSearchSession::new(
+            "alpha",
+            LiveSearchConfig {
+                max_results: 7,
+                min_score_delta: 0.25,
+            },
+            LiveSearchRefreshConfig {
+                debounce: Duration::from_millis(20),
+                max_wait: Duration::from_millis(100),
+            },
+            QuerySource {
+                generation: "a".to_owned(),
+                score: 1.0,
+                queries: Vec::new(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn retarget_queries_the_same_generation_and_starts_a_fresh_snapshot() {
+        use super::super::live_search::LiveSearchEvent;
+
+        run_test_with_cx(|cx| async move {
+            let now = Instant::now();
+            let mut session = query_session();
+            session.poll(&cx, now).unwrap().unwrap();
+            assert!(session.set_query(&cx, "beta").unwrap());
+            assert_eq!(session.query(), "beta");
+            assert_eq!(session.tracker().sequence(), 0);
+            let frame = session.poll(&cx, tick(now, 1)).unwrap().unwrap();
+            assert_eq!(frame.query, "beta");
+            assert_eq!(frame.generation, "a");
+            assert_eq!(frame.sequence, 1);
+            assert!(frame.previous_generation.is_none());
+            assert!(matches!(frame.event, LiveSearchEvent::Snapshot { .. }));
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "beta");
+            assert_eq!(
+                session.source.queries,
+                [("alpha".to_owned(), 7), ("beta".to_owned(), 7)]
+            );
+            session.source.generation = "b".to_owned();
+            session.source.score = 1.125;
+            assert!(session.poll(&cx, tick(now, 2)).unwrap().is_none());
+            let frame = session.poll(&cx, tick(now, 22)).unwrap().unwrap();
+            assert!(
+                matches!(frame.event, LiveSearchEvent::Delta { changes } if changes.is_empty())
+            );
+            assert_eq!(
+                session.tracker().results()[0].hit.score.to_bits(),
+                1.0_f64.to_bits()
+            );
+        });
+    }
+
+    #[test]
+    fn retarget_coalesces_changes_and_discards_only_the_old_pending_query() {
+        run_test_with_cx(|cx| async move {
+            let now = Instant::now();
+            let mut session = query_session();
+            session.poll(&cx, now).unwrap();
+            session.source.generation = "b".to_owned();
+            session.poll(&cx, tick(now, 1)).unwrap();
+            assert!(session.pending.is_some());
+            assert!(!session.set_query(&cx, "alpha").unwrap());
+            assert!(session.pending.is_some());
+            assert!(session.set_query(&cx, "intermediate").unwrap());
+            assert!(session.pending.is_none());
+            assert!(session.set_query(&cx, "latest").unwrap());
+            let frame = session.poll(&cx, tick(now, 2)).unwrap().unwrap();
+            assert_eq!(frame.query, "latest");
+            assert_eq!(frame.generation, "b");
+            assert_eq!(frame.sequence, 1);
+            assert_eq!(
+                session.source.queries,
+                [("alpha".to_owned(), 7), ("latest".to_owned(), 7)]
+            );
+        });
+    }
+
+    #[test]
+    fn rejected_retarget_and_noop_preserve_baseline_and_clock_admission() {
+        run_test_with_cx(|cx| async move {
+            let now = Instant::now();
+            let mut session = query_session();
+            session.poll(&cx, tick(now, 10)).unwrap();
+            assert!(session.set_query(&cx, " \n ").is_err());
+            assert!(!session.set_query(&cx, "alpha").unwrap());
+            cx.set_cancel_requested(true);
+            let cancelled = session.set_query(&cx, "beta");
+            cx.set_cancel_requested(false);
+            assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+            assert_eq!(session.query(), "alpha");
+            assert_eq!(session.tracker().sequence(), 1);
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "alpha");
+            assert_eq!(session.source.queries.len(), 1);
+            session.set_query(&cx, "beta").unwrap();
+            assert!(matches!(
+                session.poll(&cx, now),
+                Err(SearchError::InvalidConfig { .. })
+            ));
+            assert_eq!(session.source.queries.len(), 1);
+            let frame = session.poll(&cx, tick(now, 11)).unwrap().unwrap();
+            assert_eq!(frame.query, "beta");
+        });
+    }
+
+    #[test]
+    fn retargeted_output_failure_does_not_acknowledge_the_new_subscription() {
+        run_test_with_cx(|cx| async move {
+            let now = Instant::now();
+            let mut session = query_session();
+            session.poll(&cx, now).unwrap();
+            session.set_query(&cx, "beta").unwrap();
+            assert!(matches!(
+                session.poll_ndjson(&cx, tick(now, 1), &mut BrokenTransport),
+                Err(SearchError::Io(_))
+            ));
+            assert_eq!(session.tracker().sequence(), 0);
+            assert!(session.tracker().generation().is_none());
+            assert!(session.tracker().results().is_empty());
         });
     }
 }

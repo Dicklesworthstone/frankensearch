@@ -13842,9 +13842,15 @@ fn query_work_upper_bound(
     let mut dictionary_blocks = 0_u64;
     let mut string_range_term_ceiling = 0_u64;
     for segment in keeper.segments() {
-        let docs = u64::from(segment.doc_count());
+        // Sealed cursors still visit tombstoned physical postings and phrase
+        // positions. Live rows are therefore not a work ceiling. Nor is
+        // ceil(physical_rows / 128): Q1 concat retains every partial input
+        // block instead of repacking them into full blocks. The existing
+        // dictionary admission retains a wire-derived per-term block bound.
+        let docs = u64::from(segment.at_seal_doc_count());
         physical_docs = physical_docs.saturating_add(docs);
-        posting_blocks_per_stream = posting_blocks_per_stream.saturating_add(docs.div_ceil(128));
+        posting_blocks_per_stream =
+            posting_blocks_per_stream.saturating_add(segment.max_posting_blocks_per_term());
         let bytes = required_section(segment, SectionKind::TERMDICT)?;
         let count_bytes = bytes
             .get(..4)
@@ -24245,6 +24251,200 @@ mod tests {
             index.reader.config.glob_expansion_limit,
         )
         .expect("bound fragmented ceiling query")
+    }
+
+    #[test]
+    fn concat_merge_partial_blocks_cannot_disable_query_fuel() {
+        run_with_cx(|cx| async move {
+            const DOCUMENT_COUNT: usize = 16;
+            const FUEL_BUDGET: u64 = 8;
+            let mut index = QuillIndex::in_memory(QuillConfig {
+                tier_fanout: DOCUMENT_COUNT + 1,
+                query_fuel_budget: FUEL_BUDGET,
+                ..deterministic_config()
+            })
+            .expect("create partial-block fuel index");
+            for ordinal in 0..DOCUMENT_COUNT {
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new(
+                            format!("partial-{ordinal:02}"),
+                            "alpha",
+                        )],
+                    )
+                    .await
+                    .expect("stage one partial posting block");
+                index
+                    .commit(&cx)
+                    .await
+                    .expect("seal one partial posting block");
+            }
+            let source_ids = committed_segment_ids(&index);
+            assert_eq!(source_ids.len(), DOCUMENT_COUNT);
+            let output_segment_id = fresh_merge_segment_id(&index, 0xf0e1_0000_0000_0001);
+            index
+                .concat_merge(&cx, &source_ids, output_segment_id, 0)
+                .await
+                .expect("concat must preserve the small input blocks");
+            let snapshot = index.search_snapshot().expect("merged fuel snapshot");
+            let segments = snapshot.keeper_snapshot().segments();
+            assert_eq!(segments.len(), 1);
+            let dictionary =
+                open_dictionary(&segments[0], DEFAULT_SCHEMA).expect("open merged fuel dictionary");
+            let found = dictionary
+                .lookup(CONTENT_FIELD, b"alpha")
+                .expect("lookup merged alpha")
+                .expect("merged alpha remains indexed");
+            let postings = PostingList::parse(
+                span(
+                    required_section(&segments[0], SectionKind::POSTINGS)
+                        .expect("merged posting section"),
+                    found.metadata.postings,
+                    "POSTINGS",
+                )
+                .expect("merged alpha posting span"),
+                found.metadata.doc_freq,
+            )
+            .expect("parse merged alpha blocks");
+            assert_eq!(postings.block_count(), DOCUMENT_COUNT);
+            assert_eq!(segments[0].at_seal_doc_count(), 16);
+
+            // The old ceiling used ceil(live_docs / 128), so it counted one
+            // posting block after this merge and disabled metering at eight
+            // units. Q1 retains all sixteen input blocks and each is real
+            // query work, regardless of how few rows occupy the segment.
+            for exact_count in [false, true] {
+                let first = index
+                    .search_paginated(&cx, "content:alpha", DOCUMENT_COUNT, 0, exact_count)
+                    .expect_err("merged partial blocks must exhaust the real fuel budget");
+                let retry = index
+                    .search_paginated(&cx, "content:alpha", DOCUMENT_COUNT, 0, exact_count)
+                    .expect_err("retry must refuse at the same physical block");
+                assert_eq!(fuel_diagnostics(&first), fuel_diagnostics(&retry));
+                assert_eq!(fuel_diagnostics(&first).0, FUEL_BUDGET);
+                assert_eq!(fuel_diagnostics(&first).1, FUEL_BUDGET);
+            }
+            let refused_ids = index
+                .collect_docids(&cx, "content:alpha")
+                .expect_err("the identifier-only collector must also enforce fuel");
+            assert_eq!(fuel_diagnostics(&refused_ids).1, FUEL_BUDGET);
+            assert!(Arc::ptr_eq(
+                &snapshot,
+                &index
+                    .search_snapshot()
+                    .expect("snapshot after fuel refusal")
+            ));
+
+            index.reader.config.query_fuel_budget = 100;
+            let complete = index
+                .search_paginated(&cx, "content:alpha", DOCUMENT_COUNT, 0, true)
+                .expect("sufficient fuel must return every merged document");
+            assert_eq!(complete.total_count, Some(16));
+            assert_eq!(complete.hits.len(), DOCUMENT_COUNT);
+            assert_eq!(
+                index
+                    .collect_docids(&cx, "content:alpha")
+                    .expect("complete merged IDs"),
+                (0_u32..16).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    #[test]
+    fn tombstones_cannot_erase_physical_posting_and_position_work() {
+        run_with_cx(|cx| async move {
+            const DOCUMENT_COUNT: usize = 384;
+            const FUEL_BUDGET: u64 = 32;
+            let documents = (0..DOCUMENT_COUNT)
+                .map(|ordinal| {
+                    IndexableDocument::new(format!("physical-{ordinal:03}"), "alpha beta")
+                })
+                .collect::<Vec<_>>();
+            let mut index = QuillIndex::in_memory(QuillConfig {
+                query_fuel_budget: FUEL_BUDGET,
+                ..deterministic_config()
+            })
+            .expect("create physical-work fuel index");
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("stage physical-work documents");
+            index
+                .commit(&cx)
+                .await
+                .expect("seal physical-work documents");
+            let before = index
+                .search_snapshot()
+                .expect("physical snapshot before deletes");
+            assert_eq!(before.keeper_snapshot().segments().len(), 1);
+            let mut parsed = index
+                .reader
+                .default_parser()
+                .expect("physical-work parser")
+                .parse_lenient("content:\"alpha beta\"");
+            let _ = canonicalize_query(&mut parsed.query);
+            let before_bound = query_work_upper_bound(
+                &parsed.query,
+                &before,
+                DEFAULT_SCHEMA,
+                index.reader.config.glob_expansion_limit,
+            )
+            .expect("bound undeleted phrase work");
+
+            let deleted_ids = documents[..DOCUMENT_COUNT - 1]
+                .iter()
+                .map(IndexableDocument::id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                index
+                    .delete_documents(&cx, &deleted_ids)
+                    .await
+                    .expect("publish tombstones"),
+                DOCUMENT_COUNT - 1
+            );
+            let after = index
+                .search_snapshot()
+                .expect("physical snapshot after deletes");
+            let segments = after.keeper_snapshot().segments();
+            assert_eq!(segments.len(), 1);
+            assert_eq!(segments[0].at_seal_doc_count(), 384);
+            assert_eq!(segments[0].doc_count(), 1);
+            let after_bound = query_work_upper_bound(
+                &parsed.query,
+                &after,
+                DEFAULT_SCHEMA,
+                index.reader.config.glob_expansion_limit,
+            )
+            .expect("bound tombstoned phrase work");
+            assert_eq!(
+                before_bound, after_bound,
+                "tombstones hide rows but retain every physical posting and position"
+            );
+            assert!(after_bound > FUEL_BUDGET);
+            let first = index
+                .search_paginated(&cx, "content:\"alpha beta\"", 10, 0, true)
+                .expect_err("a mostly deleted segment must still meter its phrase work");
+            let retry = index
+                .search_paginated(&cx, "content:\"alpha beta\"", 10, 0, true)
+                .expect_err("retry must retain the same physical admission boundary");
+            assert_eq!(fuel_diagnostics(&first), fuel_diagnostics(&retry));
+            assert_eq!(fuel_diagnostics(&first).1, FUEL_BUDGET);
+
+            index.reader.config.query_fuel_budget = 10_000;
+            let complete = index
+                .search_paginated(&cx, "content:\"alpha beta\"", 10, 0, true)
+                .expect("sufficient fuel must still resolve the surviving phrase match");
+            assert_eq!(complete.total_count, Some(1));
+            assert_eq!(complete.hits.len(), 1);
+            assert_eq!(complete.hits[0].document_id, "physical-383");
+            assert_eq!(
+                before.live_doc_count(),
+                384,
+                "the retained snapshot stays intact"
+            );
+            assert_eq!(after.live_doc_count(), 1);
+        });
     }
 
     #[test]

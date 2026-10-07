@@ -6,18 +6,22 @@
 //! forwarder itself never retrieves locally, starts a daemon, or replays after
 //! ambiguous delivery; the search command decides around it whether to start one.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
-use super::super::super::{FSFS_DAEMON_RESPONSE_MAX_BYTES, LiveRetainedSearchReader};
+use super::super::super::{
+    FSFS_DAEMON_RESPONSE_MAX_BYTES, LiveRetainedSearchReader, SearchCacheKey, SearchExecutionMode,
+    SearchServeOptions, SearchServeRequest,
+};
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FsfsRuntime, PeerOutcome, SearchExecutionFlags,
     complete_cli_error, control, encode_response, pressure_timestamp_ms,
@@ -41,7 +45,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 10: colons that name no field reach the lexical lane.
 // 11: snippets mask credential tokens and private-key material.
 // 12: the search policy travels with each request (`SearchPolicy`).
-const VERSION: u32 = 12;
+// 13: shared buffered/progressive cache and configured search delivery budgets.
+const VERSION: u32 = 13;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -65,6 +70,25 @@ struct SearchRequest {
     store_root: PathBuf,
     configuration: serde_json::Value,
     policy: SearchPolicy,
+}
+
+impl SearchRequest {
+    /// The policy is already installed on the per-request runtime. Omitted
+    /// serve overrides preserve that exact policy in the common executor.
+    fn as_serve_request(&self, mode: SearchExecutionMode) -> SearchServeRequest {
+        SearchServeRequest {
+            query: self.query.clone(),
+            limit: Some(self.limit),
+            mode: Some(mode.label().to_owned()),
+            filter: self.filter.clone(),
+            rerank: None,
+            rerank_timeout_ms: None,
+            quality_weight: None,
+            quality_timeout_ms: None,
+            rrf_k: None,
+            fast_only: None,
+        }
+    }
 }
 
 /// The search knobs a warm daemon applies per request, as the legacy query
@@ -104,6 +128,14 @@ impl SearchPolicy {
             rerank: config.search.rerank,
             rerank_timeout_ms: config.search.rerank_timeout_ms,
         }
+    }
+
+    fn delivery_budget(self) -> Duration {
+        FsfsRuntime::search_daemon_delivery_budget(
+            self.quality_timeout_ms,
+            self.rerank,
+            self.rerank_timeout_ms,
+        )
     }
 
     /// Set this policy on `runtime`, which then searches with it. A value a
@@ -383,12 +415,20 @@ impl FsfsRuntime {
         let mut bytes = serde_json::to_vec(&request).map_err(codec_error)?;
         bytes.write_all(b"\n")?;
         let socket = self.complete_generation_socket_path(root)?;
-        let response = control::exchange(
+        let started = Instant::now();
+        let mut peer = control::connect_and_send(
             cx,
             &socket,
             &bytes,
-            FSFS_DAEMON_RESPONSE_MAX_BYTES,
+            started,
             Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS),
+        )
+        .await?;
+        let response = control::read_response(
+            cx,
+            &mut peer,
+            FSFS_DAEMON_RESPONSE_MAX_BYTES,
+            control::remaining(started, request.search.policy.delivery_budget())?,
         )
         .await?;
         let payload = decode_reply(&response, &request)?;
@@ -397,14 +437,11 @@ impl FsfsRuntime {
     }
 }
 
-async fn execute(
-    cx: &Cx,
-    runtime: &FsfsRuntime,
-    session: &mut LiveRetainedSearchReader,
-    request: &ForwardedSearch,
-) -> SearchResult<SearchPayload> {
-    validate_request(runtime, session.store.root(), request)?;
-    session.refresh(cx).await?;
+fn query_runtime(
+    session: &LiveRetainedSearchReader,
+    request: &SearchRequest,
+    stream: bool,
+) -> SearchResult<FsfsRuntime> {
     // Clone the *admitted* runtime, not the store-root runtime. Hydration and
     // retrieval must point at the same pinned bundle. The filter is request
     // scoped; None explicitly clears any filter from daemon startup.
@@ -414,22 +451,70 @@ async fn execute(
         session.reader.generation(),
     )?;
     query_runtime.cli_input.command = CliCommand::Search;
-    query_runtime.cli_input.query = Some(request.search.query.clone());
-    query_runtime
-        .cli_input
-        .filter
-        .clone_from(&request.search.filter);
+    query_runtime.cli_input.query = Some(request.query.clone());
+    query_runtime.cli_input.filter.clone_from(&request.filter);
     query_runtime.cli_input.daemon = false;
     query_runtime.cli_input.daemon_socket = None;
-    query_runtime.cli_input.stream = false;
+    query_runtime.cli_input.stream = stream;
+    if stream {
+        query_runtime.cli_input.format = OutputFormat::Jsonl;
+    }
     query_runtime.cli_input.expand = false;
-    query_runtime.cli_input.overrides.limit = Some(request.search.limit);
-    request.search.policy.apply_to(&mut query_runtime)?;
-    query_runtime.config.search.explain = request.search.explain;
-    query_runtime.cli_input.overrides.explain = Some(request.search.explain);
+    query_runtime.cli_input.overrides.limit = Some(request.limit);
+    request.policy.apply_to(&mut query_runtime)?;
+    query_runtime.config.search.explain = request.explain;
+    query_runtime.cli_input.overrides.explain = Some(request.explain);
+    Ok(query_runtime)
+}
+
+async fn execute(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    session: &mut LiveRetainedSearchReader,
+    request: &ForwardedSearch,
+    cache: Option<&mut HashMap<SearchCacheKey, Vec<SearchPayload>>>,
+) -> SearchResult<SearchPayload> {
+    validate_request(runtime, session.store.root(), request)?;
+    let cache_enabled = cache.is_some();
+    let mut disabled_cache = HashMap::new();
+    let cache = cache.unwrap_or(&mut disabled_cache);
+    if session.refresh(cx).await? {
+        // A forwarded request can be the first to observe publication. Clear
+        // the old generation before either consulting or filling the shared
+        // cache; the next raw request may otherwise see no refresh at all.
+        cache.clear();
+    }
+    let query_runtime = query_runtime(session, &request.search, false)?;
     // The daemon applies its own degradation override to every client, as
     // the legacy query daemon does.
     let mode = session.reader.search_mode()?;
+    if !request.search.explain {
+        // Use the ordinary daemon executor so both transports share complete
+        // phase payloads, producer checks, cache keys, bounded admission and
+        // the refusal to cache failed refinement. The request policy is already
+        // installed on query_runtime; omitted serve overrides preserve it.
+        let response = query_runtime
+            .execute_search_serve_request_with_sink(
+                cx,
+                request.search.as_serve_request(mode),
+                &mut session.reader.resources,
+                cache,
+                SearchServeOptions {
+                    hot_cache_enabled: cache_enabled,
+                    persist_explain_session: true,
+                },
+                None,
+            )
+            .await?;
+        return response.payloads.into_iter().last().ok_or_else(|| {
+            complete_cli_error(
+                "daemon_response",
+                "search completed without an Initial phase",
+            )
+        });
+    }
+    // Inline explanations require the actual per-query artifacts. They neither
+    // reuse plain cached payloads nor contaminate them with explanation output.
     let mut phases = Box::pin(
         query_runtime.execute_search_phase_artifacts_with_mode_using_resources(
             cx,
@@ -462,10 +547,11 @@ pub(super) async fn serve(
     peer: &mut UnixStream,
     bytes: &[u8],
     timeout: Duration,
+    cache: Option<&mut HashMap<SearchCacheKey, Vec<SearchPayload>>>,
 ) -> SearchResult<PeerOutcome> {
     if progressive::is_streamed(bytes) {
         return Box::pin(progressive::serve(
-            cx, runtime, session, peer, bytes, timeout,
+            cx, runtime, session, peer, bytes, timeout, cache,
         ))
         .await;
     }
@@ -477,7 +563,14 @@ pub(super) async fn serve(
         .as_ref()
         .map_or_else(|_| String::new(), |value| value.search.query.clone());
     let result = match request {
-        Ok(request) => run_request(cx, timeout, execute(cx, runtime, session, &request)).await,
+        Ok(request) => {
+            run_request(
+                cx,
+                request.search.policy.delivery_budget(),
+                execute(cx, runtime, session, &request, cache),
+            )
+            .await
+        }
         Err(error) => Err(error),
     };
     if matches!(result, Err(SearchError::Cancelled { .. })) {
@@ -709,10 +802,23 @@ mod tests {
         policy.rrf_k = 17.0;
         policy.fast_only = true;
         policy.rerank = true;
+        policy.quality_timeout_ms = 2_000;
+        policy.rerank_timeout_ms = 10_000;
         policy.apply_to(&mut runtime).unwrap();
         assert_eq!(SearchPolicy::of(&runtime.config), policy);
         assert_eq!(runtime.cli_input.overrides.fast_only, Some(true));
         assert_eq!(runtime.cli_input.overrides.rerank, Some(true));
+        // Delivery includes both requested stages instead of inheriting the
+        // five-second framing timeout. Disabled reranking contributes no wait.
+        assert_eq!(policy.delivery_budget(), Duration::from_secs(42));
+        assert_eq!(
+            SearchPolicy {
+                rerank: false,
+                ..policy
+            }
+            .delivery_budget(),
+            Duration::from_secs(32)
+        );
 
         let before = SearchPolicy::of(&runtime.config);
         for (field, invalid) in [
@@ -874,6 +980,10 @@ mod generation_tests {
     use super::*;
     use crate::CliInput;
     use crate::generation_store::{COMPLETE_GENERATION_POINTER, GenerationPublication};
+    use crate::output_schema::SearchHitPayload;
+    use crate::stream_protocol::{
+        StreamEvent, StreamFrame, StreamTerminalStatus, validate_stream_frame,
+    };
     use asupersync::test_utils::run_test_with_cx;
     use std::future::{Future, poll_fn};
     use std::pin::pin;
@@ -948,8 +1058,49 @@ mod generation_tests {
         Ok((hits, value["cached"] == true))
     }
 
+    async fn stream_search(
+        cx: &Cx,
+        client: &FsfsRuntime,
+        root: &Path,
+    ) -> SearchResult<(usize, bool)> {
+        let mut client = client.clone();
+        client.cli_input.stream = true;
+        client.cli_input.format = OutputFormat::Jsonl;
+        let mut output = Vec::new();
+        client
+            .stream_complete_generation_daemon(cx, root, "sharedtoken", 10, &mut output)
+            .await?;
+        let frames = std::str::from_utf8(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<StreamFrame<SearchHitPayload>>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            frames.first().unwrap().event,
+            StreamEvent::Started(_)
+        ));
+        assert!(
+            matches!(frames.last().unwrap().event, StreamEvent::Terminal(ref terminal)
+            if terminal.status == StreamTerminalStatus::Completed)
+        );
+        for (sequence, frame) in frames.iter().enumerate() {
+            assert!(validate_stream_frame(frame).valid);
+            assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
+            assert_eq!(frame.stream_id, frames[0].stream_id);
+        }
+        let hits = frames
+            .iter()
+            .filter(|frame| matches!(frame.event, StreamEvent::Result(_)))
+            .count();
+        let cached = frames.iter().any(|frame| {
+            matches!(&frame.event,
+            StreamEvent::Progress(progress) if progress.reason_code == "daemon_cache_hit")
+        });
+        Ok((hits, cached))
+    }
+
     #[test]
-    fn forwarded_searches_keep_the_serve_cache_until_they_move_the_generation() {
+    fn forwarded_searches_fill_the_serve_cache_and_replace_it_with_the_generation() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
             let source = directory.path().join("source");
@@ -993,8 +1144,6 @@ mod generation_tests {
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
                 assert!(endpoint.exists(), "daemon did not become ready");
-                assert_eq!(raw_search(&cx, &endpoint).await?, (1, false));
-                assert_eq!(raw_search(&cx, &endpoint).await?, (1, caching));
                 let forwarded = client
                     .query_complete_generation_daemon(&cx, &root, "sharedtoken", 10)
                     .await?;
@@ -1002,8 +1151,10 @@ mod generation_tests {
                 assert_eq!(
                     raw_search(&cx, &endpoint).await?,
                     (1, caching),
-                    "a forwarded search on the same generation must keep the serve cache"
+                    "the first forwarded search must populate the ordinary serve cache"
                 );
+                assert_eq!(raw_search(&cx, &endpoint).await?, (1, caching));
+                assert_eq!(stream_search(&cx, &client, &root).await?, (1, caching));
 
                 std::fs::write(source.join("beta.md"), "sharedtoken beta document")?;
                 assert!(matches!(
@@ -1018,10 +1169,35 @@ mod generation_tests {
                 assert_eq!(forwarded.hits.len(), 2);
                 assert_eq!(
                     raw_search(&cx, &endpoint).await?,
-                    (2, false),
-                    "a reply cached on the previous generation must not be served"
+                    (2, caching),
+                    "a forwarded publication refresh must replace cached old results with the new generation's results"
                 );
                 assert_eq!(raw_search(&cx, &endpoint).await?, (2, caching));
+
+                // A cold progressive query also fills the same cache, without
+                // losing its Started/Initial/Terminal framing or generation.
+                std::fs::write(source.join("gamma.md"), "sharedtoken gamma document")?;
+                assert!(matches!(
+                    runtime.rebuild_retained_generation(&cx, &root).await?,
+                    GenerationPublication::Durable(_)
+                ));
+                assert_eq!(stream_search(&cx, &client, &root).await?, (3, false));
+                assert_eq!(stream_search(&cx, &client, &root).await?, (3, caching));
+                assert_eq!(raw_search(&cx, &endpoint).await?, (3, caching));
+                let forwarded = client
+                    .query_complete_generation_daemon(&cx, &root, "sharedtoken", 10)
+                    .await?;
+                assert_eq!(forwarded.hits.len(), 3);
+                assert_eq!(raw_search(&cx, &endpoint).await?, (3, caching));
+
+                // The raw lane can be first to observe a later publication too.
+                std::fs::write(source.join("delta.md"), "sharedtoken delta document")?;
+                assert!(matches!(
+                    runtime.rebuild_retained_generation(&cx, &root).await?,
+                    GenerationPublication::Durable(_)
+                ));
+                assert_eq!(raw_search(&cx, &endpoint).await?, (4, false));
+                assert_eq!(stream_search(&cx, &client, &root).await?, (4, caching));
                 Ok::<(), SearchError>(())
             };
             Box::pin(drive_with_daemon(&cx, &runtime, &root, client_work)).await;
@@ -1077,6 +1253,18 @@ mod generation_tests {
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
                 assert!(endpoint.exists(), "daemon did not become ready");
+                // A plain raw request warms the shared cache without saving a
+                // CLI explanation session. A cached forwarded result must save
+                // that context, while --explain still computes its own detail.
+                assert_eq!(raw_search(&cx, &endpoint).await?, (2, false));
+                assert!(FsfsRuntime::load_explain_session_at_root(&root)?.is_none());
+                let cached = client
+                    .query_complete_generation_daemon(&cx, &root, "sharedtoken", 10)
+                    .await?;
+                let context = FsfsRuntime::load_explain_session_at_root(&root)?.unwrap();
+                assert_eq!(context.query, cached.query);
+                assert_eq!(context.hits.len(), 2);
+                assert!(context.complete_generation.is_some());
                 // Exercise the actual CLI dispatch and formatter, not just a
                 // JSON fixture or direct invocation of the server search helper.
                 // Explanation is per request: this daemon started without it.

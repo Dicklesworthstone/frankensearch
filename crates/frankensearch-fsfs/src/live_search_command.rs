@@ -41,14 +41,14 @@ Run a publisher separately, or explicitly opt into indexing with --watch-source.
   --query TEXT            Nonblank UTF-8 query, at most 64 KiB (required)
   --hybrid                Use the retained progressive hybrid pipeline and local models
   --config FILE           Hybrid configuration/model policy; requires --hybrid
-  --tui                   Live terminal view (Unix, terminal stdin/stdout required)
+  --tui                   Live terminal view and query editor (Unix terminals required)
   --watch-source DIR      Index and watch DIR, publishing successors; requires --hybrid
   --limit N               Result window, 1..=10000 (default 20)
   --poll-ms N             Selection probe interval, 10..=60000 (default 100)
   --debounce-ms N         Quiet period before a refresh, 0..=60000 (default 100)
   --max-wait-ms N         Churn coalescing bound, 1..=60000 (default 1000)
   --min-score-delta N     Finite, non-negative score-only threshold (default 0)
-  --max-updates N         Exit after N completed generation updates (all phases)
+  --max-updates N         Exit after N completed updates (all phases; see TUI notes)
   --once                 Deliver one generation, including refinement, then exit
   --timeout-ms N         Overall cooperative deadline, 1..=86400000
   --format jsonl         Explicit machine output (default; incompatible with --tui)
@@ -79,9 +79,22 @@ that phase sequence. Each hybrid record is bounded to 16 MiB before output.
 
 --tui displays this same subscription in an alternate-screen terminal view.
 Up/Down or j/k select results; PgUp/PgDn move ten rows; Home/End jump; q/Esc quit.
-Selection follows document identity through reranking. Failed refinement retains
-Initial results. The query is fixed for the session; there is no query editor.
-Existing time/update limits still stop the command and restore the terminal.
+Press / or Enter to edit the query. In the editor, Enter submits, Esc cancels the
+draft, Ctrl-U clears it, and Left/Right/Home/End/Backspace/Delete edit UTF-8 text.
+Bracketed paste is literal input: newlines/tabs become spaces, control characters
+are refused, and an oversized paste is rejected whole. Queries remain bounded to
+64 KiB. Ctrl-C stops in either mode; q and j/k are ordinary text while editing.
+Typing does not launch searches. Only the latest submitted query is retained while
+an existing phase sequence finishes. Then a fresh query snapshot replaces the old
+window, reusing admitted readers/models; no process, model reload or index rebuild
+is needed solely to change the query. Unchanged submissions are no-ops. Query
+changes never revive a failed transport, reset the overall timeout, or split
+Initial/refinement. Selection follows identity within a query; a new query starts
+at its first result. Failed refinement retains that query's Initial results.
+For a read-only TUI subscription, --max-updates counts completed query/generation
+refreshes. With --watch-source it still counts only actual published generations:
+query editing does not publish or spend that limit. Machine NDJSON mode remains a
+fixed-query subscription. Existing limits restore the terminal when they stop it.
 
 --watch-source is supported on Unix and requires disjoint source/store trees.
 It builds the initial generation, then streams each durable publication through

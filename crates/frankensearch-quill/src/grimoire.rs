@@ -915,11 +915,17 @@ pub(crate) struct ValidatedTermDictionaryMetadata {
     blocks: Vec<BlockMeta>,
     restarts: Vec<RestartMeta>,
     term_count: u32,
+    max_posting_blocks: u64,
 }
 
 impl ValidatedTermDictionaryMetadata {
     pub(crate) const fn schema(&self) -> SchemaDescriptor {
         self.schema
+    }
+
+    /// Conservative physical block count for any one term in this dictionary.
+    pub(crate) const fn max_posting_blocks(&self) -> u64 {
+        self.max_posting_blocks
     }
 
     /// Estimated payload bytes retained by this validated metadata object.
@@ -955,6 +961,7 @@ pub struct TermDictionary<'a> {
     blocks: Cow<'a, [BlockMeta]>,
     restarts: Cow<'a, [RestartMeta]>,
     term_count: u32,
+    max_posting_blocks: u64,
 }
 
 impl<'a> TermDictionary<'a> {
@@ -1033,6 +1040,7 @@ impl<'a> TermDictionary<'a> {
                 blocks: Cow::Owned(Vec::new()),
                 restarts: Cow::Owned(Vec::new()),
                 term_count: 0,
+                max_posting_blocks: 0,
             });
         }
 
@@ -1168,6 +1176,7 @@ impl<'a> TermDictionary<'a> {
             blocks.push(meta);
             previous_tail = Some(tail);
         }
+        let max_posting_blocks = references.max_posting_blocks;
         references.finish()?;
         let term_count_u32 =
             u32::try_from(term_count).map_err(|_| TermDictionaryError::ValueOutOfRange {
@@ -1182,6 +1191,7 @@ impl<'a> TermDictionary<'a> {
             blocks: Cow::Owned(blocks),
             restarts: Cow::Owned(restarts),
             term_count: term_count_u32,
+            max_posting_blocks,
         })
     }
 
@@ -1202,6 +1212,7 @@ impl<'a> TermDictionary<'a> {
             blocks,
             restarts,
             term_count,
+            max_posting_blocks,
         } = parsed;
         Ok(ValidatedTermDictionaryMetadata {
             source_start: bytes.as_ptr() as usize,
@@ -1211,6 +1222,7 @@ impl<'a> TermDictionary<'a> {
             blocks: blocks.into_owned(),
             restarts: restarts.into_owned(),
             term_count,
+            max_posting_blocks,
         })
     }
 
@@ -1233,6 +1245,7 @@ impl<'a> TermDictionary<'a> {
             blocks: Cow::Borrowed(&metadata.blocks),
             restarts: Cow::Borrowed(&metadata.restarts),
             term_count: metadata.term_count,
+            max_posting_blocks: metadata.max_posting_blocks,
         })
     }
 
@@ -2196,6 +2209,7 @@ struct ReferenceValidator {
     postings_end: u64,
     positions_end: u64,
     blockmax_end: u64,
+    max_posting_blocks: u64,
 }
 
 impl ReferenceValidator {
@@ -2209,6 +2223,7 @@ impl ReferenceValidator {
             postings_end: 0,
             positions_end: 0,
             blockmax_end: 0,
+            max_posting_blocks: 0,
         })
     }
 
@@ -2239,6 +2254,12 @@ impl ReferenceValidator {
             });
         }
         self.blockmax_end = metadata.blockmax.end("BLOCKMAX")?;
+        self.max_posting_blocks =
+            self.max_posting_blocks
+                .max(crate::quiver::posting_block_count_upper_bound(
+                    metadata.doc_freq,
+                    metadata.postings.len,
+                ));
         Ok(())
     }
 
