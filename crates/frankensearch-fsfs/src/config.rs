@@ -3024,6 +3024,46 @@ fn expand_tilde(value: &str, home_dir: &Path) -> Option<String> {
         .map(|rest| home_dir.join(rest).to_string_lossy().into_owned())
 }
 
+/// The ranges of the search knobs a warm query daemon also accepts per request
+/// (blend weight, RRF k, quality and rerank deadlines).
+///
+/// # Errors
+/// Returns `InvalidConfig` naming the first knob out of range.
+pub(crate) fn validate_search_policy(search: &SearchConfig) -> SearchResult<()> {
+    if !(0.0..=1.0).contains(&search.quality_weight) {
+        return Err(SearchError::InvalidConfig {
+            field: "search.quality_weight".into(),
+            value: search.quality_weight.to_string(),
+            reason: "must be between 0.0 and 1.0".into(),
+        });
+    }
+
+    if !search.rrf_k.is_finite() || search.rrf_k < 1.0 {
+        return Err(SearchError::InvalidConfig {
+            field: "search.rrf_k".into(),
+            value: search.rrf_k.to_string(),
+            reason: "must be >= 1.0".into(),
+        });
+    }
+
+    if search.quality_timeout_ms < 50 {
+        return Err(SearchError::InvalidConfig {
+            field: "search.quality_timeout_ms".into(),
+            value: search.quality_timeout_ms.to_string(),
+            reason: "must be >= 50".into(),
+        });
+    }
+
+    if !(MIN_RERANK_TIMEOUT_MS..=MAX_RERANK_TIMEOUT_MS).contains(&search.rerank_timeout_ms) {
+        return Err(SearchError::InvalidConfig {
+            field: "search.rerank_timeout_ms".into(),
+            value: search.rerank_timeout_ms.to_string(),
+            reason: format!("must be within {MIN_RERANK_TIMEOUT_MS}..={MAX_RERANK_TIMEOUT_MS}"),
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> SearchResult<()> {
     if !(1_usize..=1024_usize).contains(&config.discovery.max_file_size_mb) {
@@ -3066,37 +3106,7 @@ fn validate_config(config: &FsfsConfig, warnings: &mut Vec<ConfigWarning>) -> Se
         });
     }
 
-    if !(0.0..=1.0).contains(&config.search.quality_weight) {
-        return Err(SearchError::InvalidConfig {
-            field: "search.quality_weight".into(),
-            value: config.search.quality_weight.to_string(),
-            reason: "must be between 0.0 and 1.0".into(),
-        });
-    }
-
-    if !config.search.rrf_k.is_finite() || config.search.rrf_k < 1.0 {
-        return Err(SearchError::InvalidConfig {
-            field: "search.rrf_k".into(),
-            value: config.search.rrf_k.to_string(),
-            reason: "must be >= 1.0".into(),
-        });
-    }
-
-    if config.search.quality_timeout_ms < 50 {
-        return Err(SearchError::InvalidConfig {
-            field: "search.quality_timeout_ms".into(),
-            value: config.search.quality_timeout_ms.to_string(),
-            reason: "must be >= 50".into(),
-        });
-    }
-
-    if !(MIN_RERANK_TIMEOUT_MS..=MAX_RERANK_TIMEOUT_MS).contains(&config.search.rerank_timeout_ms) {
-        return Err(SearchError::InvalidConfig {
-            field: "search.rerank_timeout_ms".into(),
-            value: config.search.rerank_timeout_ms.to_string(),
-            reason: format!("must be within {MIN_RERANK_TIMEOUT_MS}..={MAX_RERANK_TIMEOUT_MS}"),
-        });
-    }
+    validate_search_policy(&config.search)?;
 
     if u64::from(config.search.shadow_sample_rate_basis_points)
         > frankensearch_core::SHADOW_SAMPLE_DENOMINATOR

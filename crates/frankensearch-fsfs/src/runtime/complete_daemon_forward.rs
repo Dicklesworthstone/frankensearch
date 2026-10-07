@@ -40,7 +40,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 9: extension filter clauses widen each other.
 // 10: colons that name no field reach the lexical lane.
 // 11: snippets mask credential tokens and private-key material.
-const VERSION: u32 = 11;
+// 12: the search policy travels with each request (`SearchPolicy`).
+const VERSION: u32 = 12;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -63,6 +64,64 @@ struct SearchRequest {
     explain: bool,
     store_root: PathBuf,
     configuration: serde_json::Value,
+    policy: SearchPolicy,
+}
+
+/// The search knobs a warm daemon applies per request, as the legacy query
+/// daemon applies its request policy: they change how one query is ranked,
+/// not which models, generation or privacy rules serve it. Changing one in a
+/// config file or with `--fast-only`/`--rerank` therefore needs no other
+/// daemon. They are left out of the configuration contract, which stays
+/// exact for everything else.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SearchPolicy {
+    quality_weight: f64,
+    rrf_k: f64,
+    quality_timeout_ms: u64,
+    fast_only: bool,
+    rerank: bool,
+    rerank_timeout_ms: u64,
+}
+
+impl SearchPolicy {
+    /// The `[search]` keys this policy carries.
+    const KEYS: [&'static str; 6] = [
+        "quality_weight",
+        "rrf_k",
+        "quality_timeout_ms",
+        "fast_only",
+        "rerank",
+        "rerank_timeout_ms",
+    ];
+
+    const fn of(config: &FsfsConfig) -> Self {
+        Self {
+            quality_weight: config.search.quality_weight,
+            rrf_k: config.search.rrf_k,
+            quality_timeout_ms: config.search.quality_timeout_ms,
+            fast_only: config.search.fast_only,
+            rerank: config.search.rerank,
+            rerank_timeout_ms: config.search.rerank_timeout_ms,
+        }
+    }
+
+    /// Set this policy on `runtime`, which then searches with it. A value a
+    /// config file could not hold is refused, as it would be there.
+    fn apply_to(self, runtime: &mut FsfsRuntime) -> SearchResult<()> {
+        let mut search = runtime.config.search.clone();
+        search.quality_weight = self.quality_weight;
+        search.rrf_k = self.rrf_k;
+        search.quality_timeout_ms = self.quality_timeout_ms;
+        search.fast_only = self.fast_only;
+        search.rerank = self.rerank;
+        search.rerank_timeout_ms = self.rerank_timeout_ms;
+        crate::config::validate_search_policy(&search)?;
+        runtime.config.search = search;
+        runtime.cli_input.overrides.fast_only = Some(self.fast_only);
+        runtime.cli_input.overrides.rerank = Some(self.rerank);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -99,14 +158,18 @@ fn configuration_contract(config: &FsfsConfig) -> SearchResult<serde_json::Value
     let mut value = serde_json::to_value(config).map_err(codec_error)?;
     // Limit and explanations are explicit request arguments, not properties
     // of warmed models. An ordinary daemon can explain a particular request.
+    // The search policy travels with each request and is applied to it.
     // Everything else remains exact: in particular, no model, producer,
-    // privacy, ranking, or pressure-policy mismatch is silently ignored.
+    // privacy, or pressure-policy mismatch is silently ignored.
     if let Some(search) = value
         .get_mut("search")
         .and_then(serde_json::Value::as_object_mut)
     {
         search.remove("default_limit");
         search.remove("explain");
+        for key in SearchPolicy::KEYS {
+            search.remove(key);
+        }
     }
     Ok(value)
 }
@@ -201,6 +264,7 @@ fn make_request(
             explain: runtime.config.search.explain,
             store_root: std::fs::canonicalize(root)?,
             configuration: configuration_contract(runtime.config())?,
+            policy: SearchPolicy::of(runtime.config()),
         },
     })
 }
@@ -360,8 +424,7 @@ async fn execute(
     query_runtime.cli_input.stream = false;
     query_runtime.cli_input.expand = false;
     query_runtime.cli_input.overrides.limit = Some(request.search.limit);
-    query_runtime.cli_input.overrides.fast_only = Some(query_runtime.config.search.fast_only);
-    query_runtime.cli_input.overrides.rerank = Some(query_runtime.config.search.rerank);
+    request.search.policy.apply_to(&mut query_runtime)?;
     query_runtime.config.search.explain = request.search.explain;
     query_runtime.cli_input.overrides.explain = Some(request.search.explain);
     // The daemon applies its own degradation override to every client, as
@@ -609,20 +672,62 @@ mod tests {
         );
     }
 
+    /// The resolved limit and the per-request search policy are not part of
+    /// the warmed configuration contract; the policy travels in the request
+    /// instead. A model choice is.
     #[test]
-    fn resolved_limit_is_not_part_of_the_warmed_configuration_contract() {
+    fn limit_and_search_policy_are_not_part_of_the_warmed_configuration_contract() {
         let first = FsfsConfig::default();
         let mut second = first.clone();
         second.search.default_limit = 123;
+        second.search.fast_only = !first.search.fast_only;
+        second.search.rerank = !first.search.rerank;
+        second.search.quality_weight = 0.25;
+        second.search.rrf_k = 17.0;
+        second.search.quality_timeout_ms = first.search.quality_timeout_ms + 100;
+        second.search.rerank_timeout_ms = first.search.rerank_timeout_ms + 100;
         assert_eq!(
             configuration_contract(&first).unwrap(),
             configuration_contract(&second).unwrap()
         );
-        second.search.fast_only = !first.search.fast_only;
+        assert_ne!(SearchPolicy::of(&first), SearchPolicy::of(&second));
+        second.indexing.quality_model = "another-quality-model".to_owned();
         assert_ne!(
             configuration_contract(&first).unwrap(),
             configuration_contract(&second).unwrap()
         );
+    }
+
+    /// Applying a request's policy sets each knob (and the fast-only and
+    /// rerank overrides) on the per-request runtime; a value outside its
+    /// config-file range is refused and changes nothing.
+    #[test]
+    fn a_request_policy_is_applied_or_refused_whole() {
+        let mut runtime = FsfsRuntime::new(FsfsConfig::default());
+        let mut policy = SearchPolicy::of(&runtime.config);
+        policy.quality_weight = 0.25;
+        policy.rrf_k = 17.0;
+        policy.fast_only = true;
+        policy.rerank = true;
+        policy.apply_to(&mut runtime).unwrap();
+        assert_eq!(SearchPolicy::of(&runtime.config), policy);
+        assert_eq!(runtime.cli_input.overrides.fast_only, Some(true));
+        assert_eq!(runtime.cli_input.overrides.rerank, Some(true));
+
+        let before = SearchPolicy::of(&runtime.config);
+        for (field, invalid) in [
+            ("search.quality_weight", SearchPolicy { quality_weight: 1.5, ..policy }),
+            ("search.rrf_k", SearchPolicy { rrf_k: f64::NAN, ..policy }),
+            ("search.quality_timeout_ms", SearchPolicy { quality_timeout_ms: 1, ..policy }),
+        ] {
+            let error = invalid.apply_to(&mut runtime).unwrap_err();
+            assert!(
+                matches!(&error, SearchError::InvalidConfig { field: refused, .. }
+                    if refused == field),
+                "{field}: {error:?}"
+            );
+            assert_eq!(SearchPolicy::of(&runtime.config), before, "{field}");
+        }
     }
 
     #[test]
@@ -879,8 +984,10 @@ mod generation_tests {
                     limited.hits[0].path
                 );
 
+                // Search knobs travel per request; the rest of the
+                // configuration must still match.
                 let mut different = runtime.config().clone();
-                different.search.fast_only = false;
+                different.indexing.embedding_batch_size = 32;
                 let mismatched =
                     FsfsRuntime::new(different).with_cli_input(client.cli_input.clone());
                 let failure = mismatched

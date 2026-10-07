@@ -129,8 +129,10 @@ fsfs search "connection pooling" --daemon --limit 10 \
 ```
 
 The client checks the store and resolved configuration against the daemon;
-filters and limits apply to the individual request. Use the same configuration
-for both commands. Through a named `--daemon-socket`, a configuration
+filters, limits and the search policy (`quality_weight`, `rrf_k`,
+`quality_timeout_ms`, `fast_only`, `rerank`, `rerank_timeout_ms`, and so
+`--fast-only` and `--rerank`) apply to the individual request, so one daemon
+serves clients that differ only there. Use the same configuration otherwise. Through a named `--daemon-socket`, a configuration
 mismatch, corrupt selection, or invalid reply fails the request without opening
 local search resources or retrying retrieval. A plain search (daemon transport
 is the default) with no daemon listening starts one, detached and with the

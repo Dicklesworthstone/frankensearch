@@ -2474,8 +2474,9 @@ mod tests {
             assert_eq!(daemons.lock().unwrap().len(), 1);
 
             let mut edited = search.clone();
-            edited.config.search.rrf_k = 30.0;
-            spawning.lock().unwrap().config.search.rrf_k = 30.0;
+            // Not a per-request search knob: the daemon contract holds it exact.
+            edited.config.indexing.embedding_batch_size = 32;
+            spawning.lock().unwrap().config.indexing.embedding_batch_size = 32;
             let mut named = edited.clone();
             named.cli_input.daemon_socket = Some(socket.clone());
             let refused = Box::pin(named.run_complete_generation_search_with_writer(
@@ -2527,6 +2528,116 @@ mod tests {
                 .expect("the replacement answers a stop request");
             let second = daemons.lock().unwrap().remove(0);
             join(second);
+        });
+    }
+
+    /// The search policy (blend weight, RRF k, deadlines, fast-only, rerank)
+    /// travels with each forwarded request: one daemon serves clients whose
+    /// policies differ, each ranked by its own (here RRF k, visible in the
+    /// fused score `1 / (k + 1)` of the only hit). A setting outside the
+    /// policy still has to match, and a policy a config file could not hold
+    /// is refused.
+    #[test]
+    fn complete_daemon_applies_each_requests_search_policy() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let sockets = tempfile::tempdir().unwrap();
+            let socket = fs::canonicalize(sockets.path()).unwrap().join("policy.sock");
+            let mut daemon_runtime = runtime.clone();
+            daemon_runtime.cli_input.command = CliCommand::Daemon;
+            daemon_runtime.cli_input.daemon_socket = Some(socket.clone());
+            let store = root.clone();
+            let daemon = std::thread::spawn(move || {
+                let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 2)
+                    .build()
+                    .unwrap();
+                scheduler.block_on(async move {
+                    let cx = Cx::current().expect("daemon thread context");
+                    daemon_runtime
+                        .run_complete_generation_daemon(&cx, &store)
+                        .await
+                })
+            });
+            let waiting = Instant::now();
+            while !socket.exists() {
+                assert!(
+                    waiting.elapsed() < std::time::Duration::from_secs(60),
+                    "the daemon never bound its socket"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            let client = |configure: &dyn Fn(&mut FsfsConfig)| {
+                let mut search = search_runtime(&runtime);
+                search.cli_input.daemon = true;
+                search.cli_input.daemon_socket = Some(socket.clone());
+                configure(&mut search.config);
+                search
+            };
+
+            for rrf_k in [60.0, 30.0, 60.0] {
+                let search = client(&|config| config.search.rrf_k = rrf_k);
+                let mut output = Vec::new();
+                Box::pin(search.run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output,
+                ))
+                .await
+                .expect("one daemon serves every policy");
+                let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                let hit = &envelope["data"]["hits"][0];
+                // Rank 0 in each lane that found it: 1 / (k + 1) per lane.
+                let lanes = if hit["in_both_sources"] == true { 2.0 } else { 1.0 };
+                let fused = hit["score"].as_f64().unwrap();
+                assert!(
+                    (fused * (rrf_k + 1.0) - lanes).abs() < 1e-9,
+                    "rrf_k {rrf_k}: {envelope}"
+                );
+            }
+            assert!(!daemon.is_finished(), "no policy stopped the daemon");
+
+            let other = client(&|config| config.indexing.embedding_batch_size = 32);
+            let refused = Box::pin(other.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await
+            .unwrap_err();
+            assert!(
+                FsfsRuntime::is_stale_daemon_refusal(&refused),
+                "{refused:?}"
+            );
+            let invalid = client(&|config| config.search.quality_weight = 1.5);
+            let refused = Box::pin(invalid.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await
+            .unwrap_err();
+            assert_eq!(
+                FsfsRuntime::forwarded_search_error(&refused)
+                    .and_then(|error| error.field.as_deref()),
+                Some("search.quality_weight"),
+                "{refused:?}"
+            );
+            assert!(!daemon.is_finished(), "refusals do not stop the daemon");
+
+            let mut stopper = runtime.clone();
+            stopper.cli_input.daemon_stop = true;
+            stopper.cli_input.daemon_socket = Some(socket.clone());
+            stopper
+                .run_complete_generation_daemon(&cx, &root)
+                .await
+                .expect("the daemon answers a stop request");
+            daemon
+                .join()
+                .unwrap()
+                .expect("the daemon exits cleanly on stop");
         });
     }
 

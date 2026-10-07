@@ -119,8 +119,7 @@ pub(super) async fn serve(
         query_runtime.cli_input.stream = true;
         query_runtime.cli_input.format = OutputFormat::Jsonl;
         query_runtime.cli_input.overrides.limit = Some(request.request.search.limit);
-        query_runtime.cli_input.overrides.fast_only = Some(query_runtime.config.search.fast_only);
-        query_runtime.cli_input.overrides.rerank = Some(query_runtime.config.search.rerank);
+        request.request.search.policy.apply_to(&mut query_runtime)?;
         query_runtime.config.search.explain = request.request.search.explain;
         query_runtime.cli_input.overrides.explain = Some(request.request.search.explain);
         query_runtime
