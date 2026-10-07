@@ -529,6 +529,7 @@ mod tests {
             session.source_mut().select("b", "intermediate");
             assert!(session.poll(&cx, tick(start, 10)).unwrap().is_none());
             session.source_mut().select("c", "latest");
+            assert!(session.poll(&cx, tick(start, 15)).unwrap().is_none());
             assert!(session.poll(&cx, tick(start, 34)).unwrap().is_none());
             let frame = session.poll(&cx, tick(start, 35)).unwrap().unwrap();
             assert_eq!(frame.generation, "c");
@@ -882,8 +883,13 @@ mod tests {
             session.source.score = 1.125;
             assert!(session.poll(&cx, tick(now, 2)).unwrap().is_none());
             let frame = session.poll(&cx, tick(now, 22)).unwrap().unwrap();
-            assert!(matches!(frame.event, LiveSearchEvent::Delta { changes } if changes.is_empty()));
-            assert_eq!(session.tracker().results()[0].hit.score.to_bits(), 1.0_f64.to_bits());
+            assert!(
+                matches!(frame.event, LiveSearchEvent::Delta { changes } if changes.is_empty())
+            );
+            assert_eq!(
+                session.tracker().results()[0].hit.score.to_bits(),
+                1.0_f64.to_bits()
+            );
         });
     }
 
@@ -929,7 +935,10 @@ mod tests {
             assert_eq!(session.tracker().results()[0].hit.doc_id, "alpha");
             assert_eq!(session.source.queries.len(), 1);
             session.set_query(&cx, "beta").unwrap();
-            assert!(matches!(session.poll(&cx, now), Err(SearchError::InvalidConfig { .. })));
+            assert!(matches!(
+                session.poll(&cx, now),
+                Err(SearchError::InvalidConfig { .. })
+            ));
             assert_eq!(session.source.queries.len(), 1);
             let frame = session.poll(&cx, tick(now, 11)).unwrap().unwrap();
             assert_eq!(frame.query, "beta");
