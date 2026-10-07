@@ -14,9 +14,22 @@ fn local_receipt_fixture() -> Result<(tempfile::TempDir, PathBuf, PathBuf, Encod
     std::fs::write(&segment, encoded.as_bytes())?;
     assert!(crate::read_open_receipts::supported(&File::open(&segment)?),
         "positive receipt tests must run on supported local storage");
-    write_manifest(&index.join("MANIFEST"),
-        &durable_test_manifest(1, vec![manifest_segment(&encoded, 1)]))?;
+    write_manifest(&index.join("MANIFEST"), &receipt_manifest(1, &encoded))?;
     Ok((root, index, cache, encoded))
+}
+
+// The fixture's one-segment MANIFEST with the per-field BM25 rows a real
+// publication carries; public QuillSearchIndex opens refuse a MANIFEST
+// without them. The fixture segment indexes no terms, so each indexed field
+// holds zero tokens over the segment's documents.
+fn receipt_manifest(generation: u64, encoded: &EncodedSegment) -> Manifest {
+    let mut manifest = durable_test_manifest(generation, vec![manifest_segment(encoded, 1)]);
+    let doc_count = manifest.segments[0].doc_count;
+    manifest.field_stats = DEFAULT_SCHEMA.fields.iter()
+        .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+        .map(|field| ManifestFieldStats { field_ord: field.id, total_tokens: 0, doc_count })
+        .collect();
+    manifest
 }
 
 fn eager_local_open(index: &Path, cache: &Path) -> Result<KeeperSnapshot, KeeperError> {
@@ -254,10 +267,7 @@ fn public_readers_share_receipt_policy_on_open_and_refresh() -> TestResult {
 
         // Publish a new MANIFEST reusing the immutable segment. No in-place
         // segment write occurs while any reader owns its memory mapping.
-        write_manifest(
-            &index.join("MANIFEST"),
-            &durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]),
-        )?;
+        write_manifest(&index.join("MANIFEST"), &receipt_manifest(2, &encoded))?;
         for reader in [&explicit, &ordinary] {
             assert!(reader.refresh(&cx).await?);
             assert_eq!(reader.keeper_generation(), 2);
@@ -273,10 +283,7 @@ fn public_readers_share_receipt_policy_on_open_and_refresh() -> TestResult {
         // A damaged proof changes neither data nor authority: admission must
         // fully hash the real file and may then replace the advisory proof.
         std::fs::write(cache.join("read-open-receipts-v3"), b"damaged-proof")?;
-        write_manifest(
-            &index.join("MANIFEST"),
-            &durable_test_manifest(3, vec![manifest_segment(&encoded, 1)]),
-        )?;
+        write_manifest(&index.join("MANIFEST"), &receipt_manifest(3, &encoded))?;
         assert!(ordinary.refresh(&cx).await?);
         assert_eq!(ordinary.keeper_generation(), 3);
         assert_eq!(ordinary.authenticated_file_witness_hash_count(), 1);
