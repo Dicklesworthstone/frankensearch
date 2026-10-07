@@ -1,8 +1,10 @@
-//! Opt-in recovery of a rejected native inference batch by ordered bisection.
+//! Identity-admitted inference and opt-in recovery by ordered bisection.
 //!
-//! Only ordinary `EmbeddingFailed` responses are split, using the SAME bound
-//! operation and captured producer. No raw fallback, omitted row, asynchronous
-//! worker or model substitution can turn a failed cohort into a success.
+//! Native batches require the provider's explicit bound-batch contract. Other
+//! providers retain their bound-single operation for every input slot. Only
+//! ordinary `EmbeddingFailed` responses from native batches are split, using
+//! the SAME operation and captured producer. No raw fallback, omitted row,
+//! asynchronous worker or model substitution can rescue a failed cohort.
 
 use std::sync::Arc;
 
@@ -11,6 +13,134 @@ use frankensearch_core::traits::{IdentityBoundEmbedding, ModelCategory, ModelTie
 
 use super::checkpoint;
 use crate::{Cx, Embedder, SearchError, SearchResult};
+
+fn identity_error() -> SearchError {
+    SearchError::UnverifiableRemoteSpace {
+        producer: "native_ann.builder.batch".to_owned(),
+        reason: "batch inference no longer matches the admitted producer contract".to_owned(),
+    }
+}
+
+fn admit_current_producer(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    expected: &EmbeddingIdentityBundleV1,
+    native_batch: bool,
+    phase: &'static str,
+) -> SearchResult<()> {
+    checkpoint(cx, phase)?;
+    let identity = embedder.identity();
+    let dimension = embedder.dimension();
+    let current_native_batch = embedder.bound_batch_is_native();
+    // Provider metadata access is user code too. Cancellation during that
+    // access must win before another inference call or any writer admission.
+    checkpoint(cx, phase)?;
+    if identity.is_ok_and(|identity| identity == expected)
+        && usize::try_from(expected.space.dimension).ok() == Some(dimension)
+        && current_native_batch == native_batch
+    {
+        Ok(())
+    } else {
+        Err(identity_error())
+    }
+}
+
+fn finish_admitted_call<T>(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    expected: &EmbeddingIdentityBundleV1,
+    native_batch: bool,
+    outcome: SearchResult<T>,
+) -> SearchResult<T> {
+    checkpoint(cx, "native_ann.builder.after_batch")?;
+    match outcome {
+        Err(error @ SearchError::Cancelled { .. }) => Err(error),
+        outcome => {
+            // Check before inspecting an ordinary failure: changed producers
+            // must never be made retryable by a failed inference response.
+            admit_current_producer(
+                cx,
+                embedder,
+                expected,
+                native_batch,
+                "native_ann.builder.after_batch",
+            )?;
+            outcome
+        }
+    }
+}
+
+fn admit_output(
+    expected: &EmbeddingIdentityBundleV1,
+    response: &IdentityBoundEmbedding,
+) -> SearchResult<()> {
+    // Compare before validating so untrusted foreign fields are not echoed by
+    // more detailed validation errors. Never attach our identity to raw output.
+    if &response.identity != expected {
+        return Err(identity_error());
+    }
+    response.validate()
+}
+
+/// Produce a complete ordered group under the builder's captured identity.
+/// Nothing from this group is handed to a writer until all slots are admitted.
+pub(super) async fn infer_admitted(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    expected: &EmbeddingIdentityBundleV1,
+    texts: &[&str],
+) -> SearchResult<Vec<IdentityBoundEmbedding>> {
+    checkpoint(cx, "native_ann.builder.before_batch")?;
+    let native_batch = embedder.bound_batch_is_native();
+    admit_current_producer(
+        cx,
+        embedder,
+        expected,
+        native_batch,
+        "native_ann.builder.before_batch",
+    )?;
+    let response = if native_batch {
+        let outcome = embedder.embed_batch_bound(cx, texts).await;
+        let response = finish_admitted_call(cx, embedder, expected, native_batch, outcome)?;
+        if response.len() != texts.len() {
+            return Err(SearchError::InvalidConfig {
+                field: "native_ann.builder.batch_cardinality".to_owned(),
+                value: response.len().to_string(),
+                reason: format!("expected exactly {} bound outputs", texts.len()),
+            });
+        }
+        for bound in &response {
+            checkpoint(cx, "native_ann.builder.admit_output")?;
+            admit_output(expected, bound)?;
+        }
+        response
+    } else {
+        let mut response = Vec::with_capacity(texts.len());
+        for text in texts {
+            admit_current_producer(
+                cx,
+                embedder,
+                expected,
+                native_batch,
+                "native_ann.builder.before_batch",
+            )?;
+            let outcome = embedder.embed_bound(cx, text).await;
+            let bound = finish_admitted_call(cx, embedder, expected, native_batch, outcome)?;
+            checkpoint(cx, "native_ann.builder.admit_output")?;
+            admit_output(expected, &bound)?;
+            response.push(bound);
+        }
+        response
+    };
+    admit_current_producer(
+        cx,
+        embedder,
+        expected,
+        native_batch,
+        "native_ann.builder.batch_complete",
+    )?;
+    Ok(response)
+}
 
 pub(super) fn wrap(
     inner: Arc<dyn Embedder>,
@@ -25,39 +155,19 @@ struct SplittingEmbedder {
 }
 
 impl SplittingEmbedder {
-    fn identity_error() -> SearchError {
-        SearchError::UnverifiableRemoteSpace {
-            producer: "native_ann.builder.batch".to_owned(),
-            reason: "batch inference no longer matches the admitted producer contract".to_owned(),
-        }
-    }
-
-    fn admit_producer(&self) -> SearchResult<()> {
-        let current = self.inner.identity().map_err(|_| Self::identity_error())?;
-        if current != &self.identity
-            || usize::try_from(self.identity.space.dimension).ok() != Some(self.inner.dimension())
-        {
-            return Err(Self::identity_error());
-        }
-        Ok(())
-    }
-
-    fn admit_response(&self, response: &IdentityBoundEmbedding) -> SearchResult<()> {
-        // Compare first: a foreign response must not disclose arbitrary fields
-        // through the identity validator's more detailed diagnostics.
-        if response.identity != self.identity {
-            return Err(Self::identity_error());
-        }
-        response.validate()
-    }
-
     async fn split_batch(
         &self,
         cx: &Cx,
         texts: &[&str],
     ) -> SearchResult<Vec<IdentityBoundEmbedding>> {
         checkpoint(cx, "native_ann.builder.before_batch")?;
-        self.admit_producer()?;
+        let native_batch = self.inner.bound_batch_is_native();
+        if !native_batch {
+            // A failure of an already-single operation cannot be fixed by
+            // bisecting a group. In particular, do not try the inherited raw
+            // bound-batch default after a custom bound-single refusal.
+            return infer_admitted(cx, self.inner.as_ref(), &self.identity, texts).await;
+        }
         // Keep native empty-batch admission/error behavior. There is no split
         // for an empty input and no manufactured successful empty response.
         // A work stack of index ranges, seeded with the whole batch.
@@ -65,19 +175,24 @@ impl SplittingEmbedder {
         pending.push(0..texts.len());
         let mut accepted = Vec::with_capacity(texts.len());
         while let Some(range) = pending.pop() {
-            checkpoint(cx, "native_ann.builder.before_batch")?;
-            self.admit_producer()?;
+            admit_current_producer(
+                cx,
+                self.inner.as_ref(),
+                &self.identity,
+                native_batch,
+                "native_ann.builder.before_batch",
+            )?;
             let outcome = self
                 .inner
                 .embed_batch_bound(cx, &texts[range.clone()])
                 .await;
-            // Cancellation outranks both a provider failure and late success.
-            checkpoint(cx, "native_ann.builder.after_batch")?;
-            let outcome = match outcome {
-                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                outcome => outcome,
-            };
-            self.admit_producer()?;
+            let outcome = finish_admitted_call(
+                cx,
+                self.inner.as_ref(),
+                &self.identity,
+                native_batch,
+                outcome,
+            );
             let mut response = match outcome {
                 Ok(response) => response,
                 Err(SearchError::EmbeddingFailed { .. }) if range.len() > 1 => {
@@ -105,12 +220,17 @@ impl SplittingEmbedder {
             }
             for value in &response {
                 checkpoint(cx, "native_ann.builder.admit_output")?;
-                self.admit_response(value)?;
+                admit_output(&self.identity, value)?;
             }
             accepted.append(&mut response);
         }
-        checkpoint(cx, "native_ann.builder.batch_complete")?;
-        self.admit_producer()?;
+        admit_current_producer(
+            cx,
+            self.inner.as_ref(),
+            &self.identity,
+            native_batch,
+            "native_ann.builder.batch_complete",
+        )?;
         // The caller receives all outputs at once and validates before writing.
         // A later leaf failure drops every previously accepted sibling output.
         Ok(accepted)

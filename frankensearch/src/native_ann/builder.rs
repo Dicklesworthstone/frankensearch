@@ -153,9 +153,9 @@ impl TierPlan {
         documents: &[IndexableDocument],
     ) -> SearchResult<()> {
         checkpoint(cx, "native_ann.builder.before_batch")?;
-        self.admit(self.embedder.identity()?)?;
         let texts: Vec<_> = documents.iter().map(|doc| doc.content.as_str()).collect();
-        let response = self.embedder.embed_batch_bound(cx, &texts).await;
+        let response =
+            batch::infer_admitted(cx, self.embedder.as_ref(), &self.identity, &texts).await;
         checkpoint(cx, "native_ann.builder.after_batch")?;
         let response = response?;
         if response.len() != documents.len() {
@@ -180,7 +180,7 @@ impl TierPlan {
     fn admit_output(&self, bound: &IdentityBoundEmbedding) -> SearchResult<()> {
         bound.validate()?;
         self.admit(&bound.identity)?;
-        if bound.values.len() != self.embedder.dimension()
+        if usize::try_from(self.identity.space.dimension).ok() != Some(bound.values.len())
             || bound.values.iter().any(|v| !v.is_finite())
         {
             return Err(invalid(
@@ -196,8 +196,10 @@ impl TierPlan {
 /// Build one fast and optional quality tier from exactly the same source cohort.
 ///
 /// Models and their identities are retained from construction through queries.
-/// Each batch is embedded once per tier unless failure splitting is explicitly
-/// enabled. Outputs are written before advancing: the builder does not retain
+/// Batch-native providers embed each group once per tier unless failure splitting
+/// is enabled. Other providers keep their identity-checked bound-single operation
+/// for every input, without raw fallback or splitting. An entire group is admitted
+/// before any of its outputs is written. The builder does not retain
 /// an additional corpus-sized matrix of f32 model outputs.
 /// Source documents remain owned because later reranking must use the same text.
 /// The v2 writer and final admitted owners have their own storage requirements.
