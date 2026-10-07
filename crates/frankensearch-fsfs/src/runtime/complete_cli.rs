@@ -785,10 +785,12 @@ impl FsfsRuntime {
     }
 
     /// Forward this search to the store's daemon and emit its result. `false`
-    /// means the default socket had no listener (a crashed daemon or a reboot
-    /// left it): the refused connect is the first network step, so nothing
-    /// received the request or was written, and the caller may search in
-    /// process. A named socket fails closed instead.
+    /// means the socket had no listener (a crashed daemon or a reboot left
+    /// it), or the default socket's daemon refused the search for running
+    /// with another configuration and was asked to stop. Either way nothing
+    /// executed the request or was written, and the caller may start a daemon
+    /// (or, on the default socket, search in process). A named socket's
+    /// configuration refusal fails closed instead.
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     async fn forward_complete_search<W: Write + Send>(
@@ -816,13 +818,26 @@ impl FsfsRuntime {
                 Ok(true)
             }
             Ok(None) => Ok(true),
-            Err(SearchError::Io(error))
-                if !named && error.kind() == ErrorKind::ConnectionRefused =>
-            {
+            Err(SearchError::Io(error)) if error.kind() == ErrorKind::ConnectionRefused => {
                 tracing::warn!(
                     store_root = %root.display(),
                     "complete-generation daemon socket has no listener"
                 );
+                Ok(false)
+            }
+            // The store's daemon was started with another configuration (an
+            // edited config file, another --config) or by another fsfs build
+            // (an upgrade), and refused before doing anything. Stop it so the
+            // caller can start one like this client; until then the search
+            // runs in process.
+            Err(error) if !named && Self::is_stale_daemon_refusal(&error) => {
+                tracing::warn!(
+                    store_root = %root.display(),
+                    %error,
+                    "the store's query daemon runs another configuration or build; replacing it"
+                );
+                let socket = self.complete_generation_socket_path(root)?;
+                Self::retire_complete_generation_daemon(cx, &socket).await?;
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -883,9 +898,10 @@ impl FsfsRuntime {
             #[cfg(unix)]
             {
                 // A plain search defaults to daemon transport. With no query
-                // daemon serving this store, start one and search in process
-                // until it accepts, as the legacy layout does. A named
-                // --daemon-socket still fails closed and starts nothing.
+                // daemon listening, start one (on a named --daemon-socket too,
+                // as the legacy layout does) and use it once it accepts. A
+                // default socket searches in process until then; a named one
+                // fails closed.
                 let named = self.cli_input.daemon_socket.is_some();
                 let socket = self.complete_generation_socket_path(root)?;
                 let exists = match fs::symlink_metadata(&socket) {
@@ -893,17 +909,17 @@ impl FsfsRuntime {
                     Err(error) if error.kind() == ErrorKind::NotFound => false,
                     Err(error) => return Err(error.into()),
                 };
-                let mut served = if named || exists {
+                let mut served = if exists {
                     self.forward_complete_search(cx, root, query, limit, started, named, writer)
                         .await?
                 } else {
                     false
                 };
-                // No daemon, or only the stale socket of a crashed one: start
-                // the store's warm daemon for later searches (it replaces a
-                // verified stale socket) and use it now once it accepts.
+                // No daemon, only the stale socket of a crashed one, or one
+                // with another configuration (now stopped): start a warm
+                // daemon for later searches (it replaces a verified stale
+                // socket) and use it now once it accepts.
                 if !served
-                    && !named
                     && self
                         .start_complete_generation_daemon(cx, root, &socket)
                         .await?
@@ -914,6 +930,14 @@ impl FsfsRuntime {
                 }
                 if served {
                     return Ok(());
+                }
+                if named {
+                    return Err(SearchError::InvalidConfig {
+                        field: "complete_generation.daemon_socket".to_owned(),
+                        value: socket.display().to_string(),
+                        reason: "no query daemon listens on this socket and none could be started; start one with `fsfs daemon --daemon-socket` or search with --no-daemon"
+                            .to_owned(),
+                    });
                 }
             }
             #[cfg(not(unix))]
@@ -2080,13 +2104,17 @@ mod tests {
                 "{envelope}"
             );
 
+            // Named, the same stale socket gets a daemon started on it; with
+            // none starting, the search fails closed instead of in process.
             search.cli_input.daemon_socket = Some(socket.clone());
             let error = search
                 .run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new())
                 .await
                 .unwrap_err();
             assert!(
-                matches!(&error, SearchError::Io(io) if io.kind() == ErrorKind::ConnectionRefused),
+                matches!(&error, SearchError::InvalidConfig { field, value, .. }
+                    if field == "complete_generation.daemon_socket"
+                        && *value == socket.display().to_string()),
                 "{error:?}"
             );
         });
@@ -2247,7 +2275,8 @@ mod tests {
     /// A plain search with no daemon running starts the store's daemon (here
     /// a real one on its own thread and runtime, standing in for the detached
     /// process) and returns results; the daemon is then serving the store. A
-    /// --no-daemon search and a named socket start nothing.
+    /// named socket outside the store gets a daemon started on it the same
+    /// way, which then serves the search. A --no-daemon search starts nothing.
     #[test]
     fn complete_search_starts_the_store_daemon() {
         use super::complete_daemon::{DaemonExited, TestDaemonSpawnerGuard};
@@ -2260,14 +2289,15 @@ mod tests {
             let socket = runtime.complete_generation_socket_path(&root).unwrap();
 
             let daemon_thread = Arc::new(Mutex::new(None));
-            let spawns = Arc::new(Mutex::new(0_usize));
+            let spawns = Arc::new(Mutex::new(Vec::new()));
             let mut daemon_runtime = runtime.clone();
             daemon_runtime.cli_input.command = CliCommand::Daemon;
             let _guard = {
                 let (daemon_thread, spawns) = (daemon_thread.clone(), spawns.clone());
-                TestDaemonSpawnerGuard::install(Box::new(move |store: &Path| {
-                    *spawns.lock().unwrap() += 1;
-                    let (daemon_runtime, store) = (daemon_runtime.clone(), store.to_path_buf());
+                TestDaemonSpawnerGuard::install(Box::new(move |store: &Path, socket: &Path| {
+                    spawns.lock().unwrap().push(socket.to_path_buf());
+                    let (mut daemon_runtime, store) = (daemon_runtime.clone(), store.to_path_buf());
+                    daemon_runtime.cli_input.daemon_socket = Some(socket.to_path_buf());
                     let handle = std::thread::spawn(move || {
                         let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
                             .blocking_threads(0, 2)
@@ -2286,24 +2316,32 @@ mod tests {
                 }))
             };
 
+            let bound = |socket: &Path| {
+                let waiting = Instant::now();
+                while !socket.exists() {
+                    assert!(
+                        waiting.elapsed() < std::time::Duration::from_secs(60),
+                        "the started daemon never bound its socket"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            };
+            let stop_and_join = |socket: Option<PathBuf>| {
+                let mut stopper = runtime.clone();
+                stopper.cli_input.daemon_stop = true;
+                stopper.cli_input.daemon_socket = socket;
+                (stopper, daemon_thread.lock().unwrap().take().unwrap())
+            };
+
             let mut search = search_runtime(&runtime);
             search.cli_input.daemon = false;
             search
                 .run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new())
                 .await
                 .unwrap();
-            search.cli_input.daemon_socket = Some(socket.clone());
-            search.cli_input.daemon = true;
-            assert!(
-                search
-                    .run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new())
-                    .await
-                    .is_err(),
-                "a named socket with no daemon fails closed"
-            );
-            assert_eq!(*spawns.lock().unwrap(), 0, "neither starts a daemon");
+            assert!(spawns.lock().unwrap().is_empty(), "--no-daemon starts nothing");
 
-            search.cli_input.daemon_socket = None;
+            search.cli_input.daemon = true;
             let mut output = Vec::new();
             search
                 .run_complete_generation_search_with_writer(&cx, &root, &mut output)
@@ -2316,28 +2354,179 @@ mod tests {
                     .is_some_and(|hits| !hits.is_empty()),
                 "{envelope}"
             );
-            assert_eq!(*spawns.lock().unwrap(), 1);
+            assert_eq!(spawns.lock().unwrap().as_slice(), std::slice::from_ref(&socket));
             // A slow start lets the first search run in process; the daemon
             // still comes up and serves the store.
-            let waiting = Instant::now();
-            while !socket.exists() {
-                assert!(
-                    waiting.elapsed() < std::time::Duration::from_secs(60),
-                    "the started daemon never bound its socket"
-                );
-                asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(25)).await;
-            }
-
-            let mut stopper = runtime.clone();
-            stopper.cli_input.daemon_stop = true;
+            bound(&socket);
+            let (stopper, handle) = stop_and_join(None);
             stopper
                 .run_complete_generation_daemon(&cx, &root)
                 .await
                 .expect("the started daemon answers a stop request");
-            let handle = daemon_thread.lock().unwrap().take().unwrap();
             let handle = Arc::try_unwrap(handle).ok().unwrap().into_inner().unwrap();
             handle.join().unwrap().expect("the daemon exits cleanly on stop");
             assert!(!socket.exists());
+
+            // A named socket outside the store gets a daemon of its own.
+            let sockets = tempfile::tempdir().unwrap();
+            let named = fs::canonicalize(sockets.path()).unwrap().join("named.sock");
+            search.cli_input.daemon_socket = Some(named.clone());
+            let first = Box::pin(search.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await;
+            // Under load the daemon may bind after the start window; a named
+            // search then fails closed rather than searching in process.
+            if let Err(error) = &first {
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, .. }
+                        if field == "complete_generation.daemon_socket"),
+                    "{error:?}"
+                );
+            }
+            assert_eq!(spawns.lock().unwrap().last(), Some(&named));
+            bound(&named);
+            let mut output = Vec::new();
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut output))
+                .await
+                .expect("the daemon on the named socket serves the search");
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&output).unwrap()["ok"],
+                true
+            );
+            assert_eq!(spawns.lock().unwrap().len(), 2, "an answering daemon is reused");
+            let (stopper, handle) = stop_and_join(Some(named.clone()));
+            stopper
+                .run_complete_generation_daemon(&cx, &root)
+                .await
+                .expect("the named daemon answers a stop request");
+            let handle = Arc::try_unwrap(handle).ok().unwrap().into_inner().unwrap();
+            handle.join().unwrap().expect("the daemon exits cleanly on stop");
+            assert!(!named.exists());
+        });
+    }
+
+    /// A store daemon started with another configuration (an edited config
+    /// file, another --config) refuses forwarded searches. A plain search
+    /// stops it, starts one with its own configuration and returns results;
+    /// a named socket still fails closed and stops nothing.
+    #[test]
+    fn complete_search_replaces_a_store_daemon_with_another_configuration() {
+        use super::complete_daemon::{DaemonExited, TestDaemonSpawnerGuard};
+        use std::sync::{Arc, Mutex};
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let socket = runtime.complete_generation_socket_path(&root).unwrap();
+            // A started daemon runs with the configuration of the search that
+            // started it, as the detached process inherits that --config.
+            let spawning = Arc::new(Mutex::new(runtime.clone()));
+            let daemons = Arc::new(Mutex::new(Vec::new()));
+            let _guard = {
+                let (spawning, daemons) = (spawning.clone(), daemons.clone());
+                TestDaemonSpawnerGuard::install(Box::new(move |store: &Path, socket: &Path| {
+                    let mut daemon_runtime = spawning.lock().unwrap().clone();
+                    daemon_runtime.cli_input.command = CliCommand::Daemon;
+                    daemon_runtime.cli_input.daemon_socket = Some(socket.to_path_buf());
+                    let store = store.to_path_buf();
+                    let handle = std::thread::spawn(move || {
+                        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+                            .blocking_threads(0, 2)
+                            .build()
+                            .unwrap();
+                        scheduler.block_on(async move {
+                            let cx = Cx::current().expect("daemon thread context");
+                            daemon_runtime
+                                .run_complete_generation_daemon(&cx, &store)
+                                .await
+                        })
+                    });
+                    let finished = Arc::new(Mutex::new(handle));
+                    daemons.lock().unwrap().push(finished.clone());
+                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished())) as DaemonExited)
+                }))
+            };
+            let bound = |socket: &Path| {
+                let waiting = Instant::now();
+                while !socket.exists() {
+                    assert!(
+                        waiting.elapsed() < std::time::Duration::from_secs(60),
+                        "the started daemon never bound its socket"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            };
+            let join = |daemon: Arc<Mutex<std::thread::JoinHandle<SearchResult<()>>>>| {
+                let handle = Arc::try_unwrap(daemon).ok().unwrap().into_inner().unwrap();
+                handle.join().unwrap().expect("the daemon exits cleanly on stop");
+            };
+
+            let mut search = search_runtime(&runtime);
+            search.cli_input.daemon = true;
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new()))
+                .await
+                .unwrap();
+            bound(&socket);
+            assert_eq!(daemons.lock().unwrap().len(), 1);
+
+            let mut edited = search.clone();
+            edited.config.search.rrf_k = 30.0;
+            spawning.lock().unwrap().config.search.rrf_k = 30.0;
+            let mut named = edited.clone();
+            named.cli_input.daemon_socket = Some(socket.clone());
+            let refused = Box::pin(named.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await
+            .unwrap_err();
+            assert!(
+                FsfsRuntime::is_stale_daemon_refusal(&refused),
+                "{refused:?}"
+            );
+            assert!(
+                !daemons.lock().unwrap()[0].lock().unwrap().is_finished(),
+                "a named socket stops nothing"
+            );
+
+            let mut output = Vec::new();
+            Box::pin(edited.run_complete_generation_search_with_writer(&cx, &root, &mut output))
+                .await
+                .expect("the replaced daemon does not fail the search");
+            let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert!(
+                envelope["data"]["hits"]
+                    .as_array()
+                    .is_some_and(|hits| !hits.is_empty()),
+                "{envelope}"
+            );
+            let first = daemons.lock().unwrap().remove(0);
+            join(first);
+            assert_eq!(daemons.lock().unwrap().len(), 1, "one replacement started");
+            bound(&socket);
+            // The replacement serves the edited configuration: a named socket
+            // fails closed unless that daemon answers.
+            Box::pin(named.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await
+            .expect("the replacement serves the edited configuration");
+
+            let mut stopper = edited.clone();
+            stopper.cli_input.daemon_stop = true;
+            stopper
+                .run_complete_generation_daemon(&cx, &root)
+                .await
+                .expect("the replacement answers a stop request");
+            let second = daemons.lock().unwrap().remove(0);
+            join(second);
         });
     }
 

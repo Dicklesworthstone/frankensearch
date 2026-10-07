@@ -2,8 +2,9 @@
 //!
 //! The request deliberately has no top-level `query`: an older daemon must
 //! refuse it rather than execute the query while ignoring its configuration.
-//! Connect/write/read use the existing bounded control transport. There is no
-//! local retrieval fallback, auto-start, or replay after ambiguous delivery.
+//! Connect/write/read use the existing bounded control transport. The
+//! forwarder itself never retrieves locally, starts a daemon, or replays after
+//! ambiguous delivery; `fsfs search` decides around it whether to start one.
 
 use std::fmt;
 use std::io::Write;
@@ -206,8 +207,19 @@ fn make_request(
 
 fn decode_reply(bytes: &[u8], request: &ForwardedSearch) -> SearchResult<SearchPayload> {
     let reply: Reply = serde_json::from_slice(bytes).map_err(codec_error)?;
-    if reply.fsfs_complete_cli != VERSION
-        || reply.request_id != request.request_id
+    // Every daemon refuses a request of another protocol version before
+    // searching, and answers in its own: another fsfs build started it.
+    if reply.fsfs_complete_cli != VERSION {
+        return Err(SearchError::InvalidConfig {
+            field: "complete_generation.daemon_version".to_owned(),
+            value: reply.fsfs_complete_cli.to_string(),
+            reason: format!(
+                "the query daemon was started by another fsfs build (protocol {}; this client speaks {VERSION}); stop it with `fsfs daemon --stop` or search with --no-daemon",
+                reply.fsfs_complete_cli
+            ),
+        });
+    }
+    if reply.request_id != request.request_id
         || reply.query != request.search.query
         || reply.result.v != OUTPUT_SCHEMA_VERSION
         || reply.result.meta.command != "search"
@@ -250,6 +262,29 @@ impl FsfsRuntime {
                     .map(|failure| &failure.0)
             }
             _ => None,
+        }
+    }
+
+    /// Whether `error` is a daemon's refusal of a forwarded search because it
+    /// runs with another configuration or was started by another fsfs build
+    /// (another protocol version). Either refuses before searching, and a
+    /// refused request has delivered no output, so the search may still be
+    /// served elsewhere.
+    pub(crate) fn is_stale_daemon_refusal(error: &SearchError) -> bool {
+        match error {
+            SearchError::InvalidConfig { field, .. } => {
+                field == "complete_generation.daemon_version"
+            }
+            SearchError::SubsystemError { subsystem, source }
+                if *subsystem == "fsfs.complete_generation.remote_search" =>
+            {
+                source
+                    .downcast_ref::<RemoteSearchFailure>()
+                    .is_some_and(|failure| {
+                        failure.0.field.as_deref() == Some("complete_generation.daemon_config")
+                    })
+            }
+            _ => false,
         }
     }
 
@@ -608,14 +643,22 @@ mod tests {
                 .contains("wrong semantic producer: fixture")
         );
         assert!(std::error::Error::source(&error).is_some());
+        // A reply in another protocol version names another fsfs build's
+        // daemon, which a plain search may replace.
         for stale in (1..VERSION).chain([VERSION + 1]) {
             reply.fsfs_complete_cli = stale;
+            let error = decode_reply(&serde_json::to_vec(&reply).unwrap(), &request).unwrap_err();
             assert!(
-                matches!(decode_reply(&serde_json::to_vec(&reply).unwrap(), &request),
-                Err(SearchError::InvalidConfig { field, .. }) if field == "complete_generation.daemon_response"),
-                "{stale}"
+                matches!(&error, SearchError::InvalidConfig { field, value, .. }
+                    if field == "complete_generation.daemon_version" && *value == stale.to_string()),
+                "{stale}: {error:?}"
             );
+            assert!(FsfsRuntime::is_stale_daemon_refusal(&error), "{stale}");
         }
+        assert!(
+            !FsfsRuntime::is_stale_daemon_refusal(&original),
+            "an ordinary refusal is not a stale daemon"
+        );
         reply.fsfs_complete_cli = VERSION;
         reply.request_id.push('x');
         assert!(

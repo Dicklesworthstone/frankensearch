@@ -63,9 +63,10 @@ struct BoundCompleteSocket {
 
 impl BoundCompleteSocket {
     fn bind(path: PathBuf) -> SearchResult<Self> {
-        // The socket must live in its store root, so a root too deep for
-        // sun_path cannot serve. Refuse before creating the lock, instead of
-        // leaving it behind on bind()'s raw "shorter than SUN_LEN" error.
+        // The default socket lives in its store root, so a root too deep for
+        // sun_path cannot serve on it. Refuse before creating the lock,
+        // instead of leaving it behind on bind()'s raw "shorter than SUN_LEN"
+        // error.
         let capacity = daemon_socket_path_capacity();
         let length = path.as_os_str().len();
         if length >= capacity {
@@ -73,7 +74,7 @@ impl BoundCompleteSocket {
                 field: "complete_generation.daemon_socket".to_owned(),
                 value: path.display().to_string(),
                 reason: format!(
-                    "the socket path is {length} bytes, but Unix sockets allow at most {}; complete-generation sockets live in the store root, so serve a store at a shorter path",
+                    "the socket path is {length} bytes, but Unix sockets allow at most {}; name a shorter socket outside the store with --daemon-socket, or serve a store at a shorter path",
                     capacity - 1
                 ),
             });
@@ -153,9 +154,10 @@ impl Drop for BoundCompleteSocket {
 /// Polls whether a started daemon process has already exited.
 pub(super) type DaemonExited = Box<dyn FnMut() -> io::Result<bool> + Send>;
 
-/// What a test installs in place of the detached daemon process.
+/// What a test installs in place of the detached daemon process. It receives
+/// the store root and the socket the daemon must bind.
 #[cfg(test)]
-pub(super) type TestDaemonSpawner = Box<dyn FnMut(&Path) -> Option<DaemonExited>>;
+pub(super) type TestDaemonSpawner = Box<dyn FnMut(&Path, &Path) -> Option<DaemonExited>>;
 
 #[cfg(test)]
 thread_local! {
@@ -201,11 +203,11 @@ impl FsfsRuntime {
         if socket.as_os_str().len() >= daemon_socket_path_capacity() {
             return Ok(false);
         }
-        let mut exited = match self.spawn_complete_generation_daemon(root) {
+        let mut exited = match self.spawn_complete_generation_daemon(root, socket) {
             Ok(Some(exited)) => exited,
             Ok(None) => return Ok(false),
             Err(error) => {
-                tracing::warn!(%error, "could not start the complete-generation daemon; searching in process");
+                tracing::warn!(%error, "could not start the complete-generation daemon");
                 return Ok(false);
             }
         };
@@ -226,12 +228,96 @@ impl FsfsRuntime {
         Ok(false)
     }
 
+    /// Ask the daemon on `socket` to stop, so that one started with this
+    /// runtime's configuration can replace it, and wait as long as a start
+    /// would for it to stop accepting. `false` means it did not stop in time
+    /// (or refused the request); the caller then searches in process.
+    pub(super) async fn retire_complete_generation_daemon(
+        cx: &Cx,
+        socket: &Path,
+    ) -> SearchResult<bool> {
+        let timeout = Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS);
+        if let Err(error) = control::stop(cx, socket, timeout).await {
+            tracing::warn!(
+                %error,
+                socket = %socket.display(),
+                "could not stop the store's query daemon; searching in process"
+            );
+            return Ok(false);
+        }
+        Self::socket_released(cx, socket, FSFS_DAEMON_CONNECT_MAX_ATTEMPTS).await
+    }
+
+    /// `fsfs daemon --stop`: ask the daemon on `socket` to stop, wait until it
+    /// no longer accepts (so a following start can bind), and print a receipt
+    /// in the shape the legacy `--stop` prints.
+    async fn stop_complete_generation_daemon(&self, cx: &Cx, socket: &Path) -> SearchResult<()> {
+        // As long as the legacy stop waits for its daemon's process to exit.
+        const STOP_WAIT_ATTEMPTS: usize = 400;
+
+        let started = Instant::now();
+        control::stop(
+            cx,
+            socket,
+            Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS),
+        )
+        .await?;
+        if !Self::socket_released(cx, socket, STOP_WAIT_ATTEMPTS).await? {
+            return Err(SearchError::InvalidConfig {
+                field: "complete_generation.daemon_stop".to_owned(),
+                value: socket.display().to_string(),
+                reason: "the query daemon acknowledged the stop but still accepts connections"
+                    .to_owned(),
+            });
+        }
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if self.cli_input.format == crate::OutputFormat::Table {
+            println!(
+                "daemon: stopped the query daemon on {} after {elapsed_ms}ms",
+                socket.display()
+            );
+        } else {
+            let receipt = serde_json::json!({
+                "stopped": true,
+                "socket": socket.display().to_string(),
+                "elapsed_ms": elapsed_ms,
+            });
+            println!("{receipt}");
+        }
+        Ok(())
+    }
+
+    /// Wait, polling `attempts` times, until nothing accepts on `socket` (it
+    /// is gone or refuses connections).
+    async fn socket_released(cx: &Cx, socket: &Path, attempts: usize) -> SearchResult<bool> {
+        for _ in 0..attempts {
+            retained_search_checkpoint(cx)?;
+            if fs::symlink_metadata(socket).is_err() || control::refuses_connections(socket) {
+                return Ok(true);
+            }
+            asupersync::time::sleep(
+                cx.now(),
+                Duration::from_millis(FSFS_DAEMON_CONNECT_RETRY_DELAY_MS),
+            )
+            .await;
+        }
+        Ok(false)
+    }
+
+    // The daemon binds exactly the socket this client resolved, the store's
+    // own or a named one.
     #[cfg(not(test))]
-    fn spawn_complete_generation_daemon(&self, root: &Path) -> SearchResult<Option<DaemonExited>> {
+    fn spawn_complete_generation_daemon(
+        &self,
+        root: &Path,
+        socket: &Path,
+    ) -> SearchResult<Option<DaemonExited>> {
         let mut child = self.spawn_detached_fsfs([
             "daemon".into(),
             "--index-dir".into(),
             root.into(),
+            "--daemon-socket".into(),
+            socket.into(),
             "--idle-timeout-ms".into(),
             FSFS_DAEMON_IDLE_TIMEOUT_MS.to_string().into(),
         ])?;
@@ -241,8 +327,16 @@ impl FsfsRuntime {
     // Same signature as the process spawner it stands in for.
     #[cfg(test)]
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
-    fn spawn_complete_generation_daemon(&self, root: &Path) -> SearchResult<Option<DaemonExited>> {
-        Ok(TEST_DAEMON_SPAWNER.with(|slot| slot.borrow_mut().as_mut().and_then(|spawn| spawn(root))))
+    fn spawn_complete_generation_daemon(
+        &self,
+        root: &Path,
+        socket: &Path,
+    ) -> SearchResult<Option<DaemonExited>> {
+        Ok(TEST_DAEMON_SPAWNER.with(|slot| {
+            slot.borrow_mut()
+                .as_mut()
+                .and_then(|spawn| spawn(root, socket))
+        }))
     }
 
     /// Serve one buffered or progressive request per connection until cancellation or idle
@@ -257,12 +351,7 @@ impl FsfsRuntime {
         if self.cli_input.daemon_stop {
             // Stop must remain usable when selection or model admission fails.
             // It must never acquire a listener lock or start a replacement.
-            return control::stop(
-                cx,
-                &socket_path,
-                Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS),
-            )
-            .await;
+            return self.stop_complete_generation_daemon(cx, &socket_path).await;
         }
         // Admit before opening the transport: no listening socket claims a
         // ready service while its generation or semantic producer is invalid.
@@ -413,29 +502,53 @@ impl FsfsRuntime {
                 }
             },
         );
-        // Custom names are supported at the store root only. Do not create a
-        // socket or its lock inside a sealed bundle or an unrelated directory.
+        // A named socket may live in the store root or, as a legacy
+        // --daemon-socket may, in any existing directory outside the store.
+        // Never inside the store's own subdirectories: they hold the sealed
+        // bundles and reader pins. The .sock name keeps its lock
+        // (`<name>.lock`, created next to it) off any file the caller named,
+        // and no directory is created for it.
         let parent = path.parent().ok_or_else(|| {
             complete_cli_error("daemon_socket", "socket must have a parent directory")
         })?;
-        if fs::canonicalize(parent)? != root
+        // Name the refused path and the root it relates to: the shared helper
+        // leaves the value empty, which hid both.
+        let refusal = |reason: String| SearchError::InvalidConfig {
+            field: "complete_generation.daemon_socket".to_owned(),
+            value: path.display().to_string(),
+            reason,
+        };
+        let parent = match fs::canonicalize(parent) {
+            Ok(parent) => parent,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Err(refusal(format!(
+                    "the socket's directory {} does not exist; create it first",
+                    parent.display()
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if (parent != root && parent.starts_with(&root))
             || path.extension().and_then(|extension| extension.to_str()) != Some("sock")
         {
-            // Name the refused path and the root it must live in: the shared
-            // helper leaves the value empty, which hid both.
-            return Err(SearchError::InvalidConfig {
-                field: "complete_generation.daemon_socket".to_owned(),
-                value: path.display().to_string(),
-                reason: format!(
-                    "complete-generation sockets must end in .sock and live directly in the store root {}",
-                    root.display()
-                ),
-            });
+            return Err(refusal(format!(
+                "complete-generation sockets must end in .sock and live in the store root {} or outside the store, never inside its generation or reader directories",
+                root.display()
+            )));
+        }
+        // Another store's root holds that store's own sockets and locks.
+        let pointer = parent.join(crate::generation_store::COMPLETE_GENERATION_POINTER);
+        if parent != root && fs::symlink_metadata(pointer).is_ok() {
+            return Err(refusal(format!(
+                "{} is another complete-generation store's root; name a socket in the store root {} or in a directory that is no store's root",
+                parent.display(),
+                root.display()
+            )));
         }
         let name = path
             .file_name()
             .ok_or_else(|| complete_cli_error("daemon_socket", "socket must have a file name"))?;
-        Ok(root.join(name))
+        Ok(parent.join(name))
     }
 }
 
@@ -907,9 +1020,10 @@ mod tests {
             let listener = Rc::new(std::cell::RefCell::new(None));
             {
                 let (calls, listener, bind_at) = (calls.clone(), listener.clone(), socket.clone());
-                let _guard = TestDaemonSpawnerGuard::install(Box::new(move |_root| {
+                let _guard = TestDaemonSpawnerGuard::install(Box::new(move |_root, socket| {
                     calls.set(calls.get() + 1);
-                    *listener.borrow_mut() = Some(UnixListener::bind(&bind_at).unwrap());
+                    assert_eq!(socket, bind_at, "the daemon binds the resolved socket");
+                    *listener.borrow_mut() = Some(UnixListener::bind(socket).unwrap());
                     Some(Box::new(|| Ok(false)) as DaemonExited)
                 }));
                 assert!(
@@ -925,7 +1039,7 @@ mod tests {
 
             // A process that already exited ends the wait well inside the window.
             {
-                let _guard = TestDaemonSpawnerGuard::install(Box::new(|_root| {
+                let _guard = TestDaemonSpawnerGuard::install(Box::new(|_root, _socket| {
                     Some(Box::new(|| Ok(true)) as DaemonExited)
                 }));
                 let started = Instant::now();
@@ -946,7 +1060,7 @@ mod tests {
             let calls = Rc::new(Cell::new(0));
             {
                 let calls = calls.clone();
-                let _guard = TestDaemonSpawnerGuard::install(Box::new(move |_root| {
+                let _guard = TestDaemonSpawnerGuard::install(Box::new(move |_root, _socket| {
                     calls.set(calls.get() + 1);
                     None
                 }));
@@ -1000,36 +1114,65 @@ mod tests {
         assert_eq!(fs::read(outside).unwrap(), b"sentinel");
     }
 
-    /// A daemon socket outside the store root is refused with the refused path
-    /// and the root it must live in; a name in the root is accepted.
+    /// A named daemon socket may live in the store root or in an existing
+    /// directory outside the store, as a legacy --daemon-socket may. Inside the
+    /// store's subdirectories (sealed bundles, reader pins), in another store's
+    /// root, without the .sock name, or in a missing directory it is refused,
+    /// naming the path.
     #[test]
-    fn socket_outside_the_store_root_is_refused_with_its_path() {
+    fn named_socket_lives_in_the_store_root_or_outside_the_store() {
         let store = tempfile::tempdir().unwrap();
         let elsewhere = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(store.path()).unwrap();
+        let outside_dir = fs::canonicalize(elsewhere.path()).unwrap();
         let runtime_for = |socket: PathBuf| {
             FsfsRuntime::new(crate::FsfsConfig::default()).with_cli_input(crate::CliInput {
                 daemon_socket: Some(socket),
                 ..crate::CliInput::default()
             })
         };
-        let outside = elsewhere.path().join("daemon.sock");
-        let error = runtime_for(outside.clone())
-            .complete_generation_socket_path(store.path())
-            .unwrap_err();
-        assert!(
-            matches!(&error, SearchError::InvalidConfig { field, value, reason }
-                if field == "complete_generation.daemon_socket"
-                    && *value == outside.display().to_string()
-                    && reason.contains(&root.display().to_string())),
-            "{error:?}"
-        );
+        let resolve = |socket: PathBuf| {
+            runtime_for(socket).complete_generation_socket_path(store.path())
+        };
         assert_eq!(
-            runtime_for(root.join("custom.sock"))
-                .complete_generation_socket_path(store.path())
-                .unwrap(),
+            resolve(root.join("custom.sock")).unwrap(),
             root.join("custom.sock")
         );
+        assert_eq!(
+            resolve(elsewhere.path().join("daemon.sock")).unwrap(),
+            outside_dir.join("daemon.sock")
+        );
+
+        let generations = root.join("generations");
+        fs::create_dir(&generations).unwrap();
+        let other_store = elsewhere.path().join("other-store");
+        fs::create_dir(&other_store).unwrap();
+        fs::write(
+            other_store.join(crate::generation_store::COMPLETE_GENERATION_POINTER),
+            b"",
+        )
+        .unwrap();
+        for refused in [
+            generations.join("daemon.sock"),
+            elsewhere.path().join("daemon.socket"),
+            elsewhere.path().join("missing").join("daemon.sock"),
+            other_store.join("fsfs-query.sock"),
+        ] {
+            let error = resolve(refused.clone()).unwrap_err();
+            assert!(
+                matches!(&error, SearchError::InvalidConfig { field, value, .. }
+                    if field == "complete_generation.daemon_socket"
+                        && *value == refused.display().to_string()),
+                "{error:?}"
+            );
+        }
+        let error = resolve(generations.join("daemon.sock")).unwrap_err();
+        assert!(
+            error.to_string().contains(&root.display().to_string()),
+            "{error}"
+        );
+        assert!(!generations.join("daemon.lock").exists());
+        assert!(!elsewhere.path().join("missing").exists(), "no directory is created");
     }
 
     #[test]
@@ -1048,7 +1191,7 @@ mod tests {
             matches!(&error, SearchError::InvalidConfig { field, value, reason }
                 if field == "complete_generation.daemon_socket"
                     && *value == path.display().to_string()
-                    && reason.contains("store root")),
+                    && reason.contains("--daemon-socket")),
             "{error:?}"
         );
         assert!(!path.with_extension("lock").exists(), "no lock is left behind");

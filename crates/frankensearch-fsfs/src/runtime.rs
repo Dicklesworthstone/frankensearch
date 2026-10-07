@@ -14418,6 +14418,16 @@ impl FsfsRuntime {
     /// compaction to merge them into the main index, keeping search
     /// results fresh without manual intervention.
     async fn run_daemon_command(&self, cx: &Cx) -> SearchResult<()> {
+        // `--daemon-socket` names a complete-generation store's query daemon;
+        // this legacy compaction daemon has no socket.
+        if self.cli_input.daemon_socket.is_some() {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.flag".to_owned(),
+                value: "--daemon-socket".to_owned(),
+                reason: "on this legacy index `fsfs daemon` is the WAL compaction daemon, which has no socket; serve queries on a socket with `fsfs serve --daemon --daemon-socket <path>`"
+                    .to_owned(),
+            });
+        }
         let index_root = self.resolve_status_index_root()?;
         if self.cli_input.daemon_stop {
             return self.run_daemon_stop(&index_root);
@@ -48754,6 +48764,32 @@ mod tests {
             matches!(&error, SearchError::InvalidConfig { field, .. } if field == "daemon.pid_file"),
             "unexpected error: {error}"
         );
+    }
+
+    /// The legacy compaction daemon has no socket: a `--daemon-socket` (which
+    /// names a complete-generation query daemon) is refused, for a stop too,
+    /// rather than ignored.
+    #[test]
+    fn legacy_compaction_daemon_refuses_a_daemon_socket() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(&index_root).expect("create index root");
+            for stop in [false, true] {
+                let mut runtime = daemon_stop_runtime(&index_root);
+                runtime.cli_input.daemon_stop = stop;
+                runtime.cli_input.daemon_socket = Some(temp.path().join("q.sock"));
+                let error = runtime
+                    .run_daemon_command(&cx)
+                    .await
+                    .expect_err("a socket is refused");
+                assert!(
+                    matches!(&error, SearchError::InvalidConfig { field, reason, .. }
+                        if field == "cli.flag" && reason.contains("serve --daemon")),
+                    "stop={stop}: {error}"
+                );
+            }
+        });
     }
 
     #[cfg(unix)]

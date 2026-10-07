@@ -104,15 +104,22 @@ fsfs daemon --index-dir /work/search-store --config /work/fsfs.toml --stop
 ```
 
 The first command stays in the foreground and listens at
-`/work/search-store/fsfs-query.sock`; zero disables idle expiry. Sockets must
-live directly in the store root, so a store whose socket path exceeds the Unix
-limit (107 bytes on Linux, 103 on macOS) cannot serve; the daemon refuses it
-before binding and names the path. Search still works there in process.
+`/work/search-store/fsfs-query.sock`; zero disables idle expiry. To use another
+socket, pass the same `--daemon-socket <path>` to `fsfs daemon` (or
+`fsfs serve --daemon`, the legacy spelling), to `fsfs daemon --stop` and to its
+clients: a `.sock` path in the store root or in an existing directory outside
+the store, never inside its generation or reader directories or in another
+store's root. No directory is created for it, and its lock file sits next to it. When the default socket path exceeds the
+Unix limit (107 bytes on Linux, 103 on macOS), the daemon refuses it before
+binding and names the path; name a shorter socket instead. Search still works
+there in process.
 SIGINT or SIGTERM stops the daemon with exit status 0 and removes its socket; a
 second stop signal forces exit 130. Each connection
 accepts one newline-terminated query; plain queries return a buffered response. The stop
 command addresses that socket and remains usable if the generation selection is
-damaged. It does not start a replacement daemon or repair the selection.
+damaged. It waits (up to 10 s) until the socket no longer accepts, then prints
+a receipt (`{"stopped": true, "socket": …, "elapsed_ms": …}` with
+`--format json`). It does not start a replacement daemon or repair the selection.
 
 With that daemon running, forward a buffered search explicitly:
 
@@ -123,13 +130,22 @@ fsfs search "connection pooling" --daemon --limit 10 \
 
 The client checks the store and resolved configuration against the daemon;
 filters and limits apply to the individual request. Use the same configuration
-for both commands. A configuration mismatch, corrupt selection, or invalid
-reply fails the request without opening local search resources or retrying
-retrieval. A plain search (daemon transport is the default) with no daemon
-listening starts one, detached and with the same idle timeout as a legacy
-auto-started daemon, and searches in process until it accepts, so later
-searches are warm; a socket left by a crashed daemon is treated the same way.
-A named `--daemon-socket` starts nothing and fails closed. Forwarding refuses
+for both commands. Through a named `--daemon-socket`, a configuration
+mismatch, corrupt selection, or invalid reply fails the request without opening
+local search resources or retrying retrieval. A plain search (daemon transport
+is the default) with no daemon listening starts one, detached and with the
+same idle timeout as a legacy auto-started daemon, and searches in process
+until it accepts, so later searches are warm; a socket left by a crashed daemon
+is treated the same way. When the store's daemon runs with another
+configuration (after a config edit, say) or was started by another fsfs build
+(after an upgrade), it refuses before searching; a plain search then stops it
+and starts one like itself the same way.
+Two clients with different configurations on one store therefore keep
+replacing each other's daemon; give one of them a named `--daemon-socket`.
+A search through a named `--daemon-socket` with no daemon listening starts one
+on that socket the same way, but never searches in process: if none comes up
+in time, or the one listening runs with another configuration, it fails
+closed. Forwarding refuses
 `--expand`. For progressive delivery, use `--daemon --stream` with
 `--format jsonl` or `--format toon`. The client validates request identity,
 frame sequence, and terminal completion; once a connection is accepted, a

@@ -526,11 +526,17 @@ where
                 idx += 1;
             }
             "--daemon-socket" => {
-                if !matches!(command, CliCommand::Search | CliCommand::Serve) {
+                // `daemon` takes it for a complete-generation store, whose
+                // query daemon it is (start, and `--stop`).
+                if !matches!(
+                    command,
+                    CliCommand::Search | CliCommand::Serve | CliCommand::Daemon
+                ) {
                     return Err(SearchError::InvalidConfig {
                         field: "cli.flag".into(),
                         value: "--daemon-socket".into(),
-                        reason: "--daemon-socket is only valid for search or serve commands".into(),
+                        reason: "--daemon-socket is only valid for the search, serve and daemon commands"
+                            .into(),
                     });
                 }
                 let value = expect_value(&tokens, idx, "--daemon-socket")?;
@@ -1605,6 +1611,36 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("--daemon is only valid for search or serve commands")
+        );
+    }
+
+    #[test]
+    fn parse_daemon_socket_is_accepted_by_search_serve_and_daemon_only() {
+        for command in [
+            &["search", "query"][..],
+            &["serve", "--daemon"],
+            &["daemon"],
+            &["daemon", "--stop"],
+        ] {
+            let mut args = command.to_vec();
+            args.extend(["--daemon-socket", "/tmp/fsfs-q.sock"]);
+            let input = parse_cli_args(args.clone()).expect("parse");
+            assert_eq!(
+                input.daemon_socket.as_deref(),
+                Some(Path::new("/tmp/fsfs-q.sock")),
+                "{args:?}"
+            );
+        }
+        let input = parse_cli_args(["daemon", "--stop", "--daemon-socket", "/tmp/fsfs-q.sock"])
+            .expect("parse");
+        assert!(input.daemon_stop);
+        let err = parse_cli_args(["index", ".", "--daemon-socket", "/tmp/fsfs-q.sock"])
+            .expect_err("must fail");
+        assert!(
+            err.to_string().contains(
+                "--daemon-socket is only valid for the search, serve and daemon commands"
+            ),
+            "{err}"
         );
     }
 
