@@ -19,7 +19,42 @@ mod activation;
 #[path = "warm_update.rs"]
 mod warm_update;
 
-const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Read one bounded nonblank record using the same policy for hybrid and
+/// keyword-only sessions. False means EOF or an explicit quit/exit record.
+/// Never drain an oversized record; leave later input untouched on refusal.
+pub fn read_request(
+    cx: &Cx,
+    input: &mut impl BufRead,
+    record: &mut Vec<u8>,
+) -> Result<bool> {
+    loop {
+        // This is a blocking read on the owning lane, not a detached input
+        // worker. Cancellation is checked on both sides, not during the read.
+        cx.checkpoint()
+            .map_err(|_| bad("native serving cancelled"))?;
+        record.clear();
+        let count = (&mut *input)
+            .take(MAX_REQUEST_BYTES as u64 + 1)
+            .read_until(b'\n', record)?;
+        cx.checkpoint()
+            .map_err(|_| bad("native serving cancelled"))?;
+        if count == 0 {
+            return Ok(false);
+        }
+        if record.len() > MAX_REQUEST_BYTES {
+            return Err(bad(
+                "serve request exceeds 1 MiB; session stopped without draining input",
+            ));
+        }
+        let raw = record.trim_ascii();
+        if raw.is_empty() {
+            continue;
+        }
+        return Ok(raw != b"quit" && raw != b"exit");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivationPermission {
@@ -56,7 +91,7 @@ pub struct Request {
 }
 
 impl Request {
-    fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         validate_query(&self.query)?;
         validate_id(self.id.as_deref())?;
         query::validate_timeout(self.timeout_ms)?;
@@ -70,7 +105,7 @@ impl Request {
     }
 }
 
-fn validate_id(id: Option<&str>) -> Result<()> {
+pub fn validate_id(id: Option<&str>) -> Result<()> {
     if id.is_some_and(|id| id.len() > 256 || id.contains('\0')) {
         return Err(bad("request id must be NUL-free and at most 256 bytes"));
     }
@@ -79,12 +114,12 @@ fn validate_id(id: Option<&str>) -> Result<()> {
 
 // A failed output write may already have exposed part of a frame. It must end
 // the session, not be disguised as a recoverable query error followed by JSON.
-enum Failure {
+pub enum Failure {
     Query(Box<dyn Error + Send + Sync>),
     Delivery(Box<dyn Error + Send + Sync>),
 }
 
-struct Frames<'a, W> {
+pub struct Frames<'a, W> {
     output: &'a mut W,
     request: u64,
     id: Option<&'a str>,
@@ -93,8 +128,24 @@ struct Frames<'a, W> {
     partial: bool,
 }
 
-impl<W: Write> Frames<'_, W> {
-    fn send(&mut self, mut payload: serde_json::Value) -> Result<()> {
+impl<'a, W: Write> Frames<'a, W> {
+    pub fn new(
+        output: &'a mut W,
+        request: u64,
+        id: Option<&'a str>,
+        generation: ArtifactGenerationIdentityV1,
+    ) -> Self {
+        Self {
+            output,
+            request,
+            id,
+            generation,
+            seq: 0,
+            partial: false,
+        }
+    }
+
+    pub fn send(&mut self, mut payload: serde_json::Value) -> Result<()> {
         payload["schema"] = serde_json::json!(SCHEMA);
         payload["request"] = serde_json::json!(self.request);
         payload["id"] = serde_json::json!(self.id);
@@ -241,14 +292,7 @@ pub async fn stream_one<'i, W: Write>(
     policy: &query::Policy,
 ) -> Result<bool> {
     let index = index.into();
-    let mut frames = Frames {
-        output,
-        request: ordinal,
-        id: request.id.as_deref(),
-        generation: index.generation(),
-        seq: 0,
-        partial: false,
-    };
+    let mut frames = Frames::new(output, ordinal, request.id.as_deref(), index.generation());
     let mode = request.mode.unwrap_or(defaults.0);
     let limit = request.limit.unwrap_or(defaults.1);
     let result = async {
@@ -330,31 +374,10 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
     let mut request_line = Vec::new();
     let mut ordinal = 0_u64;
     loop {
-        // Standard input is a blocking read on the owning command lane. EOF
-        // exits normally. No preemptible idle read or detached input task is claimed.
-        cx.checkpoint()
-            .map_err(|_| bad("native serving cancelled"))?;
-        request_line.clear();
-        let count = (&mut *input)
-            .take(MAX_REQUEST_BYTES as u64 + 1)
-            .read_until(b'\n', &mut request_line)?;
-        cx.checkpoint()
-            .map_err(|_| bad("native serving cancelled"))?;
-        if count == 0 {
+        if !read_request(cx, input, &mut request_line)? {
             return Ok(());
-        }
-        if request_line.len() > MAX_REQUEST_BYTES {
-            return Err(bad(
-                "serve request exceeds 1 MiB; session stopped without draining input",
-            ));
         }
         let raw = request_line.trim_ascii();
-        if raw.is_empty() {
-            continue;
-        }
-        if raw == b"quit" || raw == b"exit" {
-            return Ok(());
-        }
         ordinal = ordinal
             .checked_add(1)
             .ok_or_else(|| bad("request ordinal exhausted"))?;

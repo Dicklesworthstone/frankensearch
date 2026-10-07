@@ -4818,6 +4818,31 @@ struct UninstallTarget {
     purge_only: bool,
 }
 
+/// Per-user base directories that `fsfs uninstall` resolves its shell
+/// completion, agent hook, config, cache and data targets under.
+///
+/// The CLI reads them from the process environment
+/// ([`Self::from_environment`]). Taking them as an argument lets tests run a
+/// confirmed uninstall against a sandbox instead of the real home directory.
+#[derive(Debug)]
+struct UninstallUserDirs {
+    home: Option<PathBuf>,
+    config: Option<PathBuf>,
+    data: Option<PathBuf>,
+    cache: Option<PathBuf>,
+}
+
+impl UninstallUserDirs {
+    fn from_environment() -> Self {
+        Self {
+            home: home_dir(),
+            config: frankensearch_core::platform_dirs::config_dir(),
+            data: frankensearch_core::platform_dirs::data_dir(),
+            cache: frankensearch_core::platform_dirs::cache_dir(),
+        }
+    }
+}
+
 // ─── Self-Update Payload Types ─────────────────────────────────────────────
 
 /// Structured payload for `fsfs update` (and `fsfs update --check`).
@@ -7086,7 +7111,7 @@ impl FsfsRuntime {
     }
 
     fn run_uninstall_command(&self) -> SearchResult<()> {
-        let payload = self.collect_uninstall_payload()?;
+        let payload = self.collect_uninstall_payload(&UninstallUserDirs::from_environment())?;
         if self.cli_input.format == OutputFormat::Table {
             let table = render_uninstall_table(&payload, self.cli_input.no_color);
             print!("{table}");
@@ -7108,7 +7133,10 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    fn collect_uninstall_payload(&self) -> SearchResult<FsfsUninstallPayload> {
+    fn collect_uninstall_payload(
+        &self,
+        user_dirs: &UninstallUserDirs,
+    ) -> SearchResult<FsfsUninstallPayload> {
         let dry_run = self.cli_input.uninstall_dry_run;
         let confirmed = self.cli_input.uninstall_yes;
         let purge = self.cli_input.uninstall_purge;
@@ -7130,7 +7158,7 @@ impl FsfsRuntime {
         }
 
         let mut entries = Vec::new();
-        for target in self.collect_uninstall_targets()? {
+        for target in self.collect_uninstall_targets(user_dirs)? {
             entries.push(Self::apply_uninstall_target(&target, dry_run, purge));
         }
 
@@ -7157,7 +7185,10 @@ impl FsfsRuntime {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn collect_uninstall_targets(&self) -> SearchResult<Vec<UninstallTarget>> {
+    fn collect_uninstall_targets(
+        &self,
+        user_dirs: &UninstallUserDirs,
+    ) -> SearchResult<Vec<UninstallTarget>> {
         let mut candidates = Vec::new();
 
         if !cfg!(test)
@@ -7185,7 +7216,7 @@ impl FsfsRuntime {
             purge_only: true,
         });
 
-        if let Some(config_dir) = frankensearch_core::platform_dirs::config_dir() {
+        if let Some(config_dir) = user_dirs.config.as_deref() {
             let root = config_dir.join("frankensearch");
             candidates.push(UninstallTarget {
                 target: "config_dir".to_owned(),
@@ -7207,7 +7238,7 @@ impl FsfsRuntime {
             });
         }
 
-        if let Some(cache_dir) = frankensearch_core::platform_dirs::cache_dir() {
+        if let Some(cache_dir) = user_dirs.cache.as_deref() {
             candidates.push(UninstallTarget {
                 target: "cache_dir".to_owned(),
                 kind: UninstallTargetKind::Directory,
@@ -7216,7 +7247,7 @@ impl FsfsRuntime {
             });
         }
 
-        if let Some(data_dir) = frankensearch_core::platform_dirs::data_dir() {
+        if let Some(data_dir) = user_dirs.data.as_deref() {
             candidates.push(UninstallTarget {
                 target: "data_dir".to_owned(),
                 kind: UninstallTargetKind::Directory,
@@ -7237,7 +7268,7 @@ impl FsfsRuntime {
             });
         }
 
-        if let Some(home) = home_dir() {
+        if let Some(home) = user_dirs.home.as_deref() {
             candidates.push(UninstallTarget {
                 target: "zsh_completion_home".to_owned(),
                 kind: UninstallTargetKind::File,
@@ -45719,14 +45750,85 @@ mod tests {
         assert!(err.to_string().contains("unknown model"));
     }
 
+    /// Per-user dirs laid out like the Linux XDG defaults under
+    /// `<sandbox>/home`, so an uninstall test never resolves a completion,
+    /// agent hook, config, cache or data target under the real home.
+    fn sandboxed_uninstall_user_dirs(sandbox: &Path) -> super::UninstallUserDirs {
+        let home = sandbox.join("home");
+        super::UninstallUserDirs {
+            config: Some(home.join(".config")),
+            data: Some(home.join(".local/share")),
+            cache: Some(home.join(".cache")),
+            home: Some(home),
+        }
+    }
+
+    /// Runs the uninstall payload against [`sandboxed_uninstall_user_dirs`],
+    /// first asserting that every resolved target, including the configured
+    /// index and model dirs, lies inside `sandbox`. A test that forgets to
+    /// confine a target fails here, before anything is removed.
+    fn sandboxed_uninstall_payload(
+        runtime: &FsfsRuntime,
+        sandbox: &Path,
+    ) -> super::FsfsUninstallPayload {
+        let user_dirs = sandboxed_uninstall_user_dirs(sandbox);
+        let targets = runtime
+            .collect_uninstall_targets(&user_dirs)
+            .expect("uninstall targets");
+        for target in &targets {
+            let resolved = super::normalize_probe_path(&target.path);
+            assert!(
+                resolved.starts_with(sandbox)
+                    && !resolved
+                        .components()
+                        .any(|component| matches!(component, std::path::Component::ParentDir)),
+                "uninstall target {} resolves outside the test sandbox {}: {}",
+                target.target,
+                sandbox.display(),
+                resolved.display()
+            );
+        }
+        runtime
+            .collect_uninstall_payload(&user_dirs)
+            .expect("uninstall payload")
+    }
+
+    /// Writes a file at `relative` under the sandbox home and returns its path.
+    fn plant_sandbox_home_file(sandbox: &Path, relative: &str) -> PathBuf {
+        let path = sandbox.join("home").join(relative);
+        fs::create_dir_all(path.parent().expect("sandbox file parent")).expect("sandbox dir");
+        fs::write(&path, b"sandbox sentinel").expect("sandbox file");
+        path
+    }
+
+    #[test]
+    #[should_panic(expected = "resolves outside the test sandbox")]
+    fn sandboxed_uninstall_payload_rejects_a_target_outside_the_sandbox() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("index dir");
+        // model_dir is left at its default, which is not under the sandbox.
+        // A dry run, so nothing would be removed even if the guard regressed.
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Uninstall,
+            uninstall_dry_run: true,
+            uninstall_purge: true,
+            ..CliInput::default()
+        });
+        sandboxed_uninstall_payload(&runtime, temp.path());
+    }
+
     #[test]
     fn runtime_uninstall_requires_confirmation_without_yes_or_dry_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
         let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
             command: CliCommand::Uninstall,
             ..CliInput::default()
         });
         let err = runtime
-            .collect_uninstall_payload()
+            .collect_uninstall_payload(&sandboxed_uninstall_user_dirs(temp.path()))
             .expect_err("missing confirmation should fail");
         assert!(err.to_string().contains("requires --yes or --dry-run"));
     }
@@ -45739,6 +45841,7 @@ mod tests {
         fs::create_dir_all(index_root.join("vector")).expect("index dir");
         fs::write(index_root.join("vector/index.fsvi"), b"fsvi").expect("index file");
         fs::create_dir_all(model_root.join("potion")).expect("model dir");
+        let hook = plant_sandbox_home_file(temp.path(), ".claude/hooks/fsfs.sh");
 
         let mut config = FsfsConfig::default();
         config.storage.index_dir = index_root.display().to_string();
@@ -45750,9 +45853,14 @@ mod tests {
             ..CliInput::default()
         });
 
-        let payload = runtime
-            .collect_uninstall_payload()
-            .expect("dry-run payload");
+        let payload = sandboxed_uninstall_payload(&runtime, temp.path());
+        assert!(
+            payload
+                .entries
+                .iter()
+                .any(|entry| { entry.target == "claude_hook_fsfs" && entry.status == "planned" })
+        );
+        assert!(hook.is_file(), "dry-run must not remove agent hooks");
         assert!(
             payload
                 .entries
@@ -45777,15 +45885,14 @@ mod tests {
 
         let mut config = FsfsConfig::default();
         config.storage.index_dir = index_root.display().to_string();
+        config.indexing.model_dir = temp.path().join("models").display().to_string();
         let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
             command: CliCommand::Uninstall,
             uninstall_yes: true,
             ..CliInput::default()
         });
 
-        let payload = runtime
-            .collect_uninstall_payload()
-            .expect("uninstall payload");
+        let payload = sandboxed_uninstall_payload(&runtime, temp.path());
         let index_entry = payload
             .entries
             .iter()
@@ -45813,18 +45920,20 @@ mod tests {
         let index_root = temp.path().join("index");
         fs::create_dir_all(index_root.join("vector")).expect("index dir");
         fs::write(index_root.join("vector/index.fsvi"), b"fsvi").expect("index file");
+        let hook = plant_sandbox_home_file(temp.path(), ".claude/hooks/fsfs.sh");
+        let completion = plant_sandbox_home_file(temp.path(), ".config/fish/completions/fsfs.fish");
+        let config_file = plant_sandbox_home_file(temp.path(), ".config/frankensearch/config.toml");
 
         let mut config = FsfsConfig::default();
         config.storage.index_dir = index_root.display().to_string();
+        config.indexing.model_dir = temp.path().join("models").display().to_string();
         let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
             command: CliCommand::Uninstall,
             uninstall_yes: true,
             ..CliInput::default()
         });
 
-        let payload = runtime
-            .collect_uninstall_payload()
-            .expect("uninstall payload");
+        let payload = sandboxed_uninstall_payload(&runtime, temp.path());
         assert!(
             payload
                 .entries
@@ -45832,6 +45941,11 @@ mod tests {
                 .any(|entry| { entry.target == "index_dir" && entry.status == "removed" })
         );
         assert!(!index_root.exists(), "index dir should be removed");
+        // The per-user targets resolve under the sandbox home: hooks and
+        // completions are removed, purge-only config is kept without --purge.
+        assert!(!hook.exists(), "agent hook should be removed");
+        assert!(!completion.exists(), "shell completion should be removed");
+        assert!(config_file.is_file(), "config dir requires --purge");
     }
 
     #[cfg(any(unix, windows))]
@@ -45841,8 +45955,7 @@ mod tests {
         let index_root = temp.path().join("index");
         fs::create_dir_all(index_root.join("vector")).expect("index dir");
         fs::write(index_root.join("vector/index.fsvi"), b"fsvi").expect("index file");
-        // Drive only the index_dir entry: a confirmed full payload would also
-        // remove completions and agent hooks under the real home directory.
+        // Drive only the index_dir entry, the one the publication lease guards.
         let target = super::UninstallTarget {
             target: "index_dir".to_owned(),
             kind: super::UninstallTargetKind::Directory,

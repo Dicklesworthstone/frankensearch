@@ -71,14 +71,15 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--lexical-only (no model options, --mode, or reranking)]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
          [--allow-activation] [--allow-updates] [--filter JSON] [--timeout-ms N]\n\
-         [--reranker-dir DIR] [--rerank-window N]\n\n\
+         [--reranker-dir DIR] [--rerank-window N]\n\
+         [--lexical-only (fixed snapshot; no models or write controls)]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\
          [--shard-size N (required for sharded receipts)]\n\n\
   rebuild --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
           [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
           [--shard-size N (required for sharded receipts)]\n\n\
-Quality options (not with search --lexical-only):\n\
+Quality options (not with --lexical-only):\n\
   --quality-backend onnx|native-int8|native-f32|native-multilingual\n\
   --quality-model-dir DIR (required for native; exact verified model directory)\n\
 The default backend is always onnx; native-only builds require explicit native selection.\n\n\
@@ -211,7 +212,9 @@ impl Options {
                     options.exact = true;
                 }
                 "--stream" if command == Command::Search => options.stream = true,
-                "--lexical-only" if command == Command::Search => options.lexical_only = true,
+                "--lexical-only" if matches!(command, Command::Search | Command::Serve) => {
+                    options.lexical_only = true;
+                }
                 "--allow-activation" if command == Command::Serve => {
                     options.activation = serve::ActivationPermission::Enabled;
                 }
@@ -283,12 +286,14 @@ impl Options {
                 "--mode",
                 "--reranker-dir",
                 "--rerank-window",
+                "--allow-activation",
+                "--allow-updates",
             ]
             .iter()
             .any(|flag| seen.contains(*flag))
         {
             return Err(bad(
-                "--lexical-only cannot be combined with model options, --mode, or reranking",
+                "--lexical-only cannot be combined with model options, --mode, reranking, or write controls",
             ));
         }
         options.quality.validate_usage(!options.fast_only)?;
@@ -681,6 +686,9 @@ async fn execute(
 ) -> Result<()> {
     match options.command {
         Command::Search if options.lexical_only => lexical::execute(cx, &options, output).await,
+        Command::Serve if options.lexical_only => {
+            lexical::serve_with_io(cx, &options, &mut io::stdin().lock(), output).await
+        }
         Command::Update => update::execute(cx, &options, output, pool).await,
         Command::Rebuild => update::rebuild(cx, &options, output, pool).await,
         Command::Index => {

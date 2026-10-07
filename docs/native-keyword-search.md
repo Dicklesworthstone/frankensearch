@@ -18,8 +18,8 @@ frankensearch-native search \
 Omit all model options, `--mode`, and reranking options. Supplying them alongside
 `--lexical-only` is an error, not permission to ignore them. Ordinary searches,
 serving, activation and source updates retain their existing complete semantic
-admission. This increment exposes keyword-only one-shot and streamed search;
-`serve --lexical-only` is not supported. No default changes or downloads occur.
+admission. Keyword-only one-shot search, streaming and fixed-snapshot warm serving
+are supported. No default changes or downloads occur.
 
 ## What remains authenticated
 
@@ -88,3 +88,65 @@ cargo test -p frankensearch --features quill --lib \
   native_ann::builder::hybrid::snapshot::lexical_tests
 cargo test -p frankensearch --features hybrid --bin frankensearch-native lexical::tests
 ```
+
+## Warm model-free serving
+
+`serve --lexical-only` admits the selected source/Quill cohort once before emitting
+ready, then processes repeated JSONL requests without reopening it or loading any
+model. This works with both ordinary and sharded receipts, including when all old
+vector/graph files are missing. Source and lexical integrity remain mandatory.
+
+```sh
+frankensearch-native serve \
+  --receipt /absolute/receipts/g1.json \
+  --lexical-only --limit 20 --timeout-ms 5000 \
+  --filter '{"metadata":{"project":"alpha"}}'
+```
+
+Send the existing query fields `query`, optional `id`, `limit`, `filter`, and
+`timeout_ms`, with one JSON object per line. Explicit semantic `mode` values,
+reranking options and unknown fields are refused, not silently ignored. The
+only control operation is status:
+
+```jsonl
+{"id":"q1","query":"retry network requests"}
+{"id":"q2","query":"timeout","limit":5,"timeout_ms":1000,"filter":{"id_prefix":"src/"}}
+{"op":"status","id":"health"}
+```
+
+Successful queries emit started, one lexical results frame, and terminal. Request
+ordinals increase across messages, sequence numbers restart for each message,
+and every frame binds the held generation. Invalid JSON, invalid UTF-8, rejected
+controls and query failures produce a failed terminal without poisoning the next
+request. Blank lines do not consume an ordinal. EOF, `quit` and `exit` stop the
+session normally. The shared hybrid/keyword input reader bounds each record at
+1 MiB before parsing; oversized input stops without draining it or reading later
+requests. A failed output write or flush also stops immediately: even a lost
+terminal acknowledgement cannot cause a contradictory failure frame afterward.
+
+The fixed server filter intersects with every request filter. Omitting a request
+filter does not remove the server filter, and a request cannot widen it. Filtering
+still happens before cutoff and hydration; raw global Quill scores and metadata
+are unchanged. This remains query scoping, not authentication or access control
+for code that already owns the underlying index.
+
+Each accepted query gets one total deadline covering scope construction, keyword
+retrieval and hydration. Time spent delivering started consumes that budget. A
+request can shorten the configured server ceiling, never widen or disable it.
+Expiry preserves the typed timeout and does not cancel the shared context, so a
+later request can use the same admitted reader. Startup admission and blocking
+filesystem/input/output calls are not made preemptible by this policy.
+
+Ready and status report `retrieval: "lexical"`, `source_layout`, document count,
+`semantic_components_verified: false`, and `selection_policy: "fixed_snapshot"`.
+Status describes the retained cohort, not fresh disk validation or semantic
+health. Updating the original receipt does not switch this session; restart with
+the desired receipt to change snapshots. `--allow-activation` and `--allow-updates`
+are refused with `--lexical-only`; corresponding JSON controls cannot inspect
+supplied paths, write files, perform inference or fall through into a search.
+
+No new selector, publisher, writer lock, model fallback, result cache or background
+worker is introduced. Keep the selected Quill files immutable while the session
+holds mappings. Sources and lexical state remain resident for its lifetime; this
+adds no peak-RSS, throughput or latency claim. The ordinary hybrid server keeps
+its existing live activation and source-update implementations.
