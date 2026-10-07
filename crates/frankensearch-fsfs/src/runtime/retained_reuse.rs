@@ -149,13 +149,11 @@ fn read_json<T: serde::de::DeserializeOwned>(cx: &Cx, path: &Path) -> SearchResu
 }
 
 fn proven(entry: &CheckpointFileEntry) -> bool {
-    entry.lexical_indexed
-        && entry.semantic_indexed
-        && entry.content_hash_hex.len() == 64
-        && entry
-            .content_hash_hex
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+    entry.lexical_indexed && entry.semantic_indexed && hex_digest(&entry.content_hash_hex)
+}
+
+fn hex_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn compatible_execution(receipt: &ReuseReceipt, executable: Option<&str>, session: &str) -> bool {
@@ -492,6 +490,7 @@ pub(super) fn retain_mutated_checkpoint(
                         == super::ingestion_class_label(super::IngestionClass::FullSemanticLexical),
                     content_hash_hex: content_hash_hex.clone(),
                     fast_windows: manifest.fast_windows.clone(),
+                    canonical_lines: None,
                 },
                 Some(None) => {
                     return Err(reuse_error(
@@ -834,7 +833,16 @@ fn seed_candidate(
         .values()
         .filter(|entry| proven(entry))
         .count();
-    if eligible == 0 {
+    // A watch extending this generation carries unchanged files forward,
+    // lexical-only ones included (a lite store embeds nothing), so their
+    // lexical proof is reason enough to seed. A plain index run is not.
+    let carriable = runtime.unchanged_sources.is_some()
+        && receipt
+            .checkpoint
+            .files
+            .values()
+            .any(|entry| entry.lexical_indexed && hex_digest(&entry.content_hash_hex));
+    if eligible == 0 && !carriable {
         return Ok(0);
     }
     if !receipt.checkpoint.artifacts_durable

@@ -2758,6 +2758,141 @@ mod retained_search_tests {
         });
     }
 
+    /// A watch names the files it observed unchanged since the selected
+    /// generation; the seeded rebuild carries them forward from its checkpoint
+    /// instead of rereading them, and applies the edited, added and removed
+    /// files (bd-dnqgr). One file is rewritten with its modification time
+    /// restored and still named unchanged, as an edit that keeps every stamp
+    /// and raises no notification would be: it keeps its old rows, which is
+    /// how this test sees the carry. A file the first build skipped for its
+    /// content stays skipped the same way. A full rebuild then rereads both.
+    #[test]
+    fn rebuild_carries_files_observed_unchanged_without_rereading_them() {
+        run_test_with_cx(|cx| async move {
+            for lexical_only in [false, true] {
+                let directory = tempfile::tempdir().expect("fixture");
+                let (runtime, source, root) = fixture(directory.path());
+                let mut runtime = if lexical_only {
+                    runtime.with_lexical_only_indexing()
+                } else {
+                    runtime
+                };
+                for (name, text) in [
+                    ("bravo.md", "sharedtoken bravo document"),
+                    ("charlie.md", "sharedtoken charlie document"),
+                ] {
+                    fs::write(source.join(name), text).expect("source");
+                }
+                // Read and skipped for its content (NUL bytes), not indexed.
+                fs::write(source.join("echo.md"), b"\0\0\0binary echo\0\0\0").expect("binary");
+                publish(&runtime, &cx, &root).await;
+
+                fs::write(source.join("alpha.md"), "sharedtoken alpha zebra revision")
+                    .expect("edit alpha");
+                fs::remove_file(source.join("bravo.md")).expect("remove bravo");
+                fs::write(source.join("delta.md"), "sharedtoken delta document")
+                    .expect("add delta");
+                let rewrite_keeping_mtime = |name: &str, text: &str| {
+                    let path = fs::canonicalize(source.join(name)).expect("source path");
+                    let modified = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .expect("mtime");
+                    fs::write(&path, text).expect("rewrite");
+                    fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .and_then(|file| file.set_modified(modified))
+                        .expect("restore mtime");
+                    path
+                };
+                let unchanged = std::collections::BTreeSet::from([
+                    rewrite_keeping_mtime("charlie.md", "sharedtoken charlie yak revision"),
+                    rewrite_keeping_mtime("echo.md", "walrus echo text"),
+                ]);
+                publish(
+                    &runtime.clone().with_unchanged_sources(unchanged),
+                    &cx,
+                    &root,
+                )
+                .await;
+
+                // Keyword results are exact; the semantic lane would match
+                // every document for any query.
+                runtime.config.pressure.degradation_override =
+                    crate::config::DegradationOverrideMode::ForceLexicalOnly;
+                let mut reader = runtime
+                    .open_retained_search(&cx, &root)
+                    .await
+                    .expect("reader");
+                let mut hits = async |query: &str| {
+                    let phases = reader.search(&cx, query, 10).await.expect("search");
+                    let mut paths = phases
+                        .last()
+                        .expect("phase")
+                        .hits
+                        .iter()
+                        .map(|hit| hit.path.clone())
+                        .collect::<Vec<_>>();
+                    paths.sort_unstable();
+                    paths
+                };
+                assert_eq!(
+                    hits("sharedtoken").await,
+                    ["alpha.md", "charlie.md", "delta.md"]
+                );
+                assert_eq!(hits("zebra").await, ["alpha.md"]);
+                assert_eq!(hits("charlie").await, ["charlie.md"]);
+                assert!(
+                    hits("yak").await.is_empty(),
+                    "lexical_only={lexical_only}: charlie.md was reread instead of carried"
+                );
+                assert!(
+                    hits("walrus").await.is_empty(),
+                    "lexical_only={lexical_only}: echo.md was reread instead of skipped again"
+                );
+                drop(reader);
+                let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+                let generation = store.active(&cx).expect("active").expect("published");
+                if lexical_only {
+                    assert!(FsfsRuntime::is_lexical_only_generation(generation.path()));
+                } else {
+                    let index = VectorIndex::open_read_only(
+                        &generation.path().join(FSFS_VECTOR_INDEX_FILE),
+                    )
+                    .expect("fast tier");
+                    let mut sources = index
+                        .live_doc_ids()
+                        .expect("live rows")
+                        .iter()
+                        .map(|row| semantic_windows::source_id(row).to_owned())
+                        .collect::<Vec<_>>();
+                    sources.sort_unstable();
+                    sources.dedup();
+                    assert_eq!(
+                        sources,
+                        ["alpha.md", "charlie.md", "delta.md"],
+                        "the carried file keeps its vectors"
+                    );
+                }
+                drop(generation);
+
+                publish(&runtime, &cx, &root).await;
+                let mut reader = runtime
+                    .open_retained_search(&cx, &root)
+                    .await
+                    .expect("reader");
+                for (query, path) in [("yak", "charlie.md"), ("walrus", "echo.md")] {
+                    let phases = reader.search(&cx, query, 10).await.expect("search");
+                    assert_eq!(
+                        phases.last().expect("phase").hits[0].path,
+                        path,
+                        "a full rebuild rereads it"
+                    );
+                }
+            }
+        });
+    }
+
     #[test]
     fn retained_reader_survives_rebuild_and_search_does_not_change_inventory() {
         run_test_with_cx(|cx| async move {

@@ -142,9 +142,18 @@ a match: it is part of the generation's authenticated inventory.
 
 ## Boundaries
 
-Reuse saves eligible embedding work, not all rebuild I/O. Artifacts are still
-copied into independent files, full discovery and source hashing still run,
-and the normal validation and publication barriers remain. There are no hard
+Within one watch session, the rebuild after an edit carries forward every file
+whose observed stamp (inode, length, and modification and change times to the
+nanosecond) still matches the generation it extends and that no notification
+named: its checkpoint-proven lexical rows and vectors stay as they are, and it
+is not reread, canonicalized or re-indexed. Changed, added and removed files are
+applied. The startup rebuild, a forced reconciliation (hint overflow, a backend
+rescan request) and a file whose checkpoint entry lacks the needed proof reread
+everything they cover. An edit that keeps every observed stamp and raises no
+notification therefore keeps its old content until the next full rebuild.
+Outside a watch, reuse saves eligible embedding work, not rebuild I/O. Either
+way the selected generation is still copied into independent files, discovery
+still runs, and the normal validation and publication barriers remain. There are no hard
 links into retained vector, lexical or catalog files and no implicit pruning.
 Pausing hot sources bounds repeated candidate creation until quiet observations
 agree, not total lifetime disk use or event-to-visible latency. Retained and

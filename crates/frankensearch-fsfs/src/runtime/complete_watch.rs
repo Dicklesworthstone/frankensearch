@@ -394,6 +394,25 @@ fn touches_observed_files(
         })
 }
 
+/// Files the next build may carry forward from the generation built from
+/// `baseline`: the same stamp in both observations, and no hint naming the
+/// file or a directory above it (a content edit can keep coarse stamps).
+fn unchanged_since(
+    baseline: &SourceObservation,
+    current: &SourceObservation,
+    hint: Option<&DirtyWindow>,
+) -> BTreeSet<PathBuf> {
+    current
+        .stamps
+        .iter()
+        .filter(|(path, stamp)| baseline.stamps.get(*path) == Some(*stamp))
+        .filter(|(path, _)| {
+            hint.is_none_or(|hint| !hint.paths.iter().any(|hinted| path.starts_with(hinted)))
+        })
+        .map(|(path, _)| path.clone())
+        .collect()
+}
+
 /// The source baseline belongs to one publication, not just a store path.
 /// Reading only the bounded descriptor here avoids rehashing every sealed
 /// artifact on an idle poll. The store's ordinary admission still verifies it.
@@ -640,8 +659,20 @@ impl CompleteWatchSession {
         let expected = &observed;
         let selected = self.publication.as_ref();
         let store_root = &self.store_root;
-        let publication = self
-            .runtime
+        // The selected generation was built from the baseline (its precommit
+        // saw the same observation), so files whose stamps still match it are
+        // carried forward rather than reread; a forced rebuild rereads all.
+        // Boxed: this future is held inline by its callers.
+        let carrying = match (force_rebuild, self.baseline.as_ref()) {
+            (false, Some(baseline)) => {
+                Some(Box::new(self.runtime.clone().with_unchanged_sources(
+                    unchanged_since(baseline, &observed, pending),
+                )))
+            }
+            _ => None,
+        };
+        let runtime = carrying.as_deref().unwrap_or(&self.runtime);
+        let publication = runtime
             .rebuild_retained_generation_with_precommit(cx, &self.store_root, move |cx| {
                 check_backend(changes)?;
                 let current = source.observe(cx, discovery)?;
@@ -810,6 +841,58 @@ mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
     use notify::event::{AccessKind, DataChange, Flag, ModifyKind};
+
+    #[test]
+    fn complete_watch_carries_only_files_with_equal_stamps_and_no_hint() {
+        let stamp = |inode, modified| SourceStamp {
+            device: 1,
+            inode,
+            bytes: 10,
+            modified: (modified, 0),
+            changed: (modified, 0),
+        };
+        let observation = |stamps: Vec<(&str, SourceStamp)>| SourceObservation {
+            stamps: stamps
+                .into_iter()
+                .map(|(path, stamp)| (PathBuf::from(path), stamp))
+                .collect(),
+            directories: BTreeMap::new(),
+        };
+        let baseline = observation(vec![
+            ("/src/same.md", stamp(1, 5)),
+            ("/src/edited.md", stamp(2, 5)),
+            ("/src/hinted.md", stamp(3, 5)),
+            ("/src/dir/inside.md", stamp(4, 5)),
+            ("/src/removed.md", stamp(5, 5)),
+            ("/src/replaced.md", stamp(6, 5)),
+        ]);
+        let current = observation(vec![
+            ("/src/same.md", stamp(1, 5)),
+            ("/src/edited.md", stamp(2, 6)),
+            ("/src/hinted.md", stamp(3, 5)),
+            ("/src/dir/inside.md", stamp(4, 5)),
+            ("/src/replaced.md", stamp(7, 5)),
+            ("/src/added.md", stamp(8, 5)),
+        ]);
+        let hint = DirtyWindow {
+            first: Instant::now(),
+            last: Instant::now(),
+            force_rebuild: false,
+            paths: BTreeSet::from([PathBuf::from("/src/hinted.md"), PathBuf::from("/src/dir")]),
+        };
+        assert_eq!(
+            unchanged_since(&baseline, &current, Some(&hint)),
+            BTreeSet::from([PathBuf::from("/src/same.md")])
+        );
+        assert_eq!(
+            unchanged_since(&baseline, &current, None),
+            BTreeSet::from([
+                PathBuf::from("/src/dir/inside.md"),
+                PathBuf::from("/src/hinted.md"),
+                PathBuf::from("/src/same.md"),
+            ])
+        );
+    }
 
     #[test]
     fn complete_watch_debounce_does_not_starve_under_a_continuous_burst() {

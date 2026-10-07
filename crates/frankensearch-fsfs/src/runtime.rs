@@ -1908,6 +1908,7 @@ struct PendingIndexDocument {
     file_key: String,
     ingestion_class_label: String,
     canonical_bytes: u64,
+    canonical_lines: u64,
     revision: i64,
     reason_code: String,
     content_hash_hex: String,
@@ -2042,6 +2043,10 @@ struct CheckpointFileEntry {
     content_hash_hex: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fast_windows: Option<semantic_windows::FastWindowPlan>,
+    /// Non-empty canonical lines, so a carried-forward file still counts in
+    /// the build totals. Absent in older checkpoints: such a file is reread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    canonical_lines: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2062,6 +2067,33 @@ struct IndexingCheckpoint {
     skipped_files: usize,
     #[serde(default = "default_fast_window_max_per_file")]
     fast_window_max_per_file: usize,
+    /// Candidates this build read and skipped for their content (binary,
+    /// empty after canonicalization, no extractable PDF text), so a watch
+    /// rebuild skips them again without rereading while they stay unchanged.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    content_skipped: BTreeMap<String, ContentSkippedEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ContentSkippedEntry {
+    revision: i64,
+    /// The classification reason the skip recorded, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason_code: Option<String>,
+}
+
+fn record_content_skip(
+    checkpoint: &mut IndexingCheckpoint,
+    candidate: &IndexCandidate,
+    reason_code: Option<&str>,
+) {
+    checkpoint.content_skipped.insert(
+        candidate.file_key.clone(),
+        ContentSkippedEntry {
+            revision: i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX),
+            reason_code: reason_code.map(str::to_owned),
+        },
+    );
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5996,6 +6028,12 @@ pub struct FsfsRuntime {
     /// Build generations with the lexical arm only: no embedder, no vector
     /// tiers. Always set in a build without semantic loaders (bd-636yz).
     lexical_only_indexing: bool,
+    /// Source files a complete-generation watch observed unchanged since the
+    /// generation it extends: same inode, length, and modification and change
+    /// times to the nanosecond, and no notification naming them. A seeded
+    /// rebuild carries their checkpoint-proven rows forward instead of
+    /// rereading, canonicalizing and re-indexing them (bd-dnqgr).
+    unchanged_sources: Option<Arc<BTreeSet<PathBuf>>>,
 }
 
 /// Private CLI entry point used to extract embedded weights in a short-lived process.
@@ -6020,7 +6058,16 @@ impl FsfsRuntime {
             bundled_model_materializer: None,
             generation_retention: crate::generation_store::GenerationRetention::default(),
             lexical_only_indexing: !SEMANTIC_LOADERS_COMPILED,
+            unchanged_sources: None,
         }
+    }
+
+    /// Name the source files observed unchanged since the generation a seeded
+    /// rebuild extends (see `unchanged_sources`).
+    #[must_use]
+    pub(crate) fn with_unchanged_sources(mut self, sources: BTreeSet<PathBuf>) -> Self {
+        self.unchanged_sources = Some(Arc::new(sources));
+        self
     }
 
     /// Index as a build without semantic loaders does, in a build that has them.
@@ -17302,6 +17349,9 @@ impl FsfsRuntime {
                 discovered_files: stats.discovered_files,
                 skipped_files: stats.skipped_files,
                 fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
+                content_skipped: existing_checkpoint
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |previous| previous.content_skipped.clone()),
             },
         )?;
 
@@ -17485,6 +17535,9 @@ impl FsfsRuntime {
         let mut manifests = BTreeMap::<String, IndexManifestEntry>::new();
         let mut resume_reuse = BTreeMap::<String, CheckpointReuse>::new();
         let mut validated_content_hashes = HashMap::<String, String>::new();
+        // Proven without rereading because a watch observed them unchanged
+        // since the seeded generation; true for a semantic ingestion class.
+        let mut unchanged_complete = HashMap::<String, bool>::new();
 
         if let (Some(previous), Some(previous_manifests)) =
             (existing_checkpoint.as_ref(), checkpoint_manifests.as_ref())
@@ -17503,10 +17556,21 @@ impl FsfsRuntime {
                 {
                     continue;
                 }
-                let Ok(bytes) = async_file_read(&candidate.file_path).await else {
-                    continue;
+                let unchanged = entry.canonical_lines.is_some()
+                    && self
+                        .unchanged_sources
+                        .as_ref()
+                        .is_some_and(|sources| sources.contains(&candidate.file_path));
+                let content_hash_hex = if unchanged {
+                    // The seeded generation recorded this digest for the same
+                    // bytes the watch observed unchanged since.
+                    entry.content_hash_hex.clone()
+                } else {
+                    let Ok(bytes) = async_file_read(&candidate.file_path).await else {
+                        continue;
+                    };
+                    content_sha256_hex(&bytes)
                 };
-                let content_hash_hex = content_sha256_hex(&bytes);
                 let reuse = checkpoint_entry_reuse(
                     previous,
                     entry,
@@ -17520,6 +17584,12 @@ impl FsfsRuntime {
                 );
                 if reuse == CheckpointReuse::None {
                     continue;
+                }
+                if unchanged && reuse == CheckpointReuse::Complete {
+                    unchanged_complete.insert(
+                        candidate.file_key.clone(),
+                        candidate.ingestion_class == IngestionClass::FullSemanticLexical,
+                    );
                 }
                 validated_content_hashes.insert(candidate.file_key.clone(), content_hash_hex);
                 resume_reuse.insert(candidate.file_key.clone(), reuse);
@@ -17577,6 +17647,18 @@ impl FsfsRuntime {
                 quality_index.soft_delete_batch(&stale_quality_ids)?;
             }
         }
+        // Carry a file forward only when nothing about it needs recomputing:
+        // its lexical rows and every vector tier this build keeps already hold
+        // it. A semantic file without a surviving quality vector is reread.
+        let carried = unchanged_complete
+            .into_iter()
+            .filter(|(file_key, semantic)| {
+                !*semantic
+                    || quality_vector_index.is_none()
+                    || reusable_quality_ids.contains(file_key)
+            })
+            .map(|(file_key, _)| file_key)
+            .collect::<HashSet<String>>();
 
         let mut lexical_reconciliation_ids = BTreeSet::new();
         if let Some(previous_manifests) = reconciliation_manifests.as_ref() {
@@ -17626,6 +17708,7 @@ impl FsfsRuntime {
             discovered_files: stats.discovered_files,
             skipped_files: stats.skipped_files,
             fast_window_max_per_file: self.config.indexing.fast_window_max_per_file,
+            content_skipped: BTreeMap::new(),
         };
 
         let canonicalize_start = Instant::now();
@@ -17637,6 +17720,8 @@ impl FsfsRuntime {
         let mut lexical_resume_absent = 0_u64;
         let mut lexical_resume_unchanged = 0_u64;
         let mut lexical_resume_changed = 0_u64;
+        let mut carried_files = 0_u64;
+        let mut carried_skips = 0_u64;
         let mut remaining_reused_semantic = candidates
             .iter()
             .filter(|candidate| {
@@ -17647,8 +17732,71 @@ impl FsfsRuntime {
             })
             .count();
 
+        // Carried files change no artifact. Record them up front, so the
+        // batches, and the durable checkpoint written before each one, cover
+        // only the files this build reads (bd-dnqgr).
+        let mut reading = Vec::with_capacity(candidates.len().saturating_sub(carried.len()));
+        for candidate in &candidates {
+            if carried.contains(&candidate.file_key)
+                && let (Some(entry), Some(manifest)) = (
+                    existing_checkpoint
+                        .as_ref()
+                        .and_then(|previous| previous.files.get(&candidate.file_key)),
+                    checkpoint_manifests
+                        .as_ref()
+                        .and_then(|previous| previous.get(&candidate.file_key)),
+                )
+            {
+                // The seeded generation already holds this file's rows and
+                // vectors exactly as its checkpoint entry records them.
+                if candidate.ingestion_class == IngestionClass::FullSemanticLexical {
+                    remaining_reused_semantic = remaining_reused_semantic.saturating_sub(1);
+                }
+                canonical_line_count =
+                    canonical_line_count.saturating_add(entry.canonical_lines.unwrap_or(0));
+                if manifests
+                    .insert(candidate.file_key.clone(), manifest.clone())
+                    .is_none()
+                {
+                    canonical_bytes_total =
+                        canonical_bytes_total.saturating_add(manifest.canonical_bytes);
+                    if candidate.ingestion_class == IngestionClass::FullSemanticLexical {
+                        semantic_doc_count = semantic_doc_count.saturating_add(1);
+                    }
+                    processed_files = processed_files.saturating_add(1);
+                }
+                lexical_reconciliation_ids.remove(&candidate.file_key);
+                checkpoint
+                    .files
+                    .insert(candidate.file_key.clone(), entry.clone());
+                carried_files = carried_files.saturating_add(1);
+            } else if self
+                .unchanged_sources
+                .as_ref()
+                .is_some_and(|sources| sources.contains(&candidate.file_path))
+                && let Some(skipped) = checkpoint_manifests
+                    .as_ref()
+                    .and(existing_checkpoint.as_ref())
+                    .and_then(|previous| previous.content_skipped.get(&candidate.file_key))
+                && skipped.revision == i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX)
+            {
+                // The seeded build read this file and skipped it for its
+                // content; unchanged since, the same bytes get the same verdict.
+                if let Some(reason_code) = &skipped.reason_code {
+                    observed_reason_codes.insert(reason_code.clone());
+                }
+                checkpoint
+                    .content_skipped
+                    .insert(candidate.file_key.clone(), skipped.clone());
+                content_skipped_files = content_skipped_files.saturating_add(1);
+                carried_skips = carried_skips.saturating_add(1);
+            } else {
+                reading.push(candidate);
+            }
+        }
+
         // 3. Process in batches
-        for chunk in candidates.chunks(batch_size) {
+        for chunk in reading.chunks(batch_size) {
             control.checkpoint(cx, "index.batch", true)?;
             checkpoint.artifacts_durable = false;
             checkpoint.updated_at_ms = pressure_timestamp_ms();
@@ -17703,6 +17851,7 @@ impl FsfsRuntime {
                             LEXICAL_CANONICALIZER.canonicalize(&pdf_text),
                         ),
                         None => {
+                            record_content_skip(&mut checkpoint, candidate, None);
                             content_skipped_files = content_skipped_files.saturating_add(1);
                             continue;
                         }
@@ -17713,6 +17862,11 @@ impl FsfsRuntime {
                         .classify_bytes(path_for_contract.as_ref(), &bytes);
                     observed_reason_codes.insert(classification.reason_code.clone());
                     if !file_classification_allows_index(&classification) {
+                        record_content_skip(
+                            &mut checkpoint,
+                            candidate,
+                            Some(&classification.reason_code),
+                        );
                         content_skipped_files = content_skipped_files.saturating_add(1);
                         continue;
                     }
@@ -17727,13 +17881,18 @@ impl FsfsRuntime {
 
                 if canonical.trim().is_empty() {
                     observed_reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
+                    record_content_skip(
+                        &mut checkpoint,
+                        candidate,
+                        Some(REASON_DISCOVERY_FILE_EXCLUDED),
+                    );
                     content_skipped_files = content_skipped_files.saturating_add(1);
                     continue;
                 }
 
                 let canonical_bytes = u64::try_from(canonical.len()).unwrap_or(u64::MAX);
-                canonical_line_count =
-                    canonical_line_count.saturating_add(count_non_empty_lines(&canonical));
+                let canonical_lines = count_non_empty_lines(&canonical);
+                canonical_line_count = canonical_line_count.saturating_add(canonical_lines);
                 let ingestion_class = ingestion_class_label(candidate.ingestion_class).to_owned();
                 let reason_code = ingestion_plan_reason(candidate.ingestion_class).to_owned();
                 let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
@@ -17800,6 +17959,7 @@ impl FsfsRuntime {
                     file_key: candidate.file_key.clone(),
                     ingestion_class_label: ingestion_class,
                     canonical_bytes,
+                    canonical_lines,
                     revision,
                     reason_code,
                     content_hash_hex,
@@ -18266,6 +18426,7 @@ impl FsfsRuntime {
                         semantic_indexed,
                         content_hash_hex: pending.content_hash_hex.clone(),
                         fast_windows: pending.fast_windows.clone(),
+                        canonical_lines: Some(pending.canonical_lines),
                     },
                 );
             }
@@ -18391,6 +18552,8 @@ impl FsfsRuntime {
             lexical_resume_changed,
             stale_lexical_candidates,
             stale_lexical_deleted,
+            carried_files,
+            carried_skips,
             "fsfs classified crash-resumable Quill bulk rows"
         );
 
@@ -31945,6 +32108,7 @@ mod tests {
             embedder_dimension: 4,
             embedder_is_hash_fallback: false,
             fast_window_max_per_file: 1,
+            content_skipped: super::BTreeMap::new(),
             artifacts_durable,
             source_hash_hex: generation.to_owned(),
             reason_codes: vec!["test.publication_lease.paired_generation".to_owned()],
@@ -31962,6 +32126,7 @@ mod tests {
                     semantic_indexed: true,
                     content_hash_hex: generation.to_owned(),
                     fast_windows: None,
+                    canonical_lines: None,
                 },
             )]),
             discovered_files: 1,
@@ -39731,6 +39896,7 @@ mod tests {
                 embedder_dimension: 256,
                 embedder_is_hash_fallback: false,
                 fast_window_max_per_file: 1,
+                content_skipped: super::BTreeMap::new(),
                 artifacts_durable: false,
                 source_hash_hex: "never-published".to_owned(),
                 reason_codes: Vec::new(),
@@ -39745,6 +39911,7 @@ mod tests {
                         semantic_indexed: true,
                         content_hash_hex: "apparently-valid".to_owned(),
                         fast_windows: None,
+                        canonical_lines: None,
                     },
                 )]),
                 discovered_files: 1,
@@ -50764,6 +50931,7 @@ mod tests {
             embedder_dimension: 4,
             embedder_is_hash_fallback: false,
             fast_window_max_per_file: 1,
+            content_skipped: super::BTreeMap::new(),
             artifacts_durable: true,
             source_hash_hex: "deferred-generation".to_owned(),
             reason_codes: Vec::new(),
@@ -50778,6 +50946,7 @@ mod tests {
                     semantic_indexed: false,
                     content_hash_hex: "abc123".to_owned(),
                     fast_windows: None,
+                    canonical_lines: None,
                 },
             )]),
             discovered_files: 1,
@@ -51136,6 +51305,7 @@ mod tests {
                 semantic_indexed: false,
                 content_hash_hex: "abc123".to_owned(),
                 fast_windows: None,
+                canonical_lines: None,
             },
         );
         files.insert(
@@ -51149,6 +51319,7 @@ mod tests {
                 semantic_indexed: false,
                 content_hash_hex: "def456".to_owned(),
                 fast_windows: None,
+                canonical_lines: None,
             },
         );
 
@@ -51162,6 +51333,7 @@ mod tests {
             embedder_dimension: 384,
             embedder_is_hash_fallback: false,
             fast_window_max_per_file: 1,
+            content_skipped: super::BTreeMap::new(),
             artifacts_durable: true,
             source_hash_hex: "generation-hash".to_owned(),
             reason_codes: vec!["FSFS_CODE_EXTENSION_INCLUDED".to_owned()],
@@ -51285,6 +51457,7 @@ mod tests {
             semantic_indexed: false,
             content_hash_hex: "abc123".to_owned(),
             fast_windows: None,
+            canonical_lines: None,
         };
         let checkpoint = super::IndexingCheckpoint {
             schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
@@ -51296,6 +51469,7 @@ mod tests {
             embedder_dimension: 4,
             embedder_is_hash_fallback: false,
             fast_window_max_per_file: 1,
+            content_skipped: super::BTreeMap::new(),
             artifacts_durable: true,
             source_hash_hex: "generation-hash".to_owned(),
             reason_codes: Vec::new(),
@@ -51412,6 +51586,7 @@ mod tests {
             semantic_indexed: true,
             content_hash_hex: "abc123".to_owned(),
             fast_windows: None,
+            canonical_lines: None,
         };
         let checkpoint = super::IndexingCheckpoint {
             schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
@@ -51423,6 +51598,7 @@ mod tests {
             embedder_dimension: 256,
             embedder_is_hash_fallback: false,
             fast_window_max_per_file: 1,
+            content_skipped: super::BTreeMap::new(),
             artifacts_durable: true,
             source_hash_hex: "generation-hash".to_owned(),
             reason_codes: vec!["FSFS_CODE_EXTENSION_INCLUDED".to_owned()],
@@ -51514,6 +51690,7 @@ mod tests {
             embedder_dimension: 256,
             embedder_is_hash_fallback: true,
             fast_window_max_per_file: 1,
+            content_skipped: super::BTreeMap::new(),
             artifacts_durable: true,
             source_hash_hex: "generation-hash".to_owned(),
             reason_codes: Vec::new(),
