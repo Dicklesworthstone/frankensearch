@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
-use frankensearch::native_ann::builder::sharded::NativeBuiltShardedHybridIndex;
+use frankensearch::native_ann::builder::sharded::{
+    NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits,
+};
 
 use super::{
     BlockingPoolHandle, BufRead, BufReader, Cx, Deserialize, File, GenerationComponentReceiptV1,
@@ -421,6 +423,21 @@ where
 {
     rebuild_checkpoint(cx)?;
     let previous = Selection::read(&options.receipt)?;
+    // Receipt schema selects the source format, never a failed ordinary open.
+    // Do not infer the originally requested capacity from occupied partitions.
+    match (previous.schema.as_str(), options.shard_size) {
+        (sharded::SELECTION_SCHEMA, Some(size)) => {
+            sharded::validate_size(size, previous.documents)?;
+        }
+        (sharded::SELECTION_SCHEMA, None) => {
+            return Err(bad("a sharded rebuild requires an explicit --shard-size"));
+        }
+        (SELECTION_SCHEMA, None) => {}
+        (SELECTION_SCHEMA, Some(_)) => {
+            return Err(bad("shard size cannot change an ordinary rebuild's layout"));
+        }
+        _ => return Err(bad("unsupported rebuild source layout")),
+    }
     let old_root = fs::canonicalize(&previous.directory)?;
     let directory = new_path(
         options
@@ -447,6 +464,9 @@ where
     // creation. Do not attempt ordinary reopen first: it must reject the very
     // missing/corrupt derived artifacts this explicit rebuild is meant to replace.
     let documents = recover_documents(cx, &previous)?;
+    if let Some(size) = options.shard_size {
+        sharded::validate_size(size, documents.len())?;
+    }
     let sequence = previous
         .generation
         .sequence
@@ -463,8 +483,17 @@ where
             "loaded model topology disagrees with the explicit rebuild policy",
         ));
     }
-    let (_successor, selection) =
-        build_with_generation(cx, options, &directory, generation, documents, models).await?;
+    let selection = if let Some(size) = options.shard_size {
+        sharded::build_with_generation(
+            cx, options, &directory, generation, documents, models, size,
+        )
+        .await?
+        .1
+    } else {
+        build_with_generation(cx, options, &directory, generation, documents, models)
+            .await?
+            .1
+    };
     // A cancelled seal can leave inert evidence, but must not get a success
     // receipt. No cancellation point follows saving the caller-visible receipt.
     rebuild_checkpoint(cx)?;
@@ -486,15 +515,27 @@ fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocu
     limits.vectors.max_source_bytes = MAX_INPUT_BYTES as u64;
     limits.vectors.max_document_bytes = MAX_RECORD_BYTES as u64;
     limits.vectors.max_documents = MAX_DOCUMENTS;
-    let (generation, documents) = NativeBuiltHybridIndex::recover_selected_source(
-        cx,
-        &selection.directory,
-        &GenerationComponentReceiptV1 {
-            byte_len: selection.snapshot.byte_len,
-            sha256: selection.snapshot.sha256,
-        },
-        limits,
-    )?;
+    let expected = GenerationComponentReceiptV1 {
+        byte_len: selection.snapshot.byte_len,
+        sha256: selection.snapshot.sha256,
+    };
+    let (generation, documents) = match selection.schema.as_str() {
+        SELECTION_SCHEMA => NativeBuiltHybridIndex::recover_selected_source(
+            cx, &selection.directory, &expected, limits,
+        )?,
+        sharded::SELECTION_SCHEMA => {
+            let mut sharded_limits = NativeShardedHybridReopenLimits::default();
+            sharded_limits.vectors.partition = limits.vectors;
+            sharded_limits.vectors.max_documents = selection.documents.min(MAX_DOCUMENTS);
+            // Charge ALL selected encoded sources and descriptors, not a new
+            // 256 MiB allowance for each partition. This precedes source decoding.
+            sharded_limits.vectors.max_artifact_bytes = MAX_INPUT_BYTES as u64;
+            NativeBuiltShardedHybridIndex::recover_selected_source(
+                cx, &selection.directory, &expected, sharded_limits,
+            )?
+        }
+        _ => return Err(bad("unsupported rebuild source layout")),
+    };
     if generation != selection.generation || documents.len() != selection.documents {
         return Err(bad(
             "recovered source differs from the trusted selection's generation or count",
@@ -537,6 +578,10 @@ fn rebuild_checkpoint(cx: &Cx) -> Result<()> {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "rebuild_tests.rs"]
 mod rebuild_tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "rebuild_sharded_tests.rs"]
+mod rebuild_sharded_tests;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "update_sharded_tests.rs"]

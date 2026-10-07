@@ -68,12 +68,11 @@ complete generation; a rank number is never a physical row or partition number.
 No coordinate is synthesized for a lane that did not retrieve the document.
 Unpartitioned queries retain their existing output fields and shapes.
 
-Partitioned indexing, buffered/streamed search and warm serving with explicit
-external activation, one-shot source updates and opt-in warm updates are supported. Source recovery
-for partitioned receipts is not yet enabled here. The corresponding library
-lifecycle APIs remain available. This does not change default fsfs behavior or its generation
-authority, create a durable CURRENT selector, establish persistent antirollback,
-or authorize removing predecessors.
+Partitioned indexing, buffered/streamed search, warm serving with explicit
+external activation, source updates and authenticated-source rebuilds are supported.
+The corresponding library lifecycle APIs remain available. This does not change
+default fsfs behavior or its generation authority, create a durable CURRENT
+selector, establish persistent antirollback, or authorize removing predecessors.
 
 All admitted source/vector partitions remain resident and Quill retains mapped
 files. Partition size is not a peak-RSS guarantee. Graph/model/filesystem work
@@ -246,4 +245,68 @@ CURRENT authority, garbage collector, model migration or throughput claim here.
 ```sh
 cargo test -p frankensearch --features hybrid --bin frankensearch-native \
   serve::warm_update
+```
+
+## Rebuild after search-artifact damage or a deliberate model migration
+
+`rebuild --shard-size N` authenticates the complete retained source from a sharded
+receipt without opening the old vector images, native graphs, graph receipts or
+Quill files. Those derived files may be missing or corrupt. The original models
+need not be installed. Every source record and every link in its descriptor chain
+must remain intact: a missing final partition or corrupt source is an error, not
+permission to salvage a successful prefix or discover another generation.
+
+```sh
+frankensearch-native rebuild \
+  --receipt /absolute/receipts/g1.json \
+  --index-dir /absolute/indexes/rebuilt-g2 \
+  --new-receipt /absolute/receipts/rebuilt-g2.json \
+  --model-dir /absolute/models \
+  --shard-size 2500 --batch-size 16
+```
+
+Use `--quality-backend` and `--quality-model-dir` to explicitly select a native
+quality producer as on fresh indexing. Both tiers are required by default, even
+when the old source was fast-only; `--fast-only` explicitly requests just fast.
+`--exact` explicitly selects exact retrieval, otherwise native HNSW is rebuilt.
+The shard size is required for a sharded receipt and forbidden for an ordinary
+rebuild. The command retains its receipt-selected layout, never guesses capacity
+from old shard occupancy and never reads stdin or a replacement JSONL corpus.
+
+The library first authenticates all descriptors and preflights their complete
+source inventory, then reads every ordered source stream. Before model loading
+or candidate creation, the command checks exact generation and count, the original
+CLI ID contract, 100,000 documents, 16 MiB records, 1,024 output partitions and a
+256 MiB aggregate recovery-input limit. That last limit includes all source headers
+and source/child/root/hybrid descriptor bytes, not a separate allowance per shard.
+This can be stricter than the ordinary 256 MiB JSONL ingestion limit because the
+sealed descriptors also consume space. It bounds input, not peak resident memory.
+See `native-sharded-recovery.md` for the library API and authentication boundary.
+
+The existing complete builder re-embeds every document with the explicitly chosen
+local producers and regenerates every source/vector image, graph and global Quill
+index. No old vector is reused or relabelled. Prepared content, titles, metadata
+and IDs are unchanged. The new generation has a checked higher sequence and fresh
+nonce; the newly saved receipt identifies the actual new producers and complete
+hybrid seal. Strict reopening/update still reject producer mismatches, even when
+the replacement has the same dimension.
+
+Destinations must be new, non-overlapping and outside the sealed predecessor,
+including parent aliases. Cancellation, missing models or required-stage failure
+cannot produce a successful rebuild receipt. Partial candidate files may remain
+for inspection, but are never adopted, overwritten or deleted by retry. The
+receipt is created and synced only after complete sealing. Failed output after
+that persistence does not undo the completed snapshot. Old receipts, mapped files,
+live selections and retained readers remain untouched.
+
+Rebuild does not activate a running server. A same-producer successor can be
+explicitly activated through the existing exact-predecessor control. A model
+migration requires opening a new search/server handle with the new receipt and
+matching models; live activation never substitutes its configured producers.
+No durable CURRENT authority, antirollback floor, backup of damaged source data,
+cleanup permission or measured performance claim follows from recovery.
+
+```sh
+cargo test -p frankensearch --features hybrid --bin frankensearch-native \
+  update::rebuild
 ```

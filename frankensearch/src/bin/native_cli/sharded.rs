@@ -6,8 +6,9 @@ use frankensearch::native_ann::builder::sharded::{
 };
 
 use super::{
-    Cx, GenerationComponentReceiptV1, IndexableDocument, MAX_DOCUMENTS, Models,
-    NativeBuiltHybridIndex, Options, Path, Result, Selection, SnapshotReceipt, bad, cohort,
+    ArtifactGenerationIdentityV1, Cx, GenerationComponentReceiptV1, IndexableDocument,
+    MAX_DOCUMENTS, Models, NativeBuiltHybridIndex, Options, Path, Result, Selection,
+    SnapshotReceipt, bad, cohort,
     configured_builder, new_generation,
 };
 
@@ -65,6 +66,21 @@ pub async fn build(
 ) -> Result<(NativeBuiltShardedHybridIndex, Selection)> {
     validate_size(size, documents.len())?;
     let generation = new_generation(1)?;
+    build_with_generation(cx, options, directory, generation, documents, models, size).await
+}
+
+// Fresh indexing and authenticated-source recovery share the complete builder
+// and sealer. Recovery supplies a strictly newer identity, never reuse inputs.
+pub async fn build_with_generation(
+    cx: &Cx,
+    options: &Options,
+    directory: &Path,
+    generation: ArtifactGenerationIdentityV1,
+    documents: Vec<IndexableDocument>,
+    models: Models,
+    size: usize,
+) -> Result<(NativeBuiltShardedHybridIndex, Selection)> {
+    validate_size(size, documents.len())?;
     let fast_producer = models.fast.identity()?.fingerprint();
     let quality_producer = models
         .quality
