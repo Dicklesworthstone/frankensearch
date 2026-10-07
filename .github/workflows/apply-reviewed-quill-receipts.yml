@@ -2,10 +2,9 @@ name: Apply reviewed Quill receipt integration
 
 # One-shot application of the existing, reviewed patch. Not a replacement for
 # scripts/quality-gate.sh. Exact preimages prevent reuse after application.
+# Manual-only: committing this file does not apply or qualify the source patch.
 on:
-  push:
-    branches: [main]
-    paths: [.github/workflows/apply-reviewed-quill-receipts.yml]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -17,7 +16,7 @@ concurrency:
 
 jobs:
   apply:
-    if: github.repository == 'Dicklesworthstone/frankensearch'
+    if: github.repository == 'Dicklesworthstone/frankensearch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
