@@ -935,7 +935,7 @@ impl FsfsRuntime {
                     return Err(SearchError::InvalidConfig {
                         field: "complete_generation.daemon_socket".to_owned(),
                         value: socket.display().to_string(),
-                        reason: "no query daemon listens on this socket and none could be started; start one with `fsfs daemon --daemon-socket` or search with --no-daemon"
+                        reason: "no query daemon listens on this socket and none could be started; start one with `fsfs daemon --daemon-socket <path>` or search with --no-daemon"
                             .to_owned(),
                     });
                 }

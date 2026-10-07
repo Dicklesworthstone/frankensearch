@@ -4,7 +4,7 @@
 //! refuse it rather than execute the query while ignoring its configuration.
 //! Connect/write/read use the existing bounded control transport. The
 //! forwarder itself never retrieves locally, starts a daemon, or replays after
-//! ambiguous delivery; `fsfs search` decides around it whether to start one.
+//! ambiguous delivery; the search command decides around it whether to start one.
 
 use std::fmt;
 use std::io::Write;
