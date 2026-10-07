@@ -191,40 +191,19 @@ impl NativeBuiltIndex {
         limits: NativeReopenLimits,
     ) -> SearchResult<(ArtifactGenerationIdentityV1, Vec<IndexableDocument>)> {
         checkpoint(cx, "native_ann.snapshot.recover_source")?;
-        limits.validate()?;
-        let directory = checked_directory(directory.as_ref())?;
-        let bytes = read_selected(
+        let selected = select_source(
             cx,
-            &directory.join(SNAPSHOT_FILE),
+            directory.as_ref(),
             Artifact {
                 byte_len: expected.byte_len,
                 sha256: expected.sha256,
             },
-            SNAPSHOT_MAX_BYTES,
-        )?;
-        let saved: Snapshot = serde_json::from_slice(&bytes)
-            .map_err(|_| rejected("schema", "malformed native snapshot descriptor"))?;
-        if saved.schema != SNAPSHOT_SCHEMA {
-            return Err(rejected("schema", "unsupported native snapshot schema"));
-        }
-        saved.generation.validate()?;
-        let count = usize::try_from(saved.documents)
-            .map_err(|_| rejected("documents", "document count does not fit this platform"))?;
-        if count > limits.max_documents {
-            return Err(rejected(
-                "documents",
-                "selected source exceeds the document limit",
-            ));
-        }
-        let documents = read_sources(
-            cx,
-            &directory.join(SOURCE_FILE),
-            saved.source,
-            count,
             limits,
         )?;
+        let generation = selected.generation;
+        let documents = selected.read(cx, limits)?;
         checkpoint(cx, "native_ann.snapshot.source_recovered")?;
-        Ok((saved.generation, documents))
+        Ok((generation, documents))
     }
 
     /// Persist the retained source cohort and seal a small vector/source descriptor.
@@ -561,6 +540,81 @@ fn write_sources(cx: &Cx, path: &Path, documents: &[IndexableDocument]) -> Searc
     Ok(Artifact {
         byte_len,
         sha256: hash.finalize().into(),
+    })
+}
+
+/// Small authenticated source selection used to budget a whole shard inventory
+/// before decoding its first document. This is not vector/graph admission.
+pub(super) struct SelectedSource {
+    directory: PathBuf,
+    source: Artifact,
+    pub(super) generation: ArtifactGenerationIdentityV1,
+    pub(super) documents: usize,
+    pub(super) quality: bool,
+}
+
+impl SelectedSource {
+    pub(super) const fn byte_len(&self) -> u64 {
+        self.source.byte_len
+    }
+
+    pub(super) fn read(
+        self,
+        cx: &Cx,
+        limits: NativeReopenLimits,
+    ) -> SearchResult<Vec<IndexableDocument>> {
+        read_sources(
+            cx,
+            &self.directory.join(SOURCE_FILE),
+            self.source,
+            self.documents,
+            limits,
+        )
+    }
+}
+
+// Both ordinary and sharded recovery authenticate the SAME descriptor schema
+// and use the SAME bounded source decoder. The source digest remains pinned
+// after preflight; rereading a changing descriptor cannot retarget the source.
+pub(super) fn select_source(
+    cx: &Cx,
+    directory: &Path,
+    expected: Artifact,
+    limits: NativeReopenLimits,
+) -> SearchResult<SelectedSource> {
+    checkpoint(cx, "native_ann.snapshot.select_source")?;
+    limits.validate()?;
+    let directory = checked_directory(directory)?;
+    let bytes = read_selected(
+        cx,
+        &directory.join(SNAPSHOT_FILE),
+        expected,
+        SNAPSHOT_MAX_BYTES,
+    )?;
+    let saved: Snapshot = serde_json::from_slice(&bytes)
+        .map_err(|_| rejected("schema", "malformed native snapshot descriptor"))?;
+    if saved.schema != SNAPSHOT_SCHEMA {
+        return Err(rejected("schema", "unsupported native snapshot schema"));
+    }
+    saved.generation.validate()?;
+    let count = usize::try_from(saved.documents)
+        .map_err(|_| rejected("documents", "document count does not fit this platform"))?;
+    if count > limits.max_documents {
+        return Err(rejected(
+            "documents",
+            "selected source exceeds the document limit",
+        ));
+    }
+    saved.source.validate()?;
+    if saved.source.byte_len > limits.max_source_bytes {
+        return Err(rejected("source_size", "source exceeds the selected limit"));
+    }
+    Ok(SelectedSource {
+        directory,
+        source: saved.source,
+        generation: saved.generation,
+        documents: count,
+        quality: saved.quality.is_some(),
     })
 }
 

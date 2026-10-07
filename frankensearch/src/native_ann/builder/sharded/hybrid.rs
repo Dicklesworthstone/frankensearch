@@ -126,6 +126,70 @@ impl NativeIndexBuilder {
 }
 
 impl NativeBuiltShardedHybridIndex {
+    /// Recover every retained source partition from the original hybrid receipt.
+    ///
+    /// This authenticates the complete descriptor chain and delegates source
+    /// decoding to the ordinary native snapshot reader. No old model, FSVI,
+    /// graph or lexical file is opened. It returns owned rebuild input, never
+    /// a degraded searchable index or permission to reuse surviving vectors.
+    /// Missing/corrupt descriptors or sources fail the whole operation.
+    ///
+    /// `vectors.max_artifact_bytes` bounds ALL recovery input: this hybrid
+    /// descriptor, the shard/child descriptors and encoded sources. Derived
+    /// artifact bytes are not charged because they are not read. Lexical limits
+    /// still validate the descriptor's inventory, not its damaged files.
+    /// The original trusted-directory contract applies. Nothing is written,
+    /// selected, deleted, discovered or repaired. Run on the caller's I/O lane.
+    ///
+    /// # Errors
+    /// Returns receipt, schema, membership, resource, file or cancellation errors.
+    pub fn recover_selected_source(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeShardedHybridReopenLimits,
+    ) -> SearchResult<(ArtifactGenerationIdentityV1, Vec<IndexableDocument>)> {
+        checkpoint(cx, "native_ann.sharded_hybrid.recover_source")?;
+        limits.validate()?;
+        let directory = checked_directory(directory.as_ref())?;
+        let bytes = read_selected(
+            cx,
+            &directory.join(HYBRID_FILE),
+            Artifact {
+                byte_len: expected.byte_len,
+                sha256: expected.sha256,
+            },
+            MAX_DESCRIPTOR_BYTES.min(limits.vectors.max_artifact_bytes),
+        )?;
+        let saved: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|_| rejected("schema", "malformed sharded hybrid descriptor"))?;
+        if saved.schema != HYBRID_SCHEMA || saved.documents > limits.vectors.max_documents {
+            return Err(rejected("source", "invalid selected source inventory"));
+        }
+        saved.generation.validate()?;
+        saved.vectors.validate()?;
+        saved.lexical.validate(limits.lexical())?;
+        let mut source_limits = limits.vectors;
+        source_limits.max_artifact_bytes = source_limits
+            .max_artifact_bytes
+            .checked_sub(expected.byte_len)
+            .ok_or_else(|| rejected("source_budget", "recovery input exceeds its limit"))?;
+        // Bind the inner census to the OUTER selected count before decoding.
+        source_limits.max_documents = saved.documents;
+        let selected = super::recovery::select_sources(
+            cx,
+            &directory,
+            &saved.vectors.receipt(),
+            source_limits,
+        )?;
+        if selected.generation != saved.generation || selected.documents != saved.documents {
+            return Err(rejected("source", "recovered cohort differs from hybrid selection"));
+        }
+        let documents = selected.read(cx)?;
+        checkpoint(cx, "native_ann.sharded_hybrid.source_recovered")?;
+        Ok((saved.generation, documents))
+    }
+
     fn from_readers(
         cx: &Cx,
         vectors: NativeBuiltShardedIndex,

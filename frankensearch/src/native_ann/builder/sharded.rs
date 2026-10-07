@@ -31,6 +31,8 @@ pub use hybrid::{NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits}
 #[cfg(feature = "quill")]
 pub mod live;
 
+mod recovery;
+
 const SNAPSHOT_FILE: &str = "native.sharded.json";
 const SNAPSHOT_SCHEMA: &str = "frankensearch.native-sharded-source-vector.v1";
 const MAX_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
