@@ -624,8 +624,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v10 / stream v8: extension filter clauses widen each other.
 // v11 / stream v9: colons that name no field reach the lexical lane.
 // v12 / stream v10: snippets mask credential tokens and private-key material.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v12";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v10";
+// v13 / stream v11: apply and attest the client's rerank deadline.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v13";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v11";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -1299,6 +1300,14 @@ struct SearchExecutionFlags {
     persist_explain_session: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SearchServeOptions {
+    hot_cache_enabled: bool,
+    /// CLI forwarding preserves the actual cold-search score evidence;
+    /// raw serve requests leave explanation state untouched.
+    persist_explain_session: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 struct SearchCacheKey {
     /// Bind persisted answers to the registered local producers without
@@ -1314,6 +1323,9 @@ struct SearchCacheKey {
     /// Exact bits of the f32 policy consumed by the shared blend kernel.
     quality_weight_bits: u32,
     quality_timeout_ms: u64,
+    /// Rerank deadlines are request policy just like quality deadlines. A
+    /// cached stage must not replay evidence for a different time budget.
+    rerank_timeout_ms: u64,
     /// Reranked and un-reranked answers to the same query are different
     /// payloads; the key must not conflate them.
     #[serde(default)]
@@ -1353,6 +1365,8 @@ struct SearchServeRequest {
     /// Client's effective `search.rerank`; `None` keeps the daemon's own.
     #[serde(default)]
     rerank: Option<bool>,
+    #[serde(default)]
+    rerank_timeout_ms: Option<u64>,
     /// Client's resolved blend policy; omission uses the server configuration.
     #[serde(default)]
     quality_weight: Option<f64>,
@@ -1370,6 +1384,7 @@ struct SearchServePolicy {
     quality_model: String,
     quality_weight_bits: u32,
     quality_timeout_ms: u64,
+    rerank_timeout_ms: u64,
     rrf_k_bits: u64,
     fast_only: bool,
 }
@@ -7967,7 +7982,7 @@ impl FsfsRuntime {
         let mut seq = 0_u64;
 
         self.emit_search_stream_started(query, stream_id, &mut seq, writer)?;
-        let search_result = {
+        let search_result = async {
             let mut phase_sink = |stage_payload: &SearchPayload| {
                 self.emit_search_stream_payload(stage_payload, stream_id, &mut seq, writer)
             };
@@ -8047,7 +8062,8 @@ impl FsfsRuntime {
                 )
                 .await
             }
-        };
+        }
+        .await;
         match search_result {
             Ok(payloads) => {
                 let payload = payloads.last().cloned().unwrap_or_else(|| {
@@ -8542,11 +8558,14 @@ impl FsfsRuntime {
         let task_context = Arc::clone(&request_context);
         let disconnected = Arc::new(AtomicBool::new(false));
         let task_disconnected = Arc::clone(&disconnected);
-        let budget = Duration::from_millis(
+        let budget = Self::search_daemon_delivery_budget(
             request
                 .quality_timeout_ms
-                .unwrap_or(runtime.config.search.quality_timeout_ms)
-                .saturating_add(30_000),
+                .unwrap_or(runtime.config.search.quality_timeout_ms),
+            request.rerank.unwrap_or(runtime.config.search.rerank),
+            request
+                .rerank_timeout_ms
+                .unwrap_or(runtime.config.search.rerank_timeout_ms),
         );
         let started = Instant::now();
         let (sender, mut receiver) =
@@ -8604,7 +8623,10 @@ impl FsfsRuntime {
                             request,
                             resources,
                             hot_cache,
-                            hot_cache_enabled,
+                            SearchServeOptions {
+                                hot_cache_enabled,
+                                persist_explain_session: false,
+                            },
                             Some(&mut publish),
                         )
                         .await
@@ -8675,6 +8697,7 @@ impl FsfsRuntime {
                 mode: None,
                 filter: None,
                 rerank: None,
+                rerank_timeout_ms: None,
                 quality_weight: None,
                 quality_timeout_ms: None,
                 rrf_k: None,
@@ -8696,7 +8719,10 @@ impl FsfsRuntime {
             request,
             resources,
             hot_cache,
-            hot_cache_enabled,
+            SearchServeOptions {
+                hot_cache_enabled,
+                persist_explain_session: false,
+            },
             None,
         )
         .await
@@ -8708,7 +8734,7 @@ impl FsfsRuntime {
         request: SearchServeRequest,
         resources: &mut SearchExecutionResources,
         hot_cache: &mut HashMap<SearchCacheKey, Vec<SearchPayload>>,
-        hot_cache_enabled: bool,
+        options: SearchServeOptions,
         mut frame_sink: Option<SearchServeFrameSink<'_>>,
     ) -> SearchResult<SearchServeResponse> {
         // The server applies its own degradation override to every client.
@@ -8741,6 +8767,9 @@ impl FsfsRuntime {
         // `fsfs search --rerank` means the same thing through the daemon; the
         // clone shares this process's loaded cross-encoder.
         runtime.config.search.rerank = request.rerank.unwrap_or(self.config.search.rerank);
+        runtime.config.search.rerank_timeout_ms = request
+            .rerank_timeout_ms
+            .unwrap_or(self.config.search.rerank_timeout_ms);
         if let Some(weight) = request.quality_weight {
             if !(0.0..=1.0).contains(&weight) {
                 return Err(SearchError::InvalidConfig {
@@ -8772,10 +8801,11 @@ impl FsfsRuntime {
             runtime.config.search.rrf_k = k;
         }
         runtime.config.search.fast_only = request.fast_only.unwrap_or(self.config.search.fast_only);
+        crate::config::validate_search_policy(&runtime.config.search)?;
         runtime.prepare_search_reranker(cx).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
-        let cached_payloads = hot_cache_enabled
+        let cached_payloads = options.hot_cache_enabled
             .then(|| hot_cache.get(&cache_key))
             .flatten();
         let cached = cached_payloads.is_some();
@@ -8825,7 +8855,7 @@ impl FsfsRuntime {
                     resources,
                     SearchExecutionFlags {
                         include_snippets: true,
-                        persist_explain_session: false,
+                        persist_explain_session: options.persist_explain_session,
                     },
                     Some(&mut publish),
                 )
@@ -8836,7 +8866,17 @@ impl FsfsRuntime {
         };
         Self::validate_bound_search_resources(resources, mode)?;
         Self::search_daemon_checkpoint(cx)?;
-        if hot_cache_enabled
+        // Misses retain the full fused-candidate evidence saved by the search
+        // above. Only a cache hit needs to reconstruct the latest CLI context
+        // from its payloads, matching the ordinary persisted-cache path.
+        if cached
+            && options.persist_explain_session
+            && let Err(error) =
+                runtime.persist_explain_session_for_cached_payloads(&request.query, &payloads)
+        {
+            warn!(%error, "failed to persist cached daemon search explanation context");
+        }
+        if options.hot_cache_enabled
             && !cached
             && Self::search_payloads_cacheable(&payloads)
             && serde_json::to_writer(&mut SearchServeFrameBuffer::default(), &payloads).is_ok()
@@ -9100,6 +9140,21 @@ impl FsfsRuntime {
         }
     }
 
+    /// A delivered request owns the sequential quality and optional rerank
+    /// budgets, plus the existing allowance for preparation and transport.
+    /// Socket I/O still uses its separate bounded inactivity policy.
+    fn search_daemon_delivery_budget(
+        quality_timeout_ms: u64,
+        rerank: bool,
+        rerank_timeout_ms: u64,
+    ) -> Duration {
+        Duration::from_millis(
+            quality_timeout_ms
+                .saturating_add(if rerank { rerank_timeout_ms } else { 0 })
+                .saturating_add(30_000),
+        )
+    }
+
     async fn search_payloads_via_daemon(
         &self,
         cx: &Cx,
@@ -9147,6 +9202,7 @@ impl FsfsRuntime {
                 mode: Some(mode.label().to_owned()),
                 filter: self.cli_input.filter.clone(),
                 rerank: Some(self.config.search.rerank),
+                rerank_timeout_ms: Some(self.config.search.rerank_timeout_ms),
                 quality_weight: Some(self.config.search.quality_weight),
                 quality_timeout_ms: Some(self.config.search.quality_timeout_ms),
                 rrf_k: Some(self.config.search.rrf_k),
@@ -9172,8 +9228,11 @@ impl FsfsRuntime {
             }
             stream.set_nonblocking(true).map_err(SearchError::Io)?;
             let started = Instant::now();
-            let budget =
-                Duration::from_millis(self.config.search.quality_timeout_ms.saturating_add(30_000));
+            let budget = Self::search_daemon_delivery_budget(
+                self.config.search.quality_timeout_ms,
+                self.config.search.rerank,
+                self.config.search.rerank_timeout_ms,
+            );
             let mut written = 0;
             while written < request_json.len() {
                 Self::search_daemon_transport_checkpoint(cx, started, budget)?;
@@ -11359,6 +11418,7 @@ impl FsfsRuntime {
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
+            rerank_timeout_ms: self.config.search.rerank_timeout_ms,
             rerank: self.config.search.rerank,
             rerank_model: if self.config.search.rerank {
                 self.reranker
@@ -11385,6 +11445,7 @@ impl FsfsRuntime {
         hasher.update(key.rrf_k_bits.to_le_bytes());
         hasher.update(key.quality_weight_bits.to_le_bytes());
         hasher.update(key.quality_timeout_ms.to_le_bytes());
+        hasher.update(key.rerank_timeout_ms.to_le_bytes());
         hasher.update([u8::from(key.rerank)]);
         hasher.update(key.rerank_model.as_deref().unwrap_or("").as_bytes());
         sha256_digest_hex(hasher.finalize())
@@ -11402,6 +11463,7 @@ impl FsfsRuntime {
             quality_model: normalize_model_key(&self.config.indexing.quality_model),
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
+            rerank_timeout_ms: self.config.search.rerank_timeout_ms,
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
             fast_only: self.config.search.fast_only,
         })
@@ -29603,6 +29665,7 @@ mod tests {
                 mode: Some(mode.to_owned()),
                 filter: None,
                 rerank: Some(false),
+                rerank_timeout_ms: None,
                 quality_weight: None,
                 quality_timeout_ms: Some(5_000),
                 rrf_k: None,
@@ -29630,7 +29693,10 @@ mod tests {
                     request("full"),
                     &mut resources,
                     &mut cache,
-                    true,
+                    super::SearchServeOptions {
+                        hot_cache_enabled: true,
+                        persist_explain_session: false,
+                    },
                     Some(&mut sink),
                 )
                 .await;
@@ -29913,6 +29979,7 @@ mod tests {
                 mode: Some("fast_only".to_owned()),
                 filter: None,
                 rerank: Some(false),
+                rerank_timeout_ms: None,
                 quality_weight: None,
                 quality_timeout_ms: None,
                 rrf_k: None,
@@ -29971,6 +30038,7 @@ mod tests {
                     mode: Some("full".to_owned()),
                     filter: None,
                     rerank: Some(false),
+                    rerank_timeout_ms: None,
                     quality_weight: Some(f64::from(weight)),
                     quality_timeout_ms: Some(5_000),
                     rrf_k: None,
@@ -30306,6 +30374,121 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "semantic-support")]
+    fn daemon_cli_cold_search_preserves_initial_vector_explanation_scores() {
+        run_on_runtime_task(|cx| async move {
+            for hot_cache_enabled in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = temp.path().display().to_string();
+                config.search.fast_only = true;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    index_dir: Some(temp.path().to_path_buf()),
+                    ..CliInput::default()
+                });
+                let mut cache = HashMap::new();
+                let response = runtime
+                    .execute_search_serve_request_with_sink(
+                        &cx,
+                        SearchServeRequest {
+                            query: "how do semantic policies affect ranking".to_owned(),
+                            limit: Some(10),
+                            mode: Some("fast_only".to_owned()),
+                            filter: None,
+                            rerank: Some(false),
+                            rerank_timeout_ms: None,
+                            quality_weight: None,
+                            quality_timeout_ms: None,
+                            rrf_k: None,
+                            fast_only: Some(true),
+                        },
+                        &mut resources,
+                        &mut cache,
+                        super::SearchServeOptions {
+                            hot_cache_enabled,
+                            persist_explain_session: true,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!response.cached);
+                assert_eq!(response.payloads.len(), 1);
+                let payload = &response.payloads[0];
+                assert_eq!(payload.phase, SearchOutputPhase::Initial);
+                assert!(payload.semantic_blend.is_none());
+                assert_eq!(payload.hits[0].path, "a.rs");
+                let session = runtime.load_explain_session().unwrap().unwrap();
+                let hit = session.hits.iter().find(|hit| hit.path == "a.rs").unwrap();
+                assert_eq!(
+                    hit.semantic_score,
+                    Some(1.0),
+                    "cold forwarding must retain actual vector scores even without a Refined payload"
+                );
+                assert_eq!(hit.semantic_rank, payload.hits[0].semantic_rank);
+                assert_eq!(cache.is_empty(), !hot_cache_enabled);
+            }
+        });
+    }
+
+    #[test]
+    fn daemon_rejects_invalid_rerank_deadlines_before_emitting_results() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let mut cache = HashMap::new();
+            for timeout_ms in [0, 49, 120_001, u64::MAX] {
+                let request = SearchServeRequest {
+                    query: "recover network".to_owned(),
+                    limit: Some(10),
+                    mode: Some("full".to_owned()),
+                    filter: None,
+                    rerank: Some(true),
+                    rerank_timeout_ms: Some(timeout_ms),
+                    quality_weight: None,
+                    quality_timeout_ms: None,
+                    rrf_k: None,
+                    fast_only: None,
+                };
+                let mut frames = Vec::new();
+                let result = runtime
+                    .execute_search_serve_request_with_sink(
+                        &cx,
+                        request,
+                        &mut resources,
+                        &mut cache,
+                        super::SearchServeOptions {
+                            hot_cache_enabled: true,
+                            persist_explain_session: false,
+                        },
+                        Some(&mut |frame| {
+                            frames.push(frame);
+                            Ok(())
+                        }),
+                    )
+                    .await;
+                assert!(
+                    matches!(result, Err(SearchError::InvalidConfig { ref field, .. })
+                        if field == "search.rerank_timeout_ms"),
+                    "invalid deadline {timeout_ms}: {result:?}"
+                );
+                assert!(
+                    frames.is_empty(),
+                    "invalid policy cannot attest or emit a phase"
+                );
+                assert!(cache.is_empty(), "invalid policy cannot populate the cache");
+            }
+        });
+    }
+
+    #[test]
     fn quality_blend_daemon_requires_exact_applied_policy_acknowledgement() {
         let mut config = FsfsConfig::default();
         config.indexing.quality_model = "all-MiniLM-L6-v2".to_owned();
@@ -30331,6 +30514,26 @@ mod tests {
             super::normalize_model_key(super::FSFS_NATIVE_QUALITY_MODEL_ID);
         assert!(runtime.validate_search_serve_policy(&response).is_err());
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.policy.as_mut().unwrap().rerank_timeout_ms += 1;
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "the daemon must acknowledge the client's rerank budget"
+        );
+        response.policy = Some(runtime.search_serve_policy().unwrap());
+        let mut unbound = serde_json::to_value(&response).unwrap();
+        unbound["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rerank_timeout_ms");
+        assert!(
+            serde_json::from_value::<super::SearchServeResponse>(unbound).is_err(),
+            "an omitted deadline cannot acknowledge a current request"
+        );
+        response.schema_version = "fsfs.search.serve.v12".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that ignores client rerank deadlines cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v11".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -30653,6 +30856,7 @@ mod tests {
                             mode: Some("full".to_owned()),
                             filter: None,
                             rerank: None,
+                            rerank_timeout_ms: None,
                             quality_weight: None,
                             quality_timeout_ms: None,
                             rrf_k: None,
@@ -30696,6 +30900,7 @@ mod tests {
                 mode: Some("full".to_owned()),
                 filter: None,
                 rerank: None,
+                rerank_timeout_ms: None,
                 quality_weight: None,
                 quality_timeout_ms: None,
                 rrf_k: None,
@@ -30886,6 +31091,7 @@ mod tests {
                             mode: Some("full".to_owned()),
                             filter: None,
                             rerank: None,
+                            rerank_timeout_ms: None,
                             quality_weight: None,
                             quality_timeout_ms: Some(50),
                             rrf_k: None,
@@ -31075,13 +31281,15 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-        // v9 prints credentials in snippets; v8 drops `HashMap::new` from the
+// v10 ignores client rerank deadlines; v9 prints credentials in snippets;
+        // v8 drops `HashMap::new` from the
         // lexical lane; v7 requires every extension clause at once; v6 reads
         // `lang:rust` as an extension; v5 lets excluded documents back through
         // the vector lanes; v4 gives long windowed sources the whole quality
         // weight; v3 blends quality discoveries without fast scores; v2
         // predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v10",
             "fsfs.search.serve.stream.v9",
             "fsfs.search.serve.stream.v8",
             "fsfs.search.serve.stream.v7",
@@ -31116,6 +31324,17 @@ mod tests {
                 .to_string()
                 .contains("search policy")
         );
+        let mut bad = header();
+        if let SearchServeFrame::Attested { policy, .. } = &mut bad {
+            policy.rerank_timeout_ms += 1;
+        }
+        assert!(
+            accept(bad, &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("search policy")
+        );
+        assert!(!state.attested, "mismatched deadline admits no phase");
         let mut bad = header();
         if let SearchServeFrame::Attested {
             generation_fingerprint,
@@ -31475,7 +31694,11 @@ mod tests {
                 );
             }
         });
-        let client = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+        let mut client_config = FsfsConfig::default();
+        // The daemon above keeps its default. The real socket request must
+        // carry this distinct budget and receive its exact acknowledgement.
+        client_config.search.rerank_timeout_ms = 20_000;
+        let client = FsfsRuntime::new(client_config).with_cli_input(CliInput {
             index_dir: Some(temp.path().to_path_buf()),
             daemon: true,
             daemon_socket: Some(socket_path),
@@ -33836,6 +34059,7 @@ mod tests {
             mode: Some("full".to_owned()),
             filter: None,
             rerank: Some(true),
+            rerank_timeout_ms: None,
             quality_weight: None,
             quality_timeout_ms: None,
             rrf_k: None,
@@ -35007,6 +35231,72 @@ mod tests {
     }
 
     #[test]
+    fn rerank_deadline_cache_reuse_requires_the_same_request_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = temp.path().display().to_string();
+        config.search.rerank = true;
+        config.search.rerank_timeout_ms = 20_000;
+        let runtime = FsfsRuntime::new(config);
+        let query = "recover network";
+        let key = runtime
+            .search_cache_key(query, 2, SearchExecutionMode::Full)
+            .unwrap();
+        let payloads = vec![SearchPayload::new(
+            query,
+            SearchOutputPhase::Refined,
+            2,
+            Vec::new(),
+        )];
+        let fingerprint = "same-retained-generation";
+        runtime
+            .write_search_payload_cache(&key, &payloads, fingerprint)
+            .unwrap();
+        let hot_cache = HashMap::from([(key.clone(), payloads.clone())]);
+        assert_eq!(
+            runtime
+                .try_load_search_payload_cache(&key, fingerprint)
+                .unwrap(),
+            Some(payloads.clone()),
+            "the original request can reuse its persisted phases"
+        );
+
+        let mut changed = runtime.clone();
+        changed.config.search.rerank_timeout_ms = 50;
+        let shorter = changed
+            .search_cache_key(query, 2, SearchExecutionMode::Full)
+            .unwrap();
+        assert!(
+            !hot_cache.contains_key(&shorter),
+            "a forwarded request cannot reuse another rerank deadline"
+        );
+        assert!(
+            changed
+                .try_load_search_payload_cache(&shorter, fingerprint)
+                .unwrap()
+                .is_none(),
+            "the changed deadline also misses the persisted cache"
+        );
+        assert_ne!(
+            runtime.search_cache_path(&key).unwrap(),
+            changed.search_cache_path(&shorter).unwrap()
+        );
+
+        changed.config.search.rerank_timeout_ms = 20_000;
+        let restored = changed
+            .search_cache_key(query, 2, SearchExecutionMode::Full)
+            .unwrap();
+        assert_eq!(hot_cache.get(&restored), Some(&payloads));
+        assert_eq!(
+            changed
+                .try_load_search_payload_cache(&restored, fingerprint)
+                .unwrap(),
+            Some(payloads),
+            "a policy change preserves existing cache files for their own request"
+        );
+    }
+
+    #[test]
     fn rerank_deadline_timeout_payload_is_not_cached() {
         let temp = tempfile::tempdir().unwrap();
         let mut config = FsfsConfig::default();
@@ -35895,6 +36185,7 @@ mod tests {
                 mode: Some("lexical_only".to_owned()),
                 filter: None,
                 rerank: None,
+                rerank_timeout_ms: None,
                 quality_weight: None,
                 quality_timeout_ms: None,
                 rrf_k: None,
@@ -51113,6 +51404,7 @@ mod tests {
                         mode: Some("lexical_only".to_owned()),
                         filter: None,
                         rerank: None,
+                        rerank_timeout_ms: None,
                         quality_weight: None,
                         quality_timeout_ms: None,
                         rrf_k: None,
@@ -51136,6 +51428,7 @@ mod tests {
                             mode: Some(mode.to_owned()),
                             filter: None,
                             rerank: None,
+                            rerank_timeout_ms: None,
                             quality_weight: None,
                             quality_timeout_ms: None,
                             rrf_k: None,
@@ -51221,6 +51514,7 @@ mod tests {
                         mode: Some("lexical_only".to_owned()),
                         filter: None,
                         rerank: None,
+                        rerank_timeout_ms: None,
                         quality_weight: None,
                         quality_timeout_ms: None,
                         rrf_k: None,
@@ -51259,6 +51553,7 @@ mod tests {
                         mode: Some("full".to_owned()),
                         filter: None,
                         rerank: None,
+                        rerank_timeout_ms: None,
                         quality_weight: None,
                         quality_timeout_ms: None,
                         rrf_k: None,
