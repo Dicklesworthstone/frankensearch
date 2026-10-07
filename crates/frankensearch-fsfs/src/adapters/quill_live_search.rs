@@ -556,7 +556,15 @@ mod tests {
             let pointer = fs::read(store.root().join(COMPLETE_GENERATION_POINTER)).unwrap();
             let mut session = session(store.clone());
             session.poll(&cx, Instant::now()).await.unwrap();
-            let reader = Arc::clone(&session.session.source.admitted.as_ref().unwrap().reader);
+            let reader = Arc::clone(
+                &session
+                    .session
+                    .source_mut()
+                    .admitted
+                    .as_ref()
+                    .unwrap()
+                    .reader,
+            );
             assert_eq!(session.tracker().results()[0].hit.doc_id, "a");
             assert!(session.set_query(&cx, "beta").unwrap());
             assert_eq!(session.query(), "beta");
@@ -580,15 +588,20 @@ mod tests {
             assert_eq!(decoded.query, "beta");
             assert!(Arc::ptr_eq(
                 &reader,
-                &session.session.source.admitted.as_ref().unwrap().reader,
+                &session
+                    .session
+                    .source_mut()
+                    .admitted
+                    .as_ref()
+                    .unwrap()
+                    .reader,
             ));
             session.set_query(&cx, "unmatchedword").unwrap();
             let empty = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
             assert_eq!(empty.sequence, 1);
             assert_eq!(empty.result_count, 0);
-            assert!(
-                matches!(empty.event, LiveSearchEvent::Snapshot { results } if results.is_empty())
-            );
+            assert!(matches!(empty.event,
+                LiveSearchEvent::Snapshot { results } if results.is_empty()));
             assert_eq!(
                 fs::read(store.root().join(COMPLETE_GENERATION_POINTER)).unwrap(),
                 pointer
@@ -626,7 +639,12 @@ mod tests {
             let mut session = session(store.clone());
             session.poll(&cx, Instant::now()).await.unwrap();
             session.set_query(&cx, "beta").unwrap();
-            let successor = publish(&cx, &store, &[IndexableDocument::new("new", "beta")]).await;
+            let successor = publish(
+                &cx,
+                &store,
+                &[IndexableDocument::new("new", "beta")],
+            )
+            .await;
             let frame = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
             assert_eq!(frame.query, "beta");
             assert_eq!(frame.sequence, 1);

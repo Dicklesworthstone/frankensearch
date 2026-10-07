@@ -60,7 +60,7 @@ pub struct RetainedLiveSearchSession {
     runtime: FsfsRuntime,
     store: CompleteGenerationStore,
     query: String,
-    limit: usize,
+    config: LiveSearchConfig,
     refresh: LiveSearchRefreshConfig,
     tracker: LiveSearchTracker<Value>,
     reader: Option<RetainedSearchReader>,
@@ -68,6 +68,7 @@ pub struct RetainedLiveSearchSession {
     pending: Option<PendingGeneration>,
     last_poll: Option<Instant>,
     delivery_incomplete: bool,
+    query_changed: bool,
 }
 
 impl std::fmt::Debug for RetainedLiveSearchSession {
@@ -78,6 +79,7 @@ impl std::fmt::Debug for RetainedLiveSearchSession {
             .field("sequence", &self.tracker.sequence())
             .field("pending", &self.pending.is_some())
             .field("delivery_incomplete", &self.delivery_incomplete)
+            .field("query_changed", &self.query_changed)
             .finish_non_exhaustive()
     }
 }
@@ -103,7 +105,7 @@ impl RetainedLiveSearchSession {
             runtime,
             store,
             query,
-            limit: config.max_results,
+            config,
             refresh,
             tracker,
             reader: None,
@@ -111,6 +113,7 @@ impl RetainedLiveSearchSession {
             pending: None,
             last_poll: None,
             delivery_incomplete: false,
+            query_changed: false,
         })
     }
 
@@ -124,6 +127,49 @@ impl RetainedLiveSearchSession {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         self.delivery_incomplete
+    }
+
+    /// Query belonging to the current logical subscription.
+    #[must_use]
+    pub fn query(&self) -> &str {
+        &self.query
+    }
+
+    /// Change the logical query while retaining the admitted reader and models.
+    ///
+    /// Call only between completed polls. A changed query starts a fresh
+    /// sequence-one Initial snapshot on the next poll, even if the physical
+    /// generation is unchanged. Its refinement follows the ordinary pipeline.
+    /// Reset the consumer at this boundary; a new snapshot is not an old-query
+    /// delta. Identical queries are no-ops. Changes made before polling coalesce
+    /// to the latest query without I/O, inference or generation publication.
+    ///
+    /// The last admitted physical receipt is retained for the bounded selection
+    /// probe and missing-selection refusal. Result limits, score thresholds,
+    /// runtime policy and monotone poll clocks remain unchanged. A failed or
+    /// abandoned delivery stays closed: changing queries never authorizes replay
+    /// of a partial phase sequence or a damaged transport.
+    ///
+    /// # Errors
+    /// Returns cancellation, invalid-query or closed-session errors without
+    /// changing the current subscription or its retained resources.
+    pub fn set_query(&mut self, cx: &Cx, query: impl Into<String>) -> SearchResult<bool> {
+        checkpoint(cx)?;
+        if self.delivery_incomplete {
+            return Err(invalid(
+                "delivery did not complete; reconnect with a new subscription",
+            ));
+        }
+        let query = query.into();
+        if query == self.query {
+            return Ok(false);
+        }
+        let tracker = LiveSearchTracker::new(query.clone(), self.config).map_err(live_error)?;
+        self.query = query;
+        self.tracker = tracker;
+        self.pending = None;
+        self.query_changed = true;
+        Ok(true)
     }
 
     /// Admit a due generation and deliver Initial before awaiting refinement.
@@ -158,7 +204,7 @@ impl RetainedLiveSearchSession {
             self.pending = None;
             return Ok(0);
         };
-        if self.completed.as_ref() == Some(&observed) {
+        if self.already_delivered(&observed) {
             self.pending = None;
             return Ok(0);
         }
@@ -180,7 +226,8 @@ impl RetainedLiveSearchSession {
         let Some(pending) = &self.pending else {
             return Ok(0);
         };
-        if self.completed.is_some()
+        if !self.query_changed
+            && self.completed.is_some()
             && !refresh_due(now, pending.first_change, pending.last_change, self.refresh)
         {
             return Ok(0);
@@ -203,6 +250,10 @@ impl RetainedLiveSearchSession {
         self.deliver(cx, sink).await
     }
 
+    fn already_delivered(&self, generation: &PublishedGeneration) -> bool {
+        !self.query_changed && self.completed.as_ref() == Some(generation)
+    }
+
     async fn deliver(
         &mut self,
         cx: &Cx,
@@ -213,7 +264,7 @@ impl RetainedLiveSearchSession {
             .as_mut()
             .ok_or_else(|| invalid("reader admission returned no reader"))?;
         let generation = reader.generation().clone();
-        if self.completed.as_ref() == Some(&generation) {
+        if !self.query_changed && self.completed.as_ref() == Some(&generation) {
             self.pending = None;
             return Ok(0);
         }
@@ -225,7 +276,7 @@ impl RetainedLiveSearchSession {
             {
                 let mut phase_sink = |payload: &SearchPayload| delivery.publish(cx, payload, sink);
                 let _ = reader
-                    .search_with_phase_sink(cx, &self.query, self.limit, &mut phase_sink)
+                    .search_with_phase_sink(cx, &self.query, self.config.max_results, &mut phase_sink)
                     .await?;
             }
             checkpoint(cx)?;
@@ -237,6 +288,7 @@ impl RetainedLiveSearchSession {
         self.completed = Some(generation);
         self.pending = None;
         self.delivery_incomplete = false;
+        self.query_changed = false;
         Ok(count)
     }
 
@@ -253,7 +305,7 @@ impl RetainedLiveSearchSession {
         }
         let observed = self.store.active(cx)?;
         checkpoint(cx)?;
-        if observed.is_none() && self.tracker.sequence() != 0 {
+        if observed.is_none() && (self.completed.is_some() || self.tracker.sequence() != 0) {
             return Err(invalid(
                 "the complete-generation selection disappeared; no stale fallback is permitted",
             ));
@@ -670,6 +722,168 @@ mod tests {
             assert_eq!(session.tracker().sequence(), 0);
             assert!(!session.is_closed());
             assert!(store.active(&cx).unwrap().is_none());
+        });
+    }
+
+    fn query_session(store: CompleteGenerationStore) -> RetainedLiveSearchSession {
+        RetainedLiveSearchSession::new(
+            FsfsRuntime::new(FsfsConfig::default()),
+            store,
+            "alpha",
+            LiveSearchConfig {
+                max_results: 3,
+                min_score_delta: 0.25,
+            },
+            LiveSearchRefreshConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn query_change_preserves_the_physical_receipt_but_requires_a_new_delivery() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&cx, &store, "one");
+            let now = Instant::now();
+            let mut session = query_session(store);
+            // Scheduler/transport fixture, not model-backed inference evidence.
+            session.completed = Some(generation.clone());
+            session.last_poll = Some(now);
+            session.tracker.apply("old-result", Vec::new()).unwrap();
+            session.pending = Some(PendingGeneration {
+                generation: generation.clone(),
+                first_change: now,
+                last_change: now,
+            });
+            assert!(session.already_delivered(&generation));
+            assert!(!session.set_query(&cx, "alpha").unwrap());
+            assert!(session.pending.is_some());
+            assert!(session.set_query(&cx, "beta").unwrap());
+            assert_eq!(session.query(), "beta");
+            assert!(!session.already_delivered(&generation));
+            assert_eq!(session.observe(&cx).unwrap(), Some(generation.clone()));
+            assert_eq!(session.completed, Some(generation));
+            assert!(session.pending.is_none());
+            assert_eq!(session.last_poll, Some(now));
+            assert_eq!(session.config.max_results, 3);
+            assert_eq!(session.tracker().sequence(), 0);
+            assert!(session.set_query(&cx, "alpha").unwrap());
+            assert!(session.query_changed);
+            assert!(matches!(
+                session
+                    .poll_with_sink(&cx, now - Duration::from_millis(1), &mut |_| Ok(()))
+                    .await,
+                Err(SearchError::InvalidConfig { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn query_change_starts_a_fresh_progressive_chain_on_the_same_generation() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&cx, &store, "one");
+            let mut session = query_session(store);
+            session.tracker.apply("old-result", Vec::new()).unwrap();
+            session.completed = Some(generation.clone());
+            session.set_query(&cx, "beta").unwrap();
+            let mut frames = Vec::new();
+            {
+                let mut delivery =
+                    PhaseDelivery::new(&mut session.tracker, &generation, &session.query);
+                assert!(
+                    delivery
+                        .publish(
+                            &cx,
+                            &payload(SearchOutputPhase::Initial, &[("stale", 1.0)]),
+                            &mut |_| panic!("old-query phase reached the new subscriber"),
+                        )
+                        .is_err()
+                );
+                for (phase, score) in [
+                    (SearchOutputPhase::Initial, 1.0),
+                    (SearchOutputPhase::Refined, 1.125),
+                ] {
+                    let mut value = payload(phase, &[("beta-result", score)]);
+                    value.query = "beta".to_owned();
+                    delivery
+                        .publish(&cx, &value, &mut |frame| {
+                            frames.push(frame.clone());
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+            }
+            let first = frames[0].update.as_ref().unwrap();
+            assert_eq!(first.query, "beta");
+            assert_eq!(first.sequence, 1);
+            assert!(first.previous_generation.is_none());
+            assert!(matches!(&first.event, LiveSearchEvent::Snapshot { .. }));
+            let refined = frames[1].update.as_ref().unwrap();
+            assert_eq!(refined.sequence, 2);
+            assert_eq!(refined.previous_generation.as_ref(), Some(&first.generation));
+            assert!(matches!(&refined.event,
+                LiveSearchEvent::Delta { changes } if changes.is_empty()));
+            assert_eq!(session.tracker().results()[0].hit.doc_id, "beta-result");
+            assert_eq!(
+                session.tracker().results()[0].hit.score.to_bits(),
+                1.0_f64.to_bits()
+            );
+        });
+    }
+
+    #[test]
+    fn rejected_query_changes_preserve_state_and_never_reopen_a_closed_delivery() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let mut session = query_session(store);
+            session.tracker.apply("visible", Vec::new()).unwrap();
+            assert!(session.set_query(&cx, " \n ").is_err());
+            cx.set_cancel_requested(true);
+            let cancelled = session.set_query(&cx, "beta");
+            cx.set_cancel_requested(false);
+            assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+            assert_eq!(session.query(), "alpha");
+            assert_eq!(session.tracker().sequence(), 1);
+            assert!(!session.query_changed);
+            session.delivery_incomplete = true;
+            for query in ["beta", "alpha"] {
+                assert!(session.set_query(&cx, query).is_err());
+                assert!(session.is_closed());
+                assert_eq!(session.query(), "alpha");
+                assert_eq!(session.tracker().sequence(), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn retargeting_cannot_hide_the_loss_of_an_established_selection() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let generation = publish(&cx, &store, "one");
+            let mut session = query_session(store.clone());
+            session.completed = Some(generation);
+            session.set_query(&cx, "beta").unwrap();
+            std::fs::rename(
+                store.root().join(crate::generation_store::COMPLETE_GENERATION_POINTER),
+                store.root().join("saved-pointer"),
+            )
+            .unwrap();
+            assert!(session.observe(&cx).is_err());
+            assert!(
+                session
+                    .poll_with_sink(&cx, Instant::now(), &mut |_| {
+                        panic!("missing selection emitted a new query snapshot")
+                    })
+                    .await
+                    .is_err()
+            );
+            assert_eq!(session.query(), "beta");
+            assert_eq!(session.tracker().sequence(), 0);
         });
     }
 }
