@@ -8,8 +8,7 @@ use frankensearch::native_ann::builder::sharded::{
 use super::{
     ArtifactGenerationIdentityV1, Cx, GenerationComponentReceiptV1, IndexableDocument,
     MAX_DOCUMENTS, Models, NativeBuiltHybridIndex, Options, Path, Result, Selection,
-    SnapshotReceipt, bad, cohort,
-    configured_builder, new_generation,
+    SnapshotReceipt, bad, cohort, configured_builder, new_generation,
 };
 
 pub const SELECTION_SCHEMA: &str = "frankensearch.native.sharded-selection.v1";

@@ -155,8 +155,7 @@ impl NativeBuiltShardedHybridIndex {
     )> {
         checkpoint(cx, "native_ann.sharded_hybrid.lexical_only")?;
         let directory = checked_directory(directory.as_ref())?;
-        let (saved, documents) =
-            Self::recover_source_selection(cx, &directory, expected, limits)?;
+        let (saved, documents) = Self::recover_source_selection(cx, &directory, expected, limits)?;
         let lexical = saved
             .lexical
             .open_source_verified(cx, &directory.join("lexical"), &documents, limits.lexical())
@@ -231,7 +230,10 @@ impl NativeBuiltShardedHybridIndex {
             source_limits,
         )?;
         if selected.generation != saved.generation || selected.documents != saved.documents {
-            return Err(rejected("source", "recovered cohort differs from hybrid selection"));
+            return Err(rejected(
+                "source",
+                "recovered cohort differs from hybrid selection",
+            ));
         }
         let documents = selected.read(cx)?;
         checkpoint(cx, "native_ann.sharded_hybrid.source_recovered")?;

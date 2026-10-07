@@ -131,7 +131,12 @@ async fn build(
             receipt: index.seal_for_reopen(cx).unwrap(),
             generation,
             expected: index.lexical().search(cx, "needle", 10).await.unwrap(),
-            derived: index.vectors().partitions().iter().flat_map(paths).collect(),
+            derived: index
+                .vectors()
+                .partitions()
+                .iter()
+                .flat_map(paths)
+                .collect(),
             sharded,
         }
     } else {
@@ -219,7 +224,14 @@ fn keyword_open_needs_no_models_vectors_or_graphs_and_preserves_raw_quill_result
         for sharded in [false, true] {
             for graphs in [false, true] {
                 let root = tempfile::tempdir().unwrap();
-                let f = build(&cx, &root.path().join("index"), sharded, graphs, documents()).await;
+                let f = build(
+                    &cx,
+                    &root.path().join("index"),
+                    sharded,
+                    graphs,
+                    documents(),
+                )
+                .await;
                 for (n, path) in f.derived.iter().enumerate() {
                     fs::rename(path, root.path().join(format!("saved-{n}"))).unwrap();
                 }
@@ -239,11 +251,14 @@ fn keyword_open_needs_no_models_vectors_or_graphs_and_preserves_raw_quill_result
                     serde_json::to_value(&results).unwrap(),
                     serde_json::to_value(&f.expected).unwrap()
                 );
-                assert!(results
-                    .iter()
-                    .all(|hit| hit.fast_score.is_none() && hit.quality_score.is_none()));
+                assert!(
+                    results
+                        .iter()
+                        .all(|hit| hit.fast_score.is_none() && hit.quality_score.is_none())
+                );
                 assert_eq!(
-                    image(root.path()), before,
+                    image(root.path()),
+                    before,
                     "read-only admission must not repair or write files"
                 );
             }
@@ -260,7 +275,10 @@ fn every_used_source_lexical_and_descriptor_byte_remains_required() {
             let segment = fs::read_dir(f.path.join("lexical"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
-                .find(|path| path.extension().is_some_and(|extension| extension == "fslx"))
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "fslx")
+                })
                 .unwrap();
             for (n, path) in [f.descriptor(), f.last_source(), segment]
                 .into_iter()
@@ -292,7 +310,8 @@ fn individually_valid_same_count_lexical_population_cannot_replace_selected_sour
     run_test_with_cx(|cx| async move {
         for sharded in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            let mut first = build(&cx, &root.path().join("first"), sharded, false, documents()).await;
+            let mut first =
+                build(&cx, &root.path().join("first"), sharded, false, documents()).await;
             let mut changed = documents();
             changed[2].title = Some("different untokenized title".to_owned());
             changed[3]
@@ -339,18 +358,22 @@ fn cancellation_and_resource_limits_refuse_before_keyword_admission() {
             if sharded {
                 let mut limits = NativeShardedHybridReopenLimits::default();
                 limits.vectors.max_documents = 3;
-                assert!(NativeBuiltShardedHybridIndex::open_selected_lexical(
-                    &cx, &f.path, &f.receipt, limits,
-                )
-                .await
-                .is_err());
+                assert!(
+                    NativeBuiltShardedHybridIndex::open_selected_lexical(
+                        &cx, &f.path, &f.receipt, limits,
+                    )
+                    .await
+                    .is_err()
+                );
                 limits.vectors.max_documents = 4;
                 limits.max_lexical_bytes = 1;
-                assert!(NativeBuiltShardedHybridIndex::open_selected_lexical(
-                    &cx, &f.path, &f.receipt, limits,
-                )
-                .await
-                .is_err());
+                assert!(
+                    NativeBuiltShardedHybridIndex::open_selected_lexical(
+                        &cx, &f.path, &f.receipt, limits,
+                    )
+                    .await
+                    .is_err()
+                );
             } else {
                 let mut limits = NativeHybridReopenLimits::default();
                 limits.vectors.max_document_bytes = 1;
@@ -384,10 +407,12 @@ fn empty_sources_and_old_readers_remain_explicitly_selected() {
             let (_, newer, sources) = empty.open(&cx).await.unwrap();
             assert!(sources.is_empty());
             assert_eq!(LexicalRead::doc_count(&newer).unwrap(), 0);
-            assert!(LexicalRead::search(&newer, &cx, "needle", 10)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                LexicalRead::search(&newer, &cx, "needle", 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 serde_json::to_value(
                     LexicalRead::search(&reader, &cx, "needle", 10)

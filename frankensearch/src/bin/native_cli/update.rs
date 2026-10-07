@@ -176,7 +176,7 @@ pub fn validate_partition_policy(sharded: bool, size: Option<usize>) -> Result<(
     }
 }
 
-pub fn source_directory<'a>(index: cohort::Index<'a>) -> &'a Path {
+pub fn source_directory(index: cohort::Index<'_>) -> &Path {
     match index {
         cohort::Index::Single(index) => index.vectors().directory(),
         cohort::Index::Sharded(index) => index.vectors().directory(),
@@ -334,7 +334,10 @@ where
 {
     update_checkpoint(cx)?;
     let previous = Selection::read(&options.receipt)?;
-    validate_partition_policy(previous.schema == sharded::SELECTION_SCHEMA, options.shard_size)?;
+    validate_partition_policy(
+        previous.schema == sharded::SELECTION_SCHEMA,
+        options.shard_size,
+    )?;
     let old_root = fs::canonicalize(&previous.directory)?;
     let directory = new_path(
         options
@@ -363,7 +366,10 @@ where
     };
     let edited_ids = edits.len();
     update_checkpoint(cx)?;
-    let models = load(options.models.as_deref(), previous.quality_producer.is_some())?;
+    let models = load(
+        options.models.as_deref(),
+        previous.quality_producer.is_some(),
+    )?;
     let index = sharded::Opened::open(cx, &previous, models).await?;
     let selection = match &index {
         sharded::Opened::Single(index) => {
@@ -379,7 +385,9 @@ where
                 &directory,
                 edits,
                 options.batch_size,
-                options.shard_size.ok_or_else(|| bad("missing shard size"))?,
+                options
+                    .shard_size
+                    .ok_or_else(|| bad("missing shard size"))?,
             )
             .await?
             .1
@@ -484,11 +492,9 @@ where
         ));
     }
     let selection = if let Some(size) = options.shard_size {
-        sharded::build_with_generation(
-            cx, options, &directory, generation, documents, models, size,
-        )
-        .await?
-        .1
+        sharded::build_with_generation(cx, options, &directory, generation, documents, models, size)
+            .await?
+            .1
     } else {
         build_with_generation(cx, options, &directory, generation, documents, models)
             .await?
@@ -521,7 +527,10 @@ fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocu
     };
     let (generation, documents) = match selection.schema.as_str() {
         SELECTION_SCHEMA => NativeBuiltHybridIndex::recover_selected_source(
-            cx, &selection.directory, &expected, limits,
+            cx,
+            &selection.directory,
+            &expected,
+            limits,
         )?,
         sharded::SELECTION_SCHEMA => {
             let mut sharded_limits = NativeShardedHybridReopenLimits::default();
@@ -531,7 +540,10 @@ fn recover_documents(cx: &Cx, selection: &Selection) -> Result<Vec<IndexableDocu
             // 256 MiB allowance for each partition. This precedes source decoding.
             sharded_limits.vectors.max_artifact_bytes = MAX_INPUT_BYTES as u64;
             NativeBuiltShardedHybridIndex::recover_selected_source(
-                cx, &selection.directory, &expected, sharded_limits,
+                cx,
+                &selection.directory,
+                &expected,
+                sharded_limits,
             )?
         }
         _ => return Err(bad("unsupported rebuild source layout")),
@@ -585,4 +597,4 @@ mod rebuild_sharded_tests;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "update_sharded_tests.rs"]
-pub(crate) mod sharded_tests;
+pub mod sharded_tests;

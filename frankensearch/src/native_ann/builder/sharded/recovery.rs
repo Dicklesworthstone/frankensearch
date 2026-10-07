@@ -9,10 +9,10 @@ use super::{
     MAX_DESCRIPTOR_BYTES, Manifest, NativeBuiltShardedIndex, NativeShardedReopenLimits,
     SNAPSHOT_FILE, SNAPSHOT_SCHEMA, partition_name, rejected,
 };
+use crate::native_ann::builder::NativeReopenLimits;
 use crate::native_ann::builder::snapshot::{
     Artifact, SelectedSource, checked_directory, read_selected, select_source,
 };
-use crate::native_ann::builder::NativeReopenLimits;
 use crate::native_ann::checkpoint;
 use crate::{Cx, IndexableDocument, SearchResult};
 
@@ -114,7 +114,10 @@ pub(super) fn select_sources(
         || saved.partitions.len() > limits.max_shards
         || saved.documents > limits.max_documents
     {
-        return Err(rejected("source_inventory", "invalid selected source inventory"));
+        return Err(rejected(
+            "source_inventory",
+            "invalid selected source inventory",
+        ));
     }
     saved.generation.validate()?;
     let mut partitions = Vec::with_capacity(saved.partitions.len());
@@ -123,7 +126,10 @@ pub(super) fn select_sources(
     for (ordinal, receipt) in saved.partitions.iter().enumerate() {
         checkpoint(cx, "native_ann.sharded_recovery.preflight")?;
         if receipt.byte_len > limits.max_artifact_bytes.saturating_sub(total) {
-            return Err(rejected("source_budget", "complete recovery input exceeds its limit"));
+            return Err(rejected(
+                "source_budget",
+                "complete recovery input exceeds its limit",
+            ));
         }
         let source = select_source(
             cx,
@@ -148,12 +154,18 @@ pub(super) fn select_sources(
             .and_then(|bytes| bytes.checked_add(source.byte_len()))
             .ok_or_else(|| rejected("source_budget", "recovery input bytes overflowed"))?;
         if documents > saved.documents || total > limits.max_artifact_bytes {
-            return Err(rejected("source_budget", "complete recovery input exceeds its limit"));
+            return Err(rejected(
+                "source_budget",
+                "complete recovery input exceeds its limit",
+            ));
         }
         partitions.push(source);
     }
     if documents != saved.documents {
-        return Err(rejected("documents", "partition sources do not cover the selected count"));
+        return Err(rejected(
+            "documents",
+            "partition sources do not cover the selected count",
+        ));
     }
     // The small authenticated selections retain the exact original source
     // digests. No second descriptor read can rebind a shard between passes.

@@ -46,13 +46,14 @@ impl Opened {
                 limits.vectors.max_documents = MAX_DOCUMENTS;
                 limits.vectors.max_source_bytes = MAX_INPUT_BYTES as u64;
                 limits.vectors.max_document_bytes = MAX_RECORD_BYTES as u64;
-                let (generation, reader, documents) = NativeBuiltHybridIndex::open_selected_lexical(
-                    cx,
-                    &selection.directory,
-                    &expected,
-                    limits,
-                )
-                .await?;
+                let (generation, reader, documents) =
+                    NativeBuiltHybridIndex::open_selected_lexical(
+                        cx,
+                        &selection.directory,
+                        &expected,
+                        limits,
+                    )
+                    .await?;
                 (generation, reader, documents, "single")
             }
             sharded::SELECTION_SCHEMA => {
@@ -147,10 +148,15 @@ impl Opened {
                 self.documents.len()
             };
             let query_text = self.reader.query_text(text);
-            let batch = self.reader.search_candidates(cx, &query_text, width).await?;
+            let batch = self
+                .reader
+                .search_candidates(cx, &query_text, width)
+                .await?;
             checkpoint(cx)?;
             if batch.results().len() > width {
-                return Err(bad("keyword candidate response exceeds its declared window"));
+                return Err(bad(
+                    "keyword candidate response exceeds its declared window",
+                ));
             }
             let mut seen = BTreeSet::new();
             for candidate in batch.results() {
@@ -299,28 +305,35 @@ async fn stream_one<W: Write>(
         }
         let limit = request.limit.unwrap_or(default_limit);
         let deadline = policy.start(cx, request.timeout_ms).map_err(Query)?;
-        frames.send(serde_json::json!({
-            "ok": true, "event": "started", "mode": "lexical", "limit": limit,
-            "retrieval": "lexical", "source_layout": index.layout,
-            "semantic_components_verified": false,
-        }))
-        .map_err(Delivery)?;
+        frames
+            .send(serde_json::json!({
+                "ok": true, "event": "started", "mode": "lexical", "limit": limit,
+                "retrieval": "lexical", "source_layout": index.layout,
+                "semantic_components_verified": false,
+            }))
+            .map_err(Delivery)?;
         let page = query::within(
             cx,
             deadline.as_ref(),
-            index.search(cx, &request.query, limit, [base_filter, request.filter.as_ref()]),
+            index.search(
+                cx,
+                &request.query,
+                limit,
+                [base_filter, request.filter.as_ref()],
+            ),
         )
         .await
         .map_err(Query)?;
         frames.send(page).map_err(Delivery)?;
         // Results are already delivered. No late cancel/timeout can retract
         // that success; a broken terminal write is solely a delivery failure.
-        frames.send(serde_json::json!({
-            "event": "terminal", "ok": true, "status": "complete",
-            "partial_results": false, "retrieval": "lexical",
-            "semantic_components_verified": false,
-        }))
-        .map_err(Delivery)
+        frames
+            .send(serde_json::json!({
+                "event": "terminal", "ok": true, "status": "complete",
+                "partial_results": false, "retrieval": "lexical",
+                "semantic_components_verified": false,
+            }))
+            .map_err(Delivery)
     }
     .await;
     match result {
@@ -440,7 +453,14 @@ async fn run_opened<R: BufRead, W: Write>(
         match message {
             Message::Search(request) => {
                 match stream_one(
-                    cx, index, &request, ordinal, default_limit, base_filter, policy, output,
+                    cx,
+                    index,
+                    &request,
+                    ordinal,
+                    default_limit,
+                    base_filter,
+                    policy,
+                    output,
                 )
                 .await
                 {

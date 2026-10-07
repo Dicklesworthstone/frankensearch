@@ -49,7 +49,12 @@ async fn fixture(cx: &Cx, partitioned: bool, graphs: bool) -> Fixture {
         (
             selection,
             index.lexical().search(cx, "common", 100).await.unwrap(),
-            index.vectors().partitions().iter().flat_map(paths).collect(),
+            index
+                .vectors()
+                .partitions()
+                .iter()
+                .flat_map(paths)
+                .collect(),
         )
     } else {
         let single = index
@@ -71,7 +76,10 @@ async fn fixture(cx: &Cx, partitioned: bool, graphs: bool) -> Fixture {
     drop(index);
     drop(fast);
     drop(quality);
-    assert!(weak.upgrade().is_none(), "the command fixture owns no models");
+    assert!(
+        weak.upgrade().is_none(),
+        "the command fixture owns no models"
+    );
     let receipt = root.path().join("keyword.json");
     save_selection(&selection, &receipt).unwrap();
     Fixture {
@@ -147,7 +155,13 @@ fn explicit_keyword_policy_rejects_semantic_options_instead_of_ignoring_them() {
         );
     }
     for args in [
-        vec!["serve", "--receipt", "r", "--lexical-only", "--allow-updates"],
+        vec![
+            "serve",
+            "--receipt",
+            "r",
+            "--lexical-only",
+            "--allow-updates",
+        ],
         vec![
             "index",
             "--receipt",
@@ -193,7 +207,7 @@ fn root_command_searches_both_layouts_without_models_or_semantic_artifacts() {
                     let mut output = Vec::new();
                     // The actual root branch gets no blocking/model loader pool.
                     // A semantic-path regression cannot succeed with this receipt.
-                    crate::execute(&cx, options, &mut output, None)
+                    Box::pin(crate::execute(&cx, options, &mut output, None))
                         .await
                         .unwrap();
                     let frames = frames(&output);
@@ -290,9 +304,14 @@ fn bad_keyword_receipts_and_used_artifacts_emit_no_success() {
             fs::rename(&source, &saved).unwrap();
             let mut output = Vec::new();
             assert!(
-                crate::execute(&cx, options(&f.receipt, &["--stream"]), &mut output, None)
-                    .await
-                    .is_err()
+                Box::pin(crate::execute(
+                    &cx,
+                    options(&f.receipt, &["--stream"]),
+                    &mut output,
+                    None
+                ))
+                .await
+                .is_err()
             );
             assert!(output.is_empty(), "admission failed before started");
             fs::rename(saved, source).unwrap();
@@ -302,15 +321,25 @@ fn bad_keyword_receipts_and_used_artifacts_emit_no_success() {
             let altered = f.root.path().join("false-count.json");
             fs::write(&altered, serde_json::to_vec(&false_receipt).unwrap()).unwrap();
             assert!(
-                crate::execute(&cx, options(&altered, &[]), &mut output, None)
-                    .await
-                    .is_err()
+                Box::pin(crate::execute(
+                    &cx,
+                    options(&altered, &[]),
+                    &mut output,
+                    None
+                ))
+                .await
+                .is_err()
             );
             assert!(output.is_empty());
             cx.set_cancel_requested(true);
-            let error = crate::execute(&cx, options(&f.receipt, &[]), &mut output, None)
-                .await
-                .unwrap_err();
+            let error = Box::pin(crate::execute(
+                &cx,
+                options(&f.receipt, &[]),
+                &mut output,
+                None,
+            ))
+            .await
+            .unwrap_err();
             cx.set_cancel_requested(false);
             assert!(matches!(
                 error.downcast_ref::<SearchError>(),
@@ -414,7 +443,10 @@ fn broken_keyword_delivery_never_appends_a_contradictory_terminal_frame() {
             assert_eq!(writer.writes, fail_at);
         }
         assert_eq!(
-            index.search(&cx, "common", 100, [None, None]).await.unwrap()["results"],
+            index
+                .search(&cx, "common", 100, [None, None])
+                .await
+                .unwrap()["results"],
             serde_json::to_value(f.expected).unwrap()
         );
     });
@@ -422,9 +454,15 @@ fn broken_keyword_delivery_never_appends_a_contradictory_terminal_frame() {
 
 fn server_options(path: &Path) -> Options {
     Options::parse([
-        "serve".to_owned(), "--receipt".to_owned(), path.display().to_string(),
-        "--lexical-only".to_owned(), "--limit".to_owned(), "100".to_owned(),
-    ]).unwrap().unwrap()
+        "serve".to_owned(),
+        "--receipt".to_owned(),
+        path.display().to_string(),
+        "--lexical-only".to_owned(),
+        "--limit".to_owned(),
+        "100".to_owned(),
+    ])
+    .unwrap()
+    .unwrap()
 }
 
 fn keyword_input(messages: &[serde_json::Value]) -> std::io::Cursor<Vec<u8>> {
@@ -496,19 +534,25 @@ fn keyword_server_retains_admission_after_ready_without_models_or_reopening() {
                     receipt: f.receipt.clone(),
                     descriptor: f.selection.directory.join(if partitioned {
                         "native.sharded-hybrid.json"
-                    } else { "native.hybrid.json" }),
+                    } else {
+                        "native.hybrid.json"
+                    }),
                     saved_receipt: f.root.path().join("saved-selection"),
                     saved_descriptor: f.root.path().join("saved-descriptor"),
                     retired: false,
                 };
                 serve_with_io(
-                    &cx, &server_options(&f.receipt),
+                    &cx,
+                    &server_options(&f.receipt),
                     &mut keyword_input(&[
                         serde_json::json!({"id":"first", "query":"common"}),
                         serde_json::json!({"op":"status", "id":"health"}),
                         serde_json::json!({"id":"second", "query":"common"}),
-                    ]), &mut output,
-                ).await.unwrap();
+                    ]),
+                    &mut output,
+                )
+                .await
+                .unwrap();
                 assert!(output.retired);
                 // A per-query reopen cannot have succeeded against these paths.
                 assert!(Selection::read(&f.receipt).is_err());
@@ -520,7 +564,10 @@ fn keyword_server_retains_admission_after_ready_without_models_or_reopening() {
                 assert_eq!(rows[0]["activation_enabled"], false);
                 assert_eq!(rows[0]["updates_enabled"], false);
                 for row in &rows {
-                    assert_eq!(row["generation"], serde_json::to_value(f.selection.generation).unwrap());
+                    assert_eq!(
+                        row["generation"],
+                        serde_json::to_value(f.selection.generation).unwrap()
+                    );
                     assert_eq!(row["semantic_components_verified"], false);
                 }
                 for (offset, ordinal, id) in [(1, 1, "first"), (5, 3, "second")] {
@@ -529,8 +576,14 @@ fn keyword_server_retains_admission_after_ready_without_models_or_reopening() {
                         assert_eq!(rows[offset + seq]["request"], ordinal);
                         assert_eq!(rows[offset + seq]["id"], id);
                     }
-                    assert_eq!(results(&rows[offset + 1]["results"]), serde_json::to_value(&f.expected).unwrap());
-                    assert_eq!(rows[offset + 1]["source_layout"], if partitioned { "sharded" } else { "single" });
+                    assert_eq!(
+                        results(&rows[offset + 1]["results"]),
+                        serde_json::to_value(&f.expected).unwrap()
+                    );
+                    assert_eq!(
+                        rows[offset + 1]["source_layout"],
+                        if partitioned { "sharded" } else { "single" }
+                    );
                 }
                 assert_eq!(rows[4]["operation"], "status");
                 assert_eq!(rows[4]["documents"], f.selection.documents);
@@ -554,9 +607,13 @@ fn keyword_server_intersects_filters_before_cutoff_and_keeps_raw_quill_results()
             assert_ne!(first.doc_id, last.doc_id);
             let mut options = server_options(&f.receipt);
             options.limit = 1;
-            options.filter = Some(filter::Filter::parse(
-                &serde_json::json!({"ids":[last.doc_id], "metadata":{"version":"old"}}).to_string(),
-            ).unwrap());
+            options.filter = Some(
+                filter::Filter::parse(
+                    &serde_json::json!({"ids":[last.doc_id], "metadata":{"version":"old"}})
+                        .to_string(),
+                )
+                .unwrap(),
+            );
             let mut output = Vec::new();
             serve_with_io(&cx, &options, &mut keyword_input(&[
                 serde_json::json!({"query":"common", "id":"inherited"}),
@@ -566,12 +623,19 @@ fn keyword_server_intersects_filters_before_cutoff_and_keeps_raw_quill_results()
             ]), &mut output).await.unwrap();
             let rows = frames(&output);
             assert_eq!(rows[0]["default_filter_applied"], true);
-            let pages = rows.iter().filter(|row| row["event"] == "results").collect::<Vec<_>>();
+            let pages = rows
+                .iter()
+                .filter(|row| row["event"] == "results")
+                .collect::<Vec<_>>();
             assert_eq!(pages.len(), 4);
             for page in &pages[..2] {
-                assert_eq!(results(&page["results"]), serde_json::to_value([last]).unwrap());
+                assert_eq!(
+                    results(&page["results"]),
+                    serde_json::to_value([last]).unwrap()
+                );
                 assert_eq!(page["scope"]["eligible_documents"], 1);
-                let hits: Vec<ScoredResult> = serde_json::from_value(page["results"].clone()).unwrap();
+                let hits: Vec<ScoredResult> =
+                    serde_json::from_value(page["results"].clone()).unwrap();
                 assert_eq!(hits[0].score.to_bits(), last.score.to_bits());
             }
             for page in &pages[2..] {
@@ -608,7 +672,9 @@ fn keyword_server_rejects_bad_and_writing_requests_without_poisoning_the_session
         bytes.extend_from_slice(b"{\"query\":\"must not be consumed\"}\n");
         let mut input = std::io::Cursor::new(bytes);
         let mut output = Vec::new();
-        serve_with_io(&cx, &server_options(&f.receipt), &mut input, &mut output).await.unwrap();
+        serve_with_io(&cx, &server_options(&f.receipt), &mut input, &mut output)
+            .await
+            .unwrap();
         assert_eq!(input.position(), consumed);
         let rows = frames(&output);
         assert_eq!(rows.len(), 13);
@@ -622,7 +688,10 @@ fn keyword_server_rejects_bad_and_writing_requests_without_poisoning_the_session
             assert!(row["id"].is_null());
         }
         assert_eq!(rows[10]["id"], "healthy");
-        assert_eq!(results(&rows[11]["results"]), serde_json::to_value(f.expected).unwrap());
+        assert_eq!(
+            results(&rows[11]["results"]),
+            serde_json::to_value(f.expected).unwrap()
+        );
         assert_eq!(rows[12]["status"], "complete");
         assert_eq!(fs::read_to_string(protected).unwrap(), "unchanged");
         assert!(!destination.exists());
@@ -645,8 +714,12 @@ fn keyword_server_deadlines_cannot_be_widened_and_expired_queries_do_not_poison_
             let last = rows.last().unwrap();
             if last["event"] == "started" {
                 match last["id"].as_str() {
-                    Some("wide") => { self.clock.advance(10_000_000); }
-                    Some("short") => { self.clock.advance(1_000_000); }
+                    Some("wide") => {
+                        self.clock.advance(10_000_000);
+                    }
+                    Some("short") => {
+                        self.clock.advance(1_000_000);
+                    }
                     _ => {}
                 }
             }
@@ -662,12 +735,25 @@ fn keyword_server_deadlines_cannot_be_widened_and_expired_queries_do_not_poison_
             timer: Some(TimerDriverHandle::with_virtual_clock(clock.clone())),
             rerank: None,
         };
-        let mut output = ExpireSelected { bytes: Vec::new(), clock };
-        run_opened(&cx, &index, &mut keyword_input(&[
-            serde_json::json!({"query":"common", "id":"wide", "timeout_ms":100}),
-            serde_json::json!({"query":"common", "id":"short", "timeout_ms":1}),
-            serde_json::json!({"query":"common", "id":"healthy"}),
-        ]), &mut output, 100, None, &policy).await.unwrap();
+        let mut output = ExpireSelected {
+            bytes: Vec::new(),
+            clock,
+        };
+        run_opened(
+            &cx,
+            &index,
+            &mut keyword_input(&[
+                serde_json::json!({"query":"common", "id":"wide", "timeout_ms":100}),
+                serde_json::json!({"query":"common", "id":"short", "timeout_ms":1}),
+                serde_json::json!({"query":"common", "id":"healthy"}),
+            ]),
+            &mut output,
+            100,
+            None,
+            &policy,
+        )
+        .await
+        .unwrap();
         let rows = frames(&output.bytes);
         assert_eq!(rows[0]["maximum_timeout_ms"], 10);
         for (position, budget) in [(2, 10), (4, 1)] {
@@ -676,7 +762,10 @@ fn keyword_server_deadlines_cannot_be_widened_and_expired_queries_do_not_poison_
             assert_eq!(rows[position]["budget_ms"], budget);
             assert_eq!(rows[position]["partial_results"], false);
         }
-        assert_eq!(results(&rows[6]["results"]), serde_json::to_value(f.expected).unwrap());
+        assert_eq!(
+            results(&rows[6]["results"]),
+            serde_json::to_value(f.expected).unwrap()
+        );
         assert_eq!(rows[7]["status"], "complete");
         assert!(!cx.is_cancel_requested());
     });
@@ -692,26 +781,50 @@ fn keyword_server_broken_delivery_stops_before_reading_another_request() {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.writes += 1;
             if self.writes == self.fail_at {
-                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken output"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "broken output",
+                ));
             }
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     run_test_with_cx(|cx| async move {
         let f = fixture(&cx, false, false).await;
         let index = Opened::open(&cx, &f.selection).await.unwrap();
         let first = serde_json::json!({"query":"common", "id":"first"});
-        let first_len = crate::encode(&first, serve::MAX_REQUEST_BYTES).unwrap().len() as u64;
+        let first_len = crate::encode(&first, serve::MAX_REQUEST_BYTES)
+            .unwrap()
+            .len() as u64;
         for fail_at in [1, 2, 3, 4] {
             let mut output = Broken { writes: 0, fail_at };
             let mut input = keyword_input(&[first.clone(), serde_json::json!({"query":"second"})]);
-            assert!(run_opened(&cx, &index, &mut input, &mut output, 100, None, &query::Policy::default()).await.is_err());
+            assert!(
+                run_opened(
+                    &cx,
+                    &index,
+                    &mut input,
+                    &mut output,
+                    100,
+                    None,
+                    &query::Policy::default()
+                )
+                .await
+                .is_err()
+            );
             assert_eq!(output.writes, fail_at, "never append a contradictory frame");
             assert_eq!(input.position(), if fail_at == 1 { 0 } else { first_len });
         }
-        assert_eq!(index.search(&cx, "common", 100, [None, None]).await.unwrap()["results"],
-                   serde_json::to_value(f.expected).unwrap());
+        assert_eq!(
+            index
+                .search(&cx, "common", 100, [None, None])
+                .await
+                .unwrap()["results"],
+            serde_json::to_value(f.expected).unwrap()
+        );
     });
 }
 
@@ -722,22 +835,34 @@ fn keyword_server_admission_failure_precedes_ready_and_input_consumption() {
             let f = fixture(&cx, partitioned, false).await;
             let source = f.selection.directory.join(if partitioned {
                 "shard-000002/native.source.jsonl"
-            } else { "native.source.jsonl" });
+            } else {
+                "native.source.jsonl"
+            });
             let saved = f.root.path().join("saved-source");
             fs::rename(&source, &saved).unwrap();
             let mut input = keyword_input(&[serde_json::json!({"query":"common"})]);
             let mut output = Vec::new();
-            assert!(serve_with_io(&cx, &server_options(&f.receipt), &mut input, &mut output).await.is_err());
+            assert!(
+                serve_with_io(&cx, &server_options(&f.receipt), &mut input, &mut output)
+                    .await
+                    .is_err()
+            );
             assert!(output.is_empty());
             assert_eq!(input.position(), 0);
             fs::rename(saved, source).unwrap();
             cx.set_cancel_requested(true);
-            let failure = serve_with_io(&cx, &server_options(&f.receipt), &mut input, &mut output).await;
+            let failure =
+                serve_with_io(&cx, &server_options(&f.receipt), &mut input, &mut output).await;
             cx.set_cancel_requested(false);
-            assert!(matches!(failure.unwrap_err().downcast_ref::<SearchError>(), Some(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                failure.unwrap_err().downcast_ref::<SearchError>(),
+                Some(SearchError::Cancelled { .. })
+            ));
             assert!(output.is_empty());
             assert_eq!(input.position(), 0);
-            serve_with_io(&cx, &server_options(&f.receipt), &mut input, &mut output).await.unwrap();
+            serve_with_io(&cx, &server_options(&f.receipt), &mut input, &mut output)
+                .await
+                .unwrap();
             assert_eq!(frames(&output).last().unwrap()["status"], "complete");
         }
     });

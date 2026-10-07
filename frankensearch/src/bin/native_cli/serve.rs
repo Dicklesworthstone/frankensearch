@@ -24,11 +24,7 @@ pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Read one bounded nonblank record using the same policy for hybrid and
 /// keyword-only sessions. False means EOF or an explicit quit/exit record.
 /// Never drain an oversized record; leave later input untouched on refusal.
-pub fn read_request(
-    cx: &Cx,
-    input: &mut impl BufRead,
-    record: &mut Vec<u8>,
-) -> Result<bool> {
+pub fn read_request(cx: &Cx, input: &mut impl BufRead, record: &mut Vec<u8>) -> Result<bool> {
     loop {
         // This is a blocking read on the owning lane, not a detached input
         // worker. Cancellation is checked on both sides, not during the read.
@@ -419,8 +415,7 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                     .await?;
             }
             Message::Update(request) => {
-                warm_update::execute(live, cx, request, ordinal, controls.updates, output)
-                    .await?;
+                warm_update::execute(live, cx, request, ordinal, controls.updates, output).await?;
             }
         }
     }

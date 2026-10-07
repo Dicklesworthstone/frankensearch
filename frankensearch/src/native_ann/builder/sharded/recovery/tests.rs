@@ -115,8 +115,11 @@ fn hide_derived(index: &NativeBuiltShardedIndex, saved: &Path) {
     for (ordinal, part) in index.partitions().iter().enumerate() {
         for (name, tier) in [("fast", Some(part.fast())), ("quality", part.quality())] {
             if let Some(tier) = tier {
-                fs::rename(tier.vector_path(), saved.join(format!("{ordinal}-{name}.fsvi")))
-                    .unwrap();
+                fs::rename(
+                    tier.vector_path(),
+                    saved.join(format!("{ordinal}-{name}.fsvi")),
+                )
+                .unwrap();
                 if let Some(graph) = tier.graph_path() {
                     fs::rename(graph, saved.join(format!("{ordinal}-{name}.hnsw"))).unwrap();
                     let mut receipt = graph.as_os_str().to_os_string();
@@ -134,17 +137,25 @@ fn recovery_owns_every_source_without_old_models_vectors_or_graphs() {
         for graphs in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("index");
-            let built = builder(&path, graphs, documents()).build_sharded(&cx, 2).await.unwrap();
+            let built = builder(&path, graphs, documents())
+                .build_sharded(&cx, 2)
+                .await
+                .unwrap();
             let expected = serde_json::to_value(built.documents().collect::<Vec<_>>()).unwrap();
             let generation = built.generation();
             let receipt = built.seal_for_reopen(&cx).unwrap();
             hide_derived(&built, &temp.path().join("saved"));
-            assert!(NativeBuiltShardedIndex::open_selected(
-                &cx, &path, &receipt,
-                Provider::new("source-recovery-fast", 2),
-                Some(Provider::new("source-recovery-quality", 3)),
-                NativeShardedReopenLimits::default(),
-            ).is_err());
+            assert!(
+                NativeBuiltShardedIndex::open_selected(
+                    &cx,
+                    &path,
+                    &receipt,
+                    Provider::new("source-recovery-fast", 2),
+                    Some(Provider::new("source-recovery-quality", 3)),
+                    NativeShardedReopenLimits::default(),
+                )
+                .is_err()
+            );
             drop(built); // Recovery cannot depend on an admitted in-memory owner.
             let (recovered_generation, recovered) = recover(&cx, &path, &receipt).unwrap();
             assert_eq!(recovered_generation, generation);
@@ -163,7 +174,10 @@ fn every_link_and_the_last_source_must_authenticate_without_prefix_success() {
     run_test_with_cx(|cx| async move {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index");
-        let built = builder(&path, true, documents()).build_sharded(&cx, 2).await.unwrap();
+        let built = builder(&path, true, documents())
+            .build_sharded(&cx, 2)
+            .await
+            .unwrap();
         let receipt = built.seal_for_reopen(&cx).unwrap();
         for relative in [
             SNAPSHOT_FILE,
@@ -177,7 +191,11 @@ fn every_link_and_the_last_source_must_authenticate_without_prefix_success() {
             bytes[0] ^= 1; // Same byte count, so an existence/length check is insufficient.
             fs::write(&damaged, &bytes).unwrap();
             assert!(recover(&cx, &path, &receipt).is_err(), "{relative}");
-            assert_eq!(fs::read(&damaged).unwrap(), bytes, "recovery never repairs input");
+            assert_eq!(
+                fs::read(&damaged).unwrap(),
+                bytes,
+                "recovery never repairs input"
+            );
             fs::write(&damaged, original).unwrap();
         }
         let missing = path.join("shard-000001/native.source.jsonl");
@@ -196,28 +214,47 @@ fn complete_budget_generation_and_topology_precede_any_source_read() {
     run_test_with_cx(|cx| async move {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index");
-        let built = builder(&path, false, documents()).build_sharded(&cx, 2).await.unwrap();
-        let receipt = built.seal_for_reopen(&cx).unwrap();
-        let selected = select_sources(&cx, &path, &receipt, NativeShardedReopenLimits::default())
+        let built = builder(&path, false, documents())
+            .build_sharded(&cx, 2)
+            .await
             .unwrap();
+        let receipt = built.seal_for_reopen(&cx).unwrap();
+        let selected =
+            select_sources(&cx, &path, &receipt, NativeShardedReopenLimits::default()).unwrap();
         let saved = manifest(&path);
-        let total = receipt.byte_len + saved.partitions.iter().zip(&selected.partitions)
-            .map(|(descriptor, source)| descriptor.byte_len + source.byte_len()).sum::<u64>();
+        let total = receipt.byte_len
+            + saved
+                .partitions
+                .iter()
+                .zip(&selected.partitions)
+                .map(|(descriptor, source)| descriptor.byte_len + source.byte_len())
+                .sum::<u64>();
         let limits = NativeShardedReopenLimits {
             max_artifact_bytes: total,
             ..NativeShardedReopenLimits::default()
         };
-        assert!(NativeBuiltShardedIndex::recover_selected_source(&cx, &path, &receipt, limits).is_ok());
+        assert!(
+            NativeBuiltShardedIndex::recover_selected_source(&cx, &path, &receipt, limits).is_ok()
+        );
         let first = path.join("shard-000000/native.source.jsonl");
         fs::rename(&first, temp.path().join("held-source")).unwrap();
         let error = NativeBuiltShardedIndex::recover_selected_source(
-            &cx, &path, &receipt,
-            NativeShardedReopenLimits { max_artifact_bytes: total - 1, ..limits },
-        ).unwrap_err();
+            &cx,
+            &path,
+            &receipt,
+            NativeShardedReopenLimits {
+                max_artifact_bytes: total - 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
         assert!(matches!(error, SearchError::InvalidConfig { field, .. }
             if field == "native_ann.sharded_builder.source_budget"));
         // The unbounded attempt gets as far as the deliberately missing source.
-        assert!(matches!(recover(&cx, &path, &receipt), Err(SearchError::Io(_))));
+        assert!(matches!(
+            recover(&cx, &path, &receipt),
+            Err(SearchError::Io(_))
+        ));
         for fault in ["generation", "quality", "count", "empty"] {
             let mut changed = manifest(&path);
             match fault {
@@ -228,7 +265,10 @@ fn complete_budget_generation_and_topology_precede_any_source_read() {
                 _ => unreachable!(), // ubs:ignore — closed test-fixture cases.
             }
             let altered = write_manifest(&path, &changed);
-            assert!(matches!(recover(&cx, &path, &altered), Err(SearchError::InvalidConfig { .. })));
+            assert!(matches!(
+                recover(&cx, &path, &altered),
+                Err(SearchError::InvalidConfig { .. })
+            ));
             write_manifest(&path, &saved);
         }
     });
@@ -240,7 +280,10 @@ fn authenticated_partitions_cannot_overlap_or_arrive_out_of_order() {
         for overlap in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let path = temp.path().join("index");
-            let built = builder(&path, false, documents()).build_sharded(&cx, 2).await.unwrap();
+            let built = builder(&path, false, documents())
+                .build_sharded(&cx, 2)
+                .await
+                .unwrap();
             built.seal_for_reopen(&cx).unwrap();
             let mut saved = manifest(&path);
             let a = path.join("shard-000000");
@@ -270,9 +313,13 @@ fn preflight_retains_original_source_digests_and_cancellation_remains_typed() {
     run_test_with_cx(|cx| async move {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("index");
-        let built = builder(&path, false, documents()).build_sharded(&cx, 2).await.unwrap();
+        let built = builder(&path, false, documents())
+            .build_sharded(&cx, 2)
+            .await
+            .unwrap();
         let receipt = built.seal_for_reopen(&cx).unwrap();
-        let selected = select_sources(&cx, &path, &receipt, NativeShardedReopenLimits::default()).unwrap();
+        let selected =
+            select_sources(&cx, &path, &receipt, NativeShardedReopenLimits::default()).unwrap();
         let source = path.join("shard-000001/native.source.jsonl");
         let original = fs::read(&source).unwrap();
         let mut bytes = original.clone();
@@ -280,10 +327,17 @@ fn preflight_retains_original_source_digests_and_cancellation_remains_typed() {
         fs::write(&source, bytes).unwrap();
         assert!(selected.read(&cx).is_err());
         fs::write(&source, original).unwrap();
-        let selected = select_sources(&cx, &path, &receipt, NativeShardedReopenLimits::default()).unwrap();
+        let selected =
+            select_sources(&cx, &path, &receipt, NativeShardedReopenLimits::default()).unwrap();
         cx.set_cancel_requested(true);
-        assert!(matches!(selected.read(&cx), Err(SearchError::Cancelled { .. })));
-        assert!(matches!(recover(&cx, &path, &receipt), Err(SearchError::Cancelled { .. })));
+        assert!(matches!(
+            selected.read(&cx),
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            recover(&cx, &path, &receipt),
+            Err(SearchError::Cancelled { .. })
+        ));
         cx.set_cancel_requested(false);
         assert_eq!(recover(&cx, &path, &receipt).unwrap().1.len(), 4);
     });
@@ -294,12 +348,21 @@ fn empty_sources_and_source_object_refusals_keep_the_existing_format_contract() 
     run_test_with_cx(|cx| async move {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("empty");
-        let built = builder(&path, false, Vec::new()).build_sharded(&cx, 1).await.unwrap();
+        let built = builder(&path, false, Vec::new())
+            .build_sharded(&cx, 1)
+            .await
+            .unwrap();
         let receipt = built.seal_for_reopen(&cx).unwrap();
         let (_, docs) = NativeBuiltShardedIndex::recover_selected_source(
-            &cx, &path, &receipt,
-            NativeShardedReopenLimits { max_documents: 0, ..NativeShardedReopenLimits::default() },
-        ).unwrap();
+            &cx,
+            &path,
+            &receipt,
+            NativeShardedReopenLimits {
+                max_documents: 0,
+                ..NativeShardedReopenLimits::default()
+            },
+        )
+        .unwrap();
         assert!(docs.is_empty());
         let source = path.join("shard-000000/native.source.jsonl");
         let saved = temp.path().join("saved-source");
@@ -323,19 +386,28 @@ fn hybrid_recovery_authenticates_the_outer_selection_without_any_lexical_files()
     run_test_with_cx(|cx| async move {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("hybrid");
-        let built = builder(&path, true, documents()).build_sharded_hybrid(&cx, 2).await.unwrap();
+        let built = builder(&path, true, documents())
+            .build_sharded_hybrid(&cx, 2)
+            .await
+            .unwrap();
         let receipt = built.seal_for_reopen(&cx).unwrap();
         hide_derived(built.vectors(), &temp.path().join("saved-derived"));
         drop(built);
         fs::rename(path.join("lexical"), temp.path().join("saved-lexical")).unwrap();
         let recover = |receipt: &GenerationComponentReceiptV1| {
             NativeBuiltShardedHybridIndex::recover_selected_source(
-                &cx, &path, receipt, NativeShardedHybridReopenLimits::default(),
+                &cx,
+                &path,
+                receipt,
+                NativeShardedHybridReopenLimits::default(),
             )
         };
         let (generation, docs) = recover(&receipt).unwrap();
         assert_eq!(generation.sequence, 7);
-        assert_eq!(serde_json::to_value(docs).unwrap(), serde_json::to_value(documents()).unwrap());
+        assert_eq!(
+            serde_json::to_value(docs).unwrap(),
+            serde_json::to_value(documents()).unwrap()
+        );
         assert!(!path.join("lexical").exists());
         let outer = path.join("native.sharded-hybrid.json");
         let original = fs::read(&outer).unwrap();

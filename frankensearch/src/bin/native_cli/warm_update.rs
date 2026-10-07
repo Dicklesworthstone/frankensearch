@@ -10,8 +10,8 @@ use frankensearch::native_ann::builder::live::NativeHybridSnapshot;
 use super::NativeLiveHybridIndex;
 use super::validate_id;
 use crate::{
-    ArtifactGenerationIdentityV1, Cx, Deserialize, Path, PathBuf, Result, SCHEMA, Selection,
-    Write, bad, emit, fs, live, new_generation, new_path, query, save_selection, sharded, update,
+    ArtifactGenerationIdentityV1, Cx, Deserialize, Path, PathBuf, Result, SCHEMA, Selection, Write,
+    bad, emit, fs, live, new_generation, new_path, query, save_selection, sharded, update,
 };
 
 pub(super) const MAX_MUTATIONS: usize = 1_000;
