@@ -30,6 +30,7 @@ pub mod index;
 pub mod keeper;
 pub mod query;
 pub mod quiver;
+mod read_open_receipts;
 pub mod schema;
 pub mod scribe;
 pub mod segment;
