@@ -201,7 +201,11 @@ fn root_command_searches_both_layouts_without_models_or_semantic_artifacts() {
                     );
                     let actual: Vec<ScoredResult> =
                         serde_json::from_value(page["results"].clone()).unwrap();
-                    assert_eq!(actual, f.expected);
+                    // ScoredResult has no PartialEq; compare every field.
+                    assert_eq!(
+                        serde_json::to_value(&actual).unwrap(),
+                        serde_json::to_value(&f.expected).unwrap()
+                    );
                     assert!(actual.iter().all(|hit| {
                         hit.index.is_none()
                             && hit.fast_score.is_none()
@@ -246,7 +250,10 @@ fn keyword_scope_collects_before_cutoff_and_preserves_raw_scores_and_metadata() 
                 .unwrap();
             let hits: Vec<ScoredResult> =
                 serde_json::from_value(payload["results"].clone()).unwrap();
-            assert_eq!(hits, vec![target.clone()]);
+            assert_eq!(
+                serde_json::to_value(&hits).unwrap(),
+                serde_json::to_value([target]).unwrap()
+            );
             assert_eq!(hits[0].score.to_bits(), target.score.to_bits());
             assert_eq!(payload["scope"]["eligible_documents"], 1);
             let deny = filter::Filter::parse(r#"{"ids":[]}"#).unwrap();

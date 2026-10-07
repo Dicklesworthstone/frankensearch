@@ -234,7 +234,11 @@ fn keyword_open_needs_no_models_vectors_or_graphs_and_preserves_raw_quill_result
                 let results = LexicalRead::search(&lexical, &cx, "needle", 10)
                     .await
                     .unwrap();
-                assert_eq!(results, f.expected);
+                // ScoredResult has no PartialEq; compare every field.
+                assert_eq!(
+                    serde_json::to_value(&results).unwrap(),
+                    serde_json::to_value(&f.expected).unwrap()
+                );
                 assert!(results
                     .iter()
                     .all(|hit| hit.fast_score.is_none() && hit.quality_score.is_none()));
@@ -385,8 +389,13 @@ fn empty_sources_and_old_readers_remain_explicitly_selected() {
                 .unwrap()
                 .is_empty());
             assert_eq!(
-                LexicalRead::search(&reader, &cx, "needle", 10).await.unwrap(),
-                old.expected
+                serde_json::to_value(
+                    LexicalRead::search(&reader, &cx, "needle", 10)
+                        .await
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(&old.expected).unwrap()
             );
             assert_eq!(
                 serde_json::to_value(retained).unwrap(),

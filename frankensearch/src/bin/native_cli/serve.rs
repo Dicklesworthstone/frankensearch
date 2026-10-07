@@ -4,6 +4,8 @@
 
 use super::cohort::Phase as NativeSearchPhase;
 use frankensearch::native_ann::NativePhaseCandidates;
+// Only the test-only `run` and the regression fixtures name it here.
+#[cfg(test)]
 pub use frankensearch::native_ann::builder::live::NativeLiveHybridIndex;
 
 use super::{
