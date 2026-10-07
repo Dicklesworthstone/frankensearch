@@ -1,0 +1,124 @@
+name: Apply reviewed Quill receipt integration
+
+# One-shot application of the existing, reviewed patch. Not a replacement for
+# scripts/quality-gate.sh. Exact preimages prevent reuse after application.
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/apply-reviewed-quill-receipts.yml]
+
+permissions:
+  contents: write
+  statuses: write
+
+concurrency:
+  group: apply-reviewed-quill-receipts
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    if: github.repository == 'Dicklesworthstone/frankensearch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Report application attempt
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f state=pending -f context=quill-receipt-application \
+            -f description='Checking pinned preimages and native receipt integration' \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Read exact triggering commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh auth setup-git --hostname github.com
+          git init .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git fetch --no-tags --depth=1 origin "$GITHUB_SHA"
+          git switch -c main FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+
+      - name: Check preimages and apply only the reviewed patch
+        run: |
+          set -euo pipefail
+          while read -r expected path; do
+            actual=$(git rev-parse "HEAD:$path")
+            if test "$actual" != "$expected"; then
+              printf 'Refusing changed preimage: %s (expected %s, found %s)\n' "$path" "$expected" "$actual"
+              exit 1
+            fi
+          done <<'PREIMAGES'
+          b95c00a211705a8d1c3c7391150142a35843fb09 patches/quill-local-receipts.patch
+          a87af32e8477d7a99be6051b4bf07837ddfe0acc crates/frankensearch-quill/Cargo.toml
+          9ad68b5b42790e1e0ced8e9db26d454e0d6f61cd crates/frankensearch-quill/src/lib.rs
+          d4b278028b74a87f2630a7d15dd311757a5ca794 crates/frankensearch-quill/src/config.rs
+          55bc1333b1591e905d117b4f3b2c78211760d452 crates/frankensearch-quill/src/keeper.rs
+          bce4edbe8cb349ac32a713de84bc4d9c89f3f370 crates/frankensearch-quill/src/index.rs
+          2f23469661e52cf44ea40e7c52890790a2b5ea5c crates/frankensearch-quill/src/keeper/receipt_regressions.rs
+          4f508e1eadd49185e9604f05a7cda132b39578a1 crates/frankensearch-quill/src/read_open_receipts.rs
+          fb8e7865a38a3b5a70e7c683eaa87f612ccf5e26 crates/frankensearch-quill/src/read_open_receipts/tests.rs
+          c65f77354847b0415107a982a6d8bc14652b9774 crates/frankensearch-quill/src/keeper/receipt_admission.rs
+          45da545f8b47809154191d5c34e50da349c0ae9d rust-toolchain.toml
+          PREIMAGES
+          test -z "$(git status --porcelain)"
+          git apply --check --unidiff-zero patches/quill-local-receipts.patch
+          git apply --unidiff-zero patches/quill-local-receipts.patch
+          git diff --check
+          git diff --stat
+
+      - name: Compile production reader and native regressions
+        run: cargo check --locked -p frankensearch-quill --lib --tests
+
+      - name: Check native receipt cache integrity
+        run: cargo test --locked -p frankensearch-quill --lib read_open_receipts
+
+      - name: Check native receipt admission integrity
+        run: cargo test --locked -p frankensearch-quill --lib local_receipts
+
+      - name: Check both public constructors and refresh policy
+        run: cargo test --locked -p frankensearch-quill --lib public_readers_share_receipt_policy_on_open_and_refresh
+
+      - name: Commit production source directly to main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git add -- crates/frankensearch-quill/Cargo.toml \
+            crates/frankensearch-quill/src/lib.rs \
+            crates/frankensearch-quill/src/config.rs \
+            crates/frankensearch-quill/src/keeper.rs \
+            crates/frankensearch-quill/src/index.rs \
+            crates/frankensearch-quill/src/keeper/receipt_regressions.rs
+          git diff --cached --check
+          test "$(git diff --cached --name-only | wc -l)" -eq 6
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat(quill): activate opt-in local receipts for read-only open and refresh' \
+            -m 'Apply the pinned reviewed integration to production sources. Share policy across both reader constructors, preserve it across refresh, and retain strict default and writer/maintenance admission. Native cargo check and the receipt-cache, admission, and public reader regression filters passed in this run. Full quality-gate, cross-platform, durability/conformance and CASS performance qualification remain outstanding.'
+          # A moved main is an error, never grounds for a force push or reset.
+          remote_head=$(git ls-remote origin refs/heads/main | cut -f1)
+          test "$remote_head" = "$GITHUB_SHA"
+          git push origin HEAD:main
+          git log -1 --format=fuller
+
+      - name: Report final application outcome
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ job.status }}
+        run: |
+          if test "$OUTCOME" = success; then
+            state=success
+            description='Production integration committed; focused native checks passed'
+          else
+            state=failure
+            description='Application did not complete; inspect logs before retrying'
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" \
+            -f "state=$state" -f context=quill-receipt-application \
+            -f "description=$description" \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
