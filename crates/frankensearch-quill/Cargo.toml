@@ -70,6 +70,11 @@ atomicwrites = "0.4.4"
 same-file = "1.0.6"
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Qualify the real receipt store in the normal native test graph while reader
+# integration is pending. CLOCK_BOOTTIME is used for non-renewing proof expiry.
+rustix = { version = "1.1.5", features = ["time"] }
+
 [dev-dependencies]
 # Deterministic LabRuntime helpers remain test-only.
 asupersync = { workspace = true, features = ["test-internals"] }
