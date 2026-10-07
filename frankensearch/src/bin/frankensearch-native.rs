@@ -46,6 +46,9 @@ mod sharded;
 #[path = "native_cli/live.rs"]
 mod live;
 
+#[path = "native_cli/lexical.rs"]
+mod lexical;
+
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
 mod tests;
@@ -65,6 +68,7 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
          [--mode full|fast|quality] [--limit N] [--stream] [--filter JSON]\n\
          [--timeout-ms N] [--reranker-dir DIR] [--rerank-window N]\n\
+         [--lexical-only (no model options, --mode, or reranking)]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
          [--allow-activation] [--allow-updates] [--filter JSON] [--timeout-ms N]\n\
          [--reranker-dir DIR] [--rerank-window N]\n\n\
@@ -74,7 +78,7 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   rebuild --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
           [--model-dir DIR] [--fast-only] [--exact] [--batch-size N]\n\
           [--shard-size N (required for sharded receipts)]\n\n\
-Quality options for every command:\n\
+Quality options (not with search --lexical-only):\n\
   --quality-backend onnx|native-int8|native-f32|native-multilingual\n\
   --quality-model-dir DIR (required for native; exact verified model directory)\n\
 The default backend is always onnx; native-only builds require explicit native selection.\n\n\
@@ -137,6 +141,7 @@ struct Options {
     fast_only: bool,
     exact: bool,
     stream: bool,
+    lexical_only: bool,
     activation: serve::ActivationPermission,
     allow_updates: bool,
     filter: Option<filter::Filter>,
@@ -182,6 +187,7 @@ impl Options {
             fast_only: false,
             exact: false,
             stream: false,
+            lexical_only: false,
             activation: serve::ActivationPermission::Disabled,
             allow_updates: false,
             filter: None,
@@ -205,6 +211,7 @@ impl Options {
                     options.exact = true;
                 }
                 "--stream" if command == Command::Search => options.stream = true,
+                "--lexical-only" if command == Command::Search => options.lexical_only = true,
                 "--allow-activation" if command == Command::Serve => {
                     options.activation = serve::ActivationPermission::Enabled;
                 }
@@ -267,6 +274,22 @@ impl Options {
         }
         if options.receipt.as_os_str().is_empty() {
             return Err(bad("--receipt is required"));
+        }
+        if options.lexical_only
+            && [
+                "--model-dir",
+                "--quality-backend",
+                "--quality-model-dir",
+                "--mode",
+                "--reranker-dir",
+                "--rerank-window",
+            ]
+            .iter()
+            .any(|flag| seen.contains(*flag))
+        {
+            return Err(bad(
+                "--lexical-only cannot be combined with model options, --mode, or reranking",
+            ));
         }
         options.quality.validate_usage(!options.fast_only)?;
         if seen.contains("--rerank-window") && options.reranker_dir.is_none() {
@@ -657,6 +680,7 @@ async fn execute(
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
     match options.command {
+        Command::Search if options.lexical_only => lexical::execute(cx, &options, output).await,
         Command::Update => update::execute(cx, &options, output, pool).await,
         Command::Rebuild => update::rebuild(cx, &options, output, pool).await,
         Command::Index => {
