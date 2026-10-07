@@ -126,6 +126,44 @@ impl NativeIndexBuilder {
 }
 
 impl NativeBuiltShardedHybridIndex {
+    /// Open the selected global keyword population without loading any model.
+    ///
+    /// Returns the original generation, an immutable Quill reader and the
+    /// complete owned source set. Every child source is authenticated before
+    /// keyword admission; a missing last shard cannot become a partial result.
+    /// The global lexical inventory and full original-field source census must
+    /// pass even when vector/graph files are missing. No shard-local score merge,
+    /// inferred receipt, partial hybrid object or automatic fallback is created.
+    ///
+    /// Source/descriptor and lexical limits retain their separate budgets.
+    /// Keep the reader and its mapped files immutable through query delivery.
+    /// Work uses the caller's lane and existing trusted-directory contract.
+    /// Ordinary full reopening, live activation and update remain strict.
+    ///
+    /// # Errors
+    /// Returns any source/lexical receipt, membership, resource, I/O or
+    /// cancellation failure without changing existing files or selections.
+    pub async fn open_selected_lexical(
+        cx: &Cx,
+        directory: impl AsRef<Path> + Send,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeShardedHybridReopenLimits,
+    ) -> SearchResult<(
+        ArtifactGenerationIdentityV1,
+        QuillSearchIndex,
+        Vec<IndexableDocument>,
+    )> {
+        checkpoint(cx, "native_ann.sharded_hybrid.lexical_only")?;
+        let directory = checked_directory(directory.as_ref())?;
+        let (saved, documents) =
+            Self::recover_source_selection(cx, &directory, expected, limits)?;
+        let lexical = saved
+            .lexical
+            .open_source_verified(cx, &directory.join("lexical"), &documents, limits.lexical())
+            .await?;
+        Ok((saved.generation, lexical, documents))
+    }
+
     /// Recover every retained source partition from the original hybrid receipt.
     ///
     /// This authenticates the complete descriptor chain and delegates source
@@ -149,6 +187,16 @@ impl NativeBuiltShardedHybridIndex {
         expected: &GenerationComponentReceiptV1,
         limits: NativeShardedHybridReopenLimits,
     ) -> SearchResult<(ArtifactGenerationIdentityV1, Vec<IndexableDocument>)> {
+        let (saved, documents) = Self::recover_source_selection(cx, directory, expected, limits)?;
+        Ok((saved.generation, documents))
+    }
+
+    fn recover_source_selection(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeShardedHybridReopenLimits,
+    ) -> SearchResult<(Manifest, Vec<IndexableDocument>)> {
         checkpoint(cx, "native_ann.sharded_hybrid.recover_source")?;
         limits.validate()?;
         let directory = checked_directory(directory.as_ref())?;
@@ -187,7 +235,7 @@ impl NativeBuiltShardedHybridIndex {
         }
         let documents = selected.read(cx)?;
         checkpoint(cx, "native_ann.sharded_hybrid.source_recovered")?;
-        Ok((saved.generation, documents))
+        Ok((saved, documents))
     }
 
     fn from_readers(

@@ -23,7 +23,7 @@ use super::super::snapshot::{
 use super::super::{NativeBuiltIndex, NativeReopenLimits};
 use super::NativeBuiltHybridIndex;
 use crate::native_ann::{checkpoint, invalid};
-use crate::{Cx, Embedder, IndexableDocument, SearchError, SearchResult};
+use crate::{Cx, Embedder, IndexableDocument, LexicalRead, SearchError, SearchResult};
 
 const HYBRID_FILE: &str = "native.hybrid.json";
 const HYBRID_SCHEMA: &str = "frankensearch.native-hybrid-snapshot.v1";
@@ -88,6 +88,43 @@ pub(in crate::native_ann::builder) struct LexicalSeal {
 }
 
 impl LexicalSeal {
+    /// Shared selected keyword admission for ordinary and partitioned sources.
+    /// The returned reader cannot refresh or mutate the selected publication.
+    pub(in crate::native_ann::builder) async fn open_source_verified(
+        &self,
+        cx: &Cx,
+        directory: &Path,
+        documents: &[IndexableDocument],
+        limits: NativeHybridReopenLimits,
+    ) -> SearchResult<QuillSearchIndex> {
+        checkpoint(cx, "native_ann.lexical_snapshot.open")?;
+        let directory = checked_directory(directory)?;
+        self.verify(cx, &directory, limits, false)?;
+        let response = Box::pin(QuillSearchIndex::open(
+            cx,
+            &directory,
+            QuillConfig::default(),
+        ))
+        .await;
+        checkpoint(cx, "native_ann.lexical_snapshot.opened")?;
+        let lexical = response?;
+        self.verify(cx, &directory, limits, false)?;
+        if lexical.keeper_generation() != self.generation
+            || LexicalRead::doc_count(&lexical)? != documents.len()
+        {
+            return Err(rejected(
+                "lexical_source",
+                "selected keyword generation or document count disagrees with its source",
+            ));
+        }
+        // Matching counts or individually valid files are not sufficient.
+        // Reuse the full original-field census, including non-tokenized docs.
+        let references = documents.iter().collect::<Vec<_>>();
+        super::cohort::validate(cx, &lexical, &references)?;
+        checkpoint(cx, "native_ann.lexical_snapshot.admitted")?;
+        Ok(lexical)
+    }
+
     pub(in crate::native_ann::builder) const fn generation(&self) -> u64 {
         self.generation
     }
@@ -207,6 +244,68 @@ struct HybridSnapshot {
 }
 
 impl NativeBuiltHybridIndex {
+    /// Explicitly open only the authenticated source and keyword components.
+    ///
+    /// Returns their generation, an immutable Quill reader and owned source
+    /// records. No embedding model, vector image or ANN graph is loaded. Missing
+    /// semantic artifacts do not disable an explicitly requested keyword query;
+    /// this is NOT full hybrid admission or an automatic semantic fallback.
+    /// Ordinary `open_selected` remains strict and does not call this method.
+    ///
+    /// The original caller-held hybrid receipt binds both descriptors and every
+    /// source/lexical byte. Full original-field census joins the selected Quill
+    /// population to the recovered source, not merely its count. Keyword scores,
+    /// query grammar and metadata remain Quill's, without vector normalization.
+    /// Keep the returned reader and mapped lexical files immutable through query
+    /// delivery. Sources own their data; no snapshot is selected or rewritten.
+    /// Input limits retain their source/lexical meanings, not a peak-RSS promise.
+    /// Filesystem work stays on the caller's lane under the trusted-directory
+    /// contract; cancellation cannot preempt blocking filesystem operations.
+    ///
+    /// # Errors
+    /// Refuses corrupt/missing source or lexical components, false receipts,
+    /// census mismatches, exceeded limits, unsupported objects and cancellation.
+    pub async fn open_selected_lexical(
+        cx: &Cx,
+        directory: impl AsRef<Path> + Send,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeHybridReopenLimits,
+    ) -> SearchResult<(
+        ArtifactGenerationIdentityV1,
+        QuillSearchIndex,
+        Vec<IndexableDocument>,
+    )> {
+        checkpoint(cx, "native_ann.hybrid_snapshot.lexical_only")?;
+        limits.validate()?;
+        let directory = checked_directory(directory.as_ref())?;
+        let bytes = read_selected(
+            cx,
+            &directory.join(HYBRID_FILE),
+            Artifact {
+                byte_len: expected.byte_len,
+                sha256: expected.sha256,
+            },
+            MAX_DESCRIPTOR_BYTES,
+        )?;
+        let saved: HybridSnapshot = serde_json::from_slice(&bytes)
+            .map_err(|_| rejected("schema", "malformed hybrid snapshot descriptor"))?;
+        if saved.schema != HYBRID_SCHEMA {
+            return Err(rejected("schema", "unsupported hybrid snapshot schema"));
+        }
+        saved.lexical.validate(limits)?;
+        let (generation, documents) = NativeBuiltIndex::recover_selected_source(
+            cx,
+            &directory,
+            &saved.vectors.receipt(),
+            limits.vectors,
+        )?;
+        let lexical = saved
+            .lexical
+            .open_source_verified(cx, &directory.join("lexical"), &documents, limits)
+            .await?;
+        Ok((generation, lexical, documents))
+    }
+
     /// Recover rebuild input from a trusted hybrid receipt despite search damage.
     ///
     /// Verifies the exact chain: caller receipt -> hybrid descriptor -> vector/
@@ -493,3 +592,6 @@ fn rejected(field: &str, reason: &str) -> SearchError {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod recovery_tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod lexical_tests;
