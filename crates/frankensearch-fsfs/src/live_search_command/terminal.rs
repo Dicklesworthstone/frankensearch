@@ -5,18 +5,20 @@
 //! flush. Input and the owned subscription future are driven by the same task;
 //! no input thread, detached publisher, or unbounded event queue is introduced.
 
+mod editor;
 mod model;
 
 use std::future::{Future, poll_fn};
 use std::io::{self, IsTerminal, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::types::CancelKind;
 use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_fsfs::FsfsRuntime;
+use frankensearch_fsfs::generation_store::CompleteGenerationStore;
 use ftui_backend::{BackendEventSource, BackendFeatures};
 use ftui_core::event::{Event, KeyCode, KeyEventKind};
 use ftui_core::geometry::Rect;
@@ -28,7 +30,9 @@ use ftui_render::presenter::Presenter;
 use ftui_tty::{TtyBackend, TtySessionOptions};
 use ftui_widgets::{Widget, paragraph::Paragraph};
 
-use super::Options;
+use super::hybrid::Subscription;
+use super::{Budget, GuardedOutput, Options};
+use editor::{Command, Editor};
 use model::{Model, display_text};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -49,7 +53,7 @@ fn validate_terminals(input: bool, output: bool) -> SearchResult<()> {
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
     Move(isize),
     First,
@@ -58,6 +62,7 @@ enum Action {
     Ignore,
     Quit,
     Interrupt,
+    Edit(Command),
 }
 
 fn action_for(event: &Event) -> Option<Action> {
@@ -72,6 +77,7 @@ fn action_for(event: &Event) -> Option<Action> {
             }
             match key.code {
                 KeyCode::Char('q') | KeyCode::Escape => Some(Action::Quit),
+                KeyCode::Char('/') | KeyCode::Enter => Some(Action::Edit(Command::Start)),
                 KeyCode::Up | KeyCode::Char('k') => Some(Action::Move(-1)),
                 KeyCode::Down | KeyCode::Char('j') => Some(Action::Move(1)),
                 KeyCode::PageUp => Some(Action::Move(-10)),
@@ -87,8 +93,11 @@ fn action_for(event: &Event) -> Option<Action> {
 
 trait Surface: Send {
     fn present(&mut self, model: &Model) -> io::Result<()>;
+    fn present_with_editor(&mut self, model: &Model, _editor: &Editor) -> io::Result<()> {
+        self.present(model)
+    }
     /// None means no decoded input is currently available.
-    fn poll_action(&mut self) -> io::Result<Option<Action>>;
+    fn poll_action(&mut self, editing: bool) -> io::Result<Option<Action>>;
 }
 
 struct TerminalSurface {
@@ -107,17 +116,20 @@ impl TerminalSurface {
                 // Normal exits restore via TtyBackend's drop. Its existing signal
                 // cleanup also protects force-exit during an uninterruptible syscall.
                 intercept_signals: true,
-                features: BackendFeatures::default(),
+                // Pasted newlines are data, never Enter commands. Enable the
+                // terminal mode as well as handling its decoded Paste events.
+                features: BackendFeatures {
+                    bracketed_paste: true,
+                    ..BackendFeatures::default()
+                },
             },
         )?;
         // The capabilities `TtyBackend::open` detects for its own session.
         let presenter = Presenter::new(io::stdout(), TerminalCapabilities::with_overrides());
         Ok(Self { presenter, backend })
     }
-}
 
-impl Surface for TerminalSurface {
-    fn present(&mut self, model: &Model) -> io::Result<()> {
+    fn present_view(&mut self, model: &Model, editor: Option<&Editor>) -> io::Result<()> {
         let (width, height) = self.backend.size()?;
         let size = (width.clamp(1, 512), height.clamp(1, 256));
         // A fresh, frame-local pool bounds memory during arbitrarily long
@@ -127,6 +139,9 @@ impl Surface for TerminalSurface {
         let buffer = {
             let mut frame = Frame::new(size.0, size.1, &mut pool);
             render(model, size.0, size.1, &mut frame);
+            if let Some(editor) = editor {
+                render_editor(editor, size.0, size.1, &mut frame);
+            }
             frame.buffer
         };
         let diff = BufferDiff::full(size.0, size.1);
@@ -134,16 +149,29 @@ impl Surface for TerminalSurface {
             .present_with_pool(&buffer, &diff, Some(&pool), None)?;
         Ok(())
     }
+}
 
-    fn poll_action(&mut self) -> io::Result<Option<Action>> {
+impl Surface for TerminalSurface {
+    fn present(&mut self, model: &Model) -> io::Result<()> {
+        self.present_view(model, None)
+    }
+
+    fn present_with_editor(&mut self, model: &Model, editor: &Editor) -> io::Result<()> {
+        self.present_view(model, Some(editor))
+    }
+
+    fn poll_action(&mut self, editing: bool) -> io::Result<Option<Action>> {
         if !self.backend.poll_event(Duration::ZERO)? {
             return Ok(None);
         }
-        Ok(self
-            .backend
-            .read_event()?
-            .as_ref()
-            .map(|event| action_for(event).unwrap_or(Action::Ignore)))
+        Ok(self.backend.read_event()?.as_ref().map(|event| {
+            let action = if editing {
+                editor::action_for(event)
+            } else {
+                action_for(event)
+            };
+            action.unwrap_or(Action::Ignore)
+        }))
     }
 }
 
@@ -170,7 +198,7 @@ fn render(model: &Model, width: u16, height: u16, frame: &mut Frame<'_>) {
         line(
             frame,
             height.saturating_sub(1),
-            "Resize terminal | q/Esc: quit".to_owned(),
+            "Resize terminal | /: query | q/Esc: quit".to_owned(),
         );
         return;
     }
@@ -239,30 +267,57 @@ fn render(model: &Model, width: u16, height: u16, frame: &mut Frame<'_>) {
     line(
         frame,
         height - 1,
-        "Up/Down or j/k: select | PgUp/PgDn: 10 rows | Home/End | q/Esc: quit".to_owned(),
+        "/: edit query | Enter: edit | Up/Down or j/k | PgUp/PgDn | Home/End | q/Esc: quit".to_owned(),
     );
+}
+
+fn render_editor(editor: &Editor, width: u16, height: u16, frame: &mut Frame<'_>) {
+    if let Some(prompt) = editor.prompt(usize::from(width)) {
+        Paragraph::new(prompt).render(Rect::new(0, height.saturating_sub(2), width, 1), frame);
+    }
+    if height > 1
+        && let Some(help) = editor.help()
+    {
+        Paragraph::new(help).render(Rect::new(0, height - 1, width, 1), frame);
+    }
 }
 
 struct FrameOutput<S> {
     surface: S,
     model: Model,
     pending: Vec<u8>,
+    editor: Editor,
 }
 
 impl<S: Surface> FrameOutput<S> {
     fn new(mut surface: S, model: Model) -> io::Result<Self> {
-        surface.present(&model)?;
+        let editor = Editor::default();
+        surface.present_with_editor(&model, &editor)?;
         Ok(Self {
             surface,
             model,
             pending: Vec::new(),
+            editor,
         })
+    }
+
+    fn begin_query(&mut self, query: &str) -> io::Result<()> {
+        if !self.pending.is_empty() {
+            return Err(model::invalid("cannot change query during a partial record"));
+        }
+        if query.trim().is_empty() || query.len() > super::MAX_QUERY_BYTES {
+            return Err(model::invalid("new terminal query is blank or exceeds 64 KiB"));
+        }
+        let candidate = Model::new(query.to_owned(), self.model.hybrid, self.model.max_results);
+        self.surface.present_with_editor(&candidate, &self.editor)?;
+        self.model = candidate;
+        Ok(())
     }
 
     fn input(&mut self) -> io::Result<Option<Action>> {
         let mut redraw = false;
         for _ in 0..MAX_EVENTS_PER_TICK {
-            let Some(action) = self.surface.poll_action()? else {
+            let Some(action) = self.surface.poll_action(self.editor.is_editing())? else {
                 break;
             };
             match action {
@@ -272,11 +327,12 @@ impl<S: Surface> FrameOutput<S> {
                 Action::First => self.model.selected = 0,
                 Action::Last => self.model.selected = self.model.results.len().saturating_sub(1),
                 Action::Redraw => {}
+                Action::Edit(command) => self.editor.apply(command, &self.model.query),
             }
             redraw = true;
         }
         if redraw {
-            self.surface.present(&self.model)?;
+            self.surface.present_with_editor(&self.model, &self.editor)?;
         }
         Ok(None)
     }
@@ -301,7 +357,7 @@ impl<S: Surface> Write for FrameOutput<S> {
             return Ok(());
         }
         let candidate = self.model.prepare(&self.pending)?;
-        self.surface.present(&candidate)?;
+        self.surface.present_with_editor(&candidate, &self.editor)?;
         // Rendering is the acknowledgment. Failed presentation cannot move
         // either the terminal model or the upstream subscription baseline.
         self.model = candidate;
@@ -325,6 +381,26 @@ impl<S: Surface> Write for SharedOutput<S> {
 
     fn flush(&mut self) -> io::Result<()> {
         lock(&self.0)?.flush()
+    }
+}
+
+/// Query changes are consumed only at a completed-poll boundary. Implementations
+/// retain at most the latest request and reset their consumer before new frames.
+pub(super) trait QueryControl: Send {
+    fn take_query(&mut self) -> SearchResult<Option<String>>;
+    fn begin_query(&mut self, query: &str) -> SearchResult<()>;
+}
+
+struct SharedControl<S>(Arc<Mutex<FrameOutput<S>>>);
+
+impl<S: Surface> QueryControl for SharedControl<S> {
+    fn take_query(&mut self) -> SearchResult<Option<String>> {
+        Ok(lock(&self.0)?.editor.take_requested())
+    }
+
+    fn begin_query(&mut self, query: &str) -> SearchResult<()> {
+        lock(&self.0)?.begin_query(query)?;
+        Ok(())
     }
 }
 
@@ -372,6 +448,78 @@ async fn drive<S: Surface, F: Future<Output = SearchResult<u64>>>(
     }
 }
 
+fn change_subscription_query(
+    cx: &Cx,
+    session: &mut Subscription,
+    query: &str,
+) -> SearchResult<bool> {
+    match session {
+        Subscription::Lexical(session) => session.set_query(cx, query),
+        Subscription::Hybrid(session) => session.set_query(cx, query),
+    }
+}
+
+/// Keep the actual subscription across edits. Poll delays throttle selection
+/// probes, not query editing. Never abandon a pending progressive poll to apply
+/// a query: it must finish its phase sequence before either baseline is reset.
+async fn subscribe_existing<W: Write + Send>(
+    cx: &Cx,
+    budget: &Budget,
+    options: &Options,
+    writer: &mut W,
+    runtime: Option<FsfsRuntime>,
+    control: &mut dyn QueryControl,
+) -> SearchResult<u64> {
+    budget.check(cx)?;
+    let store = CompleteGenerationStore::open(cx, &options.root)?;
+    if options.once && store.active(cx)?.is_none() {
+        return Err(SearchError::IndexNotFound {
+            path: options.root.join("FSFS-CURRENT"),
+        });
+    }
+    let mut session = Subscription::new(store, options, runtime)?;
+    let mut delivered = 0_u64;
+    let mut next_poll = Instant::now();
+    loop {
+        budget.check(cx)?;
+        if let Some(query) = control.take_query()?
+            && change_subscription_query(cx, &mut session, &query)?
+        {
+            control.begin_query(&query)?;
+            next_poll = Instant::now();
+        }
+        let now = Instant::now();
+        if now >= next_poll {
+            let result = {
+                let mut output = GuardedOutput {
+                    writer: &mut *writer,
+                    cx,
+                    budget,
+                };
+                session.poll_ndjson(cx, now, &mut output).await
+            };
+            budget.check(cx)?;
+            if result? {
+                delivered = delivered
+                    .checked_add(1)
+                    .ok_or_else(|| super::invalid("delivered update counter exhausted"))?;
+                if options.max_updates.is_some_and(|maximum| delivered >= maximum) {
+                    return Ok(delivered);
+                }
+            } else if options.once {
+                return Err(SearchError::IndexNotFound {
+                    path: options.root.join("FSFS-CURRENT"),
+                });
+            }
+            next_poll = Instant::now() + options.poll_interval;
+        }
+        let delay = budget
+            .remaining()
+            .map_or(INPUT_TICK, |left| left.min(INPUT_TICK));
+        asupersync::time::sleep(cx.now(), delay).await;
+    }
+}
+
 pub(super) async fn execute(
     cx: &Cx,
     options: &Options,
@@ -387,7 +535,26 @@ pub(super) async fn execute(
     let output = FrameOutput::new(TerminalSurface::open()?, model)?;
     let shared = Arc::new(Mutex::new(output));
     let mut writer = SharedOutput(Arc::clone(&shared));
-    let work = super::execute_with_runtime(cx, options, &mut writer, runtime);
+    let mut control = SharedControl(Arc::clone(&shared));
+    let budget = Budget {
+        started: Instant::now(),
+        timeout: options.timeout,
+    };
+    let work = async {
+        if options.watch_source.is_some() {
+            super::watch::execute_controlled(
+                cx,
+                &budget,
+                options,
+                &mut writer,
+                runtime,
+                Some(&mut control),
+            )
+            .await
+        } else {
+            subscribe_existing(cx, &budget, options, &mut writer, runtime, &mut control).await
+        }
+    };
     // Backend drop restores the terminal on every return, including an input,
     // admission, decoding, rendering or output error. No raw guard escapes.
     Box::pin(drive(cx, shared.as_ref(), work)).await
@@ -403,7 +570,7 @@ mod tests {
     use frankensearch_fsfs::adapters::live_search::{
         LiveSearchConfig, LiveSearchHit, LiveSearchTracker,
     };
-    use frankensearch_fsfs::generation_store::{CompleteGenerationStore, GenerationPublication};
+    use frankensearch_fsfs::generation_store::GenerationPublication;
     use frankensearch_quill::{QuillConfig, QuillIndex};
     use ftui_core::event::{KeyEvent, Modifiers};
     use ftui_core::terminal_capabilities::TerminalCapabilities;
@@ -417,6 +584,7 @@ mod tests {
         actions: VecDeque<Action>,
         fail_after: Option<usize>,
         quit_when_polled: Option<Arc<AtomicBool>>,
+        submit_after_first: Option<String>,
     }
 
     impl Surface for RecordingSurface {
@@ -428,10 +596,20 @@ mod tests {
                 return Err(io::Error::other("injected terminal failure"));
             }
             self.frames.push(model.clone());
+            if model.sequence == 1
+                && let Some(query) = self.submit_after_first.take()
+            {
+                self.actions.extend([
+                    Action::Edit(Command::Start),
+                    Action::Edit(Command::Clear),
+                    Action::Edit(Command::Paste(query)),
+                    Action::Edit(Command::Submit),
+                ]);
+            }
             Ok(())
         }
 
-        fn poll_action(&mut self) -> io::Result<Option<Action>> {
+        fn poll_action(&mut self, _editing: bool) -> io::Result<Option<Action>> {
             if self
                 .quit_when_polled
                 .as_ref()
@@ -654,6 +832,7 @@ mod tests {
         fn is_send<T: Send>() {}
         is_send::<TerminalSurface>();
         is_send::<SharedOutput<TerminalSurface>>();
+        is_send::<SharedControl<TerminalSurface>>();
     }
 
     #[test]
@@ -712,6 +891,171 @@ mod tests {
             drop(view);
             // Reading and rendering did not retain publication ownership.
             drop(store.begin(&cx).unwrap());
+        });
+    }
+
+    #[test]
+    fn query_reset_requires_a_record_boundary_and_successful_presentation() {
+        let mut partial = output(RecordingSurface::default());
+        partial.write_all(b"{").unwrap();
+        assert!(partial.begin_query("beta").is_err());
+        assert_eq!(partial.model.query, "alpha");
+        let mut failed = output(RecordingSurface {
+            fail_after: Some(1),
+            ..RecordingSurface::default()
+        });
+        assert!(failed.begin_query("beta").is_err());
+        assert_eq!(failed.model.query, "alpha");
+        let mut ready = output(RecordingSurface::default());
+        ready.write_all(&record()).unwrap();
+        ready.flush().unwrap();
+        ready.begin_query("beta").unwrap();
+        assert_eq!(ready.model.query, "beta");
+        assert_eq!(ready.model.sequence, 0);
+        assert!(ready.model.results.is_empty());
+        assert!(ready.model.prepare(&record()).is_err());
+    }
+
+    #[test]
+    fn submitting_during_progressive_delivery_keeps_the_old_query_until_the_boundary() {
+        use frankensearch_fsfs::adapters::retained_live_search::RetainedLiveSearchFrame;
+        use frankensearch_fsfs::output_schema::SearchOutputPhase;
+
+        let mut output = FrameOutput::new(
+            RecordingSurface::default(),
+            Model::new("alpha".to_owned(), true, 5),
+        )
+        .unwrap();
+        let mut tracker = LiveSearchTracker::new("alpha", LiveSearchConfig::default()).unwrap();
+        for phase in [SearchOutputPhase::Initial, SearchOutputPhase::Refined] {
+            let frame = RetainedLiveSearchFrame {
+                generation_id: "g".to_owned(),
+                manifest_sha256: "digest".to_owned(),
+                phase,
+                annotations: json!({"query": "alpha", "phase": phase}),
+                update: tracker.apply(&format!("g@digest:{phase}"), Vec::new()).unwrap(),
+            };
+            super::super::hybrid::emit_frame(&frame, &mut output).unwrap();
+            output.editor.apply(Command::Start, "alpha");
+            output.editor.apply(Command::Clear, "alpha");
+            output.editor.apply(Command::Paste("beta".to_owned()), "alpha");
+            output.editor.apply(Command::Submit, "alpha");
+            assert_eq!(output.model.query, "alpha");
+        }
+        assert_eq!(output.model.sequence, 2);
+        let query = output.editor.take_requested().unwrap();
+        output.begin_query(&query).unwrap();
+        assert_eq!(output.model.query, "beta");
+        assert!(output.model.physical.is_none());
+    }
+
+    #[test]
+    fn native_terminal_edit_requeries_without_a_new_publication_or_process() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let build = store.begin(&cx).unwrap();
+            let index = QuillIndex::create(
+                &cx,
+                &build.path().join("lexical"),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            LexicalWrite::index_documents(
+                &index,
+                &cx,
+                &[
+                    IndexableDocument::new("a", "alpha").with_metadata("path", "alpha.rs"),
+                    IndexableDocument::new("b", "beta").with_metadata("path", "beta.rs"),
+                ],
+            )
+            .await
+            .unwrap();
+            LexicalWrite::commit(&index, &cx).await.unwrap();
+            drop(index);
+            let GenerationPublication::Durable(generation) =
+                build.publish(&cx, |_, _| Ok(())).unwrap()
+            else {
+                panic!("fixture must be durable");
+            };
+            let options = Options::parse(vec![
+                "--index-dir".into(),
+                root.path().as_os_str().to_owned(),
+                "--query".into(),
+                "alpha".into(),
+                "--tui".into(),
+                "--max-updates".into(),
+                "2".into(),
+                // Query requests must not wait for this selection-poll interval.
+                "--poll-ms".into(),
+                "60000".into(),
+                "--timeout-ms".into(),
+                "5000".into(),
+            ])
+            .unwrap();
+            let shared = Arc::new(Mutex::new(output(RecordingSurface {
+                submit_after_first: Some("beta".to_owned()),
+                ..RecordingSurface::default()
+            })));
+            let mut writer = SharedOutput(Arc::clone(&shared));
+            let mut control = SharedControl(Arc::clone(&shared));
+            let budget = Budget {
+                started: Instant::now(),
+                timeout: options.timeout,
+            };
+            let work = subscribe_existing(&cx, &budget, &options, &mut writer, None, &mut control);
+            assert_eq!(Box::pin(drive(&cx, shared.as_ref(), work)).await.unwrap(), 2);
+            let view = lock(&shared).unwrap();
+            assert_eq!(view.model.query, "beta");
+            assert_eq!(view.model.sequence, 1);
+            assert_eq!(view.model.results[0].hit.doc_id, "b");
+            assert_eq!(view.model.results[0].hit.item["path"], "beta.rs");
+            assert!(view.surface.frames.iter().any(|model| {
+                model.query == "alpha"
+                    && model.results.first().is_some_and(|hit| hit.hit.doc_id == "a")
+            }));
+            assert!(view.model.revision.as_ref().unwrap().starts_with(generation.id()));
+            drop(view);
+            assert_eq!(store.active(&cx).unwrap(), Some(generation));
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn query_requests_do_not_reset_an_expired_command_budget() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let options = Options::parse(vec![
+                "--index-dir".into(),
+                root.path().as_os_str().to_owned(),
+                "--query".into(),
+                "alpha".into(),
+                "--tui".into(),
+            ])
+            .unwrap();
+            let shared = Arc::new(Mutex::new(output(RecordingSurface::default())));
+            {
+                let mut view = lock(&shared).unwrap();
+                view.editor.apply(Command::Start, "beta");
+                view.editor.apply(Command::Submit, "beta");
+            }
+            let mut control = SharedControl(Arc::clone(&shared));
+            let mut writer = SharedOutput(Arc::clone(&shared));
+            let budget = Budget {
+                started: Instant::now(),
+                timeout: Some(Duration::ZERO),
+            };
+            assert!(matches!(
+                subscribe_existing(&cx, &budget, &options, &mut writer, None, &mut control).await,
+                Err(SearchError::SearchTimeout { .. })
+            ));
+            assert_eq!(control.take_query().unwrap().as_deref(), Some("beta"));
+            assert_eq!(lock(&shared).unwrap().model.query, "alpha");
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         });
     }
 }
