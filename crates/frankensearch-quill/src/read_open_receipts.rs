@@ -10,7 +10,7 @@
 //! Reads and atomic writes use its retained descriptor. Unusable storage,
 //! malformed proofs, foreign producers and unsupported filesystems fail back
 //! to full verification. Hits never renew the original verification time.
-//! Expiry uses CLOCK_BOOTTIME, not the adjustable wall clock. Boot and namespace
+//! Expiry uses `CLOCK_BOOTTIME`, not the adjustable wall clock. Boot and namespace
 //! identities prevent carrying a proof into a different clock or mount domain.
 
 use std::collections::BTreeMap;
@@ -35,7 +35,7 @@ const BOOK: &str = "read-open-receipts-v3";
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Policy {
+pub struct Policy {
     pub max_age: Duration,
     pub minimum_file_age: Duration,
 }
@@ -59,10 +59,15 @@ impl Clock {
     #[cfg(target_os = "linux")]
     fn now() -> Option<Self> {
         let unix_ns = i128::try_from(
-            SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos(),
-        ).ok()?;
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_nanos(),
+        )
+        .ok()?;
         let boot = rustix::time::clock_gettime(rustix::time::ClockId::Boottime);
-        let boot_ns = u64::try_from(boot.tv_sec).ok()?
+        let boot_ns = u64::try_from(boot.tv_sec)
+            .ok()?
             .checked_mul(NANOS_PER_SECOND)?
             .checked_add(u64::try_from(boot.tv_nsec).ok()?)?;
         Some(Self { unix_ns, boot_ns })
@@ -76,7 +81,7 @@ impl Clock {
 
 /// The schema and MANIFEST witness, independent of the path naming the file.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Binding {
+pub struct Binding {
     pub schema_id: u64,
     pub segment_id: u64,
     pub file_len: u64,
@@ -84,7 +89,7 @@ pub(crate) struct Binding {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Identity {
+pub struct Identity {
     dev: u64,
     ino: u64,
     len: u64,
@@ -95,7 +100,7 @@ pub(crate) struct Identity {
 }
 
 impl Identity {
-    /// fstat the actual descriptor supplied by open_published_checked.
+    /// fstat the actual descriptor supplied by `open_published_checked`.
     #[cfg(target_os = "linux")]
     pub(crate) fn of_file(file: &File) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
@@ -121,28 +126,26 @@ impl Identity {
     }
 
     fn valid(self) -> bool {
-        (0..1_000_000_000).contains(&self.mtime_ns)
-            && (0..1_000_000_000).contains(&self.ctime_ns)
+        (0..1_000_000_000).contains(&self.mtime_ns) && (0..1_000_000_000).contains(&self.ctime_ns)
     }
 
     fn old_enough(self, now_ns: i128, minimum: Duration) -> bool {
-        let mtime = i128::from(self.mtime_s) * i128::from(NANOS_PER_SECOND)
-            + i128::from(self.mtime_ns);
-        let ctime = i128::from(self.ctime_s) * i128::from(NANOS_PER_SECOND)
-            + i128::from(self.ctime_ns);
-        i128::try_from(minimum.as_nanos())
-            .is_ok_and(|minimum| now_ns - mtime.max(ctime) >= minimum)
+        let mtime =
+            i128::from(self.mtime_s) * i128::from(NANOS_PER_SECOND) + i128::from(self.mtime_ns);
+        let ctime =
+            i128::from(self.ctime_s) * i128::from(NANOS_PER_SECOND) + i128::from(self.ctime_ns);
+        i128::try_from(minimum.as_nanos()).is_ok_and(|minimum| now_ns - mtime.max(ctime) >= minimum)
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Receipt {
+pub struct Receipt {
     binding: Binding,
     identity: Identity,
     verified_boot_ns: u64,
 }
 
-pub(crate) struct ReceiptBook {
+pub struct ReceiptBook {
     directory: Option<File>,
     producer: [u8; 32],
     loaded: BTreeMap<Binding, Receipt>,
@@ -160,11 +163,19 @@ impl ReceiptBook {
         let producer = clock.and_then(|_| producer_binding());
         let directory = producer.and_then(|_| open_private_directory(directory).ok());
         let producer = producer.unwrap_or([0; 32]);
-        let loaded = directory.as_ref()
+        let loaded = directory
+            .as_ref()
             .and_then(|dir| read_book(dir).ok())
             .and_then(|bytes| decode(&bytes, producer))
             .unwrap_or_default();
-        Self { directory, producer, loaded, kept: BTreeMap::new(), policy, clock }
+        Self {
+            directory,
+            producer,
+            loaded,
+            kept: BTreeMap::new(),
+            policy,
+            clock,
+        }
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -179,9 +190,10 @@ impl ReceiptBook {
         let receipt = self.loaded.get(&binding)?;
         let age = clock.boot_ns.checked_sub(receipt.verified_boot_ns)?;
         let max_age = u64::try_from(self.policy.max_age.as_nanos()).ok()?;
-        (receipt.identity == identity && age <= max_age
+        (receipt.identity == identity
+            && age <= max_age
             && identity.old_enough(clock.unix_ns, self.policy.minimum_file_age))
-            .then(|| receipt.clone())
+        .then(|| receipt.clone())
     }
 
     /// Call only after full prefix verification and before/after fstat agreement.
@@ -195,11 +207,13 @@ impl ReceiptBook {
             return None;
         }
         let clock = self.clock?;
-        before.old_enough(clock.unix_ns, self.policy.minimum_file_age).then_some(Receipt {
-            binding,
-            identity: before,
-            verified_boot_ns: clock.boot_ns,
-        })
+        before
+            .old_enough(clock.unix_ns, self.policy.minimum_file_age)
+            .then_some(Receipt {
+                binding,
+                identity: before,
+                verified_boot_ns: clock.boot_ns,
+            })
     }
 
     pub(crate) fn keep(&mut self, receipt: Receipt) {
@@ -211,8 +225,12 @@ impl ReceiptBook {
         if self.kept == self.loaded {
             return;
         }
-        let Some(directory) = self.directory else { return; };
-        let Some(bytes) = encode(&self.kept, self.producer) else { return; };
+        let Some(directory) = self.directory else {
+            return;
+        };
+        let Some(bytes) = encode(&self.kept, self.producer) else {
+            return;
+        };
         // Concurrent callers may evict each other's cache entries, not add trust.
         let _ = write_book(&directory, &bytes);
     }
@@ -220,14 +238,18 @@ impl ReceiptBook {
 
 /// Unknown, network, FUSE and overlay filesystems retain strict verification.
 #[cfg(target_os = "linux")]
-pub(crate) fn supported(file: &File) -> bool {
+pub fn supported(file: &File) -> bool {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    rustix::fs::fstatfs(file).is_ok_and(|stat| matches!(stat.f_type as u32,
-        0xef53 | 0x5846_5342 | 0x9123_683e | 0xf2f5_2010 | 0x0102_1994))
+    rustix::fs::fstatfs(file).is_ok_and(|stat| {
+        matches!(
+            stat.f_type as u32,
+            0xef53 | 0x5846_5342 | 0x9123_683e | 0xf2f5_2010 | 0x0102_1994
+        )
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn supported(_file: &File) -> bool {
+pub fn supported(_file: &File) -> bool {
     false
 }
 
@@ -235,12 +257,21 @@ pub(crate) fn supported(_file: &File) -> bool {
 fn producer_binding() -> Option<[u8; 32]> {
     use std::os::unix::fs::MetadataExt;
     let mut bytes = Vec::new();
-    File::open("/proc/sys/kernel/random/boot_id").ok()?
-        .take(65).read_to_end(&mut bytes).ok()?;
+    File::open("/proc/sys/kernel/random/boot_id")
+        .ok()?
+        .take(65)
+        .read_to_end(&mut bytes)
+        .ok()?;
     let boot = std::str::from_utf8(&bytes).ok()?.trim();
-    if boot.len() != 36 || !boot.bytes().enumerate().all(|(offset, byte)| {
-        if [8, 13, 18, 23].contains(&offset) { byte == b'-' } else { byte.is_ascii_hexdigit() }
-    }) {
+    if boot.len() != 36
+        || !boot.bytes().enumerate().all(|(offset, byte)| {
+            if [8, 13, 18, 23].contains(&offset) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+    {
         return None;
     }
     let mut hash = Sha256::new();
@@ -264,7 +295,9 @@ fn producer_binding() -> Option<[u8; 32]> {
 }
 
 fn encode(receipts: &BTreeMap<Binding, Receipt>, producer: [u8; 32]) -> Option<Vec<u8>> {
-    let size = receipts.len().checked_mul(RECORD_BYTES)?
+    let size = receipts
+        .len()
+        .checked_mul(RECORD_BYTES)?
         .checked_add(HEADER_BYTES + CHECKSUM_BYTES)?;
     if size > MAX_BYTES {
         return None;
@@ -276,12 +309,20 @@ fn encode(receipts: &BTreeMap<Binding, Receipt>, producer: [u8; 32]) -> Option<V
     for receipt in receipts.values() {
         let b = receipt.binding;
         let i = receipt.identity;
-        for value in [b.schema_id, b.segment_id, b.file_len, b.file_xxh3,
-            i.dev, i.ino, i.len,
+        for value in [
+            b.schema_id,
+            b.segment_id,
+            b.file_len,
+            b.file_xxh3,
+            i.dev,
+            i.ino,
+            i.len,
             u64::from_le_bytes(i.mtime_s.to_le_bytes()),
             u64::from_le_bytes(i.mtime_ns.to_le_bytes()),
             u64::from_le_bytes(i.ctime_s.to_le_bytes()),
-            u64::from_le_bytes(i.ctime_ns.to_le_bytes()), receipt.verified_boot_ns] {
+            u64::from_le_bytes(i.ctime_ns.to_le_bytes()),
+            receipt.verified_boot_ns,
+        ] {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
@@ -295,8 +336,7 @@ fn decode(bytes: &[u8], producer: [u8; 32]) -> Option<BTreeMap<Binding, Receipt>
         return None;
     }
     let (body, checksum) = bytes.split_at(bytes.len() - CHECKSUM_BYTES);
-    if &Sha256::digest(body)[..] != checksum || &body[..8] != MAGIC
-        || body[8..40] != producer {
+    if &Sha256::digest(body)[..] != checksum || &body[..8] != MAGIC || body[8..40] != producer {
         return None;
     }
     let count = usize::try_from(u32::from_le_bytes(body[40..44].try_into().ok()?)).ok()?;
@@ -304,21 +344,37 @@ fn decode(bytes: &[u8], producer: [u8; 32]) -> Option<BTreeMap<Binding, Receipt>
         return None;
     }
     let mut receipts = BTreeMap::new();
-    for record in body[HEADER_BYTES..].chunks_exact(RECORD_BYTES) {
+    // The length check above leaves no partial record or word.
+    let (records, _) = body[HEADER_BYTES..].as_chunks::<RECORD_BYTES>();
+    for record in records {
         let mut f = [0_u64; 12];
-        for (out, word) in f.iter_mut().zip(record.chunks_exact(8)) {
-            *out = u64::from_le_bytes(word.try_into().ok()?);
+        let (words, _) = record.as_chunks::<8>();
+        for (out, word) in f.iter_mut().zip(words) {
+            *out = u64::from_le_bytes(*word);
         }
-        let binding = Binding { schema_id: f[0], segment_id: f[1], file_len: f[2], file_xxh3: f[3] };
-        let identity = Identity { dev: f[4], ino: f[5], len: f[6],
+        let binding = Binding {
+            schema_id: f[0],
+            segment_id: f[1],
+            file_len: f[2],
+            file_xxh3: f[3],
+        };
+        let identity = Identity {
+            dev: f[4],
+            ino: f[5],
+            len: f[6],
             mtime_s: i64::from_le_bytes(f[7].to_le_bytes()),
             mtime_ns: i64::from_le_bytes(f[8].to_le_bytes()),
             ctime_s: i64::from_le_bytes(f[9].to_le_bytes()),
-            ctime_ns: i64::from_le_bytes(f[10].to_le_bytes()) };
+            ctime_ns: i64::from_le_bytes(f[10].to_le_bytes()),
+        };
         if !identity.valid() || identity.len != binding.file_len {
             return None;
         }
-        let receipt = Receipt { binding, identity, verified_boot_ns: f[11] };
+        let receipt = Receipt {
+            binding,
+            identity,
+            verified_boot_ns: f[11],
+        };
         if receipts.insert(binding, receipt).is_some() {
             return None;
         }
@@ -340,18 +396,25 @@ fn private(metadata: &std::fs::Metadata, directory: bool) -> bool {
 #[cfg(target_os = "linux")]
 fn open_private_directory(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let flags = rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
-    let directory = std::fs::OpenOptions::new().read(true)
-        .custom_flags(i32::try_from(flags.bits()).map_err(io::Error::other)?).open(path)?;
+    let flags =
+        rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(i32::try_from(flags.bits()).map_err(io::Error::other)?)
+        .open(path)?;
     if !private(&directory.metadata()?, true) {
-        return Err(io::Error::other("receipt directory must be owner-controlled and mode 0700"));
+        return Err(io::Error::other(
+            "receipt directory must be owner-controlled and mode 0700",
+        ));
     }
     Ok(directory)
 }
 
 #[cfg(not(target_os = "linux"))]
 fn open_private_directory(_path: &Path) -> io::Result<File> {
-    Err(io::Error::other("receipt reuse requires supported Linux storage"))
+    Err(io::Error::other(
+        "receipt reuse requires supported Linux storage",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -360,17 +423,26 @@ fn read_book(directory: &File) -> io::Result<Vec<u8>> {
     if !private(&directory.metadata()?, true) {
         return Err(io::Error::other("receipt directory permissions changed"));
     }
-    let file = File::from(openat(directory, BOOK,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC, Mode::empty())?);
+    let file = File::from(openat(
+        directory,
+        BOOK,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?);
     let before = Identity::of_file(&file);
     let metadata = file.metadata()?;
     if !private(&metadata, false) || metadata.len() > u64::try_from(MAX_BYTES).unwrap_or(u64::MAX) {
         return Err(io::Error::other("untrusted or oversized receipt book"));
     }
     let mut bytes = Vec::new();
-    (&file).take(u64::try_from(MAX_BYTES + 1).unwrap_or(u64::MAX)).read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_BYTES || before.is_none() || before != Identity::of_file(&file)
-        || !private(&directory.metadata()?, true) {
+    (&file)
+        .take(u64::try_from(MAX_BYTES + 1).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES
+        || before.is_none()
+        || before != Identity::of_file(&file)
+        || !private(&directory.metadata()?, true)
+    {
         return Err(io::Error::other("receipt state changed during read"));
     }
     Ok(bytes)
@@ -390,10 +462,17 @@ fn write_book(directory: &File, bytes: &[u8]) -> io::Result<()> {
     }
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let nonce = Clock::now().map_or(0, |clock| clock.boot_ns);
-    let temp = format!(".read-open-{}-{nonce}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed));
-    let mut file = File::from(openat(directory, temp.as_str(),
+    let temp = format!(
+        ".read-open-{}-{nonce}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut file = File::from(openat(
+        directory,
+        temp.as_str(),
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR)?);
+        Mode::RUSR | Mode::WUSR,
+    )?);
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -411,5 +490,8 @@ fn write_book(_directory: &File, _bytes: &[u8]) -> io::Result<()> {
     Err(io::Error::other("unsupported"))
 }
 
+// Explicit, because tests/read_open_receipts.rs includes this file by path,
+// where a plain `mod tests;` would resolve to tests/../src/tests.rs.
 #[cfg(test)]
+#[path = "read_open_receipts/tests.rs"]
 mod tests;

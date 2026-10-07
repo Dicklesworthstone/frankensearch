@@ -11529,9 +11529,7 @@ impl QuillSearchIndex {
         let open_directory = directory.clone();
         let receipt_directory = config.read_open_receipt_directory.clone();
         let snapshot = spawn_blocking(move || match receipt_directory {
-            Some(cache) => {
-                KeeperSnapshot::open_with_local_receipts(open_directory, schema, cache)
-            }
+            Some(cache) => KeeperSnapshot::open_with_local_receipts(open_directory, schema, cache),
             None => KeeperSnapshot::open(open_directory, schema),
         })
         .await?;

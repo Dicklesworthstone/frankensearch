@@ -1,6 +1,8 @@
 use super::*;
 
+// The store's clock is optional, so the fixture returns what `load_at` takes.
 #[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_wraps)]
 fn clock(unix_s: i64, boot_s: u64) -> Option<Clock> {
     Some(Clock {
         unix_ns: i128::from(unix_s) * i128::from(NANOS_PER_SECOND),
@@ -9,12 +11,30 @@ fn clock(unix_s: i64, boot_s: u64) -> Option<Clock> {
 }
 
 fn fixture() -> (Binding, Identity, Receipt) {
-    let binding = Binding { schema_id: 7, segment_id: 8, file_len: 100, file_xxh3: 9 };
-    let identity = Identity {
-        dev: 1, ino: 2, len: 100,
-        mtime_s: 100, mtime_ns: 3, ctime_s: 100, ctime_ns: 4,
+    let binding = Binding {
+        schema_id: 7,
+        segment_id: 8,
+        file_len: 100,
+        file_xxh3: 9,
     };
-    (binding, identity, Receipt { binding, identity, verified_boot_ns: 200 * NANOS_PER_SECOND })
+    let identity = Identity {
+        dev: 1,
+        ino: 2,
+        len: 100,
+        mtime_s: 100,
+        mtime_ns: 3,
+        ctime_s: 100,
+        ctime_ns: 4,
+    };
+    (
+        binding,
+        identity,
+        Receipt {
+            binding,
+            identity,
+            verified_boot_ns: 200 * NANOS_PER_SECOND,
+        },
+    )
 }
 
 fn encoded_fixture() -> Vec<u8> {
@@ -32,7 +52,10 @@ fn seal(body: &[u8]) -> Vec<u8> {
 fn round_trip_binds_schema_identity_and_producer() {
     let (binding, _, receipt) = fixture();
     let bytes = encoded_fixture();
-    assert_eq!(decode(&bytes, [42; 32]), Some(BTreeMap::from([(binding, receipt)])));
+    assert_eq!(
+        decode(&bytes, [42; 32]),
+        Some(BTreeMap::from([(binding, receipt)]))
+    );
     assert!(decode(&bytes, [43; 32]).is_none());
 }
 
@@ -90,9 +113,16 @@ fn private_dir() -> tempfile::TempDir {
 fn boot_expiry_cannot_be_extended_by_wall_clock_rollback_or_cache_hits() {
     let dir = private_dir();
     let (binding, identity, _) = fixture();
-    let policy = Policy { max_age: Duration::from_secs(60), minimum_file_age: Duration::from_secs(10) };
+    let policy = Policy {
+        max_age: Duration::from_secs(60),
+        minimum_file_age: Duration::from_secs(10),
+    };
     let mut first = ReceiptBook::load_at(dir.path(), policy, clock(1000, 200));
-    first.keep(first.verified(binding, identity, Some(identity)).expect("receipt"));
+    first.keep(
+        first
+            .verified(binding, identity, Some(identity))
+            .expect("receipt"),
+    );
     first.persist();
     // Wall time moves backward but the one-minute boot-time lease never renews.
     for (wall, boot) in [(1000, 200), (900, 259), (800, 260)] {
@@ -114,22 +144,69 @@ fn every_identity_and_manifest_component_is_required() {
     let dir = private_dir();
     let (binding, identity, _) = fixture();
     let mut first = ReceiptBook::load_at(dir.path(), Policy::default(), clock(200, 200));
-    first.keep(first.verified(binding, identity, Some(identity)).expect("receipt"));
+    first.keep(
+        first
+            .verified(binding, identity, Some(identity))
+            .expect("receipt"),
+    );
     first.persist();
     let book = ReceiptBook::load_at(dir.path(), Policy::default(), clock(201, 201));
     assert!(book.admitted(binding, identity).is_some());
-    for changed in [Identity { dev: 9, ..identity }, Identity { ino: 9, ..identity },
-        Identity { len: 9, ..identity }, Identity { mtime_s: 99, ..identity },
-        Identity { mtime_ns: 9, ..identity }, Identity { ctime_s: 99, ..identity },
-        Identity { ctime_ns: 9, ..identity }] {
+    for changed in [
+        Identity { dev: 9, ..identity },
+        Identity { ino: 9, ..identity },
+        Identity { len: 9, ..identity },
+        Identity {
+            mtime_s: 99,
+            ..identity
+        },
+        Identity {
+            mtime_ns: 9,
+            ..identity
+        },
+        Identity {
+            ctime_s: 99,
+            ..identity
+        },
+        Identity {
+            ctime_ns: 9,
+            ..identity
+        },
+    ] {
         assert!(book.admitted(binding, changed).is_none());
     }
-    for changed in [Binding { schema_id: 99, ..binding }, Binding { segment_id: 99, ..binding },
-        Binding { file_len: 99, ..binding }, Binding { file_xxh3: 99, ..binding }] {
+    for changed in [
+        Binding {
+            schema_id: 99,
+            ..binding
+        },
+        Binding {
+            segment_id: 99,
+            ..binding
+        },
+        Binding {
+            file_len: 99,
+            ..binding
+        },
+        Binding {
+            file_xxh3: 99,
+            ..binding
+        },
+    ] {
         assert!(book.admitted(changed, identity).is_none());
     }
     assert!(book.verified(binding, identity, None).is_none());
-    assert!(book.verified(binding, identity, Some(Identity { ctime_ns: 9, ..identity })).is_none());
+    assert!(
+        book.verified(
+            binding,
+            identity,
+            Some(Identity {
+                ctime_ns: 9,
+                ..identity
+            })
+        )
+        .is_none()
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -152,12 +229,19 @@ fn namespace_or_boot_producer_change_invalidates_proofs() {
     let dir = private_dir();
     let (binding, identity, _) = fixture();
     let mut first = ReceiptBook::load_at(dir.path(), Policy::default(), clock(200, 200));
-    first.keep(first.verified(binding, identity, Some(identity)).expect("receipt"));
+    first.keep(
+        first
+            .verified(binding, identity, Some(identity))
+            .expect("receipt"),
+    );
     let producer = first.producer;
     let mut foreign = producer;
     foreign[0] ^= 1;
-    write_book(first.directory.as_ref().expect("directory"),
-        &encode(&first.kept, foreign).expect("foreign encoding")).expect("write");
+    write_book(
+        first.directory.as_ref().expect("directory"),
+        &encode(&first.kept, foreign).expect("foreign encoding"),
+    )
+    .expect("write");
     let reopened = ReceiptBook::load_at(dir.path(), Policy::default(), clock(201, 201));
     assert!(reopened.enabled());
     assert!(reopened.admitted(binding, identity).is_none());
@@ -183,8 +267,14 @@ fn symlink_hardlink_world_writable_and_fifo_books_are_not_read() {
     symlink(&other, &file).expect("symlink");
     assert!(read_book(&handle).is_err());
     std::fs::rename(&file, dir.path().join("symlink-book")).expect("retain symlink fixture");
-    rustix::fs::mknodat(&handle, BOOK, rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR, 0).expect("fifo");
+    rustix::fs::mknodat(
+        &handle,
+        BOOK,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        0,
+    )
+    .expect("fifo");
     assert!(read_book(&handle).is_err()); // NONBLOCK prevents hanging.
 }
 
@@ -195,23 +285,44 @@ fn descriptor_identity_detects_replacement_truncation_and_restored_mtime() {
     let dir = private_dir();
     let path = dir.path().join("segment");
     std::fs::write(&path, b"0123456789").expect("write");
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open");
     let before = Identity::of_file(&file).expect("identity");
-    let mtime = file.metadata().expect("metadata").modified().expect("mtime");
+    let mtime = file
+        .metadata()
+        .expect("metadata")
+        .modified()
+        .expect("mtime");
     std::thread::sleep(Duration::from_millis(20));
     file.seek(SeekFrom::Start(5)).expect("seek");
     file.write_all(b"X").expect("write");
-    file.set_times(std::fs::FileTimes::new().set_modified(mtime)).expect("restore mtime");
+    file.set_times(std::fs::FileTimes::new().set_modified(mtime))
+        .expect("restore mtime");
     let rewritten = Identity::of_file(&file).expect("rewritten");
     assert_eq!(before.len, rewritten.len);
-    assert_eq!((before.mtime_s, before.mtime_ns), (rewritten.mtime_s, rewritten.mtime_ns));
-    assert_ne!((before.ctime_s, before.ctime_ns), (rewritten.ctime_s, rewritten.ctime_ns));
+    assert_eq!(
+        (before.mtime_s, before.mtime_ns),
+        (rewritten.mtime_s, rewritten.mtime_ns)
+    );
+    assert_ne!(
+        (before.ctime_s, before.ctime_ns),
+        (rewritten.ctime_s, rewritten.ctime_ns)
+    );
     file.set_len(5).expect("truncate");
     assert_ne!(Identity::of_file(&file), Some(rewritten));
     let replacement = dir.path().join("replacement");
     std::fs::write(&replacement, b"0123456789").expect("replacement");
     std::fs::rename(&replacement, &path).expect("rename");
     let new = File::open(&path).expect("new handle");
-    assert_ne!(Identity::of_file(&new).expect("new identity").ino, before.ino);
-    assert_eq!(Identity::of_file(&file).expect("retained inode").ino, before.ino);
+    assert_ne!(
+        Identity::of_file(&new).expect("new identity").ino,
+        before.ino
+    );
+    assert_eq!(
+        Identity::of_file(&file).expect("retained inode").ino,
+        before.ino
+    );
 }

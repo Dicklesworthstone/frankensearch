@@ -68,9 +68,14 @@ impl KeeperSnapshot {
         schema: SchemaDescriptor,
         cache_directory: impl AsRef<Path>,
     ) -> Result<Self, KeeperError> {
-        let open = || Self::open_local_receipts_once(
-            directory.as_ref(), schema, cache_directory.as_ref(), Policy::default(),
-        );
+        let open = || {
+            Self::open_local_receipts_once(
+                directory.as_ref(),
+                schema,
+                cache_directory.as_ref(),
+                Policy::default(),
+            )
+        };
         let result = match open() {
             Err(error) if recovery_retryable(&error) => open(),
             result => result,
@@ -91,9 +96,9 @@ impl KeeperSnapshot {
     ) -> Result<Self, KeeperError> {
         // Reader-owned advisory data must not be written into the index. Resolve
         // symlinks first; failures are cache misses, not index-open failures.
-        let (Ok(index_path), Ok(cache_path)) = (
-            directory.canonicalize(), cache_directory.canonicalize(),
-        ) else {
+        let (Ok(index_path), Ok(cache_path)) =
+            (directory.canonicalize(), cache_directory.canonicalize())
+        else {
             return Self::open_once(directory, schema);
         };
         if cache_path.starts_with(&index_path) || same_directory(&index_path, &cache_path) {
@@ -103,7 +108,8 @@ impl KeeperSnapshot {
         if !book.enabled() {
             return Self::open_once(directory, schema);
         }
-        let schema_id = schema.schema_id()
+        let schema_id = schema
+            .schema_id()
             .map_err(|source| KeeperError::InvalidSchema { source })?;
         let loaded = load_manifest_pair(directory)?;
         validate_loaded_schema(directory, schema_id, &loaded)?;
@@ -113,27 +119,36 @@ impl KeeperSnapshot {
         };
         let records = &loaded.manifest.segments;
         // Collect in MANIFEST order so parallel work does not randomize errors.
-        let opened: Vec<Result<AdmittedSegment, KeeperError>> = receipt_pool()
-            .map_or_else(|| records.iter().map(&open).collect(),
-                |pool| pool.install(|| records.par_iter().map(&open).collect()));
+        let opened: Vec<Result<AdmittedSegment, KeeperError>> = receipt_pool().map_or_else(
+            || records.iter().map(&open).collect(),
+            |pool| pool.install(|| records.par_iter().map(&open).collect()),
+        );
         let mut segments: Vec<RecoveredSegment> = Vec::new();
         let mut guards = Vec::new();
-        segments.try_reserve_exact(opened.len()).map_err(|error| KeeperError::Io {
-            operation: "allocate receipted snapshot segments",
-            path: directory.to_path_buf(),
-            source: std::io::Error::other(error.to_string()),
-        })?;
-        guards.try_reserve_exact(opened.len()).map_err(|error| KeeperError::Io {
-            operation: "allocate receipted snapshot descriptor guards",
-            path: directory.to_path_buf(),
-            source: std::io::Error::other(error.to_string()),
-        })?;
+        segments
+            .try_reserve_exact(opened.len())
+            .map_err(|error| KeeperError::Io {
+                operation: "allocate receipted snapshot segments",
+                path: directory.to_path_buf(),
+                source: std::io::Error::other(error.to_string()),
+            })?;
+        guards
+            .try_reserve_exact(opened.len())
+            .map_err(|error| KeeperError::Io {
+                operation: "allocate receipted snapshot descriptor guards",
+                path: directory.to_path_buf(),
+                source: std::io::Error::other(error.to_string()),
+            })?;
         let mut receipt_hits = 0_usize;
         for result in opened {
             let admitted = result?;
             receipt_hits += usize::from(admitted.reused);
-            if let Some(receipt) = admitted.receipt { book.keep(receipt); }
-            if let Some(guard) = admitted.guard { guards.push(guard); }
+            if let Some(receipt) = admitted.receipt {
+                book.keep(receipt);
+            }
+            if let Some(guard) = admitted.guard {
+                guards.push(guard);
+            }
             segments.push(admitted.segment);
         }
         let full_verifications = segments.len() - receipt_hits;
@@ -156,8 +171,11 @@ impl KeeperSnapshot {
                 "Quill opened with retained quarantined segments; results must be surfaced as degraded"
             );
         }
-        tracing::debug!(receipt_hits, full_verifications,
-            "Quill read-only local-receipt admission completed");
+        tracing::debug!(
+            receipt_hits,
+            full_verifications,
+            "Quill read-only local-receipt admission completed"
+        );
         Ok(snapshot)
     }
 }
@@ -197,10 +215,18 @@ fn descriptor_pressure(error: &KeeperError) -> bool {
 
 fn receipt_pool() -> Option<&'static rayon::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon::ThreadPool>> = std::sync::OnceLock::new();
-    POOL.get_or_init(|| rayon::ThreadPoolBuilder::new()
-        .num_threads(std::thread::available_parallelism().map_or(1, usize::from).min(8))
-        .thread_name(|index| format!("quill-receipt-open-{index}"))
-        .build().ok()).as_ref()
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(8),
+            )
+            .thread_name(|index| format!("quill-receipt-open-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
 }
 
 fn changed_file(path: &Path) -> KeeperError {
@@ -222,18 +248,29 @@ fn open_segment(
 ) -> Result<AdmittedSegment, KeeperError> {
     let path = directory.join(canonical_segment_name(manifest.segment_id));
     let (reader, checked) = SegmentReader::open_published_checked(
-        &path, schema, SegmentLimits::default(),
-        |reader, file| Ok(check_witness(&path, schema_id, manifest, reader, file, book)),
-    ).map_err(|source| KeeperError::SegmentOpen { path: path.clone(), source })?;
+        &path,
+        schema,
+        SegmentLimits::default(),
+        |reader, file| {
+            Ok(check_witness(
+                &path, schema_id, manifest, reader, file, book,
+            ))
+        },
+    )
+    .map_err(|source| KeeperError::SegmentOpen {
+        path: path.clone(),
+        source,
+    })?;
     let checked = checked?;
-    let segment = RecoveredSegment::bind(
-        path, manifest.clone(), reader, schema, checked.witness,
-    )?;
+    let segment = RecoveredSegment::bind(path, manifest.clone(), reader, schema, checked.witness)?;
     if let Some(guard) = &checked.guard {
         guard.check()?;
     }
     Ok(AdmittedSegment {
-        segment, receipt: checked.receipt, guard: checked.guard, reused: checked.reused,
+        segment,
+        receipt: checked.receipt,
+        guard: checked.guard,
+        reused: checked.reused,
     })
 }
 
@@ -247,12 +284,20 @@ fn check_witness(
 ) -> Result<CheckedWitness, KeeperError> {
     let before = supported(file).then(|| Identity::of_file(file)).flatten();
     let Some(before) = before else {
-        return authenticate_segment_witness(path, manifest, reader, file)
-            .map(|witness| CheckedWitness { witness, receipt: None, guard: None, reused: false });
+        return authenticate_segment_witness(path, manifest, reader, file).map(|witness| {
+            CheckedWitness {
+                witness,
+                receipt: None,
+                guard: None,
+                reused: false,
+            }
+        });
     };
     let binding = Binding {
-        schema_id, segment_id: manifest.segment_id,
-        file_len: manifest.file_len, file_xxh3: manifest.file_xxh3,
+        schema_id,
+        segment_id: manifest.segment_id,
+        file_len: manifest.file_len,
+        file_xxh3: manifest.file_xxh3,
     };
     let existing = book.admitted(binding, before);
     let reused = existing.is_some();
@@ -269,13 +314,24 @@ fn check_witness(
         authenticate_segment_witness(path, manifest, reader, file)?
     };
     let after = Identity::of_file(file);
-    if after != Some(before) { return Err(changed_file(path)); }
-    let file = file.try_clone().map_err(|source| KeeperError::SegmentOpen {
-        path: path.to_path_buf(), source: QuillError::Io(source),
-    })?;
+    if after != Some(before) {
+        return Err(changed_file(path));
+    }
+    let file = file
+        .try_clone()
+        .map_err(|source| KeeperError::SegmentOpen {
+            path: path.to_path_buf(),
+            source: QuillError::Io(source),
+        })?;
     let receipt = existing.or_else(|| book.verified(binding, before, after));
     Ok(CheckedWitness {
-        witness, receipt, reused,
-        guard: Some(Guard { file, identity: before, path: path.to_path_buf() }),
+        witness,
+        receipt,
+        reused,
+        guard: Some(Guard {
+            file,
+            identity: before,
+            path: path.to_path_buf(),
+        }),
     })
 }
