@@ -214,3 +214,77 @@ fn local_receipts_are_not_persisted_when_another_segment_fails() -> TestResult {
     assert!(!cache.join("read-open-receipts-v3").exists());
     Ok(())
 }
+
+
+#[test]
+fn public_readers_share_receipt_policy_on_open_and_refresh() -> TestResult {
+    use crate::{QuillConfig, QuillSearchIndex};
+
+    let (_root, index, cache, encoded) = local_receipt_fixture()?;
+    // Exercise the actual public default policy, not the eager private helper.
+    // ctime cannot safely be backdated. Let this tiny immutable tmpfs fixture
+    // pass the production 60-second stability floor; never skip the hit case.
+    std::thread::sleep(Duration::from_secs(61));
+    let config = QuillConfig {
+        read_open_receipt_directory: Some(cache.clone()),
+        ..QuillConfig::default()
+    };
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread().build()?;
+    runtime.block_on(async {
+        let cx = Cx::for_request();
+        let initial = QuillSearchIndex::open(&cx, &index, config.clone()).await?;
+        assert_eq!(initial.authenticated_file_witness_hash_count(), 1);
+        assert!(cache.join("read-open-receipts-v3").is_file());
+
+        let explicit = QuillSearchIndex::open_with_schema(
+            &cx, &index, DEFAULT_SCHEMA, config.clone(),
+        )
+        .await?;
+        assert_eq!(explicit.authenticated_file_witness_hash_count(), 0);
+        let ordinary = QuillSearchIndex::open(&cx, &index, config).await?;
+        assert_eq!(ordinary.authenticated_file_witness_hash_count(), 0,
+            "default-schema open must not silently bypass the configured receipts");
+        let strict = QuillSearchIndex::open(&cx, &index, QuillConfig::default()).await?;
+        assert_eq!(strict.authenticated_file_witness_hash_count(), 1,
+            "a warm receipt must not bypass an explicitly strict open");
+        for reader in [&initial, &explicit, &ordinary, &strict] {
+            assert_eq!(reader.keeper_generation(), 1);
+            assert_eq!(reader.doc_count()?, 2);
+        }
+
+        // Publish a new MANIFEST reusing the immutable segment. No in-place
+        // segment write occurs while any reader owns its memory mapping.
+        write_manifest(
+            &index.join("MANIFEST"),
+            &durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]),
+        )?;
+        for reader in [&explicit, &ordinary] {
+            assert!(reader.refresh(&cx).await?);
+            assert_eq!(reader.keeper_generation(), 2);
+            assert_eq!(reader.authenticated_file_witness_hash_count(), 0,
+                "refresh must retain the admission policy of both constructors");
+        }
+        assert!(strict.refresh(&cx).await?);
+        assert_eq!(strict.keeper_generation(), 2);
+        assert_eq!(strict.authenticated_file_witness_hash_count(), 1);
+        assert_eq!(initial.keeper_generation(), 1,
+            "another handle's refresh must not move the retained snapshot");
+
+        // A damaged proof changes neither data nor authority: admission must
+        // fully hash the real file and may then replace the advisory proof.
+        std::fs::write(cache.join("read-open-receipts-v3"), b"damaged-proof")?;
+        write_manifest(
+            &index.join("MANIFEST"),
+            &durable_test_manifest(3, vec![manifest_segment(&encoded, 1)]),
+        )?;
+        assert!(ordinary.refresh(&cx).await?);
+        assert_eq!(ordinary.keeper_generation(), 3);
+        assert_eq!(ordinary.authenticated_file_witness_hash_count(), 1);
+        assert_eq!(ordinary.doc_count()?, 2);
+        assert!(explicit.refresh(&cx).await?);
+        assert_eq!(explicit.authenticated_file_witness_hash_count(), 0);
+        assert!(!ordinary.refresh(&cx).await?,
+            "an unchanged retained publication still requires no reopen");
+        Ok(())
+    })
+}

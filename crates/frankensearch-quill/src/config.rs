@@ -138,6 +138,21 @@ pub struct QuillConfig {
     /// it on must couple the resulting degraded snapshot to a freshness audit
     /// and backfill path.
     pub quarantine_on_unrepairable: bool,
+    /// Optional existing owner-private directory for read-only local receipts.
+    ///
+    /// `None` is strict and remains the default. Only [`crate::QuillSearchIndex`]
+    /// open and refresh consult this field. Writers, recovery and maintenance
+    /// continue using strict Keeper admission even when this field is set.
+    ///
+    /// Receipts reuse a prior successful file-prefix check; lazy section checks
+    /// remain active. They require supported local Linux storage and immutable
+    /// published files. Metadata-preserving faults are outside this policy's
+    /// guarantee: reopen with `None` to verify the file bytes again.
+    ///
+    /// The directory must already exist, be owner-private and be outside the
+    /// index. Unusable caches and unsupported storage fall back to full checks.
+    /// See [`crate::KeeperSnapshot::open_with_local_receipts`].
+    pub read_open_receipt_directory: Option<std::path::PathBuf>,
 }
 
 impl Default for QuillConfig {
@@ -158,6 +173,7 @@ impl Default for QuillConfig {
             deterministic_ingest: false,
             max_visibility_lag_ms: DEFAULT_MAX_VISIBILITY_LAG_MS,
             quarantine_on_unrepairable: false,
+            read_open_receipt_directory: None,
         }
     }
 }
@@ -301,6 +317,7 @@ mod tests {
                 deterministic_ingest: false,
                 max_visibility_lag_ms: 1_000,
                 quarantine_on_unrepairable: false,
+                read_open_receipt_directory: None,
             }
         );
         assert!(QuillConfig::default().validate().is_ok());
