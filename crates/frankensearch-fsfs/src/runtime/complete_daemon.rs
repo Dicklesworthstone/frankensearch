@@ -380,9 +380,12 @@ impl FsfsRuntime {
                         }
                     };
                     if forwarding::is_forwarded(&bytes) {
-                        // This lane has request-scoped filters and may refresh
-                        // selection. Never let an older v3 cache survive it.
-                        cache.clear();
+                        // Filters and policy stay on the request's own runtime,
+                        // but its refresh may move the session to a newer
+                        // generation, after which the buffered lane's refresh
+                        // reports no change. Cached replies belong to the
+                        // generation they were computed on: drop them then.
+                        let selected = session.reader.generation().manifest_sha256().to_owned();
                         let result = Box::pin(forwarding::serve(
                             cx,
                             self,
@@ -392,6 +395,9 @@ impl FsfsRuntime {
                             peer_timeout,
                         ))
                         .await;
+                        if session.reader.generation().manifest_sha256() != selected {
+                            cache.clear();
+                        }
                         match result {
                             Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                             Err(error) => {

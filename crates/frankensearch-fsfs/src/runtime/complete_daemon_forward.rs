@@ -716,9 +716,27 @@ mod tests {
 
         let before = SearchPolicy::of(&runtime.config);
         for (field, invalid) in [
-            ("search.quality_weight", SearchPolicy { quality_weight: 1.5, ..policy }),
-            ("search.rrf_k", SearchPolicy { rrf_k: f64::NAN, ..policy }),
-            ("search.quality_timeout_ms", SearchPolicy { quality_timeout_ms: 1, ..policy }),
+            (
+                "search.quality_weight",
+                SearchPolicy {
+                    quality_weight: 1.5,
+                    ..policy
+                },
+            ),
+            (
+                "search.rrf_k",
+                SearchPolicy {
+                    rrf_k: f64::NAN,
+                    ..policy
+                },
+            ),
+            (
+                "search.quality_timeout_ms",
+                SearchPolicy {
+                    quality_timeout_ms: 1,
+                    ..policy
+                },
+            ),
         ] {
             let error = invalid.apply_to(&mut runtime).unwrap_err();
             assert!(
@@ -860,6 +878,156 @@ mod generation_tests {
     use std::future::{Future, poll_fn};
     use std::pin::pin;
     use std::task::Poll;
+
+    /// Drive the real daemon command and a client future on the same
+    /// test-owned context. No worker is detached, the daemon is cancelled once
+    /// the client finishes, and a regression cannot wait indefinitely.
+    async fn drive_with_daemon<F>(cx: &Cx, runtime: &FsfsRuntime, root: &Path, client_work: F)
+    where
+        F: Future<Output = SearchResult<()>>,
+    {
+        let mut server = Box::pin(runtime.run_complete_generation_daemon(cx, root));
+        let mut client_work = Box::pin(client_work);
+        let mut deadline = pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(30)));
+        let mut server_result = None;
+        let mut client_result = None;
+        poll_fn(|task| {
+            assert!(
+                !deadline.as_mut().poll(task).is_ready(),
+                "forwarding lifecycle exceeded deadline"
+            );
+            if server_result.is_none()
+                && let Poll::Ready(result) = server.as_mut().poll(task)
+            {
+                assert!(
+                    client_result.is_some(),
+                    "daemon stopped before client: {result:?}"
+                );
+                server_result = Some(result);
+            }
+            if client_result.is_none()
+                && let Poll::Ready(result) = client_work.as_mut().poll(task)
+            {
+                client_result = Some(result);
+                cx.set_cancel_requested(true);
+            }
+            if client_result.is_some() && server_result.is_some() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+        drop(client_work);
+        drop(server);
+        cx.set_cancel_requested(false);
+        client_result.unwrap().unwrap();
+        assert!(matches!(
+            server_result.unwrap(),
+            Err(SearchError::Cancelled { .. })
+        ));
+    }
+
+    /// One buffered serve request, as `fsfs serve` clients send it: the hit
+    /// count of its last phase and whether the daemon answered from its cache.
+    async fn raw_search(cx: &Cx, endpoint: &Path) -> SearchResult<(usize, bool)> {
+        let reply = control::exchange(
+            cx,
+            endpoint,
+            b"{\"query\":\"sharedtoken\",\"limit\":10}\n",
+            FSFS_DAEMON_RESPONSE_MAX_BYTES,
+            Duration::from_secs(10),
+        )
+        .await?;
+        let value: serde_json::Value = serde_json::from_slice(&reply).map_err(codec_error)?;
+        assert_eq!(value["ok"], true, "{value}");
+        let hits = value["payloads"].as_array().unwrap().last().unwrap()["hits"]
+            .as_array()
+            .unwrap()
+            .len();
+        Ok((hits, value["cached"] == true))
+    }
+
+    #[test]
+    fn forwarded_searches_keep_the_serve_cache_until_they_move_the_generation() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let root = directory.path().join("store");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
+            let mut config = FsfsConfig::default();
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            config.indexing.offline = true;
+            config.indexing.quality_model.clear();
+            config.search.fast_only = true;
+            config.search.rerank = false;
+            let runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
+                command: CliCommand::Daemon,
+                target_path: Some(source.clone()),
+                index_dir: Some(root.clone()),
+                quiet: true,
+                ..CliInput::default()
+            });
+            assert!(matches!(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
+            let endpoint = runtime.complete_generation_socket_path(&root).unwrap();
+            let client = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(root.clone()),
+                daemon: true,
+                format: OutputFormat::Json,
+                ..CliInput::default()
+            });
+            let caching = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
+            let client_work = async {
+                for _ in 0..1_000 {
+                    if endpoint.exists() {
+                        break;
+                    }
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                assert!(endpoint.exists(), "daemon did not become ready");
+                assert_eq!(raw_search(&cx, &endpoint).await?, (1, false));
+                assert_eq!(raw_search(&cx, &endpoint).await?, (1, caching));
+                let forwarded = client
+                    .query_complete_generation_daemon(&cx, &root, "sharedtoken", 10)
+                    .await?;
+                assert_eq!(forwarded.hits.len(), 1);
+                assert_eq!(
+                    raw_search(&cx, &endpoint).await?,
+                    (1, caching),
+                    "a forwarded search on the same generation must keep the serve cache"
+                );
+
+                std::fs::write(source.join("beta.md"), "sharedtoken beta document")?;
+                assert!(matches!(
+                    runtime.rebuild_retained_generation(&cx, &root).await?,
+                    GenerationPublication::Durable(_)
+                ));
+                // The forwarded search moves the session to the new generation,
+                // so the buffered lane's own refresh then reports no change.
+                let forwarded = client
+                    .query_complete_generation_daemon(&cx, &root, "sharedtoken", 10)
+                    .await?;
+                assert_eq!(forwarded.hits.len(), 2);
+                assert_eq!(
+                    raw_search(&cx, &endpoint).await?,
+                    (2, false),
+                    "a reply cached on the previous generation must not be served"
+                );
+                assert_eq!(raw_search(&cx, &endpoint).await?, (2, caching));
+                Ok::<(), SearchError>(())
+            };
+            Box::pin(drive_with_daemon(&cx, &runtime, &root, client_work)).await;
+            assert!(!endpoint.exists(), "server must release its owned endpoint");
+        });
+    }
 
     #[test]
     fn cli_forwarding_follows_publication_isolates_filters_and_recovers_after_refusal() {
@@ -1033,48 +1201,7 @@ mod generation_tests {
                 );
                 Ok::<(), SearchError>(())
             };
-            // Drive both real command futures on the same test-owned context.
-            // No worker is detached, and a regression cannot wait indefinitely.
-            let mut server = Box::pin(runtime.run_complete_generation_daemon(&cx, &root));
-            let mut client_work = Box::pin(client_work);
-            let mut deadline = pin!(asupersync::time::sleep(cx.now(), Duration::from_secs(30)));
-            let mut server_result = None;
-            let mut client_result = None;
-            poll_fn(|task| {
-                assert!(
-                    !deadline.as_mut().poll(task).is_ready(),
-                    "forwarding lifecycle exceeded deadline"
-                );
-                if server_result.is_none()
-                    && let Poll::Ready(result) = server.as_mut().poll(task)
-                {
-                    assert!(
-                        client_result.is_some(),
-                        "daemon stopped before client: {result:?}"
-                    );
-                    server_result = Some(result);
-                }
-                if client_result.is_none()
-                    && let Poll::Ready(result) = client_work.as_mut().poll(task)
-                {
-                    client_result = Some(result);
-                    cx.set_cancel_requested(true);
-                }
-                if client_result.is_some() && server_result.is_some() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            })
-            .await;
-            drop(client_work);
-            drop(server);
-            cx.set_cancel_requested(false);
-            client_result.unwrap().unwrap();
-            assert!(matches!(
-                server_result.unwrap(),
-                Err(SearchError::Cancelled { .. })
-            ));
+            Box::pin(drive_with_daemon(&cx, &runtime, &root, client_work)).await;
             assert!(!endpoint.exists(), "server must release its owned endpoint");
             assert!(
                 crate::generation_store::CompleteGenerationStore::open(&cx, &root)
