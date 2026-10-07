@@ -119,6 +119,24 @@ pub(super) async fn exchange(
 ) -> SearchResult<Vec<u8>> {
     retained_search_checkpoint(cx)?;
     let started = Instant::now();
+    let mut peer = connect_and_send(cx, path, request, started, timeout).await?;
+    let bytes = read_response(cx, &mut peer, response_limit, remaining(started, timeout)?).await?;
+    retained_search_checkpoint(cx)?;
+    remaining(started, timeout)?;
+    Ok(bytes)
+}
+
+/// Admit and send one bounded request under the transport deadline. Search
+/// clients then wait for their configured quality/rerank budget; control
+/// exchanges continue to share one short deadline across every operation.
+pub(super) async fn connect_and_send(
+    cx: &Cx,
+    path: &Path,
+    request: &[u8],
+    started: Instant,
+    timeout: Duration,
+) -> SearchResult<UnixStream> {
+    retained_search_checkpoint(cx)?;
     remaining(started, timeout)?;
     if request.len() > FSFS_DAEMON_REQUEST_MAX_BYTES
         || request.last() != Some(&b'\n')
@@ -137,10 +155,9 @@ pub(super) async fn exchange(
     }
     let mut peer = connect(cx, path, started, timeout).await?;
     write_response(cx, &mut peer, request, remaining(started, timeout)?).await?;
-    let bytes = read_response(cx, &mut peer, response_limit, remaining(started, timeout)?).await?;
     retained_search_checkpoint(cx)?;
     remaining(started, timeout)?;
-    Ok(bytes)
+    Ok(peer)
 }
 
 pub(super) async fn connect(
@@ -237,7 +254,7 @@ pub(super) fn remaining(started: Instant, timeout: Duration) -> SearchResult<Dur
         })
 }
 
-async fn read_response(
+pub(super) async fn read_response(
     cx: &Cx,
     peer: &mut UnixStream,
     limit: usize,

@@ -586,8 +586,13 @@ mod tests {
             let empty = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
             assert_eq!(empty.sequence, 1);
             assert_eq!(empty.result_count, 0);
-            assert!(matches!(empty.event, LiveSearchEvent::Snapshot { results } if results.is_empty()));
-            assert_eq!(fs::read(store.root().join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            assert!(
+                matches!(empty.event, LiveSearchEvent::Snapshot { results } if results.is_empty())
+            );
+            assert_eq!(
+                fs::read(store.root().join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
         });
     }
 
@@ -621,12 +626,7 @@ mod tests {
             let mut session = session(store.clone());
             session.poll(&cx, Instant::now()).await.unwrap();
             session.set_query(&cx, "beta").unwrap();
-            let successor = publish(
-                &cx,
-                &store,
-                &[IndexableDocument::new("new", "beta")],
-            )
-            .await;
+            let successor = publish(&cx, &store, &[IndexableDocument::new("new", "beta")]).await;
             let frame = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
             assert_eq!(frame.query, "beta");
             assert_eq!(frame.sequence, 1);

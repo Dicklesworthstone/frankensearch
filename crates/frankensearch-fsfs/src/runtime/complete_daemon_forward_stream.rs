@@ -4,9 +4,9 @@
 //! presentation, never retrieval. There is one request, no reconnect/replay,
 //! a bounded partial record, and one deadline across connect, send and receive.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
-use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -15,20 +15,24 @@ use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
+use super::super::super::super::{SearchOutputPhase, SearchServeFrame, SearchServeOptions};
 use super::super::{FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL, streaming};
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_RESPONSE_MAX_BYTES, ForwardedSearch, FsfsRuntime,
-    LiveRetainedSearchReader, PeerOutcome, Reply, SearchExecutionFlags, VERSION, codec_error,
-    complete_cli_error, control, decode_reply, decode_request, encode_response, error_envelope,
-    make_request, retained_search_checkpoint, run_request, validate_request, write_response,
+    LiveRetainedSearchReader, PeerOutcome, Reply, SearchCacheKey, SearchExecutionFlags, VERSION,
+    codec_error, complete_cli_error, control, decode_reply, decode_request, encode_response,
+    error_envelope, make_request, query_runtime, retained_search_checkpoint, run_request,
+    validate_request, write_response,
 };
+#[cfg(test)]
+use crate::CliCommand;
+use crate::OutputFormat;
 use crate::adapters::format_emitter::emit_stream_frame;
-use crate::output_schema::{OutputError, SearchHitPayload, output_error_from};
+use crate::output_schema::{OutputError, SearchHitPayload, SearchPayload, output_error_from};
 use crate::stream_protocol::{
-    StreamEvent, StreamFrame, StreamTerminalStatus, terminal_event_from_error,
+    StreamEvent, StreamFrame, StreamProgressEvent, StreamTerminalStatus, terminal_event_from_error,
     validate_stream_frame,
 };
-use crate::{CliCommand, OutputFormat};
 
 type Frame = StreamFrame<SearchHitPayload>;
 
@@ -95,33 +99,30 @@ pub(super) async fn serve(
     peer: &mut UnixStream,
     bytes: &[u8],
     timeout: Duration,
+    mut cache: Option<&mut HashMap<SearchCacheKey, Vec<SearchPayload>>>,
 ) -> SearchResult<PeerOutcome> {
     let request = parse_request(bytes)?;
     let output = streaming::PhaseWriter::new(peer)?;
     let mut writer = output.clone();
     let producer = async {
         validate_request(runtime, session.store.root(), &request.request)?;
-        session.refresh(cx).await?;
-        let mut query_runtime = session.reader.runtime.clone();
-        query_runtime.enable_complete_generation_explanations(
-            session.store.root(),
-            session.reader.generation(),
-        )?;
-        query_runtime.cli_input.command = CliCommand::Search;
-        query_runtime.cli_input.query = Some(request.request.search.query.clone());
-        query_runtime
-            .cli_input
-            .filter
-            .clone_from(&request.request.search.filter);
-        query_runtime.cli_input.daemon = false;
-        query_runtime.cli_input.daemon_socket = None;
-        query_runtime.cli_input.expand = false;
-        query_runtime.cli_input.stream = true;
-        query_runtime.cli_input.format = OutputFormat::Jsonl;
-        query_runtime.cli_input.overrides.limit = Some(request.request.search.limit);
-        request.request.search.policy.apply_to(&mut query_runtime)?;
-        query_runtime.config.search.explain = request.request.search.explain;
-        query_runtime.cli_input.overrides.explain = Some(request.request.search.explain);
+        if session.refresh(cx).await?
+            && let Some(cache) = cache.as_mut()
+        {
+            cache.clear();
+        }
+        let query_runtime = query_runtime(session, &request.request.search, true)?;
+        if !request.request.search.explain {
+            return serve_cached_search(
+                cx,
+                &query_runtime,
+                session,
+                &request.request,
+                &mut writer,
+                cache,
+            )
+            .await;
+        }
         query_runtime
             .run_search_stream_command_with_writer(
                 cx,
@@ -141,7 +142,7 @@ pub(super) async fn serve(
     };
     let result = Box::pin(run_request(
         cx,
-        timeout,
+        request.request.search.policy.delivery_budget(),
         streaming::drive(cx, &output, producer),
     ))
     .await;
@@ -161,6 +162,83 @@ pub(super) async fn serve(
             let bytes = encode_response(&reply)?;
             write_response(cx, peer, &bytes, timeout).await?;
             Ok(PeerOutcome::Search)
+        }
+    }
+}
+
+/// Keep ordinary progressive framing while using the shared daemon executor.
+/// The sink publishes Initial immediately on a miss; a hit replays every
+/// retained phase under this request's ID and a fresh terminal event.
+async fn serve_cached_search(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    session: &mut LiveRetainedSearchReader,
+    request: &ForwardedSearch,
+    writer: &mut streaming::PhaseWriter,
+    cache: Option<&mut HashMap<SearchCacheKey, Vec<SearchPayload>>>,
+) -> SearchResult<()> {
+    let mut sequence = 0;
+    let stream_id = &request.request_id;
+    runtime.emit_search_stream_started(&request.search.query, stream_id, &mut sequence, writer)?;
+    let cache_enabled = cache.is_some();
+    let mut disabled_cache = HashMap::new();
+    let cache = cache.unwrap_or(&mut disabled_cache);
+    // Every fallible search operation after Started must return through the
+    // terminal handler, including a pressure override that refuses the mode
+    // before the executor is entered.
+    let result = async {
+        let mode = session.reader.search_mode()?;
+        let mut cached = false;
+        let mut sink = |frame| match frame {
+            SearchServeFrame::Attested { cached: hit, .. } => {
+                cached = hit;
+                Ok(())
+            }
+            SearchServeFrame::Phase { payload } => {
+                if cached && payload.phase == SearchOutputPhase::Initial {
+                    let frame = Frame::new(
+                        stream_id,
+                        sequence,
+                        super::super::super::iso_timestamp_now(),
+                        "search",
+                        StreamEvent::Progress(StreamProgressEvent {
+                            stage: "cache".to_owned(),
+                            completed_units: 1,
+                            total_units: Some(1),
+                            reason_code: "daemon_cache_hit".to_owned(),
+                            message: "Replaying complete cached search phases".to_owned(),
+                        }),
+                    );
+                    emit_stream_frame(&frame, OutputFormat::Jsonl, writer)?;
+                    sequence = sequence.saturating_add(1);
+                }
+                runtime.emit_search_stream_payload(&payload, stream_id, &mut sequence, writer)
+            }
+            SearchServeFrame::Terminal { .. } => Err(complete_cli_error(
+                "daemon_stream",
+                "search executor emitted an unexpected terminal frame",
+            )),
+        };
+        runtime
+            .execute_search_serve_request_with_sink(
+                cx,
+                request.search.as_serve_request(mode),
+                &mut session.reader.resources,
+                cache,
+                SearchServeOptions {
+                    hot_cache_enabled: cache_enabled,
+                    persist_explain_session: true,
+                },
+                Some(&mut sink),
+            )
+            .await
+    }
+    .await;
+    match result {
+        Ok(_) => runtime.emit_search_stream_terminal_completed(stream_id, &mut sequence, writer),
+        Err(error) => {
+            runtime.emit_search_stream_terminal_error(stream_id, &error, &mut sequence, writer)?;
+            Err(error)
         }
     }
 }
@@ -434,16 +512,16 @@ impl FsfsRuntime {
         }
         parse_request(&bytes)?;
         let path = self.complete_generation_socket_path(root)?;
-        if !std::fs::symlink_metadata(&path)?.file_type().is_socket() {
-            return Err(complete_cli_error(
-                "daemon_socket",
-                "expected a non-symlink Unix socket",
-            ));
-        }
-        let timeout = Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS);
+        let timeout = request.request.search.policy.delivery_budget();
         let started = Instant::now();
-        let mut peer = control::connect(cx, &path, started, timeout).await?;
-        write_response(cx, &mut peer, &bytes, control::remaining(started, timeout)?).await?;
+        let mut peer = control::connect_and_send(
+            cx,
+            &path,
+            &bytes,
+            started,
+            Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS),
+        )
+        .await?;
         let mut state = ReceiveState::default();
         let result = receive(
             cx,
@@ -950,9 +1028,143 @@ mod tests {
 #[cfg(all(test, not(feature = "embedded-models")))]
 mod generation_tests {
     use super::*;
+    use crate::config::DegradationOverrideMode;
     use crate::generation_store::{CompleteGenerationStore, GenerationPublication};
     use crate::{CliInput, FsfsConfig};
     use std::fs;
+
+    #[test]
+    fn forwarded_stream_mode_refusal_emits_one_typed_terminal_after_started() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let root = directory.path().join("store");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
+            let mut config = FsfsConfig::default();
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            config.indexing.offline = true;
+            config.indexing.quality_model.clear();
+            config.search.fast_only = true;
+            config.search.rerank = false;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                index_dir: Some(root.clone()),
+                target_path: Some(source),
+                quiet: true,
+                ..CliInput::default()
+            });
+            assert!(matches!(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let selected = store.active(&cx).unwrap();
+            for mode in [
+                DegradationOverrideMode::ForcePaused,
+                DegradationOverrideMode::ForceMetadataOnly,
+            ] {
+                // Plain requests use the shared cache executor; --explain uses
+                // the inline artifact executor. Both owe the same terminal.
+                for explain in [false, true] {
+                    let mut refused = runtime.clone();
+                    refused.config.pressure.degradation_override = mode;
+                    refused.config.search.explain = explain;
+                    // Such readers admit their lexical resources for inspection;
+                    // the request itself must report the configured search refusal.
+                    let mut session = refused.open_live_retained_search(&cx, &root).await.unwrap();
+                    let request = StreamRequest {
+                        fsfs_complete_cli_stream: VERSION,
+                        request: make_request(&refused, &root, "sharedtoken", 10).unwrap(),
+                    };
+                    let (mut client, mut peer) = UnixStream::pair().unwrap();
+                    peer.set_nonblocking(true).unwrap();
+                    client.set_nonblocking(true).unwrap();
+                    let mut cache = HashMap::new();
+                    let failure = serve(
+                        &cx,
+                        &refused,
+                        &mut session,
+                        &mut peer,
+                        &serde_json::to_vec(&request).unwrap(),
+                        Duration::from_secs(5),
+                        Some(&mut cache),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert!(matches!(&failure, SearchError::InvalidConfig { field, .. }
+                    if field == "pressure.degradation_override"));
+                    drop(peer);
+                    let expected = output_error_from(&failure);
+                    let mut state = ReceiveState::default();
+                    let mut output = Vec::new();
+                    let result = receive(
+                        &cx,
+                        &mut client,
+                        &request.request,
+                        Instant::now(),
+                        Duration::from_secs(5),
+                        OutputFormat::Jsonl,
+                        &mut state,
+                        &mut output,
+                    )
+                    .await;
+                    // Require the server's terminal, not a client-synthesized EOF
+                    // error that could hide an unterminated Started-only stream.
+                    let received = result.as_ref().expect("server must send a typed terminal");
+                    assert_eq!(
+                        serde_json::to_value(received.as_ref().unwrap()).unwrap(),
+                        serde_json::to_value(&expected).unwrap()
+                    );
+                    let reported = finish_receive(
+                        &mut state,
+                        &request.request,
+                        OutputFormat::Jsonl,
+                        &mut output,
+                        result,
+                    )
+                    .unwrap_err();
+                    assert_eq!(
+                        serde_json::to_value(
+                            FsfsRuntime::forwarded_search_error(&reported).unwrap()
+                        )
+                        .unwrap(),
+                        serde_json::to_value(&expected).unwrap()
+                    );
+                    let frames: Vec<Frame> = output
+                        .split(|byte| *byte == b'\n')
+                        .filter(|line| !line.is_empty())
+                        .map(|line| serde_json::from_slice(line).unwrap())
+                        .collect();
+                    assert_eq!(
+                        frames.len(),
+                        2,
+                        "a refused search emits no result frames: mode={mode:?}, explain={explain}"
+                    );
+                    assert!(matches!(frames[0].event, StreamEvent::Started(_)));
+                    assert!(matches!(&frames[1].event, StreamEvent::Terminal(terminal)
+                    if terminal.status == StreamTerminalStatus::Failed
+                        && terminal.error.as_ref().is_some_and(|error|
+                            error.field.as_deref() == Some("pressure.degradation_override"))));
+                    for (sequence, frame) in frames.iter().enumerate() {
+                        assert!(validate_stream_frame(frame).valid);
+                        assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
+                        assert_eq!(frame.stream_id, request.request.request_id);
+                    }
+                    assert!(cache.is_empty());
+                    assert!(
+                        FsfsRuntime::load_explain_session_at_root(&root)
+                            .unwrap()
+                            .is_none()
+                    );
+                    assert_eq!(store.active(&cx).unwrap(), selected);
+                }
+            }
+        });
+    }
 
     #[test]
     fn forwarded_stream_uses_real_retained_retrieval_and_keeps_the_bundle_intact() {
@@ -991,9 +1203,10 @@ mod generation_tests {
                 fsfs_complete_cli_stream: VERSION,
                 request: make_request(&requesting, &root, "sharedtoken", 10).unwrap(),
             };
-            let buffered = super::super::execute(&cx, &runtime, &mut session, &request.request)
-                .await
-                .unwrap();
+            let buffered =
+                super::super::execute(&cx, &runtime, &mut session, &request.request, None)
+                    .await
+                    .unwrap();
             let (mut client, mut peer) = UnixStream::pair().unwrap();
             peer.set_nonblocking(true).unwrap();
             client.set_nonblocking(true).unwrap();
@@ -1004,6 +1217,7 @@ mod generation_tests {
                 &mut peer,
                 &serde_json::to_vec(&request).unwrap(),
                 Duration::from_secs(5),
+                None,
             )
             .await
             .unwrap();
