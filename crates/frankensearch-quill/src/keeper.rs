@@ -57,6 +57,8 @@ use crate::segment::{
     SegmentAssembler, SegmentHeader, SegmentHeaderInput, SegmentReader,
 };
 
+mod receipt_admission;
+
 pub use crate::stats::{SegmentStats, SegmentStatsProvider};
 
 /// Eight-byte MANIFEST magic, including its trailing NUL.
@@ -16848,6 +16850,8 @@ impl<'a> ByteCursor<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    include!("keeper/receipt_regressions.rs");
     #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering};
