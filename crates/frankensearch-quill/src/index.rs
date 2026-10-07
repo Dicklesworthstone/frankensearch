@@ -11471,6 +11471,19 @@ impl PreparsedQuillIndex {
 }
 
 impl QuillSearchIndex {
+    /// Actual prefix hashes in this handle's current snapshot, for regressions.
+    #[cfg(test)]
+    pub(crate) fn authenticated_file_witness_hash_count(&self) -> u64 {
+        self.reader
+            .published_snapshot
+            .load()
+            .keeper_snapshot()
+            .segments()
+            .iter()
+            .map(RecoveredSegment::authenticated_file_witness_hash_count)
+            .sum()
+    }
+
     /// Open the latest published shipping-schema snapshot without acquiring the
     /// durable writer lease.
     ///
@@ -11483,31 +11496,10 @@ impl QuillSearchIndex {
         directory: impl Into<PathBuf>,
         config: QuillConfig,
     ) -> Result<Self, QuillIndexError> {
-        validate_config(&config)?;
-        validate_non_durable_quarantine(&config)?;
-        check_cancel(cx, "read-only index open")?;
-        let directory = directory.into();
-        let open_directory = directory.clone();
-        let snapshot =
-            spawn_blocking(move || KeeperSnapshot::open(open_directory, DEFAULT_SCHEMA)).await?;
-        check_cancel(cx, "read-only index open")?;
-        let generation = snapshot.loaded_manifest().manifest.generation;
-        let publication_read_state = PublicationReadState::new(generation)?;
-        let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
-        Ok(Self {
-            reader: QuillReader {
-                parser: Some(DefaultQueryParser::new(DEFAULT_SCHEMA)?),
-                config,
-                schema: DEFAULT_SCHEMA,
-                published_snapshot,
-                publication_read_state,
-                #[cfg(test)]
-                publication_read_pause: Arc::default(),
-                #[cfg(feature = "conformance-internals")]
-                conformance_controller: Arc::default(),
-            },
-            directory,
-        })
+        // Keep both public constructors on one admission path. A configuration
+        // must not silently stop taking effect when a caller uses the default
+        // schema instead of spelling that same schema explicitly.
+        Self::open_with_schema(cx, directory, DEFAULT_SCHEMA, config).await
     }
 
     /// Open the latest published snapshot of an index built on `schema`.
@@ -11535,7 +11527,14 @@ impl QuillSearchIndex {
         check_cancel(cx, "read-only index open")?;
         let directory = directory.into();
         let open_directory = directory.clone();
-        let snapshot = spawn_blocking(move || KeeperSnapshot::open(open_directory, schema)).await?;
+        let receipt_directory = config.read_open_receipt_directory.clone();
+        let snapshot = spawn_blocking(move || match receipt_directory {
+            Some(cache) => {
+                KeeperSnapshot::open_with_local_receipts(open_directory, schema, cache)
+            }
+            None => KeeperSnapshot::open(open_directory, schema),
+        })
+        .await?;
         check_cancel(cx, "read-only index open")?;
         let generation = snapshot.loaded_manifest().manifest.generation;
         let publication_read_state = PublicationReadState::new(generation)?;
@@ -11667,7 +11666,12 @@ impl QuillSearchIndex {
         // default: a reader bound to a wider schema (the CASS profile) would
         // otherwise fail every refresh with a manifest schema mismatch.
         let schema = self.reader.schema;
-        let snapshot = spawn_blocking(move || KeeperSnapshot::open(directory, schema)).await?;
+        let receipt_directory = self.reader.config.read_open_receipt_directory.clone();
+        let snapshot = spawn_blocking(move || match receipt_directory {
+            Some(cache) => KeeperSnapshot::open_with_local_receipts(directory, schema, cache),
+            None => KeeperSnapshot::open(directory, schema),
+        })
+        .await?;
         check_cancel(cx, "read-only index refresh")?;
 
         Ok(self
