@@ -3266,6 +3266,15 @@ impl RecoveredSegment {
         self.manifest.doc_count
     }
 
+    /// Bound physical posting blocks in any term, including concat partials.
+    ///
+    /// The bound is derived during the existing TERMDICT admission and stays
+    /// tied to this immutable backing. Tombstone-only rebinds retain it because
+    /// hiding a document does not remove its encoded posting block.
+    pub(crate) fn max_posting_blocks_per_term(&self) -> u64 {
+        self.term_dictionary_metadata.max_posting_blocks()
+    }
+
     /// Current MANIFEST tombstone cardinality.
     #[must_use]
     pub fn tombstone_count(&self) -> u64 {

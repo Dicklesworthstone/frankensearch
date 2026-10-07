@@ -429,6 +429,16 @@ const VINT_KIND: u8 = 2;
 const FREQ_ALL_ONE: u8 = 0;
 const FREQ_BITPACKED: u8 = 1;
 
+/// Bound the blocks in one term without opening its posting bytes.
+///
+/// Every block contains at least one posting. The shortest valid block is a
+/// singleton VINT: four header bytes plus one byte each for its document id
+/// and frequency. FOR and bitmap blocks are larger. Unlike `ceil(df / 128)`,
+/// these two bounds remain valid when concat preserves interior partials.
+pub(crate) fn posting_block_count_upper_bound(doc_freq: u32, byte_len: u64) -> u64 {
+    u64::from(doc_freq).min(byte_len / 6)
+}
+
 /// One document occurrence in a term's posting list.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Posting {
@@ -13372,6 +13382,63 @@ mod tests {
             EncodedPostingList::encode(&[Posting::new(2, 1), Posting::new(1, 1)]),
             Err(PostingCodecError::NonAscendingInput { .. })
         ));
+    }
+
+    #[test]
+    fn physical_block_bound_covers_every_codec_and_concat_partials() -> TestResult {
+        let singleton = EncodedPostingList::encode(&[Posting::new(0, 1)])?;
+        assert_eq!(singleton.as_bytes().len(), BLOCK_HEADER_LEN + 2);
+        assert_eq!(posting_block_count_upper_bound(1, 6), 1);
+        assert_eq!(posting_block_count_upper_bound(0, 0), 0);
+
+        let mut saw_for = false;
+        let mut saw_bitmap = false;
+        let mut saw_partial = false;
+        for count in [1, 127, 128, 129, 384] {
+            for input in [dense_postings(count, 0), sparse_postings(count, 1_000)] {
+                let encoded = EncodedPostingList::encode(&input)?;
+                let parsed = encoded.posting_list()?;
+                let upper_bound = posting_block_count_upper_bound(
+                    encoded.doc_freq(),
+                    u64::try_from(encoded.as_bytes().len())?,
+                );
+                assert!(upper_bound >= u64::try_from(parsed.block_count())?);
+                for block in parsed.blocks() {
+                    match block.kind {
+                        PostingBlockKind::FrameOfReference => saw_for = true,
+                        PostingBlockKind::Bitmap => saw_bitmap = true,
+                        PostingBlockKind::Vint => saw_partial = true,
+                    }
+                }
+                if count == 384 {
+                    assert!(
+                        upper_bound < u64::try_from(count)?,
+                        "a normal sealed stream must not fall back to one block per row"
+                    );
+                }
+            }
+        }
+        assert!(saw_for && saw_bitmap && saw_partial);
+
+        let leaves = (0..32)
+            .map(|doc_id| EncodedPostingList::encode(&[Posting::new(doc_id, 1)]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let parts = leaves
+            .iter()
+            .map(EncodedPostingList::posting_list)
+            .collect::<Result<Vec<_>, _>>()?;
+        let merged = EncodedPostingList::concatenate(&parts.iter().collect::<Vec<_>>())?;
+        let parsed = merged.posting_list()?;
+        assert_eq!(parsed.block_count(), 32);
+        assert_eq!(
+            posting_block_count_upper_bound(
+                merged.doc_freq(),
+                u64::try_from(merged.as_bytes().len())?,
+            ),
+            32,
+            "all preserved singleton blocks belong to the bound"
+        );
+        Ok(())
     }
 
     #[test]
