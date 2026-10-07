@@ -14,6 +14,15 @@ struct Fixture {
     derived: Vec<PathBuf>,
 }
 
+/// Stream results normalized through `ScoredResult`, to compare with
+/// `serde_json::to_value` of expected hits. The stream and `to_value` spell
+/// the same f32 score differently (0.09852762520313264 vs ...263); parsing
+/// back to f32 and serializing once more makes one spelling of each value.
+fn results(value: &serde_json::Value) -> serde_json::Value {
+    let hits: Vec<ScoredResult> = serde_json::from_value(value.clone()).unwrap();
+    serde_json::to_value(hits).unwrap()
+}
+
 async fn fixture(cx: &Cx, partitioned: bool, graphs: bool) -> Fixture {
     let update::sharded_tests::Fixture {
         root,
@@ -520,7 +529,7 @@ fn keyword_server_retains_admission_after_ready_without_models_or_reopening() {
                         assert_eq!(rows[offset + seq]["request"], ordinal);
                         assert_eq!(rows[offset + seq]["id"], id);
                     }
-                    assert_eq!(rows[offset + 1]["results"], serde_json::to_value(&f.expected).unwrap());
+                    assert_eq!(results(&rows[offset + 1]["results"]), serde_json::to_value(&f.expected).unwrap());
                     assert_eq!(rows[offset + 1]["source_layout"], if partitioned { "sharded" } else { "single" });
                 }
                 assert_eq!(rows[4]["operation"], "status");
@@ -560,7 +569,7 @@ fn keyword_server_intersects_filters_before_cutoff_and_keeps_raw_quill_results()
             let pages = rows.iter().filter(|row| row["event"] == "results").collect::<Vec<_>>();
             assert_eq!(pages.len(), 4);
             for page in &pages[..2] {
-                assert_eq!(page["results"], serde_json::to_value([last]).unwrap());
+                assert_eq!(results(&page["results"]), serde_json::to_value([last]).unwrap());
                 assert_eq!(page["scope"]["eligible_documents"], 1);
                 let hits: Vec<ScoredResult> = serde_json::from_value(page["results"].clone()).unwrap();
                 assert_eq!(hits[0].score.to_bits(), last.score.to_bits());
@@ -613,7 +622,7 @@ fn keyword_server_rejects_bad_and_writing_requests_without_poisoning_the_session
             assert!(row["id"].is_null());
         }
         assert_eq!(rows[10]["id"], "healthy");
-        assert_eq!(rows[11]["results"], serde_json::to_value(f.expected).unwrap());
+        assert_eq!(results(&rows[11]["results"]), serde_json::to_value(f.expected).unwrap());
         assert_eq!(rows[12]["status"], "complete");
         assert_eq!(fs::read_to_string(protected).unwrap(), "unchanged");
         assert!(!destination.exists());
@@ -667,7 +676,7 @@ fn keyword_server_deadlines_cannot_be_widened_and_expired_queries_do_not_poison_
             assert_eq!(rows[position]["budget_ms"], budget);
             assert_eq!(rows[position]["partial_results"], false);
         }
-        assert_eq!(rows[6]["results"], serde_json::to_value(f.expected).unwrap());
+        assert_eq!(results(&rows[6]["results"]), serde_json::to_value(f.expected).unwrap());
         assert_eq!(rows[7]["status"], "complete");
         assert!(!cx.is_cancel_requested());
     });
