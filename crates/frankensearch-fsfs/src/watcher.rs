@@ -2464,31 +2464,9 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
             },
         );
 
-        let mut received = false;
+        let mut skipped = 0_usize;
         match event_rx.recv_timeout(timeout) {
-            Ok(event) => {
-                received = true;
-                if let Err(error) = process_notify_result(
-                    event,
-                    policy,
-                    &context.stats,
-                    &mut pending,
-                    Some(&mount_table),
-                    &context.reconciliation,
-                ) {
-                    producer_failure = Some(error);
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                disconnected = true;
-                break;
-            }
-        }
-        while let Ok(event) = event_rx.try_recv() {
-            received = true;
-            if let Err(error) = process_notify_result(
+            Ok(event) => match process_notify_result(
                 event,
                 policy,
                 &context.stats,
@@ -2496,8 +2474,32 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
                 Some(&mount_table),
                 &context.reconciliation,
             ) {
-                producer_failure = Some(error);
+                Ok(count) => skipped += count,
+                Err(error) => {
+                    producer_failure = Some(error);
+                    break;
+                }
+            },
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                disconnected = true;
                 break;
+            }
+        }
+        while let Ok(event) = event_rx.try_recv() {
+            match process_notify_result(
+                event,
+                policy,
+                &context.stats,
+                &mut pending,
+                Some(&mount_table),
+                &context.reconciliation,
+            ) {
+                Ok(count) => skipped += count,
+                Err(error) => {
+                    producer_failure = Some(error);
+                    break;
+                }
             }
         }
         if producer_failure.is_some() {
@@ -2511,7 +2513,7 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
         };
         observe_pressure_transition(
             policy.watching_enabled,
-            received || dropped > 0,
+            skipped > 0 || dropped > 0,
             &mut pressure_was_disabled,
             &context.reconciliation,
         )?;
@@ -2588,7 +2590,7 @@ fn drain_notify_channel(
     let mut failure = None;
     while let Ok(event) = event_rx.try_recv() {
         match process_notify_result(event, policy, stats, pending, mount_table, reconciliation) {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(error) if failure.is_none() => failure = Some(error),
             Err(_) => {}
         }
@@ -2596,10 +2598,11 @@ fn drain_notify_channel(
     failure.map_or(Ok(()), Err)
 }
 
-/// Owe an authoritative rescan for every paused iteration that received or
-/// dropped a notification; the pause itself owes one where it is applied
+/// Owe an authoritative rescan for every paused iteration that skipped or
+/// dropped a change; the pause itself owes one where it is applied
 /// ([`FsWatcher::apply_pressure_state`]). This loop learns of a pause or of
-/// relief only after its receive timeout, so debt it owed for either raced the
+/// relief only after its receive timeout, so debt it owed for either, or for
+/// a notification naming no change (the owed pass's own reads), raced the
 /// ingest loop, which can resume and run the owed pass first; the late debt
 /// then ran a second full pass over every file (bd-r0cur).
 fn observe_pressure_transition(
@@ -3615,6 +3618,8 @@ fn watcher_task_error(message: impl Into<String>) -> SearchError {
     }
 }
 
+/// Queue a notification's changes, or count those pressure makes this skip.
+/// A notification that names no change, such as a read, counts nothing.
 fn process_notify_result(
     event: notify::Result<Event>,
     policy: WatcherExecutionPolicy,
@@ -3622,18 +3627,15 @@ fn process_notify_result(
     pending: &mut PendingEvents,
     mount_table: Option<&MountTable>,
     reconciliation: &ReconciliationTracker,
-) -> SearchResult<()> {
+) -> SearchResult<usize> {
+    let mut skipped = 0_usize;
     match event {
         Ok(event) => {
-            let mapped_events = map_notify_event_with_mount_table(event, mount_table);
-            if mapped_events.is_empty() {
-                return Ok(());
-            }
-
-            for watch_event in mapped_events {
+            for watch_event in map_notify_event_with_mount_table(event, mount_table) {
                 stats.mark_event(watch_event.observed_at_ms);
                 if !policy.watching_enabled {
                     stats.add_skipped(1);
+                    skipped += 1;
                     continue;
                 }
                 if pending.push(watch_event) {
@@ -3652,7 +3654,7 @@ fn process_notify_result(
             return Err(watcher_error(&error));
         }
     }
-    Ok(())
+    Ok(skipped)
 }
 
 fn prepare_event_batch(
@@ -9153,6 +9155,41 @@ mod tests {
             .map(|event| event.path.clone())
             .collect::<BTreeSet<_>>();
         assert_eq!(drained, BTreeSet::from([event.path, channel_path]));
+        assert!(pending.by_path.is_empty());
+    }
+
+    #[test]
+    fn a_paused_watcher_counts_skipped_changes_not_reads() {
+        let stats = WatcherStatsInner::default();
+        let mut pending = PendingEvents::default();
+        let reconciliation: ReconciliationTracker =
+            Arc::new(Mutex::new(ReconciliationState::default()));
+        let paused = WatcherExecutionPolicy::for_pressure(PressureState::Emergency, 500, 10);
+        let mut process = |kind| {
+            super::process_notify_result(
+                Ok(Event::new(kind).add_path(PathBuf::from("/tmp/repo/src/lib.rs"))),
+                paused,
+                &stats,
+                &mut pending,
+                None,
+                &reconciliation,
+            )
+            .unwrap()
+        };
+        // notify watches IN_OPEN, so the owed pass reports opening every file.
+        // Those opens must not owe another pass.
+        assert_eq!(
+            process(EventKind::Access(notify::event::AccessKind::Open(
+                notify::event::AccessMode::Any
+            ))),
+            0
+        );
+        assert_eq!(
+            process(EventKind::Modify(ModifyKind::Data(
+                notify::event::DataChange::Content
+            ))),
+            1
+        );
         assert!(pending.by_path.is_empty());
     }
 
