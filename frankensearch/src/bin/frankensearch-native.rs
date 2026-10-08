@@ -71,6 +71,7 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--lexical-only (no model options, --mode, or reranking)]\n\
   serve  --receipt JSON [--model-dir DIR] [--mode full|fast|quality] [--limit N]\n\
          [--allow-activation] [--allow-updates] [--filter JSON] [--timeout-ms N]\n\
+         [--allow-model-migration (explicit sealed replacement models)]\n\
          [--reranker-dir DIR] [--rerank-window N]\n\
          [--lexical-only (fixed snapshot; no models or write controls)]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
@@ -145,6 +146,7 @@ struct Options {
     lexical_only: bool,
     activation: serve::ActivationPermission,
     allow_updates: bool,
+    allow_model_migration: bool,
     filter: Option<filter::Filter>,
     timeout_ms: Option<u64>,
     reranker_dir: Option<PathBuf>,
@@ -191,6 +193,7 @@ impl Options {
             lexical_only: false,
             activation: serve::ActivationPermission::Disabled,
             allow_updates: false,
+            allow_model_migration: false,
             filter: None,
             timeout_ms: None,
             reranker_dir: None,
@@ -219,6 +222,9 @@ impl Options {
                     options.activation = serve::ActivationPermission::Enabled;
                 }
                 "--allow-updates" if command == Command::Serve => options.allow_updates = true,
+                "--allow-model-migration" if command == Command::Serve => {
+                    options.allow_model_migration = true;
+                }
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
                 "--new-receipt" if matches!(command, Command::Update | Command::Rebuild) => {
                     options.new_receipt = Some(PathBuf::from(value(&mut args)?));
@@ -288,6 +294,7 @@ impl Options {
                 "--rerank-window",
                 "--allow-activation",
                 "--allow-updates",
+                "--allow-model-migration",
             ]
             .iter()
             .any(|flag| seen.contains(*flag))
@@ -736,8 +743,9 @@ async fn execute(
             )
         }
         Command::Search | Command::Serve => {
-            // Explicit local-only startup, once per process. Native inference
-            // retains this caller-owned pool, including after live activation.
+            // Ordinary requests retain startup models. Only the separate
+            // startup migration grant permits explicitly selected replacements;
+            // both old and new native models use this caller-owned pool.
             let rerank = options
                 .reranker_dir
                 .as_deref()
@@ -749,7 +757,7 @@ async fn execute(
                 options.models.as_deref(),
                 selection.quality_producer.is_some(),
                 &options.quality,
-                pool,
+                pool.clone(),
             )?;
             let index = sharded::Opened::open(cx, &selection, models).await?;
             // Index/model admission is startup work. Each accepted query starts
@@ -758,16 +766,22 @@ async fn execute(
             policy.rerank = rerank;
             if options.command == Command::Serve {
                 let live = live::Serving::new(cx, index)?;
+                let controls = serve::Controls {
+                    activation: options.activation == serve::ActivationPermission::Enabled,
+                    updates: options.allow_updates,
+                };
+                let controls = if options.allow_model_migration {
+                    controls.with_model_migrations(pool)
+                } else {
+                    controls.into()
+                };
                 return serve::run_with_controls(
                     live.borrow(),
                     cx,
                     &mut io::stdin().lock(),
                     output,
                     (options.mode, options.limit),
-                    serve::Controls {
-                        activation: options.activation == serve::ActivationPermission::Enabled,
-                        updates: options.allow_updates,
-                    },
+                    controls,
                     options.filter.as_ref(),
                     &policy,
                 )

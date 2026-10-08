@@ -1,6 +1,7 @@
 //! Warm stdio serving with explicit whole-cohort activation between requests.
-//! Every phase is flushed before the next phase is polled. No result cache,
-//! model reload, independent tier refresh, or detached request task is involved.
+//! Every phase is flushed before the next phase is polled. Ordinary requests
+//! retain warm models; explicit model migrations require a separate startup
+//! grant and install only complete admitted cohorts. No request is detached.
 
 use super::cohort::Phase as NativeSearchPhase;
 use frankensearch::native_ann::NativePhaseCandidates;
@@ -18,6 +19,9 @@ mod activation;
 
 #[path = "warm_update.rs"]
 mod warm_update;
+
+#[path = "model_migration.rs"]
+mod model_migration;
 
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
@@ -66,6 +70,36 @@ pub struct Controls {
     pub(super) updates: bool,
 }
 
+/// Optional model-loading authority is not implied by activation or indexing.
+/// Keep the caller's pool alive for replacement producers without creating a
+/// runtime or changing existing non-migration controller grants.
+pub struct SessionControls {
+    controls: Controls,
+    migration: Option<model_migration::Authority>,
+}
+
+impl From<Controls> for SessionControls {
+    fn from(controls: Controls) -> Self {
+        Self {
+            controls,
+            migration: None,
+        }
+    }
+}
+
+impl Controls {
+    #[must_use]
+    pub fn with_model_migrations(
+        self,
+        pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
+    ) -> SessionControls {
+        SessionControls {
+            controls: self,
+            migration: Some(model_migration::Authority::local(pool)),
+        }
+    }
+}
+
 // Unknown control fields cannot fall through into an unrestricted search.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -73,6 +107,7 @@ enum Message {
     Search(Request),
     Control(activation::Request),
     Update(warm_update::Request),
+    ModelMigration(model_migration::Request),
 }
 
 #[derive(Debug, Deserialize)]
@@ -338,11 +373,12 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
     defaults: (Mode, usize),
-    controls: Controls,
+    controls: impl Into<SessionControls> + Send,
     base_filter: Option<&filter::Filter>,
     policy: &query::Policy,
 ) -> Result<()> {
     let live = live.into();
+    let controls = controls.into();
     cx.checkpoint()
         .map_err(|_| bad("native serving cancelled"))?;
     if let Some(filter) = base_filter {
@@ -356,8 +392,10 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
         "documents": index.document_count(),
         "quality": index.has_quality(),
         "fast_native_hnsw": index.all_native_hnsw(false),
-        "activation_enabled": controls.activation,
-        "updates_enabled": controls.updates,
+        "activation_enabled": controls.controls.activation,
+        "updates_enabled": controls.controls.updates,
+        "model_migration_enabled": controls.migration.is_some(),
+        "model_migration_supported": matches!(&initial, live::Snapshot::Single(_)),
         "update_max_mutations": warm_update::MAX_MUTATIONS,
         "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),
@@ -411,11 +449,37 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                 .await?;
             }
             Message::Control(request) => {
-                activation::execute(live, cx, &request, ordinal, controls.activation, output)
-                    .await?;
+                activation::execute(
+                    live,
+                    cx,
+                    &request,
+                    ordinal,
+                    controls.controls.activation,
+                    output,
+                )
+                .await?;
             }
             Message::Update(request) => {
-                warm_update::execute(live, cx, request, ordinal, controls.updates, output).await?;
+                warm_update::execute(
+                    live,
+                    cx,
+                    request,
+                    ordinal,
+                    controls.controls.updates,
+                    output,
+                )
+                .await?;
+            }
+            Message::ModelMigration(request) => {
+                model_migration::execute(
+                    live,
+                    cx,
+                    &request,
+                    ordinal,
+                    controls.migration.as_ref(),
+                    output,
+                )
+                .await?;
             }
         }
     }
