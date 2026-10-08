@@ -24,6 +24,9 @@ use super::{
 };
 use crate::{Cx, IndexableDocument, ScoredResult, SearchError, SearchResult};
 
+mod migration;
+pub use migration::NativeLiveHybridMigration;
+
 /// Shared serving selection for a complete, read-only native hybrid generation.
 ///
 /// Share this handle with `Arc`. The cancel-aware lock protects only a short
@@ -224,8 +227,9 @@ impl NativeHybridSnapshot {
     /// Stage incremental source edits against this exact predecessor.
     ///
     /// No live selection lock is held and no inference or filesystem write starts.
-    /// Changing model identity or adding/removing a quality tier requires a new
-    /// live handle, rather than silently migrating this handle's query contract.
+    /// This source-update path preserves every model and required tier. Use
+    /// [`Self::begin_model_migration`] for an explicit whole-cohort model or
+    /// topology change without replacing the live handle.
     ///
     /// # Errors
     /// Has the generation, provider, membership and cancellation errors of
