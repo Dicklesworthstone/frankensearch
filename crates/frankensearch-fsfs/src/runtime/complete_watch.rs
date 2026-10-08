@@ -1,7 +1,7 @@
-//! Full-generation watch rebuilding without a serving-index writer lifetime.
+//! Complete-generation watching without a serving-index writer lifetime.
 //!
 //! Native notifications are hints, not an authoritative deletion log. A complete
-//! discovery observation drives each rebuild, and a second observation is checked
+//! discovery observation drives each update, and a second observation is checked
 //! immediately before pointer publication. This is the existing cooperative
 //! store protocol, not a filesystem snapshot or hostile-directory v2 authority.
 
@@ -23,12 +23,18 @@ use super::{
     validate_retained_catalog_path,
 };
 use crate::OutputFormat;
-use crate::config::{DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision};
+use crate::config::{
+    DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision, IngestionClass,
+};
 use crate::generation_store::{
     CompleteGenerationStore, GenerationPublication, PublishedGeneration,
 };
 use crate::mount_info::{MountTable, read_system_mounts};
 use crate::watcher::DEFAULT_DEBOUNCE_MS;
+
+// This module's parent is loaded through #[path] in the runtime include.
+#[path = "complete_watch/delta.rs"]
+mod delta;
 
 const DEBOUNCE: Duration = Duration::from_millis(DEFAULT_DEBOUNCE_MS);
 const MAX_DEBOUNCE: Duration = Duration::from_secs(5);
@@ -265,12 +271,25 @@ impl SourceRoot {
         }
         // Only what `fsfs index` would discover counts as source: an edit to a
         // gitignored or hidden file must not look like a change and rebuild.
-        let discoverable: BTreeSet<PathBuf> = index_discovery_walker(&self.path, discovery)
-            .build()
-            .filter_map(Result::ok)
-            .map(ignore::DirEntry::into_path)
-            .collect();
+        let mut discoverable = BTreeSet::new();
+        for entry in index_discovery_walker(&self.path, discovery).build() {
+            retained_search_checkpoint(cx)?;
+            let entry = entry.map_err(|source| SearchError::SubsystemError {
+                subsystem: "fsfs.complete_generation.watch.discovery",
+                source: Box::new(source),
+            })?;
+            if let Some(error) = entry.error() {
+                // A failed ignore-file read/parse is not permission to change
+                // membership under an incomplete discovery policy.
+                return Err(SearchError::SubsystemError {
+                    subsystem: "fsfs.complete_generation.watch.discovery",
+                    source: Box::new(std::io::Error::other(error.to_string())),
+                });
+            }
+            discoverable.insert(entry.into_path());
+        }
         let mut stamps = BTreeMap::new();
+        let mut classes = BTreeMap::new();
         let mut directories = BTreeMap::new();
         let mut visited = BTreeSet::new();
         let mut stack = vec![(self.path.clone(), self.directory.metadata()?)];
@@ -329,6 +348,7 @@ impl SourceRoot {
                 if metadata.is_dir() {
                     stack.push((path, metadata));
                 } else if metadata.is_file() && decision.ingestion_class.is_indexed() {
+                    classes.insert(path.clone(), decision.ingestion_class);
                     stamps.insert(path, SourceStamp::from_metadata(&metadata));
                 }
             }
@@ -343,6 +363,7 @@ impl SourceRoot {
         retained_search_checkpoint(cx)?;
         Ok(SourceObservation {
             stamps,
+            classes,
             directories,
         })
     }
@@ -351,7 +372,7 @@ impl SourceRoot {
 /// Extend the legacy scan's millisecond timestamps with inode, length, ctime
 /// and nanosecond mtime. Atomic saves and restored-mtime edits are not treated
 /// as unchanged just because their coarse timestamps happen to match.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct SourceStamp {
     device: u64,
     inode: u64,
@@ -375,6 +396,9 @@ impl SourceStamp {
 #[derive(Debug, PartialEq, Eq)]
 struct SourceObservation {
     stamps: BTreeMap<PathBuf, SourceStamp>,
+    // Policy is source authority too: equal file stamps cannot hide a changed
+    // ingestion class (for example, a mount-policy change).
+    classes: BTreeMap<PathBuf, IngestionClass>,
     directories: BTreeMap<PathBuf, (u64, u64)>,
 }
 
@@ -406,6 +430,7 @@ fn unchanged_since(
         .stamps
         .iter()
         .filter(|(path, stamp)| baseline.stamps.get(*path) == Some(*stamp))
+        .filter(|(path, _)| baseline.classes.get(*path) == current.classes.get(*path))
         .filter(|(path, _)| {
             hint.is_none_or(|hint| !hint.paths.iter().any(|hinted| path.starts_with(hinted)))
         })
@@ -659,6 +684,44 @@ impl CompleteWatchSession {
         let expected = &observed;
         let selected = self.publication.as_ref();
         let store_root = &self.store_root;
+        let precommit = move |cx: &Cx| {
+            check_backend(changes)?;
+            let current = source.observe(cx, discovery)?;
+            if &current != expected {
+                return Err(source_changed());
+            }
+            // A different publisher can win between the last poll and begin.
+            // Its receipt must never retarget this session's source baseline.
+            check_watch_publication(cx, store_root, selected)?;
+            let changes = lock_changes(changes)?;
+            changes.check_backend()?;
+            if changes.dirty.as_ref().is_some_and(|hint| {
+                touches_observed_files(hint, &current, Some(expected))
+            }) {
+                return Err(source_changed());
+            }
+            drop(changes);
+            Ok(())
+        };
+        if !force_rebuild && !self.runtime.cli_input.full_reindex
+            && let (Some(baseline), Some(selected)) = (self.baseline.as_ref(), selected)
+            && let Some(batch) = delta::prepare(
+                cx, &self.runtime, source, baseline, &observed, pending,
+            ).await?
+        {
+            // Preparation reads only the changed source bodies. Mutations use
+            // one copied successor and the SAME post-seal source admission as
+            // a rebuild. Inference, I/O and precommit errors propagate: none
+            // may be retried as a weaker or partially successful rebuild.
+            let outcome = self.runtime.apply_retained_source_batch_with_precommit(
+                cx, store_root, selected, batch, &precommit,
+            ).await?;
+            if let Some(publication) = outcome.publication {
+                return Ok(Some((observed, publication)));
+            }
+            // Only absent deletions can reach this no-op outcome. Reconcile
+            // through the ordinary builder before advancing source authority.
+        }
         // The selected generation was built from the baseline (its precommit
         // saw the same observation), so files whose stamps still match it are
         // carried forward rather than reread; a forced rebuild rereads all.
@@ -673,30 +736,7 @@ impl CompleteWatchSession {
         };
         let runtime = carrying.as_deref().unwrap_or(&self.runtime);
         let publication = runtime
-            .rebuild_retained_generation_with_precommit(cx, &self.store_root, move |cx| {
-                check_backend(changes)?;
-                let current = source.observe(cx, discovery)?;
-                if &current != expected {
-                    return Err(source_changed());
-                }
-                // A different publisher can win between the last poll and
-                // this build's begin(). Its receipt cannot retarget our baseline.
-                check_watch_publication(cx, store_root, selected)?;
-                // On a coarse-timestamp filesystem even ctime can match. A
-                // queued in-scope content hint is still evidence of a raced
-                // build, and must not be acknowledged by this publication.
-                let changes = lock_changes(changes)?;
-                changes.check_backend()?;
-                if changes
-                    .dirty
-                    .as_ref()
-                    .is_some_and(|hint| touches_observed_files(hint, &current, Some(expected)))
-                {
-                    return Err(source_changed());
-                }
-                drop(changes);
-                Ok(())
-            })
+            .rebuild_retained_generation_with_precommit(cx, &self.store_root, precommit)
             .await?
             .0;
         Ok(Some((observed, publication)))
@@ -766,9 +806,12 @@ impl FsfsRuntime {
     /// validates source membership/metadata before selection. Source and store
     /// must be disjoint; an incomplete scan is never an authoritative deletion.
     ///
-    /// Existing retained readers remain usable throughout this future. This is
-    /// a replacement-build route using eligible checkpoint-proven embedding
-    /// reuse, not delta-only discovery or legacy-watch migration.
+    /// Existing retained readers remain usable throughout this future. Bounded
+    /// UTF-8 text changes use an atomic mixed batch; unchanged documents are not
+    /// reread or embedded. Startup, forced reconciliation, unsupported extraction
+    /// and oversized changes retain the full rebuild route. Both routes still
+    /// scan discovery authority and copy/seal a whole independent generation;
+    /// this is not delta-only discovery or a sublinear publication guarantee.
     /// The sink runs only after durable publication; its error cannot roll that
     /// publication back. Visibility with uncertain durability returns an explicit
     /// error and stops instead of emitting a false durable receipt.
@@ -856,6 +899,7 @@ mod tests {
                 .into_iter()
                 .map(|(path, stamp)| (PathBuf::from(path), stamp))
                 .collect(),
+            classes: BTreeMap::new(),
             directories: BTreeMap::new(),
         };
         let baseline = observation(vec![
