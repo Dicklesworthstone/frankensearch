@@ -2448,8 +2448,10 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
             },
         );
 
+        let mut received = false;
         match event_rx.recv_timeout(timeout) {
             Ok(event) => {
+                received = true;
                 if let Err(error) = process_notify_result(
                     event,
                     policy,
@@ -2469,6 +2471,7 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
             }
         }
         while let Ok(event) = event_rx.try_recv() {
+            received = true;
             if let Err(error) = process_notify_result(
                 event,
                 policy,
@@ -2485,13 +2488,18 @@ fn run_producer_loop(context: &ProducerContext) -> SearchResult<()> {
             break;
         }
 
+        let dropped = if policy.watching_enabled {
+            0
+        } else {
+            pending.clear()
+        };
         observe_pressure_transition(
             policy.watching_enabled,
+            received || dropped > 0,
             &mut pressure_was_disabled,
             &context.reconciliation,
         )?;
         if !policy.watching_enabled {
-            let dropped = pending.clear();
             if dropped > 0 {
                 context.stats.add_skipped(dropped);
                 context.stats.events_dropped_pressure.fetch_add(
@@ -2572,16 +2580,23 @@ fn drain_notify_channel(
     failure.map_or(Ok(()), Err)
 }
 
+/// Owe an authoritative rescan for the notifications pressure makes this loop
+/// drop: once when watching pauses, and again for every paused iteration that
+/// received or dropped one. Relief owes nothing more. Owing the rescan on
+/// relief instead raced the ingest loop, which can see relief first and finish
+/// the owed pass up to one receive timeout before this loop does; the late
+/// debt then ran a second full pass over every file (bd-r0cur).
 fn observe_pressure_transition(
     watching_enabled: bool,
+    dropped: bool,
     pressure_was_disabled: &mut bool,
     reconciliation: &ReconciliationTracker,
 ) -> SearchResult<()> {
-    if !watching_enabled {
-        *pressure_was_disabled = true;
-    } else if std::mem::take(pressure_was_disabled) {
+    if watching_enabled {
+        *pressure_was_disabled = false;
+    } else if !std::mem::replace(pressure_was_disabled, true) || dropped {
         lock_or_recover(reconciliation).require_full_scan()?;
-        debug!("pressure relieved; requiring authoritative watcher rescan");
+        debug!("pressure paused watching; requiring authoritative watcher rescan");
     }
     Ok(())
 }
@@ -9314,20 +9329,39 @@ mod tests {
     }
 
     #[test]
-    fn pressure_recovery_requires_an_authoritative_rescan() {
+    fn pressure_owes_one_rescan_when_it_pauses_watching_not_when_it_lifts() {
         let reconciliation: ReconciliationTracker =
             Arc::new(Mutex::new(ReconciliationState::default()));
         let mut pressure_was_disabled = false;
+        let settle = || lock_or_recover(&reconciliation).required = false;
 
-        observe_pressure_transition(false, &mut pressure_was_disabled, &reconciliation)
-            .expect("disabling pressure does not advance reconciliation");
+        observe_pressure_transition(false, false, &mut pressure_was_disabled, &reconciliation)
+            .expect("pausing has an available epoch");
         assert!(pressure_was_disabled);
-        assert!(!lock_or_recover(&reconciliation).required);
-        observe_pressure_transition(true, &mut pressure_was_disabled, &reconciliation)
-            .expect("re-enabling pressure has an available epoch");
-
+        assert!(
+            lock_or_recover(&reconciliation).required,
+            "notifications are dropped from the pause on, so the rescan is owed then"
+        );
+        settle();
+        observe_pressure_transition(false, false, &mut pressure_was_disabled, &reconciliation)
+            .unwrap();
+        assert!(
+            !lock_or_recover(&reconciliation).required,
+            "a quiet paused iteration owes nothing new"
+        );
+        observe_pressure_transition(false, true, &mut pressure_was_disabled, &reconciliation)
+            .unwrap();
+        assert!(
+            lock_or_recover(&reconciliation).required,
+            "a dropped notification is owed a rescan"
+        );
+        // The ingest loop may see relief first and settle the debt before this
+        // loop notices; noticing relief must not owe a second full pass.
+        settle();
+        observe_pressure_transition(true, false, &mut pressure_was_disabled, &reconciliation)
+            .unwrap();
         assert!(!pressure_was_disabled);
-        assert!(lock_or_recover(&reconciliation).required);
+        assert!(!lock_or_recover(&reconciliation).required);
     }
 
     #[test]
