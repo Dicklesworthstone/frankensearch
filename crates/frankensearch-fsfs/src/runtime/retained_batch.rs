@@ -82,8 +82,36 @@ pub(super) struct SourceAttributes {
 }
 
 /// Prepared source input owns only the changed documents. Preparation performs
-/// no filesystem or model work and never changes publication state.
-pub(super) struct SourceBatch(PreparedBatch);
+/// no filesystem or model work and never changes publication state. A source
+/// owner may attach additional evidence that must still hold after the common
+/// post-seal precommit check, before the pointer is changed.
+pub(super) struct SourceBatch {
+    documents: PreparedBatch,
+    source_check: Option<SourceCheck>,
+}
+
+type SourceCheck = Box<dyn FnOnce(&Cx) -> SearchResult<()> + Send>;
+
+impl SourceBatch {
+    /// Keep source-only authority out of the public opaque-document API. Checks
+    /// compose instead of replacing previously attached evidence, and all stay
+    /// owned by this batch; dropping a build never runs them independently.
+    #[must_use]
+    pub(super) fn with_source_check<F>(mut self, check: F) -> Self
+    where
+        F: FnOnce(&Cx) -> SearchResult<()> + Send + 'static,
+    {
+        let previous = self.source_check.take();
+        self.source_check = Some(Box::new(move |cx| {
+            if let Some(previous) = previous {
+                previous(cx)?;
+            }
+            retained_search_checkpoint(cx)?;
+            check(cx)
+        }));
+        self
+    }
+}
 
 pub(super) fn prepare_source_batch(
     cx: &Cx,
@@ -98,7 +126,10 @@ pub(super) fn prepare_source_batch(
         Err(error) => return Err(error),
     };
     attach_sources(cx, &mut documents, sources)?;
-    Ok(Some(SourceBatch(documents)))
+    Ok(Some(SourceBatch {
+        documents,
+        source_check: None,
+    }))
 }
 
 impl Body {
@@ -422,8 +453,22 @@ impl FsfsRuntime {
     where
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
-        self.apply_prepared_retained_batch(cx, store_root, expected, batch.0, precommit)
-            .await
+        let SourceBatch {
+            documents,
+            source_check,
+        } = batch;
+        self.apply_prepared_retained_batch(cx, store_root, expected, documents, move |cx| {
+            // Discovery/backend/selection admission remains first. Additional
+            // source evidence cannot override a failure or acknowledge a source
+            // recreated during that admission, even when discovery hides it.
+            precommit(cx)?;
+            retained_search_checkpoint(cx)?;
+            if let Some(check) = source_check {
+                check(cx)?;
+            }
+            retained_search_checkpoint(cx)
+        })
+        .await
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]

@@ -525,3 +525,334 @@ fn unreadable_ignore_policy_is_not_an_authoritative_membership_observation() {
         assert!(source.observe(&cx, &DiscoveryConfig::default()).is_err());
     });
 }
+
+#[test]
+fn removal_absence_requires_not_found_and_preserves_cancellation() {
+    use std::os::unix::fs::symlink;
+
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let file = directory.path().join("file");
+        let folder = directory.path().join("folder");
+        let link = directory.path().join("dangling");
+        fs::write(&file, "present source").unwrap();
+        fs::create_dir(&folder).unwrap();
+        symlink(&missing, &link).unwrap();
+        assert!(physically_absent(&cx, &missing).unwrap());
+        for path in [&file, &folder, &link] {
+            assert!(!physically_absent(&cx, path).unwrap());
+            assert!(is_source_changed(
+                &recheck_removals(&cx, &[path.to_path_buf()]).unwrap_err()
+            ));
+        }
+        assert!(matches!(
+            physically_absent(&cx, &file.join("child")),
+            Err(SearchError::Io(error)) if error.kind() != ErrorKind::NotFound
+        ));
+        cx.set_cancel_requested(true);
+        let cancelled = physically_absent(&cx, &missing);
+        cx.set_cancel_requested(false);
+        assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+    });
+}
+
+#[test]
+fn excluded_or_replaced_sources_fall_back_before_candidate_allocation() {
+    use std::os::unix::fs::symlink;
+
+    run_test_with_cx(|cx| async move {
+        for replacement in ["ignored", "directory", "dangling"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source_path, root) = fixture(directory.path());
+            let source = SourceRoot::open(fs::canonicalize(&source_path).unwrap()).unwrap();
+            let before = source.observe(&cx, &runtime.config.discovery).unwrap();
+            let path = source.path.join("alpha.md");
+            if replacement == "ignored" {
+                fs::write(source.path.join(".ignore"), "alpha.md\n").unwrap();
+            } else {
+                fs::rename(&path, directory.path().join("preserved-alpha.md")).unwrap();
+                if replacement == "directory" {
+                    fs::create_dir(&path).unwrap();
+                } else {
+                    symlink("missing-target", &path).unwrap();
+                }
+            }
+            let after = source.observe(&cx, &runtime.config.discovery).unwrap();
+            assert!(before.stamps.contains_key(&path));
+            assert!(!after.stamps.contains_key(&path));
+            assert!(
+                prepare(&cx, &runtime, &source, &before, &after, None)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{replacement} must use normal reconciliation"
+            );
+            assert!(fs::symlink_metadata(&path).is_ok());
+            assert!(!root.exists());
+        }
+    });
+}
+
+#[test]
+fn removal_delta_keeps_forced_indexing_and_pressure_policies_on_the_normal_route() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, source_path, root) = fixture(directory.path());
+        let source = SourceRoot::open(fs::canonicalize(&source_path).unwrap()).unwrap();
+        let before = source.observe(&cx, &runtime.config.discovery).unwrap();
+        fs::rename(
+            source.path.join("alpha.md"),
+            directory.path().join("preserved-alpha.md"),
+        )
+        .unwrap();
+        let after = source.observe(&cx, &runtime.config.discovery).unwrap();
+        for mode in [
+            DegradationOverrideMode::ForceLexicalOnly,
+            DegradationOverrideMode::ForceMetadataOnly,
+            DegradationOverrideMode::ForceEmbedDeferred,
+        ] {
+            let mut guarded = runtime.clone();
+            guarded.config.pressure.degradation_override = mode;
+            assert!(
+                prepare(&cx, &guarded, &source, &before, &after, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let mut forced = runtime.clone();
+        forced.cli_input.full_reindex = true;
+        assert!(
+            prepare(&cx, &forced, &source, &before, &after, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            prepare(&cx, &runtime, &source, &before, &after, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(!root.exists(), "preparation must not initialize a store");
+    });
+}
+
+#[test]
+fn recreated_ignored_source_vetoes_a_sealed_removal_and_preserves_old_readers() {
+    use std::os::unix::fs::symlink;
+
+    use crate::generation_store::{COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER};
+
+    run_test_with_cx(|cx| async move {
+        for replacement in ["file", "directory", "dangling"] {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let mut session = controlled_session(&runtime, &cx, &root);
+            let old = initial(&mut session, &cx).await;
+            let mut pinned = lexical_reader(&runtime)
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let path = source.join("alpha.md");
+            fs::rename(&path, directory.path().join("preserved-alpha.md")).unwrap();
+            fs::write(source.join(".ignore"), "alpha.md\n").unwrap();
+            let observed = session
+                .source
+                .observe(&cx, &runtime.config.discovery)
+                .unwrap();
+            let batch = prepare(
+                &cx,
+                &runtime,
+                &session.source,
+                session.baseline.as_ref().unwrap(),
+                &observed,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let result = runtime
+                .apply_retained_source_batch_with_precommit(&cx, &root, &old, batch, |cx| {
+                    match replacement {
+                        "file" => fs::write(&path, "recreated source must survive")?,
+                        "directory" => fs::create_dir(&path)?,
+                        _ => symlink("missing-target", &path)?,
+                    }
+                    // The usual observation agrees because .ignore hides the
+                    // recreated path. The attached check must run AFTER this.
+                    assert_eq!(
+                        session.source.observe(cx, &runtime.config.discovery)?,
+                        observed
+                    );
+                    Ok(())
+                })
+                .await;
+            assert!(is_source_changed(&result.unwrap_err()), "{replacement}");
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_eq!(store.active(&cx).unwrap().as_ref(), Some(&old));
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert!(fs::symlink_metadata(&path).is_ok());
+            assert!(directory.path().join("preserved-alpha.md").is_file());
+            let candidates = fs::read_dir(root.join("generations"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path != old.path())
+                .collect::<Vec<_>>();
+            assert_eq!(candidates.len(), 1);
+            assert!(candidates[0].join(COMPLETE_GENERATION_MANIFEST).is_file());
+            assert_eq!(
+                pinned
+                    .search(&cx, "obsoleteword", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(pinned.generation(), &old);
+            drop(store.begin(&cx).unwrap());
+        }
+    });
+}
+
+#[test]
+fn common_precommit_errors_and_cancellation_never_run_extra_source_checks() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    run_test_with_cx(|cx| async move {
+        for cancel in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let mut session = controlled_session(&runtime, &cx, &root);
+            let old = initial(&mut session, &cx).await;
+            fs::rename(
+                source.join("alpha.md"),
+                directory.path().join("preserved-alpha.md"),
+            )
+            .unwrap();
+            let observed = session
+                .source
+                .observe(&cx, &runtime.config.discovery)
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let witness = Arc::clone(&calls);
+            let batch = prepare(
+                &cx,
+                &runtime,
+                &session.source,
+                session.baseline.as_ref().unwrap(),
+                &observed,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .with_source_check(move |_| {
+                witness.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            let result = runtime
+                .apply_retained_source_batch_with_precommit(&cx, &root, &old, batch, |cx| {
+                    if cancel {
+                        cx.set_cancel_requested(true);
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            ErrorKind::PermissionDenied,
+                            "injected backend refusal",
+                        )
+                        .into())
+                    }
+                })
+                .await;
+            cx.set_cancel_requested(false);
+            let error = result.unwrap_err();
+            if cancel {
+                assert!(matches!(error, SearchError::Cancelled { .. }));
+            } else {
+                assert!(matches!(error, SearchError::Io(error)
+                    if error.kind() == ErrorKind::PermissionDenied
+                        && error.to_string() == "injected backend refusal"));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(old));
+            drop(store.begin(&cx).unwrap());
+        }
+    });
+}
+
+#[test]
+fn guarded_removal_publishes_once_after_all_source_checks_in_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, source, root) = fixture(directory.path());
+        let mut session = controlled_session(&runtime, &cx, &root);
+        let old = initial(&mut session, &cx).await;
+        let before = FsfsRuntime::read_matching_manifest_generation(old.path())
+            .unwrap()
+            .unwrap();
+        fs::rename(
+            source.join("alpha.md"),
+            directory.path().join("preserved-alpha.md"),
+        )
+        .unwrap();
+        let observed = session
+            .source
+            .observe(&cx, &runtime.config.discovery)
+            .unwrap();
+        let order = Arc::new(AtomicUsize::new(0));
+        let witness = Arc::clone(&order);
+        let batch = prepare(
+            &cx,
+            &runtime,
+            &session.source,
+            session.baseline.as_ref().unwrap(),
+            &observed,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .with_source_check(move |_| {
+            assert_eq!(witness.swap(2, Ordering::SeqCst), 1);
+            Ok(())
+        });
+        let outcome = runtime
+            .apply_retained_source_batch_with_precommit(&cx, &root, &old, batch, |_| {
+                assert_eq!(order.swap(1, Ordering::SeqCst), 0);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!((outcome.upserted, outcome.deleted), (0, 1));
+        let next = require_durable_publication(outcome.publication.unwrap()).unwrap();
+        assert_eq!(order.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 2);
+        let manifests = FsfsRuntime::read_matching_manifest_generation(next.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            manifests.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["stable.md"]
+        );
+        assert_eq!(
+            serde_json::to_value(&manifests["stable.md"]).unwrap(),
+            serde_json::to_value(&before["stable.md"]).unwrap()
+        );
+        assert!(old.path().is_dir());
+        assert!(directory.path().join("preserved-alpha.md").is_file());
+        let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+        assert_eq!(store.active(&cx).unwrap(), Some(next));
+    });
+}

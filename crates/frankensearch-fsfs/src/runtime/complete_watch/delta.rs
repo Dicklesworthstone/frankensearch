@@ -16,7 +16,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use super::{
     DirtyWindow, SourceObservation, SourceRoot, SourceStamp, observation_io, source_changed,
 };
-use crate::config::IngestionClass;
+use crate::config::{DegradationOverrideMode, IngestionClass};
 use crate::file_classification::{DetectedType, IngestAction};
 use crate::runtime::retained_batch::{
     RetainedMutation, SourceAttributes, SourceBatch, prepare_source_batch,
@@ -121,6 +121,30 @@ fn source_id(root: &Path, path: &Path) -> Option<String> {
     unambiguous_source(root, path).then(|| normalize_file_key_for_index(path, root))
 }
 
+/// Discovery exclusion is not physical absence. A directory, special file or
+/// dangling symlink replacing an indexed source keeps the full indexer's policy
+/// path; only NotFound admits an incremental removal. Never swallow I/O errors.
+fn physically_absent(cx: &Cx, path: &Path) -> SearchResult<bool> {
+    retained_search_checkpoint(cx)?;
+    let metadata = fs::symlink_metadata(path);
+    retained_search_checkpoint(cx)?;
+    match metadata {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+        Ok(_) => Ok(false),
+    }
+}
+
+fn recheck_removals(cx: &Cx, paths: &[PathBuf]) -> SearchResult<()> {
+    retained_search_checkpoint(cx)?;
+    for path in paths {
+        if !physically_absent(cx, path)? {
+            return Err(source_changed());
+        }
+    }
+    retained_search_checkpoint(cx)
+}
+
 /// Read exactly the observed regular file, with before/after descriptor and
 /// pathname stamps. `O_NONBLOCK` prevents a raced FIFO from hanging the lane.
 /// This runs on Asupersync's existing blocking pool, not a detached worker.
@@ -186,9 +210,12 @@ pub(super) async fn prepare(
     hint: Option<&DirtyWindow>,
 ) -> SearchResult<Option<SourceBatch>> {
     retained_search_checkpoint(cx)?;
-    // Link aliases and external subtrees require the full indexer's discovery
-    // treatment. They must not create ambiguous deletion/update identities.
-    if runtime.config.discovery.follow_symlinks {
+    // Forced indexing, explicit degradation and link aliases retain the normal
+    // indexer's admission/policy path. A delta must not bypass those controls.
+    if runtime.cli_input.full_reindex
+        || runtime.config.pressure.degradation_override != DegradationOverrideMode::Auto
+        || runtime.config.discovery.follow_symlinks
+    {
         return Ok(None);
     }
     // An untouched lossy name can collide with a changed valid name. Reject
@@ -225,11 +252,16 @@ pub(super) async fn prepare(
             ) {
                 return Ok(None);
             }
+        } else if !physically_absent(cx, path)? {
+            // An ignore-policy change or a replacement with an unindexed type
+            // requires normal reconciliation, not a claimed physical deletion.
+            return Ok(None);
         }
     }
     source.check()?;
     let mut operations = Vec::with_capacity(paths.len());
     let mut attributes = BTreeMap::new();
+    let mut removals = Vec::new();
     for path in paths {
         retained_search_checkpoint(cx)?;
         let Some(id) = source_id(&source.path, &path) else {
@@ -237,8 +269,10 @@ pub(super) async fn prepare(
         };
         let Some(stamp) = current.stamps.get(&path) else {
             // A deletion comes from two complete observations, never from the
-            // kind or ordering of a native notification.
+            // kind or ordering of a native notification. Retain its exact path
+            // for the final physical-absence check, not a normalized ID alias.
             operations.push(RetainedMutation::Delete { id });
+            removals.push(path);
             continue;
         };
         let task_cx = cx.clone();
@@ -288,7 +322,15 @@ pub(super) async fn prepare(
         operations.push(RetainedMutation::Upsert { id, text });
     }
     source.check()?;
-    prepare_source_batch(cx, &operations, &attributes)
+    let Some(batch) = prepare_source_batch(cx, &operations, &attributes)? else {
+        return Ok(None);
+    };
+    Ok(Some(batch.with_source_check(move |cx| {
+        // Run AFTER the owner's post-seal observation. A recreated file hidden
+        // by an ignore rule can leave that observation unchanged; it still
+        // invalidates the removal evidence. At most 128 paths are retained.
+        recheck_removals(cx, &removals)
+    })))
 }
 
 #[cfg(test)]
