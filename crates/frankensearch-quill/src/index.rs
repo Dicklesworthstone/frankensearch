@@ -24389,13 +24389,20 @@ mod tests {
                 .collect::<Vec<_>>();
             let mut index = QuillIndex::in_memory(QuillConfig {
                 query_fuel_budget: FUEL_BUDGET,
+                max_visibility_lag_ms: u64::MAX,
                 ..deterministic_config()
             })
             .expect("create physical-work fuel index");
-            index
-                .index_documents(&cx, &documents)
-                .await
-                .expect("stage physical-work documents");
+            // One batch this large takes the fixed four-way internal ingest
+            // and seals four segments; batches below its threshold accumulate
+            // into the single deterministic shard, so the commit seals one
+            // (and no visibility barrier seals early on a slow host).
+            for batch in documents.chunks(PARALLEL_INGEST_MIN_DOCS_PER_SHARD - 1) {
+                index
+                    .index_documents(&cx, batch)
+                    .await
+                    .expect("stage physical-work documents");
+            }
             index
                 .commit(&cx)
                 .await
