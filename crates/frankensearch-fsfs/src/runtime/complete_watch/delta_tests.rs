@@ -9,7 +9,7 @@ use super::super::{
     require_durable_publication,
 };
 use super::*;
-use crate::config::DiscoveryConfig;
+use crate::config::{DegradationOverrideMode, DiscoveryConfig};
 use crate::generation_store::{CompleteGenerationStore, PublishedGeneration};
 use crate::{CliCommand, CliInput, FsfsConfig, OutputFormat};
 
@@ -201,6 +201,15 @@ fn fixture(parent: &Path) -> (FsfsRuntime, PathBuf, PathBuf) {
     (runtime, source, root)
 }
 
+/// Readers for the model-free fixture: a semantic-capable build serves a
+/// lexical-only generation only under an explicit lexical-only override
+/// (`complete_lexical_only_generation_serves_search_append_and_compact`).
+fn lexical_reader(runtime: &FsfsRuntime) -> FsfsRuntime {
+    let mut reader = runtime.clone();
+    reader.config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+    reader
+}
+
 // `_watcher` only keeps the production watcher alive; tests detach it here.
 #[allow(clippy::used_underscore_binding)]
 fn controlled_session(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> CompleteWatchSession {
@@ -233,7 +242,10 @@ fn watcher_batches_edit_add_delete_and_rename_without_reindexing_unchanged_rows(
         let (runtime, source, root) = fixture(directory.path());
         let mut session = controlled_session(&runtime, &cx, &root);
         let old = initial(&mut session, &cx).await;
-        let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+        let mut pinned = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
         let before = FsfsRuntime::read_matching_manifest_generation(old.path())
             .unwrap()
             .unwrap();
@@ -266,7 +278,10 @@ fn watcher_batches_edit_add_delete_and_rename_without_reindexing_unchanged_rows(
             ))
             .unwrap()
         );
-        let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+        let mut reader = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
         assert_eq!(
             reader
                 .search(&cx, "replacementword", 10)
@@ -321,7 +336,10 @@ fn watcher_batches_edit_add_delete_and_rename_without_reindexing_unchanged_rows(
             manifests.keys().map(String::as_str).collect::<Vec<_>>(),
             ["renamed.md", "stable.md"]
         );
-        let mut current = runtime.open_retained_search(&cx, &root).await.unwrap();
+        let mut current = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
         let results = current.search(&cx, "addedword", 10).await.unwrap();
         assert!(results.last().unwrap().hits[0].path.ends_with("renamed.md"));
         assert_eq!(pinned.generation(), &old);
@@ -373,7 +391,10 @@ fn periodic_scan_finds_missed_edits_while_forced_and_unsupported_changes_rebuild
                 .command,
             "retained-batch"
         );
-        let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+        let mut reader = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
         assert!(
             reader
                 .search(&cx, "periodicword", 10)
