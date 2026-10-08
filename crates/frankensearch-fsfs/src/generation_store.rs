@@ -15,7 +15,7 @@
 //! publication-lease protocol. Synchronous filesystem work belongs on a caller's
 //! blocking lane. No new runtime or detached worker is created here.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
@@ -477,8 +477,9 @@ pub(crate) fn reject_published_write(root: &Path) -> SearchResult<()> {
 
 /// Predecessors a complete-generation command keeps after it publishes.
 ///
-/// Each generation is a full copy, so one keeps a settled store near twice a
-/// fresh build while leaving the previous generation available to restore.
+/// A generation copies its predecessor except for the keyword segments the
+/// two share, so one keeps a settled store under twice a fresh build while
+/// leaving the previous generation available to restore.
 pub const RETAINED_PREDECESSORS: usize = 1;
 
 /// What a complete-generation command does with superseded generations after
@@ -534,7 +535,9 @@ pub struct RetentionPlan {
 pub struct ReclaimableGeneration {
     /// Generation identifier (its directory name).
     pub id: String,
-    /// Bytes its directory tree holds.
+    /// Bytes removing it frees: a file it shares with a kept generation is not
+    /// counted, and one several reclaimable generations share counts once,
+    /// for the oldest.
     pub bytes: u64,
     /// False for an abandoned build that never sealed an inventory.
     pub sealed: bool,
@@ -545,7 +548,7 @@ pub struct ReclaimableGeneration {
 pub struct RetentionReport {
     /// Removed generation identifiers, oldest first.
     pub removed: Vec<String>,
-    /// Bytes the removed directory trees held.
+    /// Bytes the removed generations held (see [`ReclaimableGeneration::bytes`]).
     pub reclaimed_bytes: u64,
     /// Reclaimable generations a live reader still pins.
     pub pinned: Vec<String>,
@@ -602,20 +605,30 @@ impl CompleteGenerationStore {
         // are serialized by the publication lease, so this is publication order.
         sealed.sort_unstable_by(|left, right| right.cmp(left));
         let older = sealed.split_off(keep_predecessors.min(sealed.len()));
-        let mut reclaimable = Vec::with_capacity(older.len() + abandoned.len());
-        for (id, is_sealed) in older
+        let mut candidates = older
             .into_iter()
             .map(|id| (id, true))
             .chain(abandoned.into_iter().map(|id| (id, false)))
-        {
-            let bytes = tree_bytes(cx, &parent.join(&id), 0)?;
+            .collect::<Vec<_>>();
+        candidates.sort_unstable();
+        // Shared segments the kept generations link are freed by no removal.
+        let mut counted = HashSet::new();
+        for id in active.iter().chain(&sealed) {
+            match tree_bytes(cx, &parent.join(id), 0, &mut counted) {
+                Ok(_) => {}
+                Err(SearchError::Io(error)) if error.kind() == ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let mut reclaimable = Vec::with_capacity(candidates.len());
+        for (id, is_sealed) in candidates {
+            let bytes = tree_bytes(cx, &parent.join(&id), 0, &mut counted)?;
             reclaimable.push(ReclaimableGeneration {
                 id,
                 bytes,
                 sealed: is_sealed,
             });
         }
-        reclaimable.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         Ok(RetentionPlan {
             active,
             retained: sealed,
@@ -867,7 +880,14 @@ fn exclusive_pin(root: &Path, id: &str) -> SearchResult<Option<File>> {
 }
 
 /// Bytes held by regular files under `directory`, without following symlinks.
-fn tree_bytes(cx: &Cx, directory: &Path, depth: usize) -> SearchResult<u64> {
+/// A file with several links counts only if `counted` lacks its inode, which
+/// it then records.
+fn tree_bytes(
+    cx: &Cx,
+    directory: &Path,
+    depth: usize,
+    counted: &mut HashSet<(u64, u64)>,
+) -> SearchResult<u64> {
     checkpoint(cx)?;
     if depth > MAX_TREE_DEPTH {
         return Err(invalid(directory, "generation tree exceeds depth limit"));
@@ -877,11 +897,17 @@ fn tree_bytes(cx: &Cx, directory: &Path, depth: usize) -> SearchResult<u64> {
         let entry = entry?;
         let metadata = fs::symlink_metadata(entry.path())?;
         if metadata.is_dir() {
-            total = total.saturating_add(tree_bytes(cx, &entry.path(), depth + 1)?);
+            total = total.saturating_add(tree_bytes(cx, &entry.path(), depth + 1, counted)?);
         } else if metadata.is_file() {
+            #[cfg(unix)]
+            if metadata.nlink() > 1 && !counted.insert((metadata.dev(), metadata.ino())) {
+                continue;
+            }
             total = total.saturating_add(metadata.len());
         }
     }
+    #[cfg(not(unix))]
+    let _ = counted;
     Ok(total)
 }
 
@@ -1013,8 +1039,9 @@ fn hash_file(cx: &Cx, path: &Path) -> SearchResult<(u64, String)> {
 /// tick as the previous one cannot go unseen. A new process starts empty and
 /// reads every byte. What a memo gives up is noticing media corruption between
 /// two passes in one process, which a re-read served from the page cache
-/// rarely could; the seed copy, which reads every byte of its predecessor,
-/// still checks them against the sealed inventory.
+/// rarely could; the seed copy still checks every byte it reads against the
+/// sealed inventory, and a segment it links instead gets a new ctime, so the
+/// predecessor's admission that follows the seeding hashes it again.
 #[cfg(unix)]
 mod digest_memo {
     use std::collections::HashMap;
@@ -1219,15 +1246,26 @@ fn open_regular(path: &Path) -> SearchResult<File> {
         return Err(invalid(path, "expected a regular file"));
     }
     // Never admit a generation whose bytes alias a mutable external file or
-    // another generation through a hard link.
+    // another generation through a hard link. A Quill segment is the one
+    // exception: Quill writes it once and afterwards only renames or unlinks
+    // it, so a successor seeded from its predecessor shares it (bd-dnqgr),
+    // and every inventory pass still authenticates its bytes.
     #[cfg(unix)]
-    if metadata.nlink() != 1 {
+    if metadata.nlink() != 1 && !path.file_name().is_some_and(is_quill_segment_name) {
         return Err(invalid(
             path,
             "hard-linked bundle artifacts are unsupported",
         ));
     }
     Ok(file)
+}
+
+/// Whether `name` is a published Quill segment, `seg-<16 lowercase hex>.fslx`.
+pub(crate) fn is_quill_segment_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix("seg-"))
+        .and_then(|name| name.strip_suffix(".fslx"))
+        .is_some_and(|id| hex(id, 16))
 }
 
 fn require_directory(path: &Path) -> SearchResult<()> {
@@ -2302,6 +2340,100 @@ mod tests {
             assert!(build.publish(&cx, |_, _| Ok(())).is_err());
             assert!(store.active(&cx).unwrap().is_none());
             assert_eq!(fs::read_to_string(external).unwrap(), "mutable");
+        });
+    }
+
+    #[test]
+    fn generations_share_only_quill_segments_and_retention_counts_each_once() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let segment = |id: u64| format!("lexical/quill-v1/seg-{id:016x}.fslx");
+            // Each build shares its predecessor's newest segment, as a seed does.
+            let mut generations: Vec<PublishedGeneration> = Vec::new();
+            for (id, length) in [(1_u64, 100_usize), (2, 1000), (3, 0)] {
+                let build = store.begin(&cx).unwrap();
+                fs::create_dir_all(build.path().join("lexical/quill-v1")).unwrap();
+                fs::write(build.path().join("content.txt"), [b'c'; 10]).unwrap();
+                if let Some(previous) = generations.last() {
+                    let shared = segment(id - 1);
+                    fs::hard_link(previous.path().join(&shared), build.path().join(&shared))
+                        .unwrap();
+                }
+                if length > 0 {
+                    fs::write(build.path().join(segment(id)), vec![b's'; length]).unwrap();
+                }
+                let GenerationPublication::Durable(generation) =
+                    build.publish(&cx, |_, _| Ok(())).unwrap()
+                else {
+                    panic!("fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
+                };
+                generations.push(generation);
+            }
+            let oldest = &generations[0];
+            store
+                .open_retained(&cx, oldest.id(), oldest.manifest_sha256())
+                .unwrap();
+            let inventory_bytes = |generation: &PublishedGeneration| {
+                fs::metadata(generation.path().join(COMPLETE_GENERATION_MANIFEST))
+                    .unwrap()
+                    .len()
+            };
+            // The oldest frees its share of the first segment; the second
+            // frees neither segment, since the selection keeps the newer one.
+            let expected = [
+                (
+                    generations[0].id().to_owned(),
+                    inventory_bytes(&generations[0]) + 110,
+                ),
+                (
+                    generations[1].id().to_owned(),
+                    inventory_bytes(&generations[1]) + 10,
+                ),
+            ];
+            let active = generations.pop().unwrap();
+            drop(generations);
+            let plan = store.plan_retention(&cx, 0).unwrap();
+            let planned = plan
+                .reclaimable
+                .iter()
+                .map(|generation| (generation.id.clone(), generation.bytes))
+                .collect::<Vec<_>>();
+            assert_eq!(planned, expected);
+            let report = store.collect_retained(&cx, 0).unwrap();
+            assert_eq!(
+                report.reclaimed_bytes,
+                expected.iter().map(|(_, bytes)| bytes).sum::<u64>()
+            );
+            assert_eq!(store.active(&cx).unwrap(), Some(active.clone()));
+            assert_eq!(
+                fs::metadata(active.path().join(segment(2)))
+                    .unwrap()
+                    .nlink(),
+                1
+            );
+
+            // Any other shared artifact is still refused.
+            let build = store.begin(&cx).unwrap();
+            fs::hard_link(
+                active.path().join("content.txt"),
+                build.path().join("content.txt"),
+            )
+            .unwrap();
+            assert!(build.publish(&cx, |_, _| Ok(())).is_err());
+            for (name, is_segment) in [
+                ("seg-0123456789abcdef.fslx", true),
+                ("seg-0123456789ABCDEF.fslx", false),
+                ("seg-0123.fslx", false),
+                ("seg-0123456789abcdef.fslx.fec", false),
+                ("MANIFEST", false),
+            ] {
+                assert_eq!(
+                    is_quill_segment_name(std::ffi::OsStr::new(name)),
+                    is_segment,
+                    "{name}"
+                );
+            }
         });
     }
 

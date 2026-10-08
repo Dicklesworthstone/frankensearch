@@ -325,7 +325,8 @@ moment it exits, and the in-process TUI cockpit can search a watched index.
 The opt-in complete-generation layout (see "Complete generations" below)
 serves searches while it is watched: a watched change is searchable from
 another process within seconds, and retention keeps the active generation and
-one predecessor (about twice a fresh build on disk).
+one predecessor, which share their unchanged keyword segments (a 19,480-file
+store held 186 MB after 8 watched edits, about one fresh build).
 
 Example output:
 

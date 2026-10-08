@@ -235,9 +235,9 @@ fn validate_retained_catalog_path(value: &str) -> SearchResult<()> {
 
 /// Unlink Quill segments an unpublished candidate no longer references.
 ///
-/// A candidate starts as a byte copy of its predecessor, retired merge inputs
-/// included, and the copy restarts each input's grace window, so every
-/// generation used to inherit all earlier dead segments (bd-2op1d). No reader
+/// A candidate starts with every file of its predecessor, retired merge inputs
+/// included, so every generation used to inherit all earlier dead segments
+/// (bd-2op1d). No reader
 /// can resolve a candidate before its publication, so a zero window is safe
 /// here and nowhere else. Call once every candidate writer has closed, before
 /// resources are admitted and the bundle is sealed.

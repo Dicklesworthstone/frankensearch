@@ -32,6 +32,7 @@ use super::{
 };
 use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, CompleteGenerationStore, PublishedGeneration,
+    is_quill_segment_name,
 };
 
 // This file is itself loaded through `#[path]`, so an unannotated child
@@ -721,11 +722,13 @@ fn write_receipt(cx: &Cx, root: &Path, receipt: &ReuseReceipt) -> SearchResult<(
     Ok(())
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CopyStats {
     entries: usize,
     files: usize,
     bytes: u64,
+    /// Quill segments shared with the predecessor rather than copied.
+    linked: usize,
     /// Each copied file's destination path, length and SHA-256 of the bytes
     /// read from the source.
     copied: Vec<(PathBuf, u64, [u8; 32])>,
@@ -733,11 +736,16 @@ struct CopyStats {
 
 impl CopyStats {
     /// Require the bytes read from `predecessor` to be the ones its sealed
-    /// inventory names. Its admission may have reused digests this process
-    /// computed earlier (`generation_store`), so the copy, which reads every
-    /// byte, is what notices a predecessor that decayed on disk since.
-    fn verify_against_inventory(
+    /// inventory names, then require it to be admitted and selected still.
+    ///
+    /// Its earlier admission may have reused digests this process computed
+    /// (`generation_store`), so the copy, which reads every byte, is what
+    /// notices a predecessor that decayed on disk since. A segment the copy
+    /// linked has a new ctime, so the second admission hashes it again.
+    fn confirm(
         &self,
+        cx: &Cx,
+        store: &CompleteGenerationStore,
         predecessor: &PublishedGeneration,
         destination: &Path,
     ) -> SearchResult<()> {
@@ -757,6 +765,14 @@ impl CopyStats {
                     "predecessor artifact differs from its sealed inventory",
                 ));
             }
+        }
+        // The store lease excludes cooperating publication. Rechecking also
+        // refuses an out-of-protocol pointer change or source mutation during
+        // the copy.
+        if store.active(cx)?.as_ref() != Some(predecessor) {
+            return Err(reuse_error(
+                "selected predecessor changed while it was being copied",
+            ));
         }
         Ok(())
     }
@@ -806,12 +822,7 @@ pub(super) fn copy_selected_generation(
     }
     let mut stats = CopyStats::default();
     copy_tree(cx, predecessor.path(), destination, 0, &mut stats)?;
-    stats.verify_against_inventory(&predecessor, destination)?;
-    if store.active(cx)?.as_ref() != Some(&predecessor) {
-        return Err(reuse_error(
-            "selected predecessor changed while copying the mutation candidate",
-        ));
-    }
+    stats.confirm(cx, store, &predecessor, destination)?;
     sentinel.index_root = destination.display().to_string();
     runtime.write_index_sentinel(destination, &sentinel)?;
     retained_search_checkpoint(cx)?;
@@ -819,6 +830,7 @@ pub(super) fn copy_selected_generation(
         predecessor = predecessor.id(),
         copied_files = stats.files,
         copied_bytes = stats.bytes,
+        linked_segments = stats.linked,
         "copied complete generation for isolated mutation"
     );
     Ok(predecessor)
@@ -904,14 +916,7 @@ fn seed_candidate(
     }
     let mut stats = CopyStats::default();
     copy_tree(cx, predecessor.path(), destination, 0, &mut stats)?;
-    stats.verify_against_inventory(&predecessor, destination)?;
-    // The store lease excludes cooperating publication. Rechecking also refuses
-    // an out-of-protocol pointer change or source mutation during the copy.
-    if store.active(cx)?.as_ref() != Some(&predecessor) {
-        return Err(reuse_error(
-            "selected predecessor changed while copying the seed",
-        ));
-    }
+    stats.confirm(cx, store, &predecessor, destination)?;
     let label = destination.display().to_string();
     sentinel.index_root.clone_from(&label);
     receipt.checkpoint.index_root = label;
@@ -924,6 +929,7 @@ fn seed_candidate(
         eligible_semantic_files = eligible,
         copied_files = stats.files,
         copied_bytes = stats.bytes,
+        linked_segments = stats.linked,
         "seeded isolated generation; ordinary source-hash and producer checks decide actual reuse"
     );
     Ok(eligible)
@@ -1010,6 +1016,12 @@ fn copy_tree(
         if file_type.is_dir() {
             fs::create_dir(&target)?;
             copy_tree(cx, &entry.path(), &target, depth + 1, stats)?;
+        } else if is_quill_segment_name(&name) && fs::hard_link(entry.path(), &target).is_ok() {
+            // Quill writes a segment once and afterwards only renames or
+            // unlinks it, so the candidate shares the predecessor's instead of
+            // writing and syncing a copy of the largest file in the bundle
+            // (bd-dnqgr). A filesystem without hard links gets the copy.
+            stats.linked += 1;
         } else {
             let mut input = open_regular(&entry.path())?;
             let expected = input.metadata()?.len();
@@ -1017,8 +1029,9 @@ fn copy_tree(
                 .write(true)
                 .create_new(true)
                 .open(&target)?;
-            // No hard links: tombstones, mmap writes, catalogs and lexical
-            // commits in the candidate must never reach a retained reader.
+            // Nothing else is linked: tombstones, mmap writes, catalogs and
+            // Quill's manifests in the candidate must never reach a retained
+            // reader.
             let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
             let mut copied = 0_u64;
             let mut digest = Sha256::new();
@@ -1313,6 +1326,9 @@ mod copy_tests {
             let parent = tempfile::tempdir().unwrap();
             let store = CompleteGenerationStore::create(&cx, &parent.path().join("store")).unwrap();
             let first = store.begin(&cx).unwrap();
+            let segment = "lexical/quill-v1/seg-0123456789abcdef.fslx";
+            fs::create_dir_all(first.path().join("lexical/quill-v1")).unwrap();
+            fs::write(first.path().join(segment), b"segment!").unwrap();
             fs::create_dir(first.path().join("vector")).unwrap();
             fs::write(first.path().join("vector/fast.idx"), b"original").unwrap();
             let crate::generation_store::GenerationPublication::Durable(predecessor) =
@@ -1320,29 +1336,50 @@ mod copy_tests {
             else {
                 panic!("fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
             };
-            let intact = parent.path().join("intact");
-            fs::create_dir(&intact).unwrap();
-            let mut stats = CopyStats::default();
-            copy_tree(&cx, predecessor.path(), &intact, 0, &mut stats).unwrap();
-            stats
-                .verify_against_inventory(&predecessor, &intact)
-                .unwrap();
+            let seed = |name: &str| {
+                let destination = parent.path().join(name);
+                fs::create_dir(&destination).unwrap();
+                let mut stats = CopyStats::default();
+                copy_tree(&cx, predecessor.path(), &destination, 0, &mut stats).unwrap();
+                stats
+                    .confirm(&cx, &store, &predecessor, &destination)
+                    .map(|()| (destination, stats))
+            };
+            let (intact, stats) = seed("intact").unwrap();
+            assert_eq!((stats.files, stats.linked), (1, 1));
+            let inode = |root: &Path, relative: &str| fs::metadata(root.join(relative)).unwrap().ino();
+            assert_eq!(inode(&intact, segment), inode(predecessor.path(), segment));
+            assert_ne!(
+                inode(&intact, "vector/fast.idx"),
+                inode(predecessor.path(), "vector/fast.idx")
+            );
+
             // Bytes that decayed without a write keep the digest this process
             // remembered, so admission alone no longer notices them.
-            let artifact = predecessor.path().join("vector/fast.idx");
-            fs::write(&artifact, b"decayed!").unwrap();
-            crate::generation_store::remember_digest_for_test(&artifact, b"original");
-            let admitted = store.active(&cx).unwrap().unwrap();
-            let decayed = parent.path().join("decayed");
-            fs::create_dir(&decayed).unwrap();
-            let mut stats = CopyStats::default();
-            copy_tree(&cx, admitted.path(), &decayed, 0, &mut stats).unwrap();
-            let error = stats
-                .verify_against_inventory(&admitted, &decayed)
-                .unwrap_err();
+            let decay = |relative: &str, remembered: &[u8]| {
+                let artifact = predecessor.path().join(relative);
+                fs::write(&artifact, b"decayed!").unwrap();
+                crate::generation_store::remember_digest_for_test(&artifact, remembered);
+                assert_eq!(store.active(&cx).unwrap().as_ref(), Some(&predecessor));
+            };
+            decay("vector/fast.idx", b"original");
+            let error = seed("copied").unwrap_err();
             assert!(
                 matches!(error, SearchError::InvalidConfig { reason, .. }
                 if reason.contains("differs from its sealed inventory"))
+            );
+            fs::write(predecessor.path().join("vector/fast.idx"), b"original").unwrap();
+
+            // The copy never reads a segment it links, but linking moves the
+            // segment's ctime, so the recheck reads it. A remembered stamp is
+            // always older than the coarse clock tick a link would share.
+            decay(segment, b"segment!");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let error = seed("linked").unwrap_err();
+            assert!(
+                matches!(&error, SearchError::IndexCorrupted { detail, .. }
+                if detail == "bundle files differ from their sealed inventory"),
+                "{error}"
             );
         });
     }
