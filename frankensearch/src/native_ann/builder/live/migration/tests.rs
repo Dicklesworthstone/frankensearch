@@ -659,3 +659,351 @@ fn empty_migration_preserves_new_identity_and_topology_without_inference() {
         assert_eq!(quality.documents.load(Ordering::SeqCst), 0);
     });
 }
+
+#[test]
+fn sealed_migration_reopens_with_new_model_instances_without_reembedding() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let old_model = Provider::new("old", 2, true);
+        let initial = build(
+            &cx,
+            &root.path().join("old"),
+            1,
+            &old_model,
+            None,
+            documents(),
+        )
+        .await;
+        let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let path = root.path().join("candidate");
+        let fast = Provider::new("new-fast", 3, true);
+        let quality = Provider::new("new-quality", 4, true);
+        let graph = NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 91,
+        };
+        let candidate = old
+            .begin_model_migration(
+                &cx,
+                &path,
+                generation(2),
+                fast.clone(),
+                Some(quality.clone()),
+            )
+            .unwrap()
+            .with_fast_storage(NativeBuildPrecision::F16, graph)
+            .build(&cx)
+            .await
+            .unwrap();
+        let receipt = candidate.index().seal_for_reopen(&cx).unwrap();
+        let witness = candidate
+            .index()
+            .vectors()
+            .fast()
+            .index()
+            .owner_witness()
+            .clone();
+        let expected = candidate
+            .index()
+            .search_refined(&cx, "horizontal", 3)
+            .await
+            .unwrap();
+        let expected: Vec<_> = expected
+            .iter()
+            .map(|hit| (hit.doc_id.clone(), hit.score.to_bits()))
+            .collect();
+        drop(candidate);
+        drop(fast);
+        drop(quality);
+
+        // Distinct producer instances; no surviving candidate caches or handles.
+        let fast = Provider::new("new-fast", 3, true);
+        let quality = Provider::new("new-quality", 4, true);
+        let candidate = old
+            .begin_model_migration(
+                &cx,
+                &path,
+                generation(2),
+                fast.clone(),
+                Some(quality.clone()),
+            )
+            .unwrap()
+            .with_fast_storage(NativeBuildPrecision::F16, graph)
+            .open_selected(&cx, &receipt, NativeHybridReopenLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            candidate.index().vectors().fast().index().owner_witness(),
+            &witness
+        );
+        assert_eq!(fast.documents.load(Ordering::SeqCst), 0);
+        assert_eq!(quality.documents.load(Ordering::SeqCst), 0);
+        assert!(std::ptr::eq(
+            live.snapshot(&cx).await.unwrap().index(),
+            old.index()
+        ));
+        let selected = live.install(&cx, &candidate).await.unwrap();
+        let actual = selected
+            .index()
+            .search_refined(&cx, "horizontal", 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            actual
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_sources(old.index(), selected.index());
+        assert_eq!(fast.raw_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(quality.raw_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn selected_migration_rejects_valid_receipts_for_different_source_documents() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let old_model = Provider::new("old", 2, true);
+        let initial = build(
+            &cx,
+            &root.path().join("old"),
+            1,
+            &old_model,
+            None,
+            documents(),
+        )
+        .await;
+        let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let replacement = Provider::new("replacement", 3, true);
+        for variant in 0..5 {
+            let mut changed = documents();
+            match variant {
+                0 => changed[0].content = "different text".to_owned(),
+                1 => changed[0].title = Some("different title".to_owned()),
+                2 => {
+                    changed[0]
+                        .metadata
+                        .insert("project".to_owned(), "different".to_owned());
+                }
+                3 => changed[0].id = "different-id".to_owned(),
+                _ => {
+                    let _ = changed.pop();
+                }
+            }
+            let path = root.path().join(format!("unrelated-{variant}"));
+            // The receipt really is valid for this independently built cohort.
+            // It still is not authority to erase or change the pinned source.
+            let unrelated = build(&cx, &path, 2, &replacement, None, changed).await;
+            let receipt = unrelated.seal_for_reopen(&cx).unwrap();
+            drop(unrelated);
+            let before = replacement.documents.load(Ordering::SeqCst);
+            let result = old
+                .begin_model_migration(&cx, &path, generation(2), replacement.clone(), None)
+                .unwrap()
+                .open_selected(&cx, &receipt, NativeHybridReopenLimits::default())
+                .await;
+            assert_field(result.unwrap_err(), "native_ann.live.migration.source");
+            assert_eq!(replacement.documents.load(Ordering::SeqCst), before);
+            assert!(std::ptr::eq(
+                live.snapshot(&cx).await.unwrap().index(),
+                old.index()
+            ));
+        }
+    });
+}
+
+#[test]
+fn selected_migration_checks_full_generation_storage_and_graph_policy() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let old_model = Provider::new("old", 2, true);
+        let initial = build(
+            &cx,
+            &root.path().join("old"),
+            1,
+            &old_model,
+            None,
+            documents(),
+        )
+        .await;
+        let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let replacement = Provider::new("replacement", 3, true);
+        let path = root.path().join("candidate");
+        let graph = NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 91,
+        };
+        let candidate = old
+            .begin_model_migration(&cx, &path, generation(2), replacement.clone(), None)
+            .unwrap()
+            .with_fast_storage(NativeBuildPrecision::F16, graph)
+            .build(&cx)
+            .await
+            .unwrap();
+        let receipt = candidate.index().seal_for_reopen(&cx).unwrap();
+        drop(candidate);
+        for (precision, retrieval) in [
+            (NativeBuildPrecision::F32, graph),
+            (NativeBuildPrecision::F16, NativeBuildRetrieval::Exact),
+            (
+                NativeBuildPrecision::F16,
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 92,
+                },
+            ),
+        ] {
+            let result = old
+                .begin_model_migration(&cx, &path, generation(2), replacement.clone(), None)
+                .unwrap()
+                .with_fast_storage(precision, retrieval)
+                .open_selected(&cx, &receipt, NativeHybridReopenLimits::default())
+                .await;
+            assert_field(result.unwrap_err(), "native_ann.live.migration.storage");
+        }
+        let wrong_nonce = ArtifactGenerationIdentityV1::new(2, [0x60; 16]).unwrap();
+        let result = old
+            .begin_model_migration(&cx, &path, wrong_nonce, replacement.clone(), None)
+            .unwrap()
+            .with_fast_storage(NativeBuildPrecision::F16, graph)
+            .open_selected(&cx, &receipt, NativeHybridReopenLimits::default())
+            .await;
+        assert_field(result.unwrap_err(), "native_ann.live.migration.target");
+        assert_eq!(replacement.documents.load(Ordering::SeqCst), 3);
+        assert!(std::ptr::eq(
+            live.snapshot(&cx).await.unwrap().index(),
+            old.index()
+        ));
+    });
+}
+
+#[test]
+fn selected_migration_never_accepts_a_same_name_different_producer_or_bad_receipt() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let old_model = Provider::new("old", 2, true);
+        let initial = build(
+            &cx,
+            &root.path().join("old"),
+            1,
+            &old_model,
+            None,
+            documents(),
+        )
+        .await;
+        let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let replacement = Provider::new("same-name", 3, true);
+        let path = root.path().join("candidate");
+        let candidate = old
+            .begin_model_migration(&cx, &path, generation(2), replacement.clone(), None)
+            .unwrap()
+            .build(&cx)
+            .await
+            .unwrap();
+        let receipt = candidate.index().seal_for_reopen(&cx).unwrap();
+        drop(candidate);
+        let mut foreign = Provider::new("same-name", 3, true);
+        Arc::get_mut(&mut foreign)
+            .unwrap()
+            .identity
+            .producer
+            .backend = "different-backend".to_owned();
+        let result = old
+            .begin_model_migration(&cx, &path, generation(2), foreign.clone(), None)
+            .unwrap()
+            .open_selected(&cx, &receipt, NativeHybridReopenLimits::default())
+            .await;
+        assert!(result.is_err());
+        assert_eq!(foreign.documents.load(Ordering::SeqCst), 0);
+        assert_eq!(foreign.queries.load(Ordering::SeqCst), 0);
+        let mut wrong_receipt = receipt;
+        wrong_receipt.sha256[0] ^= 1;
+        let result = old
+            .begin_model_migration(&cx, &path, generation(2), replacement.clone(), None)
+            .unwrap()
+            .open_selected(&cx, &wrong_receipt, NativeHybridReopenLimits::default())
+            .await;
+        assert!(result.is_err());
+        assert_eq!(replacement.documents.load(Ordering::SeqCst), 3);
+        assert!(std::ptr::eq(
+            live.snapshot(&cx).await.unwrap().index(),
+            old.index()
+        ));
+    });
+}
+
+#[test]
+fn selected_migration_stays_stale_after_reopen_and_cancellation_reads_no_candidate() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let old_model = Provider::new("old", 2, true);
+        let initial = build(
+            &cx,
+            &root.path().join("old"),
+            1,
+            &old_model,
+            None,
+            documents(),
+        )
+        .await;
+        let live = NativeLiveHybridIndex::new(&cx, initial).unwrap();
+        let old = live.snapshot(&cx).await.unwrap();
+        let replacement = Provider::new("replacement", 3, true);
+        let path = root.path().join("candidate");
+        let candidate = old
+            .begin_model_migration(&cx, &path, generation(3), replacement.clone(), None)
+            .unwrap()
+            .build(&cx)
+            .await
+            .unwrap();
+        let receipt = candidate.index().seal_for_reopen(&cx).unwrap();
+        drop(candidate);
+        let migration = old
+            .begin_model_migration(&cx, &path, generation(3), replacement.clone(), None)
+            .unwrap();
+        let update = old
+            .begin_update(&cx, root.path().join("update"), generation(2))
+            .unwrap()
+            .delete_document("a")
+            .build(&cx)
+            .await
+            .unwrap();
+        live.install(&cx, &update).await.unwrap();
+        let reopened = migration
+            .open_selected(&cx, &receipt, NativeHybridReopenLimits::default())
+            .await
+            .unwrap();
+        assert_field(
+            live.install(&cx, &reopened).await.unwrap_err(),
+            "native_ann.live.expected_current",
+        );
+        let missing = root.path().join("must-not-be-opened");
+        let intent = old
+            .begin_model_migration(&cx, &missing, generation(3), replacement.clone(), None)
+            .unwrap();
+        cx.set_cancel_requested(true);
+        let error = intent
+            .open_selected(&cx, &receipt, NativeHybridReopenLimits::default())
+            .await
+            .unwrap_err();
+        cx.set_cancel_requested(false);
+        assert!(matches!(error, SearchError::Cancelled { .. }));
+        assert!(!missing.exists());
+        assert_eq!(replacement.documents.load(Ordering::SeqCst), 3);
+        assert!(
+            live.snapshot(&cx)
+                .await
+                .unwrap()
+                .index()
+                .vectors()
+                .document("a")
+                .is_none()
+        );
+    });
+}

@@ -8,11 +8,14 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use frankensearch_core::generation::{ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1};
+use frankensearch_core::generation::{
+    ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, GenerationComponentReceiptV1,
+};
 
 use super::{NativeHybridCandidate, NativeHybridSnapshot};
 use crate::native_ann::builder::{
-    NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltHybridIndex, NativeIndexBuilder,
+    NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltHybridIndex, NativeBuiltTier,
+    NativeHybridReopenLimits, NativeIndexBuilder, TierPlan,
 };
 use crate::native_ann::{checkpoint, invalid};
 use crate::{Cx, Embedder, SearchResult};
@@ -40,6 +43,34 @@ use crate::{Cx, Embedder, SearchResult};
 /// authority. Seal the completed candidate through its existing API and keep
 /// old mapped artifacts immutable while any readers retain them. Nothing here
 /// deletes files, creates a runtime, downloads models or installs a candidate.
+///
+/// # Example
+///
+/// ```no_run
+/// use std::{path::Path, sync::Arc};
+/// use frankensearch::{Cx, Embedder, SearchResult};
+/// use frankensearch::native_ann::builder::live::NativeLiveHybridIndex;
+/// use frankensearch_core::generation::ArtifactGenerationIdentityV1;
+///
+/// async fn migrate(
+///     live: &NativeLiveHybridIndex,
+///     cx: &Cx,
+///     new_directory: &Path,
+///     generation: ArtifactGenerationIdentityV1,
+///     fast: Arc<dyn Embedder>,
+///     quality: Option<Arc<dyn Embedder>>,
+/// ) -> SearchResult<()> {
+///     let base = live.snapshot(cx).await?;
+///     let candidate = base
+///         .begin_model_migration(cx, new_directory, generation, fast, quality)?
+///         .with_batch_size(64)?
+///         .build(cx).await?;
+///     // Durable selection, if required, belongs to the caller's publisher.
+///     // This swap alone is process-local and refuses a stale predecessor.
+///     live.install(cx, &candidate).await?;
+///     Ok(())
+/// }
+/// ```
 pub struct NativeLiveHybridMigration {
     base: NativeHybridSnapshot,
     builder: NativeIndexBuilder,
@@ -216,8 +247,87 @@ impl NativeLiveHybridMigration {
             self.builder.documents.push(source.clone());
         }
         checkpoint(cx, "native_ann.live.migration.build")?;
-        let next = Box::pin(self.builder.build_hybrid(cx)).await?;
+        let outcome = Box::pin(self.builder.build_hybrid(cx)).await;
+        checkpoint(cx, "native_ann.live.migration.built")?;
+        self.target.admit(cx, self.base, outcome?)
+    }
+
+    /// Admit an explicitly selected, already-built migration after restart.
+    ///
+    /// The directory passed to `begin_model_migration` now names the existing
+    /// candidate. `expected` must be its original trusted hybrid seal receipt,
+    /// never a digest manufactured by hashing an unknown directory. This reuses
+    /// the ordinary bounded selected reopen of the complete source, vector,
+    /// graph and Quill cohort. No inference, rebuilding, downloads or writes run.
+    ///
+    /// The reopened candidate must have the EXACT requested generation (nonce
+    /// included), models, quality presence, source documents and storage/graph
+    /// policies. For a non-default F16/HNSW candidate, configure the matching
+    /// `with_*_storage` policies before calling this method. Batch/input settings
+    /// concern rebuilding only; `limits` bounds the selected read's artifacts.
+    ///
+    /// A successful result is still only a prepared candidate: the usual
+    /// expected-predecessor swap refuses it if a source update won while files
+    /// were being admitted. A receipt for different source content is rejected
+    /// even when its IDs, counts, models and generation sequence all match.
+    /// No corrupt newest selection silently falls back to an older generation.
+    ///
+    /// # Errors
+    /// Returns selected-reopen errors, target/source/policy mismatches or
+    /// cancellation, without changing live selection or any persisted bytes.
+    pub async fn open_selected(
+        self,
+        cx: &Cx,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeHybridReopenLimits,
+    ) -> SearchResult<NativeHybridCandidate> {
+        checkpoint(cx, "native_ann.live.migration.reopen")?;
+        let outcome = Box::pin(NativeBuiltHybridIndex::open_selected_with_limits(
+            cx,
+            &self.builder.directory,
+            expected,
+            Arc::clone(&self.builder.fast.embedder),
+            self.builder
+                .quality
+                .as_ref()
+                .map(|tier| Arc::clone(&tier.embedder)),
+            limits,
+        ))
+        .await;
+        checkpoint(cx, "native_ann.live.migration.reopened")?;
+        let next = outcome?;
+        let after = next.vectors();
+        let quality_matches = match (&self.builder.quality, after.quality()) {
+            (None, None) => true,
+            (Some(plan), Some(tier)) => selected_policy_matches(plan, tier),
+            _ => false,
+        };
+        if !selected_policy_matches(&self.builder.fast, after.fast()) || !quality_matches {
+            return Err(invalid(
+                "live.migration.storage",
+                "mismatch",
+                "selected precision and graph policy differ from the migration request",
+            ));
+        }
         self.target.admit(cx, self.base, next)
+    }
+}
+
+fn selected_policy_matches(plan: &TierPlan, tier: &NativeBuiltTier) -> bool {
+    if plan.precision != tier.precision {
+        return false;
+    }
+    match (plan.retrieval, tier.graph_receipt.as_ref()) {
+        (NativeBuildRetrieval::Exact, None) => true,
+        (NativeBuildRetrieval::Hnsw { params, seed }, Some(receipt)) => {
+            receipt.seed == seed
+                && usize::try_from(receipt.params.m).ok() == Some(params.m)
+                && usize::try_from(receipt.params.m0).ok() == Some(params.m0)
+                && usize::try_from(receipt.params.ef_construction).ok()
+                    == Some(params.ef_construction)
+                && usize::try_from(receipt.params.ef_search).ok() == Some(params.ef_search)
+        }
+        _ => false,
     }
 }
 
