@@ -1206,6 +1206,87 @@ mod generation_tests {
     }
 
     #[test]
+    fn forwarded_searches_answer_from_the_serve_cache_unless_explained() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let root = directory.path().join("store");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
+            let mut config = FsfsConfig::default();
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            config.indexing.offline = true;
+            config.indexing.quality_model.clear();
+            config.search.fast_only = true;
+            config.search.rerank = false;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Daemon,
+                target_path: Some(source.clone()),
+                index_dir: Some(root.clone()),
+                quiet: true,
+                ..CliInput::default()
+            });
+            assert!(matches!(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
+            let mut session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+            let request = make_request(&runtime, &root, "sharedtoken", 10).unwrap();
+            let mut cache = HashMap::new();
+            let first = Box::pin(execute(
+                &cx,
+                &runtime,
+                &mut session,
+                &request,
+                Some(&mut cache),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(first.hits.len(), 1);
+            assert_eq!(cache.len(), 1, "a completed search is kept");
+            // Empty the kept phases: only an answer read from the cache can
+            // come back without the hit the index still holds.
+            for payload in cache.values_mut().flatten() {
+                payload.hits.clear();
+            }
+            let cached = Box::pin(execute(
+                &cx,
+                &runtime,
+                &mut session,
+                &request,
+                Some(&mut cache),
+            ))
+            .await
+            .unwrap();
+            assert!(
+                cached.hits.is_empty(),
+                "the identical search answers from the cache"
+            );
+
+            let mut explaining = runtime.clone();
+            explaining.config.search.explain = true;
+            let explained = make_request(&explaining, &root, "sharedtoken", 10).unwrap();
+            let fresh = Box::pin(execute(
+                &cx,
+                &runtime,
+                &mut session,
+                &explained,
+                Some(&mut cache),
+            ))
+            .await
+            .unwrap();
+            assert_eq!(fresh.hits.len(), 1, "an explained search always runs");
+            let uncached = Box::pin(execute(&cx, &runtime, &mut session, &request, None))
+                .await
+                .unwrap();
+            assert_eq!(uncached.hits.len(), 1, "a disabled cache is not read");
+        });
+    }
+
+    #[test]
     fn cli_forwarding_follows_publication_isolates_filters_and_recovers_after_refusal() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();

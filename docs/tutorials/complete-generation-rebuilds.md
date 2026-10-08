@@ -132,7 +132,11 @@ The client checks the store and resolved configuration against the daemon;
 filters, limits and the search policy (`quality_weight`, `rrf_k`,
 `quality_timeout_ms`, `fast_only`, `rerank`, `rerank_timeout_ms`, and so
 `--fast-only` and `--rerank`) apply to the individual request, so one daemon
-serves clients that differ only there. Use the same configuration otherwise. Through a named `--daemon-socket`, a configuration
+serves clients that differ only there. Use the same configuration otherwise.
+Buffered and progressive forwarded searches share the daemon's in-memory result
+cache with raw buffered requests that resolve to the same query, limit, mode,
+filter and policy, as on the legacy layout; searches with inline explanations
+always run, and a newer generation drops the cached replies. Through a named `--daemon-socket`, a configuration
 mismatch, corrupt selection, or invalid reply fails the request without opening
 local search resources or retrying retrieval. A plain search (daemon transport
 is the default) with no daemon listening starts one, detached and with the
