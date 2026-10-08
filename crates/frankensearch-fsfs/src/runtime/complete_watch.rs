@@ -5,7 +5,7 @@
 //! immediately before pointer publication. This is the existing cooperative
 //! store protocol, not a filesystem snapshot or hostile-directory v2 authority.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{self, File, Metadata};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -271,7 +271,9 @@ impl SourceRoot {
         }
         // Only what `fsfs index` would discover counts as source: an edit to a
         // gitignored or hidden file must not look like a change and rebuild.
-        let mut discoverable = BTreeSet::new();
+        // Membership sets hash: ordered lookups compared long absolute paths
+        // component by component, a large share of every edit's walk.
+        let mut discoverable = HashSet::new();
         for entry in index_discovery_walker(&self.path, discovery).build() {
             retained_search_checkpoint(cx)?;
             let entry = entry.map_err(|source| SearchError::SubsystemError {
@@ -291,7 +293,7 @@ impl SourceRoot {
         let mut stamps = BTreeMap::new();
         let mut classes = BTreeMap::new();
         let mut directories = BTreeMap::new();
-        let mut visited = BTreeSet::new();
+        let mut visited = HashSet::new();
         let mut stack = vec![(self.path.clone(), self.directory.metadata()?)];
         while let Some((directory, expected)) = stack.pop() {
             retained_search_checkpoint(cx)?;

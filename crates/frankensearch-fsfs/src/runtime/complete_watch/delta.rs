@@ -42,29 +42,62 @@ fn changed_paths(
     if hint.is_some_and(|hint| hint.force_rebuild) {
         return Ok(None);
     }
+    // Every map is ordered by path, so one merge pass compares each path about
+    // once; a lookup per map compared long absolute paths log n times each.
+    let mut before = Cursor::new(&baseline.stamps);
+    let mut before_classes = Cursor::new(&baseline.classes);
+    let mut classes = Cursor::new(&current.classes);
     let mut changed = BTreeSet::new();
     for (path, stamp) in &current.stamps {
         retained_search_checkpoint(cx)?;
-        if baseline.stamps.get(path) != Some(stamp)
-            || baseline.classes.get(path) != current.classes.get(path)
-            || hint.is_some_and(|hint| hint.paths.iter().any(|hinted| path.starts_with(hinted)))
-        {
+        let mut deleted = Vec::new();
+        let unchanged = before.seek(path, |gone| deleted.push(gone)) == Some(stamp)
+            && before_classes.seek(path, |_| {}) == classes.seek(path, |_| {})
+            && !hint.is_some_and(|hint| hint.paths.iter().any(|hinted| path.starts_with(hinted)));
+        for path in deleted.into_iter().chain((!unchanged).then_some(path)) {
             changed.insert(path.clone());
             if changed.len() > MAX_CHANGED_PATHS {
                 return Ok(None);
             }
         }
     }
-    for path in baseline.stamps.keys() {
+    for (path, _) in before.entries {
         retained_search_checkpoint(cx)?;
-        if !current.stamps.contains_key(path) {
-            changed.insert(path.clone());
-            if changed.len() > MAX_CHANGED_PATHS {
-                return Ok(None);
-            }
+        changed.insert(path.clone());
+        if changed.len() > MAX_CHANGED_PATHS {
+            return Ok(None);
         }
     }
     Ok(Some(changed))
+}
+
+/// A forward position in one path-ordered map, sought by ascending paths.
+struct Cursor<'a, V> {
+    entries: std::iter::Peekable<std::collections::btree_map::Iter<'a, PathBuf, V>>,
+}
+
+impl<'a, V> Cursor<'a, V> {
+    fn new(map: &'a BTreeMap<PathBuf, V>) -> Self {
+        Self {
+            entries: map.iter().peekable(),
+        }
+    }
+
+    /// The value at `path`, handing every smaller key passed over to `skipped`.
+    fn seek(&mut self, path: &Path, mut skipped: impl FnMut(&'a PathBuf)) -> Option<&'a V> {
+        while let Some(&(key, value)) = self.entries.peek() {
+            match key.as_path().cmp(path) {
+                std::cmp::Ordering::Less => skipped(key),
+                std::cmp::Ordering::Equal => {
+                    self.entries.next();
+                    return Some(value);
+                }
+                std::cmp::Ordering::Greater => return None,
+            }
+            self.entries.next();
+        }
+        None
+    }
 }
 
 fn unambiguous_source(root: &Path, path: &Path) -> bool {

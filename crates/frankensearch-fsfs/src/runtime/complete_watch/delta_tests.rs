@@ -89,6 +89,25 @@ fn observation_delta_tracks_membership_stamps_policy_and_same_stamp_hints() {
 }
 
 #[test]
+fn deletions_on_either_side_of_the_current_paths_are_changes() {
+    run_test_with_cx(|cx| async move {
+        let before = observation(&[("/src/a.md", 1), ("/src/m.md", 2), ("/src/z.md", 3)]);
+        let after = observation(&[("/src/m.md", 2)]);
+        assert_eq!(
+            changed_paths(&cx, &before, &after, None).unwrap().unwrap(),
+            BTreeSet::from([PathBuf::from("/src/a.md"), PathBuf::from("/src/z.md")])
+        );
+        assert_eq!(
+            changed_paths(&cx, &before, &observation(&[]), None)
+                .unwrap()
+                .unwrap()
+                .len(),
+            3
+        );
+    });
+}
+
+#[test]
 fn directory_hints_use_component_boundaries_and_large_deltas_fall_back() {
     run_test_with_cx(|cx| async move {
         let before = observation(&[("/src/dir/a.md", 1), ("/src/dir-sibling/a.md", 2)]);
