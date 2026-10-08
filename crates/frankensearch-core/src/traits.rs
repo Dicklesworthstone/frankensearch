@@ -152,6 +152,35 @@ fn validate_embedding_producer(
     }
 }
 
+// A provider failure is retryable only while it still belongs to the admitted
+// producer. Recheck before propagating an ordinary error, not just before
+// returning vectors. An explicit cancellation remains terminal and must not
+// invoke a provider again merely to classify its cancellation.
+fn admit_embedding_outcome<T>(
+    outcome: SearchResult<T>,
+    recheck: impl FnOnce() -> SearchResult<()>,
+) -> SearchResult<T> {
+    match outcome {
+        Err(error @ SearchError::Cancelled { .. }) => Err(error),
+        outcome => {
+            recheck()?;
+            outcome
+        }
+    }
+}
+
+// Capture fallible metadata as a Result before the caller's post-admission
+// checkpoint. An identity/dimension error must not hide cancellation requested
+// by that same metadata accessor, nor trigger inference under a new producer.
+fn capture_embedding_producer(
+    identity: SearchResult<&EmbeddingIdentityBundleV1>,
+    dimension: impl FnOnce() -> usize,
+) -> SearchResult<(EmbeddingIdentityBundleV1, usize)> {
+    let identity = identity?;
+    let dimension = validate_embedder_identity(identity, dimension())?;
+    Ok((identity.clone(), dimension))
+}
+
 fn validate_embedding_response(
     response: &IdentityBoundEmbedding,
     expected: &EmbeddingIdentityBundleV1,
@@ -354,12 +383,17 @@ pub trait Embedder: Send + Sync {
     ) -> SearchFuture<'a, IdentityBoundEmbedding> {
         Box::pin(async move {
             embedding_checkpoint(cx, "embedder.embed_bound")?;
-            let identity = self.identity()?.clone();
-            let dimension = validate_embedder_identity(&identity, self.dimension())?;
+            let admission = capture_embedding_producer(self.identity(), || self.dimension());
+            embedding_checkpoint(cx, "embedder.embed_bound")?;
+            let (identity, dimension) = admission?;
             let outcome = self.embed(cx, text).await;
             embedding_checkpoint(cx, "embedder.embed_bound")?;
-            let values = outcome?;
-            validate_embedding_producer(&identity, self.identity(), self.dimension())?;
+            let values = admit_embedding_outcome(outcome, || {
+                let admission =
+                    validate_embedding_producer(&identity, self.identity(), self.dimension());
+                embedding_checkpoint(cx, "embedder.embed_bound")?;
+                admission
+            })?;
             validate_embedding_values(&values, dimension)?;
             embedding_checkpoint(cx, "embedder.embed_bound")?;
             Ok(IdentityBoundEmbedding { values, identity })
@@ -381,12 +415,17 @@ pub trait Embedder: Send + Sync {
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
             embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
-            let identity = self.identity()?.clone();
-            let dimension = validate_embedder_identity(&identity, self.dimension())?;
+            let admission = capture_embedding_producer(self.identity(), || self.dimension());
+            embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
+            let (identity, dimension) = admission?;
             let outcome = self.embed_batch(cx, texts).await;
             embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
-            let vectors = outcome?;
-            validate_embedding_producer(&identity, self.identity(), self.dimension())?;
+            let vectors = admit_embedding_outcome(outcome, || {
+                let admission =
+                    validate_embedding_producer(&identity, self.identity(), self.dimension());
+                embedding_checkpoint(cx, "embedder.embed_batch_bound")?;
+                admission
+            })?;
             validate_embedding_batch_length(vectors.len(), texts.len())?;
             let bound = vectors
                 .into_iter()
@@ -408,7 +447,7 @@ pub trait Embedder: Send + Sync {
     /// [`Self::embed_bound`] would: the same producer, identity and checks,
     /// served as one batch.
     ///
-    /// Batching callers (the facade `IndexBuilder`) send batches only when
+    /// Batching callers (including both facade builders) send batches only when
     /// this is `true` and otherwise keep one `embed_bound` per input. The core
     /// defaults satisfy it for a producer that overrides neither bound
     /// operation, so such producers may return `true`. A producer that
@@ -560,8 +599,9 @@ pub trait SyncEmbed: Send + Sync {
     fn embed_bound_sync(&self, text: &str) -> SearchResult<IdentityBoundEmbedding> {
         let identity = self.identity()?.clone();
         let dimension = validate_embedder_identity(&identity, self.dimension())?;
-        let values = self.embed_sync(text)?;
-        validate_embedding_producer(&identity, self.identity(), self.dimension())?;
+        let values = admit_embedding_outcome(self.embed_sync(text), || {
+            validate_embedding_producer(&identity, self.identity(), self.dimension())
+        })?;
         validate_embedding_values(&values, dimension)?;
         Ok(IdentityBoundEmbedding { values, identity })
     }
@@ -577,8 +617,9 @@ pub trait SyncEmbed: Send + Sync {
     fn embed_batch_bound_sync(&self, texts: &[&str]) -> SearchResult<Vec<IdentityBoundEmbedding>> {
         let identity = self.identity()?.clone();
         let dimension = validate_embedder_identity(&identity, self.dimension())?;
-        let vectors = self.embed_batch_sync(texts)?;
-        validate_embedding_producer(&identity, self.identity(), self.dimension())?;
+        let vectors = admit_embedding_outcome(self.embed_batch_sync(texts), || {
+            validate_embedding_producer(&identity, self.identity(), self.dimension())
+        })?;
         validate_embedding_batch_length(vectors.len(), texts.len())?;
         vectors
             .into_iter()
@@ -590,6 +631,17 @@ pub trait SyncEmbed: Send + Sync {
                 })
             })
             .collect()
+    }
+
+    /// Whether the bound batch preserves each input's bound-single contract.
+    ///
+    /// This is the synchronous counterpart of [`Embedder::bound_batch_is_native`]
+    /// and is forwarded by [`SyncEmbedderAdapter`]. Opt in only when the batch
+    /// uses the same producer, identity, values and validation as
+    /// [`Self::embed_bound_sync`]. Overriding only the bound-single operation
+    /// must keep `false`: the default bound batch dispatches raw inference.
+    fn bound_batch_is_native(&self) -> bool {
+        false
     }
 
     /// Complete immutable identity of this embedder and its output/storage contract.
@@ -693,12 +745,17 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
     ) -> SearchFuture<'a, IdentityBoundEmbedding> {
         Box::pin(async move {
             embedding_checkpoint(cx, "sync_embed.embed_bound")?;
-            let identity = self.0.identity()?.clone();
-            validate_embedder_identity(&identity, self.0.dimension())?;
+            let admission = capture_embedding_producer(self.0.identity(), || self.0.dimension());
+            embedding_checkpoint(cx, "sync_embed.embed_bound")?;
+            let (identity, _) = admission?;
             let outcome = self.0.embed_bound_sync(text);
             embedding_checkpoint(cx, "sync_embed.embed_bound")?;
-            let response = outcome?;
-            validate_embedding_producer(&identity, self.0.identity(), self.0.dimension())?;
+            let response = admit_embedding_outcome(outcome, || {
+                let admission =
+                    validate_embedding_producer(&identity, self.0.identity(), self.0.dimension());
+                embedding_checkpoint(cx, "sync_embed.embed_bound")?;
+                admission
+            })?;
             validate_embedding_response(&response, &identity)?;
             embedding_checkpoint(cx, "sync_embed.embed_bound")?;
             Ok(response)
@@ -712,12 +769,17 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
             embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
-            let identity = self.0.identity()?.clone();
-            validate_embedder_identity(&identity, self.0.dimension())?;
+            let admission = capture_embedding_producer(self.0.identity(), || self.0.dimension());
+            embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
+            let (identity, _) = admission?;
             let outcome = self.0.embed_batch_bound_sync(texts);
             embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
-            let responses = outcome?;
-            validate_embedding_producer(&identity, self.0.identity(), self.0.dimension())?;
+            let responses = admit_embedding_outcome(outcome, || {
+                let admission =
+                    validate_embedding_producer(&identity, self.0.identity(), self.0.dimension());
+                embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
+                admission
+            })?;
             validate_embedding_batch_length(responses.len(), texts.len())?;
             for response in &responses {
                 embedding_checkpoint(cx, "sync_embed.embed_batch_bound")?;
@@ -730,6 +792,10 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
 
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
         self.0.identity()
+    }
+
+    fn bound_batch_is_native(&self) -> bool {
+        self.0.bound_batch_is_native()
     }
 
     fn dimension(&self) -> usize {
@@ -762,6 +828,482 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
 
     fn supports_mrl(&self) -> bool {
         self.0.supports_mrl()
+    }
+}
+
+#[cfg(test)]
+mod bound_completion_contract_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use asupersync::test_utils::run_test_with_cx;
+
+    #[derive(Clone, Copy)]
+    enum Drift {
+        None,
+        Identity,
+        Dimension,
+        MissingIdentity,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Completion {
+        Success,
+        Failure,
+        Cancelled,
+    }
+
+    struct State {
+        admitted: EmbeddingIdentityBundleV1,
+        foreign: EmbeddingIdentityBundleV1,
+        drift: Drift,
+        completion: Completion,
+        changed: AtomicBool,
+        calls: AtomicUsize,
+        identity_reads: AtomicUsize,
+        widths: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl State {
+        fn new(drift: Drift, completion: Completion) -> Self {
+            let admitted = EmbeddingIdentityBundleV1::explicit_test_model("bound-fence", 2);
+            let mut foreign = admitted.clone();
+            "private-drift-canary".clone_into(&mut foreign.producer.backend);
+            Self {
+                admitted,
+                foreign,
+                drift,
+                completion,
+                changed: AtomicBool::new(false),
+                calls: AtomicUsize::new(0),
+                identity_reads: AtomicUsize::new(0),
+                widths: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn infer(&self, count: usize) -> SearchResult<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.widths.lock().unwrap().push(count);
+            self.changed.store(true, Ordering::SeqCst);
+            match self.completion {
+                Completion::Success => Ok(vec![vec![0.25, -0.0]; count]),
+                Completion::Failure => Err(SearchError::EmbeddingFailed {
+                    model: "original-provider".to_owned(),
+                    source: "original inference failure".into(),
+                }),
+                Completion::Cancelled => Err(SearchError::Cancelled {
+                    phase: "provider.cancelled".to_owned(),
+                    reason: "original cancellation".to_owned(),
+                }),
+            }
+        }
+
+        fn current_identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.identity_reads.fetch_add(1, Ordering::SeqCst);
+            if self.changed.load(Ordering::SeqCst) {
+                match self.drift {
+                    Drift::Identity => return Ok(&self.foreign),
+                    Drift::MissingIdentity => return Err(embedding_identity_changed()),
+                    Drift::None | Drift::Dimension => {}
+                }
+            }
+            Ok(&self.admitted)
+        }
+
+        fn current_dimension(&self) -> usize {
+            if self.changed.load(Ordering::SeqCst) && matches!(self.drift, Drift::Dimension) {
+                3
+            } else {
+                2
+            }
+        }
+    }
+
+    // Exercise the actual SyncEmbed defaults, not a test-local reimplementation.
+    impl SyncEmbed for State {
+        fn embed_sync(&self, _text: &str) -> SearchResult<Vec<f32>> {
+            Ok(self.infer(1)?.pop().unwrap())
+        }
+
+        fn embed_batch_sync(&self, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+            self.infer(texts.len())
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.current_identity()
+        }
+
+        fn dimension(&self) -> usize {
+            self.current_dimension()
+        }
+
+        fn id(&self) -> &str {
+            "bound-fence"
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    struct RawAsync(State);
+
+    impl Embedder for RawAsync {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move { self.0.embed_sync(text) })
+        }
+
+        fn embed_batch<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+            Box::pin(async move { self.0.embed_batch_sync(texts) })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.0.current_identity()
+        }
+
+        fn dimension(&self) -> usize {
+            self.0.current_dimension()
+        }
+
+        fn id(&self) -> &str {
+            "bound-fence"
+        }
+
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    // Deliberately omits its own producer check: the async adapter must also
+    // enforce admission when synchronous bound methods are overridden.
+    struct BoundOverride {
+        state: State,
+    }
+
+    impl SyncEmbed for BoundOverride {
+        fn embed_sync(&self, _text: &str) -> SearchResult<Vec<f32>> {
+            panic!("the adapter must not replace custom bound inference with raw inference")
+        }
+
+        fn embed_bound_sync(&self, _text: &str) -> SearchResult<IdentityBoundEmbedding> {
+            Ok(IdentityBoundEmbedding {
+                values: self.state.infer(1)?.pop().unwrap(),
+                identity: self.state.admitted.clone(),
+            })
+        }
+
+        fn embed_batch_bound_sync(
+            &self,
+            texts: &[&str],
+        ) -> SearchResult<Vec<IdentityBoundEmbedding>> {
+            Ok(self
+                .state
+                .infer(texts.len())?
+                .into_iter()
+                .map(|values| IdentityBoundEmbedding {
+                    values,
+                    identity: self.state.admitted.clone(),
+                })
+                .collect())
+        }
+
+        fn bound_batch_is_native(&self) -> bool {
+            true
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.state.current_identity()
+        }
+
+        fn dimension(&self) -> usize {
+            self.state.current_dimension()
+        }
+
+        fn id(&self) -> &str {
+            "bound-fence"
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    fn assert_drift(error: SearchError) {
+        assert!(!error.to_string().contains("private-drift-canary"));
+        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+    }
+
+    fn custom_adapter(drift: Drift, completion: Completion) -> SyncEmbedderAdapter<BoundOverride> {
+        SyncEmbedderAdapter(BoundOverride {
+            state: State::new(drift, completion),
+        })
+    }
+
+    #[test]
+    fn sync_defaults_check_producer_after_success_and_failure() {
+        for drift in [Drift::Identity, Drift::Dimension, Drift::MissingIdentity] {
+            for completion in [Completion::Success, Completion::Failure] {
+                for batch in [false, true] {
+                    let provider = State::new(drift, completion);
+                    let error = if batch {
+                        provider.embed_batch_bound_sync(&["a", "b"]).unwrap_err()
+                    } else {
+                        provider.embed_bound_sync("a").unwrap_err()
+                    };
+                    assert_drift(error);
+                    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn async_defaults_check_producer_after_success_and_failure() {
+        run_test_with_cx(|cx| async move {
+            for drift in [Drift::Identity, Drift::Dimension, Drift::MissingIdentity] {
+                for completion in [Completion::Success, Completion::Failure] {
+                    for batch in [false, true] {
+                        let provider = RawAsync(State::new(drift, completion));
+                        let error = if batch {
+                            provider.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err()
+                        } else {
+                            provider.embed_bound(&cx, "a").await.unwrap_err()
+                        };
+                        assert_drift(error);
+                        assert_eq!(provider.0.calls.load(Ordering::SeqCst), 1);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn sync_adapter_checks_custom_bound_methods_after_success_and_failure() {
+        run_test_with_cx(|cx| async move {
+            for drift in [Drift::Identity, Drift::Dimension, Drift::MissingIdentity] {
+                for completion in [Completion::Success, Completion::Failure] {
+                    for batch in [false, true] {
+                        let provider = custom_adapter(drift, completion);
+                        let error = if batch {
+                            provider.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err()
+                        } else {
+                            provider.embed_bound(&cx, "a").await.unwrap_err()
+                        };
+                        assert_drift(error);
+                        assert_eq!(provider.0.state.calls.load(Ordering::SeqCst), 1);
+                    }
+                }
+            }
+        });
+    }
+
+    fn assert_original_failure(error: SearchError) {
+        match error {
+            SearchError::EmbeddingFailed { model, source } => {
+                assert_eq!(model, "original-provider");
+                assert_eq!(source.to_string(), "original inference failure");
+            }
+            other => panic!("stable producer must retain its ordinary error: {other}"),
+        }
+    }
+
+    #[test]
+    fn stable_producer_errors_remain_ordinary_across_all_bound_entry_points() {
+        run_test_with_cx(|cx| async move {
+            for batch in [false, true] {
+                let synchronous = State::new(Drift::None, Completion::Failure);
+                let asynchronous = RawAsync(State::new(Drift::None, Completion::Failure));
+                let adapter = custom_adapter(Drift::None, Completion::Failure);
+                let errors = if batch {
+                    [
+                        synchronous.embed_batch_bound_sync(&["a", "b"]).unwrap_err(),
+                        asynchronous.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err(),
+                        adapter.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err(),
+                    ]
+                } else {
+                    [
+                        synchronous.embed_bound_sync("a").unwrap_err(),
+                        asynchronous.embed_bound(&cx, "a").await.unwrap_err(),
+                        adapter.embed_bound(&cx, "a").await.unwrap_err(),
+                    ]
+                };
+                for error in errors {
+                    assert_original_failure(error);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn typed_cancellation_preserves_its_phase_without_reentering_the_producer() {
+        run_test_with_cx(|cx| async move {
+            for batch in [false, true] {
+                let synchronous = State::new(Drift::Identity, Completion::Cancelled);
+                let asynchronous = RawAsync(State::new(Drift::Identity, Completion::Cancelled));
+                let adapter = custom_adapter(Drift::Identity, Completion::Cancelled);
+                let errors = if batch {
+                    [
+                        synchronous.embed_batch_bound_sync(&["a", "b"]).unwrap_err(),
+                        asynchronous.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err(),
+                        adapter.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err(),
+                    ]
+                } else {
+                    [
+                        synchronous.embed_bound_sync("a").unwrap_err(),
+                        asynchronous.embed_bound(&cx, "a").await.unwrap_err(),
+                        adapter.embed_bound(&cx, "a").await.unwrap_err(),
+                    ]
+                };
+                for error in errors {
+                    assert!(matches!(error, SearchError::Cancelled { phase, reason }
+                        if phase == "provider.cancelled" && reason == "original cancellation"));
+                }
+                for state in [&synchronous, &asynchronous.0, &adapter.0.state] {
+                    assert_eq!(state.identity_reads.load(Ordering::SeqCst), 1);
+                    assert_eq!(state.calls.load(Ordering::SeqCst), 1);
+                }
+            }
+        });
+    }
+
+    struct CancelOnAdmission<'a> {
+        state: State,
+        cx: &'a Cx,
+        cancel_read: usize,
+        refuse_cancelled_read: bool,
+    }
+
+    impl Embedder for CancelOnAdmission<'_> {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move { self.state.embed_sync(text) })
+        }
+
+        fn embed_batch<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+            Box::pin(async move { self.state.embed_batch_sync(texts) })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            let identity = self.state.current_identity();
+            if self.state.identity_reads.load(Ordering::SeqCst) == self.cancel_read {
+                self.cx.set_cancel_requested(true);
+                if self.refuse_cancelled_read {
+                    return Err(embedding_identity_changed());
+                }
+            }
+            identity
+        }
+
+        fn dimension(&self) -> usize {
+            self.state.current_dimension()
+        }
+
+        fn id(&self) -> &str {
+            "bound-fence"
+        }
+
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+
+        fn is_semantic(&self) -> bool {
+            false
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
+    }
+
+    #[test]
+    fn cancellation_at_pre_inference_identity_admission_does_no_inference() {
+        run_test_with_cx(|cx| async move {
+            for refuse_cancelled_read in [false, true] {
+                for batch in [false, true] {
+                    let provider = CancelOnAdmission {
+                        state: State::new(Drift::None, Completion::Success),
+                        cx: &cx,
+                        cancel_read: 1,
+                        refuse_cancelled_read,
+                    };
+                    let error = if batch {
+                        provider.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err()
+                    } else {
+                        provider.embed_bound(&cx, "a").await.unwrap_err()
+                    };
+                    assert!(matches!(error, SearchError::Cancelled { .. }));
+                    assert_eq!(provider.state.calls.load(Ordering::SeqCst), 0);
+                    cx.set_cancel_requested(false);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cancellation_during_post_inference_admission_wins_over_success_error_and_drift() {
+        run_test_with_cx(|cx| async move {
+            for drift in [Drift::None, Drift::Identity] {
+                for completion in [Completion::Success, Completion::Failure] {
+                    for batch in [false, true] {
+                        let provider = CancelOnAdmission {
+                            state: State::new(drift, completion),
+                            cx: &cx,
+                            cancel_read: 2,
+                            refuse_cancelled_read: false,
+                        };
+                        let error = if batch {
+                            provider.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err()
+                        } else {
+                            provider.embed_bound(&cx, "a").await.unwrap_err()
+                        };
+                        assert!(matches!(error, SearchError::Cancelled { .. }));
+                        assert_eq!(provider.state.calls.load(Ordering::SeqCst), 1);
+                        cx.set_cancel_requested(false);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn sync_adapter_forwards_explicit_native_batch_contract_without_raw_dispatch() {
+        run_test_with_cx(|cx| async move {
+            let conservative = SyncEmbedderAdapter(State::new(Drift::None, Completion::Success));
+            assert!(!conservative.bound_batch_is_native());
+            let native = custom_adapter(Drift::None, Completion::Success);
+            assert!(native.bound_batch_is_native());
+            let output = native.embed_batch_bound(&cx, &["a", "b", "a"]).await.unwrap();
+            assert_eq!(output.len(), 3);
+            assert_eq!(*native.0.state.widths.lock().unwrap(), vec![3]);
+            for value in output {
+                assert_eq!(value.identity, native.0.state.admitted);
+                assert_eq!(value.values[0].to_bits(), 0.25_f32.to_bits());
+                assert_eq!(value.values[1].to_bits(), (-0.0_f32).to_bits());
+            }
+        });
     }
 }
 

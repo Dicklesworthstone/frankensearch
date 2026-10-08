@@ -1276,3 +1276,99 @@ fn split_batches_build_seal_and_reopen_the_complete_hybrid_graph_cohort() {
         assert_eq!(fast.raw_calls.load(Ordering::SeqCst), fast_queries);
     });
 }
+
+struct SynchronousBatch {
+    provider: Arc<Provider>,
+    change_dispatch: bool,
+    dispatch_changed: AtomicBool,
+}
+
+impl frankensearch_core::traits::SyncEmbed for SynchronousBatch {
+    fn embed_sync(&self, _text: &str) -> SearchResult<Vec<f32>> {
+        panic!("native construction must preserve synchronous bound inference")
+    }
+
+    fn embed_bound_sync(&self, text: &str) -> SearchResult<IdentityBoundEmbedding> {
+        Ok(self.embed_batch_bound_sync(&[text])?.pop().unwrap())
+    }
+
+    fn embed_batch_bound_sync(&self, texts: &[&str]) -> SearchResult<Vec<IdentityBoundEmbedding>> {
+        self.provider
+            .calls
+            .lock()
+            .unwrap()
+            .push(texts.iter().map(|text| (*text).to_owned()).collect());
+        if self.change_dispatch {
+            self.dispatch_changed.store(true, Ordering::SeqCst);
+        }
+        Ok(texts
+            .iter()
+            .map(|text| IdentityBoundEmbedding {
+                values: self.provider.values(text),
+                identity: self.provider.identity.clone(),
+            })
+            .collect())
+    }
+
+    fn bound_batch_is_native(&self) -> bool {
+        !self.dispatch_changed.load(Ordering::SeqCst)
+    }
+
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        self.provider.identity()
+    }
+
+    fn dimension(&self) -> usize {
+        self.provider.dimension()
+    }
+
+    fn id(&self) -> &str {
+        self.provider.id()
+    }
+
+    fn is_semantic(&self) -> bool {
+        false
+    }
+
+    fn category(&self) -> ModelCategory {
+        ModelCategory::HashEmbedder
+    }
+}
+
+#[test]
+fn native_build_dispatches_sync_batches_and_refuses_a_mid_group_contract_change() {
+    use frankensearch_core::traits::SyncEmbedderAdapter;
+
+    run_test_with_cx(|cx| async move {
+        for change_dispatch in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Provider::new("fast", 2, 8));
+            let adapter = SyncEmbedderAdapter(SynchronousBatch {
+                provider: provider.clone(),
+                change_dispatch,
+                dispatch_changed: AtomicBool::new(false),
+            });
+            assert!(adapter.bound_batch_is_native());
+            let built = NativeIndexBuilder::new(
+                directory.path().join("candidate"),
+                generation(1),
+                Arc::new(adapter),
+            )
+            .unwrap()
+            .with_batch_size(3)
+            .unwrap()
+            .add_documents(documents())
+            .build(&cx)
+            .await;
+            if change_dispatch {
+                assert!(matches!(built, Err(SearchError::UnverifiableRemoteSpace { .. })));
+                assert_eq!(provider.calls.lock().unwrap().len(), 1);
+            } else {
+                assert_eq!(built.unwrap().fast().index().live_count(), 7);
+                let widths: Vec<_> = provider.calls.lock().unwrap().iter().map(Vec::len).collect();
+                assert_eq!(widths, vec![3, 3, 1]);
+            }
+            assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);
+        }
+    });
+}
