@@ -409,6 +409,55 @@ fn periodic_scan_finds_missed_edits_while_forced_and_unsupported_changes_rebuild
 }
 
 #[test]
+fn delta_generations_seal_only_the_segments_their_manifest_names() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, source, root) = fixture(directory.path());
+        let mut session = controlled_session(&runtime, &cx, &root);
+        initial(&mut session, &cx).await;
+        // Each batch adds one small segment; the tier policy folds eight.
+        let mut merged = false;
+        for round in 0..10 {
+            fs::write(source.join("alpha.md"), format!("roundword{round} body")).unwrap();
+            let generation = change(&mut session, &cx, &source.join("alpha.md")).await;
+            assert_eq!(
+                FsfsRuntime::read_index_sentinel(generation.path())
+                    .unwrap()
+                    .unwrap()
+                    .command,
+                "retained-batch"
+            );
+            let engine = FsfsRuntime::resolve_lexical_engine(generation.path())
+                .unwrap()
+                .engine_dir()
+                .unwrap();
+            let named = frankensearch_quill::keeper::load_manifest_pair(&engine)
+                .unwrap()
+                .manifest
+                .segments
+                .len();
+            let sealed = fs::read_dir(&engine)
+                .unwrap()
+                .filter(|entry| {
+                    entry
+                        .as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".fslx")
+                })
+                .count();
+            assert_eq!(
+                sealed, named,
+                "round {round}: a merge's inputs must not be sealed with its output"
+            );
+            merged |= named < round + 2;
+        }
+        assert!(merged, "the fixture must reach a tier merge");
+    });
+}
+
+#[test]
 fn prepared_delta_still_requires_post_seal_source_authority() {
     run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();

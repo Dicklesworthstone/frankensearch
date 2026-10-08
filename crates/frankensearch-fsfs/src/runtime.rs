@@ -20443,10 +20443,17 @@ impl FsfsRuntime {
         // Keyword segments carry no repair sidecars (bd-2pkpj): they rebuild
         // from sources, so a segment that fails verification is quarantined
         // and its documents reindexed rather than repaired.
+        //
+        // A bulk session, because its completion is published after the tier
+        // policy runs. An ordinary commit publishes a tier merge last, which
+        // leaves the merge's inputs named by MANIFEST.prev and so on disk:
+        // a complete-generation candidate then sealed them too, a second copy
+        // of every merged row (bd-dnqgr).
         let index = QuillIndex::create(
             cx,
             &lexical_path,
             QuillConfig {
+                bulk_load_mode: true,
                 max_ingest_shards: 1,
                 deterministic_ingest: true,
                 quarantine_on_unrepairable: true,
@@ -20462,11 +20469,11 @@ impl FsfsRuntime {
             stats
         };
         // `flush` only hands the documents to Quill's accumulator; readers see
-        // them once `commit` seals the segment and publishes the next
-        // MANIFEST (watch mode commits on its own cadence; a one-shot command
-        // has no later chance).
+        // them once `finish_bulk_load` seals the segment and publishes the
+        // next MANIFEST (watch mode commits on its own cadence; a one-shot
+        // command has no later chance).
         let published_generation = index
-            .commit(cx)
+            .finish_bulk_load(cx)
             .await?
             .segment_stats()?
             .published_generation;
