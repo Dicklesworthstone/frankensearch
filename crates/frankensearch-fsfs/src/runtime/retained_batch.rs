@@ -29,6 +29,7 @@ use crate::generation_store::{
 use crate::lifecycle::PublicationLease;
 
 mod inference;
+mod inherited_reuse;
 use inference::InferenceBatch;
 
 const MAX_OPERATIONS: usize = 4096;
@@ -393,6 +394,9 @@ impl FsfsRuntime {
     /// Final operations are last-write-wins per exact ID. Only final upserts are
     /// canonicalized/embedded; unchanged documents and their metadata survive in
     /// an independent copy. All present vector tiers must remain compatible.
+    /// Existing source-reuse evidence is retained only for untouched documents,
+    /// under its original executable/configuration scope. Changed documents lose
+    /// their old reuse proof even when their resulting metadata happens to match.
     ///
     /// Empty input performs no filesystem or model work. A nonempty no-op still
     /// checks its base. Input (4096 operations, 8 MiB per body, 64 MiB total) and
@@ -752,6 +756,7 @@ impl FsfsRuntime {
                 }
             }
         }
+        let changed_ids = documents.keys().cloned().collect::<HashSet<_>>();
         for (id, body) in documents {
             if let Some(body) = body {
                 let entry = IndexManifestEntry {
@@ -809,6 +814,7 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
+        inherited_reuse::retain_unchanged(cx, &predecessor, build.path(), &changed_ids)?;
         for producer in [fast.as_ref(), quality.as_ref()].into_iter().flatten() {
             producer.recheck()?;
         }
