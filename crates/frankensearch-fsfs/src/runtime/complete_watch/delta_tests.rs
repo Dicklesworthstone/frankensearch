@@ -543,7 +543,7 @@ fn removal_absence_requires_not_found_and_preserves_cancellation() {
         for path in [&file, &folder, &link] {
             assert!(!physically_absent(&cx, path).unwrap());
             assert!(is_source_changed(
-                &recheck_removals(&cx, &[path.to_path_buf()]).unwrap_err()
+                &recheck_removals(&cx, std::slice::from_ref(path)).unwrap_err()
             ));
         }
         assert!(matches!(
