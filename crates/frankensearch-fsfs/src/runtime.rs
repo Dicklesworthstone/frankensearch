@@ -23746,7 +23746,11 @@ impl FsfsRuntime {
                     }
 
                     if let Some(state) = target_watcher_state {
-                        watcher.apply_pressure_state(state);
+                        if let Err(error) = watcher.apply_pressure_state(state) {
+                            return ShutdownReason::Error(format!(
+                                "filesystem watcher could not apply pressure: {error}"
+                            ));
+                        }
                         if last_applied_watcher_state != Some(state) {
                             info!(
                                 watcher_pressure_state = ?state,

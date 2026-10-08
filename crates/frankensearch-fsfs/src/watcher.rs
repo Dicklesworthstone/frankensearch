@@ -1540,9 +1540,25 @@ impl FsWatcher {
         pressure_state_from_code(self.pressure_state.load(Ordering::Acquire))
     }
 
-    pub fn apply_pressure_state(&self, state: PressureState) {
-        self.pressure_state
-            .store(pressure_state_to_code(state), Ordering::Release);
+    /// Apply a pressure state. Pausing watching owes an authoritative rescan
+    /// here, before either watcher loop can observe the pause, so the debt is
+    /// outstanding when relief lets the ingest loop run it.
+    ///
+    /// # Errors
+    /// Returns an error when the reconciliation lineage is exhausted.
+    pub fn apply_pressure_state(&self, state: PressureState) -> SearchResult<()> {
+        let watching = |state| {
+            WatcherExecutionPolicy::for_pressure(state, self.base_debounce_ms, self.base_batch_size)
+                .watching_enabled
+        };
+        let previous = self
+            .pressure_state
+            .swap(pressure_state_to_code(state), Ordering::AcqRel);
+        if watching(pressure_state_from_code(previous)) && !watching(state) {
+            lock_or_recover(&self.reconciliation).require_full_scan()?;
+            debug!("pressure paused watching; requiring authoritative watcher rescan");
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -2580,23 +2596,22 @@ fn drain_notify_channel(
     failure.map_or(Ok(()), Err)
 }
 
-/// Owe an authoritative rescan for the notifications pressure makes this loop
-/// drop: once when watching pauses, and again for every paused iteration that
-/// received or dropped one. Relief owes nothing more. Owing the rescan on
-/// relief instead raced the ingest loop, which can see relief first and finish
-/// the owed pass up to one receive timeout before this loop does; the late
-/// debt then ran a second full pass over every file (bd-r0cur).
+/// Owe an authoritative rescan for every paused iteration that received or
+/// dropped a notification; the pause itself owes one where it is applied
+/// ([`FsWatcher::apply_pressure_state`]). This loop learns of a pause or of
+/// relief only after its receive timeout, so debt it owed for either raced the
+/// ingest loop, which can resume and run the owed pass first; the late debt
+/// then ran a second full pass over every file (bd-r0cur).
 fn observe_pressure_transition(
     watching_enabled: bool,
     dropped: bool,
     pressure_was_disabled: &mut bool,
     reconciliation: &ReconciliationTracker,
 ) -> SearchResult<()> {
-    if watching_enabled {
-        *pressure_was_disabled = false;
-    } else if !std::mem::replace(pressure_was_disabled, true) || dropped {
+    *pressure_was_disabled = !watching_enabled;
+    if !watching_enabled && dropped {
         lock_or_recover(reconciliation).require_full_scan()?;
-        debug!("pressure paused watching; requiring authoritative watcher rescan");
+        debug!("pressure dropped notifications; requiring authoritative watcher rescan");
     }
     Ok(())
 }
@@ -5237,7 +5252,9 @@ mod tests {
             DiscoveryConfig::default(),
             pipeline.clone(),
         );
-        watcher.apply_pressure_state(PressureState::Degraded);
+        watcher
+            .apply_pressure_state(PressureState::Degraded)
+            .expect("pausing has an available epoch");
 
         run_test_with_cx(|cx| async move {
             let event = WatchEvent::modified("/tmp/repo/src/lib.rs", now_millis(), Some(128));
@@ -9211,7 +9228,9 @@ mod tests {
                 DiscoveryConfig::default(),
                 Arc::clone(&pipeline) as Arc<dyn WatchIngestPipeline>,
             );
-            watcher.apply_pressure_state(PressureState::Emergency);
+            watcher
+                .apply_pressure_state(PressureState::Emergency)
+                .expect("pausing has an available epoch");
             watcher.start(&cx).await.expect("start paused watcher");
             for _ in 0..5_000 {
                 if lock_or_recover(&watcher.reconciliation).baseline_initialized {
@@ -9225,7 +9244,9 @@ mod tests {
                 "paused startup performed ingestion"
             );
             assert!(lock_or_recover(&watcher.reconciliation).required);
-            watcher.apply_pressure_state(PressureState::Normal);
+            watcher
+                .apply_pressure_state(PressureState::Normal)
+                .expect("relief owes nothing");
             await_startup_reconciliation(&cx, &watcher).await;
             watcher
                 .stop_checked(&cx)
@@ -9329,39 +9350,43 @@ mod tests {
     }
 
     #[test]
-    fn pressure_owes_one_rescan_when_it_pauses_watching_not_when_it_lifts() {
-        let reconciliation: ReconciliationTracker =
-            Arc::new(Mutex::new(ReconciliationState::default()));
-        let mut pressure_was_disabled = false;
-        let settle = || lock_or_recover(&reconciliation).required = false;
+    fn pressure_owes_a_rescan_where_it_pauses_watching_and_for_dropped_notifications() {
+        let watcher = FsWatcher::new(
+            vec![PathBuf::from("/tmp/repo")],
+            DiscoveryConfig::default(),
+            Arc::new(RecordingPipeline::default()),
+        );
+        let reconciliation = Arc::clone(&watcher.reconciliation);
+        let owed = || std::mem::replace(&mut lock_or_recover(&reconciliation).required, false);
 
-        observe_pressure_transition(false, false, &mut pressure_was_disabled, &reconciliation)
+        watcher
+            .apply_pressure_state(PressureState::Emergency)
             .expect("pausing has an available epoch");
-        assert!(pressure_was_disabled);
         assert!(
-            lock_or_recover(&reconciliation).required,
+            owed(),
             "notifications are dropped from the pause on, so the rescan is owed then"
         );
-        settle();
+        watcher
+            .apply_pressure_state(PressureState::Degraded)
+            .unwrap();
+        watcher.apply_pressure_state(PressureState::Normal).unwrap();
+        assert!(!owed(), "a deeper pause and relief owe nothing more");
+
+        // The notify loop notices a pause, or relief, only after its receive
+        // timeout. The ingest loop may have resumed and settled the debt by
+        // then, so noticing either must not owe a second full pass.
+        let mut pressure_was_disabled = false;
         observe_pressure_transition(false, false, &mut pressure_was_disabled, &reconciliation)
             .unwrap();
-        assert!(
-            !lock_or_recover(&reconciliation).required,
-            "a quiet paused iteration owes nothing new"
-        );
+        assert!(pressure_was_disabled);
+        assert!(!owed(), "a quiet paused iteration owes nothing");
         observe_pressure_transition(false, true, &mut pressure_was_disabled, &reconciliation)
             .unwrap();
-        assert!(
-            lock_or_recover(&reconciliation).required,
-            "a dropped notification is owed a rescan"
-        );
-        // The ingest loop may see relief first and settle the debt before this
-        // loop notices; noticing relief must not owe a second full pass.
-        settle();
+        assert!(owed(), "a dropped notification is owed a rescan");
         observe_pressure_transition(true, false, &mut pressure_was_disabled, &reconciliation)
             .unwrap();
         assert!(!pressure_was_disabled);
-        assert!(!lock_or_recover(&reconciliation).required);
+        assert!(!owed());
     }
 
     #[test]
