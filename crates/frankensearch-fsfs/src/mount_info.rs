@@ -353,6 +353,24 @@ impl MountTable {
         best
     }
 
+    /// [`Self::lookup`] for an entry of a directory whose lookup was `parent`.
+    ///
+    /// A mount that contains the entry but not its directory can only be
+    /// mounted at the entry itself, so a walk pays the full search once per
+    /// directory and for mount points, not once per file.
+    #[must_use]
+    pub fn lookup_entry<'a>(
+        &'a self,
+        parent: Option<(&'a MountEntry, &'a MountPolicy)>,
+        path: &Path,
+    ) -> Option<(&'a MountEntry, &'a MountPolicy)> {
+        if self.policies.contains_key(path) {
+            self.lookup(path)
+        } else {
+            parent
+        }
+    }
+
     /// Iterate over all mount entries.
     #[must_use]
     pub fn entries(&self) -> &[MountEntry] {
@@ -824,6 +842,45 @@ user@host:/home /mnt/sshfs fuse.sshfs rw,nosuid,nodev 0 0
         // A file under /home should match the root mount.
         let (entry, _) = table.lookup(Path::new("/home/user/code.rs")).unwrap();
         assert_eq!(entry.category, FsCategory::Local);
+    }
+
+    #[test]
+    fn mount_table_entry_lookup_agrees_with_the_full_search() {
+        let entries = vec![
+            MountEntry {
+                device: "/dev/sda1".into(),
+                mount_point: PathBuf::from("/"),
+                fstype: "ext4".into(),
+                category: FsCategory::Local,
+                options: "rw".into(),
+            },
+            MountEntry {
+                device: "server:/export".into(),
+                mount_point: PathBuf::from("/mnt/nfs"),
+                fstype: "nfs4".into(),
+                category: FsCategory::Nfs,
+                options: "rw".into(),
+            },
+        ];
+        let table = MountTable::new(entries, &HashMap::new());
+        let category = |found: Option<(&MountEntry, &MountPolicy)>| found.map(|(e, _)| e.category);
+        // Walk /mnt -> /mnt/nfs (a mount point) -> /mnt/nfs/data, and /mnt -> /mnt/nfs-old.
+        let mnt = table.lookup(Path::new("/mnt"));
+        for (parent, path) in [
+            (mnt, "/mnt/nfs"),
+            (mnt, "/mnt/nfs-old"),
+            (table.lookup(Path::new("/mnt/nfs")), "/mnt/nfs/data"),
+        ] {
+            assert_eq!(
+                category(table.lookup_entry(parent, Path::new(path))),
+                category(table.lookup(Path::new(path))),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            category(table.lookup_entry(mnt, Path::new("/mnt/nfs"))),
+            Some(FsCategory::Nfs)
+        );
     }
 
     #[test]

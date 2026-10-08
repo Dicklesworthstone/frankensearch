@@ -259,7 +259,8 @@ impl SourceRoot {
         retained_search_checkpoint(cx)?;
         self.check()?;
         let mounts = MountTable::new(read_system_mounts(), &discovery.mount_override_map());
-        let category = mounts.lookup(&self.path).map(|(entry, _)| entry.category);
+        let root_mount = mounts.lookup(&self.path);
+        let category = root_mount.map(|(entry, _)| entry.category);
         if matches!(
             discovery.evaluate_root(&self.path, category).scope,
             DiscoveryScopeDecision::Exclude
@@ -290,12 +291,11 @@ impl SourceRoot {
             }
             discoverable.insert(entry.into_path());
         }
-        let mut stamps = BTreeMap::new();
-        let mut classes = BTreeMap::new();
+        let mut files = Vec::new();
         let mut directories = BTreeMap::new();
         let mut visited = HashSet::new();
-        let mut stack = vec![(self.path.clone(), self.directory.metadata()?)];
-        while let Some((directory, expected)) = stack.pop() {
+        let mut stack = vec![(self.path.clone(), self.directory.metadata()?, root_mount)];
+        while let Some((directory, expected, directory_mount)) = stack.pop() {
             retained_search_checkpoint(cx)?;
             // Keep the descriptor alive until the listing and its final check
             // finish; replacement cannot recycle the opened inode underneath us.
@@ -321,7 +321,8 @@ impl SourceRoot {
                 if !discoverable.contains(&path) {
                     continue;
                 }
-                let link = fs::symlink_metadata(&path).map_err(observation_io)?;
+                // Relative to the listed directory: no walk of the whole path.
+                let link = entry.metadata().map_err(observation_io)?;
                 let is_symlink = link.is_symlink();
                 if is_symlink && !discovery.follow_symlinks {
                     continue;
@@ -340,7 +341,8 @@ impl SourceRoot {
                     if metadata.is_dir() { 0 } else { metadata.len() },
                 )
                 .with_symlink(is_symlink);
-                if let Some((mount, _)) = mounts.lookup(&path) {
+                let mount = mounts.lookup_entry(directory_mount, &path);
+                if let Some((mount, _)) = mount {
                     candidate = candidate.with_mount_category(mount.category);
                 }
                 let decision = discovery.evaluate_candidate(&candidate);
@@ -348,10 +350,10 @@ impl SourceRoot {
                     continue;
                 }
                 if metadata.is_dir() {
-                    stack.push((path, metadata));
+                    stack.push((path, metadata, mount));
                 } else if metadata.is_file() && decision.ingestion_class.is_indexed() {
-                    classes.insert(path.clone(), decision.ingestion_class);
-                    stamps.insert(path, SourceStamp::from_metadata(&metadata));
+                    let stamp = SourceStamp::from_metadata(&metadata);
+                    files.push((path, decision.ingestion_class, stamp));
                 }
             }
             let after = fs::metadata(&directory).map_err(observation_io)?;
@@ -363,6 +365,18 @@ impl SourceRoot {
         }
         self.check()?;
         retained_search_checkpoint(cx)?;
+        // One sort, then bulk builds of already ordered input: inserting each
+        // file into two ordered maps compared long paths component by
+        // component 2·log2(files) times per file.
+        files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        let classes = files
+            .iter()
+            .map(|(path, class, _)| (path.clone(), *class))
+            .collect();
+        let stamps = files
+            .into_iter()
+            .map(|(path, _, stamp)| (path, stamp))
+            .collect();
         Ok(SourceObservation {
             stamps,
             classes,
