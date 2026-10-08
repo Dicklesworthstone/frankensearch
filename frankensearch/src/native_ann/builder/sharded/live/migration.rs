@@ -8,11 +8,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use frankensearch_core::generation::{ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1};
+use frankensearch_core::generation::{
+    ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, GenerationComponentReceiptV1,
+};
 
 use super::{NativeShardedCandidate, NativeShardedSnapshot};
 use crate::native_ann::builder::sharded::{
-    MAX_NATIVE_BUILD_SHARDS, NativeBuiltShardedHybridIndex,
+    MAX_NATIVE_BUILD_SHARDS, NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits,
 };
 use crate::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltTier, NativeIndexBuilder, TierPlan,
@@ -234,6 +236,56 @@ impl NativeLiveShardedMigration {
         )
         .await;
         checkpoint(cx, "native_ann.sharded_live.migration.built")?;
+        target.admit(cx, self.base, outcome?)
+    }
+
+    /// Reopen a sealed model replacement without rebuilding or inferring vectors.
+    ///
+    /// The directory supplied to `begin_model_migration` names the existing
+    /// candidate. Supply its original trusted hybrid receipt, never a digest
+    /// computed from an unknown directory. The ordinary selected reader admits
+    /// every partition, required graph, source and global Quill artifact under
+    /// its existing aggregate/per-file limits and exact source/lexical census.
+    /// A missing final partition cannot become a successful prefix or fallback.
+    ///
+    /// The complete reopened cohort must match the explicitly requested full
+    /// generation (including nonce), models, quality presence and per-tier
+    /// precision/graph policy. Configure matching storage policies for a sealed
+    /// F16/HNSW target. All retained source fields must equal the base snapshot,
+    /// even when the selected receipt validly authenticates another source set.
+    /// The receipt selects partition boundaries; they may differ from the base.
+    /// Inference batch settings affect builds only, not these admission limits.
+    ///
+    /// This returns a candidate for the SAME exact-predecessor `install`, not
+    /// permission to discard a source update committed while reopening. No
+    /// model inference, source cloning, discovery, repair, file mutation or
+    /// activation occurs. Callers still own durable selection, anti-rollback
+    /// policy and immutable-file retention. Blocking work stays on their lane.
+    ///
+    /// # Errors
+    /// Returns receipt, resource, identity, source/policy, artifact, I/O or
+    /// cancellation errors. Every failure preserves the existing live selection.
+    pub async fn open_selected(
+        self,
+        cx: &Cx,
+        expected: &GenerationComponentReceiptV1,
+        limits: NativeShardedHybridReopenLimits,
+    ) -> SearchResult<NativeShardedCandidate> {
+        checkpoint(cx, "native_ann.sharded_live.migration.reopen")?;
+        let target = TargetModels::capture(&self.builder);
+        let outcome = Box::pin(NativeBuiltShardedHybridIndex::open_selected(
+            cx,
+            &self.builder.directory,
+            expected,
+            Arc::clone(&self.builder.fast.embedder),
+            self.builder
+                .quality
+                .as_ref()
+                .map(|tier| Arc::clone(&tier.embedder)),
+            limits,
+        ))
+        .await;
+        checkpoint(cx, "native_ann.sharded_live.migration.reopened")?;
         target.admit(cx, self.base, outcome?)
     }
 }

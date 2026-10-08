@@ -608,3 +608,5 @@ fn failed_old_models_do_not_block_rebuilding_the_retained_source() {
         assert_eq!(old_quality.submitted().len(), 7);
     });
 }
+
+mod reopen;
