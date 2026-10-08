@@ -5287,6 +5287,13 @@ struct QuillWriterState {
     docid_allocator: DocIdAllocator,
     uncommitted_ids: BTreeSet<String>,
     next_lease_base: u64,
+    /// The docid frontier this writer opened at. Segments below it were
+    /// finished by an earlier writer, so [`Self::finish_bulk_load`] packs only
+    /// the segments above it and leaves the rest to the tier policy: a
+    /// one-document session over a large index does not rewrite it. Zero when
+    /// the writer resumes an interrupted bulk load, whose published segments
+    /// belong to the same load.
+    bulk_session_docid_lo: u64,
     next_seal_seq: u64,
     staged_flush: Option<StagedFlush>,
     pending_segments: Vec<ManifestSegment>,
@@ -5705,6 +5712,11 @@ impl QuillWriterState {
         let manifest = &initial_snapshot.loaded_manifest().manifest;
         let initial_generation = manifest.generation;
         let next_lease_base = validate_docid_watermark(manifest.docid_high_watermark)?;
+        let bulk_session_docid_lo = if manifest.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS == 0 {
+            next_lease_base
+        } else {
+            0
+        };
         let detected_parallelism = ingest_parallelism_at_construction();
         let shard_router = ShardRouter::from_config(&config, detected_parallelism);
         let docid_allocator = DocIdAllocator::open(next_lease_base, shard_router.shard_count())
@@ -5753,6 +5765,7 @@ impl QuillWriterState {
             docid_allocator,
             uncommitted_ids: BTreeSet::new(),
             next_lease_base,
+            bulk_session_docid_lo,
             next_seal_seq,
             staged_flush: None,
             pending_segments: Vec::new(),
@@ -8270,12 +8283,16 @@ impl QuillWriterState {
         }
         self.commit_with_trigger(cx, LifecycleTrigger::BulkFinish)
             .await?;
+        // Every docid this session issued lies at or above the frontier it
+        // opened at, so its segments are the manifest's consecutive tail.
+        let frontier = self.bulk_session_docid_lo;
         let source_segment_ids = self
             .authority_snapshot()?
             .loaded_manifest()
             .manifest
             .segments
             .iter()
+            .filter(|segment| segment.docid_lo >= frontier)
             .map(|segment| segment.segment_id)
             .collect::<Vec<_>>();
         if source_segment_ids.len() > 1 {
@@ -8297,6 +8314,12 @@ impl QuillWriterState {
                 .instrument(bulk_span)
                 .await?;
         }
+        // Ordinary tier merges resume here, over the segments earlier writers
+        // finished as well, which bounds the segment count across sessions.
+        // They run before the completion publication so that it comes last: a
+        // merge's inputs stay named by MANIFEST.prev, and so on disk, until
+        // the next publication retires them.
+        self.apply_tier_policy(cx).await?;
         self.publish_bulk_completion(cx).await?;
         self.reader.config.bulk_load_mode = false;
         self.authority_snapshot()
@@ -12595,9 +12618,12 @@ impl QuillIndex {
     /// bound-consecutive concat pass and clear the durable bulk marker.
     ///
     /// Intermediate MANIFEST generations remain crash-resumable according to
-    /// [`QuillConfig::bulk_publish_segment_cadence`]. After this succeeds the
-    /// shard set has at most one sealed segment and ordinary tier merging is
-    /// re-enabled for subsequent commits.
+    /// [`QuillConfig::bulk_publish_segment_cadence`]. The pass packs the
+    /// segments this load wrote into one; segments an earlier writer finished
+    /// before this one opened are not rewritten. Ordinary tier merging is then
+    /// re-enabled: it runs once here, and for subsequent commits. A build into
+    /// an empty index, or one resuming an interrupted bulk load, therefore
+    /// ends with at most one sealed segment.
     ///
     /// # Errors
     ///
@@ -35240,13 +35266,16 @@ mod tests {
 
     /// bd-k07zw: fsfs publishes every complete-generation edit, delete, and
     /// append through a short single-shard writer session that ends in a
-    /// bulk-finish concat. Each session used to open a fresh 65,536-docid
-    /// lease, and the concat stored the skipped slots as dense DOCLEN/IDMAP
-    /// holes (2.36 MB per one-line edit). The session must continue at the
-    /// exact docid frontier, so each new row widens the merged hull by one
-    /// slot.
+    /// bulk finish. Each session used to open a fresh 65,536-docid lease, and
+    /// merges stored the skipped slots as dense DOCLEN/IDMAP holes (2.36 MB
+    /// per one-line edit). The session must continue at the exact docid
+    /// frontier, so each new row widens the covered range by one slot.
+    ///
+    /// bd-dnqgr: the finish packs only the session's own segments. It used to
+    /// concat the whole index into one segment, rewriting a 178 MB segment
+    /// for a one-line edit; the base the session opened over stays as it is.
     #[test]
-    fn reopened_single_shard_sessions_merge_without_lease_holes() {
+    fn reopened_single_shard_sessions_add_rows_at_the_frontier_without_rewriting_the_base() {
         run_with_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("lexical directory");
             let bulk = || QuillConfig {
@@ -35273,7 +35302,10 @@ mod tests {
                 .finish_bulk_load(&cx)
                 .await
                 .expect("finish initial build");
-            assert_eq!(built.loaded_manifest().manifest.docid_high_watermark, 5);
+            let built_manifest = &built.loaded_manifest().manifest;
+            assert_eq!(built_manifest.docid_high_watermark, 5);
+            assert_eq!(built_manifest.segments.len(), 1);
+            let base = built_manifest.segments[0].clone();
             drop(index);
 
             for session in 0..3_u64 {
@@ -35292,17 +35324,168 @@ mod tests {
                     .expect("index one added document");
                 let snapshot = index.finish_bulk_load(&cx).await.expect("finish session");
                 let manifest = &snapshot.loaded_manifest().manifest;
-                assert_eq!(manifest.segments.len(), 1);
-                let segment = &manifest.segments[0];
+                let ranges = manifest
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.docid_lo, segment.docid_hi))
+                    .collect::<Vec<_>>();
+                let mut expected = vec![(0, 5)];
+                expected.extend((0..=session).map(|added| (5 + added, 6 + added)));
                 assert_eq!(
-                    (segment.docid_lo, segment.docid_hi),
-                    (0, 6 + session),
-                    "session {session} must widen the hull by one slot, not by a lease"
+                    ranges, expected,
+                    "session {session} must add one slot at the frontier, not a lease"
+                );
+                assert_eq!(
+                    manifest.segments[0].segment_id, base.segment_id,
+                    "session {session} must not rewrite the segment it opened over"
                 );
                 assert_eq!(manifest.docid_high_watermark, 6 + session);
                 assert_eq!(snapshot.doc_count(), 6 + session);
                 drop(index);
             }
+        });
+    }
+
+    /// The tier policy, suppressed during a bulk load, runs when it finishes,
+    /// over the segments earlier sessions left too: reopened sessions cannot
+    /// accumulate one segment each without bound.
+    #[test]
+    fn finished_bulk_sessions_hand_their_segments_to_the_tier_policy() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("lexical directory");
+            let bulk = || QuillConfig {
+                bulk_load_mode: true,
+                max_ingest_shards: 1,
+                tier_fanout: 3,
+                ..QuillConfig::default()
+            };
+            let index = QuillIndex::create(&cx, directory.path(), bulk())
+                .await
+                .expect("create bulk index");
+            index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new("doc-0", "tiered fixture document")],
+                )
+                .await
+                .expect("index initial build");
+            index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finish initial build");
+            drop(index);
+
+            let mut segment_counts = Vec::new();
+            for session in 0..2_u64 {
+                let index = QuillIndex::create(&cx, directory.path(), bulk())
+                    .await
+                    .expect("reopen for one session");
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new(
+                            format!("added-{session}"),
+                            format!("tiered fixture addition {session}"),
+                        )],
+                    )
+                    .await
+                    .expect("index one added document");
+                let snapshot = index.finish_bulk_load(&cx).await.expect("finish session");
+                segment_counts.push(snapshot.segments().len());
+                assert_eq!(snapshot.doc_count(), 2 + session);
+                drop(index);
+            }
+            // Two segments stay below the fanout; the third same-tier segment
+            // triggers one merge of all three.
+            assert_eq!(segment_counts, vec![2, 1]);
+            let reopened = QuillIndex::create(&cx, directory.path(), bulk())
+                .await
+                .expect("reopen merged index");
+            // The finish publishes once more after its merge, which retires
+            // the inputs: a sealed copy of this index holds only the output.
+            reopened
+                .collect_garbage_with(
+                    &cx,
+                    crate::GarbageCollectionOptions {
+                        grace_period: std::time::Duration::ZERO,
+                    },
+                )
+                .await
+                .expect("reclaim retired segments");
+            let on_disk = std::fs::read_dir(directory.path())
+                .expect("read index directory")
+                .filter(|entry| {
+                    std::path::Path::new(&entry.as_ref().expect("entry").file_name())
+                        .extension()
+                        .is_some_and(|extension| extension == "fslx")
+                })
+                .count();
+            assert_eq!(on_disk, 1, "the merged inputs must be reclaimable");
+            assert_eq!(
+                reopened
+                    .search_paginated(&cx, "tiered", 10, 0, true)
+                    .expect("search merged index")
+                    .total_count,
+                Some(3),
+            );
+        });
+    }
+
+    /// A writer that resumes an interrupted bulk load packs everything: the
+    /// segments the interrupted writer published belong to the same load.
+    #[test]
+    fn resumed_bulk_load_packs_the_interrupted_writers_segments() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("lexical directory");
+            let bulk = || QuillConfig {
+                scribe_shard_budget_bytes: 1,
+                deterministic_ingest: true,
+                bulk_load_mode: true,
+                bulk_publish_segment_cadence: 2,
+                max_ingest_shards: 1,
+                ..QuillConfig::default()
+            };
+            let index = QuillIndex::create(&cx, directory.path(), bulk())
+                .await
+                .expect("create bulk index");
+            let documents = (0..5)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("interrupted-{ordinal}"),
+                        format!("interrupted bulk document {ordinal}"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate the interrupted load");
+            let interrupted = index.snapshot().expect("cadence publication");
+            assert!(interrupted.segments().len() > 1);
+            assert_ne!(
+                interrupted.loaded_manifest().manifest.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
+                0,
+            );
+            let published = interrupted.doc_count();
+            drop(index);
+
+            let resumed = QuillIndex::create(&cx, directory.path(), bulk())
+                .await
+                .expect("resume the bulk load");
+            resumed
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new("resumed", "resumed bulk document")],
+                )
+                .await
+                .expect("index one more document");
+            let finished = resumed.finish_bulk_load(&cx).await.expect("finish load");
+            assert_eq!(finished.segments().len(), 1);
+            assert_eq!(finished.doc_count(), published + 1);
+            assert_eq!(
+                finished.loaded_manifest().manifest.flags & MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
+                0,
+            );
         });
     }
 
