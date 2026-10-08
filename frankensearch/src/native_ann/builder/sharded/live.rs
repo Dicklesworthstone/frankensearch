@@ -43,6 +43,9 @@ use super::{
 use crate::native_ann::{NativeShardedResult, checkpoint, invalid};
 use crate::{Cx, IndexableDocument, SearchError, SearchResult};
 
+mod migration;
+pub use migration::NativeLiveShardedMigration;
+
 /// Live selection of an entire admitted source/vector/Quill partition inventory.
 ///
 /// Share this handle with `Arc`. Snapshot acquisition clones only one owner;
@@ -231,8 +234,9 @@ impl NativeShardedSnapshot {
     /// Stage source edits against this exact predecessor without locking selection.
     ///
     /// Uses the existing sharded update admission, including every partition's
-    /// original producer, membership and inherited storage policy. Changing the
-    /// model or tier topology requires a separately opened live handle.
+    /// original producer, membership and inherited storage policy. Use the
+    /// explicit [`Self::begin_model_migration`] operation to change models or
+    /// tier topology while keeping this live handle.
     ///
     /// # Errors
     /// Propagates generation, producer, membership, policy and cancellation errors.
