@@ -156,7 +156,7 @@ fn producer_validation_refuses_foreign_nonfinite_and_wrong_width_responses() {
         let (producer, witness) = producer(Reply::Good);
         assert_eq!(producer.infer(&cx, "body").await.unwrap(), [1.0, 0.0, 0.0]);
         assert_eq!(witness.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(witness.raw_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(witness.raw_calls.load(Ordering::SeqCst), 0);
     });
 }
 
@@ -198,3 +198,5 @@ fn cancellation_wins_over_provider_success_and_failure() {
     });
 }
 
+#[cfg(all(feature = "semantic-support", not(feature = "embedded-models")))]
+mod persisted;
