@@ -2,7 +2,9 @@
 //!
 //! A rebuild writes to a fresh directory, not to the serving generation. After
 //! engine-level admission succeeds, an inventory authenticates the entire bundle
-//! and one atomic pointer switch publishes it. Publication, cancellation and
+//! and one atomic pointer switch publishes it. Within one process, a file whose
+//! identity and change stamps are unchanged since this process hashed it is not
+//! hashed again (see `digest_memo`). Publication, cancellation and
 //! Drop never delete data: predecessors and abandoned builds stay until an
 //! explicit retention pass ([`CompleteGenerationStore::collect_retained`])
 //! removes those older than the newest kept predecessors, skipping any
@@ -13,6 +15,7 @@
 //! publication-lease protocol. Synchronous filesystem work belongs on a caller's
 //! blocking lane. No new runtime or detached worker is created here.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 #[cfg(unix)]
@@ -104,6 +107,31 @@ impl PublishedGeneration {
     #[must_use]
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+
+    /// The sealed inventory admission authenticated: each artifact's
+    /// `/`-separated path within the bundle, with its length and SHA-256 hex.
+    ///
+    /// # Errors
+    /// Returns an error when the inventory no longer matches the admitted digest.
+    pub(crate) fn sealed_artifacts(&self) -> SearchResult<BTreeMap<String, (u64, String)>> {
+        let bytes = read_bounded_regular(
+            &self.path.join(COMPLETE_GENERATION_MANIFEST),
+            MAX_MANIFEST_BYTES,
+        )?;
+        if digest(&bytes) != self.manifest_sha256 {
+            return Err(invalid(
+                &self.path,
+                "bundle inventory digest changed after admission",
+            ));
+        }
+        let manifest: BundleManifest = serde_json::from_slice(&bytes)
+            .map_err(|error| invalid(&self.path, &format!("invalid bundle inventory: {error}")))?;
+        Ok(manifest
+            .files
+            .into_iter()
+            .map(|artifact| (artifact.path, (artifact.bytes, artifact.sha256)))
+            .collect())
     }
 }
 
@@ -940,6 +968,13 @@ fn inventory_at(
 
 fn hash_file(cx: &Cx, path: &Path) -> SearchResult<(u64, String)> {
     let mut file = open_regular(path)?;
+    #[cfg(unix)]
+    let stamp = digest_memo::Stamp::of(&file.metadata()?);
+    #[cfg(unix)]
+    if let Some(sha256) = digest_memo::recall(&stamp) {
+        return Ok((stamp.bytes(), ContentHasher::to_hex(&sha256)));
+    }
+    let started = SystemTime::now();
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
     let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
@@ -954,7 +989,123 @@ fn hash_file(cx: &Cx, path: &Path) -> SearchResult<(u64, String)> {
             .ok_or_else(|| invalid(path, "artifact length overflow"))?;
         hasher.update(&buffer[..count]);
     }
-    Ok((total, ContentHasher::to_hex(&hasher.finalize().into())))
+    let sha256: [u8; 32] = hasher.finalize().into();
+    #[cfg(unix)]
+    if total == stamp.bytes() && digest_memo::Stamp::of(&file.metadata()?) == stamp {
+        digest_memo::remember(stamp, started, sha256);
+    }
+    #[cfg(not(unix))]
+    let _ = started;
+    Ok((total, ContentHasher::to_hex(&sha256)))
+}
+
+/// Digests this process computed for bundle files, keyed by file identity and
+/// change stamps.
+///
+/// Every inventory pass used to re-read and re-hash the whole bundle, and one
+/// complete-generation watch edit made about nine of them over the same
+/// sealed files: `begin`, the batch base, the seed copy before and after, two
+/// at sealing, retention (bd-dnqgr). A pass now reuses a digest computed in
+/// this process while the file's device, inode, length, mtime and ctime are
+/// unchanged, as git's index does. Any write moves ctime, which no caller can
+/// set, and a digest is remembered only for a file whose ctime predates the
+/// hash by more than the timestamp granularity, so a write in the same clock
+/// tick as the previous one cannot go unseen. A new process starts empty and
+/// reads every byte. What a memo gives up is noticing media corruption between
+/// two passes in one process, which a re-read served from the page cache
+/// rarely could; the seed copy, which reads every byte of its predecessor,
+/// still checks them against the sealed inventory.
+#[cfg(unix)]
+mod digest_memo {
+    use std::collections::HashMap;
+    use std::fs::Metadata;
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::{LazyLock, Mutex, PoisonError};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// Far above the kernel's coarse timestamp tick (at most 10 ms).
+    const SETTLED: Duration = Duration::from_millis(100);
+    /// Whole-second timestamps (ext4 with 128-byte inodes, FAT) need more.
+    const SETTLED_COARSE: Duration = Duration::from_secs(2);
+    /// A bound, not a working-set estimate: a store keeps a few generations.
+    const MAX_ENTRIES: usize = 1 << 18;
+
+    /// Device and inode to the stamp a digest was computed under.
+    type Memo = HashMap<(u64, u64), (Stamp, [u8; 32])>;
+
+    static MEMO: LazyLock<Mutex<Memo>> = LazyLock::new(Mutex::default);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct Stamp {
+        pub(super) device: u64,
+        pub(super) inode: u64,
+        pub(super) bytes: u64,
+        pub(super) modified: (i64, i64),
+        pub(super) changed: (i64, i64),
+    }
+
+    impl Stamp {
+        pub(super) fn of(metadata: &Metadata) -> Self {
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                bytes: metadata.size(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+                changed: (metadata.ctime(), metadata.ctime_nsec()),
+            }
+        }
+
+        pub(super) const fn bytes(&self) -> u64 {
+            self.bytes
+        }
+
+        /// Whether every write after `hashed_at` must change this stamp.
+        pub(super) fn settled_before(&self, hashed_at: SystemTime) -> bool {
+            let (Ok(seconds), Ok(nanos)) =
+                (u64::try_from(self.changed.0), u32::try_from(self.changed.1))
+            else {
+                return false;
+            };
+            let margin = if self.changed.1 == 0 && self.modified.1 == 0 {
+                SETTLED_COARSE
+            } else {
+                SETTLED
+            };
+            UNIX_EPOCH
+                .checked_add(Duration::new(seconds, nanos))
+                .and_then(|changed| changed.checked_add(margin))
+                .is_some_and(|settled| settled < hashed_at)
+        }
+    }
+
+    pub(super) fn recall(stamp: &Stamp) -> Option<[u8; 32]> {
+        let memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
+        memo.get(&(stamp.device, stamp.inode))
+            .filter(|(remembered, _)| remembered == stamp)
+            .map(|(_, sha256)| *sha256)
+    }
+
+    /// Remember a digest of bytes read from `hashed_at` on, while `stamp`
+    /// held throughout.
+    pub(super) fn remember(stamp: Stamp, hashed_at: SystemTime, sha256: [u8; 32]) {
+        if !stamp.settled_before(hashed_at) {
+            return;
+        }
+        let mut memo = MEMO.lock().unwrap_or_else(PoisonError::into_inner);
+        if memo.len() >= MAX_ENTRIES {
+            memo.clear();
+        }
+        memo.insert((stamp.device, stamp.inode), (stamp, sha256));
+    }
+}
+
+/// Make this process remember `remembered`'s digest for `path` as it is now,
+/// standing in for bytes that decayed on disk without a write.
+#[cfg(all(test, unix))]
+pub(crate) fn remember_digest_for_test(path: &Path, remembered: &[u8]) {
+    let stamp = digest_memo::Stamp::of(&fs::metadata(path).unwrap());
+    let later = SystemTime::now() + std::time::Duration::from_secs(60);
+    digest_memo::remember(stamp, later, Sha256::digest(remembered).into());
 }
 
 fn sync_tree(cx: &Cx, root: &Path, depth: usize) -> SearchResult<()> {
@@ -1601,6 +1752,50 @@ mod tests {
                 (1_000_000, expected.to_owned())
             );
         });
+    }
+
+    #[test]
+    fn hashing_reuses_a_settled_digest_until_the_file_changes() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("artifact");
+            fs::write(&path, b"abc").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert_eq!(hash_file(&cx, &path).unwrap(), (3, digest(b"abc")));
+            let stamp = digest_memo::Stamp::of(&fs::metadata(&path).unwrap());
+            assert_eq!(
+                digest_memo::recall(&stamp).map(|sha256| ContentHasher::to_hex(&sha256)),
+                Some(digest(b"abc")),
+                "a settled file's digest is remembered"
+            );
+            // Same length, new bytes: the write moves ctime.
+            fs::write(&path, b"xyz").unwrap();
+            assert_eq!(hash_file(&cx, &path).unwrap(), (3, digest(b"xyz")));
+        });
+    }
+
+    #[test]
+    fn digest_memo_keeps_only_stamps_a_later_write_must_change() {
+        use std::time::Duration;
+        let stamp = |seconds, nanos| digest_memo::Stamp {
+            device: 1,
+            inode: 2,
+            bytes: 3,
+            modified: (seconds, nanos),
+            changed: (seconds, nanos),
+        };
+        let fine = UNIX_EPOCH + Duration::new(1_800_000_000, 500_000_000);
+        assert!(
+            !stamp(1_800_000_000, 500_000_000).settled_before(fine + Duration::from_millis(50))
+        );
+        assert!(
+            stamp(1_800_000_000, 500_000_000).settled_before(fine + Duration::from_millis(150))
+        );
+        // Whole-second timestamps come from filesystems that store no more.
+        let coarse = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(!stamp(1_800_000_000, 0).settled_before(coarse + Duration::from_secs(1)));
+        assert!(stamp(1_800_000_000, 0).settled_before(coarse + Duration::from_secs(3)));
+        assert!(!stamp(-1, 0).settled_before(SystemTime::now()));
     }
 
     fn write_bundle(path: &Path, value: &str) {

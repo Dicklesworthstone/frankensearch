@@ -726,6 +726,40 @@ struct CopyStats {
     entries: usize,
     files: usize,
     bytes: u64,
+    /// Each copied file's destination path, length and SHA-256 of the bytes
+    /// read from the source.
+    copied: Vec<(PathBuf, u64, [u8; 32])>,
+}
+
+impl CopyStats {
+    /// Require the bytes read from `predecessor` to be the ones its sealed
+    /// inventory names. Its admission may have reused digests this process
+    /// computed earlier (`generation_store`), so the copy, which reads every
+    /// byte, is what notices a predecessor that decayed on disk since.
+    fn verify_against_inventory(
+        &self,
+        predecessor: &PublishedGeneration,
+        destination: &Path,
+    ) -> SearchResult<()> {
+        let sealed = predecessor.sealed_artifacts()?;
+        for (target, bytes, sha256) in &self.copied {
+            let relative = target.strip_prefix(destination).ok().and_then(|path| {
+                path.iter()
+                    .map(std::ffi::OsStr::to_str)
+                    .collect::<Option<Vec<_>>>()
+            });
+            let sealed_as = relative.and_then(|parts| sealed.get(&parts.join("/")));
+            if sealed_as.is_none_or(|(sealed_bytes, sealed_sha256)| {
+                sealed_bytes != bytes
+                    || *sealed_sha256 != frankensearch_storage::ContentHasher::to_hex(sha256)
+            }) {
+                return Err(reuse_error(
+                    "predecessor artifact differs from its sealed inventory",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Copy a complete admitted predecessor for an explicit mutation, independently
@@ -772,6 +806,7 @@ pub(super) fn copy_selected_generation(
     }
     let mut stats = CopyStats::default();
     copy_tree(cx, predecessor.path(), destination, 0, &mut stats)?;
+    stats.verify_against_inventory(&predecessor, destination)?;
     if store.active(cx)?.as_ref() != Some(&predecessor) {
         return Err(reuse_error(
             "selected predecessor changed while copying the mutation candidate",
@@ -869,6 +904,7 @@ fn seed_candidate(
     }
     let mut stats = CopyStats::default();
     copy_tree(cx, predecessor.path(), destination, 0, &mut stats)?;
+    stats.verify_against_inventory(&predecessor, destination)?;
     // The store lease excludes cooperating publication. Rechecking also refuses
     // an out-of-protocol pointer change or source mutation during the copy.
     if store.active(cx)?.as_ref() != Some(&predecessor) {
@@ -1017,11 +1053,13 @@ fn copy_tree(
                 }
                 copied_digest.update(&buffer[..count]);
             }
-            if digest.finalize() != copied_digest.finalize() {
+            let sha256: [u8; 32] = digest.finalize().into();
+            if sha256 != <[u8; 32]>::from(copied_digest.finalize()) {
                 return Err(reuse_error(
                     "copied artifact digest differs from its source stream",
                 ));
             }
+            stats.copied.push((target, copied, sha256));
             stats.files += 1;
             stats.bytes = stats
                 .bytes
@@ -1266,6 +1304,46 @@ mod copy_tests {
             );
             assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor));
+        });
+    }
+
+    #[test]
+    fn a_copy_refuses_predecessor_bytes_that_differ_from_the_sealed_inventory() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, &parent.path().join("store")).unwrap();
+            let first = store.begin(&cx).unwrap();
+            fs::create_dir(first.path().join("vector")).unwrap();
+            fs::write(first.path().join("vector/fast.idx"), b"original").unwrap();
+            let crate::generation_store::GenerationPublication::Durable(predecessor) =
+                first.publish(&cx, |_, _| Ok(())).unwrap()
+            else {
+                panic!("fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
+            };
+            let intact = parent.path().join("intact");
+            fs::create_dir(&intact).unwrap();
+            let mut stats = CopyStats::default();
+            copy_tree(&cx, predecessor.path(), &intact, 0, &mut stats).unwrap();
+            stats
+                .verify_against_inventory(&predecessor, &intact)
+                .unwrap();
+            // Bytes that decayed without a write keep the digest this process
+            // remembered, so admission alone no longer notices them.
+            let artifact = predecessor.path().join("vector/fast.idx");
+            fs::write(&artifact, b"decayed!").unwrap();
+            crate::generation_store::remember_digest_for_test(&artifact, b"original");
+            let admitted = store.active(&cx).unwrap().unwrap();
+            let decayed = parent.path().join("decayed");
+            fs::create_dir(&decayed).unwrap();
+            let mut stats = CopyStats::default();
+            copy_tree(&cx, admitted.path(), &decayed, 0, &mut stats).unwrap();
+            let error = stats
+                .verify_against_inventory(&admitted, &decayed)
+                .unwrap_err();
+            assert!(
+                matches!(error, SearchError::InvalidConfig { reason, .. }
+                if reason.contains("differs from its sealed inventory"))
+            );
         });
     }
 

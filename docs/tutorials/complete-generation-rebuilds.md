@@ -215,7 +215,10 @@ resolved by this opt-in route, nor is incremental artifact/embedding reuse.
 There is no automatic garbage collection. Retained predecessors and failed
 builds consume disk space. The store assumes cooperating writers and a trusted
 directory tree; its inventory checks are not an anti-rollback authority or a
-security boundary against hostile ancestor replacement.
+security boundary against hostile ancestor replacement. Within one process, a
+file whose device, inode, length and modification and change times are
+unchanged since that process hashed it is not hashed again; a new process
+verifies every byte.
 
 ## Focused validation
 
