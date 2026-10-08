@@ -295,6 +295,10 @@ impl QuillConfigReceipt {
             deterministic_ingest,
             max_visibility_lag_ms,
             quarantine_on_unrepairable,
+            // A local verification cache for reopening files, not an engine
+            // knob: subjects always open with full checks (`to_config` sets
+            // `None`), so the receipt does not record it.
+            read_open_receipt_directory: _,
         } = config.clone();
         Self {
             schema_version: Self::CURRENT_SCHEMA_VERSION,
@@ -354,6 +358,7 @@ impl QuillConfigReceipt {
             deterministic_ingest: self.deterministic_ingest,
             max_visibility_lag_ms: self.max_visibility_lag_ms,
             quarantine_on_unrepairable: self.quarantine_on_unrepairable,
+            read_open_receipt_directory: None,
         })
     }
 

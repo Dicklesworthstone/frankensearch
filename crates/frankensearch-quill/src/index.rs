@@ -24394,7 +24394,7 @@ mod tests {
 
             let deleted_ids = documents[..DOCUMENT_COUNT - 1]
                 .iter()
-                .map(IndexableDocument::id)
+                .map(|document| document.id.as_str())
                 .collect::<Vec<_>>();
             assert_eq!(
                 index
