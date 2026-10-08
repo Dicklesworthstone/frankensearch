@@ -28,6 +28,9 @@ use crate::generation_store::{
 };
 use crate::lifecycle::PublicationLease;
 
+mod inference;
+use inference::InferenceBatch;
+
 const MAX_OPERATIONS: usize = 4096;
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -190,12 +193,20 @@ impl Producer {
 
     async fn infer(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
         retained_search_checkpoint(cx)?;
-        self.recheck()?;
+        let admission = self.recheck();
+        retained_search_checkpoint(cx)?;
+        admission?;
         // Preserve bound-single overrides. No raw inference or weaker retry can
         // attach an advertised identity to an otherwise unverified response.
         let result = self.embedder.embed_bound(cx, text).await;
         retained_search_checkpoint(cx)?;
-        self.recheck()?;
+        let result = match result {
+            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+            result => result,
+        };
+        let admission = self.recheck();
+        retained_search_checkpoint(cx)?;
+        admission?;
         let response = result?;
         // Check foreign contracts before validation can quote provider-owned fields.
         if response.identity != self.identity {
@@ -229,6 +240,10 @@ impl FsfsRuntime {
     /// Empty input performs no filesystem or model work. A nonempty no-op still
     /// checks its base. Input (4096 operations, 8 MiB per body, 64 MiB total) and
     /// staged vectors (128 MiB) are bounded, not a process-wide RSS guarantee.
+    /// Each tier uses native bound inference groups of at most 64 rows and
+    /// 512 KiB of text when its provider explicitly supports them. A single
+    /// larger input keeps the existing document limit. Other providers retain
+    /// custom bound-single dispatch; no failure triggers raw inference or retry.
     /// This does not scan source paths, download models, prune generations, or
     /// alter watcher discovery policy. Synchronous filesystem work retains the
     /// ordinary fsfs caller-owned blocking-lane contract.
@@ -296,15 +311,25 @@ impl FsfsRuntime {
             Some(Producer::admit(self, predecessor.path(), true)?)
         } else { None };
         let mut windows = BTreeMap::new();
-        let mut fast_entries = Vec::new();
-        let mut quality_entries = Vec::new();
+        // Finish window planning before retaining any borrowed input slices.
+        // Groups may span documents, but the source and its plans remain owned
+        // until both independent tiers have finished inference.
+        if fast.is_some() && window_maximum > 1 {
+            for (id, body) in &documents {
+                retained_search_checkpoint(cx)?;
+                if let Some(body) = body {
+                    windows.insert(id.clone(), semantic_windows::plan(&body.lexical, window_maximum)?);
+                }
+            }
+        }
+        let mut fast_batch = fast.as_ref().map(InferenceBatch::new);
+        let mut quality_batch = quality.as_ref().map(InferenceBatch::new);
         let mut vector_bytes = 0;
         for (id, body) in &documents {
             retained_search_checkpoint(cx)?;
             let Some(body) = body else { continue };
-            if let Some(producer) = &fast {
+            if let Some(batch) = &mut fast_batch {
                 let texts = if window_maximum > 1 {
-                    windows.insert(id.clone(), semantic_windows::plan(&body.lexical, window_maximum)?);
                     windows.get(id).ok_or_else(|| invalid("missing prepared window plan"))?
                         .texts(&body.lexical)?
                 } else { vec![body.embedding.as_str()] };
@@ -313,17 +338,21 @@ impl FsfsRuntime {
                     if row.len() > usize::from(u16::MAX) {
                         return Err(invalid("document ID leaves insufficient room for window IDs"));
                     }
-                    let vector = producer.infer(cx, text).await?;
-                    charge_vector(&mut vector_bytes, &vector)?;
-                    fast_entries.push((row, vector));
+                    batch.push(cx, row, text, &mut vector_bytes).await?;
                 }
             }
-            if let Some(producer) = &quality {
-                let vector = producer.infer(cx, &body.embedding).await?;
-                charge_vector(&mut vector_bytes, &vector)?;
-                quality_entries.push((id.clone(), vector));
+            if let Some(batch) = &mut quality_batch {
+                batch.push(cx, id.clone(), &body.embedding, &mut vector_bytes).await?;
             }
         }
+        let fast_entries = match fast_batch {
+            Some(batch) => batch.finish(cx, &mut vector_bytes).await?,
+            None => Vec::new(),
+        };
+        let quality_entries = match quality_batch {
+            Some(batch) => batch.finish(cx, &mut vector_bytes).await?,
+            None => Vec::new(),
+        };
         retained_search_checkpoint(cx)?;
         let mut input = self.cli_input.clone();
         input.index_dir = Some(build.path().to_path_buf());
