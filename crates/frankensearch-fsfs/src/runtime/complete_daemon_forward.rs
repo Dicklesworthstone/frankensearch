@@ -567,7 +567,7 @@ pub(super) async fn serve(
             run_request(
                 cx,
                 request.search.policy.delivery_budget(),
-                execute(cx, runtime, session, &request, cache),
+                Box::pin(execute(cx, runtime, session, &request, cache)),
             )
             .await
         }

@@ -103,7 +103,9 @@ pub(super) fn prepare_source_batch(
 
 impl Body {
     fn class(&self, default: IngestionClass) -> IngestionClass {
-        self.source.as_ref().map_or(default, |source| source.ingestion_class)
+        self.source
+            .as_ref()
+            .map_or(default, |source| source.ingestion_class)
     }
 
     fn semantic(&self) -> bool {
@@ -132,34 +134,46 @@ fn attach_sources(
     sources: &BTreeMap<String, SourceAttributes>,
 ) -> SearchResult<()> {
     if sources.len() != documents.values().filter(|body| body.is_some()).count() {
-        return Err(invalid("source attributes must cover exactly the final upserts"));
+        return Err(invalid(
+            "source attributes must cover exactly the final upserts",
+        ));
     }
     let mut bytes = 0_usize;
     for (id, body) in documents {
         retained_search_checkpoint(cx)?;
-        bytes = bytes.checked_add(id.len())
+        bytes = bytes
+            .checked_add(id.len())
             .filter(|bytes| *bytes <= MAX_INPUT_BYTES)
             .ok_or_else(|| invalid("source payload length overflow"))?;
         let Some(body) = body else { continue };
-        let source = sources.get(id)
+        let source = sources
+            .get(id)
             .ok_or_else(|| invalid("a source upsert is missing its attributes"))?;
         if i64::try_from(source.modified_ms).is_err()
-            || !matches!(source.ingestion_class,
-                IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly)
+            || !matches!(
+                source.ingestion_class,
+                IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
+            )
         {
-            return Err(invalid("source attributes require a valid timestamp and indexed text class"));
+            return Err(invalid(
+                "source attributes require a valid timestamp and indexed text class",
+            ));
         }
-        bytes = bytes.checked_add(body.embedding.len())
+        bytes = bytes
+            .checked_add(body.embedding.len())
             .and_then(|bytes| bytes.checked_add(body.lexical.len()))
             .and_then(|bytes| bytes.checked_add(source.title.as_ref().map_or(0, String::len)))
             .ok_or_else(|| invalid("source payload length overflow"))?;
         for (key, value) in &source.metadata {
-            bytes = bytes.checked_add(key.len())
+            bytes = bytes
+                .checked_add(key.len())
                 .and_then(|bytes| bytes.checked_add(value.len()))
                 .ok_or_else(|| invalid("source metadata length overflow"))?;
         }
         if bytes > MAX_INPUT_BYTES || source.metadata.len() > 64 {
-            return Err(invalid("source payload or metadata exceeds the retained batch bound"));
+            return Err(invalid(
+                "source payload or metadata exceeds the retained batch bound",
+            ));
         }
         body.source = Some(source.clone());
     }
@@ -188,7 +202,9 @@ fn prepare(cx: &Cx, operations: &[RetainedMutation]) -> SearchResult<PreparedBat
             RetainedMutation::Delete { id } => (id, None),
         };
         if id.trim().is_empty() || id.contains('\0') || id.len() > usize::from(u16::MAX) {
-            return Err(invalid("IDs must be nonblank, NUL-free and at most 65535 bytes"));
+            return Err(invalid(
+                "IDs must be nonblank, NUL-free and at most 65535 bytes",
+            ));
         }
         if text.is_some_and(|text| text.len() > MAX_BODY_BYTES) {
             return Err(invalid("a retained document body exceeds 8 MiB"));
@@ -220,7 +236,11 @@ fn prepare(cx: &Cx, operations: &[RetainedMutation]) -> SearchResult<PreparedBat
                 .checked_add(embedding.len())
                 .and_then(|bytes| bytes.checked_add(lexical.len()))
                 .ok_or_else(|| invalid("canonical batch length overflow"))?;
-            Some(Body { embedding, lexical, source: None })
+            Some(Body {
+                embedding,
+                lexical,
+                source: None,
+            })
         } else {
             None
         };
@@ -272,12 +292,20 @@ impl Producer {
                 reason: "producer changed during retained-batch admission".to_owned(),
             });
         }
-        Ok(Self { embedder, identity, role })
+        Ok(Self {
+            embedder,
+            identity,
+            role,
+        })
     }
 
     fn recheck(&self) -> SearchResult<()> {
-        if !self.embedder.identity().is_ok_and(|actual| actual == &self.identity)
-            || usize::try_from(self.identity.space.dimension).ok() != Some(self.embedder.dimension())
+        if !self
+            .embedder
+            .identity()
+            .is_ok_and(|actual| actual == &self.identity)
+            || usize::try_from(self.identity.space.dimension).ok()
+                != Some(self.embedder.dimension())
         {
             return Err(SearchError::UnverifiableRemoteSpace {
                 producer: self.role.to_owned(),
@@ -317,7 +345,9 @@ impl Producer {
 }
 
 fn charge_vector(bytes: &mut usize, values: &[f32]) -> SearchResult<()> {
-    *bytes = values.len().checked_mul(std::mem::size_of::<f32>())
+    *bytes = values
+        .len()
+        .checked_mul(std::mem::size_of::<f32>())
         .and_then(|length| bytes.checked_add(length))
         .filter(|total| *total <= MAX_VECTOR_BYTES)
         .ok_or_else(|| invalid("retained batch vector payload exceeds 128 MiB"))?;
@@ -374,7 +404,8 @@ impl FsfsRuntime {
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
         let documents = prepare(cx, operations)?;
-        self.apply_prepared_retained_batch(cx, store_root, expected, documents, precommit).await
+        self.apply_prepared_retained_batch(cx, store_root, expected, documents, precommit)
+            .await
     }
 
     /// Private source-aware route. The source owner retains discovery, decoding
@@ -391,7 +422,8 @@ impl FsfsRuntime {
     where
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
-        self.apply_prepared_retained_batch(cx, store_root, expected, batch.0, precommit).await
+        self.apply_prepared_retained_batch(cx, store_root, expected, batch.0, precommit)
+            .await
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -408,14 +440,22 @@ impl FsfsRuntime {
     {
         retained_search_checkpoint(cx)?;
         if documents.is_empty() {
-            return Ok(RetainedBatchResult { publication: None, upserted: 0, deleted: 0 });
+            return Ok(RetainedBatchResult {
+                publication: None,
+                upserted: 0,
+                deleted: 0,
+            });
         }
         validate_retained_catalog_path(&self.config.storage.db_path)?;
         let store = CompleteGenerationStore::open(cx, store_root)?;
         let build = store.begin(cx)?;
-        let predecessor = store.active(cx)?.ok_or_else(|| invalid("no generation is selected"))?;
+        let predecessor = store
+            .active(cx)?
+            .ok_or_else(|| invalid("no generation is selected"))?;
         if &predecessor != expected {
-            return Err(invalid("selected generation differs from the expected batch base"));
+            return Err(invalid(
+                "selected generation differs from the expected batch base",
+            ));
         }
         Self::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
         let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
@@ -425,26 +465,44 @@ impl FsfsRuntime {
         let deleted = documents.len() - upserted;
         if documents.is_empty() {
             retained_search_checkpoint(cx)?;
-            return Ok(RetainedBatchResult { publication: None, upserted, deleted });
+            return Ok(RetainedBatchResult {
+                publication: None,
+                upserted,
+                deleted,
+            });
         }
         let lexical_only = Self::is_lexical_only_generation(predecessor.path());
-        if lexical_only && documents.values().flatten().any(|body| {
-            body.source.is_some() && body.semantic()
-        }) {
-            return Err(invalid("source policy requires vectors absent from the selected generation"));
+        if lexical_only
+            && documents
+                .values()
+                .flatten()
+                .any(|body| body.source.is_some() && body.semantic())
+        {
+            return Err(invalid(
+                "source policy requires vectors absent from the selected generation",
+            ));
         }
         let semantic_upserts = documents.values().flatten().any(Body::semantic);
-        let window_maximum = if lexical_only { 1 } else {
+        let window_maximum = if lexical_only {
+            1
+        } else {
             Self::fast_window_policy_at_root(predecessor.path())?
         };
-        let fast = if lexical_only || !semantic_upserts { None } else {
+        let fast = if lexical_only || !semantic_upserts {
+            None
+        } else {
             Some(Producer::admit(self, predecessor.path(), false)?)
         };
         let quality = if semantic_upserts
-            && predecessor.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).try_exists()?
+            && predecessor
+                .path()
+                .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                .try_exists()?
         {
             Some(Producer::admit(self, predecessor.path(), true)?)
-        } else { None };
+        } else {
+            None
+        };
         let mut windows = BTreeMap::new();
         // Finish window planning before retaining any borrowed input slices.
         // Groups may span documents, but the source and its plans remain owned
@@ -455,7 +513,10 @@ impl FsfsRuntime {
                 if let Some(body) = body
                     && body.semantic()
                 {
-                    windows.insert(id.clone(), semantic_windows::plan(&body.lexical, window_maximum)?);
+                    windows.insert(
+                        id.clone(),
+                        semantic_windows::plan(&body.lexical, window_maximum)?,
+                    );
                 }
             }
         }
@@ -465,22 +526,32 @@ impl FsfsRuntime {
         for (id, body) in &documents {
             retained_search_checkpoint(cx)?;
             let Some(body) = body else { continue };
-            if !body.semantic() { continue; }
+            if !body.semantic() {
+                continue;
+            }
             if let Some(batch) = &mut fast_batch {
                 let texts = if window_maximum > 1 {
-                    windows.get(id).ok_or_else(|| invalid("missing prepared window plan"))?
+                    windows
+                        .get(id)
+                        .ok_or_else(|| invalid("missing prepared window plan"))?
                         .texts(&body.lexical)?
-                } else { vec![body.embedding.as_str()] };
+                } else {
+                    vec![body.embedding.as_str()]
+                };
                 for (ordinal, text) in texts.into_iter().enumerate() {
                     let row = semantic_windows::row_id(id, ordinal);
                     if row.len() > usize::from(u16::MAX) {
-                        return Err(invalid("document ID leaves insufficient room for window IDs"));
+                        return Err(invalid(
+                            "document ID leaves insufficient room for window IDs",
+                        ));
                     }
                     batch.push(cx, row, text, &mut vector_bytes).await?;
                 }
             }
             if let Some(batch) = &mut quality_batch {
-                batch.push(cx, id.clone(), &body.embedding, &mut vector_bytes).await?;
+                batch
+                    .push(cx, id.clone(), &body.embedding, &mut vector_bytes)
+                    .await?;
             }
         }
         let fast_entries = match fast_batch {
@@ -497,40 +568,78 @@ impl FsfsRuntime {
         input.daemon = false;
         input.daemon_socket = None;
         let candidate = self.clone().with_cli_input(input);
-        if retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())? != predecessor {
-            return Err(invalid("selected predecessor changed while copying the batch base"));
+        if retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?
+            != predecessor
+        {
+            return Err(invalid(
+                "selected predecessor changed while copying the batch base",
+            ));
         }
         let lease = PublicationLease::acquire(build.path())?;
         let timestamp = pressure_timestamp_ms();
-        let revision = manifests.values().map(|entry| entry.revision).max().unwrap_or(0)
-            .checked_add(1).ok_or_else(|| invalid("document revision exhausted"))?
+        let revision = manifests
+            .values()
+            .map(|entry| entry.revision)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| invalid("document revision exhausted"))?
             .max(i64::try_from(timestamp).map_err(|_| invalid("document timestamp overflow"))?);
-        let class = if lexical_only { IngestionClass::LexicalOnly } else {
+        let class = if lexical_only {
+            IngestionClass::LexicalOnly
+        } else {
             IngestionClass::FullSemanticLexical
         };
-        let mutations = documents.iter().map(|(id, body)| match body {
-            Some(body) => {
-                let modified = body.source.as_ref().map_or(timestamp, |source| source.modified_ms);
-                let mut mutation = LexicalMutation::upsert(
-                    id.clone(), modified, body.class(class), body.lexical.clone(), body.reason(class),
-                );
-                if let Some(source) = &body.source {
-                    mutation.title.clone_from(&source.title);
-                    mutation.metadata.clone_from(&source.metadata);
-                }
-                mutation
-            }
-            None => LexicalMutation::delete(id.clone(), timestamp, IngestionClass::Skip, "retained_batch"),
-        }).collect::<Vec<_>>();
+        let mutations = documents
+            .iter()
+            .map(|(id, body)| {
+                body.as_ref().map_or_else(
+                    || {
+                        LexicalMutation::delete(
+                            id.clone(),
+                            timestamp,
+                            IngestionClass::Skip,
+                            "retained_batch",
+                        )
+                    },
+                    |body| {
+                        let modified = body
+                            .source
+                            .as_ref()
+                            .map_or(timestamp, |source| source.modified_ms);
+                        let mut mutation = LexicalMutation::upsert(
+                            id.clone(),
+                            modified,
+                            body.class(class),
+                            body.lexical.clone(),
+                            body.reason(class),
+                        );
+                        if let Some(source) = &body.source {
+                            mutation.title.clone_from(&source.title);
+                            mutation.metadata.clone_from(&source.metadata);
+                        }
+                        mutation
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
         lease.fence("retained batch lexical mutation")?;
-        candidate.apply_one_shot_lexical_mutations(cx, build.path(), &mutations).await?;
+        candidate
+            .apply_one_shot_lexical_mutations(cx, build.path(), &mutations)
+            .await?;
         for (relative, producer, entries) in [
             (FSFS_VECTOR_INDEX_FILE, fast.as_ref(), &fast_entries),
-            (FSFS_VECTOR_QUALITY_INDEX_FILE, quality.as_ref(), &quality_entries),
+            (
+                FSFS_VECTOR_QUALITY_INDEX_FILE,
+                quality.as_ref(),
+                &quality_entries,
+            ),
         ] {
             retained_search_checkpoint(cx)?;
             let path = build.path().join(relative);
-            if !path.try_exists()? { continue; }
+            if !path.try_exists()? {
+                continue;
+            }
             lease.fence("retained batch vector mutation")?;
             let mut index = Self::open_vector_index_for_mutation(&path)?;
             if let Some(producer) = producer {
@@ -538,17 +647,29 @@ impl FsfsRuntime {
                 if relative == FSFS_VECTOR_INDEX_FILE {
                     Self::admit_vector_generation_for_embedder(&index, producer.embedder.as_ref())?;
                 } else {
-                    Self::admit_quality_generation_for_embedder(&index, producer.embedder.as_ref())?;
+                    Self::admit_quality_generation_for_embedder(
+                        &index,
+                        producer.embedder.as_ref(),
+                    )?;
                 }
                 index.append_batch(entries)?;
             }
-            let new_rows = entries.iter().map(|(id, _)| id.as_str()).collect::<HashSet<_>>();
-            let retired = index.live_doc_ids()?.into_iter().filter(|row| {
-                let source = if relative == FSFS_VECTOR_INDEX_FILE {
-                    semantic_windows::source_id(row)
-                } else { row.as_str() };
-                documents.contains_key(source) && !new_rows.contains(row.as_str())
-            }).collect::<Vec<_>>();
+            let new_rows = entries
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<HashSet<_>>();
+            let retired = index
+                .live_doc_ids()?
+                .into_iter()
+                .filter(|row| {
+                    let source = if relative == FSFS_VECTOR_INDEX_FILE {
+                        semantic_windows::source_id(row)
+                    } else {
+                        row.as_str()
+                    };
+                    documents.contains_key(source) && !new_rows.contains(row.as_str())
+                })
+                .collect::<Vec<_>>();
             index.soft_delete_batch(&retired.iter().map(String::as_str).collect::<Vec<_>>())?;
             index.compact()?;
             index.vacuum()?;
@@ -558,30 +679,39 @@ impl FsfsRuntime {
         let catalog_path = candidate.resolve_storage_db_path()?;
         if catalog_path.try_exists()? {
             let storage = Storage::open(PipelineStorageConfig {
-                db_path: catalog_path, ..PipelineStorageConfig::default()
+                db_path: catalog_path,
+                ..PipelineStorageConfig::default()
             })?;
             for (id, body) in &documents {
                 retained_search_checkpoint(cx)?;
                 if let Some(body) = body {
                     let revision = body.revision(revision);
-                    let created = storage.get_document(id)?.map_or(revision, |old| old.created_at);
+                    let created = storage
+                        .get_document(id)?
+                        .map_or(revision, |old| old.created_at);
                     storage.upsert_document(&frankensearch_storage::DocumentRecord::new(
-                        id, body.embedding.chars().take(400).collect::<String>(),
+                        id,
+                        body.embedding.chars().take(400).collect::<String>(),
                         frankensearch_storage::ContentHasher::hash(&body.embedding),
-                        body.embedding.chars().count(), created, revision.max(created),
+                        body.embedding.chars().count(),
+                        created,
+                        revision.max(created),
                     ))?;
                     if body.semantic() {
                         for producer in [fast.as_ref(), quality.as_ref()].into_iter().flatten() {
                             storage.mark_embedded(id, producer.embedder.id())?;
                         }
                     }
-                } else { storage.delete_document(id)?; }
+                } else {
+                    storage.delete_document(id)?;
+                }
             }
         }
         for (id, body) in documents {
             if let Some(body) = body {
                 let entry = IndexManifestEntry {
-                    file_key: id.clone(), revision: body.revision(revision),
+                    file_key: id.clone(),
+                    revision: body.revision(revision),
                     ingestion_class: ingestion_class_label(body.class(class)).to_owned(),
                     canonical_bytes: u64::try_from(body.embedding.len())
                         .map_err(|_| invalid("canonical document length overflow"))?,
@@ -589,14 +719,20 @@ impl FsfsRuntime {
                     fast_windows: windows.remove(&id),
                 };
                 manifests.insert(id, entry);
-            } else { manifests.remove(&id); }
+            } else {
+                manifests.remove(&id);
+            }
         }
         let manifests = manifests.into_values().collect::<Vec<_>>();
         let layout = Self::resolve_lexical_engine(build.path())?;
         let lexical_manifest = if layout.lexical_root() == build.path() {
-            layout.engine_dir().map(|path| path.join(FSFS_INDEX_MANIFEST_FILE_NAME))
+            layout
+                .engine_dir()
+                .map(|path| path.join(FSFS_INDEX_MANIFEST_FILE_NAME))
                 .unwrap_or_else(|| build.path().join(FSFS_LEXICAL_MANIFEST_FILE))
-        } else { build.path().join(FSFS_LEXICAL_MANIFEST_FILE) };
+        } else {
+            build.path().join(FSFS_LEXICAL_MANIFEST_FILE)
+        };
         candidate.write_index_artifacts(build.path(), &lexical_manifest, &manifests)?;
         let mut sentinel = Self::read_index_sentinel(build.path())?
             .ok_or_else(|| invalid("candidate completion sentinel is absent"))?;
@@ -605,28 +741,43 @@ impl FsfsRuntime {
         sentinel.indexed_files = manifests.len();
         sentinel.discovered_files = sentinel.discovered_files.max(manifests.len());
         sentinel.skipped_files = sentinel.discovered_files.saturating_sub(manifests.len());
-        sentinel.total_canonical_bytes = manifests.iter()
-            .fold(0_u64, |sum, entry| sum.saturating_add(entry.canonical_bytes));
+        sentinel.total_canonical_bytes = manifests.iter().fold(0_u64, |sum, entry| {
+            sum.saturating_add(entry.canonical_bytes)
+        });
         sentinel.source_hash_hex = index_source_hash_hex(&manifests);
         for reason in protect_vector_generations(build.path(), "retained batch") {
-            if !sentinel.reason_codes.contains(&reason) { sentinel.reason_codes.push(reason); }
+            if !sentinel.reason_codes.contains(&reason) {
+                sentinel.reason_codes.push(reason);
+            }
         }
         candidate.write_index_sentinel(build.path(), &sentinel)?;
         lease.fence("retained batch candidate complete")?;
         drop(lease);
         reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
-        let resources = Box::pin(candidate.prepare_search_execution_resources_at_root_with_modes(
-            cx, build.path(), SearchExecutionMode::Full, SearchExecutionMode::Full,
-        )).await?;
+        let resources = Box::pin(
+            candidate.prepare_search_execution_resources_at_root_with_modes(
+                cx,
+                build.path(),
+                SearchExecutionMode::Full,
+                SearchExecutionMode::Full,
+            ),
+        )
+        .await?;
         drop(resources);
         for producer in [fast.as_ref(), quality.as_ref()].into_iter().flatten() {
             producer.recheck()?;
         }
         retained_search_checkpoint(cx)?;
-        let publication = build.publish_with_precommit(cx, |_, path| {
-            Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
-        }, precommit)?;
-        Ok(RetainedBatchResult { publication: Some(publication), upserted, deleted })
+        let publication = build.publish_with_precommit(
+            cx,
+            |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
+            precommit,
+        )?;
+        Ok(RetainedBatchResult {
+            publication: Some(publication),
+            upserted,
+            deleted,
+        })
     }
 }
 

@@ -151,8 +151,9 @@ impl Editor {
             let side = columns.saturating_sub(12) / 4;
             let before = &draft.text[..draft.cursor];
             let after = &draft.text[draft.cursor..];
-            let tail: Vec<_> = before.chars().rev().take(side).collect();
-            let left: String = tail.into_iter().rev().collect();
+            let mut left: Vec<char> = before.chars().rev().take(side).collect();
+            left.reverse();
+            let left: String = left.into_iter().collect();
             let right: String = after.chars().take(side).collect();
             return Some(format!(
                 "Query > {}|{}",
@@ -188,7 +189,9 @@ fn next_boundary(draft: &Draft) -> usize {
     draft.text[draft.cursor..]
         .chars()
         .next()
-        .map_or(draft.cursor, |character| draft.cursor + character.len_utf8())
+        .map_or(draft.cursor, |character| {
+            draft.cursor + character.len_utf8()
+        })
 }
 
 pub(super) fn action_for(event: &Event) -> Option<Action> {
@@ -325,13 +328,22 @@ mod tests {
     #[test]
     fn editing_keys_cannot_accidentally_quit_and_releases_are_ignored() {
         let q = KeyEvent::new(KeyCode::Char('q'));
-        assert_eq!(action_for(&Event::Key(q)), Some(Action::Edit(Command::Insert('q'))));
+        assert_eq!(
+            action_for(&Event::Key(q)),
+            Some(Action::Edit(Command::Insert('q')))
+        );
         assert_eq!(
             action_for(&Event::Key(KeyEvent::new(KeyCode::Escape))),
             Some(Action::Edit(Command::Cancel))
         );
-        assert_eq!(action_for(&Event::Key(q.with_kind(KeyEventKind::Release))), None);
-        assert_eq!(action_for(&Event::Key(q.with_modifiers(Modifiers::ALT))), None);
+        assert_eq!(
+            action_for(&Event::Key(q.with_kind(KeyEventKind::Release))),
+            None
+        );
+        assert_eq!(
+            action_for(&Event::Key(q.with_modifiers(Modifiers::ALT))),
+            None
+        );
         assert_eq!(
             action_for(&Event::Key(
                 KeyEvent::new(KeyCode::Char('c')).with_modifiers(Modifiers::CTRL)
@@ -345,7 +357,9 @@ mod tests {
             Some(Action::Edit(Command::Clear))
         );
         assert_eq!(
-            action_for(&Event::Paste(PasteEvent::bracketed("x".repeat(MAX_QUERY_BYTES + 1)))),
+            action_for(&Event::Paste(PasteEvent::bracketed(
+                "x".repeat(MAX_QUERY_BYTES + 1)
+            ))),
             Some(Action::Edit(Command::TooLarge))
         );
     }

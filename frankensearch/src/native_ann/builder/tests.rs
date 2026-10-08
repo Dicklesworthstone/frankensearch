@@ -99,6 +99,11 @@ impl Embedder for Provider {
             Ok(outputs)
         })
     }
+    // The bound batch above binds the same values as `embed` under the same
+    // identity; faults deliberately violate that advertised native contract.
+    fn bound_batch_is_native(&self) -> bool {
+        true
+    }
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
         Ok(&self.identity)
     }

@@ -377,7 +377,7 @@ async fn execute_with_runtime<W: Write + Send>(
     budget.check(cx)?;
     if options.watch_source.is_some() {
         #[cfg(unix)]
-        return watch::execute(cx, &budget, options, writer, runtime).await;
+        return Box::pin(watch::execute(cx, &budget, options, writer, runtime)).await;
         #[cfg(not(unix))]
         return Err(invalid("--watch-source is unsupported on this platform"));
     }
@@ -398,7 +398,7 @@ async fn execute_with_runtime<W: Write + Send>(
                 cx,
                 budget: &budget,
             };
-            session.poll_ndjson(cx, Instant::now(), &mut output).await
+            Box::pin(session.poll_ndjson(cx, Instant::now(), &mut output)).await
         };
         // Cancellation and timeout stay typed even when the output guard was
         // the first boundary to observe them. No retry can extend a torn frame.

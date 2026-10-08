@@ -832,6 +832,8 @@ impl<T: SyncEmbed + 'static> Embedder for SyncEmbedderAdapter<T> {
 }
 
 #[cfg(test)]
+// The fixtures implement `id(&self) -> &str` with a literal, as the trait spells it.
+#[allow(clippy::unnecessary_literal_bound)]
 mod bound_completion_contract_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1048,7 +1050,7 @@ mod bound_completion_contract_tests {
         }
     }
 
-    fn assert_drift(error: SearchError) {
+    fn assert_drift(error: &SearchError) {
         assert!(!error.to_string().contains("private-drift-canary"));
         assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
     }
@@ -1070,7 +1072,7 @@ mod bound_completion_contract_tests {
                     } else {
                         provider.embed_bound_sync("a").unwrap_err()
                     };
-                    assert_drift(error);
+                    assert_drift(&error);
                     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
                 }
             }
@@ -1085,11 +1087,14 @@ mod bound_completion_contract_tests {
                     for batch in [false, true] {
                         let provider = RawAsync(State::new(drift, completion));
                         let error = if batch {
-                            provider.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err()
+                            provider
+                                .embed_batch_bound(&cx, &["a", "b"])
+                                .await
+                                .unwrap_err()
                         } else {
                             provider.embed_bound(&cx, "a").await.unwrap_err()
                         };
-                        assert_drift(error);
+                        assert_drift(&error);
                         assert_eq!(provider.0.calls.load(Ordering::SeqCst), 1);
                     }
                 }
@@ -1105,11 +1110,14 @@ mod bound_completion_contract_tests {
                     for batch in [false, true] {
                         let provider = custom_adapter(drift, completion);
                         let error = if batch {
-                            provider.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err()
+                            provider
+                                .embed_batch_bound(&cx, &["a", "b"])
+                                .await
+                                .unwrap_err()
                         } else {
                             provider.embed_bound(&cx, "a").await.unwrap_err()
                         };
-                        assert_drift(error);
+                        assert_drift(&error);
                         assert_eq!(provider.0.state.calls.load(Ordering::SeqCst), 1);
                     }
                 }
@@ -1137,8 +1145,14 @@ mod bound_completion_contract_tests {
                 let errors = if batch {
                     [
                         synchronous.embed_batch_bound_sync(&["a", "b"]).unwrap_err(),
-                        asynchronous.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err(),
-                        adapter.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err(),
+                        asynchronous
+                            .embed_batch_bound(&cx, &["a", "b"])
+                            .await
+                            .unwrap_err(),
+                        adapter
+                            .embed_batch_bound(&cx, &["a", "b"])
+                            .await
+                            .unwrap_err(),
                     ]
                 } else {
                     [
@@ -1164,8 +1178,14 @@ mod bound_completion_contract_tests {
                 let errors = if batch {
                     [
                         synchronous.embed_batch_bound_sync(&["a", "b"]).unwrap_err(),
-                        asynchronous.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err(),
-                        adapter.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err(),
+                        asynchronous
+                            .embed_batch_bound(&cx, &["a", "b"])
+                            .await
+                            .unwrap_err(),
+                        adapter
+                            .embed_batch_bound(&cx, &["a", "b"])
+                            .await
+                            .unwrap_err(),
                     ]
                 } else {
                     [
@@ -1250,7 +1270,10 @@ mod bound_completion_contract_tests {
                         refuse_cancelled_read,
                     };
                     let error = if batch {
-                        provider.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err()
+                        provider
+                            .embed_batch_bound(&cx, &["a", "b"])
+                            .await
+                            .unwrap_err()
                     } else {
                         provider.embed_bound(&cx, "a").await.unwrap_err()
                     };
@@ -1275,7 +1298,10 @@ mod bound_completion_contract_tests {
                             refuse_cancelled_read: false,
                         };
                         let error = if batch {
-                            provider.embed_batch_bound(&cx, &["a", "b"]).await.unwrap_err()
+                            provider
+                                .embed_batch_bound(&cx, &["a", "b"])
+                                .await
+                                .unwrap_err()
                         } else {
                             provider.embed_bound(&cx, "a").await.unwrap_err()
                         };
@@ -1295,7 +1321,10 @@ mod bound_completion_contract_tests {
             assert!(!conservative.bound_batch_is_native());
             let native = custom_adapter(Drift::None, Completion::Success);
             assert!(native.bound_batch_is_native());
-            let output = native.embed_batch_bound(&cx, &["a", "b", "a"]).await.unwrap();
+            let output = native
+                .embed_batch_bound(&cx, &["a", "b", "a"])
+                .await
+                .unwrap();
             assert_eq!(output.len(), 3);
             assert_eq!(*native.0.state.widths.lock().unwrap(), vec![3]);
             for value in output {

@@ -709,6 +709,12 @@ mod tests {
             })
         }
 
+        // Same values and identity as `embed`; faults violate the advertised
+        // native contract on purpose.
+        fn bound_batch_is_native(&self) -> bool {
+            true
+        }
+
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
             Ok(if self.fault.load(Ordering::SeqCst) == IDENTITY_DRIFT {
                 &self.foreign

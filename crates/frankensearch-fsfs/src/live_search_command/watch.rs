@@ -178,7 +178,10 @@ pub(super) async fn execute<W: Write + Send>(
     writer: &mut W,
     runtime: Option<FsfsRuntime>,
 ) -> SearchResult<u64> {
-    execute_controlled(cx, budget, options, writer, runtime, None).await
+    Box::pin(execute_controlled(
+        cx, budget, options, writer, runtime, None,
+    ))
+    .await
 }
 
 fn update_query(
@@ -196,9 +199,7 @@ fn update_query(
         return Ok(false);
     };
     let changed = subscriber.set_query(cx, &query)?;
-    if changed
-        && let Some(control) = control.as_deref_mut()
-    {
+    if changed && let Some(control) = control.as_deref_mut() {
         control.begin_query(&query)?;
     }
     Ok(changed)
@@ -232,7 +233,12 @@ pub(super) async fn execute_controlled<W: Write + Send>(
     let mut delivered = 0_u64;
     loop {
         let operation = next_operation(
-            cx, budget, watcher.as_mut(), &receipts, &mut control, current.is_some(),
+            cx,
+            budget,
+            watcher.as_mut(),
+            &receipts,
+            &mut control,
+            current.is_some(),
         )
         .await?;
         let (generation, publication, requested) = match operation {
@@ -241,7 +247,9 @@ pub(super) async fn execute_controlled<W: Write + Send>(
                 (generation, true, None)
             }
             Operation::Query(query) => (
-                current.clone().ok_or_else(|| watch_error("no published query generation"))?,
+                current
+                    .clone()
+                    .ok_or_else(|| watch_error("no published query generation"))?,
                 false,
                 Some(query),
             ),
@@ -252,7 +260,9 @@ pub(super) async fn execute_controlled<W: Write + Send>(
         if store.is_none() {
             store = Some(CompleteGenerationStore::open(cx, &options.root)?);
         }
-        let store = store.as_ref().ok_or_else(|| watch_error("store was not admitted"))?;
+        let store = store
+            .as_ref()
+            .ok_or_else(|| watch_error("store was not admitted"))?;
         if !store.is_selected(cx, &generation)? {
             return Err(watch_error(
                 "selection changed after watch publication; no foreign or stale generation is streamed",
@@ -271,29 +281,42 @@ pub(super) async fn execute_controlled<W: Write + Send>(
                 },
             )?);
         }
-        let subscriber = subscriber.as_mut().ok_or_else(|| watch_error("subscriber missing"))?;
+        let subscriber = subscriber
+            .as_mut()
+            .ok_or_else(|| watch_error("subscriber missing"))?;
         let changed = update_query(cx, subscriber, requested, &mut control)?;
         if !publication && !changed {
             continue;
         }
         let result = {
-            let mut output = GuardedOutput { writer: &mut *writer, cx, budget };
+            let mut output = GuardedOutput {
+                writer: &mut *writer,
+                cx,
+                budget,
+            };
             let mut sink = |frame: &RetainedLiveSearchFrame| {
                 emit_receipted_frame(&generation, frame, &mut output)
             };
-            subscriber.poll_with_sink(cx, Instant::now(), &mut sink).await
+            subscriber
+                .poll_with_sink(cx, Instant::now(), &mut sink)
+                .await
         };
         // Preserve typed cancellation and never replay a partial delivery.
         budget.check(cx)?;
         if result? == 0 {
-            return Err(watch_error("a due publication or query produced no query phases"));
+            return Err(watch_error(
+                "a due publication or query produced no query phases",
+            ));
         }
         if publication {
             delivered = delivered
                 .checked_add(1)
                 .ok_or_else(|| watch_error("delivered generation counter exhausted"))?;
         }
-        if options.max_updates.is_some_and(|maximum| delivered >= maximum) {
+        if options
+            .max_updates
+            .is_some_and(|maximum| delivered >= maximum)
+        {
             return Ok(delivered);
         }
         // Only now resume the same writer future. Native hints received during
@@ -545,16 +568,18 @@ mod tests {
     fn interactive_query_does_not_poll_or_replace_the_owned_publisher() {
         run_test_with_cx(|cx| async move {
             let slot = ReceiptSlot::default();
-            let mut queries = Queries { pending: Some("beta".to_owned()), ..Queries::default() };
+            let mut queries = Queries {
+                pending: Some("beta".to_owned()),
+                ..Queries::default()
+            };
             let mut control: Option<&mut dyn QueryControl> = Some(&mut queries);
             let mut producer = pin!(poll_fn(|_| -> Poll<SearchResult<()>> {
                 panic!("query change must not start a publication");
             }));
-            let operation = next_operation(
-                &cx, &budget(), producer.as_mut(), &slot, &mut control, true,
-            )
-            .await
-            .unwrap();
+            let operation =
+                next_operation(&cx, &budget(), producer.as_mut(), &slot, &mut control, true)
+                    .await
+                    .unwrap();
             assert!(matches!(operation, Operation::Query(query) if query == "beta"));
             assert!(slot.take().unwrap().is_none());
         });
@@ -567,25 +592,35 @@ mod tests {
             let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
             let generation = publish(&cx, &store, "one");
             let slot = ReceiptSlot::default();
-            let mut queries = Queries { pending: Some("beta".to_owned()), ..Queries::default() };
+            let mut queries = Queries {
+                pending: Some("beta".to_owned()),
+                ..Queries::default()
+            };
             let mut control: Option<&mut dyn QueryControl> = Some(&mut queries);
             let mut producer = pin!(std::future::pending::<SearchResult<()>>());
             let budget = budget();
             {
                 let mut operation = pin!(next_operation(
-                    &cx, &budget, producer.as_mut(), &slot, &mut control, false,
+                    &cx,
+                    &budget,
+                    producer.as_mut(),
+                    &slot,
+                    &mut control,
+                    false,
                 ));
                 let mut task = Context::from_waker(Waker::noop());
                 assert!(operation.as_mut().poll(&mut task).is_pending());
             }
             slot.offer(&generation).unwrap();
-            let operation = next_operation(
-                &cx, &budget, producer.as_mut(), &slot, &mut control, true,
-            )
-            .await
-            .unwrap();
+            let operation =
+                next_operation(&cx, &budget, producer.as_mut(), &slot, &mut control, true)
+                    .await
+                    .unwrap();
             assert!(matches!(operation, Operation::Publication(value) if value == generation));
-            assert_eq!(control.as_mut().unwrap().take_query().unwrap().as_deref(), Some("beta"));
+            assert_eq!(
+                control.as_mut().unwrap().take_query().unwrap().as_deref(),
+                Some("beta")
+            );
         });
     }
 
@@ -596,23 +631,35 @@ mod tests {
             let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
             let generation = publish(&cx, &store, "one");
             let mut subscriber = RetainedLiveSearchSession::new(
-                offline_runtime(), store.clone(), "alpha",
+                offline_runtime(),
+                store.clone(),
+                "alpha",
                 super::super::Options::parse(vec![
-                    "--index-dir".into(), root.path().as_os_str().to_owned(),
-                    "--query".into(), "alpha".into(),
-                ]).unwrap().limits,
+                    "--index-dir".into(),
+                    root.path().as_os_str().to_owned(),
+                    "--query".into(),
+                    "alpha".into(),
+                ])
+                .unwrap()
+                .limits,
                 LiveSearchRefreshConfig::default(),
-            ).unwrap();
-            let mut queries = Queries { pending: Some("beta".to_owned()), ..Queries::default() };
+            )
+            .unwrap();
+            let mut queries = Queries {
+                pending: Some("beta".to_owned()),
+                ..Queries::default()
+            };
             {
                 let mut control: Option<&mut dyn QueryControl> = Some(&mut queries);
                 assert!(update_query(&cx, &mut subscriber, None, &mut control).unwrap());
-                assert!(!update_query(
-                    &cx, &mut subscriber, Some("beta".to_owned()), &mut control,
-                ).unwrap());
-                assert!(update_query(
-                    &cx, &mut subscriber, Some("  ".to_owned()), &mut control,
-                ).is_err());
+                assert!(
+                    !update_query(&cx, &mut subscriber, Some("beta".to_owned()), &mut control,)
+                        .unwrap()
+                );
+                assert!(
+                    update_query(&cx, &mut subscriber, Some("  ".to_owned()), &mut control,)
+                        .is_err()
+                );
             }
             assert_eq!(subscriber.query(), "beta");
             assert_eq!(queries.resets, ["beta"]);
@@ -624,13 +671,20 @@ mod tests {
     fn interactive_requests_cannot_extend_expired_watch_budgets() {
         run_test_with_cx(|cx| async move {
             let slot = ReceiptSlot::default();
-            let mut queries = Queries { pending: Some("beta".to_owned()), ..Queries::default() };
+            let mut queries = Queries {
+                pending: Some("beta".to_owned()),
+                ..Queries::default()
+            };
             {
                 let mut control: Option<&mut dyn QueryControl> = Some(&mut queries);
-                let expired = Budget { started: Instant::now(), timeout: Some(Duration::ZERO) };
+                let expired = Budget {
+                    started: Instant::now(),
+                    timeout: Some(Duration::ZERO),
+                };
                 let mut producer = pin!(std::future::pending::<SearchResult<()>>());
                 assert!(matches!(
-                    next_operation(&cx, &expired, producer.as_mut(), &slot, &mut control, true).await,
+                    next_operation(&cx, &expired, producer.as_mut(), &slot, &mut control, true)
+                        .await,
                     Err(SearchError::SearchTimeout { .. })
                 ));
             }

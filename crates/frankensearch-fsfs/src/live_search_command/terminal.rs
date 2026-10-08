@@ -267,7 +267,8 @@ fn render(model: &Model, width: u16, height: u16, frame: &mut Frame<'_>) {
     line(
         frame,
         height - 1,
-        "/: edit query | Enter: edit | Up/Down or j/k | PgUp/PgDn | Home/End | q/Esc: quit".to_owned(),
+        "/: edit query | Enter: edit | Up/Down or j/k | PgUp/PgDn | Home/End | q/Esc: quit"
+            .to_owned(),
     );
 }
 
@@ -303,10 +304,14 @@ impl<S: Surface> FrameOutput<S> {
 
     fn begin_query(&mut self, query: &str) -> io::Result<()> {
         if !self.pending.is_empty() {
-            return Err(model::invalid("cannot change query during a partial record"));
+            return Err(model::invalid(
+                "cannot change query during a partial record",
+            ));
         }
         if query.trim().is_empty() || query.len() > super::MAX_QUERY_BYTES {
-            return Err(model::invalid("new terminal query is blank or exceeds 64 KiB"));
+            return Err(model::invalid(
+                "new terminal query is blank or exceeds 64 KiB",
+            ));
         }
         let candidate = Model::new(query.to_owned(), self.model.hybrid, self.model.max_results);
         self.surface.present_with_editor(&candidate, &self.editor)?;
@@ -332,7 +337,8 @@ impl<S: Surface> FrameOutput<S> {
             redraw = true;
         }
         if redraw {
-            self.surface.present_with_editor(&self.model, &self.editor)?;
+            self.surface
+                .present_with_editor(&self.model, &self.editor)?;
         }
         Ok(None)
     }
@@ -503,7 +509,10 @@ async fn subscribe_existing<W: Write + Send>(
                 delivered = delivered
                     .checked_add(1)
                     .ok_or_else(|| super::invalid("delivered update counter exhausted"))?;
-                if options.max_updates.is_some_and(|maximum| delivered >= maximum) {
+                if options
+                    .max_updates
+                    .is_some_and(|maximum| delivered >= maximum)
+                {
                     return Ok(delivered);
                 }
             } else if options.once {
@@ -542,14 +551,14 @@ pub(super) async fn execute(
     };
     let work = async {
         if options.watch_source.is_some() {
-            super::watch::execute_controlled(
+            Box::pin(super::watch::execute_controlled(
                 cx,
                 &budget,
                 options,
                 &mut writer,
                 runtime,
                 Some(&mut control),
-            )
+            ))
             .await
         } else {
             subscribe_existing(cx, &budget, options, &mut writer, runtime, &mut control).await
@@ -933,12 +942,16 @@ mod tests {
                 manifest_sha256: "digest".to_owned(),
                 phase,
                 annotations: json!({"query": "alpha", "phase": phase}),
-                update: tracker.apply(&format!("g@digest:{phase}"), Vec::new()).unwrap(),
+                update: tracker
+                    .apply(&format!("g@digest:{phase}"), Vec::new())
+                    .unwrap(),
             };
             super::super::hybrid::emit_frame(&frame, &mut output).unwrap();
             output.editor.apply(Command::Start, "alpha");
             output.editor.apply(Command::Clear, "alpha");
-            output.editor.apply(Command::Paste("beta".to_owned()), "alpha");
+            output
+                .editor
+                .apply(Command::Paste("beta".to_owned()), "alpha");
             output.editor.apply(Command::Submit, "alpha");
             assert_eq!(output.model.query, "alpha");
         }
@@ -1008,7 +1021,10 @@ mod tests {
                 timeout: options.timeout,
             };
             let work = subscribe_existing(&cx, &budget, &options, &mut writer, None, &mut control);
-            assert_eq!(Box::pin(drive(&cx, shared.as_ref(), work)).await.unwrap(), 2);
+            assert_eq!(
+                Box::pin(drive(&cx, shared.as_ref(), work)).await.unwrap(),
+                2
+            );
             let view = lock(&shared).unwrap();
             assert_eq!(view.model.query, "beta");
             assert_eq!(view.model.sequence, 1);
@@ -1016,9 +1032,18 @@ mod tests {
             assert_eq!(view.model.results[0].hit.item["path"], "beta.rs");
             assert!(view.surface.frames.iter().any(|model| {
                 model.query == "alpha"
-                    && model.results.first().is_some_and(|hit| hit.hit.doc_id == "a")
+                    && model
+                        .results
+                        .first()
+                        .is_some_and(|hit| hit.hit.doc_id == "a")
             }));
-            assert!(view.model.revision.as_ref().unwrap().starts_with(generation.id()));
+            assert!(
+                view.model
+                    .revision
+                    .as_ref()
+                    .unwrap()
+                    .starts_with(generation.id())
+            );
             drop(view);
             assert_eq!(store.active(&cx).unwrap(), Some(generation));
             assert!(!cx.is_cancel_requested());

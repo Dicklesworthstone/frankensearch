@@ -331,7 +331,9 @@ fn bound_single_groups_keep_slot_order_duplicates_identities_and_float_bits() {
                         .iter()
                         .map(|value| value.to_bits())
                         .collect::<Vec<_>>(),
-                    provider.0.values(text)
+                    provider
+                        .0
+                        .values(text)
                         .iter()
                         .map(|value| value.to_bits())
                         .collect::<Vec<_>>()
@@ -395,9 +397,15 @@ fn late_bound_single_failure_writes_none_of_the_group_and_stops_later_inputs() {
                 let mut writer = VectorIndex::create_v2(&path, binding.clone()).unwrap();
                 writer.write_record("earlier-batch", &[0.25, -0.0]).unwrap();
                 let input = ["a", "b", "c"].map(|id| IndexableDocument::new(id, id));
-                let error = tier.write_batch(&cx, &mut writer, &input).await.unwrap_err();
+                let error = tier
+                    .write_batch(&cx, &mut writer, &input)
+                    .await
+                    .unwrap_err();
                 cx.set_cancel_requested(false);
-                if matches!(fault, Fault::Foreign | Fault::DriftSuccess | Fault::DriftFailure) {
+                if matches!(
+                    fault,
+                    Fault::Foreign | Fault::DriftSuccess | Fault::DriftFailure
+                ) {
                     assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
                 }
                 assert_eq!(provider.0.calls.lock().unwrap().len(), 2);
@@ -495,12 +503,12 @@ fn mixed_native_and_bound_single_builds_preserve_both_tiers_and_batch_tails() {
                     let quality_single = Arc::new(BoundSingle(Provider::new("quality", 3, 8)));
                     let fast_native = Arc::new(Provider::new("fast", 2, 8));
                     let quality_native = Arc::new(Provider::new("quality", 3, 8));
-                    let (fast, quality): (Arc<dyn Embedder>, Arc<dyn Embedder>) =
-                        if fast_is_single {
-                            (fast_single.clone(), quality_native.clone())
-                        } else {
-                            (fast_native.clone(), quality_single.clone())
-                        };
+                    let (fast, quality): (Arc<dyn Embedder>, Arc<dyn Embedder>) = if fast_is_single
+                    {
+                        (fast_single.clone(), quality_native.clone())
+                    } else {
+                        (fast_native.clone(), quality_single.clone())
+                    };
                     let actual = NativeIndexBuilder::new(
                         directory.path().join("mixed"),
                         generation(1),
@@ -557,17 +565,10 @@ fn mixed_native_and_bound_single_builds_preserve_both_tiers_and_batch_tails() {
                     assert_eq!(single.0.calls.lock().unwrap().len(), 7);
                     assert_eq!(single.0.raw_calls.load(Ordering::SeqCst), 0);
                     assert_eq!(native.raw_calls.load(Ordering::SeqCst), 0);
-                    let widths: Vec<_> = native
-                        .calls
-                        .lock()
-                        .unwrap()
-                        .iter()
-                        .map(Vec::len)
-                        .collect();
-                    let expected_widths: Vec<_> = documents()
-                        .chunks(batch_size)
-                        .map(<[_]>::len)
-                        .collect();
+                    let widths: Vec<_> =
+                        native.calls.lock().unwrap().iter().map(Vec::len).collect();
+                    let expected_widths: Vec<_> =
+                        documents().chunks(batch_size).map(<[_]>::len).collect();
                     assert_eq!(widths, expected_widths);
                     assert_eq!(actual.documents().len(), 7);
                     assert_eq!(actual.document("doc-0").unwrap().content, "text-0");
@@ -669,8 +670,14 @@ fn required_quality_bound_failure_aborts_an_update_without_changing_its_predeces
         assert!(matches!(update, Err(SearchError::InvalidConfig { .. })));
         assert_eq!(quality.0.calls.lock().unwrap().len(), 8);
         assert_eq!(quality.0.raw_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(fast.calls.lock().unwrap().last().unwrap(), &["changed input"]);
-        assert_eq!(std::fs::read(original.fast().vector_path()).unwrap(), old_fast);
+        assert_eq!(
+            fast.calls.lock().unwrap().last().unwrap(),
+            &["changed input"]
+        );
+        assert_eq!(
+            std::fs::read(original.fast().vector_path()).unwrap(),
+            old_fast
+        );
         assert_eq!(
             std::fs::read(original.quality().unwrap().vector_path()).unwrap(),
             old_quality
@@ -775,11 +782,20 @@ fn native_build_refuses_a_mid_group_dispatch_contract_change() {
             .build(&cx)
             .await;
             if change_dispatch {
-                assert!(matches!(built, Err(SearchError::UnverifiableRemoteSpace { .. })));
+                assert!(matches!(
+                    built,
+                    Err(SearchError::UnverifiableRemoteSpace { .. })
+                ));
                 assert_eq!(provider.calls.lock().unwrap().len(), 1);
             } else {
                 assert_eq!(built.unwrap().fast().index().live_count(), 7);
-                let widths: Vec<_> = provider.calls.lock().unwrap().iter().map(Vec::len).collect();
+                let widths: Vec<_> = provider
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(Vec::len)
+                    .collect();
                 assert_eq!(widths, vec![3, 3, 1]);
             }
             assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);
@@ -1361,11 +1377,20 @@ fn native_build_dispatches_sync_batches_and_refuses_a_mid_group_contract_change(
             .build(&cx)
             .await;
             if change_dispatch {
-                assert!(matches!(built, Err(SearchError::UnverifiableRemoteSpace { .. })));
+                assert!(matches!(
+                    built,
+                    Err(SearchError::UnverifiableRemoteSpace { .. })
+                ));
                 assert_eq!(provider.calls.lock().unwrap().len(), 1);
             } else {
                 assert_eq!(built.unwrap().fast().index().live_count(), 7);
-                let widths: Vec<_> = provider.calls.lock().unwrap().iter().map(Vec::len).collect();
+                let widths: Vec<_> = provider
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(Vec::len)
+                    .collect();
                 assert_eq!(widths, vec![3, 3, 1]);
             }
             assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);

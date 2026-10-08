@@ -3,8 +3,10 @@
 
 use frankensearch_core::IdentityBoundEmbedding;
 
-use super::{Cx, MAX_VECTOR_BYTES, Producer, SearchError, SearchResult, charge_vector, invalid,
-    retained_search_checkpoint};
+use super::{
+    Cx, MAX_VECTOR_BYTES, Producer, SearchError, SearchResult, charge_vector, invalid,
+    retained_search_checkpoint,
+};
 
 const MAX_ROWS: usize = 64;
 const MAX_TEXT_BYTES: usize = 512 * 1024;
@@ -57,14 +59,15 @@ impl<'a> InferenceBatch<'a> {
     ) -> SearchResult<()> {
         self.check(cx)?;
         if self.ids.len() == MAX_ROWS
-            || (!self.ids.is_empty()
-                && self.text_bytes.saturating_add(text.len()) > MAX_TEXT_BYTES)
+            || (!self.ids.is_empty() && self.text_bytes.saturating_add(text.len()) > MAX_TEXT_BYTES)
         {
             self.flush(cx, vector_bytes).await?;
         }
         // A single larger input is allowed under the parent's existing 8 MiB
         // document cap, but is never combined with another input in one group.
-        self.text_bytes = self.text_bytes.checked_add(text.len())
+        self.text_bytes = self
+            .text_bytes
+            .checked_add(text.len())
             .ok_or_else(|| invalid("inference input length overflow"))?;
         self.ids.push(id);
         self.texts.push(text);
@@ -99,14 +102,19 @@ impl<'a> InferenceBatch<'a> {
         // Refuse known output cost BEFORE inference. The other tier shares this
         // counter, including completed groups; do not invoke a model merely to
         // discover that an exactly dimensioned response exceeds the budget.
-        let expected_bytes = usize::try_from(self.producer.identity.space.dimension).ok()
+        let expected_bytes = usize::try_from(self.producer.identity.space.dimension)
+            .ok()
             .and_then(|width| width.checked_mul(std::mem::size_of::<f32>()))
             .and_then(|bytes| bytes.checked_mul(self.ids.len()))
             .and_then(|bytes| vector_bytes.checked_add(bytes))
             .filter(|bytes| *bytes <= MAX_VECTOR_BYTES)
             .ok_or_else(|| invalid("retained batch vector payload exceeds 128 MiB"))?;
         let values = if self.native {
-            let outcome = self.producer.embedder.embed_batch_bound(cx, &self.texts).await;
+            let outcome = self
+                .producer
+                .embedder
+                .embed_batch_bound(cx, &self.texts)
+                .await;
             retained_search_checkpoint(cx)?;
             let outcome = match outcome {
                 Err(error @ SearchError::Cancelled { .. }) => return Err(error),
@@ -122,7 +130,10 @@ impl<'a> InferenceBatch<'a> {
                 retained_search_checkpoint(cx)?;
                 self.admit_response(row)?;
             }
-            response.into_iter().map(|row| row.values).collect::<Vec<_>>()
+            response
+                .into_iter()
+                .map(|row| row.values)
+                .collect::<Vec<_>>()
         } else {
             let mut response = Vec::with_capacity(self.ids.len());
             for text in &self.texts {
@@ -138,7 +149,9 @@ impl<'a> InferenceBatch<'a> {
             charge_vector(&mut charged, vector)?;
         }
         if charged != expected_bytes {
-            return Err(invalid("inference group output cost disagrees with its admitted shape"));
+            return Err(invalid(
+                "inference group output cost disagrees with its admitted shape",
+            ));
         }
         // Commit accounting and all rows together. On any earlier error neither
         // the group's IDs nor any prefix of its output has been staged.

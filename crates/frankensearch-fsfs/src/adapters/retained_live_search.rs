@@ -276,7 +276,12 @@ impl RetainedLiveSearchSession {
             {
                 let mut phase_sink = |payload: &SearchPayload| delivery.publish(cx, payload, sink);
                 let _ = reader
-                    .search_with_phase_sink(cx, &self.query, self.config.max_results, &mut phase_sink)
+                    .search_with_phase_sink(
+                        cx,
+                        &self.query,
+                        self.config.max_results,
+                        &mut phase_sink,
+                    )
                     .await?;
             }
             checkpoint(cx)?;
@@ -772,7 +777,11 @@ mod tests {
             assert!(session.query_changed);
             assert!(matches!(
                 session
-                    .poll_with_sink(&cx, now - Duration::from_millis(1), &mut |_| Ok(()))
+                    .poll_with_sink(
+                        &cx,
+                        now.checked_sub(Duration::from_millis(1)).unwrap(),
+                        &mut |_| Ok(()),
+                    )
                     .await,
                 Err(SearchError::InvalidConfig { .. })
             ));
@@ -823,7 +832,10 @@ mod tests {
             assert!(matches!(&first.event, LiveSearchEvent::Snapshot { .. }));
             let refined = frames[1].update.as_ref().unwrap();
             assert_eq!(refined.sequence, 2);
-            assert_eq!(refined.previous_generation.as_ref(), Some(&first.generation));
+            assert_eq!(
+                refined.previous_generation.as_ref(),
+                Some(&first.generation)
+            );
             assert!(matches!(&refined.event,
                 LiveSearchEvent::Delta { changes } if changes.is_empty()));
             assert_eq!(session.tracker().results()[0].hit.doc_id, "beta-result");
@@ -869,7 +881,9 @@ mod tests {
             session.completed = Some(generation);
             session.set_query(&cx, "beta").unwrap();
             std::fs::rename(
-                store.root().join(crate::generation_store::COMPLETE_GENERATION_POINTER),
+                store
+                    .root()
+                    .join(crate::generation_store::COMPLETE_GENERATION_POINTER),
                 store.root().join("saved-pointer"),
             )
             .unwrap();

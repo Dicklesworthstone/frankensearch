@@ -639,12 +639,7 @@ mod tests {
             let mut session = session(store.clone());
             session.poll(&cx, Instant::now()).await.unwrap();
             session.set_query(&cx, "beta").unwrap();
-            let successor = publish(
-                &cx,
-                &store,
-                &[IndexableDocument::new("new", "beta")],
-            )
-            .await;
+            let successor = publish(&cx, &store, &[IndexableDocument::new("new", "beta")]).await;
             let frame = session.poll(&cx, Instant::now()).await.unwrap().unwrap();
             assert_eq!(frame.query, "beta");
             assert_eq!(frame.sequence, 1);
