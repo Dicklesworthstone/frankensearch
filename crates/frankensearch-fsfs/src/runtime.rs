@@ -20424,8 +20424,37 @@ impl FsfsRuntime {
         index_root: &Path,
         mutations: &[LexicalMutation],
     ) -> SearchResult<()> {
+        self.commit_one_shot_lexical_mutations(cx, index_root, mutations, false)
+            .await
+            .map(|_| ())
+    }
+
+    /// [`Self::apply_one_shot_lexical_mutations`] for an unpublished
+    /// complete-generation candidate. Before closing, the session also
+    /// reclaims the candidate's unreferenced Quill files with a zero grace
+    /// window, as `reclaim_unpublished_lexical_garbage` would by opening a
+    /// second writer, whose open alone re-verifies every segment in full.
+    /// Returns whether a session ran; if not, the caller still owes that
+    /// reclamation. No other Quill writer may open the candidate afterwards.
+    pub(crate) async fn apply_candidate_lexical_mutations(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+        mutations: &[LexicalMutation],
+    ) -> SearchResult<bool> {
+        self.commit_one_shot_lexical_mutations(cx, index_root, mutations, true)
+            .await
+    }
+
+    async fn commit_one_shot_lexical_mutations(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+        mutations: &[LexicalMutation],
+        reclaim_unpublished: bool,
+    ) -> SearchResult<bool> {
         if mutations.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let lexical_layout = Self::resolve_lexical_engine(index_root)?;
         let (Some(BlueGreenEngine::Quill), Some(lexical_path)) =
@@ -20438,7 +20467,7 @@ impl FsfsRuntime {
                 mutations = mutations.len(),
                 "no active Quill generation; lexical mutations skipped"
             );
-            return Ok(());
+            return Ok(false);
         };
         // Keyword segments carry no repair sidecars (bd-2pkpj): they rebuild
         // from sources, so a segment that fails verification is quarantined
@@ -20483,7 +20512,21 @@ impl FsfsRuntime {
             published_generation,
             "one-shot lexical mutations committed to the active Quill generation"
         );
-        Ok(())
+        if reclaim_unpublished {
+            let report = index
+                .collect_garbage_with(
+                    cx,
+                    frankensearch_quill::GarbageCollectionOptions {
+                        grace_period: Duration::ZERO,
+                    },
+                )
+                .await?;
+            tracing::debug!(
+                removed = report.removed.len(),
+                "reclaimed unreferenced lexical files of an unpublished candidate"
+            );
+        }
+        Ok(true)
     }
 
     /// Retire a quality-tier generation that no longer belongs to the fast

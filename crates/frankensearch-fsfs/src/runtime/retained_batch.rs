@@ -685,8 +685,8 @@ impl FsfsRuntime {
             })
             .collect::<Vec<_>>();
         lease.fence("retained batch lexical mutation")?;
-        candidate
-            .apply_one_shot_lexical_mutations(cx, build.path(), &mutations)
+        let lexical_reclaimed = candidate
+            .apply_candidate_lexical_mutations(cx, build.path(), &mutations)
             .await?;
         for (relative, producer, entries) in [
             (FSFS_VECTOR_INDEX_FILE, fast.as_ref(), &fast_entries),
@@ -814,7 +814,9 @@ impl FsfsRuntime {
         candidate.write_index_sentinel(build.path(), &sentinel)?;
         lease.fence("retained batch candidate complete")?;
         drop(lease);
-        reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
+        if !lexical_reclaimed {
+            reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
+        }
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,

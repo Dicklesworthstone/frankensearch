@@ -237,10 +237,11 @@ fn validate_retained_catalog_path(value: &str) -> SearchResult<()> {
 ///
 /// A candidate starts with every file of its predecessor, retired merge inputs
 /// included, so every generation used to inherit all earlier dead segments
-/// (bd-2op1d). No reader
-/// can resolve a candidate before its publication, so a zero window is safe
-/// here and nowhere else. Call once every candidate writer has closed, before
-/// resources are admitted and the bundle is sealed.
+/// (bd-2op1d). No reader can resolve a candidate before its publication, so a
+/// zero window is safe here and nowhere else. Call once every candidate writer
+/// has closed, before resources are admitted and the bundle is sealed. A
+/// candidate whose one Quill writer was `apply_candidate_lexical_mutations`
+/// was already reclaimed by that session.
 async fn reclaim_unpublished_lexical_garbage(cx: &Cx, root: &Path) -> SearchResult<()> {
     retained_search_checkpoint(cx)?;
     let layout = FsfsRuntime::resolve_lexical_engine(root)?;
@@ -680,8 +681,8 @@ impl FsfsRuntime {
                 )
             })
             .collect::<Vec<_>>();
-        candidate
-            .apply_one_shot_lexical_mutations(cx, build.path(), &lexical_mutations)
+        let lexical_reclaimed = candidate
+            .apply_candidate_lexical_mutations(cx, build.path(), &lexical_mutations)
             .await?;
         for (relative, embedder, entries) in [
             (
@@ -808,7 +809,9 @@ impl FsfsRuntime {
         candidate.write_index_sentinel(build.path(), &sentinel)?;
         candidate_lease.fence("complete-generation append candidate complete")?;
         drop(candidate_lease);
-        reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
+        if !lexical_reclaimed {
+            reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
+        }
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
@@ -949,8 +952,8 @@ impl FsfsRuntime {
                 LexicalMutation::delete(id.clone(), 0, IngestionClass::Skip, "delete_command")
             })
             .collect::<Vec<_>>();
-        candidate
-            .apply_one_shot_lexical_mutations(cx, build.path(), &lexical_mutations)
+        let lexical_reclaimed = candidate
+            .apply_candidate_lexical_mutations(cx, build.path(), &lexical_mutations)
             .await?;
         let target_sources = targets.iter().map(String::as_str).collect::<HashSet<_>>();
         for (_, relative) in FSFS_VECTOR_GENERATION_FILES {
@@ -1023,7 +1026,9 @@ impl FsfsRuntime {
         // Drop clears the lease's owner record. It must precede sealing so no
         // destructor writes through the completed bundle's inventory.
         drop(candidate_lease);
-        reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
+        if !lexical_reclaimed {
+            reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
+        }
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
