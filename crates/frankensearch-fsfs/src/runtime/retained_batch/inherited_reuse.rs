@@ -1,7 +1,9 @@
 //! Preserve, but never strengthen, source-reuse evidence across a mixed batch.
 //!
 //! A document mutation is not a new source indexing run. Carry the old receipt's
-//! execution/configuration scope verbatim and invalidate every touched row. The
+//! execution/configuration scope verbatim and invalidate every touched row. A
+//! source-owned batch can replace invalidated evidence with its observed raw
+//! input, but only under that same execution/configuration scope. The
 //! ordinary retained indexer still decides compatibility, checks source hashes
 //! and admits producers before actually reusing anything. In particular, this
 //! does not hash canonical document text and call it a source-byte witness.
@@ -15,13 +17,97 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    Cx, FsfsRuntime, IndexManifestEntry, PublishedGeneration, SearchResult, invalid,
-    retained_search_checkpoint,
+    Cx, FsfsRuntime, IndexManifestEntry, IngestionClass, PreparedBatch, PublishedGeneration,
+    RetainedMutation, SearchResult, ingestion_class_label, invalid, retained_search_checkpoint,
 };
 use crate::runtime::{CheckpointFileEntry, INDEXING_CHECKPOINT_SCHEMA_VERSION, IndexingCheckpoint};
 
 const RECEIPT_FILE: &str = "FSFS-REUSE.json";
 const MAX_RECEIPT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Only source preparation constructs this witness. The public document API
+/// supplies none. Fields bind the exact input and the prepared source contract;
+/// vector/lexical completion is established later by the common batch writer.
+pub(super) struct SourceInput {
+    content_hash_hex: String,
+    canonical_lines: u64,
+    revision: i64,
+    ingestion_class: String,
+    canonical_bytes: u64,
+    reason_code: String,
+}
+
+pub(super) fn record_source_inputs(
+    cx: &Cx,
+    operations: &[RetainedMutation],
+    documents: &PreparedBatch,
+) -> SearchResult<BTreeMap<String, SourceInput>> {
+    retained_search_checkpoint(cx)?;
+    let mut seen = HashSet::new();
+    let mut inputs = BTreeMap::new();
+    // Admission has validated every operation. Hash only the last body for each
+    // ID, exactly as preparation chose it, including upsert/delete sequences.
+    for operation in operations.iter().rev() {
+        retained_search_checkpoint(cx)?;
+        let (id, text) = match operation {
+            RetainedMutation::Upsert { id, text } => (id, Some(text)),
+            RetainedMutation::Delete { id } => (id, None),
+        };
+        if !seen.insert(id.as_str()) {
+            continue;
+        }
+        let Some(text) = text else { continue };
+        let body = documents.get(id).and_then(Option::as_ref)
+            .ok_or_else(|| invalid("source input has no final prepared body"))?;
+        let source = body.source.as_ref()
+            .ok_or_else(|| invalid("opaque document input cannot certify a source"))?;
+        let mut digest = Sha256::new();
+        for chunk in text.as_bytes().chunks(64 * 1024) {
+            retained_search_checkpoint(cx)?;
+            digest.update(chunk);
+        }
+        let canonical_lines = crate::runtime::count_non_empty_lines(&body.embedding);
+        retained_search_checkpoint(cx)?;
+        inputs.insert(id.clone(), SourceInput {
+            content_hash_hex: crate::runtime::sha256_digest_hex(digest.finalize()),
+            canonical_lines,
+            revision: body.revision(0),
+            ingestion_class: ingestion_class_label(source.ingestion_class).to_owned(),
+            canonical_bytes: u64::try_from(body.embedding.len())
+                .map_err(|_| invalid("source canonical length overflow"))?,
+            reason_code: body.reason(source.ingestion_class).to_owned(),
+        });
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(inputs)
+}
+
+fn extend_source_inputs(
+    cx: &Cx,
+    files: &mut BTreeMap<String, CheckpointFileEntry>,
+    changed: &HashSet<String>,
+    inputs: &BTreeMap<String, SourceInput>,
+) -> SearchResult<()> {
+    for (id, input) in inputs {
+        retained_search_checkpoint(cx)?;
+        let entry = files.get_mut(id)
+            .filter(|_| changed.contains(id))
+            .ok_or_else(|| invalid("source evidence does not name a changed member"))?;
+        if entry.revision != input.revision
+            || entry.ingestion_class != input.ingestion_class
+            || entry.canonical_bytes != input.canonical_bytes
+            || entry.reason_code != input.reason_code
+        {
+            return Err(invalid("source evidence disagrees with the completed member"));
+        }
+        entry.lexical_indexed = true;
+        entry.semantic_indexed = input.ingestion_class
+            == ingestion_class_label(IngestionClass::FullSemanticLexical);
+        entry.content_hash_hex.clone_from(&input.content_hash_hex);
+        entry.canonical_lines = Some(input.canonical_lines);
+    }
+    retained_search_checkpoint(cx)
+}
 
 /// The version-2 wire envelope, not another compatibility policy. Never update
 /// its scope to the mutator's executable or configuration. Future receipt
@@ -188,11 +274,13 @@ impl Write for BoundedBytes {
 /// Called only after the independent candidate has passed ordinary search
 /// admission, and before sealing. No filesystem source is opened here. Missing
 /// or unsupported evidence stays cold. Errors leave the old selection intact.
-pub(super) fn retain_unchanged(
+pub(super) fn retain_inputs(
     cx: &Cx,
+    runtime: &FsfsRuntime,
     predecessor: &PublishedGeneration,
     destination: &Path,
     changed: &HashSet<String>,
+    source_inputs: &BTreeMap<String, SourceInput>,
 ) -> SearchResult<()> {
     let Some(mut receipt) = read_receipt(cx, predecessor)? else {
         return Ok(());
@@ -207,11 +295,19 @@ pub(super) fn retain_unchanged(
         ));
     }
     receipt.checkpoint.files = project_files(cx, &receipt.checkpoint.files, &manifests, changed)?;
+    // An older executable's receipt cannot certify this execution's newly
+    // prepared source bytes. Never relabel the inherited scope to make it fit.
+    if !source_inputs.is_empty() && runtime.source_reuse_scope_matches(
+        cx, &receipt.session, receipt.executable_sha256.as_deref(),
+        &receipt.configuration_sha256, &receipt.checkpoint.target_root,
+    )? {
+        extend_source_inputs(cx, &mut receipt.checkpoint.files, changed, source_inputs)?;
+    }
     // An upsert can replace a source previously skipped for its content. Its
     // old skip record is no more transferable than its old embedding witness.
     receipt.checkpoint.content_skipped.retain(|id, _| !changed.contains(id));
-    // There is nothing to preserve once every indexed row has lost its witness.
-    // Do not create a cold receipt or fabricate fresh evidence for changed rows.
+    // Opaque replacements remain unproven. A source-owned batch may instead
+    // have re-established all witnesses, including when no old member survives.
     if !receipt.checkpoint.files.values().any(|entry| {
         entry.lexical_indexed
             && entry.content_hash_hex.len() == 64
@@ -259,3 +355,6 @@ pub(super) fn retain_unchanged(
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod source_tests;

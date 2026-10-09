@@ -20,6 +20,42 @@ pub(super) fn fingerprint() -> Option<&'static str> {
     EXECUTABLE.get().and_then(Option::as_deref)
 }
 
+impl super::FsfsRuntime {
+    /// Whether fresh source evidence can extend an existing receipt without
+    /// changing its scope. Uses the established executable proof, not a model
+    /// label, pathname or newly guessed fingerprint. No executable hashing or
+    /// model loading occurs here.
+    pub(in crate::runtime) fn source_reuse_scope_matches(
+        &self,
+        cx: &Cx,
+        session: &str,
+        executable: Option<&str>,
+        configuration: &str,
+        target_root: &str,
+    ) -> SearchResult<bool> {
+        retained_search_checkpoint(cx)?;
+        // Same fail-closed scope rule as compatible_execution: absence on only
+        // one side cannot downgrade a cross-process receipt to session reuse.
+        let same_execution = match (executable, fingerprint()) {
+            (Some(expected), Some(actual)) => super::hex_digest(expected) && expected == actual,
+            (None, None) => session == super::session_id()?,
+            _ => false,
+        };
+        retained_search_checkpoint(cx)?;
+        if !same_execution {
+            return Ok(false);
+        }
+        let current_configuration = super::configuration_digest(self);
+        retained_search_checkpoint(cx)?;
+        if configuration != current_configuration? {
+            return Ok(false);
+        }
+        let current_target = self.resolve_target_root();
+        retained_search_checkpoint(cx)?;
+        Ok(target_root == current_target?.display().to_string())
+    }
+}
+
 /// Prepare once on the caller-owned blocking lane. No model is loaded and no
 /// runtime or worker pool is created. Lack of a usable lane is a cold-reuse
 /// decision, not a reason to reject an otherwise valid indexing command.

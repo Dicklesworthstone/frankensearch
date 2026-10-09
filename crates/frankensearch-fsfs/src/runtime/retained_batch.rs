@@ -88,6 +88,7 @@ pub(super) struct SourceAttributes {
 /// post-seal precommit check, before the pointer is changed.
 pub(super) struct SourceBatch {
     documents: PreparedBatch,
+    source_inputs: BTreeMap<String, inherited_reuse::SourceInput>,
     source_check: Option<SourceCheck>,
 }
 
@@ -127,8 +128,10 @@ pub(super) fn prepare_source_batch(
         Err(error) => return Err(error),
     };
     attach_sources(cx, &mut documents, sources)?;
+    let source_inputs = inherited_reuse::record_source_inputs(cx, operations, &documents)?;
     Ok(Some(SourceBatch {
         documents,
+        source_inputs,
         source_check: None,
     }))
 }
@@ -439,8 +442,10 @@ impl FsfsRuntime {
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
         let documents = prepare(cx, operations)?;
-        self.apply_prepared_retained_batch(cx, store_root, expected, documents, precommit)
-            .await
+        self.apply_prepared_retained_batch(
+            cx, store_root, expected, documents, BTreeMap::new(), precommit,
+        )
+        .await
     }
 
     /// Private source-aware route. The source owner retains discovery, decoding
@@ -459,19 +464,22 @@ impl FsfsRuntime {
     {
         let SourceBatch {
             documents,
+            source_inputs,
             source_check,
         } = batch;
-        self.apply_prepared_retained_batch(cx, store_root, expected, documents, move |cx| {
-            // Discovery/backend/selection admission remains first. Additional
-            // source evidence cannot override a failure or acknowledge a source
-            // recreated during that admission, even when discovery hides it.
-            precommit(cx)?;
-            retained_search_checkpoint(cx)?;
-            if let Some(check) = source_check {
-                check(cx)?;
-            }
-            retained_search_checkpoint(cx)
-        })
+        self.apply_prepared_retained_batch(
+            cx, store_root, expected, documents, source_inputs, move |cx| {
+                // Discovery/backend/selection admission remains first. Additional
+                // source evidence cannot override a failure or acknowledge a source
+                // recreated during that admission, even when discovery hides it.
+                precommit(cx)?;
+                retained_search_checkpoint(cx)?;
+                if let Some(check) = source_check {
+                    check(cx)?;
+                }
+                retained_search_checkpoint(cx)
+            },
+        )
         .await
     }
 
@@ -482,6 +490,7 @@ impl FsfsRuntime {
         store_root: &Path,
         expected: &PublishedGeneration,
         mut documents: PreparedBatch,
+        source_inputs: BTreeMap<String, inherited_reuse::SourceInput>,
         precommit: F,
     ) -> SearchResult<RetainedBatchResult>
     where
@@ -509,6 +518,9 @@ impl FsfsRuntime {
         Self::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
         let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
             .ok_or_else(|| invalid("selected membership manifests disagree"))?;
+        // A source deleted before it ever acquired index rows can still have
+        // a content-skip witness. Invalidate it when a mixed batch publishes.
+        let changed_ids = documents.keys().cloned().collect::<HashSet<_>>();
         documents.retain(|id, body| body.is_some() || manifests.contains_key(id));
         let upserted = documents.values().filter(|body| body.is_some()).count();
         let deleted = documents.len() - upserted;
@@ -756,7 +768,6 @@ impl FsfsRuntime {
                 }
             }
         }
-        let changed_ids = documents.keys().cloned().collect::<HashSet<_>>();
         for (id, body) in documents {
             if let Some(body) = body {
                 let entry = IndexManifestEntry {
@@ -814,7 +825,9 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
-        inherited_reuse::retain_unchanged(cx, &predecessor, build.path(), &changed_ids)?;
+        inherited_reuse::retain_inputs(
+            cx, self, &predecessor, build.path(), &changed_ids, &source_inputs,
+        )?;
         for producer in [fast.as_ref(), quality.as_ref()].into_iter().flatten() {
             producer.recheck()?;
         }
