@@ -115,24 +115,30 @@ impl PublishedGeneration {
     /// # Errors
     /// Returns an error when the inventory no longer matches the admitted digest.
     pub(crate) fn sealed_artifacts(&self) -> SearchResult<BTreeMap<String, (u64, String)>> {
-        let bytes = read_bounded_regular(
-            &self.path.join(COMPLETE_GENERATION_MANIFEST),
-            MAX_MANIFEST_BYTES,
-        )?;
-        if digest(&bytes) != self.manifest_sha256 {
-            return Err(invalid(
-                &self.path,
-                "bundle inventory digest changed after admission",
-            ));
-        }
-        let manifest: BundleManifest = serde_json::from_slice(&bytes)
-            .map_err(|error| invalid(&self.path, &format!("invalid bundle inventory: {error}")))?;
-        Ok(manifest
-            .files
-            .into_iter()
-            .map(|artifact| (artifact.path, (artifact.bytes, artifact.sha256)))
-            .collect())
+        sealed_artifacts_at(&self.path, &self.manifest_sha256)
     }
+}
+
+/// The sealed inventory of the generation at `path`, which must still hash to
+/// `manifest_sha256`.
+fn sealed_artifacts_at(
+    path: &Path,
+    manifest_sha256: &str,
+) -> SearchResult<BTreeMap<String, (u64, String)>> {
+    let bytes = read_bounded_regular(&path.join(COMPLETE_GENERATION_MANIFEST), MAX_MANIFEST_BYTES)?;
+    if digest(&bytes) != manifest_sha256 {
+        return Err(invalid(
+            path,
+            "bundle inventory digest changed after admission",
+        ));
+    }
+    let manifest: BundleManifest = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid(path, &format!("invalid bundle inventory: {error}")))?;
+    Ok(manifest
+        .files
+        .into_iter()
+        .map(|artifact| (artifact.path, (artifact.bytes, artifact.sha256)))
+        .collect())
 }
 
 /// A successful pointer rename is not undone when the following fsync fails.
@@ -391,6 +397,7 @@ impl GenerationBuild {
         if files.is_empty() {
             return Err(invalid(&self.path, "cannot publish an empty bundle"));
         }
+        self.require_shared_files_unchanged(cx, &files)?;
         let manifest = BundleManifest {
             schema_version: 1,
             generation: self.id.clone(),
@@ -445,6 +452,55 @@ impl GenerationBuild {
                 Ok(GenerationPublication::VisibleButDurabilityUncertain { generation, source })
             }
         }
+    }
+
+    /// Refuse a file that shares its inode with the predecessor's file at the
+    /// same path (a linked Quill segment) but no longer hashes to the
+    /// predecessor's sealed digest: those bytes decayed or were rewritten in
+    /// place, under both generations. `files` read every byte, so a successor
+    /// seeded by links needs no earlier pass over the shared files.
+    #[cfg(unix)]
+    fn require_shared_files_unchanged(&self, cx: &Cx, files: &[Artifact]) -> SearchResult<()> {
+        let Some(pointer) = self.predecessor.as_deref() else {
+            return Ok(());
+        };
+        let (id, manifest_sha256) = decode_pointer(pointer, &self.store.root)?;
+        let predecessor = self.store.root.join(GENERATIONS).join(id);
+        let mut sealed = None;
+        for artifact in files {
+            checkpoint(cx)?;
+            let path = self.path.join(&artifact.path);
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.nlink() < 2 {
+                continue;
+            }
+            let shared = match fs::symlink_metadata(predecessor.join(&artifact.path)) {
+                Ok(previous) => {
+                    (previous.dev(), previous.ino()) == (metadata.dev(), metadata.ino())
+                }
+                Err(error) if error.kind() == ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if !shared {
+                continue;
+            }
+            let sealed = match &mut sealed {
+                Some(sealed) => sealed,
+                None => sealed.insert(sealed_artifacts_at(&predecessor, &manifest_sha256)?),
+            };
+            if sealed.get(&artifact.path) != Some(&(artifact.bytes, artifact.sha256.clone())) {
+                return Err(invalid(
+                    &path,
+                    "a file shared with the predecessor differs from its sealed inventory",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn require_shared_files_unchanged(&self, _cx: &Cx, _files: &[Artifact]) -> SearchResult<()> {
+        Ok(())
     }
 }
 
@@ -1040,8 +1096,8 @@ fn hash_file(cx: &Cx, path: &Path) -> SearchResult<(u64, String)> {
 /// reads every byte. What a memo gives up is noticing media corruption between
 /// two passes in one process, which a re-read served from the page cache
 /// rarely could; the seed copy still checks every byte it reads against the
-/// sealed inventory, and a segment it links instead gets a new ctime, so the
-/// predecessor's admission that follows the seeding hashes it again.
+/// sealed inventory, and sealing a successor checks every file it shares
+/// with its predecessor against the predecessor's.
 #[cfg(unix)]
 mod digest_memo {
     use std::collections::HashMap;
@@ -2340,6 +2396,42 @@ mod tests {
             assert!(build.publish(&cx, |_, _| Ok(())).is_err());
             assert!(store.active(&cx).unwrap().is_none());
             assert_eq!(fs::read_to_string(external).unwrap(), "mutable");
+        });
+    }
+
+    #[test]
+    fn a_shared_file_rewritten_in_place_is_refused_at_publication() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let segment = "lexical/quill-v1/seg-0000000000000001.fslx";
+            let first = store.begin(&cx).unwrap();
+            fs::create_dir_all(first.path().join("lexical/quill-v1")).unwrap();
+            fs::write(first.path().join(segment), "sealed").unwrap();
+            let GenerationPublication::Durable(predecessor) =
+                first.publish(&cx, |_, _| Ok(())).unwrap()
+            else {
+                panic!("fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
+            };
+            let second = store.begin(&cx).unwrap();
+            fs::create_dir_all(second.path().join("lexical/quill-v1")).unwrap();
+            fs::hard_link(
+                predecessor.path().join(segment),
+                second.path().join(segment),
+            )
+            .unwrap();
+            // Same length, new bytes, one inode: both generations hold them.
+            fs::write(predecessor.path().join(segment), "SEALED").unwrap();
+            let error = second.publish(&cx, |_, _| Ok(())).unwrap_err();
+            assert!(
+                matches!(&error, SearchError::IndexCorrupted { detail, .. }
+                if detail == "a file shared with the predecessor differs from its sealed inventory"),
+                "{error}"
+            );
+            assert!(
+                store.active(&cx).is_err(),
+                "the rewritten predecessor no longer admits either"
+            );
         });
     }
 

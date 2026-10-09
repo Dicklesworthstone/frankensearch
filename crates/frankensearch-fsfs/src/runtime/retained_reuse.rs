@@ -736,12 +736,13 @@ struct CopyStats {
 
 impl CopyStats {
     /// Require the bytes read from `predecessor` to be the ones its sealed
-    /// inventory names, then require it to be admitted and selected still.
+    /// inventory names, then require it to be selected still.
     ///
-    /// Its earlier admission may have reused digests this process computed
+    /// Its admission may have reused digests this process computed
     /// (`generation_store`), so the copy, which reads every byte, is what
     /// notices a predecessor that decayed on disk since. A segment the copy
-    /// linked has a new ctime, so the second admission hashes it again.
+    /// linked is read when the successor is sealed, which refuses a shared
+    /// file that no longer matches the predecessor's sealed digest.
     fn confirm(
         &self,
         cx: &Cx,
@@ -766,10 +767,9 @@ impl CopyStats {
                 ));
             }
         }
-        // The store lease excludes cooperating publication. Rechecking also
-        // refuses an out-of-protocol pointer change or source mutation during
-        // the copy.
-        if store.active(cx)?.as_ref() != Some(predecessor) {
+        // The store lease excludes cooperating publication; this refuses an
+        // out-of-protocol pointer change during the copy.
+        if !store.is_selected(cx, predecessor)? {
             return Err(reuse_error(
                 "selected predecessor changed while it was being copied",
             ));
@@ -1370,15 +1370,22 @@ mod copy_tests {
             );
             fs::write(predecessor.path().join("vector/fast.idx"), b"original").unwrap();
 
-            // The copy never reads a segment it links, but linking moves the
-            // segment's ctime, so the recheck reads it. A remembered stamp is
-            // always older than the coarse clock tick a link would share.
+            // The copy never reads a segment it links; sealing the successor
+            // does, and refuses one that no longer matches the predecessor's
+            // inventory. A remembered stamp is always older than the coarse
+            // clock tick a link would share.
             decay(segment, b"segment!");
             std::thread::sleep(std::time::Duration::from_millis(150));
-            let error = seed("linked").unwrap_err();
+            let build = store.begin(&cx).unwrap();
+            let mut stats = CopyStats::default();
+            copy_tree(&cx, predecessor.path(), build.path(), 0, &mut stats).unwrap();
+            stats
+                .confirm(&cx, &store, &predecessor, build.path())
+                .unwrap();
+            let error = build.publish(&cx, |_, _| Ok(())).unwrap_err();
             assert!(
                 matches!(&error, SearchError::IndexCorrupted { detail, .. }
-                if detail == "bundle files differ from their sealed inventory"),
+                if detail == "a file shared with the predecessor differs from its sealed inventory"),
                 "{error}"
             );
         });
