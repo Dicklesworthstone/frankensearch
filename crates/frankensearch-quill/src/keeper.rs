@@ -3708,6 +3708,17 @@ impl KeeperSnapshot {
     }
 
     fn open_once(directory: &Path, schema: SchemaDescriptor) -> Result<Self, KeeperError> {
+        Self::open_once_reusing(directory, schema, Vec::new())
+    }
+
+    /// [`Self::open_once`], reusing segments a publication preflight verified
+    /// under the same writer admission (see [`reuse_verified_segments`]). The
+    /// MANIFEST pair is still read from disk as authority.
+    fn open_once_reusing(
+        directory: &Path,
+        schema: SchemaDescriptor,
+        verified: Vec<VerifiedProposalSegment>,
+    ) -> Result<Self, KeeperError> {
         let expected_schema_id = schema
             .schema_id()
             .map_err(|source| KeeperError::InvalidSchema { source })?;
@@ -3715,7 +3726,11 @@ impl KeeperSnapshot {
         validate_loaded_schema(directory, expected_schema_id, &loaded)?;
         validate_recovery_claims(directory, &loaded)?;
 
-        let segments = open_manifest_segments(directory, &loaded.manifest.segments, schema)?;
+        let segments = if verified.is_empty() {
+            open_manifest_segments(directory, &loaded.manifest.segments, schema)?
+        } else {
+            reuse_verified_segments(directory, &loaded.manifest.segments, schema, verified)?
+        };
 
         let snapshot = Self::from_parts(Some(directory.to_path_buf()), schema, loaded, segments)?;
         if !snapshot.quarantined_segments.is_empty() {
@@ -5041,8 +5056,8 @@ impl KeeperWriter {
         })
         .await?;
 
-        match open_snapshot_blocking(directory.clone(), schema).await {
-            Ok(_) => {}
+        let snapshot = match open_snapshot_blocking(directory.clone(), schema).await {
+            Ok(snapshot) => snapshot,
             Err(KeeperError::IndexNotFound { .. }) if create => {
                 let schema_id = schema
                     .schema_id()
@@ -5072,24 +5087,31 @@ impl KeeperWriter {
                             .await?;
                     }
                 }
-                open_snapshot_blocking(directory.clone(), schema).await?;
+                open_snapshot_blocking(directory.clone(), schema).await?
             }
             Err(error) => return Err(error),
-        }
+        };
 
+        // The snapshot above was opened after recovery, under this admission,
+        // before this writer published anything, so it is the writer's view:
+        // the witness and the sweep below are judged against it rather than
+        // reopening (and re-verifying every segment) twice more, neither
+        // removes anything it references, and both refuse to run unless the
+        // selected MANIFEST still equals it.
         #[cfg(unix)]
         {
             let gc_admission = Arc::clone(&admission);
             let gc_directory = directory.clone();
+            let gc_snapshot = snapshot.clone();
             spawn_blocking(move || {
                 gc_admission.ensure_directory_identity()?;
                 // Witness before sweeping, and only here: this writer has
                 // published nothing of its own yet, so nothing on disk is a
                 // staged-but-unpublished segment that a sighting would misread
                 // as an orphan. The sweep itself never mints provenance.
-                witness_orphaned_segments_under_lock(&gc_directory, schema)?;
+                witness_orphaned_segments_with_snapshot(&gc_directory, &gc_snapshot)?;
                 gc_admission.ensure_directory_identity()?;
-                collect_writer_garbage_under_lock(&gc_directory, schema, garbage_options)
+                collect_writer_garbage_with_snapshot(&gc_directory, &gc_snapshot, garbage_options)
             })
             .await?;
         }
@@ -5098,9 +5120,6 @@ impl KeeperWriter {
             path = %directory.display(),
             "Windows writer admission is active; descriptor-relative garbage collection remains unavailable"
         );
-        // GC cannot remove reachable bytes, but reopen once so the writer's
-        // snapshot is proven from the post-recovery directory state.
-        let snapshot = open_snapshot_blocking(directory, schema).await?;
         Ok(Self {
             admission,
             snapshot,
@@ -5313,7 +5332,7 @@ impl KeeperWriter {
         let preflight_manifest = manifest.clone();
         let preflight_protection = self.protection.clone();
         let schema = self.snapshot.schema();
-        spawn_blocking(move || {
+        let verified = spawn_blocking(move || {
             validate_proposed_manifest_segments(
                 &preflight_directory,
                 &preflight_manifest,
@@ -5388,7 +5407,8 @@ impl KeeperWriter {
             return Err(error);
         }
         self.admission.ensure_directory_identity()?;
-        self.snapshot = open_snapshot_blocking(directory, self.snapshot.schema()).await?;
+        self.snapshot =
+            open_published_snapshot_blocking(directory, self.snapshot.schema(), verified).await?;
         self.pending_publication = None;
         Ok(self.retained_snapshot_for_bookkeeping())
     }
@@ -5673,9 +5693,24 @@ impl KeeperWriter {
         let guard = writer_mutation_guard(cx, &self.admission.directory).await?;
         let admission = Arc::clone(&self.admission);
         let schema = self.snapshot.schema();
+        // With no publication awaiting reconciliation, the retained snapshot
+        // is this admission's authority; the sweep refuses if it is not.
+        #[cfg(unix)]
+        let retained = self
+            .pending_publication
+            .is_none()
+            .then(|| self.snapshot.clone());
         spawn_blocking(move || {
             let _guard = guard;
             admission.ensure_directory_identity()?;
+            #[cfg(unix)]
+            if let Some(snapshot) = retained {
+                return collect_writer_garbage_with_snapshot(
+                    &admission.directory,
+                    &snapshot,
+                    options,
+                );
+            }
             collect_writer_garbage_under_lock(&admission.directory, schema, options)
         })
         .await
@@ -7866,6 +7901,23 @@ async fn open_snapshot_blocking(
     schema: SchemaDescriptor,
 ) -> Result<KeeperSnapshot, KeeperError> {
     spawn_blocking(move || KeeperSnapshot::open(directory, schema)).await
+}
+
+/// The writer's snapshot after its own successful publication: as
+/// [`open_snapshot_blocking`], but the segments the publication preflight just
+/// verified are not verified again (see [`reuse_verified_segments`]).
+async fn open_published_snapshot_blocking(
+    directory: PathBuf,
+    schema: SchemaDescriptor,
+    verified: Vec<VerifiedProposalSegment>,
+) -> Result<KeeperSnapshot, KeeperError> {
+    spawn_blocking(
+        move || match KeeperSnapshot::open_once_reusing(&directory, schema, verified) {
+            Err(error) if recovery_retryable(&error) => KeeperSnapshot::open(&directory, schema),
+            result => result,
+        },
+    )
+    .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11086,19 +11138,58 @@ fn scan_generation_claims(directory: &Path) -> Result<Vec<(PathBuf, u64)>, Keepe
     Ok(claims)
 }
 
+/// A proposal segment the publication preflight verified and bound, with the
+/// file it was read through, so that the writer's snapshot after a successful
+/// publication need not verify the same bytes again.
+struct VerifiedProposalSegment {
+    segment: RecoveredSegment,
+    identity: Option<FileIdentity>,
+}
+
+/// Device and inode of a file; `None` where the platform reports neither, so
+/// a published snapshot reopens every segment there.
+type FileIdentity = (u64, u64);
+
+#[cfg(unix)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "platforms without inode numbers report None"
+)]
+fn file_identity(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_: &std::fs::Metadata) -> Option<FileIdentity> {
+    None
+}
+
 fn validate_proposed_manifest_segments(
     directory: &Path,
     manifest: &Manifest,
     schema: SchemaDescriptor,
     protection: &WriterProtection,
-) -> Result<(), KeeperError> {
+) -> Result<Vec<VerifiedProposalSegment>, KeeperError> {
+    let mut verified = Vec::new();
+    verified
+        .try_reserve_exact(manifest.segments.len())
+        .map_err(|error| KeeperError::Io {
+            operation: "allocate verified proposal segments",
+            path: directory.to_path_buf(),
+            source: io::Error::other(error.to_string()),
+        })?;
     for manifest_segment in &manifest.segments {
         let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
-        let reader = SegmentReader::open_published(&path, schema).map_err(|source| {
-            KeeperError::SegmentOpen {
-                path: path.clone(),
-                source,
-            }
+        let (reader, identity) = SegmentReader::open_published_checked(
+            &path,
+            schema,
+            crate::segment::SegmentLimits::default(),
+            |_, file| Ok(file_identity(&file.metadata()?)),
+        )
+        .map_err(|source| KeeperError::SegmentOpen {
+            path: path.clone(),
+            source,
         })?;
         let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
         validate_segment_witnesses(&path, manifest_segment, &reader, || Ok(file_xxh3))?;
@@ -11139,15 +11230,53 @@ fn validate_proposed_manifest_segments(
         }
         #[cfg(not(feature = "durability"))]
         let _ = protection;
-        let _validated_segment = RecoveredSegment::bind(
+        let segment = RecoveredSegment::bind(
             path,
             manifest_segment.clone(),
             reader,
             schema,
             authenticated_file_witness,
         )?;
+        verified.push(VerifiedProposalSegment { segment, identity });
     }
-    Ok(())
+    Ok(verified)
+}
+
+/// The MANIFEST segments of a snapshot, reusing a segment the publication
+/// preflight verified when the MANIFEST binds it unchanged and its path still
+/// names the file the preflight read; any other segment is opened and
+/// verified as [`open_manifest_segments`] does.
+fn reuse_verified_segments(
+    directory: &Path,
+    manifest_segments: &[ManifestSegment],
+    schema: SchemaDescriptor,
+    mut verified: Vec<VerifiedProposalSegment>,
+) -> Result<Vec<RecoveredSegment>, KeeperError> {
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(manifest_segments.len())
+        .map_err(|error| KeeperError::Io {
+            operation: "allocate recovered segment table",
+            path: directory.to_path_buf(),
+            source: io::Error::other(error.to_string()),
+        })?;
+    for manifest_segment in manifest_segments {
+        let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
+        let current = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => file_identity(&metadata),
+            _ => None,
+        };
+        let reusable = verified.iter().position(|candidate| {
+            candidate.segment.manifest == *manifest_segment
+                && candidate.identity.is_some()
+                && candidate.identity == current
+        });
+        segments.push(match reusable {
+            Some(index) => verified.swap_remove(index).segment,
+            None => open_manifest_segment(directory, manifest_segment, schema)?,
+        });
+    }
+    Ok(segments)
 }
 
 /// Upper bound on threads for one snapshot open, so a single open over a
@@ -11445,12 +11574,44 @@ fn collect_writer_garbage_at_platform(
     ensure_gc_directory_identity(directory, &directory_file)?;
     let snapshot = KeeperSnapshot::open(directory, schema)?;
     ensure_gc_directory_identity(directory, &directory_file)?;
-    let mut reachability = live_segment_names_at(&directory_file, directory, &snapshot)?;
+    sweep_writer_garbage(&directory_file, directory, &snapshot, options, now)
+}
+
+/// [`collect_writer_garbage_under_lock`] judged against a snapshot the caller
+/// opened under the same writer admission, instead of reopening one, which
+/// verifies every segment again. The sweep reads both MANIFEST slots itself
+/// and refuses to run unless the selected one still equals the snapshot's.
+#[cfg(unix)]
+fn collect_writer_garbage_with_snapshot(
+    directory: &Path,
+    snapshot: &KeeperSnapshot,
+    options: GarbageCollectionOptions,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    let directory_file = open_gc_directory(directory)?;
+    ensure_gc_directory_identity(directory, &directory_file)?;
+    sweep_writer_garbage(
+        &directory_file,
+        directory,
+        snapshot,
+        options,
+        SystemTime::now(),
+    )
+}
+
+#[cfg(unix)]
+fn sweep_writer_garbage(
+    directory_file: &File,
+    directory: &Path,
+    snapshot: &KeeperSnapshot,
+    options: GarbageCollectionOptions,
+    now: SystemTime,
+) -> Result<GarbageCollectionReport, KeeperError> {
+    let mut reachability = live_segment_names_at(directory_file, directory, snapshot)?;
     let current_generation = snapshot.loaded_manifest().manifest.generation;
     reachability.unreachable_since =
-        segment_unreachability_floor_at(&directory_file, directory, &snapshot, now)?;
+        segment_unreachability_floor_at(directory_file, directory, snapshot, now)?;
     sweep_garbage_directory(
-        &directory_file,
+        directory_file,
         directory,
         &reachability,
         current_generation,
@@ -11530,14 +11691,38 @@ fn witness_orphaned_segments_at_platform(
     schema: SchemaDescriptor,
     now: SystemTime,
 ) -> Result<OrphanWitnessReport, KeeperError> {
-    use rustix::fs::{AtFlags, Dir, FileType, statat};
-    use std::os::unix::ffi::OsStringExt;
-
     let directory_file = open_gc_directory(directory)?;
     ensure_gc_directory_identity(directory, &directory_file)?;
     let snapshot = KeeperSnapshot::open(directory, schema)?;
     ensure_gc_directory_identity(directory, &directory_file)?;
-    let reachability = live_segment_names_at(&directory_file, directory, &snapshot)?;
+    witness_orphans_against(&directory_file, directory, &snapshot, now)
+}
+
+/// [`witness_orphaned_segments_under_lock`] judged against a snapshot the
+/// caller opened under the same writer admission, instead of reopening one,
+/// which verifies every segment again. It reads both MANIFEST slots itself
+/// and refuses unless the selected one still equals the snapshot's.
+#[cfg(unix)]
+fn witness_orphaned_segments_with_snapshot(
+    directory: &Path,
+    snapshot: &KeeperSnapshot,
+) -> Result<OrphanWitnessReport, KeeperError> {
+    let directory_file = open_gc_directory(directory)?;
+    ensure_gc_directory_identity(directory, &directory_file)?;
+    witness_orphans_against(&directory_file, directory, snapshot, SystemTime::now())
+}
+
+#[cfg(unix)]
+fn witness_orphans_against(
+    directory_file: &File,
+    directory: &Path,
+    snapshot: &KeeperSnapshot,
+    now: SystemTime,
+) -> Result<OrphanWitnessReport, KeeperError> {
+    use rustix::fs::{AtFlags, Dir, FileType, statat};
+    use std::os::unix::ffi::OsStringExt;
+
+    let reachability = live_segment_names_at(directory_file, directory, snapshot)?;
     // Below the supersession threshold an unreferenced segment is provably
     // never-published and the sweep already reclaims it on file age, so a
     // witness would be pure churn: it would create a receipt only to delete
@@ -11558,7 +11743,7 @@ fn witness_orphaned_segments_at_platform(
 
     let mut unreferenced = BTreeSet::<u64>::new();
     let mut covered = BTreeSet::<u64>::new();
-    let mut entries = Dir::read_from(&directory_file)
+    let mut entries = Dir::read_from(directory_file)
         .map_err(io::Error::from)
         .map_err(|source| KeeperError::Io {
             operation: "scan orphan candidates",
@@ -11584,11 +11769,7 @@ fn witness_orphaned_segments_at_platform(
             continue;
         }
         let candidate_path = directory.join(&name);
-        let stat = match statat(
-            &directory_file,
-            entry.file_name(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        ) {
+        let stat = match statat(directory_file, entry.file_name(), AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             Err(source) if source == rustix::io::Errno::NOENT => continue,
             Err(source) => {
@@ -11616,7 +11797,7 @@ fn witness_orphaned_segments_at_platform(
                 // witness-less, and this pass supplies the witness the sweep
                 // will then require.
                 if let Some(receipt) =
-                    read_retirement_receipt_at(&directory_file, &name, &candidate_path, &stat)?
+                    read_retirement_receipt_at(directory_file, &name, &candidate_path, &stat)?
                     && receipt.segment_id == segment_id
                 {
                     covered.insert(segment_id);
@@ -11647,7 +11828,7 @@ fn witness_orphaned_segments_at_platform(
         witnessed.push(PathBuf::from(retirement_receipt_name(*segment_id)));
     }
     if !witnessed.is_empty() {
-        sync_gc_directory(&directory_file, directory)?;
+        sync_gc_directory(directory_file, directory)?;
     }
     witnessed.sort_unstable();
     Ok(OrphanWitnessReport { witnessed })
@@ -17460,6 +17641,124 @@ mod tests {
             descriptor.reopen(),
             Err(KeeperError::ExactSnapshotReceipt { .. })
         ));
+        Ok(())
+    }
+
+    /// Publish one two-document segment through a durable writer at `directory`
+    /// and return the published MANIFEST.
+    fn publish_fixture_segment(
+        directory: &Path,
+        segment_id: u64,
+    ) -> Result<Manifest, Box<dyn std::error::Error>> {
+        let encoded =
+            encoded_identity_test_segment(segment_id, 0, &[Some("reuse-a"), Some("reuse-b")])?;
+        let manifest = durable_test_manifest(2, vec![manifest_segment(&encoded, 1)]);
+        let publish_directory = directory.to_path_buf();
+        let published = manifest.clone();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::create(&cx, &publish_directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let pending = encoded
+                .write_temp(&publish_directory)
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &published)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })
+        .map_err(io::Error::other)?;
+        Ok(manifest)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_published_snapshot_reuses_only_segments_its_preflight_verified_in_place() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let manifest = publish_fixture_segment(&directory, 0x0e1a_5e01)?;
+        let preflight = || {
+            validate_proposed_manifest_segments(
+                &directory,
+                &manifest,
+                DEFAULT_SCHEMA,
+                &WriterProtection::Disabled,
+            )
+        };
+
+        // The same binding over the same file: the preflight's bound segment
+        // becomes the snapshot's, and its bytes are not hashed again.
+        let verified = preflight()?;
+        let backing = Arc::clone(&verified[0].segment.reader);
+        let snapshot = KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified)?;
+        assert!(Arc::ptr_eq(&snapshot.segments()[0].reader, &backing));
+
+        // A MANIFEST that binds the segment differently is verified again.
+        let mut verified = preflight()?;
+        verified[0].segment.manifest.seal_seq += 1;
+        let backing = Arc::clone(&verified[0].segment.reader);
+        let snapshot = KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified)?;
+        assert!(!Arc::ptr_eq(&snapshot.segments()[0].reader, &backing));
+        assert_eq!(snapshot.segments()[0].manifest(), &manifest.segments[0]);
+
+        // The same bytes behind a new inode are verified again, never trusted
+        // through the preflight's mapping of the file they replaced.
+        let verified = preflight()?;
+        let backing = Arc::clone(&verified[0].segment.reader);
+        let path = directory.join(canonical_segment_name(manifest.segments[0].segment_id));
+        let replacement = directory.join(".tmp-replacement");
+        std::fs::copy(&path, &replacement)?;
+        std::fs::rename(&replacement, &path)?;
+        let snapshot = KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified)?;
+        assert!(!Arc::ptr_eq(&snapshot.segments()[0].reader, &backing));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_retained_snapshot_that_no_longer_matches_disk_refuses_the_sweep_and_the_witness()
+    -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        publish_fixture_segment(&directory, 0x0e1a_5e02)?;
+        let stale = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)?;
+        let advance_directory = directory.clone();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::open(&cx, &advance_directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let next = writer
+                .retained_snapshot_for_bookkeeping()
+                .next_manifest()
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish(&cx, &next)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok::<(), String>(())
+        })
+        .map_err(io::Error::other)?;
+
+        let before = directory_bytes(&directory)?;
+        let options = GarbageCollectionOptions {
+            grace_period: Duration::ZERO,
+        };
+        assert!(matches!(
+            collect_writer_garbage_with_snapshot(&directory, &stale, options),
+            Err(KeeperError::GarbageDirectoryChanged { .. })
+        ));
+        assert!(matches!(
+            witness_orphaned_segments_with_snapshot(&directory, &stale),
+            Err(KeeperError::GarbageDirectoryChanged { .. })
+        ));
+        assert_eq!(directory_bytes(&directory)?, before);
+        let current = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)?;
+        collect_writer_garbage_with_snapshot(&directory, &current, options)?;
         Ok(())
     }
 
