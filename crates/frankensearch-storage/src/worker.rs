@@ -79,9 +79,11 @@ pub struct PersistentWorkerReport {
     pub idle_polls: usize,
 }
 
-/// Why a finite drain stopped. A drained queue can still contain terminal
-/// failures: inspect `remaining.failed` and the report rather than treating
-/// queue quiescence as a claim that every document embedded successfully.
+/// Why a finite drain stopped.
+///
+/// A drained queue can still contain terminal failures: inspect
+/// `remaining.failed` and the report rather than treating queue quiescence as
+/// a claim that every document embedded successfully.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerDrainOutcome {
     /// A queue read observed no pending (including delayed) or processing jobs.

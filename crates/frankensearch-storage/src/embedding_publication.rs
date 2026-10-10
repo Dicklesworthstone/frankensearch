@@ -307,8 +307,8 @@ impl Storage {
             }
             let mut values = Vec::new();
             values.try_reserve_exact(dimension).map_err(map_storage_error)?;
-            for bytes in vector_le.chunks_exact(4) {
-                values.push(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+            for bytes in vector_le.as_chunks::<4>().0 {
+                values.push(f32::from_le_bytes(*bytes));
             }
             let embedding = IdentityBoundEmbedding { values, identity };
             validate_response(expected_identity, &embedding)?;
