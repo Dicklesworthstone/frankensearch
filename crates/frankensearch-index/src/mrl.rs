@@ -32,7 +32,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 use frankensearch_core::config::ZeroSignalReason;
-use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::filter::{ExcludeDocIdsFilter, SearchFilter};
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -315,12 +315,26 @@ impl VectorIndex {
         let rescore_dims = config.effective_rescore_dims(dim);
         let rescore_top_k = config.effective_rescore_top_k(limit);
 
-        // Phase 1: truncated scan.
+        // A durable WAL replacement can outlive the main row's tombstone.
+        // Exclude every superseded main identity BEFORE either the truncated
+        // heap or the rescore limit is applied. Dropping stale winners at final
+        // resolution is too late, and overfetching by WAL count is insufficient
+        // when multiple main rows share the replaced identity.
+        let visible_main = (!self.wal_entries.is_empty()).then(|| {
+            ExcludeDocIdsFilter::new(
+                filter,
+                self.wal_entries.iter().map(|entry| entry.doc_id.as_str()),
+            )
+        });
+        let main_filter = visible_main
+            .as_ref()
+            .map_or(filter, |visible| Some(visible as &dyn SearchFilter));
         let query_truncated = &query[..search_dims];
         let mut heap =
-            self.mrl_truncated_scan(query_truncated, rescore_top_k, search_dims, filter)?;
+            self.mrl_truncated_scan(query_truncated, rescore_top_k, search_dims, main_filter)?;
 
-        // Also scan WAL entries.
+        // Apply the caller's filter, not the main-only exclusion, to the WAL:
+        // these are the replacements that must remain searchable.
         self.mrl_scan_wal_truncated(
             query_truncated,
             &mut heap,
@@ -1802,3 +1816,6 @@ mod tests {
 
     // ─── bd-2c7e tests end ───
 }
+
+#[cfg(test)]
+mod wal_visibility_tests;
