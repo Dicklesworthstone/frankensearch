@@ -4630,6 +4630,10 @@ static PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK: std::sync::Mutex<Option<PinnedPat
 static PINNED_DIRECTORY_BEFORE_SYNC_HOOK: std::sync::Mutex<Option<PinnedPathHook>> =
     std::sync::Mutex::new(None);
 
+/// Held by every pinned-file hook guard. The hooks are process-global and
+/// each test installs one, so tests that install a hook run one at a time:
+/// a second installer waits for the first guard instead of finding its slot
+/// taken (bd-mwf5c).
 #[cfg(all(
     test,
     feature = "fuzz-harness",
@@ -4643,7 +4647,28 @@ static PINNED_DIRECTORY_BEFORE_SYNC_HOOK: std::sync::Mutex<Option<PinnedPathHook
         target_os = "watchos"
     )
 ))]
-pub struct PinnedRegularFileBeforePublishHookGuard;
+static PINNED_HOOK_INSTALLERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A test that panicked while holding the installer lock has already cleared
+/// its hook in its guard's drop, so the poison carries no state.
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+fn pinned_hook_installer() -> std::sync::MutexGuard<'static, ()> {
+    PINNED_HOOK_INSTALLERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[cfg(all(
     test,
@@ -4658,7 +4683,9 @@ pub struct PinnedRegularFileBeforePublishHookGuard;
         target_os = "watchos"
     )
 ))]
-pub struct PinnedRegularFileBeforeDigestHookGuard;
+pub struct PinnedRegularFileBeforePublishHookGuard {
+    _installer: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(all(
     test,
@@ -4673,7 +4700,26 @@ pub struct PinnedRegularFileBeforeDigestHookGuard;
         target_os = "watchos"
     )
 ))]
-pub struct PinnedDirectoryBeforeSyncHookGuard;
+pub struct PinnedRegularFileBeforeDigestHookGuard {
+    _installer: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(
+    test,
+    feature = "fuzz-harness",
+    any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos"
+    )
+))]
+pub struct PinnedDirectoryBeforeSyncHookGuard {
+    _installer: std::sync::MutexGuard<'static, ()>,
+}
 
 #[cfg(all(
     test,
@@ -4691,6 +4737,7 @@ pub struct PinnedDirectoryBeforeSyncHookGuard;
 pub fn install_pinned_regular_file_before_publish_hook(
     hook: impl Fn(&Path) + Send + Sync + 'static,
 ) -> PinnedRegularFileBeforePublishHookGuard {
+    let installer = pinned_hook_installer();
     let mut slot = PINNED_REGULAR_FILE_BEFORE_PUBLISH_HOOK
         .lock()
         .expect("pinned regular-file publish hook mutex must not be poisoned");
@@ -4699,7 +4746,9 @@ pub fn install_pinned_regular_file_before_publish_hook(
         "pinned regular-file publish hook must be cleared before replacement"
     );
     *slot = Some(std::sync::Arc::new(hook));
-    PinnedRegularFileBeforePublishHookGuard
+    PinnedRegularFileBeforePublishHookGuard {
+        _installer: installer,
+    }
 }
 
 #[cfg(all(
@@ -4718,6 +4767,7 @@ pub fn install_pinned_regular_file_before_publish_hook(
 pub fn install_pinned_regular_file_before_digest_hook(
     hook: impl Fn(&Path) + Send + Sync + 'static,
 ) -> PinnedRegularFileBeforeDigestHookGuard {
+    let installer = pinned_hook_installer();
     let mut slot = PINNED_REGULAR_FILE_BEFORE_DIGEST_HOOK
         .lock()
         .expect("pinned regular-file digest hook mutex must not be poisoned");
@@ -4726,7 +4776,9 @@ pub fn install_pinned_regular_file_before_digest_hook(
         "pinned regular-file digest hook must be cleared before replacement"
     );
     *slot = Some(std::sync::Arc::new(hook));
-    PinnedRegularFileBeforeDigestHookGuard
+    PinnedRegularFileBeforeDigestHookGuard {
+        _installer: installer,
+    }
 }
 
 /// Install a fuzz-harness-only rendezvous in the post-rename,
@@ -4747,6 +4799,7 @@ pub fn install_pinned_regular_file_before_digest_hook(
 pub fn install_pinned_directory_before_sync_hook(
     hook: impl Fn(&Path) + Send + Sync + 'static,
 ) -> PinnedDirectoryBeforeSyncHookGuard {
+    let installer = pinned_hook_installer();
     let mut slot = PINNED_DIRECTORY_BEFORE_SYNC_HOOK
         .lock()
         .expect("pinned directory sync hook mutex must not be poisoned");
@@ -4755,7 +4808,9 @@ pub fn install_pinned_directory_before_sync_hook(
         "pinned directory sync hook must be cleared before replacement"
     );
     *slot = Some(std::sync::Arc::new(hook));
-    PinnedDirectoryBeforeSyncHookGuard
+    PinnedDirectoryBeforeSyncHookGuard {
+        _installer: installer,
+    }
 }
 
 #[cfg(all(
@@ -9209,5 +9264,41 @@ mod tests {
             store.persist(&prepared),
             Err(GauntletError::UnsafeStorePath { .. })
         ));
+    }
+
+    /// bd-mwf5c: two tests installing the same process-global hook at once
+    /// must both run. Unserialized, the second install found the slot taken,
+    /// panicked holding the hook mutex, and poisoned every later test.
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn concurrent_pinned_hook_installs_wait_for_each_other() {
+        let start = std::sync::Barrier::new(2);
+        let installed = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    start.wait();
+                    let _hook = install_pinned_regular_file_before_publish_hook(|_| {});
+                    assert_eq!(
+                        installed.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        0,
+                        "only one test may hold a pinned hook at a time"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    installed.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                });
+            }
+        });
     }
 }
