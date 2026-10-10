@@ -557,7 +557,7 @@ impl PersistentJobQueue {
             };
 
             let retry_count = state.retry_count.saturating_add(1);
-            if retry_count > state.max_retries {
+            if state.retry_count >= state.max_retries {
                 let target_status = JobStatus::Failed.as_str();
                 let delete_params = [
                     SqliteValue::Text(state.doc_id.clone().into()),
@@ -734,6 +734,11 @@ impl PersistentJobQueue {
         Ok(ClaimOutcome::Applied(()))
     }
 
+    /// Recover expired attempts without granting an unbounded crash retry loop.
+    ///
+    /// Returns the number of expired rows requeued, terminally failed, or
+    /// retired as superseded. Current replacement work always takes priority
+    /// over failing an expired revision. Queue and catalog changes are atomic.
     pub fn reclaim_stale_jobs(&self) -> SearchResult<usize> {
         let now_ms = unix_timestamp_ms()?;
         let reclaim_after_ms = self
@@ -741,67 +746,134 @@ impl PersistentJobQueue {
             .visibility_timeout_ms
             .min(self.config.stale_job_threshold_ms);
         let cutoff = now_ms.saturating_sub(i64::try_from(reclaim_after_ms).unwrap_or(i64::MAX));
-        let (reclaimed_pending, superseded) = self.storage.immediate_transaction(|conn| {
-            let stale_params = [SqliteValue::Integer(cutoff)];
-            let stale_rows = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id, content_hash \
-             FROM embedding_jobs \
-             WHERE status = 'processing' \
-               AND (started_at IS NULL OR started_at <= ?1);",
-            &stale_params,)
-                .map_err(map_storage_error)?;
+        let (reclaimed_pending, terminal_failed, superseded) =
+            self.storage.immediate_transaction(|conn| {
+                let stale_rows = conn
+                    .query_with_params_sync(
+                        "SELECT job_id, doc_id, embedder_id, content_hash, retry_count, max_retries \
+                         FROM embedding_jobs \
+                         WHERE status = 'processing' \
+                           AND (started_at IS NULL OR started_at <= ?1) \
+                         ORDER BY job_id;",
+                        &[SqliteValue::Integer(cutoff)],
+                    )
+                    .map_err(map_storage_error)?;
 
-            let mut reclaimed_pending = 0_usize;
-            let mut superseded = 0_usize;
-            for row in &stale_rows {
-                let job_id = row_i64(row, 0, "embedding_jobs.job_id")?;
-                let doc_id = row_text(row, 1, "embedding_jobs.doc_id")?.to_owned();
-                let embedder_id = row_text(row, 2, "embedding_jobs.embedder_id")?.to_owned();
+                let mut reclaimed_pending = 0_usize;
+                let mut terminal_failed = 0_usize;
+                let mut superseded = 0_usize;
+                for row in &stale_rows {
+                    let job_id = row_i64(row, 0, "embedding_jobs.job_id")?;
+                    let doc_id = row_text(row, 1, "embedding_jobs.doc_id")?.to_owned();
+                    let embedder_id = row_text(row, 2, "embedding_jobs.embedder_id")?.to_owned();
+                    let claimed_hash = row_optional_blob_32(row, 3, "embedding_jobs.content_hash")?;
+                    let document = get_document_inner(conn, &doc_id)?;
+                    let can_retry = match document {
+                        Some(document)
+                            if claimed_hash
+                                .as_ref()
+                                .is_none_or(|hash| *hash == document.content_hash) =>
+                        {
+                            clear_stale_pending_for_document(
+                                conn,
+                                &doc_id,
+                                &embedder_id,
+                                &document.content_hash,
+                            )?
+                        }
+                        _ => false,
+                    };
 
-                let claimed_hash = row_optional_blob_32(row, 3, "embedding_jobs.content_hash")?;
-                let document = get_document_inner(conn, &doc_id)?;
-                let can_retry = match document {
-                    Some(document) if claimed_hash.as_ref().is_none_or(|hash| *hash == document.content_hash) => {
-                        clear_stale_pending_for_document(conn, &doc_id, &embedder_id, &document.content_hash)?
+                    if !can_retry {
+                        let deleted = conn
+                            .execute_with_params_sync(
+                                "DELETE FROM embedding_jobs \
+                                 WHERE job_id = ?1 AND status = 'processing';",
+                                &[SqliteValue::Integer(job_id)],
+                            )
+                            .map_err(map_storage_error)?;
+                        if deleted == 1 {
+                            superseded += 1;
+                        }
+                        continue;
                     }
-                    _ => false,
-                };
 
-                if !can_retry {
-                    let delete_params = [SqliteValue::Integer(job_id)];
-                    let deleted = conn.execute_with_params_sync("DELETE FROM embedding_jobs \
-                     WHERE job_id = ?1 AND status = 'processing';",
-                    &delete_params,)
+                    let previous_retries = row_u32(row, 4, "embedding_jobs.retry_count")?;
+                    let max_retries = row_u32(row, 5, "embedding_jobs.max_retries")?;
+                    let retry_count = previous_retries.saturating_add(1);
+                    // Compare before incrementing: saturation must not turn a
+                    // u32::MAX retry policy into an infinite recovery loop.
+                    if previous_retries >= max_retries {
+                        let error = "stale lease retry budget exhausted";
+                        conn.execute_with_params_sync(
+                            "DELETE FROM embedding_jobs \
+                             WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'failed';",
+                            &[
+                                SqliteValue::Text(doc_id.clone().into()),
+                                SqliteValue::Text(embedder_id.clone().into()),
+                            ],
+                        )
                         .map_err(map_storage_error)?;
-                    if deleted == 1 {
-                        superseded += 1;
-                    }
-                } else {
-                    let update_params = [
-                        SqliteValue::Text(JobStatus::Pending.as_str().to_owned().into()),
-                        SqliteValue::Integer(now_ms),
-                        SqliteValue::Text("reclaimed stale lease".to_owned().into()),
-                        SqliteValue::Integer(job_id),
-                    ];
-                    let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
-                     SET status = ?1, submitted_at = ?2, started_at = NULL, worker_id = NULL, error_message = ?3, \
-                         retry_count = retry_count + 1 \
-                     WHERE job_id = ?4 AND status = 'processing';",
-                    &update_params,)
-                        .map_err(map_storage_error)?;
-                    if updated == 1 {
+                        let updated = conn
+                            .execute_with_params_sync(
+                                "UPDATE embedding_jobs \
+                                 SET status = 'failed', retry_count = ?1, completed_at = ?2, \
+                                     error_message = ?3, worker_id = NULL \
+                                 WHERE job_id = ?4 AND status = 'processing';",
+                                &[
+                                    SqliteValue::Integer(i64::from(retry_count)),
+                                    SqliteValue::Integer(now_ms),
+                                    SqliteValue::Text(error.to_owned().into()),
+                                    SqliteValue::Integer(job_id),
+                                ],
+                            )
+                            .map_err(map_storage_error)?;
+                        if updated != 1 {
+                            return Err(conflict_error(format!(
+                                "job {job_id} changed status during stale/terminal transition"
+                            )));
+                        }
+                        mark_failed_inner(conn, &doc_id, &embedder_id, error)?;
+                        terminal_failed += 1;
+                    } else {
+                        let updated = conn
+                            .execute_with_params_sync(
+                                "UPDATE embedding_jobs \
+                                 SET status = 'pending', submitted_at = ?1, started_at = NULL, \
+                                     completed_at = NULL, worker_id = NULL, \
+                                     error_message = 'reclaimed stale lease', retry_count = ?2 \
+                                 WHERE job_id = ?3 AND status = 'processing';",
+                                &[
+                                    SqliteValue::Integer(now_ms),
+                                    SqliteValue::Integer(i64::from(retry_count)),
+                                    SqliteValue::Integer(job_id),
+                                ],
+                            )
+                            .map_err(map_storage_error)?;
+                        if updated != 1 {
+                            return Err(conflict_error(format!(
+                                "job {job_id} changed status during stale/retry transition"
+                            )));
+                        }
                         reclaimed_pending += 1;
                     }
                 }
-            }
 
-            Ok((reclaimed_pending, superseded))
-        })?;
-        let reclaimed = reclaimed_pending.saturating_add(superseded);
+                Ok((reclaimed_pending, terminal_failed, superseded))
+            })?;
+        let reclaimed = reclaimed_pending
+            .saturating_add(terminal_failed)
+            .saturating_add(superseded);
 
         if reclaimed_pending > 0 {
             self.metrics
                 .total_retried
                 .fetch_add(usize_to_u64(reclaimed_pending), Ordering::Relaxed);
+        }
+        if terminal_failed > 0 {
+            self.metrics
+                .total_failed
+                .fetch_add(usize_to_u64(terminal_failed), Ordering::Relaxed);
         }
 
         if reclaimed > 0 {
@@ -810,6 +882,7 @@ impl PersistentJobQueue {
                 op = "queue.reclaim_stale_jobs",
                 reclaimed,
                 reclaimed_pending,
+                terminal_failed,
                 superseded,
                 cutoff_ms = cutoff,
                 "reclaimed stale embedding jobs"
@@ -838,28 +911,86 @@ impl PersistentJobQueue {
         )
     }
 
-    /// Reset all terminally-failed jobs for a given embedder back to pending.
+    /// Retry current terminal failures without displacing newer work or success.
     ///
-    /// This is called on startup when the embedder changes or becomes newly
-    /// available, giving previously failed jobs another chance.
+    /// Active attempts, pending replacements, obsolete revisions, and catalog
+    /// entries already embedded or deliberately skipped remain untouched.
+    /// Eligible jobs and their catalog status return to pending atomically;
+    /// claim epochs are preserved so an earlier worker cannot regain ownership.
+    /// Legacy jobs with an unknown hash are bound to the current document.
     ///
-    /// Returns the number of resurrected jobs.
+    /// Returns the number of jobs actually resurrected.
     pub fn resurrect_terminal_failures(&self, embedder_id: &str) -> SearchResult<usize> {
+        ensure_non_empty(embedder_id, "embedder_id")?;
         let now_ms = unix_timestamp_ms()?;
-        let resurrected = self.storage.transaction(|conn| {
-            let params = [
-                SqliteValue::Text(embedder_id.to_owned().into()),
-                SqliteValue::Integer(now_ms),
-            ];
-            let count = conn
-                .execute_with_params_sync(
-                    "UPDATE embedding_jobs \
-             SET status = 'pending', retry_count = 0, error_message = NULL, \
-                 started_at = NULL, submitted_at = ?2 \
-             WHERE embedder_id = ?1 AND status = 'failed';",
-                    &params,
+        let resurrected = self.storage.immediate_transaction(|conn| {
+            let rows = conn
+                .query_with_params_sync(
+                    "SELECT failed.job_id, failed.doc_id, failed.content_hash \
+                     FROM embedding_jobs failed \
+                     WHERE failed.embedder_id = ?1 AND failed.status = 'failed' \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM embedding_jobs active \
+                           WHERE active.doc_id = failed.doc_id \
+                             AND active.embedder_id = failed.embedder_id \
+                             AND active.status IN ('pending', 'processing') \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM embedding_status catalog \
+                           WHERE catalog.doc_id = failed.doc_id \
+                             AND catalog.embedder_id = failed.embedder_id \
+                             AND catalog.status IN ('embedded', 'skipped') \
+                       ) \
+                     ORDER BY failed.job_id;",
+                    &[SqliteValue::Text(embedder_id.to_owned().into())],
                 )
                 .map_err(map_storage_error)?;
+            let mut count = 0_usize;
+            for row in &rows {
+                let job_id = row_i64(row, 0, "embedding_jobs.job_id")?;
+                let doc_id = row_text(row, 1, "embedding_jobs.doc_id")?;
+                let failed_hash = row_optional_blob_32(row, 2, "embedding_jobs.content_hash")?;
+                let Some(document) = get_document_inner(conn, doc_id)? else {
+                    continue;
+                };
+                if failed_hash.is_some_and(|hash| hash != document.content_hash) {
+                    continue;
+                }
+
+                let updated = conn
+                    .execute_with_params_sync(
+                        "UPDATE embedding_jobs \
+                         SET status = 'pending', retry_count = 0, error_message = NULL, \
+                             started_at = NULL, completed_at = NULL, worker_id = NULL, \
+                             submitted_at = ?1, content_hash = ?2 \
+                         WHERE job_id = ?3 AND embedder_id = ?4 AND status = 'failed';",
+                        &[
+                            SqliteValue::Integer(now_ms),
+                            SqliteValue::Blob(document.content_hash.to_vec().into()),
+                            SqliteValue::Integer(job_id),
+                            SqliteValue::Text(embedder_id.to_owned().into()),
+                        ],
+                    )
+                    .map_err(map_storage_error)?;
+                if updated != 1 {
+                    return Err(conflict_error(format!(
+                        "job {job_id} changed status during resurrection"
+                    )));
+                }
+                conn.execute_with_params_sync(
+                    "INSERT INTO embedding_status \
+                     (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+                     VALUES (?1, ?2, NULL, 'pending', NULL, NULL, 0) \
+                     ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status, \
+                         embedded_at = NULL, error_message = NULL, retry_count = 0;",
+                    &[
+                        SqliteValue::Text(doc_id.to_owned().into()),
+                        SqliteValue::Text(embedder_id.to_owned().into()),
+                    ],
+                )
+                .map_err(map_storage_error)?;
+                count += 1;
+            }
             Ok(count)
         })?;
 
@@ -1486,6 +1617,8 @@ mod tests {
             })
             .collect()
     }
+
+    include!("job_queue_recovery_tests.rs");
 
     #[test]
     fn reclaimed_attempt_cannot_mutate_current_owner_even_with_same_worker_id() {
