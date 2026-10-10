@@ -1024,6 +1024,10 @@ fn dedup_state_for_doc(
         SqliteValue::Text(doc_id.to_owned().into()),
         SqliteValue::Text(embedder_id.to_owned().into()),
     ];
+    // A known obsolete attempt does not cover the catalog's current revision.
+    // Otherwise an external catalog update followed by ingest would skip the
+    // replacement, and the worker would retire the sole remaining stale job.
+    // Unknown legacy hashes still bind to the current document before inference.
     let rows = conn
         .query_with_params_sync(
             "SELECT d.content_hash, e.status, j.job_id \
@@ -1034,6 +1038,7 @@ fn dedup_state_for_doc(
        ON d.doc_id = j.doc_id \
       AND j.embedder_id = ?2 \
       AND j.status IN ('pending', 'processing') \
+      AND (j.content_hash IS NULL OR j.content_hash = d.content_hash) \
      WHERE d.doc_id = ?1 \
      LIMIT 1;",
             &params,
@@ -1393,6 +1398,166 @@ mod tests {
     use crate::job_queue::{FailResult, JobQueueConfig};
 
     use super::*;
+
+    mod revision_dedup {
+        use super::*;
+
+        fn replace_catalog(runner: &StorageBackedJobRunner, id: &str, text: &str) {
+            let text = runner.canonicalizer.canonicalize(text);
+            let mut doc = runner.storage.get_document(id).unwrap().unwrap();
+            doc.content_preview = truncate_chars(&text, MAX_CONTENT_PREVIEW_CHARS);
+            doc.content_hash = ContentHasher::hash(&text);
+            doc.content_length = content_char_len(&text);
+            // Exercise the supported catalog API rather than the pipeline's
+            // atomic catalog-and-queue update, which already notices changes.
+            assert!(runner.storage.upsert_document(&doc).unwrap());
+        }
+
+        fn jobs(runner: &StorageBackedJobRunner) -> Vec<Vec<SqliteValue>> {
+            runner
+                .storage
+                .connection()
+                .query_sync(
+                    "SELECT job_id, doc_id, embedder_id, status, content_hash, claim_epoch \
+                     FROM embedding_jobs ORDER BY job_id;",
+                )
+                .unwrap()
+                .iter()
+                .map(|row| (0..6).map(|column| row.get(column).unwrap().clone()).collect())
+                .collect()
+        }
+
+        #[test]
+        fn obsolete_pending_job_does_not_suppress_the_current_revision() {
+            for quality in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                    runner.ingest(IngestRequest::new("revision", "old body")).unwrap();
+                    replace_catalog(&runner, "revision", "current body");
+
+                    let result = runner
+                        .ingest(IngestRequest::new("revision", "current body"))
+                        .unwrap();
+                    assert_eq!(result.fast_job_enqueued, !quality);
+                    assert_eq!(result.quality_job_enqueued, quality);
+                    assert_eq!(runner.queue.queue_depth().unwrap().pending, 1);
+
+                    let processed = runner.process_batch(&cx, "worker").await.unwrap();
+                    assert_eq!(processed.jobs_completed, 1);
+                    assert_eq!(processed.jobs_suppressed + processed.jobs_failed, 0);
+                    assert_eq!(probe.inputs.lock().unwrap().as_slice(), ["current body"]);
+                    assert_eq!(sink.entries().len(), 1);
+                    assert_catalog_status(&runner, probe.id, EmbeddingStatus::Embedded);
+                });
+            }
+        }
+
+        #[test]
+        fn obsolete_processing_job_keeps_its_fence_but_not_enqueue_authority() {
+            for quality in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                    runner.ingest(IngestRequest::new("inflight", "old body")).unwrap();
+                    let old = runner.queue.claim_batch("old-worker", 1).unwrap().pop().unwrap();
+                    replace_catalog(&runner, "inflight", "current body");
+
+                    let result = runner
+                        .ingest(IngestRequest::new("inflight", "current body"))
+                        .unwrap();
+                    assert_eq!(result.fast_job_enqueued, !quality);
+                    assert_eq!(result.quality_job_enqueued, quality);
+                    let depth = runner.queue.queue_depth().unwrap();
+                    assert_eq!(depth.pending, 1);
+                    assert_eq!(depth.processing, 1);
+                    assert!(runner.queue.claim_batch("new-worker", 1).unwrap().is_empty());
+
+                    assert_eq!(
+                        runner.queue.complete(&old, &old.content_hash.unwrap()).unwrap(),
+                        ClaimOutcome::Superseded
+                    );
+                    let processed = runner.process_batch(&cx, "new-worker").await.unwrap();
+                    assert_eq!(processed.jobs_completed, 1);
+                    assert_eq!(probe.inputs.lock().unwrap().as_slice(), ["current body"]);
+                    assert_eq!(sink.entries().len(), 1);
+                    assert_eq!(
+                        runner.queue.complete(&old, &old.content_hash.unwrap()).unwrap(),
+                        ClaimOutcome::LostClaim
+                    );
+                });
+            }
+        }
+
+        #[test]
+        fn current_replacement_is_deduplicated_beside_obsolete_processing_work() {
+            for quality in [false, true] {
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let (runner, probe) = make_claim_probe_runner(quality, false, sink);
+                runner.ingest(IngestRequest::new("mixed", "old body")).unwrap();
+                assert_eq!(runner.queue.claim_batch("old-worker", 1).unwrap().len(), 1);
+                replace_catalog(&runner, "mixed", "current body");
+                let hash = ContentHasher::hash("current body");
+                assert!(runner.queue.enqueue("mixed", probe.id, &hash, 0).unwrap());
+                let before = jobs(&runner);
+
+                let result = runner.ingest(IngestRequest::new("mixed", "current body")).unwrap();
+                assert!(!result.fast_job_enqueued);
+                assert!(!result.quality_job_enqueued);
+                assert_eq!(jobs(&runner), before, "neither attempt may be replaced");
+            }
+        }
+
+        #[test]
+        fn legacy_unknown_hash_still_covers_the_captured_document() {
+            for quality in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                    runner.ingest(IngestRequest::new("legacy", "legacy body")).unwrap();
+                    runner
+                        .storage
+                        .connection()
+                        .execute_sync("UPDATE embedding_jobs SET content_hash = NULL;")
+                        .unwrap();
+                    let before = jobs(&runner);
+                    let result = runner.ingest(IngestRequest::new("legacy", "legacy body")).unwrap();
+                    assert!(!result.fast_job_enqueued);
+                    assert!(!result.quality_job_enqueued);
+                    assert_eq!(jobs(&runner), before);
+                    let processed = runner.process_batch(&cx, "worker").await.unwrap();
+                    assert_eq!(processed.jobs_completed, 1);
+                    assert_eq!(probe.inputs.lock().unwrap().as_slice(), ["legacy body"]);
+                    assert_eq!(sink.entries().len(), 1);
+                });
+            }
+        }
+
+        #[test]
+        fn current_terminal_catalog_state_remains_authoritative() {
+            for skipped in [false, true] {
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let (runner, probe) = make_claim_probe_runner(false, false, sink);
+                runner.ingest(IngestRequest::new("finished", "old body")).unwrap();
+                replace_catalog(&runner, "finished", "current body");
+                if skipped {
+                    runner.storage.mark_skipped("finished", probe.id, "deliberate skip").unwrap();
+                } else {
+                    runner.storage.mark_embedded("finished", probe.id).unwrap();
+                }
+                let before = jobs(&runner);
+                let result = runner.ingest(IngestRequest::new("finished", "current body")).unwrap();
+                assert_eq!(result.action, IngestAction::Unchanged);
+                assert!(!result.fast_job_enqueued);
+                assert_eq!(jobs(&runner), before);
+                assert_catalog_status(
+                    &runner,
+                    probe.id,
+                    if skipped { EmbeddingStatus::Skipped } else { EmbeddingStatus::Embedded },
+                );
+            }
+        }
+    }
 
     mod canonical_input {
         use super::*;
@@ -5192,6 +5357,7 @@ mod integration_tests {
                 PipelineConfig {
                     process_batch_size: 200,
                     worker_max_idle_cycles: Some(1),
+                    worker_idle_sleep_ms: 1,
                     ..PipelineConfig::default()
                 },
                 fast,
@@ -5274,6 +5440,7 @@ mod integration_tests {
                 PipelineConfig {
                     process_batch_size: 10,
                     worker_max_idle_cycles: Some(1),
+                    worker_idle_sleep_ms: 1,
                     ..PipelineConfig::default()
                 },
                 fast,
@@ -5342,6 +5509,7 @@ mod integration_tests {
                 PipelineConfig {
                     process_batch_size: 100,
                     worker_max_idle_cycles: Some(1),
+                    worker_idle_sleep_ms: 1,
                     ..PipelineConfig::default()
                 },
                 fast,
