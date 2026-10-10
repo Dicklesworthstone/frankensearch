@@ -1,11 +1,12 @@
 # Watch while complete-generation searches remain available
 
 This route is for the Unix complete-generation store, which a watch into a
-directory with no index creates on Linux (on macOS, set
-`FSFS_COMPLETE_GENERATIONS=1`). It does not change the legacy mutable watcher:
-an existing legacy index keeps watching on that layout unless a build converts
-it with `FSFS_COMPLETE_GENERATIONS=1`. Use a store outside the source tree; its
-parent must already exist. Configure verified
+directory with no index, outside the source tree, creates on Linux (on macOS,
+set `FSFS_COMPLETE_GENERATIONS=1`). It does not change the legacy mutable
+watcher: an existing legacy index, or a new one in a store inside the source
+tree such as the default in-project `.frankensearch`, keeps watching on that
+layout unless a build converts it with `FSFS_COMPLETE_GENERATIONS=1`. Use a
+store outside the source tree; its parent must already exist. Configure verified
 semantic models and a generation-local catalog as in
 [complete-generation rebuilding](complete-generation-rebuilds.md).
 

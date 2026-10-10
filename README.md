@@ -547,19 +547,22 @@ the BM25 tier matches for it. The BM25 tier also understands:
 `*` is not a wildcard: `quantiz*` searches for the word `quantiz`. To see how
 each word scored for a hit, run `fsfs explain <rank>` after the search.
 
-### Complete generations (the default for new indexes)
+### Complete generations (the default for new stores outside the indexed tree)
 
 The complete-generation store publishes lexical data, vector tiers, and the
 catalog as one retained bundle, so readers in other processes, including a
 search while `fsfs watch` runs, always see one whole generation. On Linux a
-build into a directory with no index creates this store, and later commands
-recognize it automatically; on macOS, where the store is not yet qualified on
-release hosts, a build creates it only with `FSFS_COMPLETE_GENERATIONS=1`. A
-directory that already holds a legacy
-index keeps that layout: `FSFS_COMPLETE_GENERATIONS=1` converts it on its next
-build (reusing its keyword rows and vectors instead of recomputing them, and
-leaving the old `vector/`, `lexical/` and `index_sentinel.json` behind, unread),
-and `FSFS_COMPLETE_GENERATIONS=0` keeps building legacy indexes:
+build into a directory that holds no index and lies outside the tree being
+indexed creates this store, and later commands recognize it automatically; on
+macOS, where the store is not yet qualified on release hosts, a build creates
+it only with `FSFS_COMPLETE_GENERATIONS=1`. The store may not sit inside the
+tree it indexes, so a build into the default in-project `.frankensearch`, as
+in `fsfs index .`, keeps building a legacy index. A directory that already
+holds a legacy index keeps that layout too: `FSFS_COMPLETE_GENERATIONS=1`
+converts it on its next build if it lies outside the indexed tree (reusing its
+keyword rows and vectors instead of recomputing them, and leaving the old
+`vector/`, `lexical/` and `index_sentinel.json` behind, unread), and
+`FSFS_COMPLETE_GENERATIONS=0` keeps building legacy indexes:
 
 ```bash
 fsfs index ~/projects --index-dir ./search-store

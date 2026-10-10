@@ -394,16 +394,20 @@ impl FsfsRuntime {
         let selected = complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
             || complete_entry_exists(&root.join("generations"))?;
         // Only a build chooses a layout: the explicit opt-in for any root, the
-        // new-root default for a root with no legacy index. Every other
-        // command follows the layout on disk, so before the first complete
-        // build it neither fails on the absent store nor hides a legacy index.
+        // new-root default for a root with no legacy index outside the source
+        // tree (a complete store refuses to overlap its source, and the
+        // default in-project `.frankensearch` does). Every other command
+        // follows the layout on disk, so before the first complete build it
+        // neither fails on the absent store nor hides a legacy index.
         let builds = matches!(
             self.cli_input.command,
             CliCommand::Index | CliCommand::Watch
         );
         let starts_complete = builds
             && (initialize_store
-                || (self.complete_generations_for_new_roots && !legacy_index_exists(&root)?));
+                || (self.complete_generations_for_new_roots
+                    && !legacy_index_exists(&root)?
+                    && store_is_outside_source(&root, &self.resolve_target_root()?)?));
         Ok((selected || starts_complete).then_some(root))
     }
 
@@ -1398,6 +1402,35 @@ const LEGACY_INDEX_ENTRIES: [&str; 4] = [
     "vector",
     "lexical",
 ];
+
+/// Whether a store at `root` is provably disjoint from the source tree at
+/// `source`, as a complete store requires. A root that does not exist yet
+/// resolves through its parent; anything that cannot be resolved counts as
+/// overlapping, so the new-root default leaves that build on the legacy route.
+fn store_is_outside_source(root: &Path, source: &Path) -> SearchResult<bool> {
+    let Ok(source) = fs::canonicalize(source) else {
+        return Ok(false);
+    };
+    let root = match fs::canonicalize(root) {
+        Ok(root) => root,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
+                return Ok(false);
+            };
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            let Ok(parent) = fs::canonicalize(parent) else {
+                return Ok(false);
+            };
+            parent.join(name)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(!root.starts_with(&source) && !source.starts_with(&root))
+}
 
 /// Whether `root` holds a legacy index or an interrupted legacy build, which
 /// the new-root default must not convert behind the user's back.
@@ -3074,8 +3107,27 @@ mod tests {
     #[test]
     fn complete_cli_new_root_default_starts_only_roots_without_a_legacy_index() {
         let directory = tempfile::tempdir().unwrap();
-        let (runtime, _, root) = fixture(directory.path());
+        let (runtime, source, root) = fixture(directory.path());
         let runtime = runtime.with_complete_generations_for_new_roots(true);
+        // A store inside the source tree, like the default in-project
+        // `.frankensearch`, or one holding the source, would be refused by a
+        // complete build: the default leaves such a build legacy, while an
+        // explicit opt-in still routes it (and gets the overlap refusal).
+        for overlapping in [source.join(".frankensearch"), directory.path().to_path_buf()] {
+            let mut build = runtime.clone();
+            build.cli_input.index_dir = Some(overlapping.clone());
+            assert!(
+                build
+                    .complete_generation_command_root(false)
+                    .unwrap()
+                    .is_none(),
+                "{overlapping:?} overlaps the source"
+            );
+            assert_eq!(
+                build.complete_generation_command_root(true).unwrap(),
+                Some(overlapping)
+            );
+        }
         // A build into a missing or empty root starts a complete store.
         assert_eq!(
             runtime.complete_generation_command_root(false).unwrap(),
