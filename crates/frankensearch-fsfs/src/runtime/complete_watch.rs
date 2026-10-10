@@ -5,7 +5,7 @@
 //! immediately before pointer publication. This is the existing cooperative
 //! store protocol, not a filesystem snapshot or hostile-directory v2 authority.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, Metadata};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
@@ -273,8 +273,10 @@ impl SourceRoot {
         // Only what `fsfs index` would discover counts as source: an edit to a
         // gitignored or hidden file must not look like a change and rebuild.
         // Membership sets hash: ordered lookups compared long absolute paths
-        // component by component, a large share of every edit's walk.
-        let mut discoverable = HashSet::new();
+        // component by component, a large share of every edit's walk. They
+        // hash with ahash, as the RRF maps do; SipHash's flood resistance buys
+        // nothing for paths this process lists itself.
+        let mut discoverable = ahash::AHashSet::new();
         for entry in index_discovery_walker(&self.path, discovery).build() {
             retained_search_checkpoint(cx)?;
             let entry = entry.map_err(|source| SearchError::SubsystemError {
@@ -293,7 +295,7 @@ impl SourceRoot {
         }
         let mut files = Vec::new();
         let mut directories = BTreeMap::new();
-        let mut visited = HashSet::new();
+        let mut visited = ahash::AHashSet::new();
         let mut stack = vec![(self.path.clone(), self.directory.metadata()?, root_mount)];
         while let Some((directory, expected, directory_mount)) = stack.pop() {
             retained_search_checkpoint(cx)?;
@@ -367,8 +369,9 @@ impl SourceRoot {
         retained_search_checkpoint(cx)?;
         // One sort, then bulk builds of already ordered input: inserting each
         // file into two ordered maps compared long paths component by
-        // component 2·log2(files) times per file.
-        files.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        // component 2·log2(files) times per file. The sort compares bytes,
+        // which orders these listed paths exactly as `Path` does.
+        files.sort_unstable_by(|left, right| compare_listed_paths(&left.0, &right.0));
         let classes = files
             .iter()
             .map(|(path, class, _)| (path.clone(), *class))
@@ -432,6 +435,20 @@ fn touches_observed_files(
                         || observation.directories.contains_key(path)
                 })
         })
+}
+
+/// `Path` order for paths joined from a canonical root and listed entry names,
+/// which have no `.` or `..` component and no repeated or trailing separator.
+/// Comparing such paths component by component is comparing their bytes with
+/// the separator ranked below every other byte, without parsing components.
+fn compare_listed_paths(left: &Path, right: &Path) -> std::cmp::Ordering {
+    let left = left.as_os_str().as_encoded_bytes();
+    let right = right.as_os_str().as_encoded_bytes();
+    let rank = |byte: u8| if byte == b'/' { 0 } else { u16::from(byte) + 1 };
+    left.iter().zip(right).find(|(a, b)| a != b).map_or_else(
+        || left.len().cmp(&right.len()),
+        |(a, b)| rank(*a).cmp(&rank(*b)),
+    )
 }
 
 /// Files the next build may carry forward from the generation built from
@@ -911,6 +928,29 @@ mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
     use notify::event::{AccessKind, DataChange, Flag, ModifyKind};
+
+    #[test]
+    fn listed_path_order_is_path_order() {
+        // Raw bytes put "a-b" (0x2d) before "a/b" (0x2f); `Path` puts the
+        // shorter component "a" first, so "a/b" sorts before "a-b".
+        let names = [
+            "a", "a-b", "a.b", "a b", "a!", "a0", "ab", "a/b", "a/b/c", "a/b-c", "a/b.c", "a/bc",
+            "a/b c", "b", "Z", "é", "a/é", "a-b/c",
+        ];
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .map(|name| Path::new("/root/source").join(name))
+            .collect();
+        for left in &paths {
+            for right in &paths {
+                assert_eq!(
+                    compare_listed_paths(left, right),
+                    left.cmp(right),
+                    "{left:?} vs {right:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn complete_watch_carries_only_files_with_equal_stamps_and_no_hint() {
