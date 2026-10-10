@@ -8743,40 +8743,13 @@ impl FsfsRuntime {
         .await
     }
 
-    async fn execute_search_serve_request_with_sink(
-        &self,
-        cx: &Cx,
-        request: SearchServeRequest,
-        resources: &mut SearchExecutionResources,
-        hot_cache: &mut HashMap<SearchCacheKey, Vec<SearchPayload>>,
-        options: SearchServeOptions,
-        mut frame_sink: Option<SearchServeFrameSink<'_>>,
-    ) -> SearchResult<SearchServeResponse> {
-        // The server applies its own degradation override to every client.
-        let mode = degraded_search_mode(
-            self.config.pressure.degradation_override,
-            parse_search_execution_mode(request.mode.as_deref())?,
-        )?;
-        // The generation fingerprint covers the active Quill MANIFEST's file
-        // identity, and every durable publication renames a new MANIFEST into
-        // place, so a newer publication rebinds all resources here. A per-request
-        // `QuillSearchIndex::refresh` found nothing more: it reopened the
-        // snapshot, re-hashing every segment file, only to report "unchanged".
-        if self
-            .rebind_search_resources_if_generation_changed(cx, mode, resources)
-            .await?
-        {
-            hot_cache.clear();
-        }
-        let requested_limit = request.limit.unwrap_or_else(|| {
-            self.cli_input
-                .overrides
-                .limit
-                .unwrap_or(self.config.search.default_limit)
-        });
+    /// This runtime as one serve request asks for it: the client's filter,
+    /// rerank switch and deadline, blend weight, quality budget, RRF k and
+    /// fast-only mode, each checked as a configuration file would be.
+    fn with_search_serve_request_policy(&self, request: &SearchServeRequest) -> SearchResult<Self> {
         let mut runtime = self.clone();
         let mut cli = runtime.cli_input.clone();
-        cli.filter = request.filter.clone();
+        cli.filter.clone_from(&request.filter);
         runtime = runtime.with_cli_input(cli);
         // The client's effective `search.rerank` travels with the request so
         // `fsfs search --rerank` means the same thing through the daemon; the
@@ -8817,6 +8790,41 @@ impl FsfsRuntime {
         }
         runtime.config.search.fast_only = request.fast_only.unwrap_or(self.config.search.fast_only);
         crate::config::validate_search_policy(&runtime.config.search)?;
+        Ok(runtime)
+    }
+
+    async fn execute_search_serve_request_with_sink(
+        &self,
+        cx: &Cx,
+        request: SearchServeRequest,
+        resources: &mut SearchExecutionResources,
+        hot_cache: &mut HashMap<SearchCacheKey, Vec<SearchPayload>>,
+        options: SearchServeOptions,
+        mut frame_sink: Option<SearchServeFrameSink<'_>>,
+    ) -> SearchResult<SearchServeResponse> {
+        // The server applies its own degradation override to every client.
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            parse_search_execution_mode(request.mode.as_deref())?,
+        )?;
+        // The generation fingerprint covers the active Quill MANIFEST's file
+        // identity, and every durable publication renames a new MANIFEST into
+        // place, so a newer publication rebinds all resources here. A per-request
+        // `QuillSearchIndex::refresh` found nothing more: it reopened the
+        // snapshot, re-hashing every segment file, only to report "unchanged".
+        if self
+            .rebind_search_resources_if_generation_changed(cx, mode, resources)
+            .await?
+        {
+            hot_cache.clear();
+        }
+        let requested_limit = request.limit.unwrap_or_else(|| {
+            self.cli_input
+                .overrides
+                .limit
+                .unwrap_or(self.config.search.default_limit)
+        });
+        let mut runtime = self.with_search_serve_request_policy(&request)?;
         runtime.prepare_search_reranker(cx).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 

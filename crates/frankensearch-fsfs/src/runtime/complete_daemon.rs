@@ -436,8 +436,14 @@ impl FsfsRuntime {
                             if let Some(mut output) = output {
                                 // Reuse direct streaming, including its producer
                                 // annotations, phase ordering and terminal frames.
-                                // Runtime paths and resources retain one generation.
-                                let mut runtime = session.reader.runtime.clone();
+                                // Runtime paths and resources retain one generation;
+                                // the client's search policy applies as it does to a
+                                // buffered request.
+                                let mut runtime = session
+                                    .reader
+                                    .runtime
+                                    .with_search_serve_request_policy(&request)?;
+                                runtime.prepare_search_reranker(cx).await?;
                                 runtime.cli_input.command = crate::CliCommand::Search;
                                 runtime.cli_input.format = crate::OutputFormat::Jsonl;
                                 runtime.cli_input.stream = true;
@@ -1701,52 +1707,65 @@ mod generation_tests {
         });
     }
 
+    /// A daemon runtime over a store with one published generation.
+    async fn published_daemon_fixture(cx: &Cx, parent: &Path) -> (FsfsRuntime, PathBuf) {
+        let source = parent.join("source");
+        let root = parent.join("store");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
+        let mut config = FsfsConfig::default();
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+        config.indexing.offline = true;
+        config.indexing.quality_model.clear();
+        config.search.fast_only = true;
+        config.search.rerank = false;
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Daemon,
+            target_path: Some(source),
+            index_dir: Some(root.clone()),
+            quiet: true,
+            ..CliInput::default()
+        });
+        assert!(matches!(
+            runtime
+                .rebuild_retained_generation(cx, &root)
+                .await
+                .unwrap(),
+            GenerationPublication::Durable(_)
+        ));
+        (runtime, root)
+    }
+
+    /// Connect once the daemon listens, with a bounded wait.
+    fn connect_daemon(endpoint: &Path) -> UnixStream {
+        let started = Instant::now();
+        loop {
+            match UnixStream::connect(endpoint) {
+                Ok(stream) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) => {
+                    assert!(started.elapsed() < Duration::from_secs(10), "{error}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
     #[test]
     fn complete_daemon_answers_the_readiness_probe_without_searching() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
-            let source = directory.path().join("source");
-            let root = directory.path().join("store");
-            fs::create_dir(&source).unwrap();
-            fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
-            let mut config = FsfsConfig::default();
-            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
-            config.indexing.offline = true;
-            config.indexing.quality_model.clear();
-            config.search.fast_only = true;
-            config.search.rerank = false;
-            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
-                command: CliCommand::Daemon,
-                target_path: Some(source.clone()),
-                index_dir: Some(root.clone()),
-                quiet: true,
-                ..CliInput::default()
-            });
-            assert!(matches!(
-                runtime
-                    .rebuild_retained_generation(&cx, &root)
-                    .await
-                    .unwrap(),
-                GenerationPublication::Durable(_)
-            ));
+            let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
             let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);
             let cancel = CancelOnDrop(cx.clone());
             let worker = std::thread::spawn(move || {
                 let _cancel = cancel;
                 let exchange = |request: &[u8]| -> serde_json::Value {
-                    let started = Instant::now();
-                    let mut stream = loop {
-                        match UnixStream::connect(&endpoint) {
-                            Ok(stream) => break stream,
-                            Err(error) => {
-                                assert!(started.elapsed() < Duration::from_secs(10), "{error}");
-                                std::thread::sleep(Duration::from_millis(5));
-                            }
-                        }
-                    };
-                    stream
-                        .set_read_timeout(Some(Duration::from_secs(10)))
-                        .unwrap();
+                    let mut stream = connect_daemon(&endpoint);
                     stream.write_all(request).unwrap();
                     let mut line = String::new();
                     std::io::BufReader::new(stream)
@@ -1764,6 +1783,76 @@ mod generation_tests {
                 let searched = exchange(b"{\"query\":\"sharedtoken\",\"limit\":10}\n");
                 assert_eq!(searched["ok"], true, "{searched}");
                 assert!(searched["payloads"].is_array(), "{searched}");
+            });
+            let result = runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await;
+            worker.join().unwrap();
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "{result:?}"
+            );
+            cx.set_cancel_requested(false);
+        });
+    }
+
+    #[test]
+    fn complete_daemon_streams_apply_the_requests_search_policy() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
+            let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);
+            let cancel = CancelOnDrop(cx.clone());
+            let worker = std::thread::spawn(move || {
+                let _cancel = cancel;
+                let frames = |request: &[u8]| -> Vec<serde_json::Value> {
+                    let mut stream = connect_daemon(&endpoint);
+                    stream.write_all(request).unwrap();
+                    let mut reader = std::io::BufReader::new(stream);
+                    let mut frames = Vec::new();
+                    loop {
+                        assert!(frames.len() < 256, "missing stream terminal");
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).unwrap() == 0 {
+                            return frames;
+                        }
+                        let frame: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let done = frame["event"] == "terminal" || frame["ok"] == false;
+                        frames.push(frame);
+                        if done {
+                            return frames;
+                        }
+                    }
+                };
+                // An out-of-range budget is refused as a buffered request's is,
+                // before the stream starts: the policy is read, not ignored.
+                let refused = frames(
+                    b"{\"query\":\"sharedtoken\",\"stream\":true,\"quality_timeout_ms\":10}\n",
+                );
+                assert_eq!(refused.len(), 1, "{refused:?}");
+                assert_eq!(refused[0]["ok"], false, "{refused:?}");
+                assert!(
+                    refused[0].to_string().contains("at least 50 milliseconds"),
+                    "{refused:?}"
+                );
+                let streamed = frames(
+                    b"{\"query\":\"sharedtoken\",\"stream\":true,\"fast_only\":true,\"quality_timeout_ms\":60}\n",
+                );
+                assert_eq!(
+                    streamed.first().unwrap()["event"],
+                    "started",
+                    "{streamed:?}"
+                );
+                assert_eq!(
+                    streamed.last().unwrap()["event"],
+                    "terminal",
+                    "{streamed:?}"
+                );
+                assert_eq!(
+                    streamed.last().unwrap()["payload"]["status"],
+                    "completed",
+                    "{streamed:?}"
+                );
             });
             let result = runtime
                 .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)

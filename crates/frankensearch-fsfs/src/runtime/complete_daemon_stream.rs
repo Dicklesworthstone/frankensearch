@@ -190,13 +190,16 @@ pub(super) fn validate_request(bytes: &[u8]) -> SearchResult<()> {
     })?;
     for (key, value) in object {
         match key.as_str() {
-            "query" | "limit" | "stream" => {}
+            // The search policy a buffered request may carry; its values are
+            // checked when the policy is applied.
+            "query" | "limit" | "stream" | "filter" | "rerank" | "rerank_timeout_ms"
+            | "quality_weight" | "quality_timeout_ms" | "rrf_k" | "fast_only" => {}
             "mode" if value.is_null() || value.as_str() == Some("full") => {}
             _ => {
                 return Err(complete_cli_error(
                     "daemon_stream",
                     &format!(
-                        "unsupported streaming option {key}; use query, limit, stream and mode=full with the daemon startup configuration"
+                        "unsupported streaming option {key}; a stream takes query, limit, mode=full and the buffered request's search policy"
                     ),
                 ));
             }
@@ -365,13 +368,16 @@ mod tests {
     }
 
     #[test]
-    fn streaming_refuses_ignored_options_and_nonfull_modes() {
+    fn streaming_takes_the_search_policy_and_refuses_other_options_and_nonfull_modes() {
         validate_request(br#"{"query":"x","limit":10,"stream":true,"mode":"full"}"#).unwrap();
+        validate_request(
+            br#"{"query":"x","stream":true,"filter":"src","rerank":false,"rerank_timeout_ms":300,"quality_weight":0.5,"quality_timeout_ms":900,"rrf_k":30,"fast_only":true}"#,
+        )
+        .unwrap();
         for raw in [
             br#"{"query":"x","stream":true,"mode":"fast"}"#.as_slice(),
-            br#"{"query":"x","stream":true,"filter":"secret"}"#,
-            br#"{"query":"x","stream":true,"fast_only":false}"#,
             br#"{"query":"x","stream":true,"protocol":"unknown"}"#,
+            br#"{"query":"x","stream":true,"explain":true}"#,
         ] {
             assert!(validate_request(raw).is_err());
         }
