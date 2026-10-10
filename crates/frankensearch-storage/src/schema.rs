@@ -7,8 +7,9 @@ use fsqlite_types::value::SqliteValue;
 
 use crate::connection::{map_storage_error_at, retry_transient_storage};
 use crate::document_content::CREATE_TABLE_SQL as CREATE_DOCUMENT_CONTENTS_SQL;
+use crate::embedding_publication::CREATE_TABLE_SQL as CREATE_PUBLISHED_EMBEDDINGS_SQL;
 
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Governed marker table for the FTS5 Porter tokenizer rebuild.
 ///
@@ -45,6 +46,7 @@ const LATEST_SCHEMA: &[&str] = &[
         metadata_json TEXT\
     );",
     CREATE_DOCUMENT_CONTENTS_SQL,
+    CREATE_PUBLISHED_EMBEDDINGS_SQL,
     "CREATE TABLE IF NOT EXISTS embedding_jobs (\
         job_id INTEGER PRIMARY KEY AUTOINCREMENT,\
         doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,\
@@ -354,6 +356,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 9,
         statements: &[CREATE_DOCUMENT_CONTENTS_SQL],
+    },
+    Migration {
+        version: 10,
+        statements: &[CREATE_PUBLISHED_EMBEDDINGS_SQL],
     },
 ];
 
@@ -939,6 +945,34 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_adds_v10_publications_without_fabricating_vectors_or_changing_claims() {
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).unwrap();
+        seed_historical_schema(&conn, 9);
+        assert!(!table_exists(&conn, "published_embeddings"));
+        conn.execute_sync(
+            "INSERT INTO documents(doc_id, content_preview, content_hash, content_length, created_at, updated_at) \
+             VALUES ('legacy-vector', 'body', X'0102', 4, 100, 150);",
+        ).unwrap();
+        conn.execute_sync(
+            "INSERT INTO document_contents(doc_id, content_hash, canonical_text) \
+             VALUES ('legacy-vector', X'0102', 'body');",
+        ).unwrap();
+        conn.execute_sync(
+            "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, claim_epoch) \
+             VALUES ('legacy-vector', 'model', 175, 'processing', 17);",
+        ).unwrap();
+        bootstrap(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(table_exists(&conn, "published_embeddings"));
+        assert!(conn.query_sync("SELECT doc_id FROM published_embeddings;").unwrap().is_empty());
+        let rows = conn.query_sync("SELECT claim_epoch FROM embedding_jobs;").unwrap();
+        assert_eq!(super::row_i64(&rows[0], 0, "claim_epoch").unwrap(), 17);
+        assert_eq!(conn.query_sync("SELECT canonical_text FROM document_contents;").unwrap().len(), 1);
+        bootstrap(&conn).unwrap();
+        assert!(conn.query_sync("SELECT doc_id FROM published_embeddings;").unwrap().is_empty());
+    }
+
+    #[test]
     fn bootstrap_migrates_every_historical_schema_edge() {
         for starting_version in 1..SCHEMA_VERSION {
             let conn =
@@ -1089,8 +1123,8 @@ mod tests {
     // ── Schema version constant ─────────────────────────────────────────
 
     #[test]
-    fn schema_version_is_nine() {
-        assert_eq!(SCHEMA_VERSION, 9);
+    fn schema_version_is_ten() {
+        assert_eq!(SCHEMA_VERSION, 10);
     }
 
     // ── Migration array invariants ──────────────────────────────────────
@@ -1148,6 +1182,7 @@ mod tests {
         let expected_tables = [
             "documents",
             "document_contents",
+            "published_embeddings",
             "embedding_jobs",
             "embedding_status",
             "content_hashes",
@@ -1330,6 +1365,7 @@ mod tests {
         for query in [
             "SELECT COUNT(*) FROM documents;",
             "SELECT COUNT(*) FROM document_contents;",
+            "SELECT COUNT(*) FROM published_embeddings;",
             "SELECT COUNT(*) FROM embedding_jobs;",
             "SELECT COUNT(*) FROM embedding_status;",
             "SELECT COUNT(*) FROM content_hashes;",

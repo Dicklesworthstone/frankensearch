@@ -16,6 +16,7 @@ pub mod connection;
 pub mod content_hash;
 pub mod document;
 mod document_content;
+pub mod embedding_publication;
 #[cfg(feature = "fts5")]
 pub mod fts5_adapter;
 pub mod history;
@@ -36,6 +37,7 @@ pub use document::{
     BatchResult, CrudErrorKind, DocumentRecord, EmbeddingStatus, StatusCounts, count_documents,
     list_document_ids, upsert_document,
 };
+pub use embedding_publication::PublishedEmbedding;
 #[cfg(feature = "fts5")]
 pub use fts5_adapter::{
     Fts5AdapterConfig, Fts5ContentMode, Fts5Hit, Fts5LexicalSearch, Fts5TokenizerChoice,
