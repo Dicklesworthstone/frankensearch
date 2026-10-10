@@ -3322,24 +3322,22 @@ mod loader_only {
         // Searches are separate processes on the store the watcher holds.
         // Polling them is the visibility criterion: one edit can publish more
         // than once, so receipt counts cannot say which edit a search sees.
-        let lexical_paths = |label: &str, query: &str| -> Vec<String> {
-            let outcome = fsfs.run(
-                temp.path(),
-                label,
-                [
-                    "search",
-                    query,
-                    "--fast-only",
-                    "--no-daemon",
-                    "--index-dir",
-                    index_arg,
-                    "--format",
-                    "json",
-                    "--limit",
-                    "10",
-                ],
-                QUICKSTART_TIMEOUT,
-            );
+        // A forwarded search goes through the store's daemon, which a plain
+        // search uses whenever its socket exists, with no fallback.
+        let lexical_paths = |label: &str, query: &str, forwarded: bool| -> Vec<String> {
+            let mut args = vec!["search", query, "--fast-only"];
+            if !forwarded {
+                args.push("--no-daemon");
+            }
+            args.extend([
+                "--index-dir",
+                index_arg,
+                "--format",
+                "json",
+                "--limit",
+                "10",
+            ]);
+            let outcome = fsfs.run(temp.path(), label, args, QUICKSTART_TIMEOUT);
             parse_success_envelope(label, &outcome)["data"]["hits"]
                 .as_array()
                 .expect("search hits")
@@ -3348,10 +3346,10 @@ mod loader_only {
                 .map(|hit| hit["path"].as_str().expect("hit path").to_owned())
                 .collect()
         };
-        let mut await_search = |label: &str, query: &str, path: &str, present: bool| {
+        let mut await_search = |label: &str, query: &str, path: &str, present: bool, forwarded| {
             let started = Instant::now();
             loop {
-                let paths = lexical_paths(label, query);
+                let paths = lexical_paths(label, query, forwarded);
                 if paths.iter().any(|hit| hit == path) == present {
                     eprintln!(
                         "[default-build-e2e] stage=complete-watch {label} visible_after_ms={}",
@@ -3370,21 +3368,72 @@ mod loader_only {
                 thread::sleep(Duration::from_millis(200));
             }
         };
-        await_search("during-watch", "Oldquartz", "database.md", true);
+        // The store's daemon serves while the watcher publishes: every
+        // forwarded search admits the generation selected at that moment.
+        let socket = index.join("fsfs-query.sock");
+        let mut live_daemon = WatchChild(
+            fsfs.command(temp.path())
+                .args(["daemon", "--index-dir", index_arg, "--idle-timeout-ms", "0"])
+                .stdout(
+                    File::create(fsfs.log_root.join("complete-live-daemon.stdout.log")).unwrap(),
+                )
+                .stderr(
+                    File::create(fsfs.log_root.join("complete-live-daemon.stderr.log")).unwrap(),
+                )
+                .spawn()
+                .expect("spawn complete-generation daemon during the watch"),
+        );
+        let listen_started = Instant::now();
+        while !socket.exists() {
+            assert!(
+                live_daemon.0.try_wait().expect("poll daemon").is_none(),
+                "daemon exited before listening"
+            );
+            assert!(
+                listen_started.elapsed() < QUICKSTART_TIMEOUT,
+                "daemon did not listen at {}",
+                socket.display()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        await_search("during-watch", "Oldquartz", "database.md", true, false);
+        await_search(
+            "during-watch-daemon",
+            "Oldquartz",
+            "database.md",
+            true,
+            true,
+        );
         fs::write(
             corpus.join("live.md"),
             "Liveamber handles transient failures with bounded retries and exponential backoff.",
         )
         .unwrap();
-        await_search("live-create", "Liveamber", "live.md", true);
+        await_search("live-create", "Liveamber", "live.md", true, false);
         fs::write(corpus.join("live.md"), "Livemalachite restores service after failures using bounded retries and exponential backoff.").unwrap();
-        await_search("live-modify", "Livemalachite", "live.md", true);
-        await_search("live-modify-old-text", "Liveamber", "live.md", false);
+        await_search("live-modify", "Livemalachite", "live.md", true, false);
+        await_search("live-modify-old-text", "Liveamber", "live.md", false, false);
         // The deletion check below is only meaningful if this query finds
         // the file while it exists.
-        await_search("delete-control", "Astronomers", "astronomy.md", true);
+        await_search("delete-control", "Astronomers", "astronomy.md", true, false);
         fs::remove_file(corpus.join("astronomy.md")).unwrap();
-        await_search("live-delete", "Astronomers", "astronomy.md", false);
+        await_search("live-delete", "Astronomers", "astronomy.md", false, false);
+        fs::write(
+            corpus.join("moved.md"),
+            "Livecobalt notes keep their rows when the watcher sees them renamed.",
+        )
+        .unwrap();
+        await_search("rename-control", "Livecobalt", "moved.md", true, true);
+        fs::rename(corpus.join("moved.md"), corpus.join("renamed.md")).unwrap();
+        await_search("rename-new-path", "Livecobalt", "renamed.md", true, true);
+        await_search("rename-old-path", "Livecobalt", "moved.md", false, true);
+        await_search("rename-direct", "Livecobalt", "renamed.md", true, false);
+        let status = terminate_and_wait(&mut live_daemon, "complete daemon during the watch");
+        assert!(
+            status.success(),
+            "graceful complete daemon shutdown during the watch failed: {status}"
+        );
+        drop(live_daemon);
 
         let status = terminate_and_wait(&mut watch, "complete watch");
         let stdout = fs::read_to_string(&stdout_path).unwrap();
@@ -3402,7 +3451,7 @@ mod loader_only {
             &fsfs.model_root,
             &active_generation_root(&index),
             &corpus,
-            &["database.md", "live.md"],
+            &["database.md", "live.md", "renamed.md"],
         );
         let config = temp.path().join("complete-watch-search.toml");
         // Functional coverage uses an explicit budget, not a latency claim.
@@ -3493,7 +3542,7 @@ mod loader_only {
         assert!(!socket.exists(), "the daemon removes its own socket");
         drop(daemon);
         eprintln!(
-            "[default-build-e2e] stage=complete-watch event=verified search_during_watch=true live_create=true live_modify=true live_delete=true fast=true quality=true post_exit=true daemon=true"
+            "[default-build-e2e] stage=complete-watch event=verified search_during_watch=true live_create=true live_modify=true live_delete=true live_rename=true daemon_during_watch=true fast=true quality=true post_exit=true daemon=true"
         );
         Ok(())
     }
