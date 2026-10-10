@@ -8,13 +8,18 @@
 use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use frankensearch_core::{EmbeddingIdentityBundleV1, IdentityBoundEmbedding, SearchError, SearchResult};
+use asupersync::Cx;
+use frankensearch_core::generation::QuantizationFormat;
+use frankensearch_core::{
+    Embedder, EmbeddingIdentityBundleV1, IdentityBoundEmbedding, SearchError, SearchResult,
+};
 use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 use sha2::{Digest, Sha256};
 
 use crate::connection::map_storage_error;
 use crate::document::{DocumentRecord, get_document_inner, mark_embedded_inner};
+use crate::document_content::read_document_content;
 use crate::{ClaimOutcome, ClaimedJob, Storage};
 
 /// Shared by fresh bootstrap and the additive v10 migration.
@@ -80,6 +85,88 @@ pub struct PublishedEmbedding {
 }
 
 impl Storage {
+    /// Embed retained canonical input and atomically publish the owned result.
+    ///
+    /// This is an explicit database-backed processing path for a claim obtained
+    /// from the queue over this storage connection. It calls the provider's
+    /// actual `embed_bound` operation, keeps its full identity through inference,
+    /// and never invokes an independent vector sink. Retained input must exist
+    /// and pass revision/digest/character-count verification; callers can retain
+    /// it with the runner's ingest API or `Storage::set_document_content`.
+    ///
+    /// Ownership is checked before inference, after its await (including provider
+    /// errors), and in the publication transaction. Neither a database transaction
+    /// nor a storage guard is held across the provider call. A cancelled, stale,
+    /// or superseded attempt cannot publish coordinates or complete newer work.
+    ///
+    /// Provider, input, and storage errors are returned, not automatically
+    /// converted into a retry or terminal failure. A still-owned failed attempt
+    /// remains processing and can be recovered by its bounded queue lease. A
+    /// caller applying an explicit failure must use the original input revision,
+    /// never a newly fetched document hash. Structured cancellation propagates
+    /// without deliberately failing, completing, or releasing the claim.
+    ///
+    /// This API is opt-in. Existing runner/worker sinks and external FSVI/ANN
+    /// publication are unchanged; queue-instance counters are not updated here.
+    #[allow(clippy::future_not_send)]
+    pub async fn embed_and_publish_claimed(
+        &self,
+        cx: &Cx,
+        claim: &ClaimedJob,
+        embedder: &dyn Embedder,
+    ) -> SearchResult<ClaimOutcome<()>> {
+        publication_checkpoint(cx)?;
+        let prepared = self.immediate_transaction(|conn| {
+            let document = match owned_document(conn, claim, None)? {
+                ClaimOutcome::Applied(document) => document,
+                ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+                ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
+            };
+            let text = read_document_content(conn, &document)?.ok_or_else(|| {
+                publication_error("complete canonical input is not retained; re-ingest the document")
+            })?;
+            Ok(ClaimOutcome::Applied((document, text)))
+        });
+        publication_checkpoint(cx)?;
+        let (document, text) = match prepared? {
+            ClaimOutcome::Applied(prepared) => prepared,
+            ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
+        };
+
+        // Capture errors before checking cancellation: provider metadata access
+        // is arbitrary code and may request cancellation even when it fails.
+        let expected = capture_producer(embedder, &claim.embedder_id);
+        publication_checkpoint(cx)?;
+        match check_publication_claim(self, cx, claim, &document.content_hash)? {
+            ClaimOutcome::Applied(()) => {}
+            outcome => return Ok(outcome),
+        }
+        let expected = expected?;
+        let response = embedder.embed_bound(cx, &text).await;
+        publication_checkpoint(cx)?;
+        let response = match response {
+            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+            response => response,
+        };
+
+        // A late failure has no authority over a successor. Suppress it before
+        // interpreting coordinates or asking the provider for more metadata.
+        match check_publication_claim(self, cx, claim, &document.content_hash)? {
+            ClaimOutcome::Applied(()) => {}
+            outcome => return Ok(outcome),
+        }
+        let actual = capture_producer(embedder, &claim.embedder_id);
+        publication_checkpoint(cx)?;
+        if actual? != expected {
+            return Err(publication_error("embedding producer changed during inference"));
+        }
+        let response = response?;
+        validate_response(&expected, &response)?;
+        publication_checkpoint(cx)?;
+        self.publish_claimed_embedding(claim, &document.content_hash, &expected, &response)
+    }
+
     /// Publish a prepared response and complete its exact attempt atomically.
     ///
     /// `expected_identity` must be captured from the intended producer before
@@ -236,6 +323,55 @@ impl Storage {
             }))
         })
     }
+}
+
+fn publication_checkpoint(cx: &Cx) -> SearchResult<()> {
+    cx.checkpoint().map_err(|error| SearchError::Cancelled {
+        phase: "storage.embedding_publication".to_owned(),
+        reason: cx
+            .cancel_reason()
+            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
+    })
+}
+
+fn check_publication_claim(
+    storage: &Storage,
+    cx: &Cx,
+    claim: &ClaimedJob,
+    expected_hash: &[u8; 32],
+) -> SearchResult<ClaimOutcome<()>> {
+    publication_checkpoint(cx)?;
+    let outcome = storage.immediate_transaction(|conn| {
+        Ok(match owned_document(conn, claim, Some(expected_hash))? {
+            ClaimOutcome::Applied(_) => ClaimOutcome::Applied(()),
+            ClaimOutcome::LostClaim => ClaimOutcome::LostClaim,
+            ClaimOutcome::Superseded => ClaimOutcome::Superseded,
+        })
+    });
+    publication_checkpoint(cx)?;
+    outcome
+}
+
+fn capture_producer(
+    embedder: &dyn Embedder,
+    queued_id: &str,
+) -> SearchResult<EmbeddingIdentityBundleV1> {
+    if embedder.id() != queued_id {
+        return Err(publication_error("provider does not match the queued embedder"));
+    }
+    let identity = embedder.identity()?.clone();
+    identity.validate()?;
+    if usize::try_from(identity.space.dimension).ok() != Some(embedder.dimension())
+        || identity.storage.quantization != QuantizationFormat::F32
+        || !identity.storage.format.starts_with("in-memory-")
+        || !matches!(
+            identity.storage.endianness.as_str(),
+            "native-f32-values" | "native-test-only"
+        )
+    {
+        return Err(publication_error("provider must declare matching in-memory f32 output"));
+    }
+    Ok(identity)
 }
 
 fn owned_document(
@@ -657,5 +793,353 @@ mod tests {
         assert_eq!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().unwrap().embedding, output);
         assert_eq!(storage.get_published_embedding("doc", "quality", &quality_output.identity).unwrap().unwrap().embedding, quality_output);
         assert_eq!(rows(&storage, "SELECT * FROM published_embeddings;", 10).len(), 2);
+    }
+
+    mod inference {
+        use std::cell::RefCell;
+        use std::marker::PhantomData;
+        use std::rc::Rc;
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use frankensearch_core::traits::{ModelCategory, SearchFuture};
+
+        use super::*;
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Behavior {
+            Valid,
+            Failure,
+            InvalidVector,
+            ForeignResponse,
+            WrongRouting,
+            WrongDimension,
+            MissingIdentity,
+            CancelSuccess,
+            CancelFailure,
+            TypedCancellation,
+            DriftSuccess,
+            DriftFailure,
+        }
+
+        type Hook = Box<dyn FnOnce()>;
+        thread_local! {
+            // Storage handles stay on the owning executor thread. Provider
+            // traits stay Send + Sync; no unsafe or cross-thread SQLite alias.
+            static INFERENCE_HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+            static METADATA_HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+
+        struct ScopedHook(PhantomData<Rc<()>>);
+
+        impl ScopedHook {
+            fn inference(hook: impl FnOnce() + 'static) -> Self {
+                INFERENCE_HOOK.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(Box::new(hook));
+                });
+                Self(PhantomData)
+            }
+
+            fn metadata(hook: impl FnOnce() + 'static) -> Self {
+                METADATA_HOOK.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(Box::new(hook));
+                });
+                Self(PhantomData)
+            }
+        }
+
+        impl Drop for ScopedHook {
+            fn drop(&mut self) {
+                INFERENCE_HOOK.with(|slot| { slot.borrow_mut().take(); });
+                METADATA_HOOK.with(|slot| { slot.borrow_mut().take(); });
+            }
+        }
+
+        struct Probe {
+            identity: EmbeddingIdentityBundleV1,
+            foreign: EmbeddingIdentityBundleV1,
+            behavior: Behavior,
+            drifted: AtomicBool,
+            inputs: Mutex<Vec<String>>,
+            calls: AtomicUsize,
+        }
+
+        impl Probe {
+            fn new(behavior: Behavior) -> Self {
+                Self {
+                    identity: response("model", vec![0.6, 0.8]).identity,
+                    foreign: response("foreign", vec![0.6, 0.8]).identity,
+                    behavior,
+                    drifted: AtomicBool::new(false),
+                    inputs: Mutex::new(Vec::new()),
+                    calls: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        impl Embedder for Probe {
+            fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                let hook = METADATA_HOOK.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook { hook(); }
+                if self.behavior == Behavior::MissingIdentity {
+                    return Err(publication_error("test provider has no identity"));
+                }
+                Ok(if self.drifted.load(Ordering::SeqCst) {
+                    &self.foreign
+                } else {
+                    &self.identity
+                })
+            }
+
+            fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                Box::pin(async { panic!("atomic inference must use the bound response operation") })
+            }
+
+            fn embed_bound<'a>(
+                &'a self,
+                cx: &'a Cx,
+                text: &'a str,
+            ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+                Box::pin(async move {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    self.inputs.lock().unwrap().push(text.to_owned());
+                    // Drop the non-Send callback before yielding the Send future.
+                    {
+                        let hook = INFERENCE_HOOK.with(|slot| slot.borrow_mut().take());
+                        if let Some(hook) = hook { hook(); }
+                    }
+                    asupersync::runtime::yield_now().await;
+                    if matches!(self.behavior, Behavior::CancelSuccess | Behavior::CancelFailure) {
+                        cx.cancel_with(asupersync::CancelKind::User, Some("cancel atomic inference"));
+                    }
+                    if self.behavior == Behavior::TypedCancellation {
+                        return Err(SearchError::Cancelled {
+                            phase: "test.provider".to_owned(),
+                            reason: "typed cancellation without changing Cx".to_owned(),
+                        });
+                    }
+                    if matches!(self.behavior, Behavior::DriftSuccess | Behavior::DriftFailure) {
+                        self.drifted.store(true, Ordering::SeqCst);
+                    }
+                    if matches!(self.behavior, Behavior::Failure | Behavior::CancelFailure | Behavior::DriftFailure) {
+                        return Err(SearchError::EmbeddingFailed {
+                            model: "model".to_owned(),
+                            source: Box::new(io::Error::other("provider failed after its await")),
+                        });
+                    }
+                    let mut output = response("model", vec![0.6, 0.8]);
+                    if self.behavior == Behavior::InvalidVector {
+                        output.values[0] = f32::NAN;
+                    }
+                    if self.behavior == Behavior::ForeignResponse {
+                        output.identity.clone_from(&self.foreign);
+                    }
+                    Ok(output)
+                })
+            }
+
+            fn dimension(&self) -> usize {
+                if self.behavior == Behavior::WrongDimension { 3 } else { 2 }
+            }
+
+            fn id(&self) -> &'static str {
+                if self.behavior == Behavior::WrongRouting { "wrong-model" } else { "model" }
+            }
+
+            fn model_name(&self) -> &'static str { "model" }
+            fn is_semantic(&self) -> bool { true }
+            fn category(&self) -> ModelCategory { ModelCategory::StaticEmbedder }
+        }
+
+        #[test]
+        fn complete_retained_input_is_embedded_outside_any_database_transaction() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let storage = Arc::new(Storage::open_in_memory().unwrap());
+                let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
+                let body = "canonical café 日本語 body \0 tail ".repeat(100);
+                let doc = document("doc", &body);
+                assert_eq!(doc.content_preview.chars().count(), 400);
+                storage.upsert_document(&doc).unwrap();
+                storage.set_document_content("doc", &body).unwrap();
+                queue.enqueue("doc", "model", &doc.content_hash, 0).unwrap();
+                let claim = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
+                let probe = Probe::new(Behavior::Valid);
+                let hook_storage = Arc::clone(&storage);
+                let _hook = ScopedHook::inference(move || {
+                    assert!(!hook_storage.connection().in_transaction());
+                    // Real writes during the provider call would fail if a
+                    // transaction were still open on this same connection.
+                    hook_storage.transaction(|_| Ok(())).unwrap();
+                });
+                assert_eq!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await.unwrap(), ClaimOutcome::Applied(()));
+                assert_eq!(*probe.inputs.lock().unwrap(), vec![body]);
+                assert_eq!(queue.queue_depth().unwrap().completed, 1);
+                assert_eq!(storage.get_published_embedding("doc", "model", &probe.identity).unwrap().unwrap().embedding.values, vec![0.6, 0.8]);
+            });
+        }
+
+        #[test]
+        fn missing_or_corrupt_retained_input_cannot_invoke_the_provider() {
+            for mutation in [
+                "DELETE FROM document_contents;",
+                "UPDATE document_contents SET canonical_text = 'corrupt';",
+                "ALTER TABLE document_contents RENAME COLUMN canonical_text TO unavailable_text;",
+            ] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (storage, _queue, claim, _) = fixture();
+                    storage.connection().execute_sync(mutation).unwrap();
+                    let before = state(&storage);
+                    let probe = Probe::new(Behavior::Valid);
+                    assert!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await.is_err());
+                    assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(state(&storage), before);
+                });
+            }
+        }
+
+        #[test]
+        fn wrong_provider_metadata_is_rejected_before_inference() {
+            for behavior in [Behavior::WrongRouting, Behavior::WrongDimension, Behavior::MissingIdentity] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (storage, _queue, claim, _) = fixture();
+                    let before = state(&storage);
+                    let probe = Probe::new(behavior);
+                    assert!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await.is_err());
+                    assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(state(&storage), before);
+                });
+            }
+        }
+
+        #[test]
+        fn provider_errors_foreign_responses_and_identity_drift_never_publish() {
+            for behavior in [Behavior::Failure, Behavior::InvalidVector, Behavior::ForeignResponse, Behavior::DriftSuccess, Behavior::DriftFailure] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (storage, queue, claim, _) = fixture();
+                    let before = state(&storage);
+                    let probe = Probe::new(behavior);
+                    assert!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await.is_err());
+                    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(state(&storage), before);
+                    assert_eq!(queue.queue_depth().unwrap().processing, 1);
+                    // Failure did not consume the valid claim. Its owner can
+                    // retry explicitly, or let bounded lease recovery handle it.
+                    let good = Probe::new(Behavior::Valid);
+                    assert_eq!(storage.embed_and_publish_claimed(&cx, &claim, &good).await.unwrap(), ClaimOutcome::Applied(()));
+                });
+            }
+        }
+
+        #[test]
+        fn cancellation_before_inference_or_during_metadata_dominates_errors() {
+            for during_metadata in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (storage, _queue, claim, _) = fixture();
+                    let before = state(&storage);
+                    let cancel_cx = cx.clone();
+                    let _hook = if during_metadata {
+                        Some(ScopedHook::metadata(move || {
+                            cancel_cx.cancel_with(asupersync::CancelKind::User, Some("metadata cancellation"));
+                        }))
+                    } else {
+                        cx.cancel_with(asupersync::CancelKind::User, Some("already cancelled"));
+                        None
+                    };
+                    let probe = Probe::new(Behavior::MissingIdentity);
+                    assert!(matches!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await, Err(SearchError::Cancelled { .. })));
+                    assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(state(&storage), before);
+                });
+            }
+        }
+
+        #[test]
+        fn cancellation_after_the_provider_await_preserves_the_uncompleted_claim() {
+            for behavior in [Behavior::CancelSuccess, Behavior::CancelFailure, Behavior::TypedCancellation] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (storage, _queue, claim, _) = fixture();
+                    let before = state(&storage);
+                    let probe = Probe::new(behavior);
+                    assert!(matches!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await, Err(SearchError::Cancelled { .. })));
+                    assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(state(&storage), before);
+                });
+            }
+        }
+
+        #[test]
+        fn a_late_success_or_failure_cannot_overwrite_the_reclaimed_successor() {
+            for behavior in [Behavior::Valid, Behavior::Failure, Behavior::InvalidVector, Behavior::ForeignResponse] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (storage, queue, old, _) = fixture();
+                    let hook_storage = Arc::clone(&storage);
+                    let state_after = Rc::new(RefCell::new(None));
+                    let hook_state = Rc::clone(&state_after);
+                    let _hook = ScopedHook::inference(move || {
+                        assert!(!hook_storage.connection().in_transaction());
+                        hook_storage.connection().execute_sync("UPDATE embedding_jobs SET started_at = 0;").unwrap();
+                        assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
+                        let current = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
+                        let output = response("model", vec![0.8, 0.6]);
+                        assert_eq!(publish(&hook_storage, &current, &output), ClaimOutcome::Applied(()));
+                        *hook_state.borrow_mut() = Some(state(&hook_storage));
+                    });
+                    let probe = Probe::new(behavior);
+                    assert_eq!(storage.embed_and_publish_claimed(&cx, &old, &probe).await.unwrap(), ClaimOutcome::LostClaim);
+                    assert_eq!(state(&storage), state_after.borrow().clone().unwrap());
+                    assert_eq!(storage.get_published_embedding("doc", "model", &probe.identity).unwrap().unwrap().embedding.values, vec![0.8, 0.6]);
+                });
+            }
+        }
+
+        #[test]
+        fn replaced_revision_suppresses_late_output_including_legacy_unknown_hashes() {
+            for legacy in [false, true] {
+                for behavior in [Behavior::Valid, Behavior::Failure] {
+                    asupersync::test_utils::run_test_with_cx(|cx| async move {
+                        let (storage, queue, mut old, _) = fixture();
+                        if legacy {
+                            storage.connection().execute_sync("UPDATE embedding_jobs SET content_hash = NULL;").unwrap();
+                            old.content_hash = None;
+                        }
+                        let hook_storage = Arc::clone(&storage);
+                        let hook_queue = queue.clone();
+                        let _hook = ScopedHook::inference(move || {
+                            let doc = document("doc", "new body");
+                            hook_storage.upsert_document(&doc).unwrap();
+                            hook_storage.set_document_content("doc", "new body").unwrap();
+                            hook_queue.enqueue("doc", "model", &doc.content_hash, 0).unwrap();
+                        });
+                        let probe = Probe::new(behavior);
+                        assert_eq!(storage.embed_and_publish_claimed(&cx, &old, &probe).await.unwrap(), ClaimOutcome::Superseded);
+                        assert_eq!(queue.queue_depth().unwrap().pending, 1);
+                        assert_eq!(queue.queue_depth().unwrap().processing, 0);
+                        assert!(rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty());
+                        let current = queue.claim_batch("next", 1).unwrap().pop().unwrap();
+                        let good = Probe::new(Behavior::Valid);
+                        assert_eq!(storage.embed_and_publish_claimed(&cx, &current, &good).await.unwrap(), ClaimOutcome::Applied(()));
+                        assert_eq!(*good.inputs.lock().unwrap(), vec!["new body"]);
+                        assert_eq!(storage.get_published_embedding("doc", "model", &good.identity).unwrap().unwrap().content_hash, ContentHasher::hash("new body"));
+                    });
+                }
+            }
+        }
+
+        #[test]
+        fn ownership_is_rechecked_after_provider_metadata_callbacks() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (storage, _queue, old, _) = fixture();
+                let hook_storage = Arc::clone(&storage);
+                let _hook = ScopedHook::metadata(move || {
+                    hook_storage.upsert_document(&document("doc", "new body")).unwrap();
+                });
+                let probe = Probe::new(Behavior::Valid);
+                assert_eq!(storage.embed_and_publish_claimed(&cx, &old, &probe).await.unwrap(), ClaimOutcome::Superseded);
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+                assert!(rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty());
+            });
+        }
     }
 }
