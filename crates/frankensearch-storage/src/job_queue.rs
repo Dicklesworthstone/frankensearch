@@ -911,28 +911,86 @@ impl PersistentJobQueue {
         )
     }
 
-    /// Reset all terminally-failed jobs for a given embedder back to pending.
+    /// Retry current terminal failures without displacing newer work or success.
     ///
-    /// This is called on startup when the embedder changes or becomes newly
-    /// available, giving previously failed jobs another chance.
+    /// Active attempts, pending replacements, obsolete revisions, and catalog
+    /// entries already embedded or deliberately skipped remain untouched.
+    /// Eligible jobs and their catalog status return to pending atomically;
+    /// claim epochs are preserved so an earlier worker cannot regain ownership.
+    /// Legacy jobs with an unknown hash are bound to the current document.
     ///
-    /// Returns the number of resurrected jobs.
+    /// Returns the number of jobs actually resurrected.
     pub fn resurrect_terminal_failures(&self, embedder_id: &str) -> SearchResult<usize> {
+        ensure_non_empty(embedder_id, "embedder_id")?;
         let now_ms = unix_timestamp_ms()?;
-        let resurrected = self.storage.transaction(|conn| {
-            let params = [
-                SqliteValue::Text(embedder_id.to_owned().into()),
-                SqliteValue::Integer(now_ms),
-            ];
-            let count = conn
-                .execute_with_params_sync(
-                    "UPDATE embedding_jobs \
-             SET status = 'pending', retry_count = 0, error_message = NULL, \
-                 started_at = NULL, submitted_at = ?2 \
-             WHERE embedder_id = ?1 AND status = 'failed';",
-                    &params,
+        let resurrected = self.storage.immediate_transaction(|conn| {
+            let rows = conn
+                .query_with_params_sync(
+                    "SELECT failed.job_id, failed.doc_id, failed.content_hash \
+                     FROM embedding_jobs failed \
+                     WHERE failed.embedder_id = ?1 AND failed.status = 'failed' \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM embedding_jobs active \
+                           WHERE active.doc_id = failed.doc_id \
+                             AND active.embedder_id = failed.embedder_id \
+                             AND active.status IN ('pending', 'processing') \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM embedding_status catalog \
+                           WHERE catalog.doc_id = failed.doc_id \
+                             AND catalog.embedder_id = failed.embedder_id \
+                             AND catalog.status IN ('embedded', 'skipped') \
+                       ) \
+                     ORDER BY failed.job_id;",
+                    &[SqliteValue::Text(embedder_id.to_owned().into())],
                 )
                 .map_err(map_storage_error)?;
+            let mut count = 0_usize;
+            for row in &rows {
+                let job_id = row_i64(row, 0, "embedding_jobs.job_id")?;
+                let doc_id = row_text(row, 1, "embedding_jobs.doc_id")?;
+                let failed_hash = row_optional_blob_32(row, 2, "embedding_jobs.content_hash")?;
+                let Some(document) = get_document_inner(conn, doc_id)? else {
+                    continue;
+                };
+                if failed_hash.is_some_and(|hash| hash != document.content_hash) {
+                    continue;
+                }
+
+                let updated = conn
+                    .execute_with_params_sync(
+                        "UPDATE embedding_jobs \
+                         SET status = 'pending', retry_count = 0, error_message = NULL, \
+                             started_at = NULL, completed_at = NULL, worker_id = NULL, \
+                             submitted_at = ?1, content_hash = ?2 \
+                         WHERE job_id = ?3 AND embedder_id = ?4 AND status = 'failed';",
+                        &[
+                            SqliteValue::Integer(now_ms),
+                            SqliteValue::Blob(document.content_hash.to_vec().into()),
+                            SqliteValue::Integer(job_id),
+                            SqliteValue::Text(embedder_id.to_owned().into()),
+                        ],
+                    )
+                    .map_err(map_storage_error)?;
+                if updated != 1 {
+                    return Err(conflict_error(format!(
+                        "job {job_id} changed status during resurrection"
+                    )));
+                }
+                conn.execute_with_params_sync(
+                    "INSERT INTO embedding_status \
+                     (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
+                     VALUES (?1, ?2, NULL, 'pending', NULL, NULL, 0) \
+                     ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status, \
+                         embedded_at = NULL, error_message = NULL, retry_count = 0;",
+                    &[
+                        SqliteValue::Text(doc_id.to_owned().into()),
+                        SqliteValue::Text(embedder_id.to_owned().into()),
+                    ],
+                )
+                .map_err(map_storage_error)?;
+                count += 1;
+            }
             Ok(count)
         })?;
 
