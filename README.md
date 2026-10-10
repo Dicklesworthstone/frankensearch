@@ -365,7 +365,8 @@ keyword writer verifies its segments when it opens, quarantines one that
 fails (`*.fslx.quarantine`), and reindexes the documents it held. The first search in a shell pays the model load
 (about 3 s for potion, plus the MiniLM session for the quality stage); the
 query daemon that `fsfs search` starts by default keeps later searches to tens
-of milliseconds and exits on its own after ten idle minutes.
+of milliseconds and exits on its own after ten idle minutes; `fsfs daemon --stop`
+stops it sooner, and the next search starts a fresh one.
 
 `--stream` also uses that warm daemon: Initial can arrive while quality
 refinement is still running, followed by Refined or RefinementFailed and one terminal

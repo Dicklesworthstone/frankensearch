@@ -9323,7 +9323,7 @@ impl FsfsRuntime {
                 }
                 let frame = serde_json::from_slice(&bytes).map_err(|error| {
                     Self::search_daemon_error(format!(
-                        "invalid daemon frame: {error}; restart the query daemon or use --no-daemon"
+                        "invalid daemon frame: {error}; stop the query daemon with `fsfs daemon --stop` (the next search starts a fresh one) or use --no-daemon"
                     ))
                 })?;
                 if let Some(payload) = self.accept_search_serve_frame(
@@ -9450,7 +9450,7 @@ impl FsfsRuntime {
                     || Some(rerank) != request.rerank
                 {
                     return Err(Self::search_daemon_error(
-                        "daemon did not acknowledge requested search policy; restart the query daemon or use --no-daemon",
+                        "daemon did not acknowledge requested search policy; stop the query daemon with `fsfs daemon --stop` (the next search starts a fresh one) or use --no-daemon",
                     ));
                 }
                 if generation_fingerprint != fingerprint
@@ -14824,58 +14824,73 @@ impl FsfsRuntime {
         Ok(())
     }
 
-    /// `fsfs daemon --stop`: signal the compaction daemon recorded in the
-    /// index root's pid file and wait for it to exit. A pid file whose
-    /// process is already gone (crash, SIGKILL) is cleared so the next start
-    /// does not trip over it.
+    /// `fsfs daemon --stop`: stop this index's compaction daemon and every
+    /// query daemon `fsfs search` started for it. The compaction daemon
+    /// recorded in the index root's pid file is signalled and awaited; a pid
+    /// file whose process is already gone (crash, SIGKILL) is cleared so the
+    /// next start does not trip over it. Query daemons are asked over their
+    /// sockets, as an in-place mutation quiesces them, and awaited; the next
+    /// search starts a fresh one. With neither running there is nothing to
+    /// stop.
     fn run_daemon_stop(&self, index_root: &Path) -> SearchResult<()> {
         const STOP_WAIT_BUDGET: Duration = Duration::from_secs(10);
         const STOP_POLL: Duration = Duration::from_millis(50);
 
+        let started = std::time::Instant::now();
         let pid_path = index_root.join(FSFS_DAEMON_PID_FILE);
-        let contents = match crate::lifecycle::PidFile::new(&pid_path).read() {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(SearchError::InvalidConfig {
-                    field: "daemon.pid_file".into(),
-                    value: pid_path.display().to_string(),
-                    reason: "no compaction daemon pid file under the index root; nothing to stop"
-                        .into(),
-                });
-            }
+        let compaction = match crate::lifecycle::PidFile::new(&pid_path).read() {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => return Err(SearchError::Io(error)),
         };
-
-        let started = std::time::Instant::now();
-        let stale_pid_file_removed = if contents.is_alive() {
-            crate::concurrency::request_termination(contents.pid).map_err(SearchError::Io)?;
-            let mut alive = true;
-            while alive && started.elapsed() < STOP_WAIT_BUDGET {
-                std::thread::sleep(STOP_POLL);
-                alive = contents.is_alive();
+        let stale_pid_file_removed = match &compaction {
+            Some(contents) => {
+                Self::stop_compaction_daemon(contents, &pid_path, STOP_WAIT_BUDGET, STOP_POLL)?
             }
-            if alive {
+            None => false,
+        };
+        #[cfg(unix)]
+        let query_daemons_stopped = {
+            let (asked, running) = self.stop_query_daemons(STOP_WAIT_BUDGET, "daemon --stop")?;
+            if running > 0 {
                 return Err(SearchError::InvalidConfig {
                     field: "daemon.stop".into(),
-                    value: contents.pid.to_string(),
+                    value: running.to_string(),
                     reason: format!(
-                        "daemon PID {} did not exit within {}s of SIGTERM",
-                        contents.pid,
+                        "{running} query daemon(s) of this index did not exit within {}s of the shutdown request",
                         STOP_WAIT_BUDGET.as_secs()
                     ),
                 });
             }
-            false
-        } else {
-            if let Err(error) = fs::remove_file(&pid_path)
-                && error.kind() != ErrorKind::NotFound
-            {
-                return Err(SearchError::Io(error));
-            }
-            true
+            asked
         };
+        #[cfg(not(unix))]
+        let query_daemons_stopped = 0_usize;
 
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let Some(contents) = compaction else {
+            if query_daemons_stopped == 0 {
+                return Err(SearchError::InvalidConfig {
+                    field: "daemon.pid_file".into(),
+                    value: pid_path.display().to_string(),
+                    reason: "no compaction daemon pid file under the index root and no query daemon for this index; nothing to stop"
+                        .into(),
+                });
+            }
+            if self.cli_input.format == OutputFormat::Table {
+                println!(
+                    "daemon: stopped {query_daemons_stopped} query daemon(s) after {elapsed_ms}ms"
+                );
+            } else {
+                let payload = serde_json::json!({
+                    "stopped": true,
+                    "query_daemons_stopped": query_daemons_stopped,
+                    "elapsed_ms": elapsed_ms,
+                });
+                println!("{payload}");
+            }
+            return Ok(());
+        };
         if self.cli_input.format == OutputFormat::Table {
             if stale_pid_file_removed {
                 println!(
@@ -14886,17 +14901,59 @@ impl FsfsRuntime {
             } else {
                 println!("daemon: stopped PID {} after {elapsed_ms}ms", contents.pid);
             }
+            if query_daemons_stopped > 0 {
+                println!("daemon: stopped {query_daemons_stopped} query daemon(s)");
+            }
         } else {
             let payload = serde_json::json!({
                 "pid": contents.pid,
                 "stopped": true,
                 "stale_pid_file_removed": stale_pid_file_removed,
+                "query_daemons_stopped": query_daemons_stopped,
                 "elapsed_ms": elapsed_ms,
                 "pid_file": pid_path.display().to_string(),
             });
             println!("{payload}");
         }
         Ok(())
+    }
+
+    /// Signal the compaction daemon `contents` records and wait for it to
+    /// exit, or clear its pid file when the process is already gone. Returns
+    /// whether the pid file was stale.
+    fn stop_compaction_daemon(
+        contents: &crate::lifecycle::PidFileContents,
+        pid_path: &Path,
+        budget: Duration,
+        poll: Duration,
+    ) -> SearchResult<bool> {
+        if !contents.is_alive() {
+            if let Err(error) = fs::remove_file(pid_path)
+                && error.kind() != ErrorKind::NotFound
+            {
+                return Err(SearchError::Io(error));
+            }
+            return Ok(true);
+        }
+        let started = std::time::Instant::now();
+        crate::concurrency::request_termination(contents.pid).map_err(SearchError::Io)?;
+        let mut alive = true;
+        while alive && started.elapsed() < budget {
+            std::thread::sleep(poll);
+            alive = contents.is_alive();
+        }
+        if alive {
+            return Err(SearchError::InvalidConfig {
+                field: "daemon.stop".into(),
+                value: contents.pid.to_string(),
+                reason: format!(
+                    "daemon PID {} did not exit within {}s of SIGTERM",
+                    contents.pid,
+                    budget.as_secs()
+                ),
+            });
+        }
+        Ok(false)
     }
 
     /// A live query daemon (spawned by an earlier `fsfs search`, alive until
@@ -14910,7 +14967,31 @@ impl FsfsRuntime {
     #[cfg(unix)]
     fn quiesce_query_daemon(&self, reason: &str) -> SearchResult<()> {
         const QUIESCE_BUDGET: Duration = Duration::from_secs(5);
-        const QUIESCE_POLL: Duration = Duration::from_millis(25);
+
+        let started = Instant::now();
+        let (asked, running) = self.stop_query_daemons(QUIESCE_BUDGET, reason)?;
+        if running > 0 {
+            warn!(
+                reason,
+                "query daemon did not exit within the quiesce budget; the mutation may be refused by the map lock"
+            );
+        } else if asked > 0 {
+            info!(
+                reason,
+                elapsed_ms = started.elapsed().as_millis(),
+                "query daemon quiesced for an in-place mutation"
+            );
+        }
+        Ok(())
+    }
+
+    /// Ask every query daemon of this index (see `quiesce_daemon_socket_paths`)
+    /// to exit over its socket, then wait up to `budget` for those sockets to
+    /// stop accepting. Returns how many daemons were asked and how many of
+    /// them still accept.
+    #[cfg(unix)]
+    fn stop_query_daemons(&self, budget: Duration, reason: &str) -> SearchResult<(usize, usize)> {
+        const POLL: Duration = Duration::from_millis(25);
 
         let mut stopping = Vec::new();
         for socket_path in self.quiesce_daemon_socket_paths()? {
@@ -14926,27 +15007,15 @@ impl FsfsRuntime {
             }
             stopping.push(socket_path);
         }
-        if stopping.is_empty() {
-            return Ok(());
-        }
+        let asked = stopping.len();
         let started = Instant::now();
-        while started.elapsed() < QUIESCE_BUDGET {
+        loop {
             stopping.retain(|socket_path| UnixStream::connect(socket_path).is_ok());
-            if stopping.is_empty() {
-                info!(
-                    reason,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "query daemon quiesced for an in-place mutation"
-                );
-                return Ok(());
+            if stopping.is_empty() || started.elapsed() >= budget {
+                return Ok((asked, stopping.len()));
             }
-            std::thread::sleep(QUIESCE_POLL);
+            std::thread::sleep(POLL);
         }
-        warn!(
-            reason,
-            "query daemon did not exit within the quiesce budget; the mutation may be refused by the map lock"
-        );
-        Ok(())
     }
 
     /// Sockets a quiesce asks to shut down: the explicit `--daemon-socket`, or
@@ -24115,7 +24184,7 @@ fn print_cli_help() {
         "  daemon [--poll-ms <ms>] [--idle-timeout-ms <ms>]  Long-running process that auto-compacts when WAL grows"
     );
     println!(
-        "  daemon --stop                            Stop the compaction daemon recorded under the index root"
+        "  daemon --stop                            Stop the index's compaction daemon and query daemons"
     );
     println!();
     println!(
@@ -49438,6 +49507,45 @@ mod tests {
             matches!(&error, SearchError::InvalidConfig { field, .. } if field == "daemon.pid_file"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Without a compaction daemon, a stop still reaches the query daemon
+    /// `fsfs search` started for this index: the daemon errors tell users to
+    /// stop it with `fsfs daemon --stop`.
+    #[cfg(unix)]
+    #[test]
+    fn daemon_stop_stops_the_index_query_daemon_without_a_compaction_daemon() {
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let runtime = daemon_stop_runtime(&index_root);
+        let socket = runtime.default_daemon_socket_path().expect("socket path");
+        fs::create_dir_all(socket.parent().expect("daemon dir")).expect("create daemon dir");
+        let listener = UnixListener::bind(&socket).expect("bind fake daemon");
+        listener.set_nonblocking(true).expect("nonblocking listener");
+        // A fake daemon that exits (unlinks its socket) on its first request
+        // and returns that request, or nothing once its deadline passes.
+        let daemon = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Ok((stream, _)) = listener.accept() {
+                    stream.set_nonblocking(false).expect("blocking stream");
+                    let mut line = String::new();
+                    let _ = std::io::BufReader::new(stream).read_line(&mut line);
+                    fs::remove_file(&socket).expect("unlink socket");
+                    return Some(line);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            fs::remove_file(&socket).expect("unlink socket");
+            None
+        });
+        let stopped = runtime.run_daemon_stop(&index_root);
+        let request = daemon.join().expect("fake daemon");
+        stopped.expect("the query daemon is stopped");
+        assert_eq!(request.as_deref().map(str::trim), Some(":shutdown"));
     }
 
     /// The legacy compaction daemon has no socket: a `--daemon-socket` (which
