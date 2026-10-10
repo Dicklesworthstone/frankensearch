@@ -25,6 +25,7 @@ pub mod metrics;
 pub mod pipeline;
 pub mod schema;
 pub mod staleness;
+pub mod worker;
 
 pub use connection::{Storage, StorageConfig};
 pub use content_hash::{
@@ -65,3 +66,4 @@ pub use staleness::{
     QuickStalenessCheck, RecommendedAction, StalenessConfig, StalenessLevel, StalenessReport,
     StalenessStats, StorageBackedStaleness,
 };
+pub use worker::{PersistentEmbeddingWorker, PersistentWorkerReport, WorkerServiceConfig};
