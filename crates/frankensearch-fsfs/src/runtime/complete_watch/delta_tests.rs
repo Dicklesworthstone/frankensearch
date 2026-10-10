@@ -856,3 +856,67 @@ fn guarded_removal_publishes_once_after_all_source_checks_in_order() {
         assert_eq!(store.active(&cx).unwrap(), Some(next));
     });
 }
+
+#[test]
+fn a_build_that_loses_a_race_retries_as_a_delta_with_every_hint() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, source, root) = fixture(directory.path());
+        let mut session = controlled_session(&runtime, &cx, &root);
+        initial(&mut session, &cx).await;
+        fs::write(source.join("alpha.md"), "racedword alpha body").unwrap();
+        fs::write(source.join("stable.md"), "laterword stable body").unwrap();
+        // An attempt consumed alpha's hint; stable's arrived before its
+        // precommit, which refused the build as a source change.
+        let now = Instant::now();
+        let consumed = {
+            let mut changes = lock_changes(&session.changes).unwrap();
+            changes.record(now, false);
+            changes.record_path(&source.join("alpha.md"));
+            changes.take_due(now + DEBOUNCE).unwrap()
+        };
+        let lost = now + DEBOUNCE;
+        {
+            let mut changes = lock_changes(&session.changes).unwrap();
+            changes.record(lost, false);
+            changes.record_path(&source.join("stable.md"));
+        }
+        session
+            .record_unstable_source(lost, Some(&consumed))
+            .unwrap();
+        let (forced, hinted) = lock_changes(&session.changes)
+            .unwrap()
+            .dirty
+            .as_ref()
+            .map(|window| (window.force_rebuild, window.paths.clone()))
+            .unwrap();
+        assert!(!forced, "a lost race must not force a whole-corpus rebuild");
+        assert_eq!(
+            hinted,
+            BTreeSet::from([source.join("alpha.md"), source.join("stable.md")])
+        );
+        let retry = require_durable_publication(
+            session
+                .advance(&cx, lost + DEBOUNCE)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            FsfsRuntime::read_index_sentinel(retry.path())
+                .unwrap()
+                .unwrap()
+                .command,
+            "retained-batch"
+        );
+        let mut reader = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+        for word in ["racedword", "laterword"] {
+            let hits = reader.search(&cx, word, 10).await.unwrap();
+            assert_eq!(hits.last().unwrap().hits.len(), 1, "{word}");
+        }
+    });
+}

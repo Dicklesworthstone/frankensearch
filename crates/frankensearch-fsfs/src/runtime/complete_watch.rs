@@ -570,7 +570,12 @@ impl CompleteWatchSession {
         })
     }
 
-    fn record_unstable_source(&mut self, now: Instant) -> SearchResult<()> {
+    /// `consumed` is the hint window the failed attempt took before observing.
+    fn record_unstable_source(
+        &mut self,
+        now: Instant,
+        consumed: Option<&DirtyWindow>,
+    ) -> SearchResult<()> {
         self.unstable_builds += 1;
         if self.unstable_builds >= MAX_UNSTABLE_BUILDS {
             self.settling = Some(SettleWindow {
@@ -584,12 +589,18 @@ impl CompleteWatchSession {
             );
         } else {
             // The catch-up obligation survives even without another event.
-            // Hints received during the failed attempt are never erased.
+            // Hints received during the failed attempt are never erased, and
+            // the window it consumed rejoins them: the retry rereads every
+            // hinted file and carries the rest forward by stamp, where forcing
+            // it would reread and re-add the whole corpus after any edit that
+            // lands while a build runs.
             let mut changes = lock_changes(&self.changes)?;
-            changes.record(now, true);
+            changes.record(now, consumed.is_some_and(|window| window.force_rebuild));
+            for path in consumed.iter().flat_map(|window| &window.paths) {
+                changes.record_path(path);
+            }
             if let Some(window) = &mut changes.dirty {
                 window.first = now;
-                window.paths.clear();
             }
         }
         Ok(())
@@ -804,7 +815,7 @@ impl CompleteWatchSession {
                 Ok(None)
             }
             Err(error) if is_source_changed(&error) => {
-                self.record_unstable_source(Instant::now())?;
+                self.record_unstable_source(Instant::now(), pending.as_ref())?;
                 Ok(None)
             }
             Err(error) => Err(error),
@@ -1416,8 +1427,18 @@ mod lifecycle_tests {
     }
 
     fn pause_after_races(session: &mut CompleteWatchSession, now: Instant) {
+        // Each lost race had consumed the hint that started its attempt.
+        let alpha = session.source.path.join("alpha.md");
         for attempt in 1..=MAX_UNSTABLE_BUILDS {
-            session.record_unstable_source(now).unwrap();
+            let consumed = DirtyWindow {
+                first: now,
+                last: now,
+                force_rebuild: false,
+                paths: BTreeSet::from([alpha.clone()]),
+            };
+            session
+                .record_unstable_source(now, Some(&consumed))
+                .unwrap();
             assert_eq!(session.settling.is_some(), attempt == MAX_UNSTABLE_BUILDS);
         }
     }
