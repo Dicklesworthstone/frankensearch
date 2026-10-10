@@ -6,8 +6,9 @@ use fsqlite::{AsyncConnection, FrankenError, Row};
 use fsqlite_types::value::SqliteValue;
 
 use crate::connection::{map_storage_error_at, retry_transient_storage};
+use crate::document_content::CREATE_TABLE_SQL as CREATE_DOCUMENT_CONTENTS_SQL;
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// Governed marker table for the FTS5 Porter tokenizer rebuild.
 ///
@@ -43,6 +44,7 @@ const LATEST_SCHEMA: &[&str] = &[
         updated_at INTEGER NOT NULL,\
         metadata_json TEXT\
     );",
+    CREATE_DOCUMENT_CONTENTS_SQL,
     "CREATE TABLE IF NOT EXISTS embedding_jobs (\
         job_id INTEGER PRIMARY KEY AUTOINCREMENT,\
         doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,\
@@ -348,6 +350,10 @@ const MIGRATIONS: &[Migration] = &[
         statements: &[
             "ALTER TABLE embedding_jobs ADD COLUMN claim_epoch INTEGER NOT NULL DEFAULT 0;",
         ],
+    },
+    Migration {
+        version: 9,
+        statements: &[CREATE_DOCUMENT_CONTENTS_SQL],
     },
 ];
 
@@ -861,7 +867,7 @@ mod tests {
 
         let conn = open();
         bootstrap(&conn).expect("populated v7 database should migrate additively");
-        assert_eq!(current_version(&conn).unwrap(), 8);
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert_eq!(job_state(&conn), before, "all existing job fields survive");
         let epochs = conn
             .query_sync("SELECT claim_epoch FROM embedding_jobs ORDER BY job_id;")
@@ -891,6 +897,45 @@ mod tests {
             [0, 17, 0, 0],
             "bootstrap never resets a claim fence"
         );
+    }
+
+    #[test]
+    fn bootstrap_adds_v9_content_store_without_fabricating_legacy_bodies() {
+        let conn = AsyncConnection::open_sync(":memory:".to_owned()).unwrap();
+        seed_historical_schema(&conn, 8);
+        assert!(!table_exists(&conn, "document_contents"));
+        conn.execute_sync(
+            "INSERT INTO documents(doc_id, content_preview, content_hash, content_length, created_at, updated_at) \
+             VALUES ('legacy', 'partial preview', X'0102', 1000, 100, 150);",
+        )
+        .unwrap();
+        conn.execute_sync(
+            "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, claim_epoch) \
+             VALUES ('legacy', 'model', 175, 'processing', 17);",
+        )
+        .unwrap();
+        bootstrap(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
+        assert!(table_exists(&conn, "document_contents"));
+        assert!(
+            conn.query_sync("SELECT doc_id FROM document_contents;")
+                .unwrap()
+                .is_empty(),
+            "a migration cannot reconstruct full input from a preview"
+        );
+        let rows = conn
+            .query_sync("SELECT content_length, created_at, updated_at FROM documents;")
+            .unwrap();
+        assert_eq!(super::row_i64(&rows[0], 0, "content_length").unwrap(), 1000);
+        assert_eq!(super::row_i64(&rows[0], 1, "created_at").unwrap(), 100);
+        assert_eq!(super::row_i64(&rows[0], 2, "updated_at").unwrap(), 150);
+        let rows = conn
+            .query_sync("SELECT claim_epoch FROM embedding_jobs WHERE status = 'processing';")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(super::row_i64(&rows[0], 0, "claim_epoch").unwrap(), 17);
+        bootstrap(&conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
@@ -1044,8 +1089,8 @@ mod tests {
     // ── Schema version constant ─────────────────────────────────────────
 
     #[test]
-    fn schema_version_is_eight() {
-        assert_eq!(SCHEMA_VERSION, 8);
+    fn schema_version_is_nine() {
+        assert_eq!(SCHEMA_VERSION, 9);
     }
 
     // ── Migration array invariants ──────────────────────────────────────
@@ -1102,6 +1147,7 @@ mod tests {
 
         let expected_tables = [
             "documents",
+            "document_contents",
             "embedding_jobs",
             "embedding_status",
             "content_hashes",
@@ -1283,6 +1329,7 @@ mod tests {
         // Verify each table is queryable
         for query in [
             "SELECT COUNT(*) FROM documents;",
+            "SELECT COUNT(*) FROM document_contents;",
             "SELECT COUNT(*) FROM embedding_jobs;",
             "SELECT COUNT(*) FROM embedding_status;",
             "SELECT COUNT(*) FROM content_hashes;",

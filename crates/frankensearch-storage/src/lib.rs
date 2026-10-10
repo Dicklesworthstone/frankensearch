@@ -1,7 +1,8 @@
 //! FrankenSQLite-backed storage primitives for frankensearch.
 //!
 //! This crate owns schema bootstrap, document metadata persistence,
-//! content-hash dedup bookkeeping, and an embedding job queue.
+//! complete canonical input retention, content-hash dedup bookkeeping,
+//! and an embedding job queue.
 // The instrumented FTS5 search future nests FrankenSQLite and Asupersync
 // futures deeply enough that proving Send exceeds rustc's default depth.
 #![recursion_limit = "256"]
@@ -14,6 +15,7 @@
 pub mod connection;
 pub mod content_hash;
 pub mod document;
+mod document_content;
 #[cfg(feature = "fts5")]
 pub mod fts5_adapter;
 pub mod history;
