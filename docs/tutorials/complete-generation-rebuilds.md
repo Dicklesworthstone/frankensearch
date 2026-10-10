@@ -27,8 +27,9 @@ refuses searches here as it does on the legacy layout.
 
 ## Build and query
 
-A build into a directory with no index creates the store. A directory that
-already holds a legacy index keeps its layout unless the build sets
+On Linux a build into a directory with no index creates the store (on macOS
+the build sets `FSFS_COMPLETE_GENERATIONS=1`). A directory that already holds
+a legacy index keeps its layout unless the build sets
 `FSFS_COMPLETE_GENERATIONS=1` (the longer `FRANKENSEARCH_COMPLETE_GENERATIONS`
 spelling takes precedence), which converts it; `=0` keeps building legacy
 indexes:

@@ -261,16 +261,18 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     }
 
     // The layout of a first build. Unset, a new root starts as a complete
-    // store (generations are Linux/macOS only) and a legacy index keeps its
-    // layout; true also converts a legacy root on its next build; false keeps
-    // building legacy indexes. Existing selections are always recognized.
+    // store on Linux, the platform its generations are qualified on, and a
+    // legacy index keeps its layout; true also converts a legacy root on its
+    // next build (and opts in on macOS); false keeps building legacy indexes.
+    // Existing selections are always recognized.
     let complete_generations = parse_env_bool(
         &env_map,
         "FRANKENSEARCH_COMPLETE_GENERATIONS",
         "FSFS_COMPLETE_GENERATIONS",
     )?;
     let initialize_complete_store = complete_generations.unwrap_or(false);
-    let complete_generations_for_new_roots = complete_generations.unwrap_or(cfg!(unix));
+    let complete_generations_for_new_roots =
+        complete_generations.unwrap_or(cfg!(target_os = "linux"));
     // What a complete-store publication does with superseded generations:
     // collect (default), report (dry run), or off.
     let generation_retention = parse_generation_retention(&env_map)?;

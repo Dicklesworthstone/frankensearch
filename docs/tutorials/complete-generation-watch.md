@@ -1,7 +1,8 @@
 # Watch while complete-generation searches remain available
 
 This route is for the Unix complete-generation store, which a watch into a
-directory with no index creates. It does not change the legacy mutable watcher:
+directory with no index creates on Linux (on macOS, set
+`FSFS_COMPLETE_GENERATIONS=1`). It does not change the legacy mutable watcher:
 an existing legacy index keeps watching on that layout unless a build converts
 it with `FSFS_COMPLETE_GENERATIONS=1`. Use a store outside the source tree; its
 parent must already exist. Configure verified

@@ -324,8 +324,8 @@ predecessor, which share their unchanged keyword segments (a 19,480-file
 store held 186 MB after 8 watched edits, about one fresh build). On that tree a
 one-line edit is published in about 1.8–2.0 s (median per round, lite release
 build), against about 0.7 s for the legacy watcher to commit it. An index that
-keeps the legacy layout (one built by an earlier fsfs, on a platform without
-generation support, or with `FSFS_COMPLETE_GENERATIONS=0`) has a known limit
+keeps the legacy layout (one built by an earlier fsfs, on a platform other than
+Linux, or with `FSFS_COMPLETE_GENERATIONS=0`) has a known limit
 (bd-z2nfa): its watcher holds the vector files' exclusive writer lock for its
 whole life, so `fsfs search` from another process (and the query daemon) is
 refused with "another fsfs process is writing this index's vector files" until
@@ -551,9 +551,11 @@ each word scored for a hit, run `fsfs explain <rank>` after the search.
 
 The complete-generation store publishes lexical data, vector tiers, and the
 catalog as one retained bundle, so readers in other processes, including a
-search while `fsfs watch` runs, always see one whole generation. On Linux and
-macOS a build into a directory with no index creates this store, and later
-commands recognize it automatically. A directory that already holds a legacy
+search while `fsfs watch` runs, always see one whole generation. On Linux a
+build into a directory with no index creates this store, and later commands
+recognize it automatically; on macOS, where the store is not yet qualified on
+release hosts, a build creates it only with `FSFS_COMPLETE_GENERATIONS=1`. A
+directory that already holds a legacy
 index keeps that layout: `FSFS_COMPLETE_GENERATIONS=1` converts it on its next
 build (reusing its keyword rows and vectors instead of recomputing them, and
 leaving the old `vector/`, `lexical/` and `index_sentinel.json` behind, unread),
