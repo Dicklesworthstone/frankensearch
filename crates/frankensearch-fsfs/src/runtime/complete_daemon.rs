@@ -255,12 +255,32 @@ impl FsfsRuntime {
         const STOP_WAIT_ATTEMPTS: usize = 400;
 
         let started = Instant::now();
-        control::stop(
+        match control::stop(
             cx,
             socket,
             Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS),
         )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            // No socket, or one a dead daemon left behind: report that there
+            // is nothing to stop, as the legacy stop does without a pid file,
+            // rather than a bare filesystem error.
+            Err(SearchError::Io(error))
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound | ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Err(SearchError::InvalidConfig {
+                    field: "complete_generation.daemon_stop".to_owned(),
+                    value: socket.display().to_string(),
+                    reason: "no query daemon is listening on the store's socket; nothing to stop"
+                        .to_owned(),
+                });
+            }
+            Err(error) => return Err(error),
+        }
         if !Self::socket_released(cx, socket, STOP_WAIT_ATTEMPTS).await? {
             return Err(SearchError::InvalidConfig {
                 field: "complete_generation.daemon_stop".to_owned(),
@@ -1704,6 +1724,31 @@ mod generation_tests {
                     .unwrap()
                     .is_some()
             );
+        });
+    }
+
+    #[test]
+    fn stop_without_a_listening_daemon_reports_nothing_to_stop() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let missing = directory.path().join("absent.sock");
+            // A socket file whose daemon died refuses connections.
+            let stale = directory.path().join("stale.sock");
+            drop(UnixListener::bind(&stale).unwrap());
+            assert!(stale.exists());
+            for socket in [missing, stale] {
+                let error = runtime
+                    .stop_complete_generation_daemon(&cx, &socket)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&error, SearchError::InvalidConfig { field, reason, .. }
+                        if field == "complete_generation.daemon_stop"
+                            && reason.contains("nothing to stop")),
+                    "{socket:?}: {error}"
+                );
+            }
         });
     }
 
