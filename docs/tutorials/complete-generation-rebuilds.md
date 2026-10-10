@@ -6,7 +6,8 @@ bundle and selects that bundle only after the existing indexing and search
 admission checks succeed. Old bundles and abandoned builds are retained.
 
 This route is currently Unix-only. Start with a fresh store outside the source
-tree, with an existing parent directory. In-place migration of a legacy index
+tree or beneath one of its hidden directories, with an existing parent
+directory. In-place migration of a legacy index
 is not qualified by this workflow. Configure a generation-local catalog:
 
 ```toml
@@ -27,10 +28,11 @@ refuses searches here as it does on the legacy layout.
 
 ## Build and query
 
-On Linux a build into a directory with no index, outside the source tree,
-creates the store (on macOS the build sets `FSFS_COMPLETE_GENERATIONS=1`). A
-store inside the source tree, such as the default in-project `.frankensearch`,
-gets a legacy index. A directory that already holds
+On Linux a build into a directory with no index creates the store (on macOS
+the build sets `FSFS_COMPLETE_GENERATIONS=1`). Inside the source tree the store
+must sit beneath a hidden directory, like the default in-project
+`.frankensearch`; a new index anywhere else inside the source stays legacy. A
+directory that already holds
 a legacy index keeps its layout unless the build sets
 `FSFS_COMPLETE_GENERATIONS=1` (the longer `FRANKENSEARCH_COMPLETE_GENERATIONS`
 spelling takes precedence), which converts it; `=0` keeps building legacy

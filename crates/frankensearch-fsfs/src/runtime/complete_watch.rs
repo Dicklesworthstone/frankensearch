@@ -19,8 +19,8 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
 use super::{
-    FsfsRuntime, index_discovery_walker, retained_search_checkpoint,
-    validate_retained_catalog_path,
+    FsfsRuntime, STORE_OVERLAP_REASON, canonical_store_root, index_discovery_walker,
+    retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
 use crate::OutputFormat;
 use crate::config::{
@@ -209,18 +209,33 @@ fn record_notification(changes: &Mutex<Changes>, result: notify::Result<Event>, 
     }
 }
 
+/// An event naming only paths inside the store is the store's own write,
+/// never a source change, when the store sits inside the source. A rescan
+/// request, or an event naming no path, still counts.
+fn is_store_event(event: &Event, store: &Path) -> bool {
+    !event.need_rescan()
+        && !event.paths.is_empty()
+        && event.paths.iter().all(|path| path.starts_with(store))
+}
+
 /// Keep the original root inode alive so remove/recreate cannot be mistaken
 /// for an authoritative empty corpus. All later indexing uses this canonical
 /// source path, not a possibly retargeted original CLI alias.
 struct SourceRoot {
     path: PathBuf,
     directory: File,
+    /// The generation store, when it sits inside the source: never a source.
+    excluded: Option<PathBuf>,
 }
 
 impl SourceRoot {
     fn open(path: PathBuf) -> SearchResult<Self> {
         let directory = File::open(&path)?;
-        let source = Self { path, directory };
+        let source = Self {
+            path,
+            directory,
+            excluded: None,
+        };
         source.check()?;
         Ok(source)
     }
@@ -291,7 +306,14 @@ impl SourceRoot {
                     source: Box::new(std::io::Error::other(error.to_string())),
                 });
             }
-            discoverable.insert(entry.into_path());
+            let path = entry.into_path();
+            if !self
+                .excluded
+                .as_deref()
+                .is_some_and(|store| path.starts_with(store))
+            {
+                discoverable.insert(path);
+            }
         }
         let mut files = Vec::new();
         let mut directories = BTreeMap::new();
@@ -495,25 +517,9 @@ fn check_watch_publication(
 /// A read-only preflight: do not create a staging tree inside the source even
 /// transiently, since that could recursively trigger its own notifications.
 fn resolve_watch_store(source: &Path, root: &Path) -> SearchResult<PathBuf> {
-    let root = match fs::canonicalize(root) {
-        Ok(root) => root,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let name = root.file_name().ok_or_else(|| {
-                complete_cli_error("store_root", "a store root needs a directory name")
-            })?;
-            let parent = root
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            fs::canonicalize(parent)?.join(name)
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if source.starts_with(&root) || root.starts_with(source) {
-        return Err(complete_cli_error(
-            "store_root",
-            "source and generation-store trees must not overlap",
-        ));
+    let root = canonical_store_root(root)?;
+    if store_overlaps_source(&root, source) {
+        return Err(complete_cli_error("store_root", STORE_OVERLAP_REASON));
     }
     Ok(root)
 }
@@ -544,8 +550,11 @@ impl CompleteWatchSession {
     fn open(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> SearchResult<Self> {
         retained_search_checkpoint(cx)?;
         validate_retained_catalog_path(&runtime.config.storage.db_path)?;
-        let source = SourceRoot::open(fs::canonicalize(runtime.resolve_target_root()?)?)?;
+        let mut source = SourceRoot::open(fs::canonicalize(runtime.resolve_target_root()?)?)?;
         let store_root = resolve_watch_store(&source.path, root)?;
+        source.excluded = store_root
+            .starts_with(&source.path)
+            .then(|| store_root.clone());
         // Preserve the store's refusal of a symlink supplied by the caller;
         // canonicalization above is only for overlap checking and anchoring.
         if fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
@@ -556,8 +565,14 @@ impl CompleteWatchSession {
         }
         let changes = Arc::new(Mutex::new(Changes::default()));
         let callback_changes = Arc::clone(&changes);
-        let mut watcher = notify::recommended_watcher(move |result| {
-            record_notification(&callback_changes, result, Instant::now());
+        let callback_store = store_root.clone();
+        let mut watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
+            if !result
+                .as_ref()
+                .is_ok_and(|event| is_store_event(event, &callback_store))
+            {
+                record_notification(&callback_changes, result, Instant::now());
+            }
         })
         .map_err(|source| SearchError::SubsystemError {
             subsystem: "fsfs.complete_generation.watch",
@@ -1258,6 +1273,29 @@ mod tests {
         assert!(resolve_watch_store(&source, &nested).is_err());
         assert!(!nested.exists());
         assert!(resolve_watch_store(&nested, &source).is_err());
+        // Beneath a hidden directory of the source, a store is accepted.
+        let hidden = source.join(".frankensearch");
+        assert_eq!(resolve_watch_store(&source, &hidden).unwrap(), hidden);
+        assert!(!hidden.exists());
+    }
+
+    #[test]
+    fn complete_watch_drops_only_the_stores_own_events() {
+        let store = Path::new("/work/source/.frankensearch");
+        let event = |paths: &[&str]| {
+            paths.iter().fold(
+                Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Content))),
+                |event, path| event.add_path(PathBuf::from(path)),
+            )
+        };
+        let own = "/work/source/.frankensearch/generations/g1/manifest.json";
+        assert!(is_store_event(&event(&[own]), store));
+        assert!(!is_store_event(&event(&["/work/source/a.md"]), store));
+        assert!(!is_store_event(&event(&[own, "/work/source/a.md"]), store));
+        // A sibling sharing the store's name as a string prefix is a source.
+        assert!(!is_store_event(&event(&["/work/source/.frankensearch-notes.md"]), store));
+        assert!(!is_store_event(&event(&[]), store));
+        assert!(!is_store_event(&event(&[own]).set_flag(Flag::Rescan), store));
     }
 
     #[test]

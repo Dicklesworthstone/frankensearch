@@ -233,6 +233,44 @@ fn validate_retained_catalog_path(value: &str) -> SearchResult<()> {
     })
 }
 
+const STORE_OVERLAP_REASON: &str = "source and generation-store trees must not overlap, except for a store beneath a hidden directory of the source";
+
+/// Whether a complete-generation store at `store` overlaps the source tree at
+/// `source` (both canonical). A store may not hold its source. It may sit
+/// inside it only beneath a hidden directory, like the default in-project
+/// `.frankensearch`: index discovery never enters hidden entries, and builds
+/// and watches also exclude the store by path, so its files never become
+/// sources and its publications never look like source changes.
+fn store_overlaps_source(store: &Path, source: &Path) -> bool {
+    if source.starts_with(store) {
+        return true;
+    }
+    store.strip_prefix(source).is_ok_and(|inside| {
+        !inside
+            .components()
+            .any(|component| component.as_os_str().as_encoded_bytes().starts_with(b"."))
+    })
+}
+
+/// Canonicalize a store root that may not exist yet through its existing
+/// parent, so an overlap check never has to create the store first.
+fn canonical_store_root(root: &Path) -> SearchResult<PathBuf> {
+    match fs::canonicalize(root) {
+        Ok(root) => Ok(root),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name = root.file_name().ok_or_else(|| {
+                complete_cli::complete_cli_error("store_root", "a store root needs a directory name")
+            })?;
+            let parent = root
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            Ok(fs::canonicalize(parent)?.join(name))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Unlink Quill segments an unpublished candidate no longer references.
 ///
 /// A candidate starts with every file of its predecessor, retired merge inputs
@@ -420,14 +458,15 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         let target_root = fs::canonicalize(self.resolve_target_root()?)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
-        let store = CompleteGenerationStore::create(cx, store_root)?;
-        if store.root().starts_with(&target_root) || target_root.starts_with(store.root()) {
+        let canonical_root = canonical_store_root(store_root)?;
+        if store_overlaps_source(&canonical_root, &target_root) {
             return Err(SearchError::InvalidConfig {
                 field: "complete_generation.store_root".to_owned(),
-                value: store.root().display().to_string(),
-                reason: "source and generation-store trees must not overlap".to_owned(),
+                value: canonical_root.display().to_string(),
+                reason: STORE_OVERLAP_REASON.to_owned(),
             });
         }
+        let store = CompleteGenerationStore::create(cx, store_root)?;
         let build = store.begin(cx)?;
         let mut input = self.cli_input.clone();
         input.command = CliCommand::Index;
@@ -440,6 +479,7 @@ impl FsfsRuntime {
         // unrelated runtime with no blocking pool.
         let mut candidate = self.clone().with_cli_input(input);
         candidate.config.indexing.watch_mode = false;
+        candidate.discovery_excluded_root = Some(store.root().to_path_buf());
         let summary =
             Box::pin(candidate.run_retained_index_with_reuse(cx, &store, build.path())).await?;
         reclaim_unpublished_lexical_garbage(cx, build.path()).await?;

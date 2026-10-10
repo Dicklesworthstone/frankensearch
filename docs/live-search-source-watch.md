@@ -9,8 +9,9 @@ fsfs live-search --watch-source /path/to/source \
   --hybrid --config /path/to/fsfs.toml --max-updates 20
 ```
 
-Source and store trees must not overlap. A new store can be bootstrapped when its
-parent exists. An existing store is handled by the same complete-generation
+The store may not contain the source tree, and may sit inside it only beneath a
+hidden directory, whose writes the watcher ignores. A new store can be
+bootstrapped when its parent exists. An existing store is handled by the same complete-generation
 writer admission and source checks as `fsfs watch`. Discovery, owner/privacy,
 pressure, producer identity, and checkpoint-proven reuse policies remain in the
 ordinary indexer. Models must already be installed; this command stays offline.

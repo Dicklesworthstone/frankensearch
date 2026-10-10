@@ -12,8 +12,9 @@ use frankensearch_core::{SearchError, SearchResult};
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
-    SearchDashboardState, SearchExecutionFlags, iso_timestamp_now, pressure_timestamp_ms,
-    retained_search_checkpoint, validate_retained_catalog_path,
+    SearchDashboardState, SearchExecutionFlags, canonical_store_root, iso_timestamp_now,
+    pressure_timestamp_ms, retained_search_checkpoint, store_overlaps_source,
+    validate_retained_catalog_path,
 };
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
@@ -394,11 +395,12 @@ impl FsfsRuntime {
         let selected = complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
             || complete_entry_exists(&root.join("generations"))?;
         // Only a build chooses a layout: the explicit opt-in for any root, the
-        // new-root default for a root with no legacy index outside the source
-        // tree (a complete store refuses to overlap its source, and the
-        // default in-project `.frankensearch` does). Every other command
-        // follows the layout on disk, so before the first complete build it
-        // neither fails on the absent store nor hides a legacy index.
+        // new-root default for a root with no legacy index that a complete
+        // build accepts (outside the source tree, or beneath one of its hidden
+        // directories like the default in-project `.frankensearch`). Every
+        // other command follows the layout on disk, so before the first
+        // complete build it neither fails on the absent store nor hides a
+        // legacy index.
         let builds = matches!(
             self.cli_input.command,
             CliCommand::Index | CliCommand::Watch
@@ -407,7 +409,7 @@ impl FsfsRuntime {
             && (initialize_store
                 || (self.complete_generations_for_new_roots
                     && !legacy_index_exists(&root)?
-                    && store_is_outside_source(&root, &self.resolve_target_root()?)?));
+                    && store_admits_source(&root, &self.resolve_target_root()?)));
         Ok((selected || starts_complete).then_some(root))
     }
 
@@ -1403,33 +1405,15 @@ const LEGACY_INDEX_ENTRIES: [&str; 4] = [
     "lexical",
 ];
 
-/// Whether a store at `root` is provably disjoint from the source tree at
-/// `source`, as a complete store requires. A root that does not exist yet
-/// resolves through its parent; anything that cannot be resolved counts as
-/// overlapping, so the new-root default leaves that build on the legacy route.
-fn store_is_outside_source(root: &Path, source: &Path) -> SearchResult<bool> {
-    let Ok(source) = fs::canonicalize(source) else {
-        return Ok(false);
+/// Whether a complete build would accept a store at `root` for the source
+/// tree at `source` (see `store_overlaps_source`). Anything that cannot be
+/// resolved counts as refused, so the new-root default leaves that build on
+/// the legacy route.
+fn store_admits_source(root: &Path, source: &Path) -> bool {
+    let (Ok(root), Ok(source)) = (canonical_store_root(root), fs::canonicalize(source)) else {
+        return false;
     };
-    let root = match fs::canonicalize(root) {
-        Ok(root) => root,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let (Some(parent), Some(name)) = (root.parent(), root.file_name()) else {
-                return Ok(false);
-            };
-            let parent = if parent.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                parent
-            };
-            let Ok(parent) = fs::canonicalize(parent) else {
-                return Ok(false);
-            };
-            parent.join(name)
-        }
-        Err(error) => return Err(error.into()),
-    };
-    Ok(!root.starts_with(&source) && !source.starts_with(&root))
+    !store_overlaps_source(&root, &source)
 }
 
 /// Whether `root` holds a legacy index or an interrupted legacy build, which
@@ -3109,11 +3093,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, source, root) = fixture(directory.path());
         let runtime = runtime.with_complete_generations_for_new_roots(true);
-        // A store inside the source tree, like the default in-project
-        // `.frankensearch`, or one holding the source, would be refused by a
-        // complete build: the default leaves such a build legacy, while an
-        // explicit opt-in still routes it (and gets the overlap refusal).
-        for overlapping in [source.join(".frankensearch"), directory.path().to_path_buf()] {
+        // A store holding the source, or inside it but not beneath a hidden
+        // directory, would be refused by a complete build: the default leaves
+        // such a build legacy, while an explicit opt-in still routes it (and
+        // gets the overlap refusal).
+        for overlapping in [source.join("store"), directory.path().to_path_buf()] {
             let mut build = runtime.clone();
             build.cli_input.index_dir = Some(overlapping.clone());
             assert!(
@@ -3128,6 +3112,14 @@ mod tests {
                 Some(overlapping)
             );
         }
+        // The default in-project `.frankensearch` is inside the source beneath
+        // a hidden directory, which a complete build accepts.
+        let mut in_project = runtime.clone();
+        in_project.cli_input.index_dir = Some(source.join(".frankensearch"));
+        assert_eq!(
+            in_project.complete_generation_command_root(false).unwrap(),
+            Some(source.join(".frankensearch"))
+        );
         // A build into a missing or empty root starts a complete store.
         assert_eq!(
             runtime.complete_generation_command_root(false).unwrap(),
@@ -3166,6 +3158,67 @@ mod tests {
                 Some(legacy)
             );
         }
+    }
+
+    #[test]
+    fn a_store_may_sit_in_its_source_only_beneath_a_hidden_directory() {
+        let source = Path::new("/work/source");
+        for (store, overlaps) in [
+            ("/work/source", true),
+            ("/work", true),
+            ("/work/source/store", true),
+            ("/work/source/docs/index", true),
+            ("/work/source/.frankensearch", false),
+            ("/work/source/.cache/fsfs/store", false),
+            ("/work/source-store", false),
+            ("/elsewhere/store", false),
+        ] {
+            assert_eq!(
+                store_overlaps_source(Path::new(store), source),
+                overlaps,
+                "{store}"
+            );
+        }
+    }
+
+    #[test]
+    fn complete_index_builds_into_a_hidden_store_inside_the_source() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, _) = fixture(directory.path());
+            let root = source.join(".frankensearch");
+            runtime.cli_input.index_dir = Some(root.clone());
+            // Unhide the store: discovery now walks into it, so only the
+            // build's path exclusion keeps its generations out of the sources.
+            fs::write(source.join(".ignore"), "!.frankensearch/\n").unwrap();
+            for build in 0..2 {
+                let receipt = publish(&runtime, &cx, &root).await;
+                assert_eq!(receipt["data"]["discovered_files"], 1, "build {build}: {receipt}");
+                assert_eq!(receipt["data"]["indexed_files"], 1, "build {build}: {receipt}");
+            }
+            let mut output = Vec::new();
+            Box::pin(search_runtime(&runtime).run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut output,
+            ))
+            .await
+            .unwrap();
+            let search: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(search["data"]["hits"].as_array().unwrap().len(), 1, "{search}");
+            assert_eq!(search["data"]["hits"][0]["path"], "alpha.md", "{search}");
+
+            // A store inside the source but not beneath a hidden directory is
+            // refused before anything is created.
+            let visible = source.join("store");
+            runtime.cli_input.index_dir = Some(visible.clone());
+            let error = runtime
+                .run_complete_generation_index_with_writer(&cx, &visible, &mut Vec::new())
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("overlap"), "{error}");
+            assert!(!visible.exists());
+        });
     }
 
     #[test]

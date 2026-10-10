@@ -5,8 +5,8 @@ use asupersync::test_utils::run_test_with_cx;
 use notify::Watcher;
 
 use super::super::{
-    Changes, CompleteWatchSession, DEBOUNCE, RECONCILE_INTERVAL, is_source_changed, lock_changes,
-    require_durable_publication,
+    Changes, CompleteWatchSession, DEBOUNCE, MAX_DEBOUNCE, RECONCILE_INTERVAL, is_source_changed,
+    lock_changes, require_durable_publication,
 };
 use super::*;
 use crate::config::{DegradationOverrideMode, DiscoveryConfig};
@@ -918,5 +918,50 @@ fn a_build_that_loses_a_race_retries_as_a_delta_with_every_hint() {
             let hits = reader.search(&cx, word, 10).await.unwrap();
             assert_eq!(hits.last().unwrap().hits.len(), 1, "{word}");
         }
+    });
+}
+
+#[test]
+fn a_hidden_store_inside_the_source_does_not_wake_its_own_watcher() {
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut runtime, source, _) = fixture(directory.path());
+        let root = source.join(".frankensearch");
+        runtime.cli_input.index_dir = Some(root.clone());
+        // The native backend stays registered: every write of the store's
+        // publication reaches it, and none may mark the source dirty.
+        let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+        let first = initial(&mut session, &cx).await;
+        assert!(first.path().starts_with(&root));
+        let dirty = |session: &CompleteWatchSession| {
+            lock_changes(&session.changes).unwrap().dirty.is_some()
+        };
+        let quiet_until = Instant::now() + std::time::Duration::from_millis(1_500);
+        while Instant::now() < quiet_until {
+            assert!(!dirty(&session), "the store's own writes marked the source dirty");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // The backend is live: a source write still registers.
+        fs::write(source.join("alpha.md"), "replacementword new body").unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !dirty(&session) {
+            assert!(Instant::now() < deadline, "the source write was not observed");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let second = require_durable_publication(
+            session
+                .advance(&cx, Instant::now() + MAX_DEBOUNCE)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut reader = lexical_reader(&runtime)
+            .open_retained_search(&cx, &root)
+            .await
+            .unwrap();
+        assert_eq!(reader.generation(), &second);
+        let hits = reader.search(&cx, "replacementword", 10).await.unwrap();
+        assert_eq!(hits.last().unwrap().hits.len(), 1);
     });
 }

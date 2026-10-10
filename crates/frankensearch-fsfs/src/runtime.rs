@@ -6052,6 +6052,11 @@ pub struct FsfsRuntime {
     /// rebuild carries their checkpoint-proven rows forward instead of
     /// rereading, canonicalizing and re-indexing them (bd-dnqgr).
     unchanged_sources: Option<Arc<BTreeSet<PathBuf>>>,
+    /// A complete-generation build discovers no file beneath its whole store,
+    /// not only beneath the generation it writes. A store inside the source
+    /// sits beneath a hidden directory the walker skips, but a `.gitignore`
+    /// whitelist can unhide that directory.
+    discovery_excluded_root: Option<PathBuf>,
 }
 
 /// Private CLI entry point used to extract embedded weights in a short-lived process.
@@ -6078,6 +6083,7 @@ impl FsfsRuntime {
             complete_generations_for_new_roots: false,
             lexical_only_indexing: !SEMANTIC_LOADERS_COMPILED,
             unchanged_sources: None,
+            discovery_excluded_root: None,
         }
     }
 
@@ -21994,7 +22000,12 @@ impl FsfsRuntime {
             }
 
             let entry_path = entry.path().to_path_buf();
-            if entry_path.starts_with(index_root) {
+            if entry_path.starts_with(index_root)
+                || self
+                    .discovery_excluded_root
+                    .as_deref()
+                    .is_some_and(|root| entry_path.starts_with(root))
+            {
                 skipped_files = skipped_files.saturating_add(1);
                 reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
                 continue;
