@@ -378,6 +378,24 @@ impl FsfsRuntime {
                             continue;
                         }
                     };
+                    if is_ready_probe(&bytes) {
+                        // The legacy daemon's readiness probe: pid, the admitted
+                        // vector generation and whether a semantic embedder is
+                        // loaded yet, answered without a search or a refresh.
+                        let ready = encode_response(&Self::search_serve_ready_event(
+                            session.reader.runtime.cli_input.format.to_string(),
+                            &session.reader.resources,
+                        ))?;
+                        match write_response(cx, &mut peer, &ready, peer_timeout).await {
+                            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                            Err(error) => {
+                                tracing::debug!(%error, "complete-generation readiness probe ended");
+                            }
+                            Ok(()) => {}
+                        }
+                        last_activity = Instant::now();
+                        continue;
+                    }
                     if forwarding::is_forwarded(&bytes) {
                         // Forwarded and raw requests share the same admitted
                         // generation and bounded hot cache. The forwarder clears
@@ -754,6 +772,14 @@ async fn run_request<T>(
             return Ok(result);
         }
     }
+}
+
+/// `ready` or `:ready`, as the legacy query daemon accepts them.
+fn is_ready_probe(bytes: &[u8]) -> bool {
+    matches!(
+        std::str::from_utf8(bytes).map(str::trim),
+        Ok("ready" | ":ready")
+    )
 }
 
 fn encode_response<T: Serialize>(response: &T) -> SearchResult<Vec<u8>> {
@@ -1672,6 +1698,82 @@ mod generation_tests {
                     .unwrap()
                     .is_some()
             );
+        });
+    }
+
+    #[test]
+    fn complete_daemon_answers_the_readiness_probe_without_searching() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let root = directory.path().join("store");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
+            let mut config = FsfsConfig::default();
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            config.indexing.offline = true;
+            config.indexing.quality_model.clear();
+            config.search.fast_only = true;
+            config.search.rerank = false;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Daemon,
+                target_path: Some(source.clone()),
+                index_dir: Some(root.clone()),
+                quiet: true,
+                ..CliInput::default()
+            });
+            assert!(matches!(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
+            let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);
+            let cancel = CancelOnDrop(cx.clone());
+            let worker = std::thread::spawn(move || {
+                let _cancel = cancel;
+                let exchange = |request: &[u8]| -> serde_json::Value {
+                    let started = Instant::now();
+                    let mut stream = loop {
+                        match UnixStream::connect(&endpoint) {
+                            Ok(stream) => break stream,
+                            Err(error) => {
+                                assert!(started.elapsed() < Duration::from_secs(10), "{error}");
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(10)))
+                        .unwrap();
+                    stream.write_all(request).unwrap();
+                    let mut line = String::new();
+                    std::io::BufReader::new(stream)
+                        .read_line(&mut line)
+                        .unwrap();
+                    serde_json::from_str(&line).unwrap()
+                };
+                for probe in [&b"ready\n"[..], b":ready\n"] {
+                    let ready = exchange(probe);
+                    assert_eq!(ready["event"], "ready", "a probe is not a search: {ready}");
+                    assert_eq!(ready["ok"], true);
+                    assert_eq!(ready["pid"], std::process::id());
+                    assert!(ready.get("payloads").is_none(), "{ready}");
+                }
+                let searched = exchange(b"{\"query\":\"sharedtoken\",\"limit\":10}\n");
+                assert_eq!(searched["ok"], true, "{searched}");
+                assert!(searched["payloads"].is_array(), "{searched}");
+            });
+            let result = runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await;
+            worker.join().unwrap();
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "{result:?}"
+            );
+            cx.set_cancel_requested(false);
         });
     }
 }
