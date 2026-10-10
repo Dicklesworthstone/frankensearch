@@ -6040,6 +6040,9 @@ pub struct FsfsRuntime {
     bundled_model_materializer: Option<PathBuf>,
     /// What complete-generation commands do with superseded generations.
     generation_retention: crate::generation_store::GenerationRetention,
+    /// A build into a root with no index yet starts a complete-generation
+    /// store; a root that holds a legacy index keeps its layout (bd-z2nfa).
+    complete_generations_for_new_roots: bool,
     /// Build generations with the lexical arm only: no embedder, no vector
     /// tiers. Always set in a build without semantic loaders (bd-636yz).
     lexical_only_indexing: bool,
@@ -6072,6 +6075,7 @@ impl FsfsRuntime {
             #[cfg(feature = "embedded-models")]
             bundled_model_materializer: None,
             generation_retention: crate::generation_store::GenerationRetention::default(),
+            complete_generations_for_new_roots: false,
             lexical_only_indexing: !SEMANTIC_LOADERS_COMPILED,
             unchanged_sources: None,
         }
@@ -6101,6 +6105,17 @@ impl FsfsRuntime {
         retention: crate::generation_store::GenerationRetention,
     ) -> Self {
         self.generation_retention = retention;
+        self
+    }
+
+    /// Start every new index root as a complete-generation store, so a
+    /// watched index serves searches from other processes. A root that
+    /// already holds a legacy index keeps its layout until a build opts it in
+    /// explicitly. The CLI enables this on Unix unless
+    /// `FSFS_COMPLETE_GENERATIONS` is false.
+    #[must_use]
+    pub const fn with_complete_generations_for_new_roots(mut self, enabled: bool) -> Self {
+        self.complete_generations_for_new_roots = enabled;
         self
     }
 

@@ -316,19 +316,20 @@ fsfs search "how does retry backoff work" --limit 5
 
 Plain `fsfs index <path>` is a one-shot operation: it seals the generation and
 exits. Use `fsfs watch <path>` or `fsfs index <path> --watch` only when you
-explicitly want a long-running incremental watcher. Known limit (bd-z2nfa):
-the watcher holds the vector generations' exclusive writer lock for its whole
-life, so `fsfs search` from another process (and the query daemon) is refused
-with "another fsfs process is writing this index's vector files" until the
-watcher stops; new and changed files are ingested and become searchable the
-moment it exits, and the in-process TUI cockpit can search a watched index.
-The opt-in complete-generation layout (see "Complete generations" below)
-serves searches while it is watched: a watched change is searchable from
-another process within seconds, and retention keeps the active generation and
-one predecessor, which share their unchanged keyword segments (a 19,480-file
+explicitly want a long-running incremental watcher. A new index uses the
+complete-generation layout (see "Complete generations" below), which serves
+searches while it is watched: a watched change is searchable from another
+process within seconds, and retention keeps the active generation and one
+predecessor, which share their unchanged keyword segments (a 19,480-file
 store held 186 MB after 8 watched edits, about one fresh build). On that tree a
 one-line edit is published in about 1.8–2.0 s (median per round, lite release
-build), against about 0.7 s for the legacy watcher to commit it.
+build), against about 0.7 s for the legacy watcher to commit it. An index that
+keeps the legacy layout (one built by an earlier fsfs, on a platform without
+generation support, or with `FSFS_COMPLETE_GENERATIONS=0`) has a known limit
+(bd-z2nfa): its watcher holds the vector files' exclusive writer lock for its
+whole life, so `fsfs search` from another process (and the query daemon) is
+refused with "another fsfs process is writing this index's vector files" until
+the watcher stops. Build it once with `FSFS_COMPLETE_GENERATIONS=1` to convert it.
 
 Example output:
 
@@ -546,14 +547,20 @@ the BM25 tier matches for it. The BM25 tier also understands:
 `*` is not a wildcard: `quantiz*` searches for the word `quantiz`. To see how
 each word scored for a hit, run `fsfs explain <rank>` after the search.
 
-### Complete generations (opt-in)
+### Complete generations (the default for new indexes)
 
 The complete-generation store publishes lexical data, vector tiers, and the
-catalog as one retained bundle. Opt in on the initial build; later commands
-recognize the store automatically:
+catalog as one retained bundle, so readers in other processes, including a
+search while `fsfs watch` runs, always see one whole generation. On Linux and
+macOS a build into a directory with no index creates this store, and later
+commands recognize it automatically. A directory that already holds a legacy
+index keeps that layout: `FSFS_COMPLETE_GENERATIONS=1` converts it on its next
+build (reusing its keyword rows and vectors instead of recomputing them, and
+leaving the old `vector/`, `lexical/` and `index_sentinel.json` behind, unread),
+and `FSFS_COMPLETE_GENERATIONS=0` keeps building legacy indexes:
 
 ```bash
-FSFS_COMPLETE_GENERATIONS=1 fsfs index ~/projects --index-dir ./search-store
+fsfs index ~/projects --index-dir ./search-store
 fsfs search "structured concurrency" --index-dir ./search-store --no-daemon
 fsfs search "structured concurrency" --explain --index-dir ./search-store --format json
 fsfs tui --index-dir ./search-store

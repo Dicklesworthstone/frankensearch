@@ -218,10 +218,13 @@ for key, name in [('HOME', 'home'), ('XDG_CONFIG_HOME', 'config'),
     path = work / name
     path.mkdir(exist_ok=True)
     env[key] = str(path)
+# This checker inspects the legacy layout's artifacts and probes their damage,
+# so its builds pin that layout; default_build_quickstart covers the default.
 env.update(FRANKENSEARCH_MODEL_DIR=str(model_root), FRANKENSEARCH_OFFLINE='1',
            FRANKENSEARCH_ALLOW_DOWNLOAD='0', FRANKENSEARCH_CHECK_UPDATES='0',
            FRANKENSEARCH_LOG='info', FSFS_DISABLE_QUERY_CACHE='1', NO_COLOR='1',
-           RAYON_NUM_THREADS='1', FSFS_A5_OWNER=str(work), OPENAI_API_KEY=REDACTION_CANARY)
+           RAYON_NUM_THREADS='1', FSFS_A5_OWNER=str(work), OPENAI_API_KEY=REDACTION_CANARY,
+           FSFS_COMPLETE_GENERATIONS='0')
 
 
 class Refusal(Exception):

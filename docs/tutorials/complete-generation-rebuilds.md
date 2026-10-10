@@ -27,11 +27,14 @@ refuses searches here as it does on the legacy layout.
 
 ## Build and query
 
-Opt in for the initial build (the longer `FRANKENSEARCH_COMPLETE_GENERATIONS`
-spelling takes precedence over `FSFS_COMPLETE_GENERATIONS`):
+A build into a directory with no index creates the store. A directory that
+already holds a legacy index keeps its layout unless the build sets
+`FSFS_COMPLETE_GENERATIONS=1` (the longer `FRANKENSEARCH_COMPLETE_GENERATIONS`
+spelling takes precedence), which converts it; `=0` keeps building legacy
+indexes:
 
 ```sh
-FSFS_COMPLETE_GENERATIONS=1 fsfs index /work/source \
+fsfs index /work/source \
   --index-dir /work/search-store --config /work/fsfs.toml --format json
 ```
 

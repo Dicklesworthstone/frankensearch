@@ -9,14 +9,14 @@ use std::time::Instant;
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 
+use super::{
+    FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
+    FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
+    SearchDashboardState, SearchExecutionFlags, iso_timestamp_now, pressure_timestamp_ms,
+    retained_search_checkpoint, validate_retained_catalog_path,
+};
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
-use super::{
-    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload,
-    FsfsRuntime, FtuiSession, InterfaceMode, SearchDashboardState, SearchExecutionFlags,
-    iso_timestamp_now, pressure_timestamp_ms, retained_search_checkpoint,
-    validate_retained_catalog_path,
-};
 use crate::adapters::format_emitter::{emit_envelope, meta_for_format};
 use crate::generation_store::{
     COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER, CompleteGenerationStore,
@@ -144,8 +144,9 @@ impl FsfsRuntime {
     /// Run a command with complete-generation publication and reader admission.
     ///
     /// `initialize_store` explicitly opts a new or legacy index root into this
-    /// layout. Once a root has a selection or staging tree, commands recognize
-    /// it without that opt-in. Rebuilds retain the predecessor until publication;
+    /// layout; without it, a build into a root with no index starts here when
+    /// the runtime's new-root default is on. Once a root has a selection or
+    /// staging tree, commands recognize it without either. Rebuilds retain the predecessor until publication;
     /// searches pin one admitted bundle and do not write caches into it.
     ///
     /// Legacy roots retain their ordinary dispatch. Unsupported complete-store
@@ -392,14 +393,18 @@ impl FsfsRuntime {
         // or after the active descriptor has been removed out of protocol.
         let selected = complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
             || complete_entry_exists(&root.join("generations"))?;
-        // The opt-in chooses the layout of a build. Every other command
-        // follows the layout on disk, so before the first complete build it
-        // neither fails on the absent store nor hides an existing legacy index.
+        // Only a build chooses a layout: the explicit opt-in for any root, the
+        // new-root default for a root with no legacy index. Every other
+        // command follows the layout on disk, so before the first complete
+        // build it neither fails on the absent store nor hides a legacy index.
         let builds = matches!(
             self.cli_input.command,
             CliCommand::Index | CliCommand::Watch
         );
-        Ok((selected || (initialize_store && builds)).then_some(root))
+        let starts_complete = builds
+            && (initialize_store
+                || (self.complete_generations_for_new_roots && !legacy_index_exists(&root)?));
+        Ok((selected || starts_complete).then_some(root))
     }
 
     /// Confirm durability of the selected immutable bundle without rescanning
@@ -1384,6 +1389,25 @@ fn complete_entry_exists(path: &Path) -> SearchResult<bool> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Entries of a legacy index root, finished or interrupted.
+const LEGACY_INDEX_ENTRIES: [&str; 4] = [
+    FSFS_SENTINEL_FILE,
+    FSFS_CHECKPOINT_FILE,
+    "vector",
+    "lexical",
+];
+
+/// Whether `root` holds a legacy index or an interrupted legacy build, which
+/// the new-root default must not convert behind the user's back.
+fn legacy_index_exists(root: &Path) -> SearchResult<bool> {
+    for entry in LEGACY_INDEX_ENTRIES {
+        if complete_entry_exists(&root.join(entry))? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// A stop signal is how a watch, daemon or server ends. The first SIGINT or
@@ -3045,6 +3069,51 @@ mod tests {
             search.complete_generation_command_root(false).unwrap(),
             Some(root)
         );
+    }
+
+    #[test]
+    fn complete_cli_new_root_default_starts_only_roots_without_a_legacy_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let (runtime, _, root) = fixture(directory.path());
+        let runtime = runtime.with_complete_generations_for_new_roots(true);
+        // A build into a missing or empty root starts a complete store.
+        assert_eq!(
+            runtime.complete_generation_command_root(false).unwrap(),
+            Some(root.clone())
+        );
+        fs::create_dir(&root).unwrap();
+        assert_eq!(
+            runtime.complete_generation_command_root(false).unwrap(),
+            Some(root)
+        );
+        // Only a build chooses a layout.
+        let search = search_runtime(&runtime);
+        assert!(
+            search
+                .complete_generation_command_root(false)
+                .unwrap()
+                .is_none()
+        );
+        // A legacy index, or an interrupted legacy build, keeps its layout
+        // unless the build opts it in explicitly.
+        for marker in LEGACY_INDEX_ENTRIES {
+            let legacy = directory.path().join(format!("legacy-{marker}"));
+            fs::create_dir(&legacy).unwrap();
+            fs::write(legacy.join(marker), b"").unwrap();
+            let mut build = runtime.clone();
+            build.cli_input.index_dir = Some(legacy.clone());
+            assert!(
+                build
+                    .complete_generation_command_root(false)
+                    .unwrap()
+                    .is_none(),
+                "{marker} marks a legacy index"
+            );
+            assert_eq!(
+                build.complete_generation_command_root(true).unwrap(),
+                Some(legacy)
+            );
+        }
     }
 
     #[test]

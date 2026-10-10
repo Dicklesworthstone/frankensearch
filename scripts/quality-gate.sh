@@ -218,8 +218,9 @@ lite_smoke() {
   cp "$target/debug/fsfs" "$work/fsfs"
   printf 'pub fn quokka_marker() -> u8 { 7 }\n' >"$work/proj/src/lib.rs"
   printf 'Wombat notes about nothing in particular.\n' >"$work/proj/README.md"
+  # The legacy layout: only a build chooses it, later commands follow the disk.
   if ! out="$(cd "$work/proj" && env -i HOME="$work/home" PATH=/usr/bin:/bin TMPDIR="$TMPDIR" \
-      XDG_RUNTIME_DIR="$work/rt" "$work/fsfs" index . --format json 2>&1)" \
+      XDG_RUNTIME_DIR="$work/rt" FSFS_COMPLETE_GENERATIONS=0 "$work/fsfs" index . --format json 2>&1)" \
     || ! printf '%s' "$out" | python3 -c 'import json,sys
 d = json.load(sys.stdin)["data"]
 sys.exit(not (d["generation_complete"] and d["indexed_files"] == 2 and d["vector_generation"] is None))'; then

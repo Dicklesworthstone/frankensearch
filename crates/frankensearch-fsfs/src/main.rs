@@ -260,14 +260,17 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         );
     }
 
-    // Opt in only for the first complete-store build. Existing selections are
-    // always recognized, even after this variable is unset or explicitly false.
-    let initialize_complete_store = parse_env_bool(
+    // The layout of a first build. Unset, a new root starts as a complete
+    // store (generations are Linux/macOS only) and a legacy index keeps its
+    // layout; true also converts a legacy root on its next build; false keeps
+    // building legacy indexes. Existing selections are always recognized.
+    let complete_generations = parse_env_bool(
         &env_map,
         "FRANKENSEARCH_COMPLETE_GENERATIONS",
         "FSFS_COMPLETE_GENERATIONS",
-    )?
-    .unwrap_or(false);
+    )?;
+    let initialize_complete_store = complete_generations.unwrap_or(false);
+    let complete_generations_for_new_roots = complete_generations.unwrap_or(cfg!(unix));
     // What a complete-store publication does with superseded generations:
     // collect (default), report (dry run), or off.
     let generation_retention = parse_generation_retention(&env_map)?;
@@ -279,7 +282,8 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     let cli_quiet = runtime_cli_input.quiet;
     let app_runtime = FsfsRuntime::new(resolved_config)
         .with_cli_input(runtime_cli_input)
-        .with_generation_retention(generation_retention);
+        .with_generation_retention(generation_retention)
+        .with_complete_generations_for_new_roots(complete_generations_for_new_roots);
     #[cfg(feature = "embedded-models")]
     let app_runtime = app_runtime.with_bundled_model_materializer(std::env::current_exe()?);
     let interface_mode = match command {

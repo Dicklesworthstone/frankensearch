@@ -301,6 +301,33 @@ mod loader_only {
     /// the legacy layout, or the generation `FSFS-CURRENT` names in a store of
     /// complete generations (`FSFS_COMPLETE_GENERATIONS=1`), whose layout
     /// inside is the same.
+    /// Whether `index` is a store of complete generations.
+    #[cfg(all(unix, any(feature = "semantic-loaders", feature = "rerank")))]
+    fn is_complete_store(index: &Path) -> bool {
+        index.join("FSFS-CURRENT").exists()
+    }
+
+    /// Ask the query daemon on `socket` to stop. A client's `quit` stops the
+    /// legacy daemon; a complete store's daemon takes only its versioned
+    /// control message (what `fsfs daemon --stop` sends), so that no ordinary
+    /// query can stop it.
+    #[cfg(all(unix, any(feature = "semantic-loaders", feature = "rerank")))]
+    fn request_daemon_stop(socket: &Path, complete: bool) {
+        use std::io::{Read as _, Write as _};
+        if let Ok(mut stream) = std::os::unix::net::UnixStream::connect(socket) {
+            let _ = stream.set_read_timeout(Some(FAILURE_TIMEOUT));
+            let _ = stream.set_write_timeout(Some(FAILURE_TIMEOUT));
+            let request: &[u8] = if complete {
+                b"{\"fsfs_complete_daemon\":\"shutdown\",\"version\":1}\n"
+            } else {
+                b"quit\n"
+            };
+            let _ = stream.write_all(request);
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let _ = stream.read_to_end(&mut Vec::new());
+        }
+    }
+
     #[cfg(any(feature = "semantic-loaders", feature = "rerank"))]
     fn active_generation_root(index: &Path) -> PathBuf {
         let Ok(pointer) = fs::read_to_string(index.join("FSFS-CURRENT")) else {
@@ -662,12 +689,11 @@ mod loader_only {
         struct Owner {
             child: std::process::Child,
             socket: PathBuf,
+            complete: bool,
         }
         impl Drop for Owner {
             fn drop(&mut self) {
-                if let Ok(mut socket) = UnixStream::connect(&self.socket) {
-                    let _ = socket.write_all(b"quit\n");
-                }
+                request_daemon_stop(&self.socket, self.complete);
                 let deadline = Instant::now() + FAILURE_TIMEOUT;
                 while Instant::now() < deadline {
                     if let Ok(Some(status)) = self.child.try_wait() {
@@ -709,7 +735,11 @@ mod loader_only {
             .stderr(File::create(&log).unwrap())
             .spawn()
             .unwrap();
-        let mut owner = Owner { child, socket };
+        let mut owner = Owner {
+            child,
+            socket,
+            complete: is_complete_store(index),
+        };
         while !owner.socket.exists() {
             assert!(
                 owner.child.try_wait().unwrap().is_none(),
@@ -923,19 +953,17 @@ mod loader_only {
         };
         let query = "How should a network client recover from transient failures using exponential backoff, bounded retries, and random jitter?";
         #[cfg(unix)]
-        struct DaemonOwner(PathBuf);
+        struct DaemonOwner(PathBuf, bool);
         #[cfg(unix)]
         impl Drop for DaemonOwner {
             fn drop(&mut self) {
-                use std::io::Write as _;
-                if let Ok(mut socket) = std::os::unix::net::UnixStream::connect(&self.0) {
-                    let _ = socket.write_all(b"quit\n");
-                }
+                request_daemon_stop(&self.0, self.1);
             }
         }
         #[cfg(unix)]
         let daemon = DaemonOwner(
             std::env::temp_dir().join(format!("fsfs-blend-{}.sock", std::process::id())),
+            is_complete_store(index),
         );
         let stack = frankensearch_embed::EmbedderStack::auto_detect_with_options(
             Some(&fsfs.model_root),
@@ -1801,19 +1829,15 @@ mod loader_only {
             use std::io::{Read as _, Write as _};
             use std::os::unix::net::UnixStream;
 
-            struct NativeDaemon(PathBuf);
+            struct NativeDaemon(PathBuf, bool);
             impl Drop for NativeDaemon {
                 fn drop(&mut self) {
-                    if let Ok(mut socket) = UnixStream::connect(&self.0) {
-                        let _ = socket.set_read_timeout(Some(FAILURE_TIMEOUT));
-                        let _ = socket.write_all(b"quit\n");
-                        let _ = socket.shutdown(std::net::Shutdown::Write);
-                        let _ = socket.read_to_end(&mut Vec::new());
-                    }
+                    request_daemon_stop(&self.0, self.1);
                 }
             }
             let daemon_path = temp.path().join("native.sock");
-            let daemon = NativeDaemon(daemon_path.clone());
+            let complete = is_complete_store(&index);
+            let daemon = NativeDaemon(daemon_path.clone(), complete);
             let args = [
                 "search",
                 query,
@@ -1882,12 +1906,15 @@ mod loader_only {
                 !wrong.status.success(),
                 "policy refusal must reach the caller: {wrong:?}"
             );
-            assert!(
-                wrong
-                    .combined_output()
-                    .contains("did not acknowledge requested search policy"),
-                "{wrong:?}"
-            );
+            // A legacy daemon answers and the client refuses the unacknowledged
+            // policy; a complete store's daemon refuses a client whose model
+            // configuration differs before it searches.
+            let refusal = if complete {
+                "client and daemon configurations differ"
+            } else {
+                "did not acknowledge requested search policy"
+            };
+            assert!(wrong.combined_output().contains(refusal), "{wrong:?}");
             assert!(
                 !wrong
                     .stderr
@@ -1948,7 +1975,7 @@ mod loader_only {
                 .stderr(File::create(&cold_log_path).unwrap())
                 .spawn()
                 .unwrap();
-            let cold_daemon = NativeDaemon(cold_path.clone());
+            let cold_daemon = NativeDaemon(cold_path.clone(), complete);
             let deadline = Instant::now() + FAILURE_TIMEOUT;
             while !cold_path.exists() && Instant::now() < deadline {
                 assert!(child.try_wait().unwrap().is_none(), "cold daemon exited");
@@ -2260,17 +2287,12 @@ mod loader_only {
 
         struct Daemon {
             socket: PathBuf,
+            complete: bool,
             child: std::process::Child,
         }
         impl Drop for Daemon {
             fn drop(&mut self) {
-                if let Ok(mut socket) = UnixStream::connect(&self.socket) {
-                    let _ = socket.set_read_timeout(Some(FAILURE_TIMEOUT));
-                    let _ = socket.set_write_timeout(Some(FAILURE_TIMEOUT));
-                    let _ = socket.write_all(b"quit\n");
-                    let _ = socket.shutdown(std::net::Shutdown::Write);
-                    let _ = socket.read_to_end(&mut Vec::new());
-                }
+                request_daemon_stop(&self.socket, self.complete);
                 let deadline = Instant::now() + FAILURE_TIMEOUT;
                 while Instant::now() < deadline {
                     if let Ok(Some(status)) = self.child.try_wait() {
@@ -2314,6 +2336,7 @@ mod loader_only {
             .unwrap();
         let mut daemon = Daemon {
             socket: socket_path.clone(),
+            complete: is_complete_store(&index),
             child,
         };
         let deadline = Instant::now() + FAILURE_TIMEOUT;
@@ -2993,7 +3016,9 @@ mod loader_only {
         .unwrap();
         let corpus_arg = corpus.to_str().unwrap();
         let index_arg = index.to_str().unwrap();
-        let initial = fsfs.run(
+        // The legacy watcher: a build pins the layout, and the watch below
+        // follows the legacy index on disk.
+        let initial = fsfs.run_with_env(
             temp.path(),
             "watch-initial-index",
             [
@@ -3005,6 +3030,7 @@ mod loader_only {
                 "json",
             ],
             QUICKSTART_TIMEOUT,
+            &[("FSFS_COMPLETE_GENERATIONS", "0")],
         );
         let envelope = parse_success_envelope("watch initial index", &initial);
         assert_eq!(envelope["data"]["indexed_files"], 2);
@@ -4332,8 +4358,29 @@ mod loader_only {
         );
         #[cfg(feature = "semantic-loaders")]
         verify_real_blend_and_deadline(&fsfs, temp.path(), &index);
+        // The raw progressive protocol (attested frames, per-request budgets)
+        // is the legacy query daemon's; a complete store's daemon streams the
+        // CLI frame protocol, which its own tests and the forwarded lane cover.
         #[cfg(all(unix, feature = "semantic-loaders"))]
-        verify_real_progressive_daemon(&fsfs, temp.path(), &index);
+        {
+            let legacy_index = temp.path().join("legacy-index");
+            let legacy = fsfs.run_with_env(
+                temp.path(),
+                "progressive-legacy-index",
+                [
+                    "index",
+                    corpus.to_str().expect("UTF-8 corpus path"),
+                    "--index-dir",
+                    legacy_index.to_str().expect("UTF-8 index path"),
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &[("FSFS_COMPLETE_GENERATIONS", "0")],
+            );
+            parse_success_envelope("legacy index for the progressive daemon", &legacy);
+            verify_real_progressive_daemon(&fsfs, temp.path(), &legacy_index);
+        }
 
         // Reality check 2026-09-01, G2: the auto-spawned query daemon must
         // outlive the search that spawned it (so the next search is warm), be
@@ -4341,7 +4388,6 @@ mod loader_only {
         // timeout so it can never linger as an orphan.
         #[cfg(unix)]
         {
-            use std::io::Write as _;
             use std::os::unix::net::UnixStream;
 
             // AF_UNIX paths are limited to ~107 bytes, so the sockets live in
@@ -4424,9 +4470,11 @@ mod loader_only {
             );
 
             // Protocol stop reclaims the socket.
-            let mut quit = UnixStream::connect(&socket).expect("connect to stop the daemon");
-            quit.write_all(b"quit\n").expect("send quit to the daemon");
-            drop(quit);
+            assert!(
+                UnixStream::connect(&socket).is_ok(),
+                "connect to stop the daemon"
+            );
+            request_daemon_stop(&socket, is_complete_store(&index));
             let mut reclaimed = false;
             for _ in 0..200 {
                 if !socket.exists() {

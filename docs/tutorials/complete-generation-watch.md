@@ -1,8 +1,10 @@
 # Watch while complete-generation searches remain available
 
-This route is for the Unix complete-generation store. It does not change the
-legacy mutable watcher or migrate an existing live index in place. Use a fresh
-store outside the source tree; its parent must already exist. Configure verified
+This route is for the Unix complete-generation store, which a watch into a
+directory with no index creates. It does not change the legacy mutable watcher:
+an existing legacy index keeps watching on that layout unless a build converts
+it with `FSFS_COMPLETE_GENERATIONS=1`. Use a store outside the source tree; its
+parent must already exist. Configure verified
 semantic models and a generation-local catalog as in
 [complete-generation rebuilding](complete-generation-rebuilds.md).
 
@@ -14,12 +16,12 @@ db_path = "{index_dir}/catalog.sqlite"
 Start the first build and keep watching:
 
 ```sh
-FSFS_COMPLETE_GENERATIONS=1 fsfs watch /work/source \
+fsfs watch /work/source \
   --index-dir /work/search-store --config /work/fsfs.toml --format jsonl
 ```
 
-`index /work/source --watch` uses the same complete-store route. After the first
-initialization, the store is recognized without the environment variable. Watch
+`index /work/source --watch` uses the same complete-store route. Once created,
+the store is recognized whatever the environment variable says. Watch
 output accepts `table`, `jsonl`, or `toon`; unframed JSON/CSV output is refused
 before creating the store. Each successful publication emits the existing index
 receipt fields with command `watch`, including generation ID and durable status.
