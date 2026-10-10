@@ -66,4 +66,6 @@ pub use staleness::{
     QuickStalenessCheck, RecommendedAction, StalenessConfig, StalenessLevel, StalenessReport,
     StalenessStats, StorageBackedStaleness,
 };
-pub use worker::{PersistentEmbeddingWorker, PersistentWorkerReport, WorkerServiceConfig};
+pub use worker::{
+    PersistentEmbeddingWorker, PersistentWorkerReport, WorkerDrainOutcome, WorkerServiceConfig,
+};

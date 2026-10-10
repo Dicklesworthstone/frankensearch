@@ -31,7 +31,7 @@ use frankensearch_core::{Canonicalizer, Embedder, SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    BatchProcessResult, EmbeddingVectorSink, JobQueueConfig, PersistentJobQueue, Storage,
+    BatchProcessResult, EmbeddingVectorSink, JobQueueConfig, PersistentJobQueue, QueueDepth, Storage,
     StorageBackedJobRunner, WorkerReport,
 };
 
@@ -77,6 +77,46 @@ pub struct PersistentWorkerReport {
     pub reclaimed_after_startup: usize,
     /// Total empty polls, not just the final consecutive idle streak.
     pub idle_polls: usize,
+}
+
+/// Why a finite drain stopped. A drained queue can still contain terminal
+/// failures: inspect `remaining.failed` and the report rather than treating
+/// queue quiescence as a claim that every document embedded successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerDrainOutcome {
+    /// A queue read observed no pending (including delayed) or processing jobs.
+    /// This is an observation, not an ingestion barrier: later submissions are
+    /// new work and may require another drain.
+    Drained {
+        /// Progress made by this invocation.
+        report: PersistentWorkerReport,
+        /// Queue state at the quiescence observation, including terminal rows.
+        remaining: QueueDepth,
+    },
+    /// Graceful shutdown was observed before starting more work.
+    Stopped {
+        /// Progress already committed by this invocation.
+        report: PersistentWorkerReport,
+    },
+    /// The cooperative between-batch deadline was reached.
+    DeadlineReached {
+        /// Progress already committed; successful work is never relabelled.
+        report: PersistentWorkerReport,
+        /// Outstanding and terminal rows when the deadline was observed.
+        remaining: QueueDepth,
+    },
+}
+
+impl WorkerDrainOutcome {
+    /// Return progress regardless of the reason the invocation stopped.
+    #[must_use]
+    pub const fn report(self) -> PersistentWorkerReport {
+        match self {
+            Self::Drained { report, .. }
+            | Self::Stopped { report }
+            | Self::DeadlineReached { report, .. } => report,
+        }
+    }
 }
 
 /// A runner and its exact queue under one persistent service owner.
@@ -177,38 +217,108 @@ impl PersistentEmbeddingWorker {
         worker_id: &str,
         shutdown: &AtomicBool,
     ) -> SearchResult<PersistentWorkerReport> {
+        self.run_loop(cx, worker_id, shutdown, None)
+            .await
+            .map(WorkerDrainOutcome::report)
+    }
+
+    /// Process until no pending or processing jobs remain, shutdown is
+    /// requested, or a cooperative runtime-clock budget expires.
+    ///
+    /// A delayed pending retry or a still-live claim is NOT an empty queue.
+    /// This mode continues polling and recovering late-expiring leases through
+    /// both, instead of returning after the first empty claim batch. Terminal
+    /// failures do not prevent quiescence and are reported explicitly.
+    ///
+    /// The budget is checked before recovery, before each new batch, and after
+    /// each batch. It does not preempt synchronous work or a provider await
+    /// already in progress; provider deadlines still belong on the caller's
+    /// `Cx`/embedder. Idle sleeps are capped by the remaining budget. A zero
+    /// budget samples the remaining queue without claiming or recovering work.
+    /// Storage errors and structured cancellation propagate, not masquerade as
+    /// a successful drain or a deadline result.
+    #[allow(clippy::future_not_send)]
+    pub async fn drain(
+        &self,
+        cx: &Cx,
+        worker_id: &str,
+        shutdown: &AtomicBool,
+        budget: Duration,
+    ) -> SearchResult<WorkerDrainOutcome> {
+        let deadline = drain_deadline(cx.now(), budget)?;
+        self.run_loop(cx, worker_id, shutdown, Some(deadline)).await
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn run_loop(
+        &self,
+        cx: &Cx,
+        worker_id: &str,
+        shutdown: &AtomicBool,
+        deadline: Option<Time>,
+    ) -> SearchResult<WorkerDrainOutcome> {
         if worker_id.trim().is_empty() {
             return Err(invalid_config("worker_id", "must not be empty"));
         }
         let mut report = PersistentWorkerReport::default();
         let mut schedule = RecoverySchedule::new(self.config.recovery_interval)?;
-        while !should_stop(cx, shutdown)? {
+        loop {
+            if should_stop(cx, shutdown)? {
+                return Ok(WorkerDrainOutcome::Stopped { report });
+            }
+            if deadline.is_some_and(|limit| cx.now() >= limit) {
+                let remaining = self.queue.queue_depth()?;
+                if should_stop(cx, shutdown)? {
+                    return Ok(WorkerDrainOutcome::Stopped { report });
+                }
+                return Ok(WorkerDrainOutcome::DeadlineReached {
+                    report,
+                    remaining,
+                });
+            }
             self.recover_if_due(cx.now(), &mut schedule, &mut report)?;
             // A synchronous scan can take time; do not start another batch if
             // shutdown or cancellation arrived while recovery was committing.
             if should_stop(cx, shutdown)? {
-                break;
+                return Ok(WorkerDrainOutcome::Stopped { report });
+            }
+            if deadline.is_some_and(|limit| cx.now() >= limit) {
+                let remaining = self.queue.queue_depth()?;
+                if should_stop(cx, shutdown)? {
+                    return Ok(WorkerDrainOutcome::Stopped { report });
+                }
+                return Ok(WorkerDrainOutcome::DeadlineReached {
+                    report,
+                    remaining,
+                });
             }
             let batch = self.runner.process_batch(cx, worker_id).await?;
             record_batch(&mut report, batch);
             if should_stop(cx, shutdown)? {
-                break;
+                return Ok(WorkerDrainOutcome::Stopped { report });
+            }
+            if let Some(limit) = deadline {
+                let remaining = self.queue.queue_depth()?;
+                if should_stop(cx, shutdown)? {
+                    return Ok(WorkerDrainOutcome::Stopped { report });
+                }
+                if remaining.pending == 0 && remaining.processing == 0 {
+                    return Ok(WorkerDrainOutcome::Drained { report, remaining });
+                }
+                if cx.now() >= limit {
+                    return Ok(WorkerDrainOutcome::DeadlineReached { report, remaining });
+                }
             }
             if batch.jobs_claimed == 0 {
-                let wait = self
-                    .config
-                    .idle_poll_interval
-                    .min(schedule.remaining(cx.now()));
+                let wait = idle_wait(self.config, &schedule, cx.now(), deadline);
                 if !wait.is_zero() {
                     asupersync::time::sleep(cx.now(), wait).await;
-                } else {
-                    asupersync::runtime::yield_now().await;
                 }
-            } else {
-                asupersync::runtime::yield_now().await;
             }
+            // Even a timer that is already ready must not turn idle polls
+            // into a non-yielding loop that starves shutdown or new work.
+            asupersync::runtime::yield_now().await;
         }
-        Ok(report)
     }
 
     fn recover_if_due(
@@ -236,6 +346,26 @@ impl PersistentEmbeddingWorker {
         );
         Ok(())
     }
+}
+
+fn drain_deadline(now: Time, budget: Duration) -> SearchResult<Time> {
+    let nanos = u64::try_from(budget.as_nanos())
+        .ok()
+        .and_then(|budget| now.as_nanos().checked_add(budget))
+        .ok_or_else(|| invalid_config("worker.drain_budget", "deadline exceeds runtime clock"))?;
+    Ok(Time::from_nanos(nanos))
+}
+
+fn idle_wait(
+    config: WorkerServiceConfig,
+    schedule: &RecoverySchedule,
+    now: Time,
+    deadline: Option<Time>,
+) -> Duration {
+    let wait = config.idle_poll_interval.min(schedule.remaining(now));
+    deadline.map_or(wait, |limit| {
+        wait.min(Duration::from_nanos(limit.duration_since(now)))
+    })
 }
 
 #[derive(Debug)]
@@ -621,6 +751,205 @@ mod tests {
             assert_eq!(depth.processing, 1, "failed batch retains its recoverable claim");
             assert_eq!(depth.failed + depth.completed + depth.pending, 0);
             assert_eq!(f.worker.queue().metrics().snapshot().total_retried, 0);
+        });
+    }
+
+    #[test]
+    fn drain_reports_terminal_failures_without_leaving_runnable_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            f.probe.failures.store(1, Ordering::SeqCst);
+            for id in ["one", "two", "three"] {
+                f.worker.runner().ingest(IngestRequest::new(id, "input")).unwrap();
+            }
+            let outcome = f.worker.drain(
+                &cx, "drain", &AtomicBool::new(false), Duration::from_secs(5),
+            ).await.unwrap();
+            let WorkerDrainOutcome::Drained { report, remaining } = outcome else {
+                panic!("expected a fully processed queue, got {outcome:?}");
+            };
+            assert_eq!(report.work.jobs_completed, 2);
+            assert_eq!(report.work.jobs_failed, 1);
+            assert_eq!(report.work.terminal_failures_encountered, 1);
+            assert_eq!(remaining.pending + remaining.processing, 0);
+            assert_eq!(remaining.failed, 1, "drained is not an all-success claim");
+            assert_eq!(f.sink.entries().len(), 2);
+        });
+    }
+
+    #[test]
+    fn zero_budget_samples_pending_and_expired_claims_without_mutation() {
+        for claimed in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let f = fixture(JobQueueConfig::default());
+                f.worker.runner().ingest(IngestRequest::new("budget", "input")).unwrap();
+                if claimed {
+                    assert_eq!(f.worker.queue().claim_batch("old", 1).unwrap().len(), 1);
+                    expire_claims(&f.storage);
+                }
+                let depth = f.worker.queue().queue_depth().unwrap();
+                let metrics = f.worker.queue().metrics().snapshot();
+                let outcome = f.worker.drain(
+                    &cx, "drain", &AtomicBool::new(false), Duration::ZERO,
+                ).await.unwrap();
+                assert_eq!(outcome, WorkerDrainOutcome::DeadlineReached {
+                    report: PersistentWorkerReport::default(),
+                    remaining: depth,
+                });
+                assert_eq!(f.worker.queue().queue_depth().unwrap(), depth);
+                assert_eq!(f.worker.queue().metrics().snapshot(), metrics);
+                assert!(f.sink.entries().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn drain_waits_for_a_live_claim_instead_of_declaring_an_empty_queue() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig::default());
+            f.worker.runner().ingest(IngestRequest::new("live", "input")).unwrap();
+            let claim = f.worker.queue().claim_batch("other", 1).unwrap().pop().unwrap();
+            let shutdown = AtomicBool::new(false);
+            let mut future = std::pin::pin!(f.worker.drain(
+                &cx, "drain", &shutdown, Duration::from_secs(5),
+            ));
+            let outcome = poll_fn(|task_cx| match future.as_mut().poll(task_cx) {
+                Poll::Pending => {
+                    shutdown.store(true, Ordering::Release);
+                    Poll::Pending
+                }
+                Poll::Ready(result) => Poll::Ready(result),
+            }).await.unwrap();
+            let WorkerDrainOutcome::Stopped { report } = outcome else {
+                panic!("a live claim is outstanding work, got {outcome:?}");
+            };
+            assert_eq!(report.idle_polls, 1);
+            assert_eq!(f.worker.queue().queue_depth().unwrap().processing, 1);
+            assert_eq!(
+                f.worker.queue().complete(&claim, &claim.content_hash.unwrap()).unwrap(),
+                ClaimOutcome::Applied(())
+            );
+        });
+    }
+
+    #[test]
+    fn stopped_drain_resumes_remaining_jobs_without_repeating_completed_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig::default());
+            for id in ["first", "second"] {
+                f.worker.runner().ingest(IngestRequest::new(id, "input")).unwrap();
+            }
+            let shutdown = AtomicBool::new(false);
+            let mut future = std::pin::pin!(f.worker.drain(
+                &cx, "drain", &shutdown, Duration::from_secs(5),
+            ));
+            let outcome = poll_fn(|task_cx| match future.as_mut().poll(task_cx) {
+                Poll::Pending => {
+                    shutdown.store(true, Ordering::Release);
+                    Poll::Pending
+                }
+                Poll::Ready(result) => Poll::Ready(result),
+            }).await.unwrap();
+            assert!(matches!(outcome, WorkerDrainOutcome::Stopped { .. }));
+            assert_eq!(outcome.report().work.jobs_completed, 1);
+            shutdown.store(false, Ordering::Release);
+            let resumed = f.worker.drain(
+                &cx, "drain", &shutdown, Duration::from_secs(5),
+            ).await.unwrap();
+            assert!(matches!(resumed, WorkerDrainOutcome::Drained { .. }));
+            assert_eq!(resumed.report().work.jobs_completed, 1);
+            assert_eq!(f.sink.entries().len(), 2);
+            assert_eq!(f.worker.queue().queue_depth().unwrap().completed, 2);
+        });
+    }
+
+    #[test]
+    fn drain_waits_for_delayed_retry_then_finishes_without_a_stop_signal() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig {
+                retry_base_delay_ms: 30_000,
+                ..JobQueueConfig::default()
+            });
+            f.probe.failures.store(1, Ordering::SeqCst);
+            f.worker.runner().ingest(IngestRequest::new("retry", "input")).unwrap();
+            let shutdown = AtomicBool::new(false);
+            let mut future = std::pin::pin!(f.worker.drain(
+                &cx, "drain", &shutdown, Duration::from_secs(5),
+            ));
+            let mut polls = 0;
+            let outcome = poll_fn(|task_cx| match future.as_mut().poll(task_cx) {
+                Poll::Pending => {
+                    polls += 1;
+                    if polls == 2 {
+                        assert_eq!(f.worker.queue().queue_depth().unwrap().ready_pending, 0);
+                        f.storage.connection().execute_sync(
+                            "UPDATE embedding_jobs SET submitted_at = 0 WHERE status = 'pending';",
+                        ).unwrap();
+                    }
+                    assert!(polls < 10_000, "drain must finish after the retry matures");
+                    Poll::Pending
+                }
+                Poll::Ready(result) => Poll::Ready(result),
+            }).await.unwrap();
+            let WorkerDrainOutcome::Drained { report, remaining } = outcome else {
+                panic!("expected quiescence after retry, got {outcome:?}");
+            };
+            assert!(report.idle_polls > 0);
+            assert_eq!(report.work.jobs_failed, 1);
+            assert_eq!(report.work.jobs_completed, 1);
+            assert_eq!(remaining.pending + remaining.processing + remaining.failed, 0);
+            assert_eq!(f.sink.entries().len(), 1);
+        });
+    }
+
+    #[test]
+    fn drain_deadline_is_checked_and_caps_idle_sleep() {
+        let config = WorkerServiceConfig {
+            idle_poll_interval: Duration::from_secs(5),
+            recovery_interval: Duration::from_secs(10),
+        };
+        let mut schedule = RecoverySchedule::new(config.recovery_interval).unwrap();
+        schedule.last = Some(Time::ZERO);
+        let deadline = drain_deadline(Time::ZERO, Duration::from_millis(3)).unwrap();
+        assert_eq!(
+            idle_wait(config, &schedule, Time::ZERO, Some(deadline)),
+            Duration::from_millis(3)
+        );
+        assert_eq!(idle_wait(config, &schedule, deadline, Some(deadline)), Duration::ZERO);
+        assert_eq!(drain_deadline(Time::MAX, Duration::ZERO).unwrap(), Time::MAX);
+        assert!(drain_deadline(Time::MAX, Duration::from_nanos(1)).is_err());
+        assert!(drain_deadline(Time::ZERO, Duration::MAX).is_err());
+    }
+
+    #[test]
+    fn drain_budget_expires_while_delayed_work_remains_outstanding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig::default());
+            f.worker.runner().ingest(IngestRequest::new("future", "input")).unwrap();
+            f.storage.connection().execute_with_params_sync(
+                "UPDATE embedding_jobs SET submitted_at = ?1 WHERE status = 'pending';",
+                &[SqliteValue::Integer(i64::MAX)],
+            ).unwrap();
+            let shutdown = AtomicBool::new(false);
+            let mut future = std::pin::pin!(f.worker.drain(
+                &cx, "drain", &shutdown, Duration::from_millis(2),
+            ));
+            let mut polls = 0;
+            let outcome = poll_fn(|task_cx| match future.as_mut().poll(task_cx) {
+                Poll::Pending => {
+                    polls += 1;
+                    assert!(polls < 10_000, "deadline must stop the unready drain");
+                    Poll::Pending
+                }
+                Poll::Ready(result) => Poll::Ready(result),
+            }).await.unwrap();
+            let WorkerDrainOutcome::DeadlineReached { report, remaining } = outcome else {
+                panic!("unready work must not be reported drained: {outcome:?}");
+            };
+            assert_eq!(remaining.pending, 1);
+            assert_eq!(remaining.processing + remaining.failed + remaining.completed, 0);
+            assert_eq!(report.work.jobs_completed + report.work.jobs_failed, 0);
+            assert!(f.sink.entries().is_empty());
         });
     }
 }
