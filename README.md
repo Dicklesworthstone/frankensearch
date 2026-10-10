@@ -326,7 +326,9 @@ The opt-in complete-generation layout (see "Complete generations" below)
 serves searches while it is watched: a watched change is searchable from
 another process within seconds, and retention keeps the active generation and
 one predecessor, which share their unchanged keyword segments (a 19,480-file
-store held 186 MB after 8 watched edits, about one fresh build).
+store held 186 MB after 8 watched edits, about one fresh build). On that tree a
+one-line edit is published in about 1.8–2.0 s (median per round, lite release
+build), against about 0.7 s for the legacy watcher to commit it.
 
 Example output:
 
