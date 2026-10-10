@@ -15,6 +15,7 @@ use crate::Storage;
 use crate::connection::map_storage_error;
 use crate::content_hash::{ContentHasher, record_content_hash};
 use crate::document::{DocumentRecord, EmbeddingStatus, upsert_document};
+use crate::document_content::{read_document_content, upsert_document_content, verify_document_text};
 use crate::job_queue::{
     ClaimOutcome, EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner,
 };
@@ -399,6 +400,9 @@ impl StorageBackedJobRunner {
 
             if !fast_needs_enqueue && !quality_needs_enqueue {
                 upsert_document(conn, &document)?;
+                // Re-ingestion also backfills legacy preview-only records,
+                // without duplicating already active or completed jobs.
+                upsert_document_content(conn, &document, &canonical_text)?;
                 return Ok(IngestTxResult {
                     action: IngestAction::Unchanged,
                     fast_job_enqueued: false,
@@ -425,6 +429,7 @@ impl StorageBackedJobRunner {
             }
 
             upsert_document(conn, &document)?;
+            upsert_document_content(conn, &document, &canonical_text)?;
 
             if fast_dedup.state == DedupState::Changed {
                 reset_embedding_status(conn, &request.doc_id)?;
@@ -573,37 +578,31 @@ impl StorageBackedJobRunner {
             let correlation_id = extract_correlation_id(doc.metadata.as_ref())
                 .unwrap_or_else(|| fallback_correlation_id(&job.doc_id));
 
-            let text_cow = if let Some(path) = &doc.source_path {
-                match read_source_text_with_limit(path, MAX_SOURCE_FILE_BYTES) {
-                    Ok(raw) => std::borrow::Cow::Owned(self.canonicalizer.canonicalize(&raw)),
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "frankensearch.storage.pipeline",
-                            stage = "process_batch",
-                            worker_id,
-                            doc_id = %job.doc_id,
-                            path = %path,
-                            max_source_file_bytes = MAX_SOURCE_FILE_BYTES,
-                            error = %error,
-                            "failed to read source file; falling back to content preview"
-                        );
-                        std::borrow::Cow::Borrowed(doc.content_preview.as_str())
+            let input = resolve_embedding_text(
+                self.storage.connection(),
+                self.canonicalizer.as_ref(),
+                &doc,
+            );
+            // Cancellation must not turn an input-resolution failure into a
+            // queue mutation, just as it must not do so after inference.
+            pipeline_checkpoint(cx, "storage.pipeline.input_admitted")?;
+            let text = match input {
+                Ok(text) => text,
+                Err(error) => {
+                    if !self.handle_job_failure(job, &doc.content_hash, &error, &mut result)? {
+                        continue;
                     }
-                }
-            } else {
-                if doc.content_length > MAX_CONTENT_PREVIEW_CHARS {
                     tracing::warn!(
                         target: "frankensearch.storage.pipeline",
-                        stage = "process_batch",
+                        stage = "resolve_input",
                         worker_id,
                         doc_id = %job.doc_id,
-                        content_length = doc.content_length,
-                        "document has no source_path and exceeds preview length; embedding will be truncated"
+                        error = %error,
+                        "exact embedding input unavailable; no vector was persisted"
                     );
+                    continue;
                 }
-                std::borrow::Cow::Borrowed(doc.content_preview.as_str())
             };
-            let text = text_cow.as_ref();
 
             if text.trim().is_empty() {
                 let skip_reason = "empty content preview";
@@ -674,7 +673,7 @@ impl StorageBackedJobRunner {
                     continue;
                 }
             };
-            let response = embed_for_persistence(cx, embedder.as_ref(), text).await;
+            let response = embed_for_persistence(cx, embedder.as_ref(), &text).await;
             pipeline_checkpoint(cx, "storage.pipeline.embedding_admitted")?;
             let response = match response {
                 Err(error @ SearchError::Cancelled { .. }) => return Err(error),
@@ -1152,6 +1151,41 @@ fn is_hash_embedder(embedder_id: &str) -> bool {
     frankensearch_core::is_hash_generation_id(embedder_id)
 }
 
+/// Resolve the exact canonical input, not merely a plausible source of text.
+///
+/// New ingests retain their canonical bytes in the catalog transaction. Older
+/// rows may be recovered from a complete preview or a bounded external file,
+/// but only if both the digest and character count match the captured revision.
+/// Retained content is already canonical: re-running a changed canonicalizer
+/// here would silently change the input associated with that revision.
+fn resolve_embedding_text(
+    conn: &AsyncConnection,
+    canonicalizer: &dyn Canonicalizer,
+    doc: &DocumentRecord,
+) -> SearchResult<String> {
+    if let Some(text) = read_document_content(conn, doc)? {
+        return Ok(text);
+    }
+    if verify_document_text(doc, &doc.content_preview).is_ok() {
+        return Ok(doc.content_preview.clone());
+    }
+    let path = doc.source_path.as_deref().ok_or_else(|| {
+        pipeline_error(format!(
+            "full canonical input for {} was not retained; re-ingest the document",
+            doc.doc_id
+        ))
+    })?;
+    let raw = read_source_text_with_limit(path, MAX_SOURCE_FILE_BYTES).map_err(|error| {
+        pipeline_error(format!(
+            "cannot recover full canonical input for {}: {error}",
+            doc.doc_id
+        ))
+    })?;
+    let text = canonicalizer.canonicalize(&raw);
+    verify_document_text(doc, &text)?;
+    Ok(text)
+}
+
 fn read_source_text_with_limit(path: &str, max_bytes: usize) -> io::Result<String> {
     let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
     let metadata = std::fs::metadata(path)?;
@@ -1359,6 +1393,338 @@ mod tests {
     use crate::job_queue::{FailResult, JobQueueConfig};
 
     use super::*;
+
+    mod canonical_input {
+        use super::*;
+
+        fn long_input() -> String {
+            "Unicode café 数据 searchable document content. ".repeat(40)
+        }
+
+        fn forget_retained_input(runner: &StorageBackedJobRunner, id: &str) {
+            runner
+                .storage
+                .connection()
+                .execute_with_params_sync(
+                    "DELETE FROM document_contents WHERE doc_id = ?1;",
+                    &[SqliteValue::Text(id.to_owned().into())],
+                )
+                .unwrap();
+        }
+
+        #[test]
+        fn full_input_reaches_both_tiers_without_an_external_source() {
+            for quality in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
+                    let raw = long_input();
+                    let expected = runner.canonicalizer.canonicalize(&raw);
+                    assert!(content_char_len(&expected) > MAX_CONTENT_PREVIEW_CHARS);
+                    runner.ingest(IngestRequest::new("full-input", raw)).unwrap();
+                    let doc = runner.storage.get_document("full-input").unwrap().unwrap();
+                    assert_eq!(content_char_len(&doc.content_preview), MAX_CONTENT_PREVIEW_CHARS);
+                    assert_eq!(
+                        read_document_content(runner.storage.connection(), &doc).unwrap(),
+                        Some(expected.clone())
+                    );
+                    let result = runner.process_batch(&cx, "worker").await.unwrap();
+                    assert_eq!(result.jobs_completed, 1);
+                    assert_eq!(*probe.inputs.lock().unwrap(), vec![expected]);
+                    assert_eq!(sink.entries().len(), 1);
+                });
+            }
+        }
+
+        #[test]
+        fn retained_input_survives_source_edits_and_disappearance() {
+            for move_source in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("source.txt");
+                    let raw = long_input();
+                    std::fs::write(&path, &raw).unwrap();
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = make_claim_probe_runner(false, false, sink.clone());
+                    let expected = runner.canonicalizer.canonicalize(&raw);
+                    let mut request = IngestRequest::new("source-edit", raw);
+                    request.source_path = Some(path.to_string_lossy().into_owned());
+                    runner.ingest(request).unwrap();
+                    if move_source {
+                        std::fs::rename(&path, dir.path().join("moved.txt")).unwrap();
+                    } else {
+                        std::fs::write(&path, "a completely different revision").unwrap();
+                    }
+                    let result = runner.process_batch(&cx, "worker").await.unwrap();
+                    assert_eq!(result.jobs_completed, 1);
+                    assert_eq!(*probe.inputs.lock().unwrap(), vec![expected]);
+                    assert_eq!(sink.entries().len(), 1);
+                });
+            }
+        }
+
+        #[test]
+        fn unchanged_ingest_backfills_retained_input_without_duplicate_jobs() {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let (runner, _) = make_claim_probe_runner(false, false, sink);
+            let request = IngestRequest::new("backfill", long_input());
+            runner.ingest(request.clone()).unwrap();
+            forget_retained_input(&runner, "backfill");
+            let doc = runner.storage.get_document("backfill").unwrap().unwrap();
+            assert_eq!(
+                read_document_content(runner.storage.connection(), &doc).unwrap(),
+                None
+            );
+            let result = runner.ingest(request.clone()).unwrap();
+            assert_eq!(result.action, IngestAction::Unchanged);
+            assert!(!result.fast_job_enqueued);
+            assert!(!result.quality_job_enqueued);
+            assert_eq!(runner.queue.queue_depth().unwrap().pending, 1);
+            assert_eq!(
+                read_document_content(runner.storage.connection(), &doc).unwrap(),
+                Some(runner.canonicalizer.canonicalize(&request.text))
+            );
+        }
+
+        #[test]
+        fn metadata_edits_preserve_input_and_new_revisions_do_not_reuse_it() {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let (runner, _) = make_claim_probe_runner(false, false, sink);
+            let raw = long_input();
+            let expected = runner.canonicalizer.canonicalize(&raw);
+            runner.ingest(IngestRequest::new("revision", raw)).unwrap();
+            let original = runner.storage.get_document("revision").unwrap().unwrap();
+            let mut edited = original.clone();
+            edited.metadata = Some(serde_json::json!({"tag": "changed"}));
+            runner.storage.upsert_document(&edited).unwrap();
+            assert_eq!(
+                read_document_content(runner.storage.connection(), &edited).unwrap(),
+                Some(expected.clone())
+            );
+            let replacement = "replacement canonical text";
+            edited.content_hash = ContentHasher::hash(replacement);
+            edited.content_length = content_char_len(replacement);
+            edited.content_preview = replacement.to_owned();
+            edited.updated_at += 1;
+            runner.storage.upsert_document(&edited).unwrap();
+            assert_eq!(
+                read_document_content(runner.storage.connection(), &edited).unwrap(),
+                None
+            );
+            assert!(runner.storage.set_document_content("revision", &expected).is_err());
+            assert_eq!(
+                read_document_content(runner.storage.connection(), &edited).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn corrupt_retained_input_is_not_hidden_by_a_valid_preview() {
+            for corrupt in [
+                SqliteValue::Text("corrupt input".to_owned().into()),
+                SqliteValue::Blob(vec![0].into()),
+            ] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = make_claim_probe_runner(false, false, sink.clone());
+                    runner
+                        .ingest(IngestRequest::new("corrupt", "complete valid preview"))
+                        .unwrap();
+                    runner.storage.connection().execute_with_params_sync(
+                        "UPDATE document_contents SET canonical_text = ?1 WHERE doc_id = 'corrupt';",
+                        &[corrupt],
+                    ).unwrap();
+                    let result = runner.process_batch(&cx, "worker").await.unwrap();
+                    assert_eq!(result.jobs_failed, 1);
+                    assert_eq!(result.jobs_completed, 0);
+                    assert!(probe.inputs.lock().unwrap().is_empty());
+                    assert!(sink.entries().is_empty());
+                    assert_eq!(runner.storage.count_by_status("fast-tier").unwrap().embedded, 0);
+                });
+            }
+        }
+
+        #[test]
+        fn enqueue_error_rolls_back_new_input_and_preserves_the_previous_revision() {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let (runner, _) = make_claim_probe_runner(false, false, sink);
+            let raw = long_input();
+            let expected = runner.canonicalizer.canonicalize(&raw);
+            runner.ingest(IngestRequest::new("atomic-input", raw)).unwrap();
+            let before = runner.storage.get_document("atomic-input").unwrap().unwrap();
+            // Dedup reads do not use max_retries. This fails only the enqueue
+            // INSERT, after document and retained-input writes have occurred.
+            runner.storage.connection().execute_sync(
+                "ALTER TABLE embedding_jobs RENAME COLUMN max_retries TO unavailable_max_retries;",
+            ).unwrap();
+            assert!(
+                runner
+                    .ingest(IngestRequest::new("atomic-input", "new revision"))
+                    .is_err()
+            );
+            runner.storage.connection().execute_sync(
+                "ALTER TABLE embedding_jobs RENAME COLUMN unavailable_max_retries TO max_retries;",
+            ).unwrap();
+            assert_eq!(runner.storage.get_document("atomic-input").unwrap(), Some(before.clone()));
+            assert_eq!(
+                read_document_content(runner.storage.connection(), &before).unwrap(),
+                Some(expected)
+            );
+            let claimed = runner.queue.claim_batch("worker", 1).unwrap();
+            assert_eq!(claimed.len(), 1);
+            assert_eq!(claimed[0].content_hash, Some(before.content_hash));
+        }
+
+        #[test]
+        #[allow(clippy::arc_with_non_send_sync)]
+        fn full_input_survives_database_close_and_reopen() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let db_path = dir.path().join("retained.sqlite3");
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let probe = Arc::new(ClaimProbeEmbedder {
+                    id: "fast-tier",
+                    identity: EmbeddingIdentityBundleV1::explicit_test_model("fast-tier", 2),
+                    inputs: Mutex::new(Vec::new()),
+                    fail_next: AtomicBool::new(false),
+                });
+                let open_runner = || {
+                    let storage = Arc::new(Storage::open(crate::connection::StorageConfig {
+                        db_path: db_path.clone(),
+                        ..crate::connection::StorageConfig::default()
+                    }).unwrap());
+                    let queue = Arc::new(PersistentJobQueue::new(
+                        storage.clone(),
+                        JobQueueConfig::default(),
+                    ));
+                    StorageBackedJobRunner::new(
+                        storage,
+                        queue,
+                        Arc::new(DefaultCanonicalizer::default()),
+                        probe.clone(),
+                        sink.clone(),
+                    )
+                };
+                let expected = DefaultCanonicalizer::default().canonicalize(&long_input());
+                {
+                    let runner = open_runner();
+                    runner.ingest(IngestRequest::new("reopen", long_input())).unwrap();
+                }
+                let runner = open_runner();
+                let result = runner.process_batch(&cx, "after-restart").await.unwrap();
+                assert_eq!(result.jobs_completed, 1);
+                assert_eq!(*probe.inputs.lock().unwrap(), vec![expected]);
+                assert_eq!(sink.entries().len(), 1);
+            });
+        }
+
+        #[test]
+        fn legacy_complete_preview_is_admitted_but_a_truncated_preview_is_not() {
+            for raw in ["complete preview".to_owned(), long_input()] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = make_claim_probe_runner(false, false, sink.clone());
+                    let expected = runner.canonicalizer.canonicalize(&raw);
+                    runner.ingest(IngestRequest::new("legacy-preview", raw)).unwrap();
+                    forget_retained_input(&runner, "legacy-preview");
+                    let result = runner.process_batch(&cx, "worker").await.unwrap();
+                    if content_char_len(&expected) <= MAX_CONTENT_PREVIEW_CHARS {
+                        assert_eq!(result.jobs_completed, 1);
+                        assert_eq!(*probe.inputs.lock().unwrap(), vec![expected]);
+                        assert_eq!(sink.entries().len(), 1);
+                    } else {
+                        assert_eq!(result.jobs_completed, 0);
+                        assert_eq!(result.jobs_failed, 1);
+                        assert!(probe.inputs.lock().unwrap().is_empty());
+                        assert!(sink.entries().is_empty());
+                    }
+                });
+            }
+        }
+
+        #[test]
+        fn legacy_file_is_admitted_only_for_the_captured_canonical_revision() {
+            for changed in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("legacy.txt");
+                    let raw = long_input();
+                    std::fs::write(&path, &raw).unwrap();
+                    let sink = Arc::new(InMemoryVectorSink::default());
+                    let (runner, probe) = make_claim_probe_runner(false, false, sink.clone());
+                    let expected = runner.canonicalizer.canonicalize(&raw);
+                    let mut request = IngestRequest::new("legacy-file", raw);
+                    request.source_path = Some(path.to_string_lossy().into_owned());
+                    runner.ingest(request).unwrap();
+                    forget_retained_input(&runner, "legacy-file");
+                    if changed {
+                        // Preserve length to prove admission checks the digest,
+                        // not just the display preview or character count.
+                        std::fs::write(&path, expected.replace("searchable", "unfindable"))
+                            .unwrap();
+                    }
+                    let result = runner.process_batch(&cx, "worker").await.unwrap();
+                    if changed {
+                        assert_eq!(result.jobs_failed, 1);
+                        assert_eq!(result.jobs_completed, 0);
+                        assert!(probe.inputs.lock().unwrap().is_empty());
+                        assert!(sink.entries().is_empty());
+                    } else {
+                        assert_eq!(result.jobs_completed, 1);
+                        assert_eq!(*probe.inputs.lock().unwrap(), vec![expected]);
+                    }
+                });
+            }
+        }
+
+        #[test]
+        fn legacy_unreadable_input_exhausts_retries_without_persisting_a_preview() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let sink = Arc::new(InMemoryVectorSink::default());
+                let (runner, probe) = make_claim_probe_runner(false, false, sink.clone());
+                let mut request = IngestRequest::new("unreadable", long_input());
+                request.source_path = Some(
+                    dir.path()
+                        .join("absent.txt")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                runner.ingest(request).unwrap();
+                forget_retained_input(&runner, "unreadable");
+                for attempt in 0..=runner.queue.config().max_retries {
+                    let result = runner.process_batch(&cx, "worker").await.unwrap();
+                    assert_eq!(result.jobs_claimed, 1);
+                    assert_eq!(result.jobs_failed, 1);
+                    assert_eq!(result.jobs_completed, 0);
+                    assert_eq!(
+                        result.terminal_failures,
+                        usize::from(attempt == runner.queue.config().max_retries)
+                    );
+                }
+                assert_eq!(runner.queue.queue_depth().unwrap().failed, 1);
+                assert!(probe.inputs.lock().unwrap().is_empty());
+                assert!(sink.entries().is_empty());
+            });
+        }
+
+        #[test]
+        fn canonical_content_rejects_a_forged_payload_before_any_write() {
+            let sink = Arc::new(InMemoryVectorSink::default());
+            let (runner, _) = make_claim_probe_runner(false, false, sink);
+            runner.ingest(IngestRequest::new("payload", "original payload")).unwrap();
+            let doc = runner.storage.get_document("payload").unwrap().unwrap();
+            let before = read_document_content(runner.storage.connection(), &doc).unwrap();
+            assert!(
+                upsert_document_content(runner.storage.connection(), &doc, "forged payload")
+                    .is_err()
+            );
+            assert_eq!(
+                read_document_content(runner.storage.connection(), &doc).unwrap(),
+                before
+            );
+        }
+    }
 
     #[derive(Debug)]
     struct StubEmbedder {
@@ -4826,7 +5192,6 @@ mod integration_tests {
                 PipelineConfig {
                     process_batch_size: 200,
                     worker_max_idle_cycles: Some(1),
-                    worker_idle_sleep_ms: 1,
                     ..PipelineConfig::default()
                 },
                 fast,
@@ -4909,7 +5274,6 @@ mod integration_tests {
                 PipelineConfig {
                     process_batch_size: 10,
                     worker_max_idle_cycles: Some(1),
-                    worker_idle_sleep_ms: 1,
                     ..PipelineConfig::default()
                 },
                 fast,
@@ -4978,7 +5342,6 @@ mod integration_tests {
                 PipelineConfig {
                     process_batch_size: 100,
                     worker_max_idle_cycles: Some(1),
-                    worker_idle_sleep_ms: 1,
                     ..PipelineConfig::default()
                 },
                 fast,
@@ -5036,7 +5399,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn process_batch_reads_source_file_content_if_available() {
+    fn process_batch_recovers_verified_legacy_source_file() {
         use std::io::Write;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             // Create a SpyEmbedder that records the text it sees.
@@ -5054,7 +5417,7 @@ mod integration_tests {
 
                 fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
                     *self.captured.lock().unwrap() = Some(text.to_owned());
-                    Box::pin(async { Ok(vec![0.0; 4]) })
+                    Box::pin(async { Ok(vec![0.5; 4]) })
                 }
                 fn dimension(&self) -> usize {
                     4
@@ -5083,7 +5446,7 @@ mod integration_tests {
                 PipelineConfig::default(),
                 fast,
                 None,
-                sink,
+                Arc::clone(&sink),
             );
 
             // Create a temp file with content longer than preview limit (400 chars).
@@ -5107,11 +5470,21 @@ mod integration_tests {
                 .expect("exists");
             assert_eq!(doc.content_preview.len(), 400);
 
-            // Process batch.
-            let _ = runner
+            // Emulate a pre-v9 catalog so this proves file recovery rather
+            // than silently exercising the new retained-body fast path.
+            runner
+                .storage
+                .connection()
+                .execute_sync("DELETE FROM document_contents WHERE doc_id = 'doc-file';")
+                .expect("remove retained body from legacy fixture");
+
+            let processed = runner
                 .process_batch(&cx, "worker-spy")
                 .await
                 .expect("process");
+            assert_eq!(processed.jobs_completed, 1);
+            assert_eq!(processed.jobs_failed, 0);
+            assert_eq!(sink.entries().len(), 1);
 
             // Verify embedder received full content.
             let captured_text = captured
@@ -5129,7 +5502,7 @@ mod integration_tests {
     }
 
     #[test]
-    fn process_batch_falls_back_to_preview_when_source_file_is_too_large() {
+    fn process_batch_uses_retained_input_when_source_file_is_too_large() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             #[derive(Debug)]
             struct SpyEmbedder {
@@ -5145,7 +5518,7 @@ mod integration_tests {
 
                 fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
                     *self.captured.lock().unwrap() = Some(text.to_owned());
-                    Box::pin(async { Ok(vec![0.0; 4]) })
+                    Box::pin(async { Ok(vec![0.5; 4]) })
                 }
                 fn dimension(&self) -> usize {
                     4
@@ -5174,7 +5547,7 @@ mod integration_tests {
                 PipelineConfig::default(),
                 fast,
                 None,
-                sink,
+                Arc::clone(&sink),
             );
 
             let mut temp = tempfile::NamedTempFile::new().expect("tempfile");
@@ -5189,21 +5562,21 @@ mod integration_tests {
             let ingest_result = runner.ingest(req).expect("ingest");
             assert_eq!(ingest_result.action, IngestAction::New);
 
-            let _ = runner
+            let processed = runner
                 .process_batch(&cx, "worker-spy")
                 .await
                 .expect("process");
+            assert_eq!(processed.jobs_completed, 1);
+            assert_eq!(processed.jobs_failed, 0);
+            assert_eq!(sink.entries().len(), 1);
 
             let captured_text = captured
                 .lock()
                 .unwrap()
                 .take()
-                .expect("should have captured fallback preview text");
-            assert_eq!(captured_text.len(), MAX_CONTENT_PREVIEW_CHARS);
-            assert_eq!(
-                captured_text,
-                truncate_chars(&preview_source, MAX_CONTENT_PREVIEW_CHARS)
-            );
+                .expect("should have captured the complete retained body");
+            assert_eq!(captured_text.len(), preview_source.len());
+            assert_eq!(captured_text, preview_source);
         });
     }
 }
