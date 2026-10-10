@@ -16,7 +16,7 @@ use crate::content_hash::ContentHasher;
 use crate::document::{DocumentRecord, get_document_inner};
 
 /// Governed by schema version 9, shared by fresh bootstrap and migration.
-pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS document_contents (\
+pub const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS document_contents (\
     doc_id TEXT PRIMARY KEY REFERENCES documents(doc_id) ON DELETE CASCADE,\
     content_hash BLOB NOT NULL,\
     canonical_text TEXT NOT NULL\
@@ -61,7 +61,7 @@ impl Storage {
 }
 
 /// Write on the caller's transaction connection; never starts a nested transaction.
-pub(crate) fn upsert_document_content(
+pub fn upsert_document_content(
     conn: &AsyncConnection,
     document: &DocumentRecord,
     canonical_text: &str,
@@ -83,7 +83,7 @@ pub(crate) fn upsert_document_content(
 }
 
 /// Read against an explicit catalog revision, including a runner's claimed one.
-pub(crate) fn read_document_content(
+pub fn read_document_content(
     conn: &AsyncConnection,
     document: &DocumentRecord,
 ) -> SearchResult<Option<String>> {
@@ -116,7 +116,7 @@ pub(crate) fn read_document_content(
 }
 
 /// Validate actual input bytes, not only a caller-supplied digest or preview length.
-pub(crate) fn verify_document_text(
+pub fn verify_document_text(
     document: &DocumentRecord,
     canonical_text: &str,
 ) -> SearchResult<()> {
