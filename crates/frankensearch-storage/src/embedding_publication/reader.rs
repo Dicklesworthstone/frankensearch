@@ -1,5 +1,8 @@
 //! Verified, bounded reads of a single publication snapshot.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 use super::{
     EmbeddingIdentityBundleV1, IdentityBoundEmbedding, PublishedEmbedding, QuantizationFormat,
     READ_EMBEDDING_SQL, blob_column, hash_column, integer_column, map_storage_error,
@@ -8,6 +11,8 @@ use super::{
 };
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::generation::EmbeddingSpaceKindV1;
+use frankensearch_core::types::{BoundQueryEmbedding, VectorHit};
 use fsqlite::{AsyncConnection, Row};
 use fsqlite_types::value::SqliteValue;
 
@@ -61,6 +66,154 @@ pub struct PublishedEmbeddingScanStats {
 pub struct PublishedEmbeddingSnapshot {
     pub records: Vec<PublishedEmbedding>,
     pub stats: PublishedEmbeddingScanStats,
+}
+
+impl PublishedEmbeddingSnapshot {
+    /// Search this captured publication set by exact cosine similarity.
+    ///
+    /// This is an in-memory exact backend, not ANN or live database discovery.
+    /// It scans every captured vector, keeps at most `limit` hits, and orders
+    /// them by descending score then binary document ID. Negative similarities
+    /// are retained. `VectorHit::index` addresses `self.records`, so callers
+    /// can hydrate using the exact content hash that produced each result.
+    /// Reload the snapshot to observe later publications or document changes.
+    ///
+    /// The query must carry the same complete in-memory producer contract as
+    /// every record. Hash-control spaces are not admitted as semantic search.
+    /// Publicly mutable vector contracts, tier membership, and document order
+    /// are revalidated on every search. Malformed or mixed-producer vectors
+    /// fail the whole search even when
+    /// they would not enter the top k. Counts in `stats` are not trusted as
+    /// evidence of corpus coverage. A zero limit validates only the query.
+    ///
+    /// Norms and dot products use f64 intermediates without rewriting vectors.
+    /// The finite cosine is clamped to [-1, 1] and then rounded to f32 for the
+    /// existing hit type. Cancellation is checked during coordinate scans and
+    /// between records. This synchronous CPU operation creates no runtime or
+    /// task; schedule large searches on the caller's blocking execution path.
+    pub fn search(
+        &self,
+        cx: &Cx,
+        query: &BoundQueryEmbedding,
+        limit: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        publication_checkpoint(cx)?;
+        validate_read_identity(query.identity())?;
+        if matches!(query.identity().space.kind, EmbeddingSpaceKindV1::HashControl) {
+            return Err(publication_error("hash-control vectors are not semantic search input"));
+        }
+        let query_norm = query_norm(cx, query.vector())?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut heap = BinaryHeap::new();
+        let mut previous: Option<&str> = None;
+        let tier = self.records.first().map(|record| record.embedder_id.as_str());
+        for (index, record) in self.records.iter().enumerate() {
+            publication_checkpoint(cx)?;
+            if record.doc_id.trim().is_empty()
+                || record.embedder_id.trim().is_empty()
+                || previous.is_some_and(|id| record.doc_id.as_str() <= id)
+                || tier != Some(record.embedder_id.as_str())
+            {
+                return Err(publication_error("snapshot must contain one tier in unique document order"));
+            }
+            validate_response(query.identity(), &record.embedding)?;
+            let index = u32::try_from(index)
+                .map_err(|_| publication_error("snapshot position exceeds vector-hit index width"))?;
+            let score = cosine(cx, query.vector(), &record.embedding.values, query_norm)?;
+            let hit = RankedHit(VectorHit { index, score, doc_id: record.doc_id.clone().into() });
+            retain_hit(&mut heap, hit, limit)?;
+            previous = Some(record.doc_id.as_str());
+        }
+        publication_checkpoint(cx)?;
+        // The greatest heap element is the worst hit. Ascending heap order
+        // therefore yields the public best-first order, including tie breaks.
+        let hits = heap.into_sorted_vec().into_iter().map(|hit| hit.0).collect();
+        publication_checkpoint(cx)?;
+        Ok(hits)
+    }
+}
+
+fn query_norm(cx: &Cx, values: &[f32]) -> SearchResult<f64> {
+    let mut squared = 0.0_f64;
+    for (index, &value) in values.iter().enumerate() {
+        if index % 256 == 0 {
+            publication_checkpoint(cx)?;
+        }
+        if !value.is_finite() {
+            return Err(publication_error("query coordinates must be finite"));
+        }
+        let value = f64::from(value);
+        squared += value * value;
+    }
+    publication_checkpoint(cx)?;
+    if squared == 0.0 || !squared.is_finite() {
+        return Err(publication_error("query must have finite non-zero norm"));
+    }
+    Ok(squared.sqrt())
+}
+
+fn cosine(cx: &Cx, query: &[f32], vector: &[f32], query_norm: f64) -> SearchResult<f32> {
+    if query.len() != vector.len() {
+        return Err(publication_error("query and publication dimensions differ"));
+    }
+    let mut dot = 0.0_f64;
+    let mut squared = 0.0_f64;
+    for (index, (&left, &right)) in query.iter().zip(vector).enumerate() {
+        if index % 256 == 0 {
+            publication_checkpoint(cx)?;
+        }
+        let left = f64::from(left);
+        let right = f64::from(right);
+        dot += left * right;
+        squared += right * right;
+    }
+    let score = dot / (query_norm * squared.sqrt());
+    if !score.is_finite() {
+        return Err(publication_error("cosine similarity is not finite"));
+    }
+    // [-1, 1] cannot overflow f32. Rounding is the public VectorHit contract.
+    #[allow(clippy::cast_possible_truncation)]
+    let score = score.clamp(-1.0, 1.0) as f32;
+    Ok(if score == 0.0 { 0.0 } else { score })
+}
+
+#[derive(Debug)]
+struct RankedHit(VectorHit);
+
+impl PartialEq for RankedHit {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedHit {}
+
+impl PartialOrd for RankedHit {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedHit {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.0.score.total_cmp(&self.0.score)
+            .then_with(|| self.0.doc_id.cmp(&other.0.doc_id))
+            .then_with(|| self.0.index.cmp(&other.0.index))
+    }
+}
+
+fn retain_hit(heap: &mut BinaryHeap<RankedHit>, hit: RankedHit, limit: usize) -> SearchResult<()> {
+    if heap.len() < limit {
+        heap.try_reserve(1).map_err(map_storage_error)?;
+        heap.push(hit);
+    } else if let Some(mut worst) = heap.peek_mut()
+        && hit < *worst
+    {
+        *worst = hit;
+    }
+    Ok(())
 }
 
 impl Storage {
@@ -283,6 +436,16 @@ mod tests {
         producer: &str,
         values: Vec<f32>,
     ) {
+        publish_with_identity(storage, queue, id, identity(producer), values);
+    }
+
+    fn publish_with_identity(
+        storage: &Storage,
+        queue: &PersistentJobQueue,
+        id: &str,
+        identity: EmbeddingIdentityBundleV1,
+        values: Vec<f32>,
+    ) {
         let body = format!("complete body for {id}");
         let hash = ContentHasher::hash(&body);
         let document = DocumentRecord::new(id, &body, hash, body.chars().count(), 1, 1);
@@ -291,7 +454,7 @@ mod tests {
         queue.enqueue(id, "model", &hash, 0).unwrap();
         let claim = queue.claim_batch("publisher", 1).unwrap().pop().unwrap();
         assert_eq!(claim.doc_id, id);
-        let response = IdentityBoundEmbedding { values, identity: identity(producer) };
+        let response = IdentityBoundEmbedding { values, identity };
         assert_eq!(
             storage.publish_claimed_embedding(&claim, &hash, &response.identity, &response).unwrap(),
             ClaimOutcome::Applied(())
@@ -446,6 +609,259 @@ mod tests {
             assert_eq!(visited, 1);
             assert_eq!(queue.queue_depth().unwrap().completed, 2);
             assert!(!storage.connection().in_transaction());
+        });
+    }
+
+    fn semantic_identity(name: &str) -> EmbeddingIdentityBundleV1 {
+        use frankensearch_core::generation::EmbeddingArtifactIdentityV1;
+
+        // Synthetic admission fixture, not evidence of model quality. Keep the
+        // production hash-control rejection and rebind every changed identity
+        // component, following native_ann/builder/scope.rs's test provider.
+        let mut identity = identity(name);
+        identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+        identity.space.hash_control = None;
+        identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+        identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+            role: "weights".to_owned(),
+            sha256: "b".repeat(64),
+            size: 1,
+        }];
+        identity.producer.space_fingerprint = identity.space.fingerprint();
+        identity.validate().unwrap();
+        identity
+    }
+
+    fn captured_record(id: &str, values: Vec<f32>) -> PublishedEmbedding {
+        PublishedEmbedding {
+            doc_id: id.to_owned(),
+            embedder_id: "model".to_owned(),
+            content_hash: ContentHasher::hash(id),
+            source_job_id: 1,
+            claim_epoch: 1,
+            published_at_ms: 1,
+            embedding: IdentityBoundEmbedding { values, identity: semantic_identity("model") },
+        }
+    }
+
+    fn captured(rows: &[(&str, [f32; 2])]) -> PublishedEmbeddingSnapshot {
+        PublishedEmbeddingSnapshot {
+            records: rows.iter().map(|(id, values)| captured_record(id, values.to_vec())).collect(),
+            // Deliberately not a coverage witness: search must inspect records
+            // rather than trust the mutable stats field or invent missing rows.
+            stats: PublishedEmbeddingScanStats::default(),
+        }
+    }
+
+    #[test]
+    fn exact_search_normalizes_vectors_keeps_negative_scores_and_resolves_ties() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let snapshot = captured(&[
+                ("a-near", [2.0, 0.0]),
+                ("b-angled", [100.0, 100.0]),
+                ("c-near", [4.0, -0.0]),
+                ("d-orthogonal", [0.0, 3.0]),
+                ("e-opposite", [-5.0, 0.0]),
+            ]);
+            let before = snapshot.clone();
+            let query = BoundQueryEmbedding::new(vec![7.0, 0.0], semantic_identity("model")).unwrap();
+            let hits = snapshot.search(&cx, &query, usize::MAX).unwrap();
+            assert_eq!(
+                hits.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+                ["a-near", "c-near", "b-angled", "d-orthogonal", "e-opposite"]
+            );
+            for (hit, expected) in hits.iter().zip([1.0, 1.0, std::f32::consts::FRAC_1_SQRT_2, 0.0, -1.0]) {
+                assert!((hit.score - expected).abs() < 1.0e-6);
+                let row = &snapshot.records[usize::try_from(hit.index).unwrap()];
+                assert_eq!(row.doc_id.as_str(), hit.doc_id.as_str());
+                assert_eq!(row.content_hash, ContentHasher::hash(hit.doc_id.as_str()));
+            }
+            assert_eq!(hits[3].score.to_bits(), 0.0_f32.to_bits());
+            assert_eq!(snapshot, before, "scoring does not rewrite the snapshot");
+            assert_eq!(snapshot.records[2].embedding.values[1].to_bits(), (-0.0_f32).to_bits());
+        });
+    }
+
+    #[test]
+    fn bounded_heap_matches_an_independent_full_sort_for_every_limit() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut snapshot = captured(&[]);
+            for x in -3_i16..=3 {
+                for y in -3_i16..=3 {
+                    if x == 0 && y == 0 {
+                        continue;
+                    }
+                    let id = format!("doc-{:03}", snapshot.records.len());
+                    snapshot.records.push(captured_record(&id, vec![f32::from(x), f32::from(y)]));
+                }
+            }
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            let mut reference: Vec<_> = snapshot.records.iter().enumerate().map(|(index, row)| {
+                // Independent 2-D reference: normalized x coordinate from
+                // hypot, not the production reduction or heap comparator.
+                let x = f64::from(row.embedding.values[0]);
+                let y = f64::from(row.embedding.values[1]);
+                #[allow(clippy::cast_possible_truncation)]
+                let score = (x / x.hypot(y)) as f32;
+                VectorHit {
+                    index: u32::try_from(index).unwrap(),
+                    score: if score == 0.0 { 0.0 } else { score },
+                    doc_id: row.doc_id.clone().into(),
+                }
+            }).collect();
+            reference.sort_by(VectorHit::cmp_rank);
+            for limit in (0..=reference.len() + 1).chain(std::iter::once(usize::MAX)) {
+                let actual = snapshot.search(&cx, &query, limit).unwrap();
+                assert_eq!(actual, reference[..limit.min(reference.len())], "limit={limit}");
+            }
+        });
+    }
+
+    #[test]
+    fn search_accepts_extreme_finite_query_scales_but_rejects_zero_and_foreign_queries() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let snapshot = captured(&[("aligned", [1.0, 0.0]), ("opposite", [-1.0, 0.0])]);
+            for scale in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1), 0.5] {
+                let query = BoundQueryEmbedding::new(vec![scale, 0.0], semantic_identity("model")).unwrap();
+                let hits = snapshot.search(&cx, &query, 2).unwrap();
+                assert_eq!(hits[0].doc_id.as_str(), "aligned");
+                assert!((hits[0].score - 1.0).abs() < f32::EPSILON);
+                assert!((hits[1].score + 1.0).abs() < f32::EPSILON);
+            }
+            let zero = BoundQueryEmbedding::new(vec![0.0, -0.0], semantic_identity("model")).unwrap();
+            assert!(snapshot.search(&cx, &zero, 1).is_err());
+            assert!(snapshot.search(&cx, &zero, 0).is_err());
+            let foreign = BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("foreign")).unwrap();
+            assert!(snapshot.search(&cx, &foreign, 1).is_err());
+        });
+    }
+
+    #[test]
+    fn malformed_tail_records_fail_even_when_the_best_hit_is_already_known() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let original = captured(&[("a-best", [1.0, 0.0]), ("z-last", [-1.0, 0.0])]);
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            for corruption in ["nan", "zero", "dimension", "producer", "duplicate", "tier"] {
+                let mut snapshot = original.clone();
+                let tail = &mut snapshot.records[1];
+                match corruption {
+                    "nan" => tail.embedding.values[0] = f32::NAN,
+                    "zero" => tail.embedding.values.fill(0.0),
+                    "dimension" => { tail.embedding.values.pop(); }
+                    "producer" => tail.embedding.identity = semantic_identity("foreign"),
+                    "duplicate" => tail.doc_id = "a-best".to_owned(),
+                    "tier" => tail.embedder_id = "other-tier".to_owned(),
+                    _ => unreachable!(),
+                }
+                assert!(snapshot.search(&cx, &query, 1).is_err(), "{corruption}");
+            }
+        });
+    }
+
+    #[test]
+    fn search_cancellation_precedes_empty_and_zero_limit_results() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            cx.cancel_with(asupersync::CancelKind::User, Some("cancel snapshot search"));
+            for snapshot in [captured(&[]), captured(&[("doc", [1.0, 0.0])])] {
+                for limit in [0, 1] {
+                    assert!(matches!(snapshot.search(&cx, &query, limit), Err(SearchError::Cancelled { .. })));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn snapshot_search_keeps_its_captured_revision_until_reloaded() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            publish_with_identity(&storage, &queue, "doc", semantic_identity("model"), vec![1.0, 0.0]);
+            let old = storage.load_published_embeddings(
+                &cx, "model", &semantic_identity("model"), PublishedEmbeddingReadLimits::default(),
+            ).unwrap();
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            let changed = DocumentRecord::new("doc", "new body", ContentHasher::hash("new body"), 8, 1, 2);
+            storage.upsert_document(&changed).unwrap();
+            storage.set_document_content("doc", "new body").unwrap();
+            queue.enqueue("doc", "model", &changed.content_hash, 0).unwrap();
+            let claim = queue.claim_batch("publisher", 1).unwrap().pop().unwrap();
+            let response = IdentityBoundEmbedding { values: vec![-1.0, 0.0], identity: semantic_identity("model") };
+            assert_eq!(storage.publish_claimed_embedding(
+                &claim, &changed.content_hash, &response.identity, &response,
+            ).unwrap(), ClaimOutcome::Applied(()));
+            let new = storage.load_published_embeddings(
+                &cx, "model", &semantic_identity("model"), PublishedEmbeddingReadLimits::default(),
+            ).unwrap();
+            assert!((old.search(&cx, &query, 1).unwrap()[0].score - 1.0).abs() < f32::EPSILON);
+            assert!((new.search(&cx, &query, 1).unwrap()[0].score + 1.0).abs() < f32::EPSILON);
+            assert_ne!(old.records[0].content_hash, new.records[0].content_hash);
+            assert_eq!(new.records[0].content_hash, changed.content_hash);
+        });
+    }
+
+    #[test]
+    fn database_worker_output_is_searchable_after_reopen_without_an_external_index() {
+        use frankensearch_core::canonicalize::DefaultCanonicalizer;
+        use frankensearch_core::traits::{ModelCategory, SearchFuture};
+        use crate::{InMemoryVectorSink, IngestRequest, PersistentEmbeddingWorker, StorageConfig};
+
+        struct Probe {
+            identity: EmbeddingIdentityBundleV1,
+        }
+        impl frankensearch_core::Embedder for Probe {
+            fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { Ok(&self.identity) }
+            fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                let values = if text.contains("orchard") { vec![1.0, 0.0] } else { vec![0.0, 1.0] };
+                Box::pin(async move { Ok(values) })
+            }
+            fn dimension(&self) -> usize { 2 }
+            fn id(&self) -> &'static str { "model" }
+            fn model_name(&self) -> &'static str { "snapshot-search-probe" }
+            fn is_semantic(&self) -> bool { true }
+            fn category(&self) -> ModelCategory { ModelCategory::StaticEmbedder }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let config = StorageConfig { db_path: directory.path().join("search.sqlite3"), ..StorageConfig::default() };
+            let sink = Arc::new(InMemoryVectorSink::default());
+            {
+                let storage = Arc::new(Storage::open(config.clone()).unwrap());
+                let worker = PersistentEmbeddingWorker::new(
+                    storage, JobQueueConfig::default(), Arc::new(DefaultCanonicalizer::default()),
+                    Arc::new(Probe { identity: semantic_identity("model") }), sink.clone(),
+                ).unwrap().with_database_publication();
+                worker.runner().ingest(IngestRequest::new("fruit", "apple orchard")).unwrap();
+                worker.runner().ingest(IngestRequest::new("systems", "database transaction")).unwrap();
+                let processed = worker.process_batch(&cx, "publisher").await.unwrap();
+                assert_eq!(processed.jobs_completed, 2);
+                assert_eq!(processed.jobs_failed + processed.jobs_suppressed, 0);
+                assert!(sink.entries().is_empty());
+            }
+            let storage = Storage::open(config).unwrap();
+            let snapshot = storage.load_published_embeddings(
+                &cx, "model", &semantic_identity("model"), PublishedEmbeddingReadLimits::default(),
+            ).unwrap();
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            let hits = snapshot.search(&cx, &query, 1).unwrap();
+            assert_eq!(snapshot.stats.records, 2);
+            assert_eq!(hits[0].doc_id.as_str(), "fruit");
+            let row = &snapshot.records[usize::try_from(hits[0].index).unwrap()];
+            assert_eq!(row.content_hash, ContentHasher::hash("apple orchard"));
+            assert_eq!(storage.get_document_content(&row.doc_id).unwrap().as_deref(), Some("apple orchard"));
+            assert!(sink.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn hash_control_queries_cannot_be_reported_as_semantic_search() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
+            assert_eq!(query.identity().space.kind, EmbeddingSpaceKindV1::HashControl);
+            for limit in [0, 1] {
+                let error = captured(&[]).search(&cx, &query, limit).unwrap_err();
+                assert!(error.to_string().contains("hash-control"));
+            }
         });
     }
 }
