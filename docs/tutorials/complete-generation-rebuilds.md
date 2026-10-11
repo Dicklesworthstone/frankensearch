@@ -35,8 +35,9 @@ must sit beneath a hidden directory, like the default in-project
 directory that already holds
 a legacy index keeps its layout unless the build sets
 `FSFS_COMPLETE_GENERATIONS=1` (the longer `FRANKENSEARCH_COMPLETE_GENERATIONS`
-spelling takes precedence), which converts it; `=0` keeps building legacy
-indexes:
+spelling takes precedence), which converts it, seeding the first generation
+from the legacy index when its completion receipt comes from the same fsfs build
+and configuration; `=0` keeps building legacy indexes:
 
 ```sh
 fsfs index /work/source \

@@ -110,9 +110,11 @@ The retained builder writes a version-2 `FSFS-REUSE.json` inside each completed
 bundle when it has indexing checkpoint evidence. On Linux, a later process can
 reuse that evidence when the actual running executable, the full resolved
 configuration and the source root match. This applies to retained `index`
-rebuilds and the builder used by `watch`; it does not enable reuse for a legacy
-mutable index. No additional reuse flag is needed. Rerun the same indexing or
-watch command with the same configuration and executable.
+rebuilds and the builder used by `watch`. A legacy index keeps its own receipt
+(`FSFS-LEGACY-REUSE.json`), and the first complete build in its directory seeds
+from it, so converting the index carries its unchanged files. No additional
+reuse flag is needed. Rerun the same indexing or watch command with the same
+configuration and executable.
 
 The proof hashes the executable opened through `/proc/self/exe`, not a pathname
 that an upgrade may already have replaced, and checks that FSFS code belongs to
@@ -153,13 +155,17 @@ nanosecond) still matches the generation it extends and that no notification
 named: its checkpoint-proven lexical rows and vectors stay as they are, and it
 is not reread, canonicalized or re-indexed. Changed, added and removed files are
 applied. The startup rebuild, a forced reconciliation (hint overflow, a backend
-rescan request) and a file whose checkpoint entry lacks the needed proof reread
-everything they cover. An edit that keeps every observed stamp and raises no
-notification therefore keeps its old content until the next full rebuild.
-Outside a watch, reuse saves eligible embedding work, not rebuild I/O. Either
-way the selected generation is still copied into independent files, discovery
-still runs, and the normal validation and publication barriers remain. There are no hard
-links into retained vector, lexical or catalog files and no implicit pruning.
+rescan request) and a plain `fsfs index` rerun observe nothing, so they prove
+files unchanged from the receipt instead: a file whose settled stamp (recorded
+only once its change time is older than the filesystem's timestamp tick) still
+matches is carried without being opened, and a file whose stamp moved is read
+once and carried if its digest still matches. A file whose checkpoint entry
+lacks the needed proof is reread. An edit that keeps every observed stamp and
+raises no notification therefore keeps its old content until the file changes
+again or `fsfs index --full` rebuilds it. Either way the selected generation is
+still seeded into the candidate (Quill segments are shared by hard link, since
+Quill never rewrites one; vector, catalog and every other file is copied),
+discovery still runs, and the normal validation and publication barriers remain.
 Pausing hot sources bounds repeated candidate creation until quiet observations
 agree, not total lifetime disk use or event-to-visible latency. Retained and
 abandoned generations consume disk space; automatic reclamation is not implemented.
