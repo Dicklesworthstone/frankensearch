@@ -11995,16 +11995,49 @@ mod tests {
             target_os = "watchos"
         )
     ))]
-    fn typed_query_replay_test_root(label: &str) -> std::path::PathBuf {
-        static DIRECTORY_NONCE: AtomicUsize = AtomicUsize::new(0);
+    fn typed_query_replay_test_root(label: &str) -> ReplayTestRoot {
+        ReplayTestRoot(
+            tempfile::Builder::new()
+                .prefix(&format!("frankensearch-typed-query-replay-{label}-"))
+                .tempdir()
+                .expect("create unique owned replay test directory"),
+        )
+    }
 
-        let nonce = DIRECTORY_NONCE.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!(
-            "frankensearch-typed-query-replay-{label}-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&root).expect("create unique owned replay test directory");
-        root
+    /// An owned replay test directory, removed with everything the test left
+    /// in it when the test ends, panics included (bd-hsffx).
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    struct ReplayTestRoot(tempfile::TempDir);
+
+    #[cfg(all(
+        feature = "fuzz-harness",
+        any(
+            target_os = "android",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos"
+        )
+    ))]
+    impl std::ops::Deref for ReplayTestRoot {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            self.0.path()
+        }
     }
 
     #[cfg(all(
@@ -13023,7 +13056,7 @@ mod tests {
             }
         });
 
-        let winner_root = root.clone();
+        let winner_root = root.to_path_buf();
         let winner_replay = replay.clone();
         let winner = std::thread::spawn(move || {
             persist_typed_query_fuzz_replay(&winner_root, &winner_replay)
@@ -13034,7 +13067,7 @@ mod tests {
         };
         assert_eq!(winner_event, "winner");
 
-        let loser_root = root.clone();
+        let loser_root = root.to_path_buf();
         let loser_replay = replay.clone();
         let loser =
             std::thread::spawn(move || persist_typed_query_fuzz_replay(&loser_root, &loser_replay));
