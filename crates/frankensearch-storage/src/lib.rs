@@ -37,7 +37,10 @@ pub use document::{
     BatchResult, CrudErrorKind, DocumentRecord, EmbeddingStatus, StatusCounts, count_documents,
     list_document_ids, upsert_document,
 };
-pub use embedding_publication::PublishedEmbedding;
+pub use embedding_publication::{
+    PublishedEmbedding, PublishedEmbeddingReadLimits, PublishedEmbeddingScanStats,
+    PublishedEmbeddingSnapshot,
+};
 #[cfg(feature = "fts5")]
 pub use fts5_adapter::{
     Fts5AdapterConfig, Fts5ContentMode, Fts5Hit, Fts5LexicalSearch, Fts5TokenizerChoice,

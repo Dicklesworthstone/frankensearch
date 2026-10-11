@@ -22,6 +22,9 @@ use crate::document::{DocumentRecord, get_document_inner, mark_embedded_inner};
 use crate::document_content::read_document_content;
 use crate::{ClaimOutcome, ClaimedJob, Storage};
 
+mod reader;
+pub use reader::{PublishedEmbeddingReadLimits, PublishedEmbeddingScanStats, PublishedEmbeddingSnapshot};
+
 /// Shared by fresh bootstrap and the additive v10 migration.
 pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS published_embeddings (\
     doc_id TEXT NOT NULL REFERENCES documents(doc_id) ON DELETE CASCADE,\
@@ -337,7 +340,7 @@ impl Storage {
         if doc_id.trim().is_empty() || embedder_id.trim().is_empty() {
             return Err(publication_error("document and embedder IDs must not be empty"));
         }
-        expected_identity.validate()?;
+        reader::validate_read_identity(expected_identity)?;
         self.transaction(|conn| {
             let rows = conn
                 .query_with_params_sync(
@@ -348,60 +351,7 @@ impl Storage {
             let Some(row) = rows.first() else {
                 return Ok(None);
             };
-            let content_hash = hash_column(row, 0)?;
-            if content_hash != hash_column(row, 8)? {
-                return Ok(None);
-            }
-            let identity_json = text_column(row, 1)?;
-            let vector_le = blob_column(row, 2)?;
-            let record_hash = hash_column(row, 3)?;
-            let source_job_id = integer_column(row, 4)?;
-            let claim_epoch = integer_column(row, 5)?;
-            let published_at_ms = integer_column(row, 6)?;
-            if integer_column(row, 7)? != 1 || source_job_id <= 0 || claim_epoch <= 0 {
-                return Err(publication_error("invalid embedding publication version or attempt"));
-            }
-            if publication_hash(
-                doc_id,
-                embedder_id,
-                &content_hash,
-                identity_json,
-                vector_le,
-                [source_job_id, claim_epoch, published_at_ms],
-            )? != record_hash
-            {
-                return Err(publication_error("embedding publication checksum mismatch"));
-            }
-            let identity: EmbeddingIdentityBundleV1 = serde_json::from_str(identity_json)
-                .map_err(|_| publication_error("invalid stored embedding identity"))?;
-            // Never return coordinates or provider fields under the wrong contract.
-            if &identity != expected_identity {
-                return Err(publication_error("published embedding producer identity mismatch"));
-            }
-            let dimension = usize::try_from(identity.space.dimension)
-                .map_err(|_| publication_error("embedding dimension does not fit usize"))?;
-            let expected_bytes = dimension
-                .checked_mul(4)
-                .ok_or_else(|| publication_error("embedding byte length overflow"))?;
-            if vector_le.len() != expected_bytes {
-                return Err(publication_error("published embedding has an invalid byte length"));
-            }
-            let mut values = Vec::new();
-            values.try_reserve_exact(dimension).map_err(map_storage_error)?;
-            for bytes in vector_le.as_chunks::<4>().0 {
-                values.push(f32::from_le_bytes(*bytes));
-            }
-            let embedding = IdentityBoundEmbedding { values, identity };
-            validate_response(expected_identity, &embedding)?;
-            Ok(Some(PublishedEmbedding {
-                doc_id: doc_id.to_owned(),
-                embedder_id: embedder_id.to_owned(),
-                content_hash,
-                source_job_id,
-                claim_epoch,
-                published_at_ms,
-                embedding,
-            }))
+            reader::decode_row(row, doc_id, embedder_id, expected_identity)
         })
     }
 }
