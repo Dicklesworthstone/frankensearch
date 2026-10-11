@@ -24,6 +24,7 @@ pub mod index_metadata;
 pub mod job_queue;
 pub mod metrics;
 pub mod pipeline;
+pub mod publication_recovery;
 pub mod schema;
 pub mod staleness;
 pub mod worker;
@@ -66,6 +67,7 @@ pub use pipeline::{
     IngestRequest, IngestResult, PersistedEmbedding, PipelineConfig, PipelineMetrics,
     PipelineMetricsSnapshot, StorageBackedJobRunner, WorkerReport,
 };
+pub use publication_recovery::{PublicationRecoveryConfig, PublicationRecoveryPage};
 pub use schema::{SCHEMA_VERSION, bootstrap, current_version};
 pub use staleness::{
     QuickStalenessCheck, RecommendedAction, StalenessConfig, StalenessLevel, StalenessReport,
