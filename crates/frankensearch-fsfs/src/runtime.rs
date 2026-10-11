@@ -131,7 +131,7 @@ use crate::incremental_change::{
     IndexMembershipEntry, WatcherCheckpointSnapshot,
 };
 use crate::lexical_pipeline::{
-    LexicalMutation, LexicalPipeline, QuillLexicalBackend, lexical_query_text,
+    LexicalMutation, LexicalPipeline, QuillLexicalBackend, QuillResumeStats, lexical_query_text,
 };
 use crate::lifecycle::{
     DiskBudgetAction, DiskBudgetSnapshot, DiskBudgetStage, IndexStorageBreakdown, LifecycleTracker,
@@ -18121,6 +18121,10 @@ impl FsfsRuntime {
         // made a first build's checkpoint I/O quadratic in the number of files.
         // The initial checkpoint above is undurable.
         let mut checkpoint_durable_on_disk = false;
+        // A fresh engine directory, or a generation reset above, holds no row a
+        // resumable flush could find unchanged.
+        let lexical_starts_empty =
+            discard_undurable_lexical_generation || lexical_plan.publish_pointer.is_some();
 
         // 3. Process in batches
         for chunk in reading.chunks(batch_size) {
@@ -18350,7 +18354,17 @@ impl FsfsRuntime {
                 let mut pipeline = LexicalPipeline::new(backend);
                 let _stats = pipeline.apply_initial(&lexical_batch)?;
                 publication_lease.fence("one-shot lexical batch resumable flush")?;
-                let resume_stats = pipeline.backend_mut().flush_resumable(cx).await?;
+                let resume_stats = if lexical_starts_empty {
+                    // Every row is new: a file enters one batch per build and
+                    // the engine held nothing, so there is no witness to check.
+                    pipeline.backend_mut().flush(cx).await?;
+                    QuillResumeStats {
+                        absent: u64::try_from(lexical_batch.len()).unwrap_or(u64::MAX),
+                        ..QuillResumeStats::default()
+                    }
+                } else {
+                    pipeline.backend_mut().flush_resumable(cx).await?
+                };
                 lexical_resume_absent = lexical_resume_absent.saturating_add(resume_stats.absent);
                 lexical_resume_unchanged =
                     lexical_resume_unchanged.saturating_add(resume_stats.unchanged);
