@@ -289,16 +289,16 @@ pub(super) fn legacy_checkpoint(
     if runtime.cli_input.full_reindex {
         return Ok(None);
     }
-    admitted_legacy_checkpoint(cx, runtime, root)
+    Ok(admitted_legacy_evidence(cx, runtime, root)?.map(|evidence| evidence.receipt.checkpoint))
 }
 
-/// The completed checkpoint whose receipt still binds the root's artifacts.
-fn admitted_legacy_checkpoint(
+/// The completion evidence whose receipt still binds the root's artifacts.
+fn admitted_legacy_evidence(
     cx: &Cx,
     runtime: &FsfsRuntime,
     root: &Path,
-) -> SearchResult<Option<IndexingCheckpoint>> {
-    let read = || -> SearchResult<Option<IndexingCheckpoint>> {
+) -> SearchResult<Option<LegacyReuseReceipt>> {
+    let read = || -> SearchResult<Option<LegacyReuseReceipt>> {
         retained_search_checkpoint(cx)?;
         for excluded in [FSFS_CHECKPOINT_FILE, COMPLETE_GENERATION_MANIFEST] {
             match fs::symlink_metadata(root.join(excluded)) {
@@ -340,7 +340,7 @@ fn admitted_legacy_checkpoint(
             covered_files = receipt.checkpoint.files.len(),
             "admitted completed legacy inputs; source hashes and active producers decide reuse"
         );
-        Ok(Some(evidence.receipt.checkpoint))
+        Ok(Some(evidence))
     };
     match read() {
         Err(error @ SearchError::Cancelled { .. }) => Err(error),
@@ -458,9 +458,9 @@ pub(super) fn reuse_ledger(
     root: &Path,
 ) -> SearchResult<Option<ReuseLedger>> {
     Ok(
-        admitted_legacy_checkpoint(cx, runtime, root)?.map(|admitted| ReuseLedger {
+        admitted_legacy_evidence(cx, runtime, root)?.map(|evidence| ReuseLedger {
             index_root: root.to_path_buf(),
-            admitted,
+            admitted: evidence.receipt.checkpoint,
             replaced: std::sync::Mutex::new(BTreeMap::new()),
         }),
     )
@@ -551,6 +551,32 @@ pub(super) fn retain_mutated_checkpoint(
 /// Cache/catalog/explain files cannot affect checkpoint reuse and are omitted.
 fn legacy_state_digest(cx: &Cx, root: &Path, receipt: &ReuseReceipt) -> SearchResult<String> {
     retained_search_checkpoint(cx)?;
+    let artifacts = legacy_artifacts(root)?;
+    let bytes = serde_json::to_vec(receipt).map_err(|source| SearchError::SubsystemError {
+        subsystem: "fsfs.index.completed_reuse",
+        source: Box::new(source),
+    })?;
+    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
+        return Err(reuse_error(
+            "completed legacy input evidence exceeds its byte limit",
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"fsfs.legacy_completed_reuse.v1\0");
+    digest.update((bytes.len() as u64).to_le_bytes());
+    digest.update(bytes);
+    let mut stats = CopyStats::default();
+    for path in artifacts {
+        legacy_hash_artifact(cx, root, &path, 0, &mut stats, &mut digest)?;
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(super::sha256_digest_hex(digest.finalize()))
+}
+
+/// The paths of a legacy root's selected index, in digest order: CURRENT
+/// pointers, the completion sentinel, the membership manifest, the vector
+/// tiers (WALs included) and the active Quill engine. Some may be absent.
+fn legacy_artifacts(root: &Path) -> SearchResult<[PathBuf; 6]> {
     if !fs::symlink_metadata(root)?.file_type().is_dir() {
         return Err(reuse_error(
             "legacy index root is not a non-symlink directory",
@@ -579,32 +605,14 @@ fn legacy_state_digest(cx: &Cx, root: &Path, receipt: &ReuseReceipt) -> SearchRe
             "legacy lexical root is not a non-symlink directory",
         ));
     }
-    let bytes = serde_json::to_vec(receipt).map_err(|source| SearchError::SubsystemError {
-        subsystem: "fsfs.index.completed_reuse",
-        source: Box::new(source),
-    })?;
-    if bytes.len() as u64 > MAX_RECEIPT_BYTES {
-        return Err(reuse_error(
-            "completed legacy input evidence exceeds its byte limit",
-        ));
-    }
-    let mut digest = Sha256::new();
-    digest.update(b"fsfs.legacy_completed_reuse.v1\0");
-    digest.update((bytes.len() as u64).to_le_bytes());
-    digest.update(bytes);
-    let mut stats = CopyStats::default();
-    for path in [
+    Ok([
         root.join(super::CURRENT_FILE_NAME),
         root.join("lexical").join(super::CURRENT_FILE_NAME),
         root.join(super::FSFS_SENTINEL_FILE),
         root.join(super::FSFS_LEXICAL_MANIFEST_FILE),
         root.join("vector"),
         lexical,
-    ] {
-        legacy_hash_artifact(cx, root, &path, 0, &mut stats, &mut digest)?;
-    }
-    retained_search_checkpoint(cx)?;
-    Ok(super::sha256_digest_hex(digest.finalize()))
+    ])
 }
 
 fn legacy_hash_artifact(
@@ -860,7 +868,7 @@ fn seed_candidate(
         return Ok(None);
     }
     let Some(predecessor) = store.active(cx)? else {
-        return Ok(None);
+        return seed_candidate_from_legacy(cx, runtime, store.root(), destination);
     };
     let path = predecessor.path().join(RECEIPT_FILE);
     match fs::symlink_metadata(&path) {
@@ -940,6 +948,83 @@ fn seed_candidate(
         copied_bytes = stats.bytes,
         linked_segments = stats.linked,
         "seeded isolated generation; ordinary source-hash and producer checks decide actual reuse"
+    );
+    Ok(Some(eligible))
+}
+
+/// The first complete build in a directory that still holds a legacy index
+/// converts it. When that index's completion receipt is compatible (same
+/// executable and configuration) and still binds its artifacts, seed the
+/// candidate with exactly those artifacts, so conversion carries unchanged
+/// files instead of rebuilding them. The build's publication lease on the
+/// store root is the legacy root's own lease: no legacy writer can change the
+/// artifacts while they are read.
+fn seed_candidate_from_legacy(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    root: &Path,
+    destination: &Path,
+) -> SearchResult<Option<usize>> {
+    let Some(evidence) = admitted_legacy_evidence(cx, runtime, root)? else {
+        return Ok(None);
+    };
+    if !fs::symlink_metadata(destination)?.file_type().is_dir()
+        || fs::read_dir(destination)?.next().transpose()?.is_some()
+    {
+        return Err(reuse_error(
+            "reuse requires an empty, non-symlink candidate directory",
+        ));
+    }
+    let mut stats = CopyStats::default();
+    for source in legacy_artifacts(root)? {
+        retained_search_checkpoint(cx)?;
+        let relative = source
+            .strip_prefix(root)
+            .map_err(|_| reuse_error("legacy artifact escapes the index root"))?;
+        let metadata = match fs::symlink_metadata(&source) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let target = destination.join(relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if metadata.is_dir() {
+            fs::create_dir(&target)?;
+            copy_tree(cx, &source, &target, relative.components().count(), &mut stats)?;
+        } else if metadata.is_file() {
+            copy_file(cx, &source, &target, &mut stats)?;
+        } else {
+            return Err(reuse_error(
+                "legacy index contains a symlink or special filesystem object",
+            ));
+        }
+    }
+    // The copy holds exactly the bytes the receipt binds: its digest, taken
+    // before the sentinel is rebased, equals the one admitted for the root.
+    let receipt = evidence.receipt;
+    if legacy_state_digest(cx, destination, &receipt)? != evidence.state_sha256 {
+        return Err(reuse_error(
+            "legacy index artifacts changed while they were copied",
+        ));
+    }
+    let mut sentinel = FsfsRuntime::read_index_sentinel(destination)?
+        .ok_or_else(|| reuse_error("legacy index has no sentinel"))?;
+    let label = destination.display().to_string();
+    sentinel.index_root.clone_from(&label);
+    let mut checkpoint = receipt.checkpoint;
+    checkpoint.index_root = label;
+    let eligible = checkpoint.files.values().filter(|entry| proven(entry)).count();
+    runtime.write_index_sentinel(destination, &sentinel)?;
+    write_indexing_checkpoint(destination, &checkpoint)?;
+    File::open(destination)?.sync_all()?;
+    tracing::info!(
+        eligible_semantic_files = eligible,
+        copied_files = stats.files,
+        copied_bytes = stats.bytes,
+        linked_segments = stats.linked,
+        "seeded the first complete generation from the legacy index it converts"
     );
     Ok(Some(eligible))
 }
@@ -1025,71 +1110,80 @@ fn copy_tree(
         if file_type.is_dir() {
             fs::create_dir(&target)?;
             copy_tree(cx, &entry.path(), &target, depth + 1, stats)?;
-        } else if is_quill_segment_name(&name) && fs::hard_link(entry.path(), &target).is_ok() {
-            // Quill writes a segment once and afterwards only renames or
-            // unlinks it, so the candidate shares the predecessor's instead of
-            // writing and syncing a copy of the largest file in the bundle
-            // (bd-dnqgr). A filesystem without hard links gets the copy.
-            stats.linked += 1;
         } else {
-            let mut input = open_regular(&entry.path())?;
-            let expected = input.metadata()?.len();
-            let mut output = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&target)?;
-            // Nothing else is linked: tombstones, mmap writes, catalogs and
-            // Quill's manifests in the candidate must never reach a retained
-            // reader.
-            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-            let mut copied = 0_u64;
-            let mut digest = Sha256::new();
-            loop {
-                retained_search_checkpoint(cx)?;
-                let count = input.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                copied = copied
-                    .checked_add(count as u64)
-                    .ok_or_else(|| reuse_error("copied artifact length overflow"))?;
-                if copied > expected {
-                    return Err(reuse_error("predecessor artifact grew during copying"));
-                }
-                output.write_all(&buffer[..count])?;
-                digest.update(&buffer[..count]);
-            }
-            if copied != expected || input.metadata()?.len() != expected {
-                return Err(reuse_error(
-                    "predecessor artifact changed length during copying",
-                ));
-            }
-            output.sync_all()?;
-            let mut verification = open_regular(&target)?;
-            let mut copied_digest = Sha256::new();
-            loop {
-                retained_search_checkpoint(cx)?;
-                let count = verification.read(&mut buffer)?;
-                if count == 0 {
-                    break;
-                }
-                copied_digest.update(&buffer[..count]);
-            }
-            let sha256: [u8; 32] = digest.finalize().into();
-            if sha256 != <[u8; 32]>::from(copied_digest.finalize()) {
-                return Err(reuse_error(
-                    "copied artifact digest differs from its source stream",
-                ));
-            }
-            stats.copied.push((target, copied, sha256));
-            stats.files += 1;
-            stats.bytes = stats
-                .bytes
-                .checked_add(copied)
-                .ok_or_else(|| reuse_error("total copied artifact length overflow"))?;
+            copy_file(cx, &entry.path(), &target, stats)?;
         }
     }
     File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
+/// Share a Quill segment by hard link, else copy `source` to the new file
+/// `target`, sync it and check the copy against the bytes read.
+fn copy_file(cx: &Cx, source: &Path, target: &Path, stats: &mut CopyStats) -> SearchResult<()> {
+    if target.file_name().is_some_and(is_quill_segment_name) && fs::hard_link(source, target).is_ok()
+    {
+        // Quill writes a segment once and afterwards only renames or unlinks
+        // it, so the candidate shares the predecessor's instead of writing and
+        // syncing a copy of the largest file in the bundle (bd-dnqgr). A
+        // filesystem without hard links gets the copy.
+        stats.linked += 1;
+        return Ok(());
+    }
+    let mut input = open_regular(source)?;
+    let expected = input.metadata()?.len();
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
+    // Nothing else is linked: tombstones, mmap writes, catalogs and Quill's
+    // manifests in the candidate must never reach a retained reader.
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    let mut copied = 0_u64;
+    let mut digest = Sha256::new();
+    loop {
+        retained_search_checkpoint(cx)?;
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(count as u64)
+            .ok_or_else(|| reuse_error("copied artifact length overflow"))?;
+        if copied > expected {
+            return Err(reuse_error("predecessor artifact grew during copying"));
+        }
+        output.write_all(&buffer[..count])?;
+        digest.update(&buffer[..count]);
+    }
+    if copied != expected || input.metadata()?.len() != expected {
+        return Err(reuse_error(
+            "predecessor artifact changed length during copying",
+        ));
+    }
+    output.sync_all()?;
+    let mut verification = open_regular(target)?;
+    let mut copied_digest = Sha256::new();
+    loop {
+        retained_search_checkpoint(cx)?;
+        let count = verification.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        copied_digest.update(&buffer[..count]);
+    }
+    let sha256: [u8; 32] = digest.finalize().into();
+    if sha256 != <[u8; 32]>::from(copied_digest.finalize()) {
+        return Err(reuse_error(
+            "copied artifact digest differs from its source stream",
+        ));
+    }
+    stats.copied.push((target.to_path_buf(), copied, sha256));
+    stats.files += 1;
+    stats.bytes = stats
+        .bytes
+        .checked_add(copied)
+        .ok_or_else(|| reuse_error("total copied artifact length overflow"))?;
     Ok(())
 }
 

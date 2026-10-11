@@ -3010,6 +3010,83 @@ mod retained_search_tests {
         });
     }
 
+    /// The first complete build in a directory that holds a legacy index
+    /// converts it from the legacy completion receipt: an unchanged file is
+    /// carried with its rows and vectors, an edited one is reread, and the
+    /// converted store answers the same searches.
+    #[test]
+    fn converting_a_legacy_index_carries_its_unchanged_files() {
+        run_test_with_cx(|cx| async move {
+            for lexical_only in [false, true] {
+                let directory = tempfile::tempdir().expect("fixture");
+                let (runtime, source, root) = fixture(directory.path());
+                let mut runtime = if lexical_only {
+                    runtime.with_lexical_only_indexing()
+                } else {
+                    runtime
+                };
+                fs::write(source.join("bravo.md"), "sharedtoken bravo document").expect("source");
+                let legacy = Box::pin(runtime.run_one_shot_index_scaffold_internal(
+                    &cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    true,
+                ))
+                .await
+                .expect("legacy index");
+                assert_eq!(legacy.generation.indexed_files, 2);
+                assert!(root.join(FSFS_SENTINEL_FILE).is_file(), "a legacy index");
+
+                fs::write(source.join("bravo.md"), "sharedtoken bravo yak revision")
+                    .expect("edit bravo");
+                let (publication, converted) = runtime
+                    .rebuild_retained_generation_with_precommit(&cx, &root, |_| Ok(()))
+                    .await
+                    .expect("convert");
+                assert!(matches!(publication, GenerationPublication::Durable(_)));
+                assert_eq!(converted.generation.indexed_files, 2);
+                assert_eq!(
+                    converted.unchanged_files, 1,
+                    "lexical_only={lexical_only}: alpha.md was rebuilt, not carried from the legacy index"
+                );
+
+                runtime.config.pressure.degradation_override =
+                    crate::config::DegradationOverrideMode::ForceLexicalOnly;
+                let mut reader = runtime
+                    .open_retained_search(&cx, &root)
+                    .await
+                    .expect("reader");
+                for (query, path) in [("yak", "bravo.md"), ("alpha", "alpha.md")] {
+                    let phases = reader.search(&cx, query, 10).await.expect("search");
+                    let hits = &phases.last().expect("phase").hits;
+                    assert!(
+                        hits.len() == 1 && hits[0].path == path,
+                        "lexical_only={lexical_only}: {query}: {hits:?}"
+                    );
+                }
+                drop(reader);
+                if !lexical_only {
+                    let store = CompleteGenerationStore::open(&cx, &root).expect("store");
+                    let generation = store.active(&cx).expect("active").expect("published");
+                    let index = VectorIndex::open_read_only(
+                        &generation.path().join(FSFS_VECTOR_INDEX_FILE),
+                    )
+                    .expect("fast tier");
+                    let mut sources = index
+                        .live_doc_ids()
+                        .expect("live rows")
+                        .iter()
+                        .map(|row| semantic_windows::source_id(row).to_owned())
+                        .collect::<Vec<_>>();
+                    sources.sort_unstable();
+                    sources.dedup();
+                    assert_eq!(sources, ["alpha.md", "bravo.md"]);
+                }
+            }
+        });
+    }
+
     #[test]
     fn retained_reader_survives_rebuild_and_search_does_not_change_inventory() {
         run_test_with_cx(|cx| async move {

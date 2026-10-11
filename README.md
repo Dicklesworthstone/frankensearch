@@ -568,9 +568,13 @@ the default in-project `.frankensearch` that `fsfs index .` uses; a build into
 any other directory inside the indexed tree keeps building a legacy index, and
 the store may never contain that tree. A directory that already holds a legacy
 index keeps that layout: `FSFS_COMPLETE_GENERATIONS=1` converts it on its next
-build (reusing its keyword rows and vectors instead of recomputing them, and
-leaving the old `vector/`, `lexical/` and `index_sentinel.json` behind, unread),
-and `FSFS_COMPLETE_GENERATIONS=0` keeps building legacy indexes:
+build, and `FSFS_COMPLETE_GENERATIONS=0` keeps building legacy indexes. When the
+legacy index's completion evidence comes from the same fsfs build and
+configuration, the conversion copies its keyword segments (shared by hard link)
+and vector files into the first generation and carries every unchanged file
+instead of recomputing it; otherwise, as on the first build after an upgrade,
+it rebuilds. The old `vector/`, `lexical/` and `index_sentinel.json` stay
+behind, unread:
 
 ```bash
 fsfs index ~/projects --index-dir ./search-store
