@@ -2431,13 +2431,12 @@ impl NativeHnsw {
             ..header
         }
         .metadata()?;
-        temporary.persist(path).map_err(|error| {
+        crate::replace_with_staged(temporary.into_temp_path(), path, true).map_err(|error| {
             SearchError::Io(std::io::Error::new(
-                error.error.kind(),
+                error.kind(),
                 format!(
-                    "failed to atomically publish native HNSW graph '{}': {}",
+                    "failed to atomically publish native HNSW graph '{}': {error}",
                     path.display(),
-                    error.error
                 ),
             ))
         })?;
@@ -3565,13 +3564,12 @@ fn persist_native_hnsw_receipt(path: &Path, bytes: &[u8]) -> SearchResult<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(SearchError::Io)?;
     temporary.write_all(bytes).map_err(SearchError::Io)?;
     temporary.as_file().sync_all().map_err(SearchError::Io)?;
-    temporary.persist(path).map_err(|error| {
+    crate::replace_with_staged(temporary.into_temp_path(), path, true).map_err(|error| {
         SearchError::Io(std::io::Error::new(
-            error.error.kind(),
+            error.kind(),
             format!(
-                "failed to atomically publish native HNSW generation receipt '{}': {}",
+                "failed to atomically publish native HNSW generation receipt '{}': {error}",
                 path.display(),
-                error.error
             ),
         ))
     })?;

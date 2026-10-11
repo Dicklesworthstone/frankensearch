@@ -2886,13 +2886,12 @@ fn install_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResu
         .map_err(SearchError::Io)?;
     temporary.write_all(bytes).map_err(SearchError::Io)?;
     temporary.as_file().sync_all().map_err(SearchError::Io)?;
-    temporary.persist(path).map_err(|error| {
+    crate::replace_with_staged(temporary.into_temp_path(), path, true).map_err(|error| {
         SearchError::Io(std::io::Error::new(
-            error.error.kind(),
+            error.kind(),
             format!(
-                "failed to atomically publish HNSW metadata '{}': {}",
+                "failed to atomically publish HNSW metadata '{}': {error}",
                 path.display(),
-                error.error
             ),
         ))
     })?;
