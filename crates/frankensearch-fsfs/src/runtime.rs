@@ -2081,6 +2081,11 @@ const FSFS_CHECKPOINT_FILE: &str = "index_checkpoint.json";
 const EMBEDDING_PROBE_MAX_RETRIES: usize = 2;
 const EMBEDDING_BATCH_MAX_ATTEMPTS: usize = 3;
 const CHECKPOINT_PERSIST_INTERVAL: usize = 4;
+/// A durable publication rewrites the checkpoint and the membership manifest
+/// for every file indexed so far, so a long build publishes at power-of-two
+/// batch counts and otherwise at most this often: an interruption still loses
+/// at most this much work, and the rewrites stop growing quadratically.
+const DURABLE_PUBLICATION_SPACING: Duration = Duration::from_secs(30);
 const INDEXING_CHECKPOINT_SCHEMA_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18121,6 +18126,7 @@ impl FsfsRuntime {
         // made a first build's checkpoint I/O quadratic in the number of files.
         // The initial checkpoint above is undurable.
         let mut checkpoint_durable_on_disk = false;
+        let mut last_durable_publication = Instant::now();
         // A fresh engine directory, or a generation reset above, holds no row a
         // resumable flush could find unchanged.
         let lexical_starts_empty =
@@ -18785,7 +18791,11 @@ impl FsfsRuntime {
             }
 
             batch_counter = batch_counter.saturating_add(1);
-            if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 && remaining_reused_semantic == 0 {
+            if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0
+                && remaining_reused_semantic == 0
+                && (batch_counter.is_power_of_two()
+                    || last_durable_publication.elapsed() >= DURABLE_PUBLICATION_SPACING)
+            {
                 control.checkpoint(cx, "index.incremental_publication", true)?;
                 publication_lease.fence("one-shot incremental generation publication")?;
                 // The batch above already left an undurable checkpoint on disk.
@@ -18850,6 +18860,7 @@ impl FsfsRuntime {
                 publication_lease.fence("one-shot incremental durable checkpoint publication")?;
                 write_indexing_checkpoint(&index_root, &checkpoint)?;
                 checkpoint_durable_on_disk = true;
+                last_durable_publication = Instant::now();
             }
 
             on_progress(&make_snapshot(
