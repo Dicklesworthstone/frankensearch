@@ -1431,13 +1431,12 @@ impl ValidatedFsviBytes {
         before_temp_admission(temporary.path())?;
         let _validated_temporary = Self::reopen_exact(temporary.path(), expected, &witness)?;
         before_replace()?;
-        temporary.persist(destination).map_err(|error| {
+        replace_with_staged(temporary.into_temp_path(), destination, true).map_err(|error| {
             SearchError::Io(std::io::Error::new(
-                error.error.kind(),
+                error.kind(),
                 format!(
-                    "failed to atomically publish sealed FSVI v2 bytes at '{}': {}",
+                    "failed to atomically publish sealed FSVI v2 bytes at '{}': {error}",
                     destination.display(),
-                    error.error
                 ),
             ))
         })?;
@@ -2227,12 +2226,9 @@ impl VectorIndex {
             }
         }
 
+        // A failed install leaves the caller's replacement in place.
         let temporary = tempfile::TempPath::try_from_path(replacement_path.to_path_buf())?;
-        if let Err(error) = temporary.persist(path) {
-            let tempfile::PathPersistError { error, mut path } = error;
-            path.disable_cleanup(true);
-            return Err(SearchError::Io(error));
-        }
+        replace_with_staged(temporary, path, false).map_err(SearchError::Io)?;
         #[cfg(unix)]
         sync_parent_directory(path)?;
 
@@ -6292,6 +6288,39 @@ pub(crate) fn sync_parent_directory(path: &Path) -> SearchResult<()> {
     Ok(())
 }
 
+/// Atomically replace `destination` with the fully written file at `staged`.
+///
+/// This renames with `std::fs::rename`, not tempfile's `persist`. On Windows
+/// std renames with POSIX semantics, which replaces a destination that a
+/// reader holds open, locked and memory-mapped; that mapping keeps reading
+/// the old bytes, as on Unix. `persist` uses `MoveFileExW`, which Windows
+/// refuses with "Access is denied" while any handle to the destination is
+/// open, so any process holding an index made every install over it fail.
+/// `TempPath::keep` first clears the temporary attribute tempfile sets on
+/// Windows, as `persist` does. If the rename fails, the staged file is
+/// removed when `remove_on_failure` is set (as dropping a tempfile would),
+/// and otherwise left for the caller.
+pub(crate) fn replace_with_staged(
+    staged: tempfile::TempPath,
+    destination: &Path,
+    remove_on_failure: bool,
+) -> std::io::Result<()> {
+    let staged = match staged.keep() {
+        Ok(staged) => staged,
+        Err(tempfile::PathPersistError { error, mut path }) => {
+            path.disable_cleanup(!remove_on_failure);
+            return Err(error);
+        }
+    };
+    if let Err(error) = fs::rename(&staged, destination) {
+        if remove_on_failure {
+            let _ = fs::remove_file(&staged);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Drop the durability crate's `<fsvi>.fec` repair sidecar after the main
 /// file's bytes change (compaction, vacuum, `finish`, in-place tombstones).
 ///
@@ -9901,6 +9930,49 @@ mod tests {
             !wal::wal_path_for(&path).exists(),
             "a healthy install leaves no sidecar residue"
         );
+    }
+
+    /// A reader that maps the destination must not block installing a new
+    /// generation over it, and keeps the generation it mapped. On Windows,
+    /// tempfile's `persist` (`MoveFileExW`) refused this with "Access is
+    /// denied" while any handle was open, so a search process holding the
+    /// index failed every install over it.
+    #[test]
+    fn install_replacement_succeeds_while_a_reader_maps_the_destination() {
+        let path = temp_index_path("install-under-reader");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("main-old", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+        let reader = VectorIndex::open_read_only(&path).expect("reader maps the destination");
+
+        let replacement_path = path.with_extension("replacement");
+        let destination_gen =
+            VectorIndex::peek_compaction_gen(&path).expect("peek destination generation");
+        let mut replacement_writer = VectorIndex::create(&replacement_path, "new", 4)
+            .expect("replacement writer")
+            .with_generation(next_generation(destination_gen));
+        replacement_writer
+            .write_record("main-new", &[0.0, 0.0, 1.0, 0.0])
+            .expect("write replacement record");
+        replacement_writer.finish().expect("finish replacement");
+
+        let installed = VectorIndex::install_replacement(&path, &replacement_path)
+            .expect("installs while a reader maps the destination");
+        let installed_ids = installed.live_doc_ids().expect("installed ids");
+        assert!(installed_ids.contains("main-new") && !installed_ids.contains("main-old"));
+        assert!(
+            !replacement_path.exists(),
+            "the replacement is moved into place, not copied"
+        );
+        let reader_ids = reader.live_doc_ids().expect("reader ids");
+        assert!(
+            reader_ids.contains("main-old") && !reader_ids.contains("main-new"),
+            "the open reader keeps the generation it mapped"
+        );
+        drop(installed);
+        drop(reader);
     }
 
     #[test]
