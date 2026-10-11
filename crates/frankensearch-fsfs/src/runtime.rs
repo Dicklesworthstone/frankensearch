@@ -18114,13 +18114,24 @@ impl FsfsRuntime {
             }
         }
 
+        // Only a durable checkpoint admits work to a later run; an undurable one
+        // just locks admission. So before artifacts change, a durable checkpoint
+        // on disk is replaced with an undurable one, and an undurable one stays:
+        // rewriting it before every batch only added its growing file list, which
+        // made a first build's checkpoint I/O quadratic in the number of files.
+        // The initial checkpoint above is undurable.
+        let mut checkpoint_durable_on_disk = false;
+
         // 3. Process in batches
         for chunk in reading.chunks(batch_size) {
             control.checkpoint(cx, "index.batch", true)?;
-            checkpoint.artifacts_durable = false;
-            checkpoint.updated_at_ms = pressure_timestamp_ms();
-            publication_lease.fence("one-shot batch checkpoint publication")?;
-            write_indexing_checkpoint(&index_root, &checkpoint)?;
+            if checkpoint_durable_on_disk {
+                checkpoint.artifacts_durable = false;
+                checkpoint.updated_at_ms = pressure_timestamp_ms();
+                publication_lease.fence("one-shot batch checkpoint publication")?;
+                write_indexing_checkpoint(&index_root, &checkpoint)?;
+                checkpoint_durable_on_disk = false;
+            }
             let mut chunk_docs = Vec::with_capacity(chunk.len());
 
             // Read & Canonicalize
@@ -18763,9 +18774,8 @@ impl FsfsRuntime {
             if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 && remaining_reused_semantic == 0 {
                 control.checkpoint(cx, "index.incremental_publication", true)?;
                 publication_lease.fence("one-shot incremental generation publication")?;
-                checkpoint.artifacts_durable = false;
-                checkpoint.updated_at_ms = pressure_timestamp_ms();
-                write_indexing_checkpoint(&index_root, &checkpoint)?;
+                // The batch above already left an undurable checkpoint on disk.
+                debug_assert!(!checkpoint_durable_on_disk);
 
                 let lexical_commit_start = Instant::now();
                 publication_lease.fence("one-shot incremental lexical commit")?;
@@ -18825,6 +18835,7 @@ impl FsfsRuntime {
                 checkpoint.artifacts_durable = true;
                 publication_lease.fence("one-shot incremental durable checkpoint publication")?;
                 write_indexing_checkpoint(&index_root, &checkpoint)?;
+                checkpoint_durable_on_disk = true;
             }
 
             on_progress(&make_snapshot(
@@ -18913,10 +18924,12 @@ impl FsfsRuntime {
         // 4. Publish the final durable generation. The checkpoint is always
         // last, so every row it advertises is already represented on disk.
         control.checkpoint(cx, "index.final_publication", true)?;
-        publication_lease.fence("final generation checkpoint publication")?;
-        checkpoint.artifacts_durable = false;
-        checkpoint.updated_at_ms = pressure_timestamp_ms();
-        write_indexing_checkpoint(&index_root, &checkpoint)?;
+        if checkpoint_durable_on_disk {
+            publication_lease.fence("final generation checkpoint publication")?;
+            checkpoint.artifacts_durable = false;
+            checkpoint.updated_at_ms = pressure_timestamp_ms();
+            write_indexing_checkpoint(&index_root, &checkpoint)?;
+        }
         let lexical_commit_start = Instant::now();
         publication_lease.fence("final lexical bulk-load publication")?;
         lexical_index.finish_bulk_load(cx).await?;
@@ -29181,13 +29194,13 @@ fn write_indexing_checkpoint(
     index_root: &Path,
     checkpoint: &IndexingCheckpoint,
 ) -> SearchResult<()> {
-    let path = index_root.join(FSFS_CHECKPOINT_FILE);
-    let json =
-        serde_json::to_string_pretty(checkpoint).map_err(|source| SearchError::SubsystemError {
-            subsystem: "fsfs.index.checkpoint.serialize",
-            source: Box::new(source),
-        })?;
-    write_durable(&path, json).map_err(SearchError::Io)
+    // Compact: the file lists every indexed file, and pretty-printing it made
+    // serialization a tenth of a first build's CPU.
+    write_durable_json(
+        &index_root.join(FSFS_CHECKPOINT_FILE),
+        checkpoint,
+        "fsfs.index.checkpoint.serialize",
+    )
 }
 
 fn remove_indexing_checkpoint(index_root: &Path) -> SearchResult<()> {
