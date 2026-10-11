@@ -6,7 +6,7 @@
 //! store protocol, not a filesystem snapshot or hostile-directory v2 authority.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, Metadata};
+use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -19,7 +19,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
 use super::{
-    FsfsRuntime, STORE_OVERLAP_REASON, canonical_store_root, index_discovery_walker,
+    FsfsRuntime, STORE_OVERLAP_REASON, SourceStamp, canonical_store_root, index_discovery_walker,
     retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
 use crate::OutputFormat;
@@ -407,30 +407,6 @@ impl SourceRoot {
             classes,
             directories,
         })
-    }
-}
-
-/// Extend the legacy scan's millisecond timestamps with inode, length, ctime
-/// and nanosecond mtime. Atomic saves and restored-mtime edits are not treated
-/// as unchanged just because their coarse timestamps happen to match.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SourceStamp {
-    device: u64,
-    inode: u64,
-    bytes: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-
-impl SourceStamp {
-    fn from_metadata(metadata: &Metadata) -> Self {
-        Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            bytes: metadata.len(),
-            modified: (metadata.mtime(), metadata.mtime_nsec()),
-            changed: (metadata.ctime(), metadata.ctime_nsec()),
-        }
     }
 }
 

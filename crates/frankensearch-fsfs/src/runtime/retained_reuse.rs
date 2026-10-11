@@ -190,8 +190,16 @@ impl FsfsRuntime {
         candidate_root: &Path,
     ) -> SearchResult<FsfsIndexPayload> {
         execution::prepare(cx).await?;
-        seed_candidate(cx, self, store, candidate_root)?;
-        let payload = Box::pin(self.run_one_shot_index_scaffold_internal(
+        let seeded;
+        let runtime = if seed_candidate(cx, self, store, candidate_root)?.is_some() {
+            let mut runtime = self.clone();
+            runtime.seeded_from_receipt = true;
+            seeded = runtime;
+            &seeded
+        } else {
+            self
+        };
+        let payload = Box::pin(runtime.run_one_shot_index_scaffold_internal(
             cx,
             CliCommand::Index,
             |_| Ok(()),
@@ -492,6 +500,7 @@ pub(super) fn retain_mutated_checkpoint(
                     content_hash_hex: content_hash_hex.clone(),
                     fast_windows: manifest.fast_windows.clone(),
                     canonical_lines: None,
+                    stamp: None,
                 },
                 Some(None) => {
                     return Err(reuse_error(
@@ -839,22 +848,23 @@ pub(super) fn copy_selected_generation(
 /// Must be called while the caller owns `store.begin()` and before opening any
 /// candidate resources. Missing/incompatible evidence starts cold; malformed
 /// evidence or damaged selection is an error, not permission to reuse data.
+/// Returns `None` for a cold start, else the seeded semantic files.
 fn seed_candidate(
     cx: &Cx,
     runtime: &FsfsRuntime,
     store: &CompleteGenerationStore,
     destination: &Path,
-) -> SearchResult<usize> {
+) -> SearchResult<Option<usize>> {
     retained_search_checkpoint(cx)?;
     if runtime.cli_input.full_reindex {
-        return Ok(0);
+        return Ok(None);
     }
     let Some(predecessor) = store.active(cx)? else {
-        return Ok(0);
+        return Ok(None);
     };
     let path = predecessor.path().join(RECEIPT_FILE);
     match fs::symlink_metadata(&path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
         Ok(_) => {}
     }
@@ -864,7 +874,7 @@ fn seed_candidate(
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| reuse_error("reuse receipt has no valid version"))?;
     if version != u64::from(RECEIPT_VERSION) {
-        return Ok(0);
+        return Ok(None);
     }
     let mut receipt: ReuseReceipt =
         serde_json::from_value(encoded).map_err(|source| SearchError::SubsystemError {
@@ -872,7 +882,7 @@ fn seed_candidate(
             source: Box::new(source),
         })?;
     if !compatible_receipt(runtime, &receipt)? {
-        return Ok(0);
+        return Ok(None);
     }
     let eligible = receipt
         .checkpoint
@@ -880,17 +890,16 @@ fn seed_candidate(
         .values()
         .filter(|entry| proven(entry))
         .count();
-    // A watch extending this generation carries unchanged files forward,
-    // lexical-only ones included (a lite store embeds nothing), so their
-    // lexical proof is reason enough to seed. A plain index run is not.
-    let carriable = runtime.unchanged_sources.is_some()
-        && receipt
-            .checkpoint
-            .files
-            .values()
-            .any(|entry| entry.lexical_indexed && hex_digest(&entry.content_hash_hex));
+    // The build carries unchanged files forward, lexical-only ones included
+    // (a lite store embeds nothing), so their lexical proof is reason enough
+    // to seed: a watch observes them unchanged, a plain run checks digests.
+    let carriable = receipt
+        .checkpoint
+        .files
+        .values()
+        .any(|entry| entry.lexical_indexed && hex_digest(&entry.content_hash_hex));
     if eligible == 0 && !carriable {
-        return Ok(0);
+        return Ok(None);
     }
     if !receipt.checkpoint.artifacts_durable
         || receipt.checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
@@ -932,7 +941,7 @@ fn seed_candidate(
         linked_segments = stats.linked,
         "seeded isolated generation; ordinary source-hash and producer checks decide actual reuse"
     );
-    Ok(eligible)
+    Ok(Some(eligible))
 }
 
 /// Charge entries while enumerating, including siblings awaiting recursion.
@@ -1864,6 +1873,7 @@ mod generation_tests {
                     file_key: "doc-0.md".to_owned(),
                     modified_ms: u64::try_from(entry.revision).unwrap(),
                     ingestion_class: IngestionClass::FullSemanticLexical,
+                    stamp: None,
                 };
                 let mut live = plan.row_ids("doc-0.md").into_iter().collect::<HashSet<_>>();
                 let reuse = |ids: &HashSet<String>| {
@@ -2705,7 +2715,7 @@ mod generation_tests {
                         "invalid current evidence must not be accepted"
                     );
                 } else {
-                    assert_eq!(result.unwrap(), 0, "unsupported evidence grants no reuse");
+                    assert_eq!(result.unwrap(), None, "unsupported evidence grants no reuse");
                 }
                 assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
                 assert_eq!(store.active(&cx).unwrap(), Some(selected));
@@ -2787,7 +2797,7 @@ mod generation_tests {
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             let build = store.begin(&cx).unwrap();
             let next = candidate(&runtime, build.path());
-            assert_eq!(seed_candidate(&cx, &next, &store, build.path()).unwrap(), 4);
+            assert_eq!(seed_candidate(&cx, &next, &store, build.path()).unwrap(), Some(4));
             let checkpoint: IndexingCheckpoint =
                 read_json(&cx, &build.path().join(FSFS_CHECKPOINT_FILE)).unwrap();
             assert_eq!(checkpoint.index_root, build.path().display().to_string());
@@ -2844,7 +2854,7 @@ mod generation_tests {
             let build = store.begin(&cx).unwrap();
             let mut next = candidate(&runtime, build.path());
             next.cli_input.full_reindex = true;
-            assert_eq!(seed_candidate(&cx, &next, &store, build.path()).unwrap(), 0);
+            assert_eq!(seed_candidate(&cx, &next, &store, build.path()).unwrap(), None);
             assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor));
         });
@@ -2914,6 +2924,7 @@ mod generation_tests {
                 file_key: key.clone(),
                 modified_ms: u64::try_from(entry.revision).unwrap(),
                 ingestion_class: IngestionClass::FullSemanticLexical,
+                stamp: None,
             };
             let live_ids = HashSet::from([key.clone()]);
             let classify = |hash: &str| {

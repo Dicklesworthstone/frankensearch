@@ -414,14 +414,21 @@ file counts, vector model identities, and `generation_complete`. If embedding
 retries are exhausted, `semantic_deferred_files` and a warning explain why the
 published artifacts still need indexing resumed before semantic search.
 
-Completed ordinary index runs retain evidence for reusing their embeddings on
-later runs. Reuse requires matching executable, configuration, producer
-identities, artifact bytes, and each file's current revision and content hash.
-Changed and newly discovered files are embedded again; removed files leave the
-index. `fsfs index --force` (also `--full`) rebuilds all discovered files and
-clears stale lexical rows. Existing indexes acquire this evidence on their next
-successful build. Cross-process reuse is supported on Linux; other platforms
-keep the existing process-scoped executable evidence policy.
+Completed ordinary index runs retain evidence for reusing their work on later
+runs. Reuse requires matching executable, configuration, producer identities
+and artifact bytes. A file whose device, inode, length and modification and
+change times still match the stamp recorded when it was read is reused without
+being opened (a stamp is recorded only once its change time is older than the
+filesystem's timestamp tick, as git does); a file whose stamp moved is reused
+if its content hash still matches. A reused file keeps its keyword rows and
+vectors, and the payload counts such files as `unchanged_files`, so a rerun
+over an unchanged tree opens no source file. Changed and newly discovered
+files are read and indexed again; removed files leave the index. `fsfs index
+--force` (also `--full`) rebuilds all discovered files and clears stale
+lexical rows.
+Existing indexes acquire this evidence on their next successful build.
+Cross-process reuse is supported on Linux; other platforms keep the existing
+process-scoped executable evidence policy.
 
 Each search hit carries its `path`, a plain-text `snippet` of the best-matching
 fragment, and `line`: the 1-based line of the file where the snippet's first

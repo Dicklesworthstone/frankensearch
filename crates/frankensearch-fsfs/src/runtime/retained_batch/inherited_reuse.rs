@@ -236,6 +236,7 @@ fn project_files(
                 content_hash_hex: String::new(),
                 fast_windows: manifest.fast_windows.clone(),
                 canonical_lines: None,
+                stamp: None,
             }
         } else {
             previous

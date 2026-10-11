@@ -213,8 +213,8 @@ fn restart_child() {
             let mut input = runtime.cli_input.clone();
             input.index_dir = Some(build.path().to_path_buf());
             let candidate = runtime.clone().with_cli_input(input);
-            seeded = Some(seed_candidate(&cx, &candidate, &store, build.path()).unwrap());
-            if seeded == Some(0) {
+            seeded = seed_candidate(&cx, &candidate, &store, build.path()).unwrap();
+            if seeded.is_none() {
                 assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
             }
             assert_eq!(store.active(&cx).unwrap(), Some(selected.clone()));
@@ -497,7 +497,7 @@ fn restart_changed_executable_bytes_cannot_reuse_a_same_version_receipt() {
     }
     let refused = child(&alternate, parent, "seed", "different-image");
     assert_ne!(refused.executable, first.executable);
-    assert_eq!(refused.seeded, Some(0));
+    assert_eq!(refused.seeded, None);
     assert_eq!(refused.generation, first.generation);
     assert_eq!(refused.hits, first.hits);
     assert!(refused.embedded_inputs.is_empty());
@@ -516,7 +516,7 @@ fn restart_changed_configuration_and_explicit_full_reindex_bypass_seed() {
     for mode in ["seed_changed_config", "seed_full"] {
         let refused = child(&executable, parent, mode, mode);
         assert_eq!(refused.executable, first.executable);
-        assert_eq!(refused.seeded, Some(0));
+        assert_eq!(refused.seeded, None);
         assert_eq!(refused.generation, first.generation);
         assert!(refused.embedded_inputs.is_empty());
     }

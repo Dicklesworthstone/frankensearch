@@ -2938,6 +2938,78 @@ mod retained_search_tests {
         });
     }
 
+    /// Without a watch observation a plain rebuild proves files unchanged by
+    /// stamp or digest: over an unchanged source it carries every indexed file
+    /// from the seeded predecessor, a lexical-only store included; an edit that
+    /// restores its modification time is the only file reread; and `--full`
+    /// seeds nothing and rereads everything.
+    #[test]
+    fn plain_rebuild_carries_files_whose_digest_still_matches() {
+        run_test_with_cx(|cx| async move {
+            for lexical_only in [false, true] {
+                let directory = tempfile::tempdir().expect("fixture");
+                let (runtime, source, root) = fixture(directory.path());
+                let mut runtime = if lexical_only {
+                    runtime.with_lexical_only_indexing()
+                } else {
+                    runtime
+                };
+                fs::write(source.join("bravo.md"), "sharedtoken bravo document").expect("source");
+                let rebuild = async |runtime: &FsfsRuntime| {
+                    runtime
+                        .rebuild_retained_generation_with_precommit(&cx, &root, |_| Ok(()))
+                        .await
+                        .expect("rebuild")
+                        .1
+                };
+
+                let first = rebuild(&runtime).await;
+                assert_eq!(first.generation.indexed_files, 2);
+                assert_eq!(first.unchanged_files, 0);
+                assert_eq!(
+                    rebuild(&runtime).await.unchanged_files,
+                    2,
+                    "lexical_only={lexical_only}: an unchanged source was reread"
+                );
+                // The rewrite restores its modification time, so only its change
+                // time and digest tell.
+                let bravo = source.join("bravo.md");
+                let modified = fs::metadata(&bravo)
+                    .and_then(|metadata| metadata.modified())
+                    .expect("mtime");
+                fs::write(&bravo, "sharedtoken bravo yak revision").expect("edit bravo");
+                fs::File::options()
+                    .write(true)
+                    .open(&bravo)
+                    .and_then(|file| file.set_modified(modified))
+                    .expect("restore mtime");
+                let edited = rebuild(&runtime).await;
+                assert_eq!(edited.generation.indexed_files, 2);
+                assert_eq!(edited.unchanged_files, 1, "lexical_only={lexical_only}");
+
+                runtime.config.pressure.degradation_override =
+                    crate::config::DegradationOverrideMode::ForceLexicalOnly;
+                let mut reader = runtime
+                    .open_retained_search(&cx, &root)
+                    .await
+                    .expect("reader");
+                for (query, path) in [("yak", "bravo.md"), ("alpha", "alpha.md")] {
+                    let phases = reader.search(&cx, query, 10).await.expect("search");
+                    let hits = &phases.last().expect("phase").hits;
+                    assert!(
+                        hits.len() == 1 && hits[0].path == path,
+                        "lexical_only={lexical_only}: {query}: {hits:?}"
+                    );
+                }
+                drop(reader);
+
+                let mut full = runtime.clone();
+                full.cli_input.full_reindex = true;
+                assert_eq!(rebuild(&full).await.unchanged_files, 0, "--full rereads");
+            }
+        });
+    }
+
     #[test]
     fn retained_reader_survives_rebuild_and_search_does_not_change_inventory() {
         run_test_with_cx(|cx| async move {

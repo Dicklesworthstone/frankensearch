@@ -28,6 +28,7 @@ fn entry(manifest: &IndexManifestEntry) -> CheckpointFileEntry {
         content_hash_hex: "ab".repeat(32),
         fast_windows: manifest.fast_windows.clone(),
         canonical_lines: None,
+        stamp: None,
     }
 }
 

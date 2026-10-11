@@ -559,10 +559,11 @@ impl FsfsRuntime {
                 }
                 writeln!(
                     writer,
-                    "Indexed {} file(s) (discovered {}, skipped {}) into {} in {} ms (index size {} bytes)",
+                    "Indexed {} file(s) (discovered {}, skipped {}{}) into {} in {} ms (index size {} bytes)",
                     sentinel.indexed_files,
                     sentinel.discovered_files,
                     sentinel.skipped_files,
+                    build.summary.unchanged_summary(),
                     generation.path().display(),
                     build.elapsed_ms,
                     build.summary.index_size_bytes,

@@ -77,6 +77,7 @@ fn projected(input: &SourceInput) -> CheckpointFileEntry {
         content_hash_hex: String::new(),
         fast_windows: None,
         canonical_lines: None,
+        stamp: None,
     }
 }
 

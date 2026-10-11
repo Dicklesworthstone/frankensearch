@@ -1915,6 +1915,61 @@ struct IndexCandidate {
     file_key: String,
     modified_ms: u64,
     ingestion_class: IngestionClass,
+    /// What discovery saw, if settled before the walk began (see
+    /// [`SourceStamp::settled_before`]); `None` where the platform reports no
+    /// change time or the file changed too recently to trust its stamp.
+    stamp: Option<SourceStamp>,
+}
+
+/// Extend the legacy scan's millisecond timestamps with inode, length, ctime
+/// and nanosecond mtime. Atomic saves and restored-mtime edits are not treated
+/// as unchanged just because their coarse timestamps happen to match, and no
+/// unprivileged caller can set the change time a write moves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SourceStamp {
+    device: u64,
+    inode: u64,
+    bytes: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl SourceStamp {
+    #[cfg(unix)]
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            bytes: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+
+    /// Whether every write from `instant` on must move this stamp: its change
+    /// time predates `instant` by more than the filesystem's timestamp tick
+    /// (git's racily-clean rule). Only such a stamp may later stand in for the
+    /// bytes read after it was taken.
+    #[cfg(unix)]
+    fn settled_before(&self, instant: SystemTime) -> bool {
+        // Far above the kernel's coarse timestamp tick (at most 10 ms); whole-
+        // second timestamps (ext4 with 128-byte inodes, FAT) need more.
+        let margin = if self.changed.1 == 0 && self.modified.1 == 0 {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(100)
+        };
+        let (Ok(seconds), Ok(nanos)) =
+            (u64::try_from(self.changed.0), u32::try_from(self.changed.1))
+        else {
+            return false;
+        };
+        UNIX_EPOCH
+            .checked_add(Duration::new(seconds, nanos))
+            .and_then(|changed| changed.checked_add(margin))
+            .is_some_and(|settled| settled < instant)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1934,6 +1989,8 @@ struct PendingIndexDocument {
     document: IndexableDocument,
     /// The whole file's text for the lexical index (`LEXICAL_CANONICALIZER`).
     lexical_text: String,
+    /// The candidate's settled discovery stamp, taken before these bytes were read.
+    stamp: Option<SourceStamp>,
 }
 
 /// Canonicalization for the lexical index: the embedding text's normalization
@@ -2062,6 +2119,10 @@ struct CheckpointFileEntry {
     /// the build totals. Absent in older checkpoints: such a file is reread.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     canonical_lines: Option<u64>,
+    /// The settled stamp discovery saw before the recorded bytes were read.
+    /// A plain rerun that sees it again carries the file without reading it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stamp: Option<SourceStamp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2095,20 +2156,40 @@ struct ContentSkippedEntry {
     /// The classification reason the skip recorded, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reason_code: Option<String>,
+    /// SHA-256 of the bytes that earned the skip, so a plain rerun can prove
+    /// them unchanged. Absent in older checkpoints: such a file is reread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_hash_hex: Option<String>,
+    /// As [`CheckpointFileEntry::stamp`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stamp: Option<SourceStamp>,
 }
 
 fn record_content_skip(
     checkpoint: &mut IndexingCheckpoint,
     candidate: &IndexCandidate,
     reason_code: Option<&str>,
+    content_hash_hex: &str,
 ) {
     checkpoint.content_skipped.insert(
         candidate.file_key.clone(),
         ContentSkippedEntry {
             revision: i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX),
             reason_code: reason_code.map(str::to_owned),
+            content_hash_hex: Some(content_hash_hex.to_owned()),
+            stamp: candidate.stamp.clone(),
         },
     );
+}
+
+/// Whether `path` still holds the bytes `recorded` digests.
+async fn file_matches_digest(path: &Path, recorded: Option<&str>) -> bool {
+    let Some(recorded) = recorded else {
+        return false;
+    };
+    async_file_read(path)
+        .await
+        .is_ok_and(|bytes| content_sha256_hex(&bytes) == recorded)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2188,6 +2269,11 @@ struct FsfsIndexPayload {
     #[serde(flatten)]
     generation: IndexSentinel,
     index_size_bytes: u64,
+    /// Indexed files proven unchanged since the previous build (by a watch
+    /// observation, a settled stamp or a digest) and carried forward without
+    /// being reindexed: their rows and vectors are kept as they were. A rerun
+    /// over an unchanged tree reports every indexed file here.
+    unchanged_files: usize,
     semantic_indexed_files: usize,
     semantic_deferred_files: usize,
     embedding_retries: usize,
@@ -2211,6 +2297,15 @@ struct FsfsIndexPayload {
 }
 
 impl FsfsIndexPayload {
+    /// The table summary's note on carried files, empty when none were.
+    fn unchanged_summary(&self) -> String {
+        if self.unchanged_files == 0 {
+            String::new()
+        } else {
+            format!("; {} unchanged, not reread", self.unchanged_files)
+        }
+    }
+
     fn emit<W: Write>(
         &self,
         format: OutputFormat,
@@ -2240,10 +2335,11 @@ impl FsfsIndexPayload {
         if format == OutputFormat::Table {
             writeln!(
                 writer,
-                "Indexed {} file(s) (discovered {}, skipped {}) into {} in {} ms (index size {} bytes)",
+                "Indexed {} file(s) (discovered {}, skipped {}{}) into {} in {} ms (index size {} bytes)",
                 self.generation.indexed_files,
                 self.generation.discovered_files,
                 self.generation.skipped_files,
+                self.unchanged_summary(),
                 self.generation.index_root,
                 elapsed_ms,
                 self.index_size_bytes,
@@ -6052,6 +6148,11 @@ pub struct FsfsRuntime {
     /// rebuild carries their checkpoint-proven rows forward instead of
     /// rereading, canonicalizing and re-indexing them (bd-dnqgr).
     unchanged_sources: Option<Arc<BTreeSet<PathBuf>>>,
+    /// The candidate's checkpoint was seeded from a completion receipt bound
+    /// to this executable and configuration. A file whose settled stamp or
+    /// digest still matches is then carried forward like an observed-unchanged
+    /// one; a legacy root proves the same through its own receipt.
+    seeded_from_receipt: bool,
     /// A complete-generation build discovers no file beneath its whole store,
     /// not only beneath the generation it writes. A store inside the source
     /// sits beneath a hidden directory the walker skips, but a `.gitignore`
@@ -6083,6 +6184,7 @@ impl FsfsRuntime {
             complete_generations_for_new_roots: false,
             lexical_only_indexing: !SEMANTIC_LOADERS_COMPILED,
             unchanged_sources: None,
+            seeded_from_receipt: false,
             discovery_excluded_root: None,
         }
     }
@@ -17437,9 +17539,16 @@ impl FsfsRuntime {
                 None
             }
         };
-        if !self.cli_input.full_reindex && retain_legacy_reuse && existing_checkpoint.is_none() {
-            existing_checkpoint = retained_reuse::legacy_checkpoint(cx, self, &index_root)?;
-        }
+        // An interruption checkpoint proves its rows only to the build that
+        // wrote them; a completion receipt binds them to this executable and
+        // configuration.
+        let checkpoint_from_receipt =
+            if !self.cli_input.full_reindex && retain_legacy_reuse && existing_checkpoint.is_none() {
+                existing_checkpoint = retained_reuse::legacy_checkpoint(cx, self, &index_root)?;
+                existing_checkpoint.is_some()
+            } else {
+                existing_checkpoint.is_some() && self.seeded_from_receipt
+            };
         let target_root_label = target_root.display().to_string();
         let index_root_label = index_root.display().to_string();
         let checkpoint_metadata_valid = existing_checkpoint.as_ref().is_some_and(|checkpoint| {
@@ -17695,35 +17804,76 @@ impl FsfsRuntime {
         let mut manifests = BTreeMap::<String, IndexManifestEntry>::new();
         let mut resume_reuse = BTreeMap::<String, CheckpointReuse>::new();
         let mut validated_content_hashes = HashMap::<String, String>::new();
-        // Proven without rereading because a watch observed them unchanged
-        // since the seeded generation; true for a semantic ingestion class.
+        // Proven unchanged since the seeded generation, by a watch observation,
+        // a settled stamp or a digest; true for a semantic ingestion class.
         let mut unchanged_complete = HashMap::<String, bool>::new();
+        // Content-skipped files proven unchanged the same way.
+        let mut unchanged_skips = HashSet::<String>::new();
+        // Proven by rereading their bytes, so their entries take this
+        // build's stamp: the next rerun need not read them again.
+        let mut digest_proven = HashSet::<String>::new();
+        // A plain rerun proves a file unchanged by its settled stamp or its
+        // digest when the checkpoint came from a completion receipt and this
+        // build writes into the lexical engine that receipt describes: a fresh
+        // or migrated engine holds none of the rows a carried file relies on.
+        let receipt_carry = checkpoint_from_receipt
+            && !discard_undurable_lexical_generation
+            && lexical_plan.publish_pointer.is_none();
+        let observed_unchanged = |path: &Path| {
+            self.unchanged_sources
+                .as_ref()
+                .is_some_and(|sources| sources.contains(path))
+        };
+        let same_stamp = |candidate: &IndexCandidate, recorded: Option<&SourceStamp>| {
+            receipt_carry && candidate.stamp.is_some() && candidate.stamp.as_ref() == recorded
+        };
 
         if let (Some(previous), Some(previous_manifests)) =
             (existing_checkpoint.as_ref(), checkpoint_manifests.as_ref())
         {
             for candidate in &candidates {
                 control.checkpoint(cx, "index.resume_validation", false)?;
+                let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
                 let Some(entry) = previous.files.get(&candidate.file_key) else {
+                    // The seeded build skipped this file for its content; the
+                    // same bytes get the same verdict without classifying them
+                    // again. A watch-observed file is carried without a read.
+                    if receipt_carry
+                        && !observed_unchanged(&candidate.file_path)
+                        && let Some(skipped) = previous
+                            .content_skipped
+                            .get(&candidate.file_key)
+                            .filter(|skipped| skipped.revision == revision)
+                    {
+                        if same_stamp(candidate, skipped.stamp.as_ref()) {
+                            unchanged_skips.insert(candidate.file_key.clone());
+                        } else if file_matches_digest(
+                            &candidate.file_path,
+                            skipped.content_hash_hex.as_deref(),
+                        )
+                        .await
+                        {
+                            unchanged_skips.insert(candidate.file_key.clone());
+                            digest_proven.insert(candidate.file_key.clone());
+                        }
+                    }
                     continue;
                 };
                 let Some(manifest) = previous_manifests.get(&candidate.file_key) else {
                     continue;
                 };
-                let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
                 if entry.revision != revision
                     || entry.ingestion_class != ingestion_class_label(candidate.ingestion_class)
                 {
                     continue;
                 }
                 let unchanged = entry.canonical_lines.is_some()
-                    && self
-                        .unchanged_sources
-                        .as_ref()
-                        .is_some_and(|sources| sources.contains(&candidate.file_path));
+                    && (observed_unchanged(&candidate.file_path)
+                        || same_stamp(candidate, entry.stamp.as_ref()));
                 let content_hash_hex = if unchanged {
                     // The seeded generation recorded this digest for the same
-                    // bytes the watch observed unchanged since.
+                    // bytes, unchanged since by the watch's observation or by
+                    // the settled stamp they were read under.
                     entry.content_hash_hex.clone()
                 } else {
                     let Ok(bytes) = async_file_read(&candidate.file_path).await else {
@@ -17745,11 +17895,16 @@ impl FsfsRuntime {
                 if reuse == CheckpointReuse::None {
                     continue;
                 }
-                if unchanged && reuse == CheckpointReuse::Complete {
+                // Complete reuse already requires the recorded digest.
+                let carriable = unchanged || (receipt_carry && entry.canonical_lines.is_some());
+                if carriable && reuse == CheckpointReuse::Complete {
                     unchanged_complete.insert(
                         candidate.file_key.clone(),
                         candidate.ingestion_class == IngestionClass::FullSemanticLexical,
                     );
+                    if !unchanged {
+                        digest_proven.insert(candidate.file_key.clone());
+                    }
                 }
                 validated_content_hashes.insert(candidate.file_key.clone(), content_hash_hex);
                 resume_reuse.insert(candidate.file_key.clone(), reuse);
@@ -17926,14 +18081,14 @@ impl FsfsRuntime {
                     processed_files = processed_files.saturating_add(1);
                 }
                 lexical_reconciliation_ids.remove(&candidate.file_key);
-                checkpoint
-                    .files
-                    .insert(candidate.file_key.clone(), entry.clone());
+                let mut entry = entry.clone();
+                if digest_proven.contains(&candidate.file_key) {
+                    entry.stamp.clone_from(&candidate.stamp);
+                }
+                checkpoint.files.insert(candidate.file_key.clone(), entry);
                 carried_files = carried_files.saturating_add(1);
-            } else if self
-                .unchanged_sources
-                .as_ref()
-                .is_some_and(|sources| sources.contains(&candidate.file_path))
+            } else if (observed_unchanged(&candidate.file_path)
+                || unchanged_skips.contains(&candidate.file_key))
                 && let Some(skipped) = checkpoint_manifests
                     .as_ref()
                     .and(existing_checkpoint.as_ref())
@@ -17945,9 +18100,13 @@ impl FsfsRuntime {
                 if let Some(reason_code) = &skipped.reason_code {
                     observed_reason_codes.insert(reason_code.clone());
                 }
+                let mut skipped = skipped.clone();
+                if digest_proven.contains(&candidate.file_key) {
+                    skipped.stamp.clone_from(&candidate.stamp);
+                }
                 checkpoint
                     .content_skipped
-                    .insert(candidate.file_key.clone(), skipped.clone());
+                    .insert(candidate.file_key.clone(), skipped);
                 content_skipped_files = content_skipped_files.saturating_add(1);
                 carried_skips = carried_skips.saturating_add(1);
             } else {
@@ -18011,7 +18170,12 @@ impl FsfsRuntime {
                             LEXICAL_CANONICALIZER.canonicalize(&pdf_text),
                         ),
                         None => {
-                            record_content_skip(&mut checkpoint, candidate, None);
+                            record_content_skip(
+                                &mut checkpoint,
+                                candidate,
+                                None,
+                                &content_hash_hex,
+                            );
                             content_skipped_files = content_skipped_files.saturating_add(1);
                             continue;
                         }
@@ -18026,6 +18190,7 @@ impl FsfsRuntime {
                             &mut checkpoint,
                             candidate,
                             Some(&classification.reason_code),
+                            &content_hash_hex,
                         );
                         content_skipped_files = content_skipped_files.saturating_add(1);
                         continue;
@@ -18045,6 +18210,7 @@ impl FsfsRuntime {
                         &mut checkpoint,
                         candidate,
                         Some(REASON_DISCOVERY_FILE_EXCLUDED),
+                        &content_hash_hex,
                     );
                     content_skipped_files = content_skipped_files.saturating_add(1);
                     continue;
@@ -18133,6 +18299,7 @@ impl FsfsRuntime {
                     fast_windows,
                     document: doc,
                     lexical_text,
+                    stamp: candidate.stamp.clone(),
                 });
             }
 
@@ -18587,6 +18754,7 @@ impl FsfsRuntime {
                         content_hash_hex: pending.content_hash_hex.clone(),
                         fast_windows: pending.fast_windows.clone(),
                         canonical_lines: Some(pending.canonical_lines),
+                        stamp: pending.stamp.clone(),
                     },
                 );
             }
@@ -18954,6 +19122,7 @@ impl FsfsRuntime {
         let payload = FsfsIndexPayload {
             generation: sentinel,
             index_size_bytes: storage_usage.total_bytes(),
+            unchanged_files: usize::try_from(carried_files).unwrap_or(usize::MAX),
             semantic_indexed_files: checkpoint
                 .files
                 .values()
@@ -22031,6 +22200,9 @@ impl FsfsRuntime {
         let mount_table = MountTable::new(read_system_mounts(), &mount_overrides);
 
         let walker = index_discovery_walker(target_root, &self.config.discovery);
+        // Precedes every stat below and every read of the files they describe.
+        #[cfg(unix)]
+        let walk_started = SystemTime::now();
 
         for entry in walker.build() {
             control.checkpoint(cx, "index.discovery", false)?;
@@ -22128,12 +22300,20 @@ impl FsfsRuntime {
                 .ok()
                 .map(system_time_to_ms)
                 .unwrap_or_default();
+            #[cfg(unix)]
+            let stamp = Some(SourceStamp::from_metadata(&metadata))
+                .filter(|stamp| stamp.settled_before(walk_started));
+            // Without a change time no stamp proves a file unchanged; its
+            // digest does.
+            #[cfg(not(unix))]
+            let stamp = None;
 
             output.push(IndexCandidate {
                 file_path: entry_path.clone(),
                 file_key: normalize_file_key_for_index(&entry_path, target_root),
                 modified_ms,
                 ingestion_class: decision.ingestion_class,
+                stamp,
             });
         }
 
@@ -32507,6 +32687,7 @@ mod tests {
                     content_hash_hex: generation.to_owned(),
                     fast_windows: None,
                     canonical_lines: None,
+                    stamp: None,
                 },
             )]),
             discovered_files: 1,
@@ -40360,6 +40541,7 @@ mod tests {
                         content_hash_hex: "apparently-valid".to_owned(),
                         fast_windows: None,
                         canonical_lines: None,
+                        stamp: None,
                     },
                 )]),
                 discovered_files: 1,
@@ -41084,6 +41266,209 @@ mod tests {
                     .is_err(),
                 "a semantic search must refuse a generation with no vector tiers"
             );
+        });
+    }
+
+    /// A plain rerun reads only files that may have changed. One whose settled
+    /// stamp matches the receipt-bound checkpoint is carried, rows and vectors
+    /// kept, without being opened; one whose stamp moved but whose digest still
+    /// matches is read once, carried, and stamped again; a rewrite that
+    /// restores the modification time is reread and reindexed. A file skipped
+    /// for its content is treated the same way. With one file per batch each
+    /// reread is one progress event, and inotify reports every open.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn plain_reindex_rereads_only_files_whose_digest_changed() {
+        use notify::event::AccessKind;
+        use notify::{EventKind, RecursiveMode, Watcher};
+        use std::collections::BTreeSet;
+        use std::os::unix::fs::PermissionsExt;
+
+        // A stamp is trusted once its change time is older than the 100 ms
+        // timestamp-tick margin.
+        let settle = || std::thread::sleep(Duration::from_millis(250));
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        run_test_with_cx(|cx| async move {
+            for lexical_only in [false, true] {
+                let temp = tempfile::tempdir().expect("tempdir");
+                let project = temp.path().join("project");
+                // Its own repository: discovery must not apply an enclosing
+                // checkout's ignore rules to the fixture.
+                fs::create_dir_all(project.join(".git")).expect("create project");
+                fs::write(project.join("alpha.md"), "sharedtoken alpha document\n")
+                    .expect("write alpha");
+                fs::write(project.join("bravo.md"), "sharedtoken bravo document\n")
+                    .expect("write bravo");
+                // Read and skipped for its content (NUL bytes), not indexed.
+                fs::write(project.join("echo.md"), b"\0\0\0binary echo\0\0\0")
+                    .expect("write echo");
+                // Hidden, so never indexed; opened to flush the watch.
+                fs::write(project.join(".sentinel"), "").expect("write sentinel");
+                settle();
+                let mut config = FsfsConfig::default();
+                config.storage.index_dir = ".frankensearch".to_owned();
+                config.indexing.embedding_batch_size = 1;
+                let input = CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    ..CliInput::default()
+                };
+                let runtime = |input: &CliInput| {
+                    let runtime = FsfsRuntime::new(config.clone()).with_cli_input(input.clone());
+                    if lexical_only {
+                        runtime.with_lexical_only_indexing()
+                    } else {
+                        runtime
+                    }
+                };
+                // The batch rereads, and every source file the run opened.
+                let run = async |runtime: FsfsRuntime| {
+                    let (sender, events) = std::sync::mpsc::channel();
+                    let mut watcher = notify::recommended_watcher(sender).expect("watcher");
+                    watcher
+                        .watch(&project, RecursiveMode::NonRecursive)
+                        .expect("watch project");
+                    let mut rereads = 0_usize;
+                    Box::pin(runtime.run_one_shot_index_scaffold_internal(
+                        &cx,
+                        CliCommand::Index,
+                        |snapshot| {
+                            if snapshot.stage == super::IndexingProgressStage::Indexing {
+                                rereads += 1;
+                            }
+                            Ok(())
+                        },
+                        false,
+                        true,
+                    ))
+                    .await
+                    .expect("index");
+                    // Inotify keeps order: once the sentinel's open arrives,
+                    // every open the run made has arrived before it.
+                    fs::read(project.join(".sentinel")).expect("read sentinel");
+                    let mut opened = BTreeSet::new();
+                    loop {
+                        let event = events
+                            .recv_timeout(Duration::from_secs(10))
+                            .expect("sentinel open event")
+                            .expect("watch event");
+                        if !matches!(event.kind, EventKind::Access(AccessKind::Open(_))) {
+                            continue;
+                        }
+                        let paths = event
+                            .paths
+                            .iter()
+                            .filter_map(|path| path.file_name()?.to_str())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        if paths.iter().any(|name| name == ".sentinel") {
+                            break;
+                        }
+                        opened.extend(paths.into_iter().filter(|name| {
+                            Path::new(name).extension().is_some_and(|ext| ext == "md")
+                        }));
+                    }
+                    (rereads, opened)
+                };
+
+                let (rereads, opened) = run(runtime(&input)).await;
+                assert_eq!(rereads, 3, "{lexical_only}");
+                assert_eq!(opened, names(&["alpha.md", "bravo.md", "echo.md"]));
+                let (rereads, opened) = run(runtime(&input)).await;
+                assert_eq!(
+                    (rereads, opened),
+                    (0, BTreeSet::new()),
+                    "lexical_only={lexical_only}: an unchanged tree was read"
+                );
+
+                let rewrite_keeping_mtime = |name: &str, text: &str| {
+                    let path = project.join(name);
+                    let modified = fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .expect("mtime");
+                    fs::write(&path, text).expect("rewrite");
+                    fs::File::options()
+                        .write(true)
+                        .open(&path)
+                        .and_then(|file| file.set_modified(modified))
+                        .expect("restore mtime");
+                };
+                rewrite_keeping_mtime("bravo.md", "sharedtoken bravo yak revision\n");
+                rewrite_keeping_mtime("echo.md", "walrus echo text\n");
+                settle();
+                let (rereads, opened) = run(runtime(&input)).await;
+                assert_eq!(rereads, 2, "lexical_only={lexical_only}");
+                assert!(!opened.contains("alpha.md"), "lexical_only={lexical_only}");
+
+                // A permission change moves the stamp but not the bytes.
+                fs::set_permissions(project.join("alpha.md"), fs::Permissions::from_mode(0o600))
+                    .expect("chmod alpha");
+                settle();
+                let (rereads, opened) = run(runtime(&input)).await;
+                assert_eq!(
+                    (rereads, opened),
+                    (0, names(&["alpha.md"])),
+                    "lexical_only={lexical_only}: only its digest is checked"
+                );
+                let (rereads, opened) = run(runtime(&input)).await;
+                assert_eq!(
+                    (rereads, opened),
+                    (0, BTreeSet::new()),
+                    "lexical_only={lexical_only}: the digest check stamped it again"
+                );
+
+                let search = runtime(&CliInput {
+                    command: CliCommand::Search,
+                    index_dir: Some(project.join(".frankensearch")),
+                    ..CliInput::default()
+                });
+                for (query, expected) in [
+                    ("yak", "bravo.md"),
+                    ("walrus", "echo.md"),
+                    ("alpha", "alpha.md"),
+                ] {
+                    let payloads = search
+                        .execute_search_payloads_with_mode(
+                            &cx,
+                            query,
+                            5,
+                            SearchExecutionMode::LexicalOnly,
+                        )
+                        .await
+                        .expect("lexical search");
+                    let hits = &payloads.last().expect("one phase").hits;
+                    assert!(
+                        hits.len() == 1 && hits[0].path.ends_with(expected),
+                        "lexical_only={lexical_only}: {query}: {hits:?}"
+                    );
+                }
+                if !lexical_only {
+                    let index = VectorIndex::open_read_only(
+                        &project.join(".frankensearch").join(super::FSFS_VECTOR_INDEX_FILE),
+                    )
+                    .expect("fast tier");
+                    let mut sources = index
+                        .live_doc_ids()
+                        .expect("live rows")
+                        .iter()
+                        .map(|row| super::semantic_windows::source_id(row).to_owned())
+                        .collect::<Vec<_>>();
+                    sources.sort_unstable();
+                    sources.dedup();
+                    assert_eq!(sources, ["alpha.md", "bravo.md", "echo.md"]);
+                }
+
+                let full = CliInput {
+                    full_reindex: true,
+                    ..input.clone()
+                };
+                assert_eq!(run(runtime(&full)).await.0, 3, "--full rereads");
+            }
         });
     }
 
@@ -51434,6 +51819,7 @@ mod tests {
                     content_hash_hex: "abc123".to_owned(),
                     fast_windows: None,
                     canonical_lines: None,
+                    stamp: None,
                 },
             )]),
             discovered_files: 1,
@@ -51797,6 +52183,7 @@ mod tests {
                 content_hash_hex: "abc123".to_owned(),
                 fast_windows: None,
                 canonical_lines: None,
+                stamp: None,
             },
         );
         files.insert(
@@ -51811,6 +52198,7 @@ mod tests {
                 content_hash_hex: "def456".to_owned(),
                 fast_windows: None,
                 canonical_lines: None,
+                stamp: None,
             },
         );
 
@@ -51949,6 +52337,7 @@ mod tests {
             content_hash_hex: "abc123".to_owned(),
             fast_windows: None,
             canonical_lines: None,
+            stamp: None,
         };
         let checkpoint = super::IndexingCheckpoint {
             schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
@@ -52059,6 +52448,7 @@ mod tests {
             file_key: "src/main.rs".to_owned(),
             modified_ms: 42,
             ingestion_class: IngestionClass::FullSemanticLexical,
+            stamp: None,
         };
         let manifest = super::IndexManifestEntry {
             file_key: candidate.file_key.clone(),
@@ -52078,6 +52468,7 @@ mod tests {
             content_hash_hex: "abc123".to_owned(),
             fast_windows: None,
             canonical_lines: None,
+            stamp: None,
         };
         let checkpoint = super::IndexingCheckpoint {
             schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
