@@ -778,7 +778,7 @@ mod tests {
             assert_eq!(remaining.completed, 2);
             assert_eq!(remaining.failed + remaining.pending + remaining.processing, 0);
             assert!(f.sink.entries().is_empty());
-            assert_eq!(f.probe.inputs.lock().unwrap().as_slice(), [expected.clone()]);
+            assert_eq!(f.probe.inputs.lock().unwrap().as_slice(), std::slice::from_ref(&expected));
             assert_eq!(quality.inputs.lock().unwrap().as_slice(), [expected]);
             for probe in [&f.probe, &quality] {
                 let published = f.storage.get_published_embedding("doc", probe.id, &probe.identity).unwrap().unwrap();
