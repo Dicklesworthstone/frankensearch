@@ -23,16 +23,17 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::types::Time;
 use frankensearch_core::{Canonicalizer, Embedder, SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
+use crate::embedding_publication::PublicationAttempt;
 use crate::{
-    BatchProcessResult, EmbeddingVectorSink, JobQueueConfig, PersistentJobQueue, QueueDepth, Storage,
-    StorageBackedJobRunner, WorkerReport,
+    BatchProcessResult, ClaimOutcome, ClaimedJob, EmbeddingVectorSink, FailResult, JobQueueConfig,
+    PersistentJobQueue, QueueDepth, Storage, StorageBackedJobRunner, WorkerReport,
 };
 
 /// Scheduling policy for a persistent worker, independent of the runner's
@@ -126,11 +127,24 @@ impl WorkerDrainOutcome {
 /// Use `runner().ingest(...)` to submit work and `run(...)` inside the caller's
 /// asupersync region. Sharing these handles preserves the storage crate's
 /// single-connection ownership contract; this is not a cross-process queue.
-#[derive(Debug)]
 pub struct PersistentEmbeddingWorker {
     runner: StorageBackedJobRunner,
     queue: Arc<PersistentJobQueue>,
     config: WorkerServiceConfig,
+    storage: Arc<Storage>,
+    fast_embedder: Arc<dyn Embedder>,
+    quality_embedder: Option<Arc<dyn Embedder>>,
+    database_publication: bool,
+}
+
+impl std::fmt::Debug for PersistentEmbeddingWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentEmbeddingWorker")
+            .field("runner", &self.runner)
+            .field("config", &self.config)
+            .field("database_publication", &self.database_publication)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PersistentEmbeddingWorker {
@@ -151,22 +165,45 @@ impl PersistentEmbeddingWorker {
         }
         let queue = Arc::new(PersistentJobQueue::new(Arc::clone(&storage), queue_config));
         let runner = StorageBackedJobRunner::new(
-            storage,
+            Arc::clone(&storage),
             Arc::clone(&queue),
             canonicalizer,
-            fast_embedder,
+            Arc::clone(&fast_embedder),
             vector_sink,
         );
         Ok(Self {
             runner,
             queue,
             config: WorkerServiceConfig::default(),
+            storage,
+            fast_embedder,
+            quality_embedder: None,
+            database_publication: false,
         })
+    }
+
+    /// Select atomic database publication for this worker's processing methods.
+    ///
+    /// `run`, `drain`, and `process_batch` publish vectors, catalog status, and
+    /// queue completion in one transaction. They never call the external sink
+    /// supplied at construction. The runner remains available for ingestion;
+    /// calling `runner().process_batch(...)` directly still selects its external
+    /// sink and deliberately bypasses this worker policy.
+    ///
+    /// Provider and missing-input rejections use the exact captured revision and
+    /// the queue's bounded retry policy. Database errors and corrupt retained
+    /// records propagate instead of consuming retry budgets. External FSVI/ANN
+    /// artifacts are not published by this mode.
+    #[must_use]
+    pub const fn with_database_publication(mut self) -> Self {
+        self.database_publication = true;
+        self
     }
 
     /// Configure the quality tier on the same ingestion and processing runner.
     #[must_use]
     pub fn with_quality_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.quality_embedder = Some(Arc::clone(&embedder));
         self.runner = self.runner.with_quality_embedder(embedder);
         self
     }
@@ -189,7 +226,9 @@ impl PersistentEmbeddingWorker {
         Ok(self)
     }
 
-    /// The exact runner used by this service, including its atomic ingest API.
+    /// The runner holding this service's ingestion policy and shared metrics.
+    /// Use the worker's `process_batch` to honor database-publication selection;
+    /// the runner's direct processing methods retain their external-sink policy.
     #[must_use]
     pub const fn runner(&self) -> &StorageBackedJobRunner {
         &self.runner
@@ -199,6 +238,157 @@ impl PersistentEmbeddingWorker {
     #[must_use]
     pub fn queue(&self) -> &PersistentJobQueue {
         &self.queue
+    }
+
+    /// Process one batch under the selected publication policy.
+    ///
+    /// Database publication uses the same claim limits, fenced failures, and
+    /// metrics as the service loop. Every committed transition is counted before
+    /// the next attempt, so a later storage error cannot erase earlier progress
+    /// from the metrics. A failed publication transaction is propagated intact.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    pub async fn process_batch(
+        &self,
+        cx: &Cx,
+        worker_id: &str,
+    ) -> SearchResult<BatchProcessResult> {
+        if !self.database_publication {
+            return self.runner.process_batch(cx, worker_id).await;
+        }
+        worker_checkpoint(cx)?;
+        if worker_id.trim().is_empty() {
+            return Err(invalid_config("worker_id", "must not be empty"));
+        }
+        let started = Instant::now();
+        let claims = self
+            .queue
+            .claim_batch(worker_id, self.runner.config().process_batch_size)?;
+        let mut result = BatchProcessResult {
+            jobs_claimed: claims.len(),
+            ..BatchProcessResult::default()
+        };
+        self.runner.metrics().total_jobs_claimed.fetch_add(
+            u64::try_from(claims.len()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        for claim in &claims {
+            worker_checkpoint(cx)?;
+            let document = match self.queue.check_claim(claim, None)? {
+                ClaimOutcome::Applied(document) => document,
+                ClaimOutcome::LostClaim | ClaimOutcome::Superseded => {
+                    self.record_suppressed(&mut result);
+                    continue;
+                }
+            };
+            if frankensearch_core::is_hash_generation_id(&claim.embedder_id) {
+                match self.queue.skip(
+                    claim,
+                    &document.content_hash,
+                    "hash embeddings computed on-the-fly",
+                )? {
+                    ClaimOutcome::Applied(()) => {
+                        result.jobs_skipped += 1;
+                        self.runner
+                            .metrics()
+                            .total_jobs_skipped
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    ClaimOutcome::LostClaim | ClaimOutcome::Superseded => {
+                        self.record_suppressed(&mut result);
+                    }
+                }
+                continue;
+            }
+            let producer = if self.fast_embedder.id() == claim.embedder_id {
+                Some(self.fast_embedder.as_ref())
+            } else {
+                self.quality_embedder
+                    .as_deref()
+                    .filter(|model| model.id() == claim.embedder_id)
+            };
+            // Even routing metadata can execute provider callbacks.
+            worker_checkpoint(cx)?;
+            let Some(producer) = producer else {
+                self.record_rejected(
+                    claim,
+                    &document.content_hash,
+                    &invalid_config(
+                        "worker.embedder",
+                        "no provider configured for the claimed embedder",
+                    ),
+                    &mut result,
+                )?;
+                continue;
+            };
+            let inference_started = Instant::now();
+            let attempted = self
+                .storage
+                .attempt_claimed_publication(cx, claim, producer)
+                .await;
+            let elapsed = inference_started.elapsed();
+            result.embed_time += elapsed;
+            self.runner.metrics().total_embed_time_us.fetch_add(
+                u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            match attempted? {
+                ClaimOutcome::Applied(PublicationAttempt::Published) => {
+                    // Publication already completed this claim in the same
+                    // transaction as the vector. Never call queue.complete.
+                    self.queue
+                        .metrics()
+                        .total_completed
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.runner
+                        .metrics()
+                        .total_jobs_completed
+                        .fetch_add(1, Ordering::Relaxed);
+                    result.jobs_completed += 1;
+                }
+                ClaimOutcome::Applied(PublicationAttempt::Rejected {
+                    document_hash,
+                    error,
+                }) => {
+                    worker_checkpoint(cx)?;
+                    self.record_rejected(claim, &document_hash, &error, &mut result)?;
+                }
+                ClaimOutcome::LostClaim | ClaimOutcome::Superseded => {
+                    self.record_suppressed(&mut result);
+                }
+            }
+        }
+        result.total_time = started.elapsed();
+        Ok(result)
+    }
+
+    fn record_rejected(
+        &self,
+        claim: &ClaimedJob,
+        document_hash: &[u8; 32],
+        error: &SearchError,
+        result: &mut BatchProcessResult,
+    ) -> SearchResult<()> {
+        match self.queue.fail(claim, document_hash, &error.to_string())? {
+            ClaimOutcome::Applied(failure) => {
+                result.jobs_failed += 1;
+                result.terminal_failures +=
+                    usize::from(matches!(failure, FailResult::TerminalFailed { .. }));
+                self.runner
+                    .metrics()
+                    .total_jobs_failed
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            ClaimOutcome::LostClaim | ClaimOutcome::Superseded => self.record_suppressed(result),
+        }
+        Ok(())
+    }
+
+    fn record_suppressed(&self, result: &mut BatchProcessResult) {
+        result.jobs_suppressed += 1;
+        self.runner
+            .metrics()
+            .total_jobs_suppressed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Run until graceful shutdown or structured cancellation.
@@ -294,7 +484,7 @@ impl PersistentEmbeddingWorker {
                     remaining,
                 });
             }
-            let batch = self.runner.process_batch(cx, worker_id).await?;
+            let batch = self.process_batch(cx, worker_id).await?;
             record_batch(&mut report, batch);
             if should_stop(cx, shutdown)? {
                 return Ok(WorkerDrainOutcome::Stopped { report });
@@ -420,11 +610,15 @@ fn record_batch(report: &mut PersistentWorkerReport, batch: BatchProcessResult) 
 }
 
 fn should_stop(cx: &Cx, shutdown: &AtomicBool) -> SearchResult<bool> {
+    worker_checkpoint(cx)?;
+    Ok(shutdown.load(Ordering::Acquire))
+}
+
+fn worker_checkpoint(cx: &Cx) -> SearchResult<()> {
     cx.checkpoint().map_err(|error| SearchError::Cancelled {
         phase: "storage.worker_service".to_owned(),
         reason: error.to_string(),
-    })?;
-    Ok(shutdown.load(Ordering::Acquire))
+    })
 }
 
 fn positive_nanos(duration: Duration, field: &str) -> SearchResult<u64> {
@@ -450,6 +644,7 @@ mod tests {
 
     use std::future::{Future, poll_fn};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Mutex;
     use std::task::Poll;
 
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
@@ -461,8 +656,11 @@ mod tests {
     use crate::{ClaimOutcome, InMemoryVectorSink, IngestRequest};
 
     struct Probe {
+        id: &'static str,
         identity: EmbeddingIdentityBundleV1,
         failures: AtomicUsize,
+        cancel: AtomicBool,
+        inputs: Mutex<Vec<String>>,
     }
 
     impl Embedder for Probe {
@@ -470,8 +668,15 @@ mod tests {
             Ok(&self.identity)
         }
 
-        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async move {
+                self.inputs.lock().unwrap().push(text.to_owned());
+                if self.cancel.load(Ordering::SeqCst) {
+                    return Err(SearchError::Cancelled {
+                        phase: "worker.probe".to_owned(),
+                        reason: "provider cancelled its operation".to_owned(),
+                    });
+                }
                 if self
                     .failures
                     .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
@@ -491,7 +696,7 @@ mod tests {
         }
 
         fn id(&self) -> &'static str {
-            "worker-probe"
+            self.id
         }
 
         fn model_name(&self) -> &str {
@@ -518,8 +723,11 @@ mod tests {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let sink = Arc::new(InMemoryVectorSink::default());
         let probe = Arc::new(Probe {
+            id: "worker-probe",
             identity: EmbeddingIdentityBundleV1::explicit_test_model("worker-probe", 2),
             failures: AtomicUsize::new(0),
+            cancel: AtomicBool::new(false),
+            inputs: Mutex::new(Vec::new()),
         });
         let worker = PersistentEmbeddingWorker::new(
             Arc::clone(&storage),
@@ -544,6 +752,183 @@ mod tests {
             .connection()
             .execute_sync("UPDATE embedding_jobs SET started_at = 0 WHERE status = 'processing';")
             .unwrap();
+    }
+
+    #[test]
+    fn database_publication_drains_both_tiers_without_calling_the_external_sink() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig::default());
+            let quality = Arc::new(Probe {
+                id: "worker-quality",
+                identity: EmbeddingIdentityBundleV1::explicit_test_model("worker-quality", 2),
+                failures: AtomicUsize::new(0),
+                cancel: AtomicBool::new(false),
+                inputs: Mutex::new(Vec::new()),
+            });
+            let worker = f.worker.with_database_publication().with_quality_embedder(quality.clone());
+            let text = "searchable café 数据 complete content ".repeat(80);
+            worker.runner().ingest(IngestRequest::new("doc", &text)).unwrap();
+            let expected = f.storage.get_document_content("doc").unwrap().unwrap();
+            assert!(expected.chars().count() > 400);
+            let outcome = worker.drain(&cx, "worker", &AtomicBool::new(false), Duration::from_secs(2)).await.unwrap();
+            let WorkerDrainOutcome::Drained { report, remaining } = outcome else {
+                panic!("expected a complete database drain: {outcome:?}");
+            };
+            assert_eq!(report.work.jobs_completed, 2);
+            assert_eq!(remaining.completed, 2);
+            assert_eq!(remaining.failed + remaining.pending + remaining.processing, 0);
+            assert!(f.sink.entries().is_empty());
+            assert_eq!(f.probe.inputs.lock().unwrap().as_slice(), [expected.clone()]);
+            assert_eq!(quality.inputs.lock().unwrap().as_slice(), [expected]);
+            for probe in [&f.probe, &quality] {
+                let published = f.storage.get_published_embedding("doc", probe.id, &probe.identity).unwrap().unwrap();
+                assert_eq!(published.embedding.values, vec![0.6, 0.8]);
+            }
+            assert_eq!(worker.queue().metrics().snapshot().total_completed, 2);
+            assert_eq!(worker.runner().metrics().snapshot().total_jobs_completed, 2);
+        });
+    }
+
+    #[test]
+    fn database_publication_retries_provider_failures_without_waiting_for_a_lease() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig { retry_base_delay_ms: 5, ..JobQueueConfig::default() });
+            f.probe.failures.store(1, Ordering::SeqCst);
+            let worker = f.worker.with_database_publication();
+            worker.runner().ingest(IngestRequest::new("retry", "complete input")).unwrap();
+            let outcome = worker.drain(&cx, "worker", &AtomicBool::new(false), Duration::from_secs(2)).await.unwrap();
+            let WorkerDrainOutcome::Drained { report, remaining } = outcome else {
+                panic!("delayed retry must drain without lease expiry: {outcome:?}");
+            };
+            assert_eq!(report.work.jobs_completed, 1);
+            assert_eq!(report.work.jobs_failed, 1);
+            assert_eq!(report.work.terminal_failures_encountered, 0);
+            assert_eq!(remaining.completed, 1);
+            assert_eq!(remaining.failed + remaining.processing + remaining.pending, 0);
+            assert!(f.sink.entries().is_empty());
+            let metrics = worker.queue().metrics().snapshot();
+            assert_eq!(metrics.total_completed, 1);
+            assert_eq!(metrics.total_retried, 1);
+            assert_eq!(metrics.total_failed, 0);
+            assert_eq!(worker.runner().metrics().snapshot().total_jobs_claimed, 2);
+            assert!(f.storage.get_published_embedding("retry", f.probe.id, &f.probe.identity).unwrap().is_some());
+        });
+    }
+
+    #[test]
+    fn database_publication_terminal_failure_does_not_block_the_next_job() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            f.probe.failures.store(1, Ordering::SeqCst);
+            let worker = f.worker.with_database_publication().with_batch_size(2).unwrap();
+            for id in ["reject", "good"] {
+                worker.runner().ingest(IngestRequest::new(id, id)).unwrap();
+            }
+            f.storage.connection().execute_sync("UPDATE embedding_jobs SET priority = 100 WHERE doc_id = 'reject';").unwrap();
+            let result = worker.process_batch(&cx, "worker").await.unwrap();
+            assert_eq!(result.jobs_claimed, 2);
+            assert_eq!(result.jobs_completed, 1);
+            assert_eq!(result.jobs_failed, 1);
+            assert_eq!(result.terminal_failures, 1);
+            assert!(f.sink.entries().is_empty());
+            assert!(f.storage.get_published_embedding("reject", f.probe.id, &f.probe.identity).unwrap().is_none());
+            assert!(f.storage.get_published_embedding("good", f.probe.id, &f.probe.identity).unwrap().is_some());
+            let queue = worker.queue().metrics().snapshot();
+            assert_eq!(queue.total_failed, 1);
+            assert_eq!(queue.total_completed, 1);
+            let pipeline = worker.runner().metrics().snapshot();
+            assert_eq!(pipeline.total_jobs_failed, 1);
+            assert_eq!(pipeline.total_jobs_completed, 1);
+        });
+    }
+
+    #[test]
+    fn database_publication_missing_input_consumes_only_the_bounded_job_retry() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            let worker = f.worker.with_database_publication();
+            worker.runner().ingest(IngestRequest::new("missing", "input")).unwrap();
+            f.storage.connection().execute_sync("DELETE FROM document_contents;").unwrap();
+            let result = worker.process_batch(&cx, "worker").await.unwrap();
+            assert_eq!(result.terminal_failures, 1);
+            assert_eq!(result.jobs_completed, 0);
+            assert!(f.probe.inputs.lock().unwrap().is_empty());
+            assert!(f.sink.entries().is_empty());
+            assert_eq!(worker.queue().queue_depth().unwrap().failed, 1);
+        });
+    }
+
+    #[test]
+    fn database_publication_failure_rolls_back_without_becoming_a_provider_failure() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            let worker = f.worker.with_database_publication();
+            worker.runner().ingest(IngestRequest::new("rollback", "input")).unwrap();
+            // The last catalog write fails, after vector and queue writes.
+            f.storage.connection().execute_sync("ALTER TABLE embedding_status RENAME COLUMN embedded_at TO unavailable_embedded_at;").unwrap();
+            assert!(worker.process_batch(&cx, "worker").await.is_err());
+            let depth = worker.queue().queue_depth().unwrap();
+            assert_eq!(depth.processing, 1);
+            assert_eq!(depth.completed + depth.failed + depth.pending, 0);
+            assert!(f.storage.connection().query_sync("SELECT doc_id FROM published_embeddings;").unwrap().is_empty());
+            assert_eq!(worker.queue().metrics().snapshot().total_completed, 0);
+            assert_eq!(worker.queue().metrics().snapshot().total_failed, 0);
+            assert_eq!(worker.runner().metrics().snapshot().total_jobs_failed, 0);
+            assert_eq!(worker.runner().metrics().snapshot().total_jobs_completed, 0);
+            assert!(f.sink.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn database_publication_counts_prior_commits_when_later_input_is_corrupt() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig::default());
+            let worker = f.worker.with_database_publication().with_batch_size(2).unwrap();
+            for id in ["good", "corrupt"] {
+                worker.runner().ingest(IngestRequest::new(id, id)).unwrap();
+            }
+            f.storage.connection().execute_sync("UPDATE embedding_jobs SET priority = 100 WHERE doc_id = 'good';").unwrap();
+            f.storage.connection().execute_sync("UPDATE document_contents SET canonical_text = 'wrong bytes' WHERE doc_id = 'corrupt';").unwrap();
+            assert!(worker.process_batch(&cx, "worker").await.is_err());
+            let depth = worker.queue().queue_depth().unwrap();
+            assert_eq!(depth.completed, 1);
+            assert_eq!(depth.processing, 1);
+            assert_eq!(depth.failed + depth.pending, 0);
+            assert_eq!(worker.queue().metrics().snapshot().total_completed, 1);
+            let metrics = worker.runner().metrics().snapshot();
+            assert_eq!(metrics.total_jobs_completed, 1);
+            assert_eq!(metrics.total_jobs_failed, 0);
+            assert_eq!(metrics.total_jobs_claimed, 2);
+            assert!(f.storage.get_published_embedding("good", f.probe.id, &f.probe.identity).unwrap().is_some());
+            assert!(f.sink.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn database_publication_propagates_typed_cancellation_without_consuming_retry_budget() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            f.probe.cancel.store(true, Ordering::SeqCst);
+            let worker = f.worker.with_database_publication();
+            worker.runner().ingest(IngestRequest::new("cancel", "input")).unwrap();
+            assert!(matches!(worker.process_batch(&cx, "worker").await, Err(SearchError::Cancelled { .. })));
+            assert_eq!(worker.queue().queue_depth().unwrap().processing, 1);
+            assert_eq!(worker.queue().metrics().snapshot().total_failed, 0);
+            assert_eq!(worker.runner().metrics().snapshot().total_jobs_failed, 0);
+            assert!(f.sink.entries().is_empty());
+            assert!(f.storage.get_published_embedding("cancel", f.probe.id, &f.probe.identity).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn external_worker_processing_keeps_its_explicit_sink_policy() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let f = fixture(JobQueueConfig::default());
+            f.worker.runner().ingest(IngestRequest::new("external", "input")).unwrap();
+            assert_eq!(f.worker.process_batch(&cx, "worker").await.unwrap().jobs_completed, 1);
+            assert_eq!(f.sink.entries().len(), 1);
+            assert!(f.storage.get_published_embedding("external", f.probe.id, &f.probe.identity).unwrap().is_none());
+        });
     }
 
     #[test]

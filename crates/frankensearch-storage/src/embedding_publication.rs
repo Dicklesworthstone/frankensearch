@@ -84,6 +84,18 @@ pub struct PublishedEmbedding {
     pub embedding: IdentityBoundEmbedding,
 }
 
+/// Preserve the revision responsible for a provider/input rejection. A worker
+/// must pass this hash to its fenced failure transition, never re-read a newer
+/// catalog revision. Storage/commit errors and cancellation stay in `Err`.
+#[derive(Debug)]
+pub(crate) enum PublicationAttempt {
+    Published,
+    Rejected {
+        document_hash: [u8; 32],
+        error: SearchError,
+    },
+}
+
 impl Storage {
     /// Embed retained canonical input and atomically publish the owned result.
     ///
@@ -115,6 +127,24 @@ impl Storage {
         claim: &ClaimedJob,
         embedder: &dyn Embedder,
     ) -> SearchResult<ClaimOutcome<()>> {
+        match self.attempt_claimed_publication(cx, claim, embedder).await? {
+            ClaimOutcome::Applied(PublicationAttempt::Published) => Ok(ClaimOutcome::Applied(())),
+            ClaimOutcome::Applied(PublicationAttempt::Rejected { error, .. }) => Err(error),
+            ClaimOutcome::LostClaim => Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => Ok(ClaimOutcome::Superseded),
+        }
+    }
+
+    /// The worker-facing operation separates job rejection from storage failure
+    /// without classifying arbitrary provider errors by their display strings.
+    /// Rejections do not themselves release a claim or consume its retry budget.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    pub(crate) async fn attempt_claimed_publication(
+        &self,
+        cx: &Cx,
+        claim: &ClaimedJob,
+        embedder: &dyn Embedder,
+    ) -> SearchResult<ClaimOutcome<PublicationAttempt>> {
         publication_checkpoint(cx)?;
         let prepared = self.immediate_transaction(|conn| {
             let document = match owned_document(conn, claim, None)? {
@@ -122,9 +152,10 @@ impl Storage {
                 ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
                 ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
             };
-            let text = read_document_content(conn, &document)?.ok_or_else(|| {
-                publication_error("complete canonical input is not retained; re-ingest the document")
-            })?;
+            // A missing payload is a recoverable input rejection. A failed
+            // database read or corrupt retained record is a storage error and
+            // must not be disguised as an ordinary provider retry.
+            let text = read_document_content(conn, &document)?;
             Ok(ClaimOutcome::Applied((document, text)))
         });
         publication_checkpoint(cx)?;
@@ -133,16 +164,30 @@ impl Storage {
             ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
             ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
         };
+        let Some(text) = text else {
+            return reject_attempt(
+                document.content_hash,
+                publication_error("complete canonical input is not retained; re-ingest the document"),
+            );
+        };
 
         // Capture errors before checking cancellation: provider metadata access
         // is arbitrary code and may request cancellation even when it fails.
         let expected = capture_producer(embedder, &claim.embedder_id);
         publication_checkpoint(cx)?;
+        let expected = match expected {
+            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+            expected => expected,
+        };
         match check_publication_claim(self, cx, claim, &document.content_hash)? {
             ClaimOutcome::Applied(()) => {}
-            outcome => return Ok(outcome),
+            ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
         }
-        let expected = expected?;
+        let expected = match expected {
+            Ok(expected) => expected,
+            Err(error) => return reject_attempt(document.content_hash, error),
+        };
         let response = embedder.embed_bound(cx, &text).await;
         publication_checkpoint(cx)?;
         let response = match response {
@@ -154,17 +199,53 @@ impl Storage {
         // interpreting coordinates or asking the provider for more metadata.
         match check_publication_claim(self, cx, claim, &document.content_hash)? {
             ClaimOutcome::Applied(()) => {}
-            outcome => return Ok(outcome),
+            ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
         }
         let actual = capture_producer(embedder, &claim.embedder_id);
         publication_checkpoint(cx)?;
-        if actual? != expected {
-            return Err(publication_error("embedding producer changed during inference"));
+        let actual = match actual {
+            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+            actual => actual,
+        };
+        // The post-inference metadata accessor is arbitrary provider code too.
+        // It can replace the document or relinquish the claim before returning
+        // an error. Such an error must be suppressed, not charged to new work.
+        match check_publication_claim(self, cx, claim, &document.content_hash)? {
+            ClaimOutcome::Applied(()) => {}
+            ClaimOutcome::LostClaim => return Ok(ClaimOutcome::LostClaim),
+            ClaimOutcome::Superseded => return Ok(ClaimOutcome::Superseded),
         }
-        let response = response?;
-        validate_response(&expected, &response)?;
+        let actual = match actual {
+            Ok(actual) => actual,
+            Err(error) => return reject_attempt(document.content_hash, error),
+        };
+        if actual != expected {
+            return reject_attempt(
+                document.content_hash,
+                publication_error("embedding producer changed during inference"),
+            );
+        }
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => return reject_attempt(document.content_hash, error),
+        };
+        if let Err(error) = validate_response(&expected, &response) {
+            return reject_attempt(document.content_hash, error);
+        }
         publication_checkpoint(cx)?;
-        self.publish_claimed_embedding(claim, &document.content_hash, &expected, &response)
+        // A publication failure rolls back all writes and propagates. It is
+        // never fed to queue.fail as though the provider rejected this job.
+        Ok(match self.publish_claimed_embedding(
+            claim,
+            &document.content_hash,
+            &expected,
+            &response,
+        )? {
+            ClaimOutcome::Applied(()) => ClaimOutcome::Applied(PublicationAttempt::Published),
+            ClaimOutcome::LostClaim => ClaimOutcome::LostClaim,
+            ClaimOutcome::Superseded => ClaimOutcome::Superseded,
+        })
     }
 
     /// Publish a prepared response and complete its exact attempt atomically.
@@ -323,6 +404,19 @@ impl Storage {
             }))
         })
     }
+}
+
+fn reject_attempt(
+    document_hash: [u8; 32],
+    error: SearchError,
+) -> SearchResult<ClaimOutcome<PublicationAttempt>> {
+    if matches!(error, SearchError::Cancelled { .. }) {
+        return Err(error);
+    }
+    Ok(ClaimOutcome::Applied(PublicationAttempt::Rejected {
+        document_hash,
+        error,
+    }))
 }
 
 fn publication_checkpoint(cx: &Cx) -> SearchResult<()> {
@@ -1138,6 +1232,56 @@ mod tests {
                 let probe = Probe::new(Behavior::Valid);
                 assert_eq!(storage.embed_and_publish_claimed(&cx, &old, &probe).await.unwrap(), ClaimOutcome::Superseded);
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+                assert!(rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty());
+            });
+        }
+
+        #[test]
+        fn rejected_legacy_attempt_retains_its_original_revision_for_failure_fencing() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (storage, queue, mut claim, _) = fixture();
+                storage.connection().execute_sync("UPDATE embedding_jobs SET content_hash = NULL;").unwrap();
+                claim.content_hash = None;
+                let probe = Probe::new(Behavior::Failure);
+                let attempt = storage.attempt_claimed_publication(&cx, &claim, &probe).await.unwrap();
+                let ClaimOutcome::Applied(PublicationAttempt::Rejected { document_hash, error }) = attempt else {
+                    panic!("expected a revision-bound provider rejection: {attempt:?}");
+                };
+                assert_eq!(document_hash, ContentHasher::hash("original body"));
+                assert_eq!(queue.queue_depth().unwrap().processing, 1);
+                assert_eq!(queue.metrics().snapshot().total_retried, 0);
+                let replacement = document("doc", "replacement body");
+                storage.upsert_document(&replacement).unwrap();
+                storage.set_document_content("doc", "replacement body").unwrap();
+                queue.enqueue("doc", "model", &replacement.content_hash, 0).unwrap();
+                assert_eq!(queue.fail(&claim, &document_hash, &error.to_string()).unwrap(), ClaimOutcome::Superseded);
+                assert_eq!(queue.queue_depth().unwrap().pending, 1);
+                assert_eq!(queue.queue_depth().unwrap().failed, 0);
+                assert_eq!(storage.count_by_status("model").unwrap().failed, 0);
+            });
+        }
+
+        #[test]
+        fn post_inference_metadata_replacement_suppresses_a_provider_rejection() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (storage, queue, claim, _) = fixture();
+                let hook_storage = Arc::clone(&storage);
+                let _hook = ScopedHook::inference(move || {
+                    // The first metadata read already finished. Arrange a
+                    // replacement in the post-inference identity callback.
+                    METADATA_HOOK.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            hook_storage.upsert_document(&document("doc", "replacement body")).unwrap();
+                        }));
+                    });
+                });
+                let probe = Probe::new(Behavior::DriftFailure);
+                assert!(matches!(
+                    storage.attempt_claimed_publication(&cx, &claim, &probe).await.unwrap(),
+                    ClaimOutcome::Superseded
+                ));
+                assert_eq!(queue.queue_depth().unwrap().processing, 0);
+                assert_eq!(queue.metrics().snapshot().total_failed, 0);
                 assert!(rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty());
             });
         }
