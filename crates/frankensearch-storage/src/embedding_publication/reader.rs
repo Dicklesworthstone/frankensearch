@@ -217,6 +217,49 @@ fn retain_hit(heap: &mut BinaryHeap<RankedHit>, hit: RankedHit, limit: usize) ->
 }
 
 impl Storage {
+    /// Capture verified vectors, canonical source text, and catalog metadata.
+    ///
+    /// All records are read in the SAME transaction, not hydrated by a later
+    /// current-document lookup. Missing, stale, or corrupt source input fails
+    /// the entire capture. Vector and source budgets are independent and both
+    /// reject overflow rather than return an incomplete prefix. No external
+    /// files, providers, caller callbacks, or awaits enter this transaction.
+    /// The configured storage transaction mode may hold a writer lock.
+    pub fn load_published_search_snapshot(
+        &self,
+        cx: &Cx,
+        embedder_id: &str,
+        expected_identity: &EmbeddingIdentityBundleV1,
+        limits: crate::publication_search::PublishedSearchReadLimits,
+    ) -> SearchResult<crate::publication_search::PublishedSearchSnapshot> {
+        validate_read_request(cx, embedder_id, expected_identity)?;
+        let result = self.transaction(|conn| {
+            let mut records = Vec::new();
+            let mut documents = Vec::new();
+            let mut source_payload_bytes = 0_usize;
+            let stats = scan_on(conn, cx, embedder_id, expected_identity, limits.embeddings, |record| {
+                let (document, bytes) = crate::publication_search::read_search_document(
+                    conn, cx, &record, limits.max_source_bytes - source_payload_bytes,
+                )?;
+                records.try_reserve(1).map_err(map_storage_error)?;
+                documents.try_reserve(1).map_err(map_storage_error)?;
+                source_payload_bytes += bytes;
+                records.push(record);
+                documents.push(document);
+                Ok(())
+            })?;
+            Ok(crate::publication_search::PublishedSearchSnapshot {
+                vectors: PublishedEmbeddingSnapshot { records, stats },
+                documents,
+                identity: expected_identity.clone(),
+                embedder_id: embedder_id.to_owned(),
+                source_payload_bytes,
+            })
+        });
+        publication_checkpoint(cx)?;
+        result
+    }
+
     /// Load all current embedded publications for one operational tier.
     ///
     /// Every record must match the expected complete producer identity and
