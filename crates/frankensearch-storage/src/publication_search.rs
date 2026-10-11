@@ -7,7 +7,7 @@
 
 use asupersync::Cx;
 use frankensearch_core::types::{BoundQueryEmbedding, VectorHit};
-use frankensearch_core::{EmbeddingIdentityBundleV1, SearchError, SearchResult};
+use frankensearch_core::{Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult};
 use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
 
@@ -171,6 +171,80 @@ impl PublishedSearchSnapshot {
         self.source_payload_bytes
     }
 
+    /// Embed a text query and search this captured corpus with verified sources.
+    ///
+    /// The caller supplies the query canonicalizer corresponding to the captured
+    /// input contract; the `Canonicalizer` trait cannot attest its own policy.
+    /// Document canonicalization is never applied to a query here. The actual
+    /// `embed_bound` response, not a newly stamped raw vector, supplies the query
+    /// identity. Provider ID, dimension and full identity must match before and
+    /// after canonicalization and after inference, including provider failures.
+    ///
+    /// Empty canonical queries, empty corpora and zero limits skip inference but
+    /// do not skip producer admission. No database connection/transaction is held
+    /// by this snapshot or across the await. Cancellation dominates provider
+    /// errors; caller-owned provider deadlines still apply. Exact scoring is
+    /// synchronous after inference, as in `search`; this is not an ANN backend.
+    pub async fn search_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        canonicalizer: &dyn Canonicalizer,
+        text: &str,
+        limit: usize,
+    ) -> SearchResult<Vec<PublishedSearchHit<'_>>> {
+        self.admit_query_producer(cx, embedder)?;
+        if limit == 0 || self.is_empty() {
+            return Ok(Vec::new());
+        }
+        let text = canonicalizer.canonicalize_query(text);
+        checkpoint(cx)?;
+        // Even an empty-query canonicalizer can run arbitrary callbacks.
+        self.admit_query_producer(cx, embedder)?;
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = embedder.embed_bound(cx, &text).await;
+        checkpoint(cx)?;
+        let response = match response {
+            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+            response => response,
+        };
+        // Provider failure is not permission to silently accept producer drift.
+        self.admit_query_producer(cx, embedder)?;
+        let response = response?;
+        if response.identity != self.identity {
+            return Err(invalid("identity", "query response has a foreign producer contract"));
+        }
+        let query = BoundQueryEmbedding::new(response.values, response.identity)?;
+        checkpoint(cx)?;
+        self.search(cx, &query, limit)
+    }
+
+    fn admit_query_producer(&self, cx: &Cx, embedder: &dyn Embedder) -> SearchResult<()> {
+        checkpoint(cx)?;
+        // Capture errors before checking cancellation: metadata accessors can
+        // request cancellation while returning a different error or identity.
+        let admitted = (|| {
+            if matches!(self.identity.space.kind,
+                frankensearch_core::generation::EmbeddingSpaceKindV1::HashControl)
+            {
+                return Err(invalid("identity", "hash-control input is not semantic search"));
+            }
+            let id = embedder.id();
+            let dimension = embedder.dimension();
+            let identity = embedder.identity()?;
+            if id != self.embedder_id.as_str() || identity != &self.identity
+                || usize::try_from(self.identity.space.dimension).ok() != Some(dimension)
+            {
+                return Err(invalid("identity", "query provider does not match the captured producer"));
+            }
+            Ok(())
+        })();
+        checkpoint(cx)?;
+        admitted
+    }
+
     /// Exact cosine search with source hydration from this same captured owner.
     ///
     /// The complete query contract must match even for an empty corpus or a
@@ -275,8 +349,11 @@ mod tests {
     #![allow(clippy::arc_with_non_send_sync)]
 
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
     use frankensearch_core::IdentityBoundEmbedding;
+    use frankensearch_core::traits::{ModelCategory, SearchFuture};
     use crate::{ClaimOutcome, ContentHasher, JobQueueConfig, PersistentJobQueue, Storage};
     use super::*;
 
@@ -317,6 +394,246 @@ mod tests {
 
     fn load(storage: &Storage, cx: &Cx) -> PublishedSearchSnapshot {
         storage.load_published_search_snapshot(cx, "model", &identity("model"), PublishedSearchReadLimits::default()).unwrap()
+    }
+
+    #[derive(Clone, Copy)]
+    enum QueryReply {
+        Normal, Foreign, BadDimension, NonFinite, Zero, Error,
+        DriftSuccess, DriftError, CancelError, ExplicitCancel,
+    }
+
+    thread_local! {
+        static QUERY_METADATA_CANCEL: std::cell::RefCell<Option<Cx>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    struct ClearQueryMetadataCancel;
+
+    impl Drop for ClearQueryMetadataCancel {
+        fn drop(&mut self) {
+            QUERY_METADATA_CANCEL.with(|slot| { let _ = slot.borrow_mut().take(); });
+        }
+    }
+
+    struct QueryProbe {
+        identity: EmbeddingIdentityBundleV1,
+        foreign: EmbeddingIdentityBundleV1,
+        drift: Arc<AtomicBool>,
+        calls: AtomicUsize,
+        metadata_calls: AtomicUsize,
+        inputs: Mutex<Vec<String>>,
+        reply: QueryReply,
+    }
+
+    impl QueryProbe {
+        fn new(reply: QueryReply) -> Self {
+            let admitted = identity("model");
+            let mut foreign = admitted.clone();
+            foreign.producer.backend = "foreign-test-backend".to_owned();
+            foreign.validate().unwrap();
+            Self {
+                identity: admitted, foreign, reply,
+                drift: Arc::new(AtomicBool::new(false)),
+                calls: AtomicUsize::new(0), metadata_calls: AtomicUsize::new(0),
+                inputs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Embedder for QueryProbe {
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.metadata_calls.fetch_add(1, Ordering::SeqCst);
+            let cancel = QUERY_METADATA_CANCEL.with(|slot| slot.borrow_mut().take());
+            if let Some(cx) = cancel {
+                cx.cancel_with(asupersync::CancelKind::User, Some("metadata cancellation"));
+                return Err(invalid("provider", "metadata failed"));
+            }
+            Ok(if self.drift.load(Ordering::SeqCst) { &self.foreign } else { &self.identity })
+        }
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async { Err(invalid("provider", "raw embedding must not be used")) })
+        }
+        fn embed_bound<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, IdentityBoundEmbedding> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inputs.lock().unwrap().push(text.to_owned());
+                asupersync::runtime::yield_now().await;
+                if matches!(self.reply, QueryReply::DriftSuccess | QueryReply::DriftError) {
+                    self.drift.store(true, Ordering::SeqCst);
+                }
+                if matches!(self.reply, QueryReply::CancelError) {
+                    cx.cancel_with(asupersync::CancelKind::User, Some("inference cancellation"));
+                }
+                if matches!(self.reply, QueryReply::ExplicitCancel) {
+                    return Err(SearchError::Cancelled { phase: "probe".to_owned(), reason: "explicit".to_owned() });
+                }
+                if matches!(self.reply, QueryReply::Error | QueryReply::DriftError | QueryReply::CancelError) {
+                    return Err(invalid("provider", "inference failed"));
+                }
+                let values = match self.reply {
+                    QueryReply::BadDimension => vec![1.0],
+                    QueryReply::NonFinite => vec![f32::NAN, 0.0],
+                    QueryReply::Zero => vec![0.0, 0.0],
+                    _ if text.contains("orchard") => vec![1.0, 0.0],
+                    _ => vec![0.0, 1.0],
+                };
+                Ok(IdentityBoundEmbedding {
+                    values,
+                    identity: if matches!(self.reply, QueryReply::Foreign) { self.foreign.clone() } else { self.identity.clone() },
+                })
+            })
+        }
+        fn dimension(&self) -> usize { 2 }
+        fn id(&self) -> &'static str { "model" }
+        fn model_name(&self) -> &'static str { "source-query-probe" }
+        fn is_semantic(&self) -> bool { true }
+        fn category(&self) -> ModelCategory { ModelCategory::StaticEmbedder }
+    }
+
+    struct QueryCanonicalizer {
+        drift: Option<Arc<AtomicBool>>,
+        empty: bool,
+    }
+
+    impl Canonicalizer for QueryCanonicalizer {
+        fn canonicalize(&self, _text: &str) -> String {
+            panic!("document canonicalization must not run for search text")
+        }
+        fn canonicalize_query(&self, text: &str) -> String {
+            if let Some(drift) = &self.drift { drift.store(true, Ordering::SeqCst); }
+            if self.empty { String::new() } else { text.trim().to_owned() }
+        }
+    }
+
+    #[test]
+    fn text_queries_use_bound_inference_and_captured_sources_after_database_reopen() {
+        use frankensearch_core::canonicalize::DefaultCanonicalizer;
+        use crate::{InMemoryVectorSink, IngestRequest, PersistentEmbeddingWorker, StorageConfig};
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let config = StorageConfig { db_path: directory.path().join("query.sqlite3"), ..StorageConfig::default() };
+            let probe = Arc::new(QueryProbe::new(QueryReply::Normal));
+            let sink = Arc::new(InMemoryVectorSink::default());
+            {
+                let storage = Arc::new(Storage::open(config.clone()).unwrap());
+                let worker = PersistentEmbeddingWorker::new(storage, JobQueueConfig::default(),
+                    Arc::new(DefaultCanonicalizer::default()), probe.clone(), sink.clone()).unwrap().with_database_publication();
+                worker.runner().ingest(IngestRequest::new("fruit", "apple orchard")).unwrap();
+                worker.runner().ingest(IngestRequest::new("systems", "database transaction")).unwrap();
+                assert_eq!(worker.process_batch(&cx, "publisher").await.unwrap().jobs_completed, 2);
+            }
+            let storage = Storage::open(config).unwrap();
+            let captured = load(&storage, &cx);
+            storage.connection().execute_sync("DELETE FROM documents;").unwrap();
+            drop(storage);
+            let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
+            let hits = captured.search_text(&cx, probe.as_ref(), &canonicalizer, "  apple orchard  ", 1).await.unwrap();
+            assert_eq!(hits[0].hit().doc_id.as_str(), "fruit");
+            assert_eq!(hits[0].document().canonical_text(), "apple orchard");
+            assert_eq!(hits[0].publication().content_hash, ContentHasher::hash("apple orchard"));
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(probe.inputs.lock().unwrap().last().unwrap(), "apple orchard");
+            assert!(sink.entries().is_empty());
+        });
+    }
+
+    #[test]
+    fn text_query_noops_skip_inference_but_do_not_hide_a_foreign_provider() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            let empty = load(&storage, &cx);
+            publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
+            let full = load(&storage, &cx);
+            let probe = QueryProbe::new(QueryReply::Normal);
+            let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
+            for (snapshot, text, k) in [(&empty, "orchard", 1), (&full, "orchard", 0), (&full, " \t ", 1)] {
+                assert!(snapshot.search_text(&cx, &probe, &canonicalizer, text, k).await.unwrap().is_empty());
+            }
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+            probe.drift.store(true, Ordering::SeqCst);
+            for (snapshot, k) in [(&empty, 1), (&full, 0)] {
+                assert!(snapshot.search_text(&cx, &probe, &canonicalizer, "", k).await.is_err());
+            }
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn text_queries_reject_foreign_malformed_and_drifting_outputs() {
+        for reply in [QueryReply::Foreign, QueryReply::BadDimension, QueryReply::NonFinite,
+            QueryReply::Zero, QueryReply::DriftSuccess, QueryReply::DriftError, QueryReply::Error]
+        {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (storage, queue) = fixture();
+                publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
+                let captured = load(&storage, &cx);
+                let probe = QueryProbe::new(reply);
+                let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
+                let error = captured.search_text(&cx, &probe, &canonicalizer, "orchard", 1).await.unwrap_err();
+                if matches!(reply, QueryReply::DriftError | QueryReply::DriftSuccess) {
+                    assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.identity"));
+                } else if matches!(reply, QueryReply::Error) {
+                    assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.provider"));
+                }
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(queue.queue_depth().unwrap().completed, 1);
+            });
+        }
+    }
+
+    #[test]
+    fn canonicalizer_callbacks_cannot_switch_providers_even_for_an_empty_query() {
+        for empty in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (storage, queue) = fixture();
+                publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
+                let captured = load(&storage, &cx);
+                let probe = QueryProbe::new(QueryReply::Normal);
+                let canonicalizer = QueryCanonicalizer { drift: Some(Arc::clone(&probe.drift)), empty };
+                assert!(captured.search_text(&cx, &probe, &canonicalizer, "orchard", 1).await.is_err());
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+            });
+        }
+    }
+
+    #[test]
+    fn query_cancellation_dominates_provider_and_metadata_failures() {
+        for reply in [QueryReply::CancelError, QueryReply::ExplicitCancel] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (storage, queue) = fixture();
+                publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
+                let captured = load(&storage, &cx);
+                let probe = QueryProbe::new(reply);
+                let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
+                assert!(matches!(captured.search_text(&cx, &probe, &canonicalizer, "orchard", 1).await, Err(SearchError::Cancelled { .. })));
+                assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2, "cancelled inference never calls provider metadata again");
+            });
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, _) = fixture();
+            let captured = load(&storage, &cx);
+            let probe = QueryProbe::new(QueryReply::Normal);
+            let _guard = ClearQueryMetadataCancel;
+            QUERY_METADATA_CANCEL.with(|slot| { *slot.borrow_mut() = Some(cx.clone()); });
+            let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
+            assert!(matches!(captured.search_text(&cx, &probe, &canonicalizer, "", 0).await, Err(SearchError::Cancelled { .. })));
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn precancelled_text_queries_do_not_invoke_any_provider_code() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, _) = fixture();
+            let captured = load(&storage, &cx);
+            let probe = QueryProbe::new(QueryReply::Normal);
+            let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
+            cx.cancel_with(asupersync::CancelKind::User, Some("stop before query"));
+            assert!(matches!(captured.search_text(&cx, &probe, &canonicalizer, "", 0).await, Err(SearchError::Cancelled { .. })));
+            assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        });
     }
 
     #[test]
