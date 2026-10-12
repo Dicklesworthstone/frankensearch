@@ -12820,6 +12820,32 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn durable_layout_u32_boundaries_require_no_large_allocation() {
+        let max = u32::MAX as usize;
+        let doclen_limits = DocLenLimits {
+            max_section_bytes: u64::MAX,
+            ..DocLenLimits::default()
+        };
+        // Column two's aligned start is the first offset outside u32.
+        assert!(doclen_layout(&[0, 1], max - 127, doclen_limits).is_ok());
+        assert!(matches!(
+            doclen_layout(&[0, 1], max - 126, doclen_limits),
+            Err(DocLenCodecError::OffsetUnrepresentable { field_ord: 1, .. })
+        ));
+        let stored_limits = StoredMetaLimits {
+            max_section_bytes: u64::MAX,
+            ..StoredMetaLimits::default()
+        };
+        // span=1 contributes one presence byte and two u32 offsets.
+        assert!(stored_meta_layout(&[0, 1], 1, &[max - 21, 0], stored_limits).is_ok());
+        assert!(matches!(
+            stored_meta_layout(&[0, 1], 1, &[max - 20, 0], stored_limits),
+            Err(StoredMetaCodecError::OffsetUnrepresentable { field_ord: 1, .. })
+        ));
+    }
+
     fn init_replay_tracing() {
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)

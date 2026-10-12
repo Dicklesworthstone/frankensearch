@@ -558,6 +558,9 @@ pub enum CompactionError {
 /// Typed failures from Q1-preserving whole-segment concat merge.
 #[derive(Debug, Error)]
 pub enum ConcatMergeError {
+    /// The conservative durable-layout bound exceeds the v1 offset space.
+    #[error("concat merge exceeds the u32 durable layout budget; merge smaller consecutive runs")]
+    OutputTooLarge,
     /// A merge must replace at least two immutable segments.
     #[error("concat merge requires at least two source segments, got {count}")]
     TooFewSources {
@@ -1779,6 +1782,7 @@ pub enum TierPolicyError {
 
 /// Select the first same-tier, bound-consecutive manifest run admitted by the
 /// optional hole-ratio gate.
+/// Runs beyond the conservative durable u32 layout budget are skipped.
 ///
 /// The planner validates interval ordering and disjointness before selecting an
 /// uninterrupted slice. That slice is therefore exactly Q1 R2: the output hull
@@ -1799,6 +1803,9 @@ pub fn plan_tier_merge(
         return Ok(None);
     }
     for sources in segments.windows(policy.fanout) {
+        if !concat_layout_fits(sources.iter()) {
+            continue;
+        }
         let first = &sources[0];
         let tier = policy.classify_width(first.docid_hi - first.docid_lo);
         if sources
@@ -1839,6 +1846,86 @@ pub fn plan_tier_merge(
         }));
     }
     Ok(None)
+}
+
+/// Conservative, allocation-free admission for the existing u32 section layouts.
+///
+/// Source file lengths bound all copied blobs and dense column bytes. Holes
+/// add one DOCLEN byte and at most five STOREDMETA bytes per schema field,
+/// plus twelve IDMAP bytes per slot. Reserve worst-case DOCLEN alignment for
+/// the schema-field upper bound derived from the source lengths. Bounding each
+/// section bounds
+/// each field offset, blob offset, and blob-relative terminal offset. This is
+/// deliberately conservative: large indexes retain several compatible segments.
+pub(crate) fn concat_layout_fits<'a>(
+    segments: impl IntoIterator<Item = &'a ManifestSegment, IntoIter: Clone>,
+) -> bool {
+    let segments = segments.into_iter();
+    // A complete source file bounds the number of fields: every DOCLEN
+    // field needs a six-byte directory entry and `span` bytes; every stored
+    // field additionally needs presence and `(span + 1)` u32 offsets.
+    // Use the smallest bound across sources, whose schema is identical.
+    let mut doclen_fields = u64::from(u16::MAX);
+    let mut stored_fields = u64::from(u16::MAX);
+    for segment in segments.clone() {
+        let Some(span) = segment.docid_hi.checked_sub(segment.docid_lo) else {
+            return false;
+        };
+        let Some(doclen_min) = span.checked_add(6) else {
+            return false;
+        };
+        let Some(stored_min) = span
+            .checked_add(1)
+            .and_then(|slots| slots.checked_mul(4))
+            .and_then(|offsets| offsets.checked_add(span.div_ceil(8)))
+            .and_then(|prefix| prefix.checked_add(6))
+        else {
+            return false;
+        };
+        doclen_fields = doclen_fields.min(segment.file_len / doclen_min);
+        stored_fields = stored_fields.min(segment.file_len / stored_min);
+    }
+    let mut bytes = 63 * doclen_fields;
+    let mut previous_hi = None;
+    let mut docs = 0_u64;
+    for segment in segments {
+        let gap = match previous_hi {
+            Some(hi) => match segment.docid_lo.checked_sub(hi) {
+                Some(gap) => gap,
+                None => return false,
+            },
+            None => 0,
+        };
+        // Presence bitmaps grow by at most one byte per added slot; the
+        // DOCLEN and STOREDMETA bounds are independent sections, so five
+        // bytes per field bounds either one, rather than their sum.
+        let Some(next) = gap
+            .checked_mul((5 * stored_fields).max(doclen_fields) + 12)
+            .and_then(|extra| bytes.checked_add(extra))
+            .and_then(|total| total.checked_add(segment.file_len))
+        else {
+            return false;
+        };
+        bytes = next;
+        docs += u64::from(segment.doc_count);
+        if bytes > u64::from(u32::MAX) || docs > u64::from(u32::MAX) {
+            return false;
+        }
+        previous_hi = Some(segment.docid_hi);
+    }
+    true
+}
+
+/// Largest admitted prefix, or one retained source when no pair fits.
+pub(crate) fn bounded_concat_prefix(sources: &[ManifestSegment]) -> usize {
+    if sources.is_empty() {
+        return 0;
+    }
+    let mut end = 1;
+    while end < sources.len() && concat_layout_fits(sources[..=end].iter()) {
+        end += 1;
+    }
+    end
 }
 
 fn validate_tier_policy(policy: TierMergePolicy) -> Result<(), TierPolicyError> {
@@ -6678,6 +6765,9 @@ fn build_concat_merge(
                 position: source_segment_ids.len(),
                 actual: *source_segment_ids.last().unwrap_or(&first_id),
             })?;
+    if !concat_layout_fits(selected.iter().map(|segment| &segment.manifest)) {
+        return Err(ConcatMergeError::OutputTooLarge);
+    }
     for segment in selected {
         if let Some(entry) = segment.section_entries().iter().find(|entry| {
             !(SectionKind::TERMDICT.raw()..=SectionKind::STATS.raw()).contains(&entry.kind.raw())
@@ -17229,6 +17319,74 @@ mod tests {
         }
     }
 
+    #[test]
+    fn concat_layout_budget_checks_boundary_gaps_and_overflow_without_payloads() {
+        let mut left = tier_test_segment(1, 0, 1);
+        let mut right = tier_test_segment(2, 1, 2);
+        right.file_len = 4 * 1024 * 1024;
+        left.file_len = u64::from(u32::MAX) - 63 * u64::from(u16::MAX) - right.file_len;
+        assert!(concat_layout_fits([&left, &right]));
+        left.file_len += 1;
+        assert!(!concat_layout_fits([&left, &right]));
+        left.file_len = right.file_len;
+        let mut distant = right.clone();
+        distant.docid_lo = 20_000;
+        distant.docid_hi = 20_001;
+        assert!(!concat_layout_fits([&left, &distant]));
+        left.file_len = u64::MAX;
+        assert!(!concat_layout_fits([&left, &right]));
+    }
+
+    #[test]
+    fn tier_planner_skips_oversized_run_and_merges_later_neighbors() {
+        let mut segments = vec![
+            tier_test_segment(1, 0, 1),
+            tier_test_segment(2, 1, 2),
+            tier_test_segment(3, 2, 3),
+        ];
+        segments[0].file_len = u64::from(u32::MAX);
+        let policy = TierMergePolicy {
+            fanout: 2,
+            small_max_docid_width: 64,
+            medium_max_docid_width: 512,
+            max_hole_ratio: 1.0,
+        };
+        let plan = plan_tier_merge(&segments, policy).unwrap().unwrap();
+        assert_eq!(plan.source_segment_ids, [2, 3]);
+        segments[1].file_len = u64::from(u32::MAX);
+        assert!(plan_tier_merge(&segments, policy).unwrap().is_none());
+    }
+
+    #[test]
+    fn bulk_layout_partition_keeps_order_and_every_document() {
+        let sources = (0..7)
+            .map(|id| {
+                let mut source = tier_test_segment(id + 1, id * 250_000, (id + 1) * 250_000);
+                source.file_len = 1_500_000_000;
+                source
+            })
+            .collect::<Vec<_>>();
+        let mut remaining = sources.as_slice();
+        let mut groups = Vec::new();
+        let mut ids = Vec::new();
+        let mut docs = 0_u64;
+        while !remaining.is_empty() {
+            let count = bounded_concat_prefix(remaining);
+            let run = &remaining[..count];
+            assert!(concat_layout_fits(run.iter()));
+            groups.push(count);
+            ids.extend(run.iter().map(|source| source.segment_id));
+            docs += run
+                .iter()
+                .map(|source| u64::from(source.doc_count))
+                .sum::<u64>();
+            remaining = &remaining[count..];
+        }
+        assert_eq!(groups, [2, 2, 2, 1]);
+        assert_eq!(ids, (1..=7).collect::<Vec<_>>());
+        assert_eq!(docs, 1_750_000);
+    }
+
     fn apply_tier_test_plan(
         segments: &mut Vec<ManifestSegment>,
         plan: &TierMergePlan,
@@ -20230,6 +20388,38 @@ mod tests {
         assert_eq!(
             replaced.materialize_document_id(131_072),
             Some(DocId::new("floor-a-v2"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_concat_is_rejected_before_verification_or_publication() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let first = encoded_identity_test_segment(0xb11, 0, &[Some("large-a")])?;
+        let second = encoded_identity_test_segment(0xb12, 1, &[Some("large-b")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 2;
+        proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
+        let mut published = original.publish_owned_segments(&proposed, vec![first, second])?;
+        let authority = published.loaded_manifest().clone();
+        // A controlled projected size, without manufacturing a multi-GB
+        // backing. Verification would reject this deliberately inconsistent
+        // binding, so OutputTooLarge also proves the early guard's ordering.
+        published.segments[0].manifest.file_len = u64::from(u32::MAX);
+        assert!(matches!(
+            build_concat_merge(&published, &[0xb11, 0xb12], 0xb13, 0),
+            Err(ConcatMergeError::OutputTooLarge)
+        ));
+        assert_eq!(published.loaded_manifest().manifest, authority.manifest);
+        assert_eq!(published.segments().len(), 2);
+        assert_eq!(published.doc_count(), 2);
+        assert_eq!(
+            published.materialize_document_id(0),
+            Some(DocId::new("large-a"))
+        );
+        assert_eq!(
+            published.materialize_document_id(1),
+            Some(DocId::new("large-b"))
         );
         Ok(())
     }

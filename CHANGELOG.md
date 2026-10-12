@@ -1,5 +1,16 @@
 # Changelog
 
+### Unreleased — Quill large-index merge admission (#66)
+
+Quill now bounds concat candidates before verification and codec construction.
+Bulk-load completion partitions the session tail into consecutive compatible
+runs; ordinary tier and session maintenance skip runs beyond the durable u32
+layout budget. Explicit oversized concat requests return `OutputTooLarge`
+without installing an output or publishing a manifest. The bound includes dense
+document-ID gaps and alignment, and conservatively uses complete source file
+lengths, so it can retain more segments than an exact per-section estimate.
+Existing FSLX bytes, document IDs, and atomic manifest publication are unchanged.
+
 All notable changes to [frankensearch](https://github.com/Dicklesworthstone/frankensearch) are documented here.
 
 Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/frankensearch/releases) unless noted otherwise. Tags that share a commit with another release are called out explicitly. Each entry links to representative commits using full commit URLs.

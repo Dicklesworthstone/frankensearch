@@ -145,6 +145,7 @@ fn checkpoint(cx: &Cx) -> Result<(), SessionMergeError> {
 /// order. Every selected run has exactly `fanout` adjacent entries and fits
 /// both input budgets. Oversized runs are skipped, not partially selected.
 /// Counts include tombstoned rows because concat copies their physical bytes.
+/// The durable u32 layout budget applies independently of caller input budgets.
 ///
 /// The caller supplies the complete ordered manifest segment list. This
 /// function validates its range/count shape; full codec/checksum admission
@@ -186,6 +187,9 @@ pub fn plan_session_merge(
     let mut selected: Option<(u32, usize, u64, u64)> = None;
     for (start, sources) in segments.windows(policy.fanout).enumerate() {
         checkpoint(cx)?;
+        if !crate::keeper::concat_layout_fits(sources.iter()) {
+            continue;
+        }
         let tier = policy.tier(sources[0].doc_count);
         if selected.is_some_and(|(best, ..)| best <= tier)
             || sources
@@ -300,6 +304,29 @@ mod tests {
             doc_count: docs,
             tombstones: TombstoneSet::new(),
         }
+    }
+
+    #[test]
+    fn durable_budget_applies_even_with_unlimited_session_input_budget() {
+        run_test_with_cx(|cx| async move {
+            let sources = [
+                segment(1, 0, 1, u64::from(u32::MAX)),
+                segment(2, 1, 1, 4096),
+                segment(3, 2, 1, 4096),
+            ];
+            let policy = SessionMergePolicy {
+                fanout: 2,
+                max_input_docs: u64::MAX,
+                max_input_bytes: u64::MAX,
+            };
+            let plan = plan_session_merge(&cx, &sources, policy).unwrap().unwrap();
+            assert_eq!(plan.source_segment_ids, [2, 3]);
+            assert!(
+                plan_session_merge(&cx, &sources[..2], policy)
+                    .unwrap()
+                    .is_none()
+            );
+        });
     }
 
     #[test]

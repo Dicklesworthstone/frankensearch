@@ -8286,16 +8286,28 @@ impl QuillWriterState {
         // Every docid this session issued lies at or above the frontier it
         // opened at, so its segments are the manifest's consecutive tail.
         let frontier = self.bulk_session_docid_lo;
-        let source_segment_ids = self
+        let sources = self
             .authority_snapshot()?
             .loaded_manifest()
             .manifest
             .segments
             .iter()
             .filter(|segment| segment.docid_lo >= frontier)
-            .map(|segment| segment.segment_id)
+            .cloned()
             .collect::<Vec<_>>();
-        if source_segment_ids.len() > 1 {
+        let mut start = 0;
+        while start < sources.len() {
+            let end = start + crate::keeper::bounded_concat_prefix(&sources[start..]);
+            // An already sealed segment may itself exceed this conservative
+            // budget. Keep it intact; never let it block later eligible runs.
+            if end - start < 2 {
+                start = end;
+                continue;
+            }
+            let source_segment_ids = sources[start..end]
+                .iter()
+                .map(|segment| segment.segment_id)
+                .collect::<Vec<_>>();
             let output_segment_id =
                 self.derive_policy_segment_id(&source_segment_ids, b"bulk-finish")?;
             let created_unix_s = self.created_unix_s()?;
@@ -8313,6 +8325,7 @@ impl QuillWriterState {
             self.concat_merge(cx, &source_segment_ids, output_segment_id, created_unix_s)
                 .instrument(bulk_span)
                 .await?;
+            start = end;
         }
         // Ordinary tier merges resume here, over the segments earlier writers
         // finished as well, which bounds the segment count across sessions.
@@ -12619,11 +12632,13 @@ impl QuillIndex {
     ///
     /// Intermediate MANIFEST generations remain crash-resumable according to
     /// [`QuillConfig::bulk_publish_segment_cadence`]. The pass packs the
-    /// segments this load wrote into one; segments an earlier writer finished
-    /// before this one opened are not rewritten. Ordinary tier merging is then
-    /// re-enabled: it runs once here, and for subsequent commits. A build into
+    /// segments this load wrote into bounded consecutive runs; segments an
+    /// earlier writer finished before this one opened are not rewritten.
+    /// Ordinary tier merging is then re-enabled: it runs once here, and for
+    /// subsequent commits. A build into
     /// an empty index, or one resuming an interrupted bulk load, therefore
-    /// ends with at most one sealed segment.
+    /// ends with one sealed segment when the durable layout budget permits,
+    /// and several compatible segments for larger corpora.
     ///
     /// # Errors
     ///
