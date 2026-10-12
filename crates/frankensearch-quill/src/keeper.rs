@@ -49,7 +49,8 @@ use crate::quiver::{
     IdMapEntryInput, IdMapPresence, IdMapSection, NumericEntry, NumericFieldInput, NumericSection,
     PositionList, Posting, PostingList, StatsSection, StoredMetaCodecError, StoredMetaFieldInput,
     StoredMetaLookup, StoredMetaSection, ValidatedStoredMetaLookupPlan,
-    ValidatedTermPruningMetadata, aggregate_field_stats,
+    ValidatedTermPruningMetadata, aggregate_field_stats, project_doclen_len, project_id_hash_len,
+    project_id_map_len, project_stored_meta_len_total,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{
@@ -558,7 +559,7 @@ pub enum CompactionError {
 /// Typed failures from Q1-preserving whole-segment concat merge.
 #[derive(Debug, Error)]
 pub enum ConcatMergeError {
-    /// The conservative durable-layout bound exceeds the v1 offset space.
+    /// The projected output exceeds the durable layout or codec budget.
     #[error("concat merge exceeds the u32 durable layout budget; merge smaller consecutive runs")]
     OutputTooLarge,
     /// A merge must replace at least two immutable segments.
@@ -1787,6 +1788,9 @@ pub enum TierPolicyError {
 /// The planner validates interval ordering and disjointness before selecting an
 /// uninterrupted slice. That slice is therefore exactly Q1 R2: the output hull
 /// cannot contain a skipped live interval, including when it crosses shards.
+/// A conservative bound on dense metadata, including new holes, keeps the
+/// output within the current format. The engine uses actual section lengths
+/// for a tighter projection; no format version or source bytes are changed.
 ///
 /// # Errors
 ///
@@ -1797,15 +1801,24 @@ pub fn plan_tier_merge(
     segments: &[ManifestSegment],
     policy: TierMergePolicy,
 ) -> Result<Option<TierMergePlan>, TierPolicyError> {
+    plan_tier_merge_with_fit(segments, policy, |range| {
+        manifest_concat_fits(&segments[range])
+    })
+}
+
+/// Snapshot callers supply the section-table projection, avoiding the
+/// conservative file-size bound needed by the manifest-only public planner.
+pub(crate) fn plan_tier_merge_with_fit(
+    segments: &[ManifestSegment],
+    policy: TierMergePolicy,
+    mut fits: impl FnMut(Range<usize>) -> bool,
+) -> Result<Option<TierMergePlan>, TierPolicyError> {
     validate_tier_policy(policy)?;
     validate_tier_segments(segments)?;
     if segments.len() < policy.fanout {
         return Ok(None);
     }
-    for sources in segments.windows(policy.fanout) {
-        if !concat_layout_fits(sources.iter()) {
-            continue;
-        }
+    for (start, sources) in segments.windows(policy.fanout).enumerate() {
         let first = &sources[0];
         let tier = policy.classify_width(first.docid_hi - first.docid_lo);
         if sources
@@ -1830,6 +1843,9 @@ pub fn plan_tier_merge(
         if hole_ratio > policy.max_hole_ratio {
             continue;
         }
+        if !fits(start..start + sources.len()) {
+            continue;
+        }
         let mut source_segment_ids = Vec::new();
         source_segment_ids
             .try_reserve_exact(sources.len())
@@ -1846,6 +1862,26 @@ pub fn plan_tier_merge(
         }));
     }
     Ok(None)
+}
+
+/// Manifest-only admission combines the conservative layout bound with the
+/// IDMAP docid range and IDHASH physical-row budgets. Snapshot planners use
+/// exact section lengths instead of the file-size bound.
+pub(crate) fn manifest_concat_fits(sources: &[ManifestSegment]) -> bool {
+    let Some(first) = sources.first() else {
+        return false;
+    };
+    let Some(last) = sources.last() else {
+        return false;
+    };
+    let Some(docs) = sources.iter().try_fold(0_u64, |docs, source| {
+        docs.checked_add(u64::from(source.doc_count))
+    }) else {
+        return false;
+    };
+    concat_layout_fits(sources.iter())
+        && project_id_map_len(first.docid_lo, last.docid_hi, 0).is_ok()
+        && project_id_hash_len(docs).is_ok()
 }
 
 /// Conservative, allocation-free admission for the existing u32 section layouts.
@@ -1916,13 +1952,17 @@ pub(crate) fn concat_layout_fits<'a>(
     true
 }
 
-/// Largest admitted prefix, or one retained source when no pair fits.
-pub(crate) fn bounded_concat_prefix(sources: &[ManifestSegment]) -> usize {
-    if sources.is_empty() {
+/// Grow an admitted prefix until the next source fails the bound.
+/// Retain one source when no pair fits.
+pub(crate) fn bounded_concat_prefix(
+    source_count: usize,
+    mut fits: impl FnMut(Range<usize>) -> bool,
+) -> usize {
+    if source_count == 0 {
         return 0;
     }
     let mut end = 1;
-    while end < sources.len() && concat_layout_fits(sources[..=end].iter()) {
+    while end < source_count && fits(0..end + 1) {
         end += 1;
     }
     end
@@ -6692,6 +6732,183 @@ struct IdentityRepresentative {
     live_global_docid: Option<u32>,
 }
 
+/// Metadata needed to bound an output without reading postings or scanning
+/// stored values. Section-table lengths are already bound to the snapshot's
+/// immutable source files; source codec validation still runs before merging.
+pub(crate) struct ConcatMergeSizing {
+    term_fields: Vec<u16>,
+    stored_fields: Vec<u16>,
+    inputs: Vec<ConcatMergeInputSize>,
+}
+
+struct ConcatMergeInputSize {
+    docid_lo: u64,
+    docid_hi: u64,
+    // Inclusive prefix sums make candidate checks independent of run length.
+    docs: u64,
+    id_blob_bytes: u64,
+    stored_blob_bytes: u64,
+    numeric_bytes: u64,
+}
+
+impl ConcatMergeSizing {
+    pub(crate) fn new(
+        schema: SchemaDescriptor,
+        segments: &[RecoveredSegment],
+    ) -> Result<Self, ConcatMergeError> {
+        let term_fields = concat_term_field_ords(schema)?;
+        let stored_fields = concat_stored_field_ords(schema)?;
+        let mut inputs = Vec::new();
+        inputs
+            .try_reserve_exact(segments.len())
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "merge size projections",
+                count: segments.len(),
+            })?;
+        let mut totals = (0_u64, 0_u64, 0_u64, 0_u64);
+        for segment in segments {
+            let manifest = segment.manifest();
+            let lo = manifest.docid_lo;
+            let hi = manifest.docid_hi;
+            let id_prefix = project_id_map_len(lo, hi, 0)
+                .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
+            let id_blob_bytes = concat_section_blob_bytes(segment, SectionKind::IDMAP, id_prefix)?;
+            let stored_blob_bytes = if stored_fields.is_empty() {
+                0
+            } else {
+                let prefix = project_stored_meta_len_total(lo, hi, &stored_fields, 0)
+                    .map_err(|error| concat_codec(SectionKind::STOREDMETA, error))?;
+                concat_section_blob_bytes(segment, SectionKind::STOREDMETA, prefix)?
+            };
+            let numeric_bytes = segment
+                .section_entries()
+                .iter()
+                .find(|entry| entry.kind == SectionKind::NUMERIC)
+                .map_or(0, |entry| entry.len);
+            totals = totals
+                .0
+                .checked_add(u64::from(manifest.doc_count))
+                .and_then(|docs| {
+                    Some((
+                        docs,
+                        totals.1.checked_add(id_blob_bytes)?,
+                        totals.2.checked_add(stored_blob_bytes)?,
+                        totals.3.checked_add(numeric_bytes)?,
+                    ))
+                })
+                .ok_or(ConcatMergeError::ArithmeticOverflow {
+                    field: "source metadata prefix sums",
+                })?;
+            inputs.push(ConcatMergeInputSize {
+                docid_lo: lo,
+                docid_hi: hi,
+                docs: totals.0,
+                id_blob_bytes: totals.1,
+                stored_blob_bytes: totals.2,
+                numeric_bytes: totals.3,
+            });
+        }
+        Ok(Self {
+            term_fields,
+            stored_fields,
+            inputs,
+        })
+    }
+
+    /// All errors here describe an unrepresentable output; source metadata
+    /// errors are returned by `new` and must never be treated as a skipped run.
+    pub(crate) fn check(&self, range: Range<usize>) -> Result<(), ConcatMergeError> {
+        let previous = range
+            .start
+            .checked_sub(1)
+            .and_then(|index| self.inputs.get(index));
+        let sources = self
+            .inputs
+            .get(range)
+            .filter(|sources| !sources.is_empty())
+            .ok_or(ConcatMergeError::TooFewSources { count: 0 })?;
+        let lo = sources[0].docid_lo;
+        let last = &sources[sources.len() - 1];
+        let hi = last.docid_hi;
+        let docs = last.docs - previous.map_or(0, |source| source.docs);
+        let id_blob_bytes = last.id_blob_bytes - previous.map_or(0, |source| source.id_blob_bytes);
+        let stored_blob_bytes =
+            last.stored_blob_bytes - previous.map_or(0, |source| source.stored_blob_bytes);
+        let numeric_bytes = last.numeric_bytes - previous.map_or(0, |source| source.numeric_bytes);
+        u32::try_from(docs).map_err(|_| ConcatMergeError::ArithmeticOverflow {
+            field: "projected physical document count",
+        })?;
+        project_doclen_len(lo, hi, &self.term_fields)
+            .map_err(|error| concat_codec(SectionKind::DOCLEN, error))?;
+        if !self.stored_fields.is_empty() {
+            // Packed STOREDMETA has no per-field alignment. The total blob
+            // bytes plus the schema/range-derived prefixes give its exact
+            // length. A total <= u32::MAX also bounds every field offset and
+            // every individual blob, independent of their distribution.
+            project_stored_meta_len_total(lo, hi, &self.stored_fields, stored_blob_bytes)
+                .map_err(|error| concat_codec(SectionKind::STOREDMETA, error))?;
+        }
+        project_id_map_len(lo, hi, id_blob_bytes)
+            .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
+        // Duplicate external IDs only reduce the canonical hash capacity.
+        project_id_hash_len(docs).map_err(|error| concat_codec(SectionKind::IDHASH, error))?;
+        // NUMERIC concatenates fixed-size rows and removes redundant source
+        // directories; its summed input lengths conservatively bound output.
+        if numeric_bytes > u64::from(u32::MAX) {
+            return Err(concat_codec(
+                SectionKind::NUMERIC,
+                format!(
+                    "projected section bytes {numeric_bytes} exceed {}",
+                    u32::MAX
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Greedily partition one manifest tail into maximal representable runs.
+    /// Singletons remain in place and are never bridges across a rejected run.
+    pub(crate) fn groups(&self, start: usize) -> Result<Vec<Range<usize>>, ConcatMergeError> {
+        let mut groups = Vec::new();
+        groups
+            .try_reserve(self.inputs.len() / 2)
+            .map_err(|_| ConcatMergeError::Allocation {
+                resource: "bounded bulk merge groups",
+                count: self.inputs.len() / 2,
+            })?;
+        let mut first = start;
+        while first < self.inputs.len() {
+            let count = bounded_concat_prefix(self.inputs.len() - first, |range| {
+                self.check(first + range.start..first + range.end).is_ok()
+            });
+            let end = first + count;
+            if end - first >= 2 {
+                groups.push(first..end);
+            }
+            first = end;
+        }
+        Ok(groups)
+    }
+}
+
+fn concat_section_blob_bytes(
+    segment: &RecoveredSegment,
+    kind: SectionKind,
+    prefix_len: usize,
+) -> Result<u64, ConcatMergeError> {
+    let entry = segment
+        .section_entries()
+        .iter()
+        .find(|entry| entry.kind == kind)
+        .ok_or_else(|| concat_missing_section(segment, kind))?;
+    entry.len.checked_sub(prefix_len as u64).ok_or_else(|| {
+        concat_codec(
+            kind,
+            "source section is shorter than its canonical metadata prefix",
+        )
+    })
+}
+
 fn build_concat_merge(
     snapshot: &KeeperSnapshot,
     source_segment_ids: &[u64],
@@ -6765,9 +6982,12 @@ fn build_concat_merge(
                 position: source_segment_ids.len(),
                 actual: *source_segment_ids.last().unwrap_or(&first_id),
             })?;
-    if !concat_layout_fits(selected.iter().map(|segment| &segment.manifest)) {
-        return Err(ConcatMergeError::OutputTooLarge);
-    }
+    // Refuse impossible output before rehashing input files, opening term
+    // cursors, copying posting streams, or creating any publication artifact.
+    let sizing = ConcatMergeSizing::new(snapshot.schema(), selected)?;
+    sizing
+        .check(0..selected.len())
+        .map_err(|_| ConcatMergeError::OutputTooLarge)?;
     for segment in selected {
         if let Some(entry) = segment.section_entries().iter().find(|entry| {
             !(SectionKind::TERMDICT.raw()..=SectionKind::STATS.raw()).contains(&entry.kind.raw())
@@ -17371,7 +17591,9 @@ mod tests {
         let mut ids = Vec::new();
         let mut docs = 0_u64;
         while !remaining.is_empty() {
-            let count = bounded_concat_prefix(remaining);
+            let count = bounded_concat_prefix(remaining.len(), |range| {
+                concat_layout_fits(remaining[range].iter())
+            });
             let run = &remaining[..count];
             assert!(concat_layout_fits(run.iter()));
             groups.push(count);
@@ -17483,6 +17705,87 @@ mod tests {
                 right_segment_id: 1,
             })
         ));
+    }
+
+    #[test]
+    fn merge_projection_partitions_large_blobs_without_allocating_them() {
+        let blob_bytes = u64::from(u32::MAX) / 3;
+        let sizing = ConcatMergeSizing {
+            term_fields: vec![0],
+            stored_fields: vec![4],
+            inputs: (0..6_u64)
+                .map(|index| ConcatMergeInputSize {
+                    docid_lo: index,
+                    docid_hi: index + 1,
+                    docs: index + 1,
+                    id_blob_bytes: index + 1,
+                    stored_blob_bytes: (index + 1) * blob_bytes,
+                    numeric_bytes: 0,
+                })
+                .collect(),
+        };
+        assert!(sizing.check(0..2).is_ok());
+        assert!(matches!(
+            sizing.check(0..3),
+            Err(ConcatMergeError::SectionCodec {
+                section: SectionKind::STOREDMETA,
+                ..
+            })
+        ));
+        assert_eq!(sizing.groups(0).unwrap(), vec![0..2, 2..4, 4..6]);
+        assert_eq!(sizing.groups(1).unwrap(), vec![1..3, 3..5]);
+        assert!(sizing.groups(5).unwrap().is_empty());
+        assert!(sizing.groups(6).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tier_planner_skips_format_overflow_and_preserves_consecutiveness() {
+        let policy = TierMergePolicy {
+            fanout: 2,
+            small_max_docid_width: 16,
+            medium_max_docid_width: 64,
+            max_hole_ratio: 1.0,
+        };
+        let mut segments = [
+            tier_test_segment(1, 0, 1),
+            tier_test_segment(2, 1, 2),
+            tier_test_segment(3, 2, 3),
+        ];
+        segments[0].file_len = u64::from(u32::MAX) - 1;
+        segments[1].file_len = 1;
+        assert_eq!(
+            plan_tier_merge(&segments, policy)
+                .unwrap()
+                .unwrap()
+                .source_segment_ids,
+            vec![1, 2],
+        );
+        segments[0].file_len += 1;
+        assert_eq!(
+            plan_tier_merge(&segments, policy)
+                .unwrap()
+                .unwrap()
+                .source_segment_ids,
+            vec![2, 3],
+        );
+        segments[1].file_len = u64::MAX;
+        assert!(plan_tier_merge(&segments, policy).unwrap().is_none());
+    }
+
+    #[test]
+    fn manifest_projection_includes_padding_across_new_holes() {
+        let mut sources = [
+            tier_test_segment(1, 0, 10),
+            tier_test_segment(2, 300_000_000, 300_000_010),
+        ];
+        for source in &mut sources {
+            source.file_len = 1000;
+        }
+        assert!(project_id_map_len(0, 300_000_010, 0).is_ok());
+        assert!(!manifest_concat_fits(&sources));
+        sources[1].docid_lo = 10;
+        sources[1].docid_hi = 20;
+        assert!(manifest_concat_fits(&sources));
     }
 
     #[test]
@@ -20394,22 +20697,55 @@ mod tests {
 
     #[test]
     fn oversized_concat_is_rejected_before_verification_or_publication() -> TestResult {
+        use crate::scribe::{
+            ColumnarAccumulator, FlushDocumentInput, FlushSegmentInput, IndexedFieldValue,
+            flush_accumulator,
+        };
+
+        fn source(
+            segment_id: u64,
+            doc_ord: u32,
+            document_id: &str,
+        ) -> Result<EncodedSegment, Box<dyn std::error::Error>> {
+            let mut accumulator = ColumnarAccumulator::new(DEFAULT_SCHEMA)?;
+            accumulator.add_document(doc_ord, &[IndexedFieldValue::new(0, document_id)])?;
+            let documents = [FlushDocumentInput::from_canonical_content(
+                doc_ord,
+                document_id,
+                document_id.as_bytes(),
+            )];
+            Ok(flush_accumulator(
+                &accumulator,
+                FlushSegmentInput {
+                    segment_id,
+                    lease_docid_base: 0,
+                    created_unix_s: 0,
+                    engine_version: CURRENT_ENGINE_VERSION,
+                    documents: &documents,
+                },
+            )?)
+        }
+
         let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
-        let first = encoded_identity_test_segment(0xb11, 0, &[Some("large-a")])?;
-        let second = encoded_identity_test_segment(0xb12, 1, &[Some("large-b")])?;
+        let first = source(0xb11, 0, "large-a")?;
+        let second = source(0xb12, 1, "large-b")?;
         let mut proposed = original.next_manifest()?;
         proposed.docid_high_watermark = 2;
         proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
         let mut published = original.publish_owned_segments(&proposed, vec![first, second])?;
         let authority = published.loaded_manifest().clone();
-        // A controlled projected size, without manufacturing a multi-GB
-        // backing. Verification would reject this deliberately inconsistent
-        // binding, so OutputTooLarge also proves the early guard's ordering.
-        published.segments[0].manifest.file_len = u64::from(u32::MAX);
+        // Preserve each source's span while introducing a large output gap,
+        // without manufacturing a multi-GB backing. Verification would reject
+        // this deliberately inconsistent binding, so OutputTooLarge also
+        // proves the early guard's ordering.
+        published.segments[1].manifest.docid_lo += 1 << 29;
+        published.segments[1].manifest.docid_hi += 1 << 29;
         assert!(matches!(
             build_concat_merge(&published, &[0xb11, 0xb12], 0xb13, 0),
             Err(ConcatMergeError::OutputTooLarge)
         ));
+        published.segments[1].manifest.docid_lo -= 1 << 29;
+        published.segments[1].manifest.docid_hi -= 1 << 29;
         assert_eq!(published.loaded_manifest().manifest, authority.manifest);
         assert_eq!(published.segments().len(), 2);
         assert_eq!(published.doc_count(), 2);

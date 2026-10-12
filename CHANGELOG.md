@@ -1,15 +1,26 @@
 # Changelog
 
-### Unreleased — Quill large-index merge admission (#66)
+### Unreleased — Quill large-index merge admission (#66, 2026-10-12)
 
-Quill now bounds concat candidates before verification and codec construction.
-Bulk-load completion partitions the session tail into consecutive compatible
-runs; ordinary tier and session maintenance skip runs beyond the durable u32
-layout budget. Explicit oversized concat requests return `OutputTooLarge`
-without installing an output or publishing a manifest. The bound includes dense
-document-ID gaps and alignment, and conservatively uses complete source file
-lengths, so it can retain more segments than an exact per-section estimate.
-Existing FSLX bytes, document IDs, and atomic manifest publication are unchanged.
+- Quill checks projected DOCLEN, STOREDMETA and IDMAP layouts before concat
+  merge verifies sources, reads posting streams or creates output artifacts.
+  Native writers use actual section lengths and account for dense columns
+  across document-ID gaps and physical rows hidden by tombstones, with
+  additional IDHASH and NUMERIC resource bounds. Manifest-only planners retain
+  the conservative complete-file bound when section metadata is unavailable.
+- Bulk-load completion partitions oversized candidates into consecutive
+  compatible groups and retains singleton segments. Ordinary tier and session
+  maintenance skip candidates that cannot fit the existing format and continue
+  looking for eligible runs. Each published group uses the existing MANIFEST
+  protocol; interrupted bulk completion remains resumable.
+- Automatic merge identities include the output's encoded creation timestamp,
+  allowing a later retry to choose a fresh identity when an earlier attempt
+  installed an output but did not publish its MANIFEST.
+- Existing FSLX and MANIFEST formats are unchanged. Large indexes can remain
+  distributed across multiple searchable segments without a wider offset
+  format or an index rebuild. Explicit oversized concat requests return
+  `OutputTooLarge` during preflight. Fixes
+  [#66](https://github.com/Dicklesworthstone/frankensearch/issues/66).
 
 All notable changes to [frankensearch](https://github.com/Dicklesworthstone/frankensearch) are documented here.
 
