@@ -1895,7 +1895,7 @@ dependencies = [
 
 [[package]]
 name = "frankensearch-index"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "ahash",
  "arc-swap",
