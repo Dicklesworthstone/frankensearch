@@ -450,6 +450,45 @@ impl CompactionPolicy {
     pub const fn new(tombstone_density: f64) -> Self {
         Self { tombstone_density }
     }
+
+    fn selects_segment(self, segment: &ManifestSegment) -> bool {
+        let physical = segment.doc_count;
+        let deleted = segment.tombstones.cardinality();
+        physical != 0
+            && deleted != 0
+            && deleted as f64 / f64::from(physical) > self.tombstone_density
+    }
+
+    /// Reserve the writer's next unused sequence before publishing replacements.
+    ///
+    /// Fully deleted sources emit no segment and consume no new sequence. The
+    /// original maximum still matters when compaction empties the MANIFEST:
+    /// removing a source must not make its already-used sequence reusable.
+    pub(crate) fn next_seal_seq_after_compaction(
+        self,
+        segments: &[ManifestSegment],
+    ) -> Result<u64, CompactionError> {
+        validate_compaction_policy(self)?;
+        let mut maximum = segments
+            .iter()
+            .map(|segment| segment.seal_seq)
+            .max()
+            .unwrap_or(0);
+        for segment in segments {
+            if self.selects_segment(segment) && segment.live_doc_count() != 0 {
+                maximum = maximum
+                    .checked_add(1)
+                    .ok_or(CompactionError::ArithmeticOverflow {
+                        field: "seal sequence",
+                    })?;
+            }
+        }
+        maximum
+            .checked_add(1)
+            .ok_or(CompactionError::ArithmeticOverflow {
+                field: "next seal sequence",
+            })
+    }
 }
 
 impl Default for CompactionPolicy {
@@ -5904,12 +5943,7 @@ fn build_compaction(
             count: snapshot.segments.len(),
         })?;
     for (index, segment) in snapshot.segments.iter().enumerate() {
-        let physical = segment.manifest.doc_count;
-        let deleted = segment.manifest.tombstones.cardinality();
-        if physical != 0
-            && deleted != 0
-            && deleted as f64 / f64::from(physical) > policy.tombstone_density
-        {
+        if policy.selects_segment(&segment.manifest) {
             eligible.push(index);
         }
     }

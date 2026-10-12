@@ -8507,7 +8507,15 @@ impl QuillWriterState {
                 "compaction requires a fully committed scalar index",
             ));
         }
+        if self.has_active_deltas() {
+            return Err(invalid_state(
+                "compaction cannot discard active Delta epochs",
+            ));
+        }
         let authority = self.authority_snapshot()?;
+        let next_seal_seq = policy
+            .next_seal_seq_after_compaction(&authority.loaded_manifest().manifest.segments)
+            .map_err(KeeperError::from)?;
         let authority_generation = authority.loaded_manifest().manifest.generation;
         let authority_segment_count = authority.segments().len();
         let created_unix_s = self.created_unix_s()?;
@@ -8557,13 +8565,7 @@ impl QuillWriterState {
                 Arc::new(authority.clone()),
                 prepared_publication,
             )?;
-            self.next_seal_seq = self
-                .authority_snapshot()?
-                .segments()
-                .iter()
-                .map(|segment| segment.manifest().seal_seq)
-                .max()
-                .unwrap_or(0);
+            self.next_seal_seq = self.next_seal_seq.max(next_seal_seq);
         }
         Ok(report)
     }
@@ -31604,6 +31606,351 @@ mod tests {
                     .iter()
                     .all(|row| row.doc_count == 28),
                 "post-compaction statistics must be re-derived over retained documents",
+            );
+        });
+    }
+
+    #[test]
+    fn compaction_refuses_active_delta_epochs_without_losing_visible_rows() {
+        run_with_blocking_cx(|cx| async move {
+            for durable in [false, true] {
+                let directory = tempfile::tempdir().expect("Delta compaction directory");
+                let index = if durable {
+                    QuillIndex::create(&cx, directory.path(), deterministic_config())
+                        .await
+                        .expect("durable Delta compaction index")
+                } else {
+                    QuillIndex::in_memory(deterministic_config())
+                        .expect("owned Delta compaction index")
+                };
+                index
+                    .index_documents(
+                        &cx,
+                        &[
+                            IndexableDocument::new("sealed-live", "sealed"),
+                            IndexableDocument::new("sealed-dead", "retired"),
+                        ],
+                    )
+                    .await
+                    .expect("accumulate the sealed source rows");
+                index.commit(&cx).await.expect("publish sealed rows");
+                assert!(
+                    index
+                        .delete_document(&cx, "sealed-dead")
+                        .await
+                        .expect("make the source eligible for compaction")
+                );
+                let source = index.snapshot().expect("tombstoned source authority");
+                let manifest = source.loaded_manifest().manifest.clone();
+                assert_eq!(source.segments()[0].manifest().tombstones.cardinality(), 1);
+                let lease_base = manifest
+                    .docid_high_watermark
+                    .next_multiple_of(u64::from(DOC_ORDS_PER_LEASE));
+                let delta_docid = u32::try_from(lease_base).expect("small Delta docid");
+                let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, lease_base, usize::MAX)
+                    .expect("real independent Delta lease");
+                apply_sealable_delta_document(&mut delta, delta_docid, "delta-live", "fresh", 2);
+                apply_sealable_delta_document(
+                    &mut delta,
+                    delta_docid + 1,
+                    "delta-dead",
+                    "vanished",
+                    1,
+                );
+                assert_eq!(delta.delete_delta_id("delta-dead"), Some(delta_docid + 1));
+                let frozen = Arc::new(delta.freeze(manifest.generation));
+                let held = index
+                    .publish_delta_table(vec![Arc::clone(&frozen)])
+                    .expect("publish the actual frozen Delta through the public API");
+                assert!(!index.has_uncommitted_changes());
+                assert_eq!(index.doc_count().expect("visible composite count"), 2);
+                assert_eq!(held.delta_count(), 1);
+                let expected = index
+                    .search_paginated(&cx, "sealed OR fresh OR retired OR vanished", 10, 0, true)
+                    .expect("search both live rows before compaction");
+                assert_eq!(expected.total_count, Some(2));
+                let files = durable.then(|| segment_files_and_receipts(directory.path()));
+
+                let failure = index
+                    .compact(&cx, CompactionPolicy::default())
+                    .await
+                    .expect_err("compaction must refuse a published Delta instead of losing it");
+                assert!(
+                    matches!(failure, QuillIndexError::InvalidState { ref detail } if detail.contains("Delta")),
+                    "unexpected compaction refusal: {failure}"
+                );
+                let retained = index
+                    .search_snapshot()
+                    .expect("retained composite authority");
+                assert!(Arc::ptr_eq(&held, &retained));
+                assert!(Arc::ptr_eq(&retained.delta_snapshots()[0], &frozen));
+                assert_eq!(
+                    index
+                        .search_paginated(
+                            &cx,
+                            "sealed OR fresh OR retired OR vanished",
+                            10,
+                            0,
+                            true
+                        )
+                        .expect("query after refused compaction"),
+                    expected
+                );
+                assert_eq!(
+                    retained.keeper_snapshot().loaded_manifest().manifest,
+                    manifest
+                );
+                if let Some(files) = files {
+                    assert_eq!(segment_files_and_receipts(directory.path()), files);
+                    assert_eq!(
+                        load_manifest_pair(directory.path())
+                            .expect("unchanged durable authority")
+                            .manifest,
+                        manifest
+                    );
+                }
+
+                // The rejected operation must leave the original epoch
+                // sealable, so callers can commit it and compact normally.
+                index
+                    .seal_delta_snapshot(
+                        &cx,
+                        frozen,
+                        Vec::new(),
+                        DeltaFlushInput {
+                            segment_id: 0xde17_a066,
+                            created_unix_s: 0,
+                            engine_version: CURRENT_ENGINE_VERSION,
+                        },
+                    )
+                    .await
+                    .expect("seal the exact Delta epoch after compaction refusal");
+                let report = index
+                    .compact(&cx, CompactionPolicy::default())
+                    .await
+                    .expect("compact after the Delta has become durable");
+                assert_eq!(report.compacted_segments, 1);
+                assert_eq!(report.dropped_documents, 1);
+                assert_eq!(index.doc_count().expect("compacted count"), 2);
+                assert_eq!(
+                    index
+                        .collect_docids(&cx, "sealed OR fresh OR retired OR vanished")
+                        .expect("compacted live document set"),
+                    vec![0, delta_docid]
+                );
+                let current = index.search_snapshot().expect("compacted sealed view");
+                assert_eq!(current.delta_count(), 0);
+                for docid in [0, delta_docid, delta_docid + 1] {
+                    for field in DEFAULT_SCHEMA.fields.iter().filter(|field| field.stored) {
+                        assert_eq!(
+                            current
+                                .stored_field_value(field.id, docid)
+                                .expect("stored field after sealing and compaction"),
+                            held.stored_field_value(field.id, docid)
+                                .expect("original stored field and tombstone visibility")
+                        );
+                    }
+                }
+                if durable {
+                    let reopened =
+                        QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                            .await
+                            .expect("cold reader after Delta seal and compaction");
+                    assert_eq!(
+                        reopened
+                            .collect_docids(&cx, "sealed OR fresh OR retired OR vanished")
+                            .expect("cold reader document set"),
+                        vec![0, delta_docid]
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn scalar_commit_after_compaction_advances_seal_sequence() {
+        run_with_blocking_cx(|cx| async move {
+            for durable in [false, true] {
+                for remove_all in [false, true] {
+                    let directory = tempfile::tempdir().expect("post-compaction writer directory");
+                    let index = if durable {
+                        QuillIndex::create(&cx, directory.path(), deterministic_config())
+                            .await
+                            .expect("durable post-compaction writer")
+                    } else {
+                        QuillIndex::in_memory(deterministic_config())
+                            .expect("owned post-compaction writer")
+                    };
+                    index
+                        .index_documents(
+                            &cx,
+                            &[
+                                IndexableDocument::new("first", "lifecycle retained"),
+                                IndexableDocument::new("second", "lifecycle removed"),
+                            ],
+                        )
+                        .await
+                        .expect("accumulate source rows");
+                    index.commit(&cx).await.expect("publish source rows");
+                    let original = index.snapshot().expect("original source authority");
+                    let original_sequence = original.segments()[0].manifest().seal_seq;
+                    if remove_all {
+                        assert_eq!(
+                            index
+                                .delete_documents(&cx, &["first", "second"])
+                                .await
+                                .expect("tombstone every row without removing its source"),
+                            2
+                        );
+                    } else {
+                        assert!(
+                            index
+                                .delete_document(&cx, "second")
+                                .await
+                                .expect("tombstone one source row")
+                        );
+                    }
+                    let report = index
+                        .compact(&cx, CompactionPolicy::default())
+                        .await
+                        .expect("compact the tombstoned source");
+                    assert!(report.changed());
+                    let compacted = index.snapshot().expect("compacted authority");
+                    let maximum_sequence = compacted
+                        .segments()
+                        .iter()
+                        .map(|segment| segment.manifest().seal_seq)
+                        .max()
+                        .unwrap_or(original_sequence);
+                    assert_eq!(compacted.segments().is_empty(), remove_all);
+
+                    index
+                        .index_document(&cx, &IndexableDocument::new("after", "lifecycle fresh"))
+                        .await
+                        .expect("accept the first document after compaction");
+                    index
+                        .commit(&cx)
+                        .await
+                        .expect("publish the first document after compaction without reopening");
+                    let appended = index.snapshot().expect("post-compaction append authority");
+                    let fresh = appended
+                        .segments()
+                        .last()
+                        .expect("new document must have a sealed segment");
+                    assert!(
+                        fresh.manifest().seal_seq > maximum_sequence,
+                        "fresh seal must advance compaction's sequence, including an emptied index"
+                    );
+                    let expected_count = if remove_all { 1 } else { 2 };
+                    assert_eq!(
+                        index.doc_count().expect("appended live count"),
+                        expected_count
+                    );
+                    assert_eq!(
+                        index
+                            .search_paginated(&cx, "lifecycle", 10, 0, true)
+                            .expect("query after compact and append")
+                            .total_count,
+                        Some(expected_count)
+                    );
+                    let after_docid = index
+                        .collect_docids(&cx, "fresh")
+                        .expect("find appended row");
+                    assert_eq!(after_docid, vec![2]);
+                    assert_eq!(
+                        index
+                            .search_snapshot()
+                            .expect("read appended stored content")
+                            .stored_field_value(CONTENT_FIELD, 2)
+                            .expect("stored appended content"),
+                        Some(b"lifecycle fresh".to_vec())
+                    );
+                    assert!(!index.has_uncommitted_changes());
+                    if durable {
+                        let reopened =
+                            QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                                .await
+                                .expect("cold reader after post-compaction append");
+                        assert_eq!(
+                            reopened.doc_count().expect("cold live count"),
+                            expected_count
+                        );
+                        assert_eq!(
+                            reopened
+                                .collect_docids(&cx, "fresh")
+                                .expect("cold appended row"),
+                            after_docid
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn compaction_sequence_exhaustion_is_rejected_before_publication() {
+        run_with_blocking_cx(|cx| async move {
+            let documents = [
+                IndexableDocument::new("sequence-live", "retained"),
+                IndexableDocument::new("sequence-dead", "removed"),
+            ];
+            let sealed = seal_q1_ob2a_documents(&documents, 0, 0xc066_ffff);
+            let genesis = KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("sequence genesis");
+            let mut manifest = genesis.next_manifest().expect("sequence source manifest");
+            manifest.docid_high_watermark = 2;
+            manifest.field_stats =
+                merge_field_stats(&[], &sealed.field_stats).expect("source field statistics");
+            let mut source = manifest_segment(&sealed.encoded, u64::MAX - 1);
+            source
+                .tombstones
+                .insert(1)
+                .expect("tombstone one source row");
+            manifest.segments.push(source);
+            let keeper = genesis
+                .publish_owned_segments(&manifest, vec![sealed.encoded])
+                .expect("publish tiny source with boundary sequence metadata");
+            let index = QuillIndex::from_backend(
+                IndexBackend::Memory(keeper),
+                DEFAULT_SCHEMA,
+                deterministic_config(),
+            )
+            .expect("boundary source still has a representable next sequence");
+            let held = index.search_snapshot().expect("pin sequence source");
+            let expected = index
+                .search_paginated(&cx, "retained OR removed", 10, 0, true)
+                .expect("query sequence source");
+            assert_eq!(expected.total_count, Some(1));
+            let unchanged = index
+                .compact(&cx, CompactionPolicy::new(0.5))
+                .await
+                .expect("an ineligible boundary segment remains a normal no-op");
+            assert!(!unchanged.changed());
+
+            let failure = index
+                .compact(&cx, CompactionPolicy::default())
+                .await
+                .expect_err("refuse a rewrite that leaves no representable next seal sequence");
+            assert!(
+                failure.to_string().contains("seal sequence"),
+                "unexpected sequence exhaustion error: {failure}"
+            );
+            let retained = index.search_snapshot().expect("unchanged source authority");
+            assert!(Arc::ptr_eq(&held, &retained));
+            assert_eq!(
+                retained.keeper_snapshot().loaded_manifest().manifest,
+                manifest
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "retained OR removed", 10, 0, true)
+                    .expect("query after refused sequence exhaustion"),
+                expected
+            );
+            assert_eq!(
+                retained
+                    .stored_field_value(CONTENT_FIELD, 0)
+                    .expect("retained content after refused sequence exhaustion"),
+                Some(b"retained".to_vec())
             );
         });
     }

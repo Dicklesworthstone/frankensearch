@@ -1,5 +1,18 @@
 # Changelog
 
+### Unreleased — Quill compaction preserves writer state (2026-10-12)
+
+- Compaction refuses active published Delta epochs before changing authority.
+  Previously, compacting a tombstoned sealed segment could discard searchable
+  Delta rows from the composite snapshot. The original epoch remains visible
+  and can be sealed before retrying compaction.
+- A successful compaction advances the writer's next seal sequence beyond its
+  replacement segments, so subsequent ingest can commit without reopening the
+  index. Removing every segment preserves the writer's consumed sequence.
+- Seal-sequence exhaustion is checked before compaction publishes a successor,
+  preserving the previous authority when no next ingest sequence can be
+  represented. Ineligible policy-boundary cases remain ordinary no-ops.
+
 ### Unreleased — Quill large-index merge admission (#66, 2026-10-12)
 
 - Quill checks projected DOCLEN, STOREDMETA and IDMAP layouts before concat
