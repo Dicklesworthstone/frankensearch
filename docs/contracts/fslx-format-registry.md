@@ -484,6 +484,32 @@ Concat-merge rebases offset tables, inserts zero presence bits for
 inter-segment gaps, and copies each source field blob once without interpreting
 or re-encoding values.
 
+**Merge admission (#66, format unchanged).** Writers project the output's
+DOCLEN, STOREDMETA and IDMAP layouts from the complete docid hull, schema and
+source section lengths before reading posting streams or staging output.
+The projection includes offset tables, presence bitmaps and alignment across
+inter-segment holes. Stored blobs remain opaque; their total byte count is
+the source section length minus its canonical directory and column prefixes.
+The default section-size ceilings also guarantee that each u32 field/blob
+offset is representable. Physical row counts include tombstones; IDHASH
+capacity and mandatory probe-work bounds and a conservative NUMERIC byte
+bound also apply. Content-dependent codec validation remains required.
+Manifest-only planners retain a conservative complete-file bound when actual
+section metadata is unavailable.
+
+Bulk completion partitions the session's manifest tail into consecutive runs
+that pass these checks, leaving singletons in place. Tier/session maintenance
+skips an oversized candidate without skipping a live interval inside a chosen
+run. Every resulting segment retains the existing Q1 docids and publication
+protocol. Partial bulk progress is durable; the in-progress MANIFEST flag is
+cleared only after all compatible groups have published. No durable field,
+format version, or reader migration changes are introduced.
+
+Automatic merge identities bind the encoded creation timestamp as well as the
+source run and publication generation. A retry with identical bytes can adopt
+an already-installed output; a later timestamp selects a different identity
+instead of colliding with the earlier, unpublished output.
+
 ### 5.10 STATS
 
 Per indexed field: `{ field_ord: u16, total_tokens: u64, doc_count: u32 }`.

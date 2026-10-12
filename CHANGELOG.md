@@ -1,5 +1,27 @@
 # Changelog
 
+### Unreleased — Quill large-index merge admission (#66, 2026-10-12)
+
+- Quill checks projected DOCLEN, STOREDMETA and IDMAP layouts before concat
+  merge verifies sources, reads posting streams or creates output artifacts.
+  Native writers use actual section lengths and account for dense columns
+  across document-ID gaps and physical rows hidden by tombstones, with
+  additional IDHASH and NUMERIC resource bounds. Manifest-only planners retain
+  the conservative complete-file bound when section metadata is unavailable.
+- Bulk-load completion partitions oversized candidates into consecutive
+  compatible groups and retains singleton segments. Ordinary tier and session
+  maintenance skip candidates that cannot fit the existing format and continue
+  looking for eligible runs. Each published group uses the existing MANIFEST
+  protocol; interrupted bulk completion remains resumable.
+- Automatic merge identities include the output's encoded creation timestamp,
+  allowing a later retry to choose a fresh identity when an earlier attempt
+  installed an output but did not publish its MANIFEST.
+- Existing FSLX and MANIFEST formats are unchanged. Large indexes can remain
+  distributed across multiple searchable segments without a wider offset
+  format or an index rebuild. Explicit oversized concat requests return
+  `OutputTooLarge` during preflight. Fixes
+  [#66](https://github.com/Dicklesworthstone/frankensearch/issues/66).
+
 All notable changes to [frankensearch](https://github.com/Dicklesworthstone/frankensearch) are documented here.
 
 Entries correspond to [GitHub Releases](https://github.com/Dicklesworthstone/frankensearch/releases) unless noted otherwise. Tags that share a commit with another release are called out explicitly. Each entry links to representative commits using full commit URLs.
@@ -121,6 +143,8 @@ record their original qualification boundary.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| frankensearch-index 0.4.2 | Hotfix crate on frankensearch-index 0.4.1 (branch `hotfix/index-0.4.2-hnsw-sidecar-sync`, tag `frankensearch-index-v0.4.2`) | 2026-10-12 | On Windows, saving an HNSW graph no longer fails with "Access is denied". After dumping the graph and data sidecars, the save flushed them through read-only handles, and Windows' `FlushFileBuffers` needs write access, so every HNSW save failed there (in cass, `cass index --semantic --build-hnsw` exited 9; cass bead ujxiq). The sidecars are now flushed through write handles. Unix was unaffected. HNSW is behind the `ann` feature, which the default lib tests do not enable. frankensearch 0.7.1 already accepts index `^0.4.0` |
+| frankensearch-quill 0.4.1 | Hotfix crate on frankensearch-quill 0.4.0 (branch `hotfix/quill-0.4.1-writer-verify-once`, tag `frankensearch-quill-v0.4.1`) | 2026-10-12 | A Quill writer verifies each segment once per admission step instead of again right after (main 178f4383, bd-dnqgr). Opening a writer kept no post-recovery snapshot, then the orphan witness and the garbage sweep each opened their own and the writer reopened once more: four full verifications on top of recovery's. The post-recovery snapshot is now the writer's view and both passes are judged against it. After a publication, the next snapshot reuses a segment the preflight verified only while the MANIFEST still binds it unchanged and its path names the same inode. A no-op `cass index` hashed the whole lexical index 7 times, 4 of them in one writer open (cass bead hfosx). frankensearch 0.7.1 already accepts quill `^0.4.0` |
 | frankensearch-index 0.4.1 | Hotfix crate on frankensearch-index 0.4.0 (branch `hotfix/index-0.4.1-windows-replace`, tag `frankensearch-index-v0.4.1`) | 2026-10-10 | On Windows, installing an index file no longer fails with "Access is denied" while another process has that file open. `install_replacement`, the sealed FSVI v2 publish and the HNSW writes moved the staged file with tempfile's `persist` (`MoveFileExW`), which Windows refuses while any handle to the destination is open; a reader keeps the FSVI open, locked and mapped, so a search or TUI process made every install fail (cass bead if17v). They now rename with `std::fs::rename` (POSIX semantics on Windows), and an open reader keeps the generation it mapped, as on Unix. A new test that holds a reader across `install_replacement` fails on 0.4.0 on Windows. frankensearch 0.7.1 already accepts index `^0.4.0` |
 | [fsfs 1.12.3](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.3) / [frankensearch-tui 0.4.0](https://crates.io/crates/frankensearch-tui/0.4.0) | GitHub and crates.io publication | 2026-10-05 | Valid UTF-8 files no longer quarantined when the 8 KiB probe cuts a character (about two thirds of CJK documents over 8 KiB); warm daemon through a short private socket directory; FrankenTUI 0.9; complete-generation retention-race fixes |
 | [fsfs 1.12.2](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.2) | GitHub and crates.io publication (fsfs only) | 2026-10-05 | Lite builds index, watch and search by keyword; GNU binary built for glibc 2.39; TUI resize crash fixed; no 2 s wait for an unbindable daemon socket; read-only complete-generation readers keep their generation (#60); embedder identity rechecked around inference (#55) |
