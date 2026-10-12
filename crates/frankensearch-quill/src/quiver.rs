@@ -439,6 +439,29 @@ pub(crate) fn posting_block_count_upper_bound(doc_freq: u32, byte_len: u64) -> u
     u64::from(doc_freq).min(byte_len / 6)
 }
 
+/// Admit aggregate per-source maxima before copying any common term's blocks.
+/// Summing maxima can overstate a term present in only some of the sources,
+/// but it bounds every output term without decoding any posting payload.
+pub(crate) fn check_posting_concat_bounds(
+    doc_freq: u64,
+    block_count: u64,
+) -> Result<(), PostingCodecError> {
+    let limits = PostingListLimits::default();
+    if doc_freq > limits.max_postings as u64 {
+        return Err(PostingCodecError::PostingLimitExceeded {
+            limit: limits.max_postings,
+            actual: usize::try_from(doc_freq).unwrap_or(usize::MAX),
+        });
+    }
+    if block_count > limits.max_blocks as u64 {
+        return Err(PostingCodecError::BlockBudgetExhausted {
+            limit: limits.max_blocks,
+            validated: usize::try_from(block_count).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(())
+}
+
 /// One document occurrence in a term's posting list.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Posting {
@@ -3481,6 +3504,76 @@ impl Default for PositionListLimits {
             max_positions: DEFAULT_MAX_POSITIONS_PER_TERM,
         }
     }
+}
+
+/// Bound decoded positions from a term's four-byte directory header and span.
+/// Each directory row consumes at least two vint bytes and every position at
+/// least one payload byte. No posting frequencies or position values are read.
+pub(crate) fn position_count_upper_bound(
+    doc_freq: u32,
+    byte_len: u64,
+    block_count: u32,
+) -> Option<u64> {
+    if block_count == 0 || block_count > doc_freq {
+        return None;
+    }
+    byte_len
+        .checked_sub(POSITION_DIRECTORY_HEADER_LEN as u64 + 2 * u64::from(block_count))
+        .filter(|&payload| payload >= u64::from(doc_freq))
+}
+
+/// Bound a positional concat using sums of each source's per-term maxima.
+/// Existing payload blocks survive verbatim. A rebased directory row uses at
+/// most `vint(doc_freq) + vint(input_bytes)` bytes, compared with at least two
+/// source bytes. Keeping all source headers only overstates the output size.
+pub(crate) fn project_position_concat_bounds(
+    doc_freq: u64,
+    block_count: u64,
+    positions: u64,
+    input_bytes: u64,
+) -> Result<u64, PositionCodecError> {
+    project_position_concat_bounds_with_limits(
+        doc_freq,
+        block_count,
+        positions,
+        input_bytes,
+        PositionListLimits::default(),
+    )
+}
+
+fn project_position_concat_bounds_with_limits(
+    doc_freq: u64,
+    block_count: u64,
+    positions: u64,
+    input_bytes: u64,
+    limits: PositionListLimits,
+) -> Result<u64, PositionCodecError> {
+    if positions > limits.max_positions {
+        return Err(PositionCodecError::PositionLimitExceeded {
+            limit: limits.max_positions,
+            actual: positions,
+        });
+    }
+    if block_count > limits.max_blocks as u64 {
+        return Err(PositionCodecError::BlockLimitExceeded {
+            limit: limits.max_blocks,
+            actual: usize::try_from(block_count).unwrap_or(usize::MAX),
+        });
+    }
+    let growth = (vint64_length(doc_freq) + vint64_length(input_bytes) - 2) as u64;
+    let bytes = block_count
+        .checked_mul(growth)
+        .and_then(|extra| input_bytes.checked_add(extra))
+        .ok_or(PositionCodecError::ArithmeticOverflow {
+            field: "projected concat position bytes",
+        })?;
+    if bytes > limits.max_bytes as u64 {
+        return Err(PositionCodecError::ByteLimitExceeded {
+            limit: limits.max_bytes,
+            actual: usize::try_from(bytes).unwrap_or(usize::MAX),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Typed failures from encoding or validating an FSLX POSITIONS term stream.
@@ -14533,6 +14626,149 @@ mod tests {
                 validated: 4,
             })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn posting_concat_projection_observes_default_reader_limits() {
+        let postings = DEFAULT_MAX_POSTINGS_PER_TERM as u64;
+        let blocks = DEFAULT_MAX_POSTING_BLOCKS as u64;
+        assert!(check_posting_concat_bounds(postings, blocks).is_ok());
+        assert!(matches!(
+            check_posting_concat_bounds(postings + 1, blocks),
+            Err(PostingCodecError::PostingLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            check_posting_concat_bounds(postings, blocks + 1),
+            Err(PostingCodecError::BlockBudgetExhausted { .. })
+        ));
+        // Full blocks should admit millions of documents; doc frequency is
+        // not an acceptable substitute for the block count when planning.
+        assert!(check_posting_concat_bounds(postings, postings / 128).is_ok());
+    }
+
+    #[test]
+    fn position_concat_projection_observes_default_reader_limits() {
+        let positions = DEFAULT_MAX_POSITIONS_PER_TERM;
+        let blocks = DEFAULT_MAX_POSITION_BLOCKS as u64;
+        assert!(project_position_concat_bounds(1, 1, positions, positions + 6).is_ok());
+        assert!(matches!(
+            project_position_concat_bounds(1, 1, positions + 1, positions + 7),
+            Err(PositionCodecError::PositionLimitExceeded { .. })
+        ));
+        assert!(project_position_concat_bounds(blocks, blocks, blocks, 7 * blocks).is_ok());
+        assert!(matches!(
+            project_position_concat_bounds(blocks + 1, blocks + 1, blocks + 1, 7 * blocks + 7),
+            Err(PositionCodecError::BlockLimitExceeded { .. })
+        ));
+        let byte_limit = DEFAULT_MAX_POSITION_BYTES_PER_TERM as u64;
+        // At this boundary, each row's two source vint bytes can grow by
+        // four bytes: a two-byte posting ordinal and a four-byte offset.
+        assert_eq!(
+            project_position_concat_bounds(128, 1, 128, byte_limit - 4),
+            Ok(byte_limit)
+        );
+        assert!(matches!(
+            project_position_concat_bounds(128, 1, 128, byte_limit - 3),
+            Err(PositionCodecError::ByteLimitExceeded { .. })
+        ));
+        assert!(matches!(
+            project_position_concat_bounds_with_limits(
+                u64::MAX,
+                1,
+                1,
+                u64::MAX,
+                PositionListLimits {
+                    max_bytes: usize::MAX,
+                    max_blocks: usize::MAX,
+                    max_positions: u64::MAX,
+                }
+            ),
+            Err(PositionCodecError::ArithmeticOverflow { .. })
+        ));
+        assert_eq!(position_count_upper_bound(1, 7, 1), Some(1));
+        assert_eq!(position_count_upper_bound(1, 6, 1), None);
+        assert_eq!(position_count_upper_bound(1, 100, 0), None);
+        assert_eq!(position_count_upper_bound(1, 100, 2), None);
+        assert_eq!(position_count_upper_bound(2, 10, 2), Some(2));
+        let count = position_count_upper_bound(4_000_000, 4_010_000, 1_000).unwrap();
+        assert!(project_position_concat_bounds(4_000_000, 1_000, count, 4_010_000).is_ok());
+    }
+
+    #[test]
+    fn term_stream_concat_projections_bound_canonical_encoders() -> TestResult {
+        for (count, frequency, value) in [
+            (1_u32, 1_u32, 0_u32),
+            (127, 1, 127),
+            (128, 2, 128),
+            (129, 3, u32::MAX),
+            (1, 4_097, 0),
+            (300, 9, 0),
+        ] {
+            let mut posting_bytes = Vec::new();
+            let mut position_bytes = Vec::new();
+            for source in 0..3 {
+                let rows: Vec<_> = (0..count)
+                    .map(|index| Posting::new(source * 100_000 + index * 2, frequency))
+                    .collect();
+                let values = vec![value; usize::try_from(count * frequency)?];
+                posting_bytes.push(EncodedPostingList::encode(&rows)?);
+                position_bytes.push(EncodedPositionList::encode(&rows, &values)?);
+            }
+            let postings: Vec<_> = posting_bytes
+                .iter()
+                .map(EncodedPostingList::posting_list)
+                .collect::<Result<_, _>>()?;
+            let positions: Vec<_> = position_bytes
+                .iter()
+                .zip(&postings)
+                .map(|(bytes, rows)| bytes.position_list(rows))
+                .collect::<Result<_, _>>()?;
+            let posting_refs: Vec<_> = postings.iter().collect();
+            let position_refs: Vec<_> = positions.iter().collect();
+            let merged_postings = EncodedPostingList::concatenate(&posting_refs)?;
+            let merged_positions = EncodedPositionList::concatenate(&position_refs)?;
+            let mut count_bound = 0;
+            let mut blocks = 0;
+            let mut bytes = 0;
+            let mut posting_blocks = 0;
+            for (posting, position) in postings.iter().zip(&positions) {
+                let header = u32::from_le_bytes(position.as_bytes()[..4].try_into()?);
+                assert_eq!(usize::try_from(header)?, position.block_count());
+                let bound = position_count_upper_bound(
+                    posting.doc_freq(),
+                    position.as_bytes().len() as u64,
+                    header,
+                )
+                .ok_or("canonical position header bound")?;
+                assert!(bound >= position.total_positions());
+                count_bound += bound;
+                blocks += u64::from(header);
+                bytes += position.as_bytes().len() as u64;
+                posting_blocks += posting_block_count_upper_bound(
+                    posting.doc_freq(),
+                    posting.as_bytes().len() as u64,
+                );
+            }
+            assert!(posting_blocks >= merged_postings.block_count() as u64);
+            check_posting_concat_bounds(u64::from(merged_postings.doc_freq()), posting_blocks)?;
+            let projected = project_position_concat_bounds(
+                u64::from(merged_postings.doc_freq()),
+                blocks,
+                count_bound,
+                bytes,
+            )?;
+            assert!(projected >= merged_positions.as_bytes().len() as u64);
+            assert_eq!(blocks, merged_positions.block_count() as u64);
+            assert!(count_bound >= merged_positions.total_positions());
+            let reopened_postings = merged_postings.posting_list()?;
+            let reopened_positions = merged_positions.position_list(&reopened_postings)?;
+            assert_eq!(reopened_positions.doc_freq(), 3 * count);
+            assert_eq!(
+                reopened_positions.total_positions(),
+                u64::from(3 * count * frequency)
+            );
+        }
         Ok(())
     }
 

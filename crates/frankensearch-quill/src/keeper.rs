@@ -38,8 +38,9 @@ use thiserror::Error;
 
 use crate::error::QuillError;
 use crate::grimoire::{
-    ByteSpan, EncodedTermDictionary, OwnedTerm, TermDictionary, TermDictionaryError, TermInput,
-    TermMetadata, TermSectionLengths, ValidatedTermDictionaryMetadata,
+    ByteSpan, EncodedTermDictionary, OwnedTerm, TermDictionary, TermDictionaryConcatBounds,
+    TermDictionaryError, TermInput, TermMetadata, TermSectionLengths,
+    ValidatedTermDictionaryMetadata,
 };
 use crate::quiver::{
     BlockMaxConcatList, DocLenFieldInput, DocLenSection, EncodedBlockMax, EncodedDocLenSection,
@@ -49,8 +50,9 @@ use crate::quiver::{
     IdMapEntryInput, IdMapPresence, IdMapSection, NumericEntry, NumericFieldInput, NumericSection,
     PositionList, Posting, PostingList, StatsSection, StoredMetaCodecError, StoredMetaFieldInput,
     StoredMetaLookup, StoredMetaSection, ValidatedStoredMetaLookupPlan,
-    ValidatedTermPruningMetadata, aggregate_field_stats, project_doclen_len, project_id_hash_len,
-    project_id_map_len, project_stored_meta_len_total,
+    ValidatedTermPruningMetadata, aggregate_field_stats, check_posting_concat_bounds,
+    project_doclen_len, project_id_hash_len, project_id_map_len, project_position_concat_bounds,
+    project_stored_meta_len_total,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{
@@ -449,6 +451,45 @@ impl CompactionPolicy {
     #[must_use]
     pub const fn new(tombstone_density: f64) -> Self {
         Self { tombstone_density }
+    }
+
+    fn selects_segment(self, segment: &ManifestSegment) -> bool {
+        let physical = segment.doc_count;
+        let deleted = segment.tombstones.cardinality();
+        physical != 0
+            && deleted != 0
+            && deleted as f64 / f64::from(physical) > self.tombstone_density
+    }
+
+    /// Reserve the writer's next unused sequence before publishing replacements.
+    ///
+    /// Fully deleted sources emit no segment and consume no new sequence. The
+    /// original maximum still matters when compaction empties the MANIFEST:
+    /// removing a source must not make its already-used sequence reusable.
+    pub(crate) fn next_seal_seq_after_compaction(
+        self,
+        segments: &[ManifestSegment],
+    ) -> Result<u64, CompactionError> {
+        validate_compaction_policy(self)?;
+        let mut maximum = segments
+            .iter()
+            .map(|segment| segment.seal_seq)
+            .max()
+            .unwrap_or(0);
+        for segment in segments {
+            if self.selects_segment(segment) && segment.live_doc_count() != 0 {
+                maximum = maximum
+                    .checked_add(1)
+                    .ok_or(CompactionError::ArithmeticOverflow {
+                        field: "seal sequence",
+                    })?;
+            }
+        }
+        maximum
+            .checked_add(1)
+            .ok_or(CompactionError::ArithmeticOverflow {
+                field: "next seal sequence",
+            })
     }
 }
 
@@ -2532,7 +2573,28 @@ fn validate_term_dictionary_metadata(
             .map(|entry| entry.len),
         blockmax: required_section_length(path, reader, SectionKind::BLOCKMAX)?,
     };
-    TermDictionary::validate_metadata(dictionary, schema, sections)
+    // Inspect only each referenced four-byte directory header while validating
+    // the dictionary. Reading the raw framed slice preserves lazy POSITIONS
+    // checksum/payload validation; it does not open or decode the section.
+    let position_bytes = reader
+        .section_entries()
+        .iter()
+        .find(|entry| entry.kind == SectionKind::POSITIONS)
+        .map(|entry| {
+            let range = usize::try_from(entry.offset).ok().and_then(|start| {
+                usize::try_from(entry.len)
+                    .ok()
+                    .and_then(|len| start.checked_add(len).map(|end| start..end))
+            });
+            range
+                .and_then(|range| reader.source_bytes().get(range))
+                .ok_or_else(|| KeeperError::SegmentMetadataMismatch {
+                    path: path.to_path_buf(),
+                    detail: "POSITIONS byte range exceeds the immutable backing".to_owned(),
+                })
+        })
+        .transpose()?;
+    TermDictionary::validate_metadata(dictionary, schema, sections, position_bytes)
         .map_err(|source| term_dictionary_admission_error(path, source))
 }
 
@@ -5904,12 +5966,7 @@ fn build_compaction(
             count: snapshot.segments.len(),
         })?;
     for (index, segment) in snapshot.segments.iter().enumerate() {
-        let physical = segment.manifest.doc_count;
-        let deleted = segment.manifest.tombstones.cardinality();
-        if physical != 0
-            && deleted != 0
-            && deleted as f64 / f64::from(physical) > policy.tombstone_density
-        {
+        if policy.selects_segment(&segment.manifest) {
             eligible.push(index);
         }
     }
@@ -6749,6 +6806,7 @@ struct ConcatMergeInputSize {
     id_blob_bytes: u64,
     stored_blob_bytes: u64,
     numeric_bytes: u64,
+    term_bounds: TermDictionaryConcatBounds,
 }
 
 impl ConcatMergeSizing {
@@ -6766,6 +6824,7 @@ impl ConcatMergeSizing {
                 count: segments.len(),
             })?;
         let mut totals = (0_u64, 0_u64, 0_u64, 0_u64);
+        let mut term_totals = TermDictionaryConcatBounds::default();
         for segment in segments {
             let manifest = segment.manifest();
             let lo = manifest.docid_lo;
@@ -6785,6 +6844,18 @@ impl ConcatMergeSizing {
                 .iter()
                 .find(|entry| entry.kind == SectionKind::NUMERIC)
                 .map_or(0, |entry| entry.len);
+            let term_bounds = segment.term_dictionary_metadata.concat_bounds();
+            if term_bounds.invalid_position_header {
+                return Err(concat_codec(
+                    SectionKind::POSITIONS,
+                    "source term has an invalid POSITIONS directory header",
+                ));
+            }
+            term_totals = term_totals.checked_add(term_bounds).ok_or(
+                ConcatMergeError::ArithmeticOverflow {
+                    field: "source term bounds prefix sums",
+                },
+            )?;
             totals = totals
                 .0
                 .checked_add(u64::from(manifest.doc_count))
@@ -6806,6 +6877,7 @@ impl ConcatMergeSizing {
                 id_blob_bytes: totals.1,
                 stored_blob_bytes: totals.2,
                 numeric_bytes: totals.3,
+                term_bounds: term_totals,
             });
         }
         Ok(Self {
@@ -6815,8 +6887,9 @@ impl ConcatMergeSizing {
         })
     }
 
-    /// All errors here describe an unrepresentable output; source metadata
-    /// errors are returned by `new` and must never be treated as a skipped run.
+    /// Errors here mean the output cannot be guaranteed to fit its durable
+    /// layout and default reader budgets. Structural source metadata errors
+    /// are returned by `new` and must never be treated as a skipped run.
     pub(crate) fn check(&self, range: Range<usize>) -> Result<(), ConcatMergeError> {
         let previous = range
             .start
@@ -6835,6 +6908,16 @@ impl ConcatMergeSizing {
         let stored_blob_bytes =
             last.stored_blob_bytes - previous.map_or(0, |source| source.stored_blob_bytes);
         let numeric_bytes = last.numeric_bytes - previous.map_or(0, |source| source.numeric_bytes);
+        let term_bounds = last
+            .term_bounds
+            .checked_sub(
+                previous.map_or_else(TermDictionaryConcatBounds::default, |source| {
+                    source.term_bounds
+                }),
+            )
+            .ok_or(ConcatMergeError::ArithmeticOverflow {
+                field: "candidate term bounds prefix difference",
+            })?;
         u32::try_from(docs).map_err(|_| ConcatMergeError::ArithmeticOverflow {
             field: "projected physical document count",
         })?;
@@ -6852,6 +6935,18 @@ impl ConcatMergeSizing {
             .map_err(|error| concat_codec(SectionKind::IDMAP, error))?;
         // Duplicate external IDs only reduce the canonical hash capacity.
         project_id_hash_len(docs).map_err(|error| concat_codec(SectionKind::IDHASH, error))?;
+        check_posting_concat_bounds(term_bounds.max_doc_freq, term_bounds.max_posting_blocks)
+            .map_err(|error| concat_codec(SectionKind::POSTINGS, error))?;
+        project_position_concat_bounds(
+            term_bounds.max_doc_freq,
+            term_bounds.max_position_blocks,
+            term_bounds.max_position_count,
+            term_bounds.max_position_bytes,
+        )
+        .map_err(|error| concat_codec(SectionKind::POSITIONS, error))?;
+        term_bounds
+            .check_dictionary()
+            .map_err(|error| concat_codec(SectionKind::TERMDICT, error))?;
         // NUMERIC concatenates fixed-size rows and removes redundant source
         // directories; its summed input lengths conservatively bound output.
         if numeric_bytes > u64::from(u32::MAX) {
@@ -17708,6 +17803,145 @@ mod tests {
     }
 
     #[test]
+    fn merge_projection_rejects_default_common_term_posting_limit() {
+        let half = crate::quiver::DEFAULT_MAX_POSTINGS_PER_TERM as u64 / 2;
+        let mut sizing = ConcatMergeSizing {
+            term_fields: vec![0],
+            stored_fields: vec![],
+            inputs: vec![
+                ConcatMergeInputSize {
+                    docid_lo: 0,
+                    docid_hi: half,
+                    docs: half,
+                    id_blob_bytes: half,
+                    stored_blob_bytes: 0,
+                    numeric_bytes: 0,
+                    term_bounds: TermDictionaryConcatBounds {
+                        terms: 1,
+                        key_bytes: 8,
+                        max_key_bytes: 8,
+                        max_doc_freq: half,
+                        max_posting_blocks: half / 128,
+                        ..TermDictionaryConcatBounds::default()
+                    },
+                },
+                ConcatMergeInputSize {
+                    docid_lo: half,
+                    docid_hi: 2 * half + 1,
+                    docs: 2 * half + 1,
+                    id_blob_bytes: 2 * half + 1,
+                    stored_blob_bytes: 0,
+                    numeric_bytes: 0,
+                    term_bounds: TermDictionaryConcatBounds {
+                        terms: 2,
+                        key_bytes: 16,
+                        max_key_bytes: 16,
+                        max_doc_freq: 2 * half + 1,
+                        max_posting_blocks: (2 * half).div_ceil(128) + 1,
+                        ..TermDictionaryConcatBounds::default()
+                    },
+                },
+            ],
+        };
+        assert!(sizing.check(0..1).is_ok());
+        assert!(sizing.check(1..2).is_ok());
+        assert!(matches!(
+            sizing.check(0..2),
+            Err(ConcatMergeError::SectionCodec {
+                section: SectionKind::POSTINGS,
+                ..
+            })
+        ));
+        assert!(sizing.groups(0).unwrap().is_empty());
+        sizing.inputs[1].term_bounds.max_doc_freq -= 1;
+        assert!(sizing.check(0..2).is_ok());
+        assert_eq!(sizing.groups(0).unwrap(), vec![0..2]);
+    }
+
+    #[test]
+    fn merge_projection_partitions_default_term_reader_budgets() {
+        let cases = [
+            (
+                TermDictionaryConcatBounds {
+                    terms: 1,
+                    key_bytes: 8,
+                    max_key_bytes: 8,
+                    max_doc_freq: 1 << 17,
+                    max_posting_blocks: 1 << 17,
+                    postings_bytes: 6 << 17,
+                    blockmax_bytes: 7 << 17,
+                    ..TermDictionaryConcatBounds::default()
+                },
+                SectionKind::POSTINGS,
+                vec![0..2, 2..4, 4..6],
+            ),
+            (
+                TermDictionaryConcatBounds {
+                    terms: 1,
+                    positional_terms: 1,
+                    key_bytes: 8,
+                    max_key_bytes: 8,
+                    max_doc_freq: 1,
+                    max_posting_blocks: 1,
+                    postings_bytes: 10,
+                    blockmax_bytes: 7,
+                    positions_bytes: (1 << 23) + 6,
+                    max_position_bytes: (1 << 23) + 6,
+                    max_position_blocks: 1,
+                    max_position_count: 1 << 23,
+                    ..TermDictionaryConcatBounds::default()
+                },
+                SectionKind::POSITIONS,
+                vec![0..2, 2..4, 4..6],
+            ),
+            (
+                TermDictionaryConcatBounds {
+                    terms: 2_048,
+                    key_bytes: 2_048 * crate::grimoire::MAX_COMPOSITE_KEY_BYTES as u64,
+                    max_key_bytes: crate::grimoire::MAX_COMPOSITE_KEY_BYTES as u64,
+                    max_doc_freq: 1,
+                    max_posting_blocks: 1,
+                    postings_bytes: 2_048 * 6,
+                    blockmax_bytes: 2_048 * 7,
+                    ..TermDictionaryConcatBounds::default()
+                },
+                SectionKind::TERMDICT,
+                vec![0..3, 3..6],
+            ),
+        ];
+        for (source, section, expected) in cases {
+            let mut prefix = TermDictionaryConcatBounds::default();
+            let docs = source.max_doc_freq;
+            let sizing = ConcatMergeSizing {
+                term_fields: vec![0],
+                stored_fields: vec![],
+                inputs: (0..6)
+                    .map(|index| {
+                        prefix = prefix.checked_add(source).unwrap();
+                        ConcatMergeInputSize {
+                            docid_lo: index * docs,
+                            docid_hi: (index + 1) * docs,
+                            docs: (index + 1) * docs,
+                            id_blob_bytes: (index + 1) * docs,
+                            stored_blob_bytes: 0,
+                            numeric_bytes: 0,
+                            term_bounds: prefix,
+                        }
+                    })
+                    .collect(),
+            };
+            let admitted = expected[0].end;
+            assert!(sizing.check(0..admitted).is_ok(), "{section:?}");
+            assert!(sizing.check(1..admitted + 1).is_ok(), "{section:?}");
+            assert!(matches!(
+                sizing.check(0..admitted + 1),
+                Err(ConcatMergeError::SectionCodec { section: actual, .. }) if actual == section
+            ));
+            assert_eq!(sizing.groups(0).unwrap(), expected, "{section:?}");
+        }
+    }
+
+    #[test]
     fn merge_projection_partitions_large_blobs_without_allocating_them() {
         let blob_bytes = u64::from(u32::MAX) / 3;
         let sizing = ConcatMergeSizing {
@@ -17721,6 +17955,7 @@ mod tests {
                     id_blob_bytes: index + 1,
                     stored_blob_bytes: (index + 1) * blob_bytes,
                     numeric_bytes: 0,
+                    term_bounds: TermDictionaryConcatBounds::default(),
                 })
                 .collect(),
         };

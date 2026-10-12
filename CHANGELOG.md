@@ -1,5 +1,34 @@
 # Changelog
 
+### Unreleased — Quill bounds term streams before merge (2026-10-12)
+
+- Native concat admission also respects the existing POSTINGS, POSITIONS and
+  TERMDICT reader limits. A common term, fragmented posting stream or growing
+  term dictionary can no longer pass metadata-size planning and then exceed
+  those limits after the merge has copied its payloads.
+- The existing dictionary validation pass caches source term counts, key
+  lengths, reference lengths and per-term bounds. POSITIONS needs only each
+  referenced four-byte directory header; payload validation remains lazy.
+  Candidate checks use prefix sums and account for directory and metadata vint
+  growth without decoding posting frequencies, positions or stored values.
+- Oversized runs use the existing bounded-group planner and publication path.
+  Conservative bounds may retain additional segments; all durable formats and
+  reader ceilings remain unchanged. Synthetic boundary regressions and small
+  canonical encoder comparisons cover the added admission calculations.
+
+### Unreleased — Quill compaction preserves writer state (2026-10-12)
+
+- Compaction refuses active published Delta epochs before changing authority.
+  Previously, compacting a tombstoned sealed segment could discard searchable
+  Delta rows from the composite snapshot. The original epoch remains visible
+  and can be sealed before retrying compaction.
+- A successful compaction advances the writer's next seal sequence beyond its
+  replacement segments, so subsequent ingest can commit without reopening the
+  index. Removing every segment preserves the writer's consumed sequence.
+- Seal-sequence exhaustion is checked before compaction publishes a successor,
+  preserving the previous authority when no next ingest sequence can be
+  represented. Ineligible policy-boundary cases remain ordinary no-ops.
+
 ### Unreleased — Quill large-index merge admission (#66, 2026-10-12)
 
 - Quill checks projected DOCLEN, STOREDMETA and IDMAP layouts before concat
