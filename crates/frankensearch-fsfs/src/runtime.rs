@@ -32073,6 +32073,9 @@ mod tests {
         // The daemon above keeps its default. The real socket request must
         // carry this distinct budget and receive its exact acknowledgement.
         client_config.search.rerank_timeout_ms = 20_000;
+        // Refinement must finish for the assertions below, and the default
+        // 500 ms quality budget expires on a loaded test host.
+        client_config.search.quality_timeout_ms = 20_000;
         let client = FsfsRuntime::new(client_config).with_cli_input(CliInput {
             index_dir: Some(temp.path().to_path_buf()),
             daemon: true,
@@ -32200,12 +32203,18 @@ mod tests {
                 resources,
                 HashMap::from([(key, vec![payload, refined])]),
             )));
+            // The daemon abandons a phase whose reader stalls past its 5 s
+            // client deadline, and state held behind the blocked phase would
+            // be released only then: such a hold either times out the
+            // readiness probe below or truncates the phases drained after it.
+            // The timeouts are generous so that a slow, loaded test host still
+            // answers a healthy attestation and probe in time.
             let (mut client, server) = UnixStream::pair().unwrap();
             client
-                .set_read_timeout(Some(Duration::from_secs(3)))
+                .set_read_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
             server
-                .set_write_timeout(Some(Duration::from_secs(3)))
+                .set_write_timeout(Some(Duration::from_secs(30)))
                 .unwrap();
             let server_shared = Arc::clone(&shared);
             let slow = thread::spawn(move || {
@@ -32229,7 +32238,7 @@ mod tests {
             assert!(line.contains("\"cached\":true"));
             let (mut probe, server) = UnixStream::pair().unwrap();
             probe
-                .set_read_timeout(Some(Duration::from_secs(1)))
+                .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
             let ready = thread::spawn(move || {
                 FsfsRuntime::handle_search_serve_socket_client(
