@@ -23,6 +23,26 @@ The September 21 supplement records executable complete-generation integration,
 live replacement-generation watching, Unix-socket serving, and reloadable default
 configuration files. These changes remain unreleased.
 
+### Unreleased: bounded Quill compaction (2026-10-12)
+
+- Quill checks projected DOCLEN, STOREDMETA and IDMAP layouts before concat
+  merge reads posting streams or creates output artifacts. The projection
+  includes dense columns across document-ID gaps and physical rows hidden by
+  tombstones, with additional IDHASH and NUMERIC resource bounds.
+- Bulk-load completion partitions oversized candidates into consecutive
+  compatible groups and retains singleton segments. Ordinary tier maintenance
+  and explicit session maintenance skip candidates that cannot fit the existing
+  format and continue looking for eligible runs. Each published group uses the
+  existing MANIFEST protocol; interrupted bulk completion remains resumable.
+- Automatic merge identities include the output's encoded creation timestamp,
+  allowing a later retry to choose a fresh identity when an earlier attempt
+  installed an output but did not publish its MANIFEST.
+- Existing FSLX and MANIFEST formats are unchanged. Large indexes can remain
+  distributed across multiple searchable segments without requiring a wider
+  offset format or an index rebuild. Explicit requests to concatenate an
+  oversized run still return an error, now during preflight. Fixes
+  [#66](https://github.com/Dicklesworthstone/frankensearch/issues/66).
+
 ### Published fsfs 1.12.1 / frankensearch 0.7.1 (2026-10-03)
 
 [fsfs v1.12.1](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.1)

@@ -1,4 +1,4 @@
-//! Publication validation contracts for the delta-preflight change in gh#51.
+//! Publication validation contracts for gh#51 and size-bounded merges in gh#66.
 //!
 //! These public-API regressions protect both the incumbent and delta preflight.
 //! They deliberately do not claim to measure skipped validation work: the
@@ -18,9 +18,17 @@ use frankensearch_core::SearchError;
 use frankensearch_core::{IndexableDocument, LexicalRead, LexicalWrite, ScoredResult};
 #[cfg(feature = "conformance-internals")]
 use frankensearch_quill::index::ConformanceCancellationStage;
+use frankensearch_quill::keeper::MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
+use frankensearch_quill::quiver::{StatsSection, aggregate_field_stats};
+use frankensearch_quill::scribe::{
+    ColumnarAccumulator, DOC_ORDS_PER_LEASE, FlushDocumentInput, FlushSegmentInput,
+    IndexedFieldValue, StoredFieldValue, flush_accumulator,
+};
 use frankensearch_quill::{
-    DEFAULT_SCHEMA, KeeperError, KeeperSnapshot, KeeperWriter, Manifest, QuillConfig, QuillIndex,
-    QuillSearchIndex, SegmentReader, load_manifest_pair,
+    CURRENT_ENGINE_VERSION, CompactionPolicy, DEFAULT_SCHEMA, KeeperError, KeeperSnapshot,
+    KeeperWriter, Manifest, ManifestFieldStats, ManifestSegment, QuillConfig, QuillIndex,
+    QuillSearchIndex, QuillSearchResult, QuillSearchSnapshot, SectionKind, SegmentReader,
+    SessionMergePolicy, TombstoneSet, load_manifest_pair,
 };
 
 fn config() -> QuillConfig {
@@ -992,4 +1000,608 @@ fn retained_damage_never_returns_success_and_reconciliation_requires_fresh_bytes
             assert_fresh_search_matches(&cx, directory.path(), &expected).await;
         });
     }
+}
+
+// The dense metadata layout makes the gaps expensive even though every real
+// source file below has only two rows. A hull across 2^29 docids needs more
+// than u32 can address in STOREDMETA; 2^31 also overflows DOCLEN. These fixtures
+// exercise the shipping format limit without constructing a gigabyte buffer.
+const METADATA_GAP: u64 = 1 << 29;
+const GAP_QUERIES: [&str; 5] = [
+    "shared",
+    "\"amber rust\"",
+    "amber OR cobalt",
+    "title:boundary",
+    "removed",
+];
+
+struct GapDocument {
+    global_docid: u32,
+    stored: [Option<Vec<u8>>; 5],
+}
+
+async fn controlled_gap_fixture(
+    cx: &Cx,
+    directory: &Path,
+    starts: &[u64],
+    bulk: bool,
+) -> (Manifest, Vec<GapDocument>) {
+    let mut writer = KeeperWriter::create(cx, directory, DEFAULT_SCHEMA)
+        .await
+        .expect("create controlled-gap writer");
+    let mut manifest = writer
+        .snapshot()
+        .expect("fixture genesis")
+        .next_manifest()
+        .expect("fixture successor");
+    let mut stats = Vec::new();
+    let mut documents = Vec::new();
+    for (source, &start) in starts.iter().enumerate() {
+        let source_id = 0x6600 + u64::try_from(source).expect("small fixture source index");
+        let lease_base = start / u64::from(DOC_ORDS_PER_LEASE) * u64::from(DOC_ORDS_PER_LEASE);
+        let local_start = u32::try_from(start - lease_base).expect("local ordinal fits u32");
+        let source_documents: Vec<_> = (0..2)
+            .map(|row| {
+                let global_docid = u32::try_from(start + row).expect("global docid fits u32");
+                let body = if global_docid == 1 {
+                    "shared removed"
+                } else if row == 0 {
+                    "shared amber rust amber"
+                } else {
+                    "shared cobalt python"
+                };
+                GapDocument {
+                    global_docid,
+                    stored: [
+                        Some(format!("gap-{global_docid}").into_bytes()),
+                        Some(body.as_bytes().to_vec()),
+                        (row == 0).then(|| {
+                            if source % 2 == 0 {
+                                format!("boundary {global_docid}").into_bytes()
+                            } else {
+                                Vec::new()
+                            }
+                        }),
+                        (row == 0).then(|| {
+                            serde_json::to_vec(&serde_json::json!({
+                                "source": source,
+                                "tag": "boundary",
+                            }))
+                            .expect("encode fixture metadata")
+                        }),
+                        Some(u64::from(global_docid).to_le_bytes().to_vec()),
+                    ],
+                }
+            })
+            .collect();
+        let mut accumulator =
+            ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("default fixture accumulator");
+        let mut identities = Vec::new();
+        for (row, document) in source_documents.iter().enumerate() {
+            let indexed: Vec<_> = document.stored[..3]
+                .iter()
+                .enumerate()
+                .filter_map(|(field, value)| {
+                    value.as_deref().map(|bytes| {
+                        IndexedFieldValue::new(
+                            u16::try_from(field).expect("fixture field ordinal"),
+                            std::str::from_utf8(bytes).expect("fixture text is UTF-8"),
+                        )
+                    })
+                })
+                .collect();
+            let stored: Vec<_> = document.stored[3..]
+                .iter()
+                .enumerate()
+                .filter_map(|(field, value)| {
+                    value.as_deref().map(|bytes| {
+                        StoredFieldValue::new(
+                            u16::try_from(field + 3).expect("fixture stored ordinal"),
+                            bytes,
+                        )
+                    })
+                })
+                .collect();
+            let ordinal = local_start + u32::try_from(row).expect("fixture row ordinal");
+            accumulator
+                .add_document_with_stored(ordinal, &indexed, &stored)
+                .expect("accumulate tiny source document");
+            identities.push(FlushDocumentInput::from_canonical_content(
+                ordinal,
+                std::str::from_utf8(document.stored[0].as_deref().expect("stored identity"))
+                    .expect("identity is UTF-8"),
+                document.stored[1].as_deref().expect("stored content"),
+            ));
+        }
+        let encoded = flush_accumulator(
+            &accumulator,
+            FlushSegmentInput {
+                segment_id: source_id,
+                lease_docid_base: lease_base,
+                created_unix_s: 0,
+                engine_version: CURRENT_ENGINE_VERSION,
+                documents: &identities,
+            },
+        )
+        .expect("seal two-row source in the existing FSLX format");
+        assert!(encoded.file_len() < 16 * 1024, "source must stay tiny");
+        let reader = SegmentReader::from_bytes(encoded.as_bytes(), DEFAULT_SCHEMA)
+            .expect("read source format");
+        stats.push(
+            StatsSection::parse(
+                reader
+                    .section(SectionKind::STATS)
+                    .expect("source STATS checksum")
+                    .expect("source STATS present"),
+                &[0, 1, 2],
+                2,
+            )
+            .expect("source STATS decode"),
+        );
+        let mut tombstones = TombstoneSet::new();
+        if start == 0 {
+            tombstones.insert(1).expect("tombstone one physical row");
+        }
+        manifest.segments.push(ManifestSegment {
+            segment_id: source_id,
+            seal_seq: u64::try_from(source).expect("fixture seal sequence") + 1,
+            file_len: encoded.file_len(),
+            file_xxh3: encoded.file_xxh3(),
+            docid_lo: encoded.header().docid_lo,
+            docid_hi: encoded.header().docid_hi,
+            doc_count: encoded.header().doc_count,
+            tombstones,
+        });
+        writer
+            .publish_segment(
+                cx,
+                encoded
+                    .write_temp(directory)
+                    .expect("sync tiny source segment"),
+            )
+            .await
+            .expect("install tiny source segment");
+        documents.extend(source_documents);
+    }
+    manifest.docid_high_watermark = starts.last().expect("nonempty fixture") + 2;
+    manifest.field_stats = aggregate_field_stats(stats.iter())
+        .expect("aggregate real source statistics")
+        .into_iter()
+        .map(|field| ManifestFieldStats {
+            field_ord: field.field_ord,
+            total_tokens: field.total_tokens,
+            doc_count: u32::try_from(field.doc_count).expect("small physical count"),
+        })
+        .collect();
+    if bulk {
+        manifest.flags |= MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
+    }
+    writer
+        .publish(cx, &manifest)
+        .await
+        .expect("publish real controlled-gap fixture");
+    (retained_manifest(&writer), documents)
+}
+
+fn gap_queries(index: &QuillIndex, cx: &Cx) -> Vec<QuillSearchResult> {
+    GAP_QUERIES
+        .iter()
+        .map(|query| {
+            index
+                .search_paginated(cx, query, 20, 0, true)
+                .expect("query controlled-gap index")
+        })
+        .collect()
+}
+
+fn assert_gap_stored(snapshot: &QuillSearchSnapshot, documents: &[GapDocument]) {
+    assert_gap_stored_values(documents, |field, docid| {
+        snapshot
+            .stored_field_value(field, docid)
+            .expect("read original stored column bytes")
+    });
+}
+
+fn assert_gap_stored_values(
+    documents: &[GapDocument],
+    mut read: impl FnMut(u16, u32) -> Option<Vec<u8>>,
+) {
+    for document in documents {
+        for (field, expected) in document.stored.iter().enumerate() {
+            let actual = read(
+                u16::try_from(field).expect("fixture field ordinal"),
+                document.global_docid,
+            );
+            assert_eq!(
+                actual.as_deref(),
+                if document.global_docid == 1 {
+                    None
+                } else {
+                    expected.as_deref()
+                },
+                "stored field {field} at global docid {}",
+                document.global_docid,
+            );
+        }
+    }
+}
+
+async fn assert_gap_reopened(
+    cx: &Cx,
+    directory: &Path,
+    expected: &[QuillSearchResult],
+    documents: &[GapDocument],
+) {
+    let reader = QuillSearchIndex::open(cx, directory, config())
+        .await
+        .expect("reopen unchanged FSLX format after bounded maintenance");
+    for (query, expected) in GAP_QUERIES.iter().zip(expected) {
+        assert_eq!(
+            reader
+                .search_paginated(cx, query, 20, 0, true)
+                .expect("query fresh bounded-merge reader"),
+            *expected,
+            "reopened query {query} preserves scores, order, identities, and counts",
+        );
+    }
+    assert_gap_stored_values(documents, |field, docid| {
+        reader
+            .stored_field_value(field, docid)
+            .expect("cold reader preserves every stored value")
+    });
+}
+
+#[test]
+fn unrepresentable_concat_is_rejected_before_allocation_or_publication() {
+    for (gap, section) in [(METADATA_GAP, "STOREDMETA"), (1 << 31, "DOCLEN")] {
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("overflow refusal directory");
+            let (manifest, documents) =
+                controlled_gap_fixture(&cx, directory.path(), &[0, gap], false).await;
+            let index = QuillIndex::open(&cx, directory.path(), config())
+                .await
+                .expect("open tiny distant source files");
+            let before = directory_bytes(directory.path());
+            let expected = gap_queries(&index, &cx);
+            let sources: Vec<_> = manifest.segments.iter().map(|s| s.segment_id).collect();
+            let error = index
+                .concat_merge(&cx, &sources, 0x66ff, 0)
+                .await
+                .err()
+                .expect("unrepresentable dense hull must be refused");
+            assert!(
+                error.to_string().contains(section),
+                "expected {section} size diagnosis, got {error}",
+            );
+            assert_eq!(directory_bytes(directory.path()), before);
+            assert_eq!(gap_queries(&index, &cx), expected);
+            assert_eq!(
+                index
+                    .snapshot()
+                    .expect("retained authority")
+                    .loaded_manifest()
+                    .manifest,
+                manifest,
+            );
+            assert_gap_stored(&index.search_snapshot().expect("retained view"), &documents);
+            assert_gap_reopened(&cx, directory.path(), &expected, &documents).await;
+        });
+    }
+}
+
+#[test]
+fn bounded_session_merges_skip_unrepresentable_hulls_and_preserve_all_live_rows() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("bounded session directory");
+        let starts = [0, 2, METADATA_GAP, METADATA_GAP + 2, 2 * METADATA_GAP];
+        let (initial, documents) =
+            controlled_gap_fixture(&cx, directory.path(), &starts, false).await;
+        let index = QuillIndex::open(&cx, directory.path(), config())
+            .await
+            .expect("open session maintenance fixture");
+        let expected = gap_queries(&index, &cx);
+        assert_eq!(expected[0].total_count, Some(9));
+        assert!(
+            expected[4].hits.is_empty(),
+            "tombstoned row stays invisible"
+        );
+        let held = index.search_snapshot().expect("pin source search snapshot");
+        let policy = SessionMergePolicy {
+            fanout: 2,
+            max_input_docs: 100,
+            max_input_bytes: u64::MAX,
+        };
+        for output in [0x66f0, 0x66f1] {
+            let merged = index
+                .merge_sessions_once(&cx, policy, output, 0)
+                .await
+                .expect("skip impossible hull and merge a compatible adjacent pair")
+                .expect("an eligible pair remains");
+            assert_eq!(merged.doc_count(), 9);
+            assert_eq!(
+                merged.loaded_manifest().manifest.field_stats,
+                initial.field_stats
+            );
+            assert_eq!(gap_queries(&index, &cx), expected);
+            assert_gap_stored(&held, &documents);
+            assert_gap_stored(&index.search_snapshot().expect("merged view"), &documents);
+            assert_gap_reopened(&cx, directory.path(), &expected, &documents).await;
+        }
+        let finished = index.snapshot().expect("bounded final snapshot");
+        assert_eq!(finished.segments().len(), 3);
+        assert_eq!(
+            finished
+                .segments()
+                .iter()
+                .map(|segment| (segment.manifest().docid_lo, segment.manifest().docid_hi))
+                .collect::<Vec<_>>(),
+            [
+                (0, 4),
+                (METADATA_GAP, METADATA_GAP + 4),
+                (2 * METADATA_GAP, 2 * METADATA_GAP + 2)
+            ],
+        );
+        let before_noop = directory_bytes(directory.path());
+        assert!(
+            index
+                .merge_sessions_once(&cx, policy, 0x66f2, 0)
+                .await
+                .expect("capacity-limited maintenance completes normally")
+                .is_none()
+        );
+        assert_eq!(directory_bytes(directory.path()), before_noop);
+
+        let report = index
+            .compact(&cx, CompactionPolicy::default())
+            .await
+            .expect("fold the tombstone in its bounded merged segment");
+        assert_eq!(report.compacted_segments, 1);
+        assert_eq!(report.dropped_documents, 1);
+        assert_eq!(index.doc_count().expect("compacted live count"), 9);
+        for (query, previous) in GAP_QUERIES.iter().zip(&expected) {
+            let mut previous_docids: Vec<_> =
+                previous.hits.iter().map(|hit| hit.global_docid).collect();
+            previous_docids.sort_unstable();
+            assert_eq!(
+                index
+                    .collect_docids(&cx, query)
+                    .expect("compacted document set"),
+                previous_docids,
+                "compaction keeps matching documents for {query}",
+            );
+        }
+        assert_gap_stored(&held, &documents);
+        assert_gap_stored(
+            &index.search_snapshot().expect("compacted view"),
+            &documents,
+        );
+        assert_gap_reopened(&cx, directory.path(), &gap_queries(&index, &cx), &documents).await;
+    });
+}
+
+#[test]
+fn automatic_tiers_and_resumed_bulk_finish_leave_multiple_representable_segments() {
+    for bulk in [false, true] {
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("bounded automatic merge directory");
+            let starts = [0, 2, METADATA_GAP, METADATA_GAP + 2, 2 * METADATA_GAP];
+            let (initial, documents) =
+                controlled_gap_fixture(&cx, directory.path(), &starts, bulk).await;
+            let index = QuillIndex::open(
+                &cx,
+                directory.path(),
+                QuillConfig {
+                    tier_fanout: 2,
+                    merge_max_hole_ratio: 1.0,
+                    bulk_load_mode: bulk,
+                    ..config()
+                },
+            )
+            .await
+            .expect("open interrupted bulk or ordinary tier fixture");
+            let expected = gap_queries(&index, &cx);
+            let held = index.search_snapshot().expect("pin source view");
+            if bulk {
+                index
+                    .finish_bulk_load(&cx)
+                    .await
+                    .expect("finish size-bounded bulk tail");
+            } else {
+                index
+                    .commit(&cx)
+                    .await
+                    .expect("apply size-bounded automatic tiers");
+            }
+            let snapshot = index.snapshot().expect("finished bounded maintenance");
+            let manifest = &snapshot.loaded_manifest().manifest;
+            assert_eq!(manifest.segments.len(), 3, "bulk={bulk}");
+            assert_eq!(manifest.field_stats, initial.field_stats);
+            assert!(!manifest.bulk_mode_in_progress());
+            assert_eq!(gap_queries(&index, &cx), expected);
+            assert_gap_stored(&held, &documents);
+            assert_gap_stored(&index.search_snapshot().expect("new view"), &documents);
+            assert_gap_reopened(&cx, directory.path(), &expected, &documents).await;
+            let before_noop = directory_bytes(directory.path());
+            index
+                .commit(&cx)
+                .await
+                .expect("no remaining representable tier run");
+            assert_eq!(directory_bytes(directory.path()), before_noop);
+        });
+    }
+}
+
+#[test]
+fn bounded_merge_output_stays_unreachable_until_manifest_publication_and_retries() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("bounded merge publication directory");
+        // The first candidate crosses the overflow gap; the second is legal.
+        let (initial, documents) = controlled_gap_fixture(
+            &cx,
+            directory.path(),
+            &[0, METADATA_GAP, METADATA_GAP + 2],
+            false,
+        )
+        .await;
+        let index = QuillIndex::open(&cx, directory.path(), config())
+            .await
+            .expect("open publication fixture");
+        let expected = gap_queries(&index, &cx);
+        let held = index.search_snapshot().expect("pin pre-publication view");
+        let blocked_temp = directory
+            .path()
+            .join(format!(".tmp-manifest-{}", initial.generation + 1));
+        let blocker = b"foreign proposal must not be overwritten";
+        std::fs::write(&blocked_temp, blocker).expect("stage deterministic publication failure");
+        let policy = SessionMergePolicy {
+            fanout: 2,
+            max_input_docs: 100,
+            max_input_bytes: u64::MAX,
+        };
+        let error = index
+            .merge_sessions_once(&cx, policy, 0x66ee, 0)
+            .await
+            .err()
+            .expect("fail after output installation, before MANIFEST promotion");
+        assert!(
+            error.to_string().contains("temp"),
+            "unexpected publication error: {error}"
+        );
+        let output_path = directory.path().join("seg-00000000000066ee.fslx");
+        let staged_output = std::fs::read(&output_path).expect("synced unreferenced merge output");
+        assert_eq!(
+            std::fs::read(&blocked_temp).expect("retained foreign temp"),
+            blocker
+        );
+        assert_eq!(
+            load_manifest_pair(directory.path())
+                .expect("old authority")
+                .manifest,
+            initial
+        );
+        assert_gap_stored(&held, &documents);
+        assert_gap_reopened(&cx, directory.path(), &expected, &documents).await;
+        for segment in &initial.segments {
+            assert!(
+                directory
+                    .path()
+                    .join(format!("seg-{:016x}.fslx", segment.segment_id))
+                    .exists()
+            );
+        }
+
+        std::fs::rename(
+            &blocked_temp,
+            directory
+                .path()
+                .join("preserved-conflicting-proposal.fixture"),
+        )
+        .expect("preserve the conflicting temp outside the publication namespace");
+        index
+            .reconcile_publication(&cx)
+            .await
+            .expect("reconcile authoritative old generation");
+        index
+            .merge_sessions_once(&cx, policy, 0x66ee, 0)
+            .await
+            .expect("retry adopts the exact already-installed output")
+            .expect("compatible pair still merges");
+        assert_eq!(
+            std::fs::read(&output_path).expect("reused output"),
+            staged_output
+        );
+        assert_eq!(gap_queries(&index, &cx), expected);
+        assert_gap_stored(&held, &documents);
+        assert_gap_stored(
+            &index.search_snapshot().expect("published merge view"),
+            &documents,
+        );
+        assert_gap_reopened(&cx, directory.path(), &expected, &documents).await;
+        assert_eq!(
+            Manifest::from_bytes(
+                &std::fs::read(directory.path().join("MANIFEST.prev")).expect("previous slot")
+            )
+            .expect("decode retained predecessor"),
+            initial,
+        );
+    });
+}
+
+#[test]
+fn interrupted_bounded_bulk_finish_resumes_after_a_group_has_been_published() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("partially finished bulk directory");
+        let starts = [0, 2, METADATA_GAP, METADATA_GAP + 2, 2 * METADATA_GAP];
+        let (initial, documents) =
+            controlled_gap_fixture(&cx, directory.path(), &starts, true).await;
+        let bulk_config = QuillConfig {
+            tier_fanout: 2,
+            merge_max_hole_ratio: 1.0,
+            bulk_load_mode: true,
+            ..config()
+        };
+        let index = QuillIndex::open(&cx, directory.path(), bulk_config.clone())
+            .await
+            .expect("open interrupted bulk source generation");
+        let expected = gap_queries(&index, &cx);
+        let held = index
+            .search_snapshot()
+            .expect("pin original bulk generation");
+        // The first output publishes normally. Refuse the second group's
+        // manifest so recovery has to retain that completed first group.
+        let blocked_temp = directory
+            .path()
+            .join(format!(".tmp-manifest-{}", initial.generation + 2));
+        std::fs::write(&blocked_temp, b"conflicting second bulk publication")
+            .expect("stage second-group publication fault");
+        let error = index
+            .finish_bulk_load(&cx)
+            .await
+            .err()
+            .expect("interrupt after the first bounded output became authoritative");
+        assert!(
+            error.to_string().contains("temp"),
+            "unexpected partial-bulk failure: {error}",
+        );
+        let partial = load_manifest_pair(directory.path())
+            .expect("read partially finished bulk authority")
+            .manifest;
+        assert_eq!(partial.generation, initial.generation + 1);
+        assert_eq!(partial.segments.len(), 4);
+        assert!(partial.bulk_mode_in_progress());
+        assert_eq!(partial.field_stats, initial.field_stats);
+        let completed_group = partial.segments[0].clone();
+        assert_eq!((completed_group.docid_lo, completed_group.docid_hi), (0, 4));
+        assert_gap_stored(&held, &documents);
+        assert_gap_reopened(&cx, directory.path(), &expected, &documents).await;
+
+        std::fs::rename(
+            &blocked_temp,
+            directory
+                .path()
+                .join("preserved-bulk-publication-conflict.fixture"),
+        )
+        .expect("preserve the fault fixture before reopening");
+        drop(index);
+        let resumed = QuillIndex::open(&cx, directory.path(), bulk_config)
+            .await
+            .expect("recover authoritative partial progress under a new writer");
+        let finished = resumed
+            .finish_bulk_load(&cx)
+            .await
+            .expect("resume the remaining compatible bulk groups");
+        let manifest = &finished.loaded_manifest().manifest;
+        assert_eq!(manifest.segments.len(), 3);
+        assert!(manifest.segments.contains(&completed_group));
+        assert!(!manifest.bulk_mode_in_progress());
+        assert_eq!(finished.doc_count(), 9);
+        assert_eq!(manifest.field_stats, initial.field_stats);
+        assert_eq!(gap_queries(&resumed, &cx), expected);
+        assert_gap_stored(&held, &documents);
+        assert_gap_stored(
+            &resumed.search_snapshot().expect("resumed view"),
+            &documents,
+        );
+        assert_gap_reopened(&cx, directory.path(), &expected, &documents).await;
+    });
 }
