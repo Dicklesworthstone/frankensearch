@@ -35980,8 +35980,9 @@ mod tests {
                 let orphan_path = directory.path().join(format!("seg-{first_id:016x}.fslx"));
                 let orphan_bytes =
                     std::fs::read(&orphan_path).expect("installed but unpublished policy output");
-                let orphan = SegmentReader::from_bytes(&orphan_bytes, DEFAULT_SCHEMA)
-                    .expect("decode installed policy output");
+                let orphan =
+                    crate::segment::SegmentReader::from_bytes(&orphan_bytes, DEFAULT_SCHEMA)
+                        .expect("decode installed policy output");
                 orphan.verify().expect("verify installed policy output");
                 assert_eq!(orphan.header().created_unix_s, first_created_unix_s);
                 assert_eq!(

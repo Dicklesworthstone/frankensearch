@@ -1034,7 +1034,7 @@ async fn controlled_gap_fixture(
         .expect("fixture genesis")
         .next_manifest()
         .expect("fixture successor");
-    let mut stats = Vec::new();
+    let mut source_stats = Vec::new();
     let mut documents = Vec::new();
     for (source, &start) in starts.iter().enumerate() {
         let source_id = 0x6600 + u64::try_from(source).expect("small fixture source index");
@@ -1127,7 +1127,7 @@ async fn controlled_gap_fixture(
         assert!(encoded.file_len() < 16 * 1024, "source must stay tiny");
         let reader = SegmentReader::from_bytes(encoded.as_bytes(), DEFAULT_SCHEMA)
             .expect("read source format");
-        stats.push(
+        source_stats.push(
             StatsSection::parse(
                 reader
                     .section(SectionKind::STATS)
@@ -1164,7 +1164,7 @@ async fn controlled_gap_fixture(
         documents.extend(source_documents);
     }
     manifest.docid_high_watermark = starts.last().expect("nonempty fixture") + 2;
-    manifest.field_stats = aggregate_field_stats(stats.iter())
+    manifest.field_stats = aggregate_field_stats(source_stats.iter())
         .expect("aggregate real source statistics")
         .into_iter()
         .map(|field| ManifestFieldStats {
