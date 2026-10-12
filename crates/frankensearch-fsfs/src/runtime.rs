@@ -4349,10 +4349,9 @@ impl LiveIngestPipeline {
         let mut classification_metadata = None;
         let (canonical, lexical_text) = if is_pdf_file(&abs_path) {
             match try_extract_pdf_text(&bytes, &abs_path) {
-                Some(pdf_text) => (
-                    self.canonicalizer.canonicalize(&pdf_text),
-                    LEXICAL_CANONICALIZER.canonicalize(&pdf_text),
-                ),
+                Some(pdf_text) => self
+                    .canonicalizer
+                    .canonicalize_pair(&LEXICAL_CANONICALIZER, &pdf_text),
                 None => {
                     self.prune_indexes(cx, &rel_key).await?;
                     Self::purge_storage_document(storage, &rel_key)?;
@@ -4369,10 +4368,8 @@ impl LiveIngestPipeline {
 
             let raw_text = String::from_utf8_lossy(&bytes);
             classification_metadata = Some(classification);
-            (
-                self.canonicalizer.canonicalize(&raw_text),
-                LEXICAL_CANONICALIZER.canonicalize(&raw_text),
-            )
+            self.canonicalizer
+                .canonicalize_pair(&LEXICAL_CANONICALIZER, &raw_text)
         };
 
         if canonical.trim().is_empty() {
@@ -4518,10 +4515,8 @@ impl LiveIngestPipeline {
             let Some(pdf_text) = try_extract_pdf_text(&bytes, &abs_path) else {
                 return Ok(false);
             };
-            (
-                self.canonicalizer.canonicalize(&pdf_text),
-                LEXICAL_CANONICALIZER.canonicalize(&pdf_text),
-            )
+            self.canonicalizer
+                .canonicalize_pair(&LEXICAL_CANONICALIZER, &pdf_text)
         } else {
             let classification = classify_file_for_ingest(&abs_path, &bytes);
             if !file_classification_allows_index(&classification) {
@@ -4529,10 +4524,8 @@ impl LiveIngestPipeline {
             }
             let raw_text = String::from_utf8_lossy(&bytes);
             classification_metadata = Some(classification);
-            (
-                self.canonicalizer.canonicalize(&raw_text),
-                LEXICAL_CANONICALIZER.canonicalize(&raw_text),
-            )
+            self.canonicalizer
+                .canonicalize_pair(&LEXICAL_CANONICALIZER, &raw_text)
         };
         if canonical.trim().is_empty() {
             return Ok(false);
@@ -18186,10 +18179,9 @@ impl FsfsRuntime {
                 let mut classification_metadata = None;
                 let (canonical, lexical_text) = if is_pdf_file(&candidate.file_path) {
                     match try_extract_pdf_text(&bytes, &candidate.file_path) {
-                        Some(pdf_text) => (
-                            canonicalizer.canonicalize(&pdf_text),
-                            LEXICAL_CANONICALIZER.canonicalize(&pdf_text),
-                        ),
+                        Some(pdf_text) => {
+                            canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &pdf_text)
+                        }
                         None => {
                             record_content_skip(
                                 &mut checkpoint,
@@ -18219,10 +18211,7 @@ impl FsfsRuntime {
 
                     let raw_text = String::from_utf8_lossy(&bytes);
                     classification_metadata = Some(classification);
-                    (
-                        canonicalizer.canonicalize(&raw_text),
-                        LEXICAL_CANONICALIZER.canonicalize(&raw_text),
-                    )
+                    canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &raw_text)
                 };
 
                 if canonical.trim().is_empty() {

@@ -109,18 +109,7 @@ impl Canonicalizer for DefaultCanonicalizer {
     fn canonicalize(&self, text: &str) -> String {
         // 1. NFC Unicode normalization (critical for hash stability). ASCII text
         //    borrows the input (no copy); non-ASCII allocates the normalized form.
-        let normalized = nfc_normalize(text);
-        // 2. Strip markdown and collapse code blocks
-        let stripped = self.strip_markdown_and_code(&normalized);
-        // 3. Normalize whitespace
-        let ws_normalized = normalize_whitespace(&stripped);
-        // 4. Filter low-signal content — drop the whole doc if it's just an ack.
-        if is_low_signal(&ws_normalized) {
-            return String::new();
-        }
-        // 5. Truncate to max length — pass the owned buffer straight through,
-        //    avoiding the old `filter_low_signal` whole-document copy.
-        truncate_to_chars(&ws_normalized, self.max_length)
+        self.canonicalize_normalized(&nfc_normalize(text))
     }
 
     fn canonicalize_query(&self, query: &str) -> String {
@@ -132,6 +121,46 @@ impl Canonicalizer for DefaultCanonicalizer {
 }
 
 impl DefaultCanonicalizer {
+    /// Canonicalize `text` under this configuration and under `other` at once.
+    ///
+    /// Two configurations differ only in how they collapse fenced code blocks
+    /// and where they truncate, so text with no fence line canonicalizes the
+    /// same under both up to the length cap: the pipeline runs once and each
+    /// result is a prefix of it. Text with a fence runs both pipelines.
+    #[must_use]
+    pub fn canonicalize_pair(&self, other: &Self, text: &str) -> (String, String) {
+        let normalized = nfc_normalize(text);
+        if normalized.lines().any(|line| line.starts_with("```")) {
+            return (
+                self.canonicalize_normalized(&normalized),
+                other.canonicalize_normalized(&normalized),
+            );
+        }
+        let ws_normalized = normalize_whitespace(&self.strip_markdown_and_code(&normalized));
+        if is_low_signal(&ws_normalized) {
+            return (String::new(), String::new());
+        }
+        (
+            truncate_to_chars(&ws_normalized, self.max_length),
+            truncate_to_chars(&ws_normalized, other.max_length),
+        )
+    }
+
+    /// Canonicalize already NFC-normalized text.
+    fn canonicalize_normalized(&self, normalized: &str) -> String {
+        // 2. Strip markdown and collapse code blocks
+        let stripped = self.strip_markdown_and_code(normalized);
+        // 3. Normalize whitespace
+        let ws_normalized = normalize_whitespace(&stripped);
+        // 4. Filter low-signal content — drop the whole doc if it's just an ack.
+        if is_low_signal(&ws_normalized) {
+            return String::new();
+        }
+        // 5. Truncate to max length — pass the owned buffer straight through,
+        //    avoiding the old `filter_low_signal` whole-document copy.
+        truncate_to_chars(&ws_normalized, self.max_length)
+    }
+
     /// Strip markdown formatting and collapse code blocks.
     fn strip_markdown_and_code(&self, text: &str) -> String {
         let mut result = String::with_capacity(text.len());
@@ -973,6 +1002,92 @@ mod tests {
                 normalize_whitespace(text),
                 normalize_whitespace_slow(text),
                 "mismatch for {text:?}"
+            );
+        }
+    }
+
+    /// One pass serves both configurations only where they cannot differ but in
+    /// length, so the pair must equal two separate canonicalizations for every
+    /// input, and a fenced document must be one where they differ otherwise.
+    #[test]
+    fn canonicalize_pair_equals_two_separate_canonicalizations() {
+        let narrow = DefaultCanonicalizer::default();
+        let wide = DefaultCanonicalizer {
+            max_length: usize::MAX,
+            code_head_lines: usize::MAX,
+            code_tail_lines: 0,
+        };
+        let fenced = format!(
+            "intro\n```rust\n{}```\nafter the block\n",
+            "let value = compute(1);\n".repeat(40)
+        );
+        let (narrow_fenced, wide_fenced) =
+            (narrow.canonicalize(&fenced), wide.canonicalize(&fenced));
+        assert!(
+            !wide_fenced.starts_with(&narrow_fenced),
+            "the fenced fixture must collapse differently, not only truncate"
+        );
+        let mut cases = vec![
+            String::new(),
+            "ok".to_owned(),
+            "  Thanks!  ".to_owned(),
+            "word ".repeat(1_000),
+            fenced,
+            "# Title\n\n* item one\n* item two\n[a link](https://x.y) and _it_\n".to_owned(),
+            "cafe\u{301} e\u{301}cole\n\u{3000}wide space\n".to_owned(),
+            "line\u{0B}tab\t\n\n\n  spaced  \r\nend".to_owned(),
+            "```unclosed\ncode line\n".to_owned(),
+            " ```not a fence\nprose".to_owned(),
+            "é".repeat(2_500),
+        ];
+        let fragments = [
+            "word",
+            " ",
+            "\n",
+            "```",
+            "```rust\n",
+            "* ",
+            "# ",
+            "[a](b)",
+            "_x_",
+            "é",
+            "e\u{301}",
+            "\u{0B}",
+            "\t",
+            "ok",
+            "Thanks",
+            "> ",
+            "1. ",
+            "`code`",
+            "\r\n",
+            "  ",
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..2_000 {
+            let mut text = String::new();
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            for _ in 0..(state >> 54) {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                text.push_str(
+                    fragments[usize::try_from(state >> 59).unwrap_or(0) % fragments.len()],
+                );
+            }
+            cases.push(text);
+        }
+        for text in &cases {
+            assert_eq!(
+                narrow.canonicalize_pair(&wide, text),
+                (narrow.canonicalize(text), wide.canonicalize(text)),
+                "{text:?}"
+            );
+            assert_eq!(
+                wide.canonicalize_pair(&narrow, text),
+                (wide.canonicalize(text), narrow.canonicalize(text)),
+                "{text:?}"
             );
         }
     }
