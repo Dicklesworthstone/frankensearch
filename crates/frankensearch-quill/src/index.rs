@@ -8246,9 +8246,9 @@ impl QuillWriterState {
             let Some(plan) = plan else {
                 return Ok(());
             };
-            let output_segment_id =
-                self.derive_policy_segment_id(&plan.source_segment_ids, b"tier")?;
             let created_unix_s = self.created_unix_s()?;
+            let output_segment_id =
+                self.derive_policy_segment_id(&plan.source_segment_ids, b"tier", created_unix_s)?;
             let policy_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
                 crate::tracing_conventions::KEEPER_LIFECYCLE,
@@ -8308,9 +8308,9 @@ impl QuillWriterState {
         // If a later run fails or is cancelled, earlier publications remain
         // valid and the bulk flag allows recovery to resume the remaining work.
         for source_segment_ids in source_groups {
-            let output_segment_id =
-                self.derive_policy_segment_id(&source_segment_ids, b"bulk-finish")?;
             let created_unix_s = self.created_unix_s()?;
+            let output_segment_id =
+                self.derive_policy_segment_id(&source_segment_ids, b"bulk-finish", created_unix_s)?;
             let bulk_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
                 crate::tracing_conventions::KEEPER_LIFECYCLE,
@@ -9426,6 +9426,7 @@ impl QuillWriterState {
         &self,
         source_segment_ids: &[u64],
         domain: &[u8],
+        created_unix_s: i64,
     ) -> Result<u64, QuillIndexError> {
         let authority = self.authority_snapshot()?;
         let generation = authority
@@ -9442,12 +9443,15 @@ impl QuillWriterState {
         }
         let source_digest = source_hasher.digest();
         for salt in 0_u64..=u64::from(u16::MAX) {
-            let mut preimage = [0_u8; 40];
+            let mut preimage = [0_u8; 48];
             preimage[..8].copy_from_slice(&schema_id.to_le_bytes());
             preimage[8..16].copy_from_slice(&generation.to_le_bytes());
             preimage[16..24].copy_from_slice(&source_digest.to_le_bytes());
             preimage[24..32].copy_from_slice(&self.next_seal_seq.to_le_bytes());
-            preimage[32..].copy_from_slice(&salt.to_le_bytes());
+            // Creation time is part of the encoded segment. A later retry
+            // must not reuse an installed orphan's identity for new bytes.
+            preimage[32..40].copy_from_slice(&created_unix_s.to_le_bytes());
+            preimage[40..].copy_from_slice(&salt.to_le_bytes());
             let candidate = xxh3_64(&preimage);
             if authority
                 .loaded_manifest()
@@ -35915,6 +35919,148 @@ mod tests {
                 [merge_seal_seq, merge_seal_seq + 1],
                 "concat output and the next ordinary seal need distinct monotone sequences",
             );
+        });
+    }
+
+    #[test]
+    fn policy_merge_retry_with_later_creation_time_preserves_unpublished_output() {
+        run_with_cx(|cx| async move {
+            for domain in [b"tier".as_slice(), b"bulk-finish".as_slice()] {
+                let directory = tempfile::tempdir().expect("policy retry directory");
+                let config = QuillConfig {
+                    max_ingest_shards: 1,
+                    tier_fanout: 8,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::create(&cx, directory.path(), config.clone())
+                    .await
+                    .expect("create policy retry index");
+                for document in fixture_documents() {
+                    index
+                        .index_documents(&cx, &[document])
+                        .await
+                        .expect("accumulate policy retry leaf");
+                    index.commit(&cx).await.expect("commit policy retry leaf");
+                }
+                let source_ids = committed_segment_ids(&index);
+                assert_eq!(source_ids.len(), 3);
+                let initial = index
+                    .snapshot()
+                    .expect("original policy authority")
+                    .loaded_manifest()
+                    .manifest
+                    .clone();
+                let expected = concat_merge_query_results(&index, &cx);
+                let docids = index
+                    .collect_docids(&cx, "rust OR python")
+                    .expect("all policy fixture docids");
+                let held = index.search_snapshot().expect("pin original policy view");
+                // Supply distinct creation times explicitly: crossing the
+                // wall-clock second must be tested without sleeps or races.
+                let first_created_unix_s = 1_700_000_000;
+                let later_created_unix_s = first_created_unix_s + 1;
+                let first_id = index
+                    .writer_mut()
+                    .derive_policy_segment_id(&source_ids, domain, first_created_unix_s)
+                    .expect("derive first policy output identity");
+                let blocked_temp = directory
+                    .path()
+                    .join(format!(".tmp-manifest-{}", initial.generation + 1));
+                std::fs::write(&blocked_temp, b"conflicting policy publication")
+                    .expect("stage failure before MANIFEST promotion");
+                let error = index
+                    .concat_merge(&cx, &source_ids, first_id, first_created_unix_s)
+                    .await
+                    .err()
+                    .expect("interrupt after the merge output was installed");
+                assert!(
+                    error.to_string().contains("temp"),
+                    "unexpected publication failure: {error}"
+                );
+                let orphan_path = directory.path().join(format!("seg-{first_id:016x}.fslx"));
+                let orphan_bytes =
+                    std::fs::read(&orphan_path).expect("installed but unpublished policy output");
+                let orphan = SegmentReader::from_bytes(&orphan_bytes, DEFAULT_SCHEMA)
+                    .expect("decode installed policy output");
+                orphan.verify().expect("verify installed policy output");
+                assert_eq!(orphan.header().created_unix_s, first_created_unix_s);
+                assert_eq!(
+                    load_manifest_pair(directory.path())
+                        .expect("read old authoritative MANIFEST")
+                        .manifest,
+                    initial
+                );
+                std::fs::rename(
+                    &blocked_temp,
+                    directory.path().join("preserved-policy-conflict.fixture"),
+                )
+                .expect("preserve the fault fixture outside the temp namespace");
+                drop(index);
+
+                let mut resumed = QuillIndex::open(&cx, directory.path(), config.clone())
+                    .await
+                    .expect("reopen unchanged policy authority");
+                assert_eq!(concat_merge_query_results(&resumed, &cx), expected);
+                assert_eq!(committed_segment_ids(&resumed), source_ids);
+                assert_eq!(
+                    resumed
+                        .writer_mut()
+                        .derive_policy_segment_id(&source_ids, domain, first_created_unix_s)
+                        .expect("derive the same policy attempt after reopening"),
+                    first_id,
+                    "recovery must retain the authority, source run, and seal sequence"
+                );
+                let later_id = resumed
+                    .writer_mut()
+                    .derive_policy_segment_id(&source_ids, domain, later_created_unix_s)
+                    .expect("derive the later policy attempt");
+                assert_ne!(
+                    later_id, first_id,
+                    "a different FSLX creation time needs a different policy identity"
+                );
+                resumed
+                    .concat_merge(&cx, &source_ids, later_id, later_created_unix_s)
+                    .await
+                    .expect("publish a later attempt while preserving the old orphan");
+                let successor = resumed.snapshot().expect("resumed policy authority");
+                assert_eq!(successor.doc_count(), 3);
+                assert_eq!(successor.segments().len(), 1);
+                assert_eq!(successor.segments()[0].header().segment_id, later_id);
+                assert_eq!(
+                    successor.segments()[0].header().created_unix_s,
+                    later_created_unix_s
+                );
+                assert_eq!(concat_merge_query_results(&resumed, &cx), expected);
+                let current = resumed.search_snapshot().expect("resumed policy view");
+                for docid in docids {
+                    for field in DEFAULT_SCHEMA.fields.iter().filter(|field| field.stored) {
+                        assert_eq!(
+                            current
+                                .stored_field_value(field.id, docid)
+                                .expect("merged stored field"),
+                            held.stored_field_value(field.id, docid)
+                                .expect("pinned original stored field")
+                        );
+                    }
+                }
+                assert_eq!(
+                    std::fs::read(&orphan_path).expect("preserved unpublished output"),
+                    orphan_bytes
+                );
+                assert_eq!(
+                    Manifest::from_bytes(
+                        &std::fs::read(directory.path().join("MANIFEST.prev"))
+                            .expect("retained predecessor bytes")
+                    )
+                    .expect("decode retained predecessor"),
+                    initial
+                );
+                drop(resumed);
+                let reopened = QuillIndex::open(&cx, directory.path(), config)
+                    .await
+                    .expect("reopen published policy retry");
+                assert_eq!(concat_merge_query_results(&reopened, &cx), expected);
+            }
         });
     }
 
