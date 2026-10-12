@@ -2765,15 +2765,20 @@ fn native_sidecar_pair_is_local(
 fn sync_hnsw_sidecars(parent: &Path, basename: &str) -> SearchResult<()> {
     for suffix in [".hnsw.graph", ".hnsw.data"] {
         let sidecar_path = parent.join(format!("{basename}{suffix}"));
-        let sidecar = std::fs::File::open(&sidecar_path).map_err(|error| {
-            SearchError::Io(std::io::Error::new(
-                error.kind(),
-                format!(
-                    "failed to open dumped HNSW sidecar '{}': {error}",
-                    sidecar_path.display()
-                ),
-            ))
-        })?;
+        // Windows flushes a file (FlushFileBuffers) only through a handle
+        // with write access; a read-only handle fails with "Access is denied".
+        let sidecar = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&sidecar_path)
+            .map_err(|error| {
+                SearchError::Io(std::io::Error::new(
+                    error.kind(),
+                    format!(
+                        "failed to open dumped HNSW sidecar '{}': {error}",
+                        sidecar_path.display()
+                    ),
+                ))
+            })?;
         sidecar.sync_all().map_err(|error| {
             SearchError::Io(std::io::Error::new(
                 error.kind(),
