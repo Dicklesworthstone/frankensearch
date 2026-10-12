@@ -163,6 +163,193 @@ impl Default for TermDictionaryLimits {
     }
 }
 
+/// Bounds collected during the existing dictionary validation pass. Source
+/// maxima add conservatively across a run: different sources need not attain
+/// their maxima on the same term. No posting or stored-value decode is needed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TermDictionaryConcatBounds {
+    pub(crate) terms: u64,
+    pub(crate) positional_terms: u64,
+    pub(crate) key_bytes: u64,
+    pub(crate) max_key_bytes: u64,
+    pub(crate) postings_bytes: u64,
+    pub(crate) positions_bytes: u64,
+    pub(crate) blockmax_bytes: u64,
+    pub(crate) max_doc_freq: u64,
+    pub(crate) max_posting_blocks: u64,
+    pub(crate) max_position_bytes: u64,
+    pub(crate) max_position_blocks: u64,
+    pub(crate) max_position_count: u64,
+    // Header-only inspection must not turn lazy POSITIONS admission into an
+    // eager payload error. Merge preflight surfaces this source error instead.
+    pub(crate) invalid_position_header: bool,
+}
+
+impl TermDictionaryConcatBounds {
+    pub(crate) fn checked_add(self, other: Self) -> Option<Self> {
+        Some(Self {
+            terms: self.terms.checked_add(other.terms)?,
+            positional_terms: self.positional_terms.checked_add(other.positional_terms)?,
+            key_bytes: self.key_bytes.checked_add(other.key_bytes)?,
+            max_key_bytes: self.max_key_bytes.checked_add(other.max_key_bytes)?,
+            postings_bytes: self.postings_bytes.checked_add(other.postings_bytes)?,
+            positions_bytes: self.positions_bytes.checked_add(other.positions_bytes)?,
+            blockmax_bytes: self.blockmax_bytes.checked_add(other.blockmax_bytes)?,
+            max_doc_freq: self.max_doc_freq.checked_add(other.max_doc_freq)?,
+            max_posting_blocks: self
+                .max_posting_blocks
+                .checked_add(other.max_posting_blocks)?,
+            max_position_bytes: self
+                .max_position_bytes
+                .checked_add(other.max_position_bytes)?,
+            max_position_blocks: self
+                .max_position_blocks
+                .checked_add(other.max_position_blocks)?,
+            max_position_count: self
+                .max_position_count
+                .checked_add(other.max_position_count)?,
+            invalid_position_header: self.invalid_position_header || other.invalid_position_header,
+        })
+    }
+
+    pub(crate) fn checked_sub(self, other: Self) -> Option<Self> {
+        Some(Self {
+            terms: self.terms.checked_sub(other.terms)?,
+            positional_terms: self.positional_terms.checked_sub(other.positional_terms)?,
+            key_bytes: self.key_bytes.checked_sub(other.key_bytes)?,
+            max_key_bytes: self.max_key_bytes.checked_sub(other.max_key_bytes)?,
+            postings_bytes: self.postings_bytes.checked_sub(other.postings_bytes)?,
+            positions_bytes: self.positions_bytes.checked_sub(other.positions_bytes)?,
+            blockmax_bytes: self.blockmax_bytes.checked_sub(other.blockmax_bytes)?,
+            max_doc_freq: self.max_doc_freq.checked_sub(other.max_doc_freq)?,
+            max_posting_blocks: self
+                .max_posting_blocks
+                .checked_sub(other.max_posting_blocks)?,
+            max_position_bytes: self
+                .max_position_bytes
+                .checked_sub(other.max_position_bytes)?,
+            max_position_blocks: self
+                .max_position_blocks
+                .checked_sub(other.max_position_blocks)?,
+            max_position_count: self
+                .max_position_count
+                .checked_sub(other.max_position_count)?,
+            invalid_position_header: self.invalid_position_header || other.invalid_position_header,
+        })
+    }
+
+    pub(crate) fn check_dictionary(self) -> Result<(), TermDictionaryError> {
+        self.check_dictionary_with_limits(TermDictionaryLimits::default())
+    }
+
+    fn check_dictionary_with_limits(
+        self,
+        limits: TermDictionaryLimits,
+    ) -> Result<(), TermDictionaryError> {
+        if self.terms > limits.max_terms as u64 {
+            return Err(TermDictionaryError::TermBudgetExceeded {
+                limit: limits.max_terms,
+                actual: usize::try_from(self.terms).unwrap_or(usize::MAX),
+            });
+        }
+        let projected = self.dictionary_projection()?;
+        if projected.blocks > limits.max_blocks as u64 {
+            return Err(TermDictionaryError::BlockBudgetExceeded {
+                limit: limits.max_blocks,
+                actual: usize::try_from(projected.blocks).unwrap_or(usize::MAX),
+            });
+        }
+        if projected.restarts > limits.max_restarts as u64 {
+            return Err(TermDictionaryError::RestartBudgetExceeded {
+                limit: limits.max_restarts,
+                actual: usize::try_from(projected.restarts).unwrap_or(usize::MAX),
+            });
+        }
+        if projected.bytes > limits.max_bytes as u64 {
+            return Err(TermDictionaryError::ByteBudgetExceeded {
+                limit: limits.max_bytes,
+                actual: usize::try_from(projected.bytes).unwrap_or(usize::MAX),
+            });
+        }
+        Ok(())
+    }
+
+    fn dictionary_projection(self) -> Result<TermDictionaryConcatProjection, TermDictionaryError> {
+        let overflow = || TermDictionaryError::SizeOverflow {
+            field: "concat dictionary projection",
+        };
+        if self.terms == 0 {
+            return Ok(TermDictionaryConcatProjection {
+                bytes: BLOCK_COUNT_BYTES as u64,
+                blocks: 0,
+                restarts: 0,
+            });
+        }
+        // POSTINGS is copied verbatim. A BLOCKMAX entry grows from at least
+        // seven to at most sixteen bytes when its offset vint is rebased.
+        // A POSITIONS directory row can gain at most thirteen bytes and had
+        // at least two directory bytes plus one payload byte in its source.
+        let blockmax = self.blockmax_bytes.checked_mul(3).ok_or_else(overflow)?;
+        let positions = self.positions_bytes.checked_mul(6).ok_or_else(overflow)?;
+        let metadata_width = (vint_len(self.max_doc_freq)
+            + 2 * vint_len(self.postings_bytes)
+            + 2 * vint_len(blockmax)) as u64;
+        // Ignore prefix savings. Two key-length vints cost at most six bytes.
+        let entries = self
+            .terms
+            .checked_mul(6 + metadata_width)
+            .and_then(|bytes| bytes.checked_add(self.key_bytes))
+            .and_then(|bytes| {
+                self.positional_terms
+                    .checked_mul(2 * vint_len(positions) as u64)
+                    .and_then(|extra| bytes.checked_add(extra))
+            })
+            .ok_or_else(overflow)?;
+        // At a greedy split, a compressed entry is at most one byte longer
+        // than the full-key entry starting the next block. Thus every pair
+        // of adjacent blocks contains at least target - 2 entry bytes. This
+        // bound also covers legal oversized singleton keys.
+        let blocks = (entries / (TERM_BLOCK_TARGET_BYTES - BLOCK_ENTRY_COUNT_BYTES) as u64)
+            .checked_mul(2)
+            .and_then(|pairs| pairs.checked_add(1))
+            .ok_or_else(overflow)?
+            .min(self.terms);
+        let restarts = blocks
+            .checked_mul((TERM_RESTART_INTERVAL - 1) as u64)
+            .and_then(|rounding| self.terms.checked_add(rounding))
+            .ok_or_else(overflow)?
+            / TERM_RESTART_INTERVAL as u64;
+        let payload = blocks
+            .checked_mul(BLOCK_ENTRY_COUNT_BYTES as u64)
+            .and_then(|headers| entries.checked_add(headers))
+            .ok_or_else(overflow)?;
+        // First-key directory encodings duplicate a subset of entry bytes.
+        // Summed source maxima bound the longest key in any candidate slice.
+        let directory_keys = blocks
+            .checked_mul(self.max_key_bytes.min(MAX_COMPOSITE_KEY_BYTES as u64) + 3)
+            .ok_or_else(overflow)?
+            .min(entries);
+        let bytes = blocks
+            .checked_mul(vint_len(payload) as u64)
+            .and_then(|offsets| offsets.checked_add(directory_keys))
+            .and_then(|directory| directory.checked_add(payload))
+            .and_then(|total| total.checked_add(BLOCK_COUNT_BYTES as u64))
+            .ok_or_else(overflow)?;
+        Ok(TermDictionaryConcatProjection {
+            bytes,
+            blocks,
+            restarts,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TermDictionaryConcatProjection {
+    bytes: u64,
+    blocks: u64,
+    restarts: u64,
+}
+
 /// Result of an exact term lookup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TermMatch {
@@ -595,7 +782,7 @@ impl EncodedTermDictionary {
             })?;
 
         let mut blocks = Vec::new();
-        let mut references = ReferenceValidator::new(schema, sections)?;
+        let mut references = ReferenceValidator::new(schema, sections, None)?;
         let mut previous_global = Vec::new();
         let mut previous_block = Vec::new();
         let mut current = new_block_buffer(limits.max_bytes)?;
@@ -617,7 +804,7 @@ impl EncodedTermDictionary {
                 sections,
                 index,
             )?;
-            references.push(input.metadata)?;
+            references.push(input.metadata, key.len())?;
 
             let mut encoded_entry = encode_entry(
                 &key,
@@ -916,6 +1103,7 @@ pub(crate) struct ValidatedTermDictionaryMetadata {
     restarts: Vec<RestartMeta>,
     term_count: u32,
     max_posting_blocks: u64,
+    concat_bounds: TermDictionaryConcatBounds,
 }
 
 impl ValidatedTermDictionaryMetadata {
@@ -926,6 +1114,10 @@ impl ValidatedTermDictionaryMetadata {
     /// Conservative physical block count for any one term in this dictionary.
     pub(crate) const fn max_posting_blocks(&self) -> u64 {
         self.max_posting_blocks
+    }
+
+    pub(crate) const fn concat_bounds(&self) -> TermDictionaryConcatBounds {
+        self.concat_bounds
     }
 
     /// Estimated payload bytes retained by this validated metadata object.
@@ -962,6 +1154,7 @@ pub struct TermDictionary<'a> {
     restarts: Cow<'a, [RestartMeta]>,
     term_count: u32,
     max_posting_blocks: u64,
+    concat_bounds: TermDictionaryConcatBounds,
 }
 
 impl<'a> TermDictionary<'a> {
@@ -990,6 +1183,16 @@ impl<'a> TermDictionary<'a> {
         schema: SchemaDescriptor,
         sections: TermSectionLengths,
         limits: TermDictionaryLimits,
+    ) -> Result<Self, TermDictionaryError> {
+        Self::parse_with_position_headers(bytes, schema, sections, limits, None)
+    }
+
+    fn parse_with_position_headers(
+        bytes: &'a [u8],
+        schema: SchemaDescriptor,
+        sections: TermSectionLengths,
+        limits: TermDictionaryLimits,
+        position_bytes: Option<&[u8]>,
     ) -> Result<Self, TermDictionaryError> {
         validate_schema(schema)?;
         validate_positions_section(schema, sections)?;
@@ -1032,7 +1235,7 @@ impl<'a> TermDictionary<'a> {
             if remaining != 0 {
                 return Err(TermDictionaryError::TrailingEmptyBytes { remaining });
             }
-            ReferenceValidator::new(schema, sections)?.finish()?;
+            ReferenceValidator::new(schema, sections, position_bytes)?.finish()?;
             return Ok(Self {
                 bytes,
                 schema,
@@ -1041,6 +1244,7 @@ impl<'a> TermDictionary<'a> {
                 restarts: Cow::Owned(Vec::new()),
                 term_count: 0,
                 max_posting_blocks: 0,
+                concat_bounds: TermDictionaryConcatBounds::default(),
             });
         }
 
@@ -1133,7 +1337,7 @@ impl<'a> TermDictionary<'a> {
 
         let mut blocks = Vec::new();
         let mut restarts = Vec::new();
-        let mut references = ReferenceValidator::new(schema, sections)?;
+        let mut references = ReferenceValidator::new(schema, sections, position_bytes)?;
         let mut previous_key = Vec::new();
         let mut decode_key = Vec::new();
         let mut previous_tail = None;
@@ -1177,6 +1381,7 @@ impl<'a> TermDictionary<'a> {
             previous_tail = Some(tail);
         }
         let max_posting_blocks = references.max_posting_blocks;
+        let concat_bounds = references.concat_bounds;
         references.finish()?;
         let term_count_u32 =
             u32::try_from(term_count).map_err(|_| TermDictionaryError::ValueOutOfRange {
@@ -1192,6 +1397,7 @@ impl<'a> TermDictionary<'a> {
             restarts: Cow::Owned(restarts),
             term_count: term_count_u32,
             max_posting_blocks,
+            concat_bounds,
         })
     }
 
@@ -1203,8 +1409,15 @@ impl<'a> TermDictionary<'a> {
         bytes: &'a [u8],
         schema: SchemaDescriptor,
         sections: TermSectionLengths,
+        position_bytes: Option<&[u8]>,
     ) -> Result<ValidatedTermDictionaryMetadata, TermDictionaryError> {
-        let parsed = Self::parse(bytes, schema, sections)?;
+        let parsed = Self::parse_with_position_headers(
+            bytes,
+            schema,
+            sections,
+            TermDictionaryLimits::default(),
+            position_bytes,
+        )?;
         let Self {
             bytes,
             schema,
@@ -1213,6 +1426,7 @@ impl<'a> TermDictionary<'a> {
             restarts,
             term_count,
             max_posting_blocks,
+            concat_bounds,
         } = parsed;
         Ok(ValidatedTermDictionaryMetadata {
             source_start: bytes.as_ptr() as usize,
@@ -1223,6 +1437,7 @@ impl<'a> TermDictionary<'a> {
             restarts: restarts.into_owned(),
             term_count,
             max_posting_blocks,
+            concat_bounds,
         })
     }
 
@@ -1246,6 +1461,7 @@ impl<'a> TermDictionary<'a> {
             restarts: Cow::Borrowed(&metadata.restarts),
             term_count: metadata.term_count,
             max_posting_blocks: metadata.max_posting_blocks,
+            concat_bounds: metadata.concat_bounds,
         })
     }
 
@@ -1962,7 +2178,7 @@ fn validate_block(
     base_term_ord: u32,
     term_count: &mut usize,
     restarts: &mut Vec<RestartMeta>,
-    references: &mut ReferenceValidator,
+    references: &mut ReferenceValidator<'_>,
     block_key: &mut Vec<u8>,
     previous_key: &mut Vec<u8>,
     previous_tail: Option<&BlockTail>,
@@ -2081,7 +2297,7 @@ fn validate_block(
                 key_range: marker.into_range(),
             });
         }
-        references.push(decoded.metadata)?;
+        references.push(decoded.metadata, block_key.len())?;
         copy_bytes(previous_key, block_key, "validated previous key")?;
     }
     let remaining = byte_range.end.saturating_sub(reader.position());
@@ -2204,18 +2420,21 @@ fn decode_entry(
 }
 
 #[derive(Debug)]
-struct ReferenceValidator {
+struct ReferenceValidator<'a> {
     sections: TermSectionLengths,
     postings_end: u64,
     positions_end: u64,
     blockmax_end: u64,
     max_posting_blocks: u64,
+    position_bytes: Option<&'a [u8]>,
+    concat_bounds: TermDictionaryConcatBounds,
 }
 
-impl ReferenceValidator {
+impl<'a> ReferenceValidator<'a> {
     fn new(
         schema: SchemaDescriptor,
         sections: TermSectionLengths,
+        position_bytes: Option<&'a [u8]>,
     ) -> Result<Self, TermDictionaryError> {
         validate_positions_section(schema, sections)?;
         Ok(Self {
@@ -2224,10 +2443,17 @@ impl ReferenceValidator {
             positions_end: 0,
             blockmax_end: 0,
             max_posting_blocks: 0,
+            position_bytes,
+            concat_bounds: TermDictionaryConcatBounds {
+                postings_bytes: sections.postings,
+                positions_bytes: sections.positions.unwrap_or(0),
+                blockmax_bytes: sections.blockmax,
+                ..TermDictionaryConcatBounds::default()
+            },
         })
     }
 
-    fn push(&mut self, metadata: TermMetadata) -> Result<(), TermDictionaryError> {
+    fn push(&mut self, metadata: TermMetadata, key_len: usize) -> Result<(), TermDictionaryError> {
         if metadata.postings.offset != self.postings_end {
             return Err(TermDictionaryError::NonContiguousReference {
                 section: "POSTINGS",
@@ -2260,6 +2486,44 @@ impl ReferenceValidator {
                     metadata.doc_freq,
                     metadata.postings.len,
                 ));
+        let bounds = &mut self.concat_bounds;
+        bounds.terms += 1;
+        bounds.key_bytes = bounds.key_bytes.checked_add(key_len as u64).ok_or(
+            TermDictionaryError::SizeOverflow {
+                field: "concat composite-key bytes",
+            },
+        )?;
+        bounds.max_key_bytes = bounds.max_key_bytes.max(key_len as u64);
+        bounds.max_doc_freq = bounds.max_doc_freq.max(u64::from(metadata.doc_freq));
+        // A BLOCKMAX record has a four-byte docid, at least one offset byte,
+        // and two bound bytes. Its span tightens the POSTINGS-only estimate.
+        bounds.max_posting_blocks = bounds.max_posting_blocks.max(
+            crate::quiver::posting_block_count_upper_bound(
+                metadata.doc_freq,
+                metadata.postings.len,
+            )
+            .min(metadata.blockmax.len / 7),
+        );
+        if let Some(span) = metadata.positions {
+            bounds.positional_terms += 1;
+            bounds.max_position_bytes = bounds.max_position_bytes.max(span.len);
+            let header = self.position_bytes.and_then(|bytes| {
+                let start = usize::try_from(span.offset).ok()?;
+                let end = start.checked_add(4)?;
+                (span.len >= 4).then_some(())?;
+                <[u8; 4]>::try_from(bytes.get(start..end)?).ok()
+            });
+            let block_count = header.map(u32::from_le_bytes);
+            let count_bound = block_count.and_then(|count| {
+                crate::quiver::position_count_upper_bound(metadata.doc_freq, span.len, count)
+            });
+            if let (Some(block_count), Some(count_bound)) = (block_count, count_bound) {
+                bounds.max_position_blocks = bounds.max_position_blocks.max(u64::from(block_count));
+                bounds.max_position_count = bounds.max_position_count.max(count_bound);
+            } else {
+                bounds.invalid_position_header = true;
+            }
+        }
         Ok(())
     }
 
@@ -3213,6 +3477,267 @@ mod tests {
     }
 
     #[test]
+    fn dictionary_concat_projection_observes_reader_budgets() -> TestResult {
+        let single = TermDictionaryConcatBounds {
+            terms: 1,
+            key_bytes: 3,
+            max_key_bytes: 3,
+            max_doc_freq: 1,
+            postings_bytes: 6,
+            blockmax_bytes: 7,
+            ..TermDictionaryConcatBounds::default()
+        };
+        assert_eq!(
+            single.dictionary_projection()?,
+            TermDictionaryConcatProjection {
+                bytes: 27,
+                blocks: 1,
+                restarts: 1,
+            }
+        );
+        let limits = TermDictionaryLimits {
+            max_bytes: 27,
+            max_blocks: 1,
+            max_terms: 1,
+            max_restarts: 1,
+        };
+        single.check_dictionary_with_limits(limits)?;
+        assert!(matches!(
+            single.check_dictionary_with_limits(TermDictionaryLimits {
+                max_bytes: 26,
+                ..limits
+            }),
+            Err(TermDictionaryError::ByteBudgetExceeded { .. })
+        ));
+        assert!(matches!(
+            single.check_dictionary_with_limits(TermDictionaryLimits {
+                max_blocks: 0,
+                ..limits
+            }),
+            Err(TermDictionaryError::BlockBudgetExceeded { .. })
+        ));
+        assert!(matches!(
+            single.check_dictionary_with_limits(TermDictionaryLimits {
+                max_restarts: 0,
+                ..limits
+            }),
+            Err(TermDictionaryError::RestartBudgetExceeded { .. })
+        ));
+        assert!(matches!(
+            TermDictionaryConcatBounds {
+                terms: DEFAULT_MAX_TERMS as u64 + 1,
+                ..single
+            }
+            .check_dictionary(),
+            Err(TermDictionaryError::TermBudgetExceeded { .. })
+        ));
+        assert!(matches!(
+            TermDictionaryConcatBounds {
+                terms: DEFAULT_MAX_TERM_BLOCKS as u64 + 1,
+                key_bytes: (DEFAULT_MAX_TERM_BLOCKS as u64 + 1) * MAX_COMPOSITE_KEY_BYTES as u64,
+                max_key_bytes: MAX_COMPOSITE_KEY_BYTES as u64,
+                ..single
+            }
+            .check_dictionary(),
+            Err(TermDictionaryError::BlockBudgetExceeded { .. })
+        ));
+        assert!(matches!(
+            TermDictionaryConcatBounds {
+                terms: DEFAULT_MAX_TERMS as u64,
+                key_bytes: 2 * DEFAULT_MAX_TERMS as u64,
+                max_key_bytes: 2,
+                ..single
+            }
+            .check_dictionary(),
+            Err(TermDictionaryError::RestartBudgetExceeded { .. })
+        ));
+        assert!(matches!(
+            TermDictionaryConcatBounds {
+                terms: 16_384,
+                key_bytes: 16_384 * MAX_COMPOSITE_KEY_BYTES as u64,
+                max_key_bytes: MAX_COMPOSITE_KEY_BYTES as u64,
+                ..single
+            }
+            .check_dictionary(),
+            Err(TermDictionaryError::ByteBudgetExceeded { .. })
+        ));
+        // A million ordinary short terms still fit this deliberately
+        // conservative bound, including source metadata vint growth.
+        TermDictionaryConcatBounds {
+            terms: 1_000_000,
+            key_bytes: 12_000_000,
+            max_key_bytes: 12,
+            postings_bytes: 6_000_000,
+            blockmax_bytes: 7_000_000,
+            ..single
+        }
+        .check_dictionary()?;
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_concat_prefix_bounds_are_checked() -> TestResult {
+        let first = TermDictionaryConcatBounds {
+            terms: 3,
+            positional_terms: 2,
+            key_bytes: 30,
+            max_key_bytes: 20,
+            postings_bytes: 100,
+            positions_bytes: 80,
+            blockmax_bytes: 30,
+            max_doc_freq: 5,
+            max_posting_blocks: 2,
+            max_position_bytes: 40,
+            max_position_blocks: 2,
+            max_position_count: 25,
+            invalid_position_header: false,
+        };
+        let second = TermDictionaryConcatBounds {
+            terms: 2,
+            key_bytes: 40,
+            max_key_bytes: 25,
+            ..first
+        };
+        let total = first.checked_add(second).ok_or("prefix sum")?;
+        assert_eq!(total.checked_sub(first), Some(second));
+        assert_eq!(total.max_doc_freq, 10);
+        assert_eq!(total.max_key_bytes, 45);
+        assert_eq!(first.checked_sub(total), None);
+        assert!(
+            TermDictionaryConcatBounds {
+                key_bytes: u64::MAX,
+                ..first
+            }
+            .checked_add(second)
+            .is_none()
+        );
+        assert!(matches!(
+            TermDictionaryConcatBounds {
+                postings_bytes: u64::MAX,
+                blockmax_bytes: u64::MAX,
+                ..first
+            }
+            .dictionary_projection(),
+            Err(TermDictionaryError::SizeOverflow { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn dictionary_concat_projection_bounds_canonical_encoders() -> TestResult {
+        let mut fixtures = Vec::new();
+        for count in [0, 1, 15, 16, 17, 31, 32, 127, 128, 1_000] {
+            fixtures.push(sorted_numbered_keys(count));
+        }
+        for length in [127, 128, 4_093, 4_096, MAX_TERM_BYTES] {
+            fixtures.push(
+                (0_u16..33)
+                    .map(|index| {
+                        let mut term = vec![b'a'; length];
+                        term[length - 2..].copy_from_slice(&index.to_be_bytes());
+                        (0, term)
+                    })
+                    .collect(),
+            );
+        }
+        fixtures.push(vec![
+            (0, b"keyword".to_vec()),
+            (1, b"nonpositional".to_vec()),
+            (2, b"positional".to_vec()),
+        ]);
+        for keys in fixtures {
+            let (encoded, _, sections) = encode_fixture(MIXED_SCHEMA, &keys)?;
+            let dictionary = encoded.dictionary(MIXED_SCHEMA, sections)?;
+            let bounds = dictionary.concat_bounds;
+            assert_eq!(bounds.terms, keys.len() as u64);
+            assert_eq!(
+                bounds.key_bytes,
+                keys.iter()
+                    .map(|(_, term)| term.len() as u64 + 2)
+                    .sum::<u64>()
+            );
+            let projection = bounds.dictionary_projection()?;
+            assert!(projection.bytes >= encoded.as_bytes().len() as u64);
+            assert!(projection.blocks >= u64::from(encoded.block_count()));
+            assert!(projection.restarts >= dictionary.restart_count() as u64);
+            bounds.check_dictionary()?;
+        }
+        // Canonical entries with wide section references remain bounded even
+        // when source offsets need additional vint bytes after concatenation.
+        let lengths = [127_u64, 128, 16_383, 16_384, u64::from(u32::MAX)];
+        let keys = sorted_numbered_keys(lengths.len());
+        let mut inputs = Vec::new();
+        let mut offset = 0;
+        for ((field, key), length) in keys.iter().zip(lengths) {
+            let span = ByteSpan::new(offset, length);
+            inputs.push(TermInput::new(
+                *field,
+                key,
+                TermMetadata::without_positions(128, span, span),
+            ));
+            offset += length;
+        }
+        let sections = TermSectionLengths {
+            postings: offset,
+            positions: None,
+            blockmax: offset,
+        };
+        let encoded = EncodedTermDictionary::encode_sorted(KEYWORD_SCHEMA, sections, &inputs)?;
+        let dictionary = encoded.dictionary(KEYWORD_SCHEMA, sections)?;
+        assert!(
+            dictionary.concat_bounds.dictionary_projection()?.bytes
+                >= encoded.as_bytes().len() as u64
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concat_metadata_reads_only_position_headers_and_preserves_lazy_errors() -> TestResult {
+        let input = [TermInput::new(
+            2,
+            b"term",
+            TermMetadata::with_positions(
+                1,
+                ByteSpan::new(0, 6),
+                ByteSpan::new(0, 7),
+                ByteSpan::new(0, 7),
+            ),
+        )];
+        let sections = TermSectionLengths {
+            postings: 6,
+            positions: Some(7),
+            blockmax: 7,
+        };
+        let encoded = EncodedTermDictionary::encode_sorted(MIXED_SCHEMA, sections, &input)?;
+        // The final byte is a truncated payload vint. Dictionary admission
+        // still succeeds because only its referenced directory header is read.
+        let mut positions = [1, 0, 0, 0, 0, 0, 0x80];
+        let metadata = TermDictionary::validate_metadata(
+            encoded.as_bytes(),
+            MIXED_SCHEMA,
+            sections,
+            Some(&positions),
+        )?;
+        let bounds = metadata.concat_bounds();
+        assert_eq!(bounds.positional_terms, 1);
+        assert_eq!(bounds.max_doc_freq, 1);
+        assert_eq!(bounds.max_posting_blocks, 1);
+        assert_eq!(bounds.max_position_bytes, 7);
+        assert_eq!(bounds.max_position_blocks, 1);
+        assert_eq!(bounds.max_position_count, 1);
+        assert!(!bounds.invalid_position_header);
+        positions[0] = 0;
+        let malformed = TermDictionary::validate_metadata(
+            encoded.as_bytes(),
+            MIXED_SCHEMA,
+            sections,
+            Some(&positions),
+        )?;
+        assert!(malformed.concat_bounds().invalid_position_header);
+        Ok(())
+    }
+
+    #[test]
     fn validated_metadata_builds_borrowed_views_only_for_its_exact_byte_source() -> TestResult {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ValidatedTermDictionaryMetadata>();
@@ -3220,7 +3745,7 @@ mod tests {
         let keys = sorted_numbered_keys(33);
         let (encoded, inputs, sections) = encode_fixture(KEYWORD_SCHEMA, &keys)?;
         let metadata =
-            TermDictionary::validate_metadata(encoded.as_bytes(), KEYWORD_SCHEMA, sections)?;
+            TermDictionary::validate_metadata(encoded.as_bytes(), KEYWORD_SCHEMA, sections, None)?;
 
         let first = TermDictionary::from_validated_metadata(encoded.as_bytes(), &metadata)?;
         let second = TermDictionary::from_validated_metadata(encoded.as_bytes(), &metadata)?;

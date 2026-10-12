@@ -497,6 +497,23 @@ bound also apply. Content-dependent codec validation remains required.
 Manifest-only planners retain a conservative complete-file bound when actual
 section metadata is unavailable.
 
+Native admission also enforces the existing POSTINGS, POSITIONS and TERMDICT
+reader resource ceilings. The normal dictionary validation pass caches source
+term counts, full-key byte totals, referenced section lengths and per-term
+maxima. Summing those maxima bounds every output term, even when different
+source terms attain each maximum. POSTINGS bounds include preserved partial
+blocks. POSITIONS reads only the referenced four-byte directory headers and
+bounds position counts and rebased directory sizes without decoding payloads;
+ordinary section checksum and payload validation remain lazy. A malformed
+header is retained as a source error for merge preflight.
+
+TERMDICT projection includes metadata vint growth, restart entries, greedy
+block splits and the block-key directory. Candidate checks use prefix sums of
+these cached summaries, without another dictionary scan or payload copy.
+These conservative bounds may retain more output segments than exact term
+union sizing would require; they do not increase any reader ceiling or change
+the durable layout.
+
 Bulk completion partitions the session's manifest tail into consecutive runs
 that pass these checks, leaving singletons in place. Tier/session maintenance
 skips an oversized candidate without skipping a live interval inside a chosen
