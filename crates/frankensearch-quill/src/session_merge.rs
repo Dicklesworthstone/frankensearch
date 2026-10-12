@@ -10,6 +10,7 @@ use std::sync::Arc;
 use asupersync::Cx;
 use thiserror::Error;
 
+use crate::keeper::{ConcatMergeSizing, KeeperError, manifest_concat_fits};
 use crate::{KeeperSnapshot, ManifestSegment, QuillIndex, QuillIndexError};
 
 /// Maximum number of source entries examined in one candidate window.
@@ -149,6 +150,9 @@ fn checkpoint(cx: &Cx) -> Result<(), SessionMergeError> {
 /// The caller supplies the complete ordered manifest segment list. This
 /// function validates its range/count shape; full codec/checksum admission
 /// remains the snapshot reader's responsibility. Planning does not read files.
+/// A conservative dense-metadata bound also enforces the current format's
+/// limits even when input budgets are raised. `merge_sessions_once` uses the
+/// snapshot's section lengths for a tighter bound before selecting a run.
 ///
 /// # Errors
 ///
@@ -158,6 +162,17 @@ pub fn plan_session_merge(
     cx: &Cx,
     segments: &[ManifestSegment],
     policy: SessionMergePolicy,
+) -> Result<Option<SessionMergePlan>, SessionMergeError> {
+    plan_session_merge_with_fit(cx, segments, policy, |range| {
+        manifest_concat_fits(&segments[range])
+    })
+}
+
+fn plan_session_merge_with_fit(
+    cx: &Cx,
+    segments: &[ManifestSegment],
+    policy: SessionMergePolicy,
+    mut fits: impl FnMut(std::ops::Range<usize>) -> bool,
 ) -> Result<Option<SessionMergePlan>, SessionMergeError> {
     checkpoint(cx)?;
     policy.validate()?;
@@ -206,7 +221,10 @@ pub fn plan_session_merge(
             // Overflow cannot fit any u64 budget. A later run may still fit.
             continue;
         };
-        if docs <= policy.max_input_docs && bytes <= policy.max_input_bytes {
+        if docs <= policy.max_input_docs
+            && bytes <= policy.max_input_bytes
+            && fits(start..start + sources.len())
+        {
             selected = Some((tier, start, docs, bytes));
         }
     }
@@ -262,7 +280,15 @@ impl QuillIndex {
         checkpoint(cx)?;
         policy.validate()?;
         let snapshot = self.snapshot()?;
-        let plan = plan_session_merge(cx, &snapshot.loaded_manifest().manifest.segments, policy)?;
+        let sizing = ConcatMergeSizing::new(snapshot.schema(), snapshot.segments())
+            .map_err(KeeperError::from)
+            .map_err(QuillIndexError::from)?;
+        let plan = plan_session_merge_with_fit(
+            cx,
+            &snapshot.loaded_manifest().manifest.segments,
+            policy,
+            |range| sizing.check(range).is_ok(),
+        )?;
         drop(snapshot);
         let Some(plan) = plan else {
             return Ok(None);
@@ -421,6 +447,45 @@ mod tests {
             ];
             let plan = plan_session_merge(&cx, &segments, policy).unwrap().unwrap();
             assert_eq!(plan.source_segment_ids, vec![2, 3]);
+        });
+    }
+
+    #[test]
+    fn raised_input_budgets_cannot_bypass_durable_output_limits() {
+        run_test_with_cx(|cx| async move {
+            let policy = SessionMergePolicy {
+                fanout: 2,
+                max_input_docs: u64::MAX,
+                max_input_bytes: u64::MAX,
+            };
+            let mut segments = [
+                segment(1, 0, 1, u64::from(u32::MAX) - 1024),
+                segment(2, 1, 1, 1024),
+                segment(3, 2, 1, 1024),
+            ];
+            assert_eq!(
+                plan_session_merge(&cx, &segments, policy)
+                    .unwrap()
+                    .unwrap()
+                    .source_segment_ids,
+                vec![1, 2],
+            );
+            segments[0].file_len += 1;
+            assert_eq!(
+                plan_session_merge(&cx, &segments, policy)
+                    .unwrap()
+                    .unwrap()
+                    .source_segment_ids,
+                vec![2, 3],
+            );
+            // A huge intervening interval cannot be skipped to combine the
+            // smaller files on either side of it.
+            segments[1].file_len = u64::MAX;
+            assert!(
+                plan_session_merge(&cx, &segments, policy)
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 

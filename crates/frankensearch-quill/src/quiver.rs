@@ -6251,6 +6251,22 @@ fn checked_doclen_span(
     })
 }
 
+/// Compute the exact default-writer DOCLEN size without allocating columns.
+///
+/// Merge admission must use the full docid hull, including gaps between
+/// sources, because every field is dense over that range. The canonical
+/// layout walker also checks alignment, durable offsets, and section limits.
+pub(crate) fn project_doclen_len(
+    docid_lo: u64,
+    docid_hi: u64,
+    field_ords: &[u16],
+) -> Result<usize, DocLenCodecError> {
+    let limits = DocLenLimits::default();
+    validate_doclen_expected_fields(field_ords, limits.max_fields)?;
+    let span = checked_doclen_span(docid_lo, docid_hi, limits)?;
+    doclen_layout_len_iter(field_ords.iter().copied(), field_ords.len(), span, limits)
+}
+
 fn doclen_layout(
     field_ords: &[u16],
     span: usize,
@@ -7365,6 +7381,27 @@ fn validate_id_map_blob_len(blob_len: usize, limits: IdMapLimits) -> Result<(), 
         });
     }
     Ok(())
+}
+
+/// Compute the exact default-writer IDMAP size without visiting identifiers.
+///
+/// `blob_bytes` is the sum of source identifier blobs. Dense offsets and
+/// content hashes cover the complete output hull, including inter-source
+/// holes; merely adding source section sizes would miss that expansion.
+pub(crate) fn project_id_map_len(
+    docid_lo: u64,
+    docid_hi: u64,
+    blob_bytes: u64,
+) -> Result<usize, IdMapCodecError> {
+    let limits = IdMapLimits::default();
+    let span = checked_id_map_span(docid_lo, docid_hi, limits)?;
+    let blob_len = usize::try_from(blob_bytes).map_err(|_| IdMapCodecError::ResourceLimit {
+        resource: "host identifier blob bytes",
+        actual: blob_bytes,
+        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })?;
+    validate_id_map_blob_len(blob_len, limits)?;
+    id_map_layout(span, blob_len, limits).map(|(_, total_len)| total_len)
 }
 
 fn id_map_prefix_len(span: usize) -> Result<usize, IdMapCodecError> {
@@ -8714,6 +8751,32 @@ fn canonical_id_hash_capacity(
         });
     }
     Ok(capacity)
+}
+
+/// Bound the default-writer IDHASH size before resolving repeated identifiers.
+///
+/// Supplying the physical present-row count is conservative: selecting one
+/// representative per distinct identifier can only reduce table capacity.
+/// Every physical row also requires at least one validation probe. Reject a
+/// count that already exhausts that budget; additional collision-dependent
+/// probe work remains the responsibility of the validating writer.
+pub(crate) fn project_id_hash_len(present_count: u64) -> Result<usize, IdHashCodecError> {
+    let limits = IdHashLimits::default();
+    let entries = usize::try_from(present_count).map_err(|_| IdHashCodecError::ResourceLimit {
+        resource: "host entry count",
+        actual: present_count,
+        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })?;
+    validate_id_hash_entry_limit(entries, limits)?;
+    if present_count > limits.max_probe_steps {
+        return Err(IdHashCodecError::ResourceLimit {
+            resource: "probe steps",
+            actual: present_count,
+            limit: limits.max_probe_steps,
+        });
+    }
+    let capacity = canonical_id_hash_capacity(entries, limits)?;
+    id_hash_section_len(capacity, limits)
 }
 
 fn id_hash_section_len(capacity: usize, limits: IdHashLimits) -> Result<usize, IdHashCodecError> {
@@ -12138,12 +12201,120 @@ fn stored_meta_presence_len(span: usize) -> Result<usize, StoredMetaCodecError> 
         })
 }
 
+/// Compute the exact default-writer STOREDMETA size without visiting values.
+///
+/// Each `blob_lengths` entry is the summed source blob length for the
+/// corresponding stored field. The shared layout walker checks both kinds of
+/// u32 offsets (field starts and blob offsets), dense presence/offset tables
+/// for the complete output docid hull, and the complete section limit.
+pub(crate) fn project_stored_meta_len(
+    docid_lo: u64,
+    docid_hi: u64,
+    field_ords: &[u16],
+    blob_lengths: &[u64],
+) -> Result<usize, StoredMetaCodecError> {
+    let limits = StoredMetaLimits::default();
+    validate_stored_meta_expected_fields(field_ords, limits.max_fields)?;
+    let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
+    stored_meta_layout_len_iter(
+        field_ords,
+        span,
+        blob_lengths.iter().copied(),
+        limits,
+        |_| {},
+    )
+}
+
+/// Compute the default-writer STOREDMETA size from its total opaque bytes.
+///
+/// Stored fields are packed without alignment, so their distribution does not
+/// affect the complete section length. A section within the default u32 byte
+/// ceiling necessarily has representable field starts and per-field blobs.
+/// Adding total blob bytes to the canonical empty-blob layout therefore proves
+/// admission without opening values or allocating per-field metadata.
+pub(crate) fn project_stored_meta_len_total(
+    docid_lo: u64,
+    docid_hi: u64,
+    field_ords: &[u16],
+    total_blob_bytes: u64,
+) -> Result<usize, StoredMetaCodecError> {
+    if field_ords.is_empty() {
+        if total_blob_bytes != 0 {
+            return Err(StoredMetaCodecError::ResourceLimit {
+                resource: "blob bytes without stored fields",
+                actual: total_blob_bytes,
+                limit: 0,
+            });
+        }
+        return project_stored_meta_len(docid_lo, docid_hi, field_ords, &[]);
+    }
+    let limits = StoredMetaLimits::default();
+    validate_stored_meta_expected_fields(field_ords, limits.max_fields)?;
+    let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
+    let prefix_len = stored_meta_layout_len_iter(
+        field_ords,
+        span,
+        std::iter::repeat_n(0, field_ords.len()),
+        limits,
+        |_| {},
+    )?;
+    let section_len = (prefix_len as u64).checked_add(total_blob_bytes).ok_or(
+        StoredMetaCodecError::ArithmeticOverflow {
+            field: "projected section length",
+        },
+    )?;
+    if section_len > limits.max_section_bytes {
+        return Err(StoredMetaCodecError::ResourceLimit {
+            resource: "section bytes",
+            actual: section_len,
+            limit: limits.max_section_bytes,
+        });
+    }
+    usize::try_from(section_len).map_err(|_| StoredMetaCodecError::ResourceLimit {
+        resource: "host section bytes",
+        actual: section_len,
+        limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+    })
+}
+
 fn stored_meta_layout(
     field_ords: &[u16],
     span: usize,
     blob_lengths: &[usize],
     limits: StoredMetaLimits,
 ) -> Result<(Vec<usize>, usize), StoredMetaCodecError> {
+    let mut field_offsets = Vec::new();
+    field_offsets
+        .try_reserve_exact(field_ords.len())
+        .map_err(|_| StoredMetaCodecError::Allocation {
+            resource: "directory offsets",
+            bytes: field_ords
+                .len()
+                .saturating_mul(std::mem::size_of::<usize>()),
+        })?;
+    let total_len = stored_meta_layout_len_iter(
+        field_ords,
+        span,
+        blob_lengths
+            .iter()
+            .map(|&length| u64::try_from(length).unwrap_or(u64::MAX)),
+        limits,
+        |offset| field_offsets.push(offset),
+    )?;
+    Ok((field_offsets, total_len))
+}
+
+fn stored_meta_layout_len_iter<I, F>(
+    field_ords: &[u16],
+    span: usize,
+    mut blob_lengths: I,
+    limits: StoredMetaLimits,
+    mut record_offset: F,
+) -> Result<usize, StoredMetaCodecError>
+where
+    I: Iterator<Item = u64>,
+    F: FnMut(usize),
+{
     let directory_len = field_ords
         .len()
         .checked_mul(STORED_META_DIRECTORY_ENTRY_LEN)
@@ -12163,34 +12334,49 @@ fn stored_meta_layout(
             .ok_or(StoredMetaCodecError::ArithmeticOverflow {
                 field: "field prefix length",
             })?;
-    let mut field_offsets = Vec::new();
-    field_offsets
-        .try_reserve_exact(field_ords.len())
-        .map_err(|_| StoredMetaCodecError::Allocation {
-            resource: "directory offsets",
-            bytes: field_ords
-                .len()
-                .saturating_mul(std::mem::size_of::<usize>()),
-        })?;
     let mut cursor = directory_len;
-    for (index, &field_ord) in field_ords.iter().enumerate() {
+    for &field_ord in field_ords {
         if u32::try_from(cursor).is_err() {
             return Err(StoredMetaCodecError::OffsetUnrepresentable {
                 field_ord,
                 offset: cursor,
             });
         }
-        field_offsets.push(cursor);
+        record_offset(cursor);
+        let blob_len = blob_lengths
+            .next()
+            .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                field: "field blob layout",
+            })?;
+        if blob_len > limits.max_field_blob_bytes {
+            return Err(StoredMetaCodecError::ResourceLimit {
+                resource: "field blob bytes",
+                actual: blob_len,
+                limit: limits.max_field_blob_bytes,
+            });
+        }
+        if blob_len > u64::from(u32::MAX) {
+            return Err(StoredMetaCodecError::ResourceLimit {
+                resource: "durable field blob bytes",
+                actual: blob_len,
+                limit: u64::from(u32::MAX),
+            });
+        }
         let blob_len =
-            *blob_lengths
-                .get(index)
-                .ok_or(StoredMetaCodecError::ArithmeticOverflow {
-                    field: "field blob layout",
-                })?;
+            usize::try_from(blob_len).map_err(|_| StoredMetaCodecError::ResourceLimit {
+                resource: "host field blob bytes",
+                actual: blob_len,
+                limit: u64::try_from(usize::MAX).unwrap_or(u64::MAX),
+            })?;
         cursor = cursor
             .checked_add(field_prefix_len)
             .and_then(|end| end.checked_add(blob_len))
             .ok_or(StoredMetaCodecError::ArithmeticOverflow { field: "field end" })?;
+    }
+    if blob_lengths.next().is_some() {
+        return Err(StoredMetaCodecError::ArithmeticOverflow {
+            field: "field blob layout",
+        });
     }
     let section_len = u64::try_from(cursor).unwrap_or(u64::MAX);
     if section_len > limits.max_section_bytes {
@@ -12200,7 +12386,7 @@ fn stored_meta_layout(
             limit: limits.max_section_bytes,
         });
     }
-    Ok((field_offsets, cursor))
+    Ok(cursor)
 }
 
 fn stored_meta_presence_bit(presence: &[u8], ordinal: usize) -> Option<bool> {
@@ -16292,6 +16478,272 @@ mod tests {
             DocLenSection::parse(encoded.as_bytes(), 0, 3, &[2]),
             Err(DocLenCodecError::UnexpectedField { .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_size_projections_match_encoded_sections() -> TestResult {
+        let field_ords = [1, 4];
+        for span in [0_usize, 1, 7, 8, 9, 63, 64, 65, 127, 128, 129] {
+            let docid_lo = 37;
+            let docid_hi = docid_lo + u64::try_from(span)?;
+            let lengths: Vec<_> = (0..span)
+                .map(|ordinal| (ordinal % 3 != 0).then_some(5))
+                .collect();
+            let doclen = EncodedDocLenSection::encode(
+                docid_lo,
+                docid_hi,
+                &field_ords,
+                &[
+                    DocLenFieldInput::new(1, &lengths),
+                    DocLenFieldInput::new(4, &lengths),
+                ],
+            )?;
+            assert_eq!(
+                project_doclen_len(docid_lo, docid_hi, &field_ords)?,
+                doclen.as_bytes().len(),
+                "DOCLEN span={span}"
+            );
+
+            let first_values: Vec<_> = (0..span)
+                .map(|ordinal| match ordinal % 3 {
+                    0 => None,
+                    1 => Some(b"".as_slice()),
+                    _ => Some(b"first".as_slice()),
+                })
+                .collect();
+            let last_values = vec![Some(b"\x00\xff".as_slice()); span];
+            let stored = EncodedStoredMetaSection::encode(
+                docid_lo,
+                docid_hi,
+                &field_ords,
+                &[
+                    StoredMetaFieldInput::new(1, &first_values),
+                    StoredMetaFieldInput::new(4, &last_values),
+                ],
+            )?;
+            let stored_view = stored.section(&field_ords)?;
+            let blob_lengths = [
+                u64::try_from(
+                    stored_view
+                        .field(1)
+                        .ok_or("first stored field")?
+                        .blob()
+                        .len(),
+                )?,
+                u64::try_from(
+                    stored_view
+                        .field(4)
+                        .ok_or("last stored field")?
+                        .blob()
+                        .len(),
+                )?,
+            ];
+            assert_eq!(
+                project_stored_meta_len(docid_lo, docid_hi, &field_ords, &blob_lengths)?,
+                stored.as_bytes().len(),
+                "STOREDMETA span={span}"
+            );
+            let total_blob_bytes = blob_lengths.iter().sum();
+            assert_eq!(
+                project_stored_meta_len_total(docid_lo, docid_hi, &field_ords, total_blob_bytes)?,
+                stored.as_bytes().len(),
+                "aggregate STOREDMETA span={span}"
+            );
+            assert_eq!(
+                stored.as_bytes().len()
+                    - project_stored_meta_len_total(docid_lo, docid_hi, &field_ords, 0)?,
+                usize::try_from(total_blob_bytes)?,
+                "recover opaque byte count from section length, span={span}"
+            );
+
+            let identifiers: Vec<_> = (0..span).map(|ordinal| format!("id-{ordinal}")).collect();
+            let id_inputs: Vec<_> = identifiers
+                .iter()
+                .enumerate()
+                .map(|(ordinal, id)| (ordinal % 3 != 0).then_some(IdMapEntryInput::new(id, 0)))
+                .collect();
+            let id_map = EncodedIdMapSection::encode(docid_lo, docid_hi, &id_inputs)?;
+            let id_map_view = id_map.section()?;
+            assert_eq!(
+                project_id_map_len(docid_lo, docid_hi, u64::try_from(id_map_view.blob().len())?)?,
+                id_map.as_bytes().len(),
+                "IDMAP span={span}"
+            );
+            let id_hash = EncodedIdHashSection::encode(id_map_view)?;
+            assert_eq!(
+                project_id_hash_len(u64::try_from(id_map_view.present_count())?)?,
+                id_hash.as_bytes().len(),
+                "IDHASH span={span}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn doclen_size_projection_checks_four_gib_boundary_without_columns() -> TestResult {
+        let max = u64::from(u32::MAX);
+        // One directory entry is followed by padding up to byte 64.
+        assert_eq!(
+            project_doclen_len(0, max - 65, &[1])?,
+            usize::try_from(max - 1)?
+        );
+        assert_eq!(
+            project_doclen_len(0, max - 64, &[1])?,
+            usize::try_from(max)?
+        );
+        assert!(project_doclen_len(0, max - 63, &[1]).is_err());
+        assert!(project_doclen_len(1, 0, &[1]).is_err());
+        assert!(project_doclen_len(0, 1, &[4, 1]).is_err());
+        assert_eq!(project_doclen_len(0, 129, &[])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn doclen_size_projection_rejects_unrepresentable_later_field() {
+        assert!(matches!(
+            project_doclen_len(0, 1_u64 << 31, &[1, 4, 9]),
+            Err(DocLenCodecError::OffsetUnrepresentable {
+                field_ord: 9,
+                offset: 4_294_967_360,
+            })
+        ));
+    }
+
+    #[test]
+    fn stored_meta_size_projection_checks_four_gib_boundary_without_values() -> TestResult {
+        let max = u64::from(u32::MAX);
+        // Two fields, one document: directory 12, two presence bytes, two
+        // 8-byte offset tables. No stored payload allocation is needed.
+        let exact_blob = max - 30;
+        assert_eq!(
+            project_stored_meta_len(0, 1, &[2, 4], &[exact_blob - 1, 0])?,
+            usize::try_from(max - 1)?
+        );
+        assert_eq!(
+            project_stored_meta_len(0, 1, &[2, 4], &[exact_blob, 0])?,
+            usize::try_from(max)?
+        );
+        assert_eq!(
+            project_stored_meta_len_total(0, 1, &[2, 4], exact_blob)?,
+            usize::try_from(max)?
+        );
+        assert!(project_stored_meta_len(0, 1, &[2, 4], &[exact_blob + 1, 0]).is_err());
+        assert!(project_stored_meta_len_total(0, 1, &[2, 4], exact_blob + 1).is_err());
+        assert!(project_stored_meta_len(0, 1, &[2], &[max + 1]).is_err());
+        // Offset tables and presence bits alone can exceed the byte ceiling.
+        assert!(project_stored_meta_len(0, 1_u64 << 30, &[2], &[0]).is_err());
+        assert!(project_stored_meta_len(1, 0, &[2], &[0]).is_err());
+        assert!(project_stored_meta_len(0, 1, &[2, 2], &[0, 0]).is_err());
+        assert!(project_stored_meta_len(0, 1, &[2], &[]).is_err());
+        assert!(project_stored_meta_len(0, 1, &[], &[1]).is_err());
+        assert!(project_stored_meta_len_total(0, 1, &[], 1).is_err());
+        assert_eq!(project_stored_meta_len_total(0, 1, &[], 0)?, 0);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn stored_meta_size_projection_reproduces_issue_66_offset_without_blob_allocation() {
+        // Synthetic output with 6.7 million slots and two individually legal
+        // blobs reproduces the reporter's exact overflowing field-4 offset.
+        assert!(matches!(
+            project_stored_meta_len(0, 6_700_000, &[0, 2, 4], &[2_147_483_647, 2_202_092_429, 0]),
+            Err(StoredMetaCodecError::OffsetUnrepresentable {
+                field_ord: 4,
+                offset: 4_404_851_102,
+            })
+        ));
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn stored_meta_layout_checks_field_offset_and_blob_limits_independently() -> TestResult {
+        let max = usize::try_from(u32::MAX)?;
+        let limits = StoredMetaLimits {
+            max_section_bytes: u64::MAX,
+            max_field_blob_bytes: u64::MAX,
+            ..StoredMetaLimits::default()
+        };
+        // A permissive section ceiling must never widen a durable u32 field.
+        let (offsets, len) = stored_meta_layout(&[2, 4], 1, &[max - 21, 0], limits)?;
+        assert_eq!(offsets, [12, max]);
+        assert_eq!(len, max + 9);
+        assert!(matches!(
+            stored_meta_layout(&[2, 4], 1, &[max - 20, 0], limits),
+            Err(StoredMetaCodecError::OffsetUnrepresentable {
+                field_ord: 4,
+                offset: 4_294_967_296,
+            })
+        ));
+        assert!(matches!(
+            stored_meta_layout(&[2], 1, &[max + 1], limits),
+            Err(StoredMetaCodecError::ResourceLimit {
+                resource: "durable field blob bytes",
+                actual: 4_294_967_296,
+                limit: 4_294_967_295,
+            })
+        ));
+        assert!(matches!(
+            stored_meta_layout(&[2], usize::MAX, &[0], limits),
+            Err(StoredMetaCodecError::ArithmeticOverflow { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn id_map_size_projection_checks_prefix_blob_and_docid_boundaries() -> TestResult {
+        let max = u64::from(u32::MAX);
+        assert_eq!(
+            project_id_map_len(0, ID_MAP_MAX_SPAN, 3)?,
+            usize::try_from(max)?
+        );
+        assert!(project_id_map_len(0, ID_MAP_MAX_SPAN, 4).is_err());
+        assert!(project_id_map_len(0, ID_MAP_MAX_SPAN + 1, 0).is_err());
+        assert!(project_id_map_len(0, 1, max + 1).is_err());
+        assert_eq!(project_id_map_len(max, max + 1, 1)?, 25);
+        assert!(matches!(
+            project_id_map_len(max, max + 2, 1),
+            Err(IdMapCodecError::InvalidDocIdRange { .. })
+        ));
+        assert!(matches!(
+            project_id_map_len(1, 0, 0),
+            Err(IdMapCodecError::InvalidDocIdRange { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn id_hash_size_projection_bounds_capacity_without_hash_allocation() -> TestResult {
+        assert_eq!(project_id_hash_len(0)?, 16);
+        assert_eq!(project_id_hash_len(1)?, 28);
+        assert_eq!(project_id_hash_len(2)?, 52);
+        let limits = IdHashLimits::default();
+        assert_eq!(
+            project_id_hash_len(limits.max_probe_steps)?,
+            4 + 12 * (1_usize << 25)
+        );
+        assert!(matches!(
+            project_id_hash_len(limits.max_probe_steps + 1),
+            Err(IdHashCodecError::ResourceLimit {
+                resource: "probe steps",
+                actual: 16_777_217,
+                limit: 16_777_216,
+            })
+        ));
+        // Capacity has its own durable ceiling even with a larger probe
+        // budget; the canonical sizing primitive requires no table bytes.
+        let max_capacity = 1_u64 << 28;
+        let max_entries = max_capacity * 7 / 10;
+        let capacity = canonical_id_hash_capacity(usize::try_from(max_entries)?, limits)?;
+        assert_eq!(capacity, usize::try_from(max_capacity)?);
+        assert_eq!(
+            id_hash_section_len(capacity, limits)?,
+            usize::try_from(4 + 12 * max_capacity)?
+        );
+        assert!(canonical_id_hash_capacity(usize::try_from(max_entries + 1)?, limits).is_err());
+        assert!(project_id_hash_len(u64::MAX).is_err());
         Ok(())
     }
 

@@ -79,13 +79,13 @@ use crate::keeper::BenchmarkQuillDirectorySyncState;
 #[cfg(feature = "durability")]
 use crate::keeper::UnrepairableSegmentPolicy;
 use crate::keeper::{
-    BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, CurrentPointer,
-    CurrentPointerError, GarbageCollectionOptions, GarbageCollectionReport, KeeperError,
-    KeeperSnapshot, KeeperWriter, LexicalLayout, LiveDocumentFloor,
+    BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, ConcatMergeSizing,
+    CurrentPointer, CurrentPointerError, GarbageCollectionOptions, GarbageCollectionReport,
+    KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout, LiveDocumentFloor,
     MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
     PublicationAuthorityPhase, PublicationAuthorityState, PublicationReadState, PublishIntent,
     RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout,
-    load_manifest_pair, plan_tier_merge, validate_manifest_successor,
+    load_manifest_pair, plan_tier_merge_with_fit, validate_manifest_successor,
 };
 use crate::query::{
     BooleanClause, BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError,
@@ -8235,13 +8235,13 @@ impl QuillWriterState {
     async fn apply_tier_policy(&mut self, cx: &Cx) -> Result<(), QuillIndexError> {
         loop {
             let policy = TierMergePolicy::from_config(&self.config);
-            let plan = plan_tier_merge(
-                &self
-                    .authority_snapshot()?
-                    .loaded_manifest()
-                    .manifest
-                    .segments,
+            let snapshot = self.authority_snapshot()?;
+            let sizing = ConcatMergeSizing::new(snapshot.schema(), snapshot.segments())
+                .map_err(KeeperError::from)?;
+            let plan = plan_tier_merge_with_fit(
+                &snapshot.loaded_manifest().manifest.segments,
                 policy,
+                |range| sizing.check(range).is_ok(),
             )?;
             let Some(plan) = plan else {
                 return Ok(());
@@ -8286,16 +8286,28 @@ impl QuillWriterState {
         // Every docid this session issued lies at or above the frontier it
         // opened at, so its segments are the manifest's consecutive tail.
         let frontier = self.bulk_session_docid_lo;
-        let source_segment_ids = self
-            .authority_snapshot()?
-            .loaded_manifest()
-            .manifest
-            .segments
-            .iter()
-            .filter(|segment| segment.docid_lo >= frontier)
-            .map(|segment| segment.segment_id)
-            .collect::<Vec<_>>();
-        if source_segment_ids.len() > 1 {
+        let source_groups = {
+            let snapshot = self.authority_snapshot()?;
+            let segments = &snapshot.loaded_manifest().manifest.segments;
+            let start = segments.partition_point(|segment| segment.docid_lo < frontier);
+            let sizing = ConcatMergeSizing::new(snapshot.schema(), snapshot.segments())
+                .map_err(KeeperError::from)?;
+            sizing
+                .groups(start)
+                .map_err(KeeperError::from)?
+                .into_iter()
+                .map(|range| {
+                    segments[range]
+                        .iter()
+                        .map(|segment| segment.segment_id)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        // Publish each compatible run through the ordinary concat protocol.
+        // If a later run fails or is cancelled, earlier publications remain
+        // valid and the bulk flag allows recovery to resume the remaining work.
+        for source_segment_ids in source_groups {
             let output_segment_id =
                 self.derive_policy_segment_id(&source_segment_ids, b"bulk-finish")?;
             let created_unix_s = self.created_unix_s()?;
@@ -12614,16 +12626,18 @@ impl QuillIndex {
         }
     }
 
-    /// Finish an explicitly configured bulk build with one final
-    /// bound-consecutive concat pass and clear the durable bulk marker.
+    /// Finish an explicitly configured bulk build with format-compatible
+    /// bound-consecutive concat groups and clear the durable bulk marker.
     ///
     /// Intermediate MANIFEST generations remain crash-resumable according to
     /// [`QuillConfig::bulk_publish_segment_cadence`]. The pass packs the
-    /// segments this load wrote into one; segments an earlier writer finished
-    /// before this one opened are not rewritten. Ordinary tier merging is then
-    /// re-enabled: it runs once here, and for subsequent commits. A build into
-    /// an empty index, or one resuming an interrupted bulk load, therefore
-    /// ends with at most one sealed segment.
+    /// segments this load wrote into consecutive groups whose projected
+    /// metadata fits the durable format, retaining singleton groups. Each
+    /// group publishes independently, so an interrupted build resumes from
+    /// its last durable generation. Segments an earlier writer finished before
+    /// this one opened are not rewritten by this pass. Ordinary tier merging
+    /// is then re-enabled: it runs once here, and for subsequent commits.
+    /// Large builds can therefore finish with multiple sealed segments.
     ///
     /// # Errors
     ///
@@ -12641,7 +12655,8 @@ impl QuillIndex {
     /// # Errors
     ///
     /// Rejects writer-lock failure, uncommitted state, cancellation, a
-    /// nonconsecutive source run, codec failure, or publication failure.
+    /// nonconsecutive source run, unrepresentable projected output, codec
+    /// failure, or publication failure.
     pub async fn concat_merge(
         &self,
         cx: &Cx,
