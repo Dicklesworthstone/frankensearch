@@ -9,6 +9,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
@@ -233,15 +235,59 @@ struct ReadText {
     classification: FileClassificationDecision,
 }
 
+type TextReads = BTreeMap<PathBuf, ReadText>;
+type ReadJob = Box<dyn FnOnce() -> SearchResult<Option<TextReads>> + Send>;
+
+/// Only this future owns the right to keep reading. The blocking job holds the
+/// stop flag, not this guard, so a queued or running job cannot keep itself alive
+/// after its caller abandons the await. Do not cancel the caller's shared Cx.
+struct ReadGuard(Arc<AtomicBool>);
+
+impl Drop for ReadGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn read_checkpoint(cx: &Cx, abandoned: &AtomicBool) -> SearchResult<()> {
+    retained_search_checkpoint(cx)?;
+    if abandoned.load(Ordering::Acquire) {
+        return Err(SearchError::Cancelled {
+            phase: "complete_watch.read_batch".to_owned(),
+            reason: "the source-read future was abandoned".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// One caller-owned blocking-pool job for the complete bounded text delta.
 /// Per-file awaits can each pay a current-thread runtime wake delay (bd-0wxjd).
 /// Metadata-only files and removals are deliberately absent from these requests.
 /// Empty text inventories submit no work, and cancellation dominates no-op and
-/// unsupported plans. The job only reads; abandoning it cannot publish anything.
+/// unsupported plans. A dropped await stops queued and between-file work. A
+/// regular-file read already executing can finish its bounded scalar operation;
+/// this does not claim to preempt an OS read. No job can publish independently.
 async fn read_text_batch(
     cx: &Cx,
     requests: Vec<(PathBuf, SourceStamp)>,
-) -> SearchResult<Option<BTreeMap<PathBuf, ReadText>>> {
+) -> SearchResult<Option<TextReads>> {
+    read_text_batch_with(cx, requests, |job| {
+        asupersync::runtime::spawn_blocking(job)
+    })
+    .await
+}
+
+/// One submission boundary shared with deterministic queue/drop tests. The
+/// production caller above always uses the existing Asupersync blocking pool.
+async fn read_text_batch_with<F, Fut>(
+    cx: &Cx,
+    requests: Vec<(PathBuf, SourceStamp)>,
+    submit: F,
+) -> SearchResult<Option<TextReads>>
+where
+    F: FnOnce(ReadJob) -> Fut,
+    Fut: std::future::Future<Output = SearchResult<Option<TextReads>>>,
+{
     retained_search_checkpoint(cx)?;
     if !text_batch_supported(cx, &requests)? {
         return Ok(None);
@@ -250,11 +296,12 @@ async fn read_text_batch(
         return Ok(Some(BTreeMap::new()));
     }
     let task_cx = cx.clone();
-    let result = asupersync::runtime::spawn_blocking(move || {
-        read_text_sources(&task_cx, &requests)
-    })
-    .await;
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let guard = ReadGuard(Arc::clone(&abandoned));
+    let job = Box::new(move || read_text_sources(&task_cx, &requests, &abandoned, read_source));
+    let result = submit(job).await;
     retained_search_checkpoint(cx)?;
+    drop(guard);
     result
 }
 
@@ -283,31 +330,44 @@ fn text_batch_supported(cx: &Cx, requests: &[(PathBuf, SourceStamp)]) -> SearchR
 /// returning a partial batch or retrying a failed read with weaker admission.
 /// UTF-8 decoding consumes each byte buffer, so the total owned source payload
 /// is at most MAX_RAW_BYTES; it is moved, not copied, into the mutation batch.
-fn read_text_sources(
+fn read_text_sources<F>(
     cx: &Cx,
     requests: &[(PathBuf, SourceStamp)],
-) -> SearchResult<Option<BTreeMap<PathBuf, ReadText>>> {
-    retained_search_checkpoint(cx)?;
+    abandoned: &AtomicBool,
+    mut read: F,
+) -> SearchResult<Option<TextReads>>
+where
+    F: FnMut(&Cx, &Path, &SourceStamp) -> SearchResult<(Vec<u8>, u64)>,
+{
+    read_checkpoint(cx, abandoned)?;
     let mut results = BTreeMap::new();
     for (path, stamp) in requests {
-        retained_search_checkpoint(cx)?;
-        let (bytes, modified_ms) = read_source(cx, path, stamp)?;
+        read_checkpoint(cx, abandoned)?;
+        let response = read(cx, path, stamp);
+        read_checkpoint(cx, abandoned)?;
+        let (bytes, modified_ms) = response?;
         let classification = classify_file_for_ingest(path, &bytes);
-        retained_search_checkpoint(cx)?;
+        read_checkpoint(cx, abandoned)?;
         if classification.detected_type != DetectedType::Text
             || classification.ingest_action != IngestAction::Index
         {
             return Ok(None);
         }
         let text = String::from_utf8(bytes);
-        retained_search_checkpoint(cx)?;
-        let Ok(text) = text else { return Ok(None) };
+        read_checkpoint(cx, abandoned)?;
+        let Ok(text) = text else {
+            return Ok(None);
+        };
         results.insert(
             path.clone(),
-            ReadText { text, modified_ms, classification },
+            ReadText {
+                text,
+                modified_ms,
+                classification,
+            },
         );
     }
-    retained_search_checkpoint(cx)?;
+    read_checkpoint(cx, abandoned)?;
     Ok(Some(results))
 }
 
@@ -452,7 +512,10 @@ mod tests;
 
 #[cfg(test)]
 mod metadata_tests {
+    use std::future::Future;
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::Instant;
 
     use asupersync::test_utils::run_test_with_cx;
@@ -822,6 +885,129 @@ mod metadata_tests {
             query_runtime.config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
             let mut reader = query_runtime.open_retained_search(&cx, &root).await.unwrap();
             assert_eq!(reader.search(&cx, "retrycohort", 10).await.unwrap().last().unwrap().hits.len(), 2);
+        });
+    }
+
+    struct NoopWake;
+
+    impl Wake for NoopWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    #[test]
+    fn one_owned_submission_reads_all_text_and_noops_do_not_queue_work() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let mut requests = Vec::new();
+            for name in ["first.md", "second.md", "third.md"] {
+                let path = directory.path().join(name);
+                fs::write(&path, format!("complete source for {name}")).unwrap();
+                requests.push(request(&path));
+            }
+            let submitted = AtomicUsize::new(0);
+            let results = read_text_batch_with(&cx, requests, |job| {
+                submitted.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(job())
+            }).await.unwrap().unwrap();
+            assert_eq!(submitted.load(Ordering::SeqCst), 1);
+            assert_eq!(results.len(), 3);
+            assert!(read_text_batch_with(&cx, Vec::new(), |_| {
+                submitted.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err(source_changed()))
+            }).await.unwrap().unwrap().is_empty());
+            assert_eq!(submitted.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn unpolled_source_read_future_never_submits_work_or_cancels_its_caller() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.md");
+            fs::write(&path, "original source text").unwrap();
+            let submitted = AtomicUsize::new(0);
+            let future = read_text_batch_with(&cx, vec![request(&path)], |job| {
+                submitted.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(job())
+            });
+            drop(future);
+            assert_eq!(submitted.load(Ordering::SeqCst), 0);
+            assert!(!cx.is_cancel_requested());
+            assert_eq!(read_text_batch(&cx, vec![request(&path)]).await.unwrap().unwrap().len(), 1);
+        });
+    }
+
+    #[test]
+    fn dropping_a_pending_read_future_stops_its_queued_job_before_file_io() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.md");
+            fs::write(&path, "original source text").unwrap();
+            let queued = Arc::new(Mutex::new(None::<ReadJob>));
+            let captured = Arc::clone(&queued);
+            let mut future = Box::pin(read_text_batch_with(&cx, vec![request(&path)], move |job| {
+                assert!(captured.lock().unwrap().replace(job).is_none());
+                std::future::pending()
+            }));
+            let waker = Waker::from(Arc::new(NoopWake));
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Pending));
+            drop(future);
+            // If dropping the future did not stop the queued job, this would
+            // now be an I/O/source-changed error, not the exact local cancel.
+            fs::rename(&path, directory.path().join("preserved-source.md")).unwrap();
+            let job = queued.lock().unwrap().take().unwrap();
+            assert!(matches!(job(), Err(SearchError::Cancelled { ref phase, .. })
+                if phase == "complete_watch.read_batch"));
+            assert!(!cx.is_cancel_requested());
+            fs::write(&path, "fresh retry text").unwrap();
+            let results = read_text_batch(&cx, vec![request(&path)]).await.unwrap().unwrap();
+            assert_eq!(results[&path].text, "fresh retry text");
+        });
+    }
+
+    #[test]
+    fn abandonment_after_a_scalar_read_stops_the_batch_before_the_next_source() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let first = directory.path().join("first.md");
+            let second = directory.path().join("second.md");
+            fs::write(&first, "first source text").unwrap();
+            fs::write(&second, "second source text").unwrap();
+            let requests = vec![request(&first), request(&second)];
+            for fail_read in [false, true] {
+                let abandoned = Arc::new(AtomicBool::new(false));
+                let mut guard = Some(ReadGuard(Arc::clone(&abandoned)));
+                let mut reads = 0;
+                let result = read_text_sources(&cx, &requests, &abandoned, |cx, path, stamp| {
+                    reads += 1;
+                    let result = read_source(cx, path, stamp);
+                    // Deterministic boundary: the scalar read has completed,
+                    // but its result has not yet entered the shared batch.
+                    drop(guard.take());
+                    if fail_read { Err(source_changed()) } else { result }
+                });
+                assert!(matches!(result, Err(SearchError::Cancelled { ref phase, .. })
+                    if phase == "complete_watch.read_batch"));
+                assert_eq!(reads, 1, "abandoned work must not open the second source");
+                assert!(!cx.is_cancel_requested());
+            }
+        });
+    }
+
+    #[test]
+    fn caller_cancellation_after_job_completion_discards_successful_read_results() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("source.md");
+            fs::write(&path, "original source text").unwrap();
+            let result = read_text_batch_with(&cx, vec![request(&path)], |job| {
+                let result = job();
+                assert!(result.as_ref().is_ok_and(|batch| batch.as_ref().is_some_and(|batch| batch.len() == 1)));
+                cx.set_cancel_requested(true);
+                std::future::ready(result)
+            }).await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
         });
     }
 }
