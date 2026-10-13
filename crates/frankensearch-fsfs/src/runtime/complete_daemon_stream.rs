@@ -13,9 +13,41 @@ use std::task::Poll;
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 use super::super::super::FSFS_DAEMON_RESPONSE_MAX_BYTES;
 use super::{IO_POLL_INTERVAL, complete_cli_error, retained_search_checkpoint};
+
+/// Observe a disconnected response consumer without reading request bytes or
+/// writing a probe into the response. EOF on the input half alone is NOT a
+/// disconnect: clients may shutdown(Write) and continue receiving the answer.
+/// Request only write readiness, since BSD poll maps a read-side EOF to HUP.
+/// Ignore OUT itself; this zero-time probe never waits or schedules a wake on
+/// a normally writable socket. The owning driver's existing tick sets cadence.
+fn check_peer(peer: &UnixStream) -> io::Result<()> {
+    let mut descriptors = [PollFd::new(peer, PollFlags::OUT)];
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match poll(&mut descriptors, Some(&timeout)) {
+        Ok(_) => {}
+        // A signal is not evidence of disconnection. The next owning poll
+        // repeats the check; do not spin or abort healthy work on EINTR.
+        Err(rustix::io::Errno::INTR) => return Ok(()),
+        Err(error) => return Err(io::Error::from(error)),
+    }
+    if descriptors[0]
+        .revents()
+        .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
+    {
+        return Err(io::Error::new(
+            ErrorKind::BrokenPipe,
+            "complete-generation response peer disconnected",
+        ));
+    }
+    Ok(())
+}
 
 struct Output {
     peer: UnixStream,
@@ -27,6 +59,9 @@ struct Output {
 
 impl Output {
     fn drain(&mut self) -> io::Result<()> {
+        // Check even with an empty queue: quality inference or generation
+        // admission can suspend long after Initial was completely delivered.
+        check_peer(&self.peer)?;
         while self.offset < self.pending.len() {
             match self.peer.write(&self.pending[self.offset..]) {
                 Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "stream peer closed")),
@@ -115,6 +150,8 @@ impl Write for PhaseWriter {
 /// Drive and drain one producer, retaining its completed result until all
 /// committed records have been delivered. The caller supplies the overall
 /// request deadline through `run_request`; this function adds no retry/replay.
+/// Peer hangup drops pending work at the next owning poll, even without queued
+/// output. It does not cancel the daemon's Cx or preempt synchronous inference.
 pub(super) async fn drive<T>(
     cx: &Cx,
     output: &PhaseWriter,
@@ -136,6 +173,11 @@ pub(super) async fn drive<T>(
             {
                 producer = None;
                 finished = Some(result);
+            }
+            // A provider may request cancellation and finish in the same poll.
+            // Do not turn that into success or drain more queued output first.
+            if let Err(error) = retained_search_checkpoint(cx) {
+                return Poll::Ready(Err(error));
             }
             let mut state = match output.lock() {
                 Ok(state) => state,
@@ -213,7 +255,9 @@ mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
     use std::io::Read;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::net::Shutdown;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::task::{Context, Waker};
     use std::time::Duration;
 
     #[test]
@@ -381,5 +425,134 @@ mod tests {
         ] {
             assert!(validate_request(raw).is_err());
         }
+    }
+
+    #[test]
+    fn peer_probe_preserves_request_bytes_and_write_half_close() {
+        run_test_with_cx(|cx| async move {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client.write_all(b"request bytes\n").unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
+            let output = PhaseWriter::new(&server).unwrap();
+            let mut writer = output.clone();
+            for _ in 0..4 {
+                check_peer(&server).unwrap();
+            }
+            let mut request = [0; 14];
+            server.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"request bytes\n");
+            assert_eq!(server.read(&mut [0; 1]).unwrap(), 0);
+            drive(&cx, &output, async {
+                writer.write_all(b"{}\n")?;
+                writer.flush()?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let mut response = [0; 3];
+            client.read_exact(&mut response).unwrap();
+            assert_eq!(&response, b"{}\n");
+        });
+    }
+
+    #[test]
+    fn disconnected_pending_stream_stops_with_an_empty_output_queue() {
+        run_test_with_cx(|cx| async move {
+            for emit_initial in [false, true] {
+                let (mut client, server) = UnixStream::pair().unwrap();
+                let output = PhaseWriter::new(&server).unwrap();
+                let mut writer = output.clone();
+                let released = Arc::new(AtomicBool::new(false));
+                let owned = Released(Arc::clone(&released));
+                let mut request = Box::pin(drive(&cx, &output, async move {
+                    let _owned = owned;
+                    if emit_initial {
+                        writer.write_all(b"{}\n")?;
+                        writer.flush()?;
+                    }
+                    std::future::pending::<SearchResult<()>>().await
+                }));
+                let mut task = Context::from_waker(Waker::noop());
+                assert!(request.as_mut().poll(&mut task).is_pending());
+                assert!(output.lock().unwrap().pending.is_empty());
+                if emit_initial {
+                    let mut initial = [0; 3];
+                    client.read_exact(&mut initial).unwrap();
+                    assert_eq!(&initial, b"{}\n");
+                }
+                drop(client);
+                // No model completion, new write, sleep or deadline expiry.
+                // The parent remains Pending here because drain sees no bytes.
+                assert!(matches!(
+                    request.as_mut().poll(&mut task),
+                    Poll::Ready(Err(SearchError::Io(error)))
+                        if error.kind() == ErrorKind::BrokenPipe
+                ));
+                assert!(released.load(Ordering::SeqCst));
+                retained_search_checkpoint(&cx).unwrap();
+            }
+            let (_client, server) = UnixStream::pair().unwrap();
+            let output = PhaseWriter::new(&server).unwrap();
+            assert_eq!(drive(&cx, &output, async { Ok(42) }).await.unwrap(), 42);
+        });
+    }
+
+    #[test]
+    fn closed_peer_refuses_before_polling_admission_or_inference() {
+        run_test_with_cx(|cx| async move {
+            let (client, server) = UnixStream::pair().unwrap();
+            let output = PhaseWriter::new(&server).unwrap();
+            let calls = AtomicUsize::new(0);
+            client.shutdown(Shutdown::Both).unwrap();
+            let result = drive(&cx, &output, async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+            assert!(matches!(result, Err(SearchError::Io(error))
+                if error.kind() == ErrorKind::BrokenPipe));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(!output.emitted());
+            retained_search_checkpoint(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn closing_only_one_client_handle_keeps_the_response_consumer_alive() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let retained = client.try_clone().unwrap();
+        drop(client);
+        check_peer(&server).unwrap();
+        drop(retained);
+        assert_eq!(check_peer(&server).unwrap_err().kind(), ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn cancellation_dominates_same_poll_completion_and_peer_hangup() {
+        run_test_with_cx(|cx| async move {
+            for fail in [false, true] {
+                let (_client, server) = UnixStream::pair().unwrap();
+                let output = PhaseWriter::new(&server).unwrap();
+                let result = drive(&cx, &output, async {
+                    cx.set_cancel_requested(true);
+                    if fail {
+                        Err(SearchError::Io(io::Error::other("provider failure")))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+                cx.set_cancel_requested(false);
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                assert!(!output.emitted());
+            }
+            let (client, server) = UnixStream::pair().unwrap();
+            let output = PhaseWriter::new(&server).unwrap();
+            drop(client);
+            cx.set_cancel_requested(true);
+            let result = drive(&cx, &output, async { Ok(()) }).await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+        });
     }
 }
