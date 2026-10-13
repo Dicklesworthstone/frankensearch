@@ -127,14 +127,18 @@ fn boot_expiry_cannot_be_extended_by_wall_clock_rollback_or_cache_hits() {
     // Wall time moves backward but the one-minute boot-time lease never renews.
     for (wall, boot) in [(1000, 200), (900, 259), (800, 260)] {
         let mut hit = ReceiptBook::load_at(dir.path(), policy, clock(wall, boot));
-        let receipt = hit.admitted(binding, identity).expect("hit");
+        let receipt = hit
+            .admitted_at(binding, identity, clock(wall, boot))
+            .expect("hit");
         assert_eq!(receipt.verified_boot_ns, 200 * NANOS_PER_SECOND);
         hit.keep(receipt);
         hit.persist();
     }
     for (wall, boot) in [(1000, 199), (800, 261), (100_000, 261)] {
         let miss = ReceiptBook::load_at(dir.path(), policy, clock(wall, boot));
-        assert!(miss.admitted(binding, identity).is_none());
+        assert!(miss
+            .admitted_at(binding, identity, clock(wall, boot))
+            .is_none());
     }
 }
 
@@ -151,7 +155,7 @@ fn every_identity_and_manifest_component_is_required() {
     );
     first.persist();
     let book = ReceiptBook::load_at(dir.path(), Policy::default(), clock(201, 201));
-    assert!(book.admitted(binding, identity).is_some());
+    assert!(book.admitted_at(binding, identity, book.clock).is_some());
     for changed in [
         Identity { dev: 9, ..identity },
         Identity { ino: 9, ..identity },
@@ -173,7 +177,7 @@ fn every_identity_and_manifest_component_is_required() {
             ..identity
         },
     ] {
-        assert!(book.admitted(binding, changed).is_none());
+        assert!(book.admitted_at(binding, changed, book.clock).is_none());
     }
     for changed in [
         Binding {
@@ -193,7 +197,7 @@ fn every_identity_and_manifest_component_is_required() {
             ..binding
         },
     ] {
-        assert!(book.admitted(changed, identity).is_none());
+        assert!(book.admitted_at(changed, identity, book.clock).is_none());
     }
     assert!(book.verified(binding, identity, None).is_none());
     assert!(
@@ -244,7 +248,9 @@ fn namespace_or_boot_producer_change_invalidates_proofs() {
     .expect("write");
     let reopened = ReceiptBook::load_at(dir.path(), Policy::default(), clock(201, 201));
     assert!(reopened.enabled());
-    assert!(reopened.admitted(binding, identity).is_none());
+    assert!(reopened
+        .admitted_at(binding, identity, reopened.clock)
+        .is_none());
 }
 
 #[cfg(target_os = "linux")]
@@ -324,5 +330,94 @@ fn descriptor_identity_detects_replacement_truncation_and_restored_mtime() {
     assert_eq!(
         Identity::of_file(&file).expect("retained inode").ino,
         before.ino
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn receipts_expire_during_one_open_without_reloading_the_book() {
+    let dir = private_dir();
+    let (binding, identity, _) = fixture();
+    let policy = Policy {
+        max_age: Duration::from_secs(60),
+        minimum_file_age: Duration::from_secs(10),
+    };
+    let mut first = ReceiptBook::load_at(dir.path(), policy, clock(1000, 200));
+    first.keep(
+        first
+            .verified(binding, identity, Some(identity))
+            .expect("fully verified receipt"),
+    );
+    first.persist();
+    let mut book = ReceiptBook::load_at(dir.path(), policy, clock(1000, 250));
+    assert!(book.enabled());
+
+    // Simulate later segment workers using the SAME already-loaded book.
+    // Backward wall time cannot renew its original boot-time deadline.
+    for now in [clock(1000, 250), clock(900, 259), clock(800, 260)] {
+        let receipt = book.admitted_at(binding, identity, now).expect("live lease");
+        assert_eq!(receipt.verified_boot_ns, 200 * NANOS_PER_SECOND);
+        book.keep(receipt);
+    }
+    let mut just_expired = clock(800, 260).expect("boundary clock");
+    just_expired.boot_ns += 1;
+    for now in [
+        Some(just_expired),
+        clock(800, 261),
+        clock(100_000, 261),
+        clock(1000, 249), // Boot time must not regress behind this open.
+        clock(109, 260),  // Minimum file age also uses the decision-time clock.
+        None,
+    ] {
+        assert!(
+            book.admitted_at(binding, identity, now).is_none(),
+            "stale, regressed, too-young or unavailable clock: {now:?}"
+        );
+    }
+    book.persist();
+    let reopened = ReceiptBook::load_at(dir.path(), policy, clock(800, 261));
+    assert_eq!(
+        reopened.loaded[&binding].verified_boot_ns,
+        200 * NANOS_PER_SECOND,
+        "keeping cache hits must not renew the persisted proof"
+    );
+    assert!(reopened
+        .admitted_at(binding, identity, reopened.clock)
+        .is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn production_admission_samples_the_clock_instead_of_the_load_timestamp() {
+    let dir = private_dir();
+    let (binding, identity, _) = fixture();
+    let now = Clock::now().expect("Linux boot clock");
+    let loaded_at = Some(Clock {
+        boot_ns: now.boot_ns.checked_sub(1).expect("positive host uptime"),
+        ..now
+    });
+    let policy = Policy {
+        max_age: Duration::ZERO,
+        minimum_file_age: Duration::ZERO,
+    };
+    let mut first = ReceiptBook::load_at(dir.path(), policy, loaded_at);
+    first.keep(
+        first
+            .verified(binding, identity, Some(identity))
+            .expect("fully verified receipt"),
+    );
+    first.persist();
+    let mut book = ReceiptBook::load_at(dir.path(), policy, loaded_at);
+    assert!(book.admitted_at(binding, identity, loaded_at).is_some());
+    // No sleep: the receipt was already older than the real boot clock before
+    // the book was loaded. The old implementation admits it indefinitely.
+    assert!(
+        book.admitted(binding, identity).is_none(),
+        "the production decision must not use the frozen load timestamp"
+    );
+    book.policy.max_age = Duration::from_secs(3600);
+    assert!(
+        book.admitted(binding, identity).is_some(),
+        "a fresh-clock lookup must still reuse a proof within its lease"
     );
 }

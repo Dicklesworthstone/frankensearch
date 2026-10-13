@@ -151,6 +151,8 @@ pub struct ReceiptBook {
     loaded: BTreeMap<Binding, Receipt>,
     kept: BTreeMap<Binding, Receipt>,
     policy: Policy,
+    /// Conservative lower bound for newly verified receipts, not the time at
+    /// which later segments are admitted from this book.
     clock: Option<Clock>,
 }
 
@@ -183,10 +185,27 @@ impl ReceiptBook {
     }
 
     pub(crate) fn admitted(&self, binding: Binding, identity: Identity) -> Option<Receipt> {
+        // Loading and earlier segment checks can outlast a receipt's lease.
+        // Each decision must use current boot time, including time suspended,
+        // rather than freezing proof age for the whole snapshot admission.
+        self.admitted_at(binding, identity, Clock::now())
+    }
+
+    fn admitted_at(
+        &self,
+        binding: Binding,
+        identity: Identity,
+        clock: Option<Clock>,
+    ) -> Option<Receipt> {
         if !self.enabled() || identity.len != binding.file_len {
             return None;
         }
-        let clock = self.clock?;
+        let clock = clock?;
+        // A clock that regressed even relative to this open is not usable
+        // evidence, regardless of whether the receipt predates both reads.
+        if clock.boot_ns < self.clock?.boot_ns {
+            return None;
+        }
         let receipt = self.loaded.get(&binding)?;
         let age = clock.boot_ns.checked_sub(receipt.verified_boot_ns)?;
         let max_age = u64::try_from(self.policy.max_age.as_nanos()).ok()?;
