@@ -214,3 +214,163 @@ fn lexical_source_batch_persists_metadata_and_preserves_the_retained_reader() {
         drop(store.begin(&cx).unwrap());
     });
 }
+
+#[test]
+fn metadata_sources_are_path_only_and_never_certify_file_content() {
+    run_test_with_cx(|cx| async move {
+        let operations = [
+            RetainedMutation::Upsert {
+                id: "alpha.md".to_owned(),
+                text: "alpha.md".to_owned(),
+            },
+            RetainedMutation::Upsert {
+                id: "text.md".to_owned(),
+                text: "actual source text".to_owned(),
+            },
+        ];
+        let attributes = BTreeMap::from([
+            ("alpha.md".to_owned(), source(IngestionClass::MetadataOnly)),
+            ("text.md".to_owned(), source(IngestionClass::LexicalOnly)),
+        ]);
+        // The opaque document API still treats the same text as an ordinary
+        // upsert; source-only policy never leaks into that public interface.
+        assert!(prepare(&cx, &operations).unwrap()["alpha.md"].as_ref().unwrap().semantic());
+        let batch = prepare_source_batch(&cx, &operations, &attributes)
+            .unwrap()
+            .unwrap();
+        let body = batch.documents["alpha.md"].as_ref().unwrap();
+        assert!(!body.semantic());
+        assert_eq!(body.embedding, "alpha.md");
+        assert_eq!(body.lexical, "alpha.md");
+        assert_eq!(body.revision(0), 42);
+        assert_eq!(body.reason(IngestionClass::LexicalOnly), "index.plan.metadata_only");
+        assert_eq!(body.source.as_ref().unwrap().metadata["ingestion_class"], "metadata_only");
+        assert_eq!(
+            batch.source_inputs.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["text.md"],
+            "the path-only operation cannot stand in for a raw file-byte witness"
+        );
+    });
+}
+
+#[test]
+fn metadata_sources_reject_content_even_in_a_superseded_input() {
+    run_test_with_cx(|cx| async move {
+        let attributes = BTreeMap::from([
+            ("alpha.md".to_owned(), source(IngestionClass::MetadataOnly)),
+        ]);
+        for text in ["secret file contents", " alpha.md "] {
+            let operations = [
+                RetainedMutation::Upsert { id: "alpha.md".to_owned(), text: text.to_owned() },
+                RetainedMutation::Upsert { id: "alpha.md".to_owned(), text: "alpha.md".to_owned() },
+            ];
+            assert!(matches!(
+                prepare_source_batch(&cx, &operations, &attributes),
+                Err(SearchError::InvalidConfig { .. })
+            ));
+        }
+    });
+}
+
+#[test]
+fn metadata_sources_keep_timestamp_metadata_operation_and_cancel_bounds() {
+    run_test_with_cx(|cx| async move {
+        let operation = RetainedMutation::Upsert {
+            id: "alpha.md".to_owned(), text: "alpha.md".to_owned(),
+        };
+        let mut overflow = source(IngestionClass::MetadataOnly);
+        overflow.modified_ms = u64::MAX;
+        let mut excess = source(IngestionClass::MetadataOnly);
+        excess.metadata = (0..65).map(|n| (n.to_string(), "v".to_owned())).collect();
+        for attributes in [overflow, excess] {
+            assert!(prepare_source_batch(
+                &cx, std::slice::from_ref(&operation),
+                &BTreeMap::from([("alpha.md".to_owned(), attributes)]),
+            ).is_err());
+        }
+        let attributes = BTreeMap::from([
+            ("alpha.md".to_owned(), source(IngestionClass::MetadataOnly)),
+        ]);
+        assert!(prepare_source_batch(&cx, &vec![operation.clone(); MAX_OPERATIONS + 1], &attributes)
+            .unwrap().is_none());
+        cx.set_cancel_requested(true);
+        let cancelled = prepare_source_batch(&cx, &[operation], &attributes);
+        cx.set_cancel_requested(false);
+        assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+    });
+}
+
+#[test]
+fn metadata_demotion_publishes_path_only_and_preserves_the_old_reader() {
+    use crate::config::DegradationOverrideMode;
+    use crate::{CliCommand, CliInput, FsfsConfig};
+
+    run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source");
+        let root = directory.path().join("store");
+        std::fs::create_dir(&source_path).unwrap();
+        std::fs::write(source_path.join("alpha.md"), "privatebody original text").unwrap();
+        std::fs::write(source_path.join("stable.md"), "untouchedword original text").unwrap();
+        let mut config = FsfsConfig::default();
+        config.indexing.offline = true;
+        config.indexing.quality_model.clear();
+        config.search.fast_only = true;
+        config.search.rerank = false;
+        "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+        let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Index,
+            target_path: Some(source_path.clone()),
+            index_dir: Some(root.clone()),
+            quiet: true,
+            ..CliInput::default()
+        });
+        runtime.lexical_only_indexing = true;
+        let GenerationPublication::Durable(first) = runtime
+            .rebuild_retained_generation(&cx, &root).await.unwrap()
+        else { panic!("fixture must be durable"); }; // ubs:ignore — test assertion.
+        let mut query_runtime = runtime.clone();
+        query_runtime.config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+        let mut pinned = query_runtime.open_retained_search(&cx, &root).await.unwrap();
+        let before = FsfsRuntime::read_matching_manifest_generation(first.path()).unwrap().unwrap();
+        let operations = [RetainedMutation::Upsert {
+            id: "alpha.md".to_owned(), text: "alpha.md".to_owned(),
+        }];
+        let attributes = BTreeMap::from([
+            ("alpha.md".to_owned(), source(IngestionClass::MetadataOnly)),
+        ]);
+        let batch = prepare_source_batch(&cx, &operations, &attributes).unwrap().unwrap();
+        assert!(batch.source_inputs.is_empty());
+        let outcome = runtime.apply_retained_source_batch_with_precommit(
+            &cx, &root, &first, batch, |_| Ok(()),
+        ).await.unwrap();
+        assert_eq!((outcome.upserted, outcome.deleted), (1, 0));
+        let Some(GenerationPublication::Durable(next)) = outcome.publication
+        else { panic!("metadata update must be durable"); }; // ubs:ignore — test assertion.
+        let manifests = FsfsRuntime::read_matching_manifest_generation(next.path()).unwrap().unwrap();
+        let metadata = &manifests["alpha.md"];
+        assert_eq!(metadata.ingestion_class, "metadata_only");
+        assert_eq!(metadata.reason_code, "index.plan.metadata_only");
+        assert_eq!(metadata.revision, 42);
+        assert!(metadata.fast_windows.is_none());
+        assert_eq!(serde_json::to_value(&manifests["stable.md"]).unwrap(),
+            serde_json::to_value(&before["stable.md"]).unwrap());
+        let mut reader = query_runtime.open_retained_search(&cx, &root).await.unwrap();
+        let hits = reader.search(&cx, "alpha", 10).await.unwrap();
+        assert!(hits.last().unwrap().hits.iter().any(|hit| hit.path.ends_with("alpha.md")));
+        assert!(reader.search(&cx, "privatebody", 10).await.unwrap().last().unwrap().hits.is_empty());
+        assert_eq!(pinned.search(&cx, "privatebody", 10).await.unwrap().last().unwrap().hits.len(), 1);
+        assert_eq!(reader.search(&cx, "untouchedword", 10).await.unwrap().last().unwrap().hits.len(), 1);
+        assert_eq!(std::fs::read_to_string(source_path.join("alpha.md")).unwrap(), "privatebody original text");
+        assert_eq!(pinned.generation(), &first);
+
+        // A failed final source check must not install even a valid path-only
+        // candidate. The prior metadata-only publication remains selected.
+        let batch = prepare_source_batch(&cx, &operations, &attributes).unwrap().unwrap()
+            .with_source_check(|_| Err(invalid("source changed before publication")));
+        assert!(runtime.apply_retained_source_batch_with_precommit(
+            &cx, &root, &next, batch, |_| Ok(()),
+        ).await.is_err());
+        assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(next));
+    });
+}

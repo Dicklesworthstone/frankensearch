@@ -127,6 +127,20 @@ pub(super) fn prepare_source_batch(
         Err(SearchError::InvalidConfig { .. }) => return Ok(None),
         Err(error) => return Err(error),
     };
+    // A metadata-only source supplies its relative path, never its contents.
+    // Check raw input too: canonicalization must not hide an accidental body,
+    // even when a later operation for the same metadata-only ID supersedes it.
+    for operation in operations {
+        retained_search_checkpoint(cx)?;
+        if let RetainedMutation::Upsert { id, text } = operation
+            && sources
+                .get(id)
+                .is_some_and(|source| source.ingestion_class == IngestionClass::MetadataOnly)
+            && text != id
+        {
+            return Err(invalid("metadata-only source input must be its exact document ID"));
+        }
+    }
     attach_sources(cx, &mut documents, sources)?;
     let source_inputs = inherited_reuse::record_source_inputs(cx, operations, &documents)?;
     Ok(Some(SourceBatch {
@@ -187,12 +201,20 @@ fn attach_sources(
         if i64::try_from(source.modified_ms).is_err()
             || !matches!(
                 source.ingestion_class,
-                IngestionClass::FullSemanticLexical | IngestionClass::LexicalOnly
+                IngestionClass::FullSemanticLexical
+                    | IngestionClass::LexicalOnly
+                    | IngestionClass::MetadataOnly
             )
         {
             return Err(invalid(
-                "source attributes require a valid timestamp and indexed text class",
+                "source attributes require a valid timestamp and indexed source class",
             ));
+        }
+        if source.ingestion_class == IngestionClass::MetadataOnly
+            && (body.embedding != DefaultCanonicalizer::default().canonicalize(id)
+                || body.lexical != LEXICAL_CANONICALIZER.canonicalize(id))
+        {
+            return Err(invalid("metadata-only source bodies must contain only the document ID"));
         }
         bytes = bytes
             .checked_add(body.embedding.len())

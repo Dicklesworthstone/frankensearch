@@ -61,6 +61,12 @@ pub(super) fn record_source_inputs(
             .ok_or_else(|| invalid("source input has no final prepared body"))?;
         let source = body.source.as_ref()
             .ok_or_else(|| invalid("opaque document input cannot certify a source"))?;
+        // This input is a filename, not bytes read from the source file. Never
+        // mint a content witness from it. project_files invalidates any prior
+        // evidence for this changed ID; untouched source proofs still survive.
+        if source.ingestion_class == IngestionClass::MetadataOnly {
+            continue;
+        }
         let mut digest = Sha256::new();
         for chunk in text.as_bytes().chunks(64 * 1024) {
             retained_search_checkpoint(cx)?;
