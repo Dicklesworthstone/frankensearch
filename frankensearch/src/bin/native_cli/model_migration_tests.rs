@@ -177,20 +177,53 @@ fn permitted(models: Models, loads: Arc<AtomicUsize>) -> SessionControls {
 #[test]
 fn migration_grant_is_separate_serve_only_and_refuses_lexical_mode() {
     let parse = |args: &[&str]| Options::parse(args.iter().map(|arg| (*arg).to_owned()));
-    let options = parse(&["serve", "--receipt", "saved.json", "--allow-model-migration"])
-        .unwrap()
-        .unwrap();
+    let options = parse(&[
+        "serve",
+        "--receipt",
+        "saved.json",
+        "--allow-model-migration",
+    ])
+    .unwrap()
+    .unwrap();
     assert!(options.allow_model_migration);
     assert!(!options.allow_updates);
-    assert_eq!(options.activation, crate::serve::ActivationPermission::Disabled);
-    let ordinary = parse(&["serve", "--receipt", "saved.json", "--allow-activation", "--allow-updates"])
-        .unwrap()
-        .unwrap();
+    assert_eq!(
+        options.activation,
+        crate::serve::ActivationPermission::Disabled
+    );
+    let ordinary = parse(&[
+        "serve",
+        "--receipt",
+        "saved.json",
+        "--allow-activation",
+        "--allow-updates",
+    ])
+    .unwrap()
+    .unwrap();
     assert!(!ordinary.allow_model_migration);
     for args in [
-        vec!["serve", "--receipt", "saved.json", "--lexical-only", "--allow-model-migration"],
-        vec!["search", "--receipt", "saved.json", "--query", "q", "--allow-model-migration"],
-        vec!["serve", "--receipt", "saved.json", "--allow-model-migration", "--allow-model-migration"],
+        vec![
+            "serve",
+            "--receipt",
+            "saved.json",
+            "--lexical-only",
+            "--allow-model-migration",
+        ],
+        vec![
+            "search",
+            "--receipt",
+            "saved.json",
+            "--query",
+            "q",
+            "--allow-model-migration",
+        ],
+        vec![
+            "serve",
+            "--receipt",
+            "saved.json",
+            "--allow-model-migration",
+            "--allow-model-migration",
+        ],
     ] {
         assert!(parse(&args).is_err());
     }
@@ -208,7 +241,13 @@ fn unknown_or_ambiguous_migration_fields_do_not_become_searches() {
         value.as_object_mut().unwrap().remove(missing);
         assert!(serde_json::from_value::<crate::serve::Message>(value).is_err());
     }
-    for field in ["query", "timeout_ms", "allow_model_migration", "shard_size", "unknown"] {
+    for field in [
+        "query",
+        "timeout_ms",
+        "allow_model_migration",
+        "shard_size",
+        "unknown",
+    ] {
         let mut value = valid.clone();
         value[field] = serde_json::json!("unexpected");
         assert!(serde_json::from_value::<crate::serve::Message>(value).is_err());
@@ -222,18 +261,35 @@ fn warm_loop_loads_replacement_once_and_uses_new_models_after_atomic_install() {
             let root = tempfile::tempdir().unwrap();
             let old = Provider::new("old", 2);
             let (built, _) = sealed(
-                &cx, &root.path().join("old"), 1,
-                Models { fast: old.clone(), quality: None }, documents(), true,
-            ).await;
+                &cx,
+                &root.path().join("old"),
+                1,
+                Models {
+                    fast: old.clone(),
+                    quality: None,
+                },
+                documents(),
+                true,
+            )
+            .await;
             let live = NativeLiveHybridIndex::new(&cx, built).unwrap();
             let pinned = live.snapshot(&cx).await.unwrap();
             let old_bytes = crate::fs::read(pinned.index().vectors().fast().vector_path()).unwrap();
             let fast = Provider::new("new-fast", 3);
             let quality = Provider::new("new-quality", 4);
-            let models = Models { fast: fast.clone(), quality: Some(quality.clone()) };
+            let models = Models {
+                fast: fast.clone(),
+                quality: Some(quality.clone()),
+            };
             let (candidate, selection) = sealed(
-                &cx, &root.path().join("next"), 2, models.clone(), documents(), exact,
-            ).await;
+                &cx,
+                &root.path().join("next"),
+                2,
+                models.clone(),
+                documents(),
+                exact,
+            )
+            .await;
             let receipt = root.path().join("next.json");
             save_selection(&selection, &receipt).unwrap();
             drop(candidate);
@@ -247,35 +303,63 @@ fn warm_loop_loads_replacement_once_and_uses_new_models_after_atomic_install() {
             ]);
             let mut output = Vec::new();
             run_with_controls(
-                &live, &cx, &mut reader, &mut output, (crate::Mode::Full, 3),
-                permitted(models, loads.clone()), None, &query::Policy::new(&cx, None).unwrap(),
-            ).await.unwrap();
+                &live,
+                &cx,
+                &mut reader,
+                &mut output,
+                (crate::Mode::Full, 3),
+                permitted(models, loads.clone()),
+                None,
+                &query::Policy::new(&cx, None).unwrap(),
+            )
+            .await
+            .unwrap();
             let output = frames(&output);
             assert_eq!(output[0]["model_migration_enabled"], true);
             assert_eq!(output[0]["activation_enabled"], false);
             assert_eq!(output[0]["updates_enabled"], false);
-            let migration = output.iter().find(|frame| frame["operation"] == "activate_model_migration").unwrap();
+            let migration = output
+                .iter()
+                .find(|frame| frame["operation"] == "activate_model_migration")
+                .unwrap();
             assert_eq!(migration["ok"], true);
             assert_eq!(migration["selection_changed"], true);
             assert_eq!(migration["generation"], serde_json::json!(generation(2)));
             assert_eq!(migration["fast_producer"], fast.identity.fingerprint());
-            assert_eq!(migration["quality_producer"], quality.identity.fingerprint());
+            assert_eq!(
+                migration["quality_producer"],
+                quality.identity.fingerprint()
+            );
             for id in ["after", "again"] {
                 let selected: Vec<_> = output.iter().filter(|frame| frame["id"] == id).collect();
                 assert!(selected.iter().any(|frame| frame["phase"] == "initial"));
                 assert!(selected.iter().any(|frame| frame["phase"] == "refined"));
-                assert!(selected.iter().all(|frame| frame["generation"] == serde_json::json!(generation(2))));
+                assert!(
+                    selected
+                        .iter()
+                        .all(|frame| frame["generation"] == serde_json::json!(generation(2)))
+                );
             }
             assert_eq!(loads.load(Ordering::SeqCst), 1);
             assert_eq!(old.queries.load(Ordering::SeqCst), 1);
             assert_eq!(fast.queries.load(Ordering::SeqCst), 2);
             assert_eq!(quality.queries.load(Ordering::SeqCst), 2);
-            assert_eq!(fast.documents.load(Ordering::SeqCst), 3, "no inference during reopen");
+            assert_eq!(
+                fast.documents.load(Ordering::SeqCst),
+                3,
+                "no inference during reopen"
+            );
             assert_eq!(quality.documents.load(Ordering::SeqCst), 3);
             assert_eq!(pinned.generation(), generation(1));
             assert_eq!(pinned.index().vectors().fast().embedder().dimension(), 2);
-            assert_eq!(crate::fs::read(pinned.index().vectors().fast().vector_path()).unwrap(), old_bytes);
-            assert_eq!(live.snapshot(&cx).await.unwrap().generation(), generation(2));
+            assert_eq!(
+                crate::fs::read(pinned.index().vectors().fast().vector_path()).unwrap(),
+                old_bytes
+            );
+            assert_eq!(
+                live.snapshot(&cx).await.unwrap().generation(),
+                generation(2)
+            );
         }
     });
 }
@@ -286,9 +370,17 @@ fn ordinary_controller_grants_do_not_authorize_loading_new_models() {
         let root = tempfile::tempdir().unwrap();
         let model = Provider::new("old", 2);
         let (built, _) = sealed(
-            &cx, &root.path().join("old"), 1,
-            Models { fast: model.clone(), quality: None }, documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast: model.clone(),
+                quality: None,
+            },
+            documents(),
+            true,
+        )
+        .await;
         let live = NativeLiveHybridIndex::new(&cx, built).unwrap();
         let mut reader = input(&[
             request(&root.path().join("absent.json"), true),
@@ -296,16 +388,38 @@ fn ordinary_controller_grants_do_not_authorize_loading_new_models() {
         ]);
         let mut output = Vec::new();
         run_with_controls(
-            &live, &cx, &mut reader, &mut output, (crate::Mode::Fast, 3),
-            Controls { activation: true, updates: true }, None,
+            &live,
+            &cx,
+            &mut reader,
+            &mut output,
+            (crate::Mode::Fast, 3),
+            Controls {
+                activation: true,
+                updates: true,
+            },
+            None,
             &query::Policy::new(&cx, None).unwrap(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let output = frames(&output);
         assert_eq!(output[0]["model_migration_enabled"], false);
-        assert!(output[1]["error"].as_str().unwrap().contains("model migration is disabled"));
+        assert!(
+            output[1]["error"]
+                .as_str()
+                .unwrap()
+                .contains("model migration is disabled")
+        );
         assert_eq!(output[1]["selection_changed"], false);
-        assert_eq!(output.last().unwrap()["ok"], true, "session stays usable after refusal");
-        assert_eq!(live.snapshot(&cx).await.unwrap().generation(), generation(1));
+        assert_eq!(
+            output.last().unwrap()["ok"],
+            true,
+            "session stays usable after refusal"
+        );
+        assert_eq!(
+            live.snapshot(&cx).await.unwrap().generation(),
+            generation(1)
+        );
         assert_eq!(model.queries.load(Ordering::SeqCst), 1);
     });
 }
@@ -316,12 +430,22 @@ fn stale_expected_generation_and_invalid_paths_fail_before_loading() {
         let root = tempfile::tempdir().unwrap();
         let old = Provider::new("old", 2);
         let (built, _) = sealed(
-            &cx, &root.path().join("old"), 1,
-            Models { fast: old, quality: None }, documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast: old,
+                quality: None,
+            },
+            documents(),
+            true,
+        )
+        .await;
         let live = NativeLiveHybridIndex::new(&cx, built).unwrap();
         let base = live.snapshot(&cx).await.unwrap();
-        let authority = Authority { load: Box::new(|_, _, _, _| panic!("must refuse before loading")) };
+        let authority = Authority {
+            load: Box::new(|_, _, _, _| panic!("must refuse before loading")),
+        };
         for variant in 0..4 {
             let mut value = request(&root.path().join("missing.json"), true);
             match variant {
@@ -331,9 +455,14 @@ fn stale_expected_generation_and_invalid_paths_fail_before_loading() {
                 _ => value["quality_backend"] = serde_json::json!("automatic"),
             }
             let request: Request = serde_json::from_value(value).unwrap();
-            let error = prepare(&base, &cx, &request, &authority).await.err().unwrap();
+            let error = prepare(&base, &cx, &request, &authority)
+                .await
+                .err()
+                .unwrap();
             assert!(error.to_string().contains(match variant {
-                0 => "expected_generation", 1 | 2 => "paths must be", _ => "quality backend",
+                0 => "expected_generation",
+                1 | 2 => "paths must be",
+                _ => "quality backend",
             }));
         }
     });
@@ -360,30 +489,61 @@ fn delivery_failure_after_migration_does_not_rollback_or_consume_next_request() 
         let root = tempfile::tempdir().unwrap();
         let old = Provider::new("old", 2);
         let (built, _) = sealed(
-            &cx, &root.path().join("old"), 1,
-            Models { fast: old, quality: None }, documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast: old,
+                quality: None,
+            },
+            documents(),
+            true,
+        )
+        .await;
         let live = NativeLiveHybridIndex::new(&cx, built).unwrap();
         let fast = Provider::new("replacement", 3);
-        let models = Models { fast: fast.clone(), quality: None };
+        let models = Models {
+            fast: fast.clone(),
+            quality: None,
+        };
         let (candidate, selection) = sealed(
-            &cx, &root.path().join("next"), 2, models.clone(), documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("next"),
+            2,
+            models.clone(),
+            documents(),
+            true,
+        )
+        .await;
         let receipt = root.path().join("next.json");
         save_selection(&selection, &receipt).unwrap();
         drop(candidate);
         let mut reader = input(&[
-            request(&receipt, true), serde_json::json!({"query": "horizontal"}),
+            request(&receipt, true),
+            serde_json::json!({"query": "horizontal"}),
         ]);
         let mut output = BrokenAck { writes: 0 };
         let error = run_with_controls(
-            &live, &cx, &mut reader, &mut output, (crate::Mode::Full, 3),
-            permitted(models, Arc::new(AtomicUsize::new(0))), None,
+            &live,
+            &cx,
+            &mut reader,
+            &mut output,
+            (crate::Mode::Full, 3),
+            permitted(models, Arc::new(AtomicUsize::new(0))),
+            None,
             &query::Policy::new(&cx, None).unwrap(),
-        ).await.unwrap_err();
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("lost migration acknowledgement"));
-        assert_eq!(live.snapshot(&cx).await.unwrap().generation(), generation(2));
-        assert_eq!(output.writes, 2, "no contradictory failure frame is appended");
+        assert_eq!(
+            live.snapshot(&cx).await.unwrap().generation(),
+            generation(2)
+        );
+        assert_eq!(
+            output.writes, 2,
+            "no contradictory failure frame is appended"
+        );
         assert!(reader.position() < u64::try_from(reader.get_ref().len()).unwrap());
         assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
     });
@@ -398,14 +558,21 @@ fn valid_but_foreign_source_receipts_never_change_live_selection() {
             &cx,
             &root.path().join("old"),
             1,
-            Models { fast: old, quality: None },
+            Models {
+                fast: old,
+                quality: None,
+            },
             documents(),
             true,
-        ).await;
+        )
+        .await;
         let live = NativeLiveHybridIndex::new(&cx, built).unwrap();
         let base = live.snapshot(&cx).await.unwrap();
         let replacement = Provider::new("replacement", 3);
-        let models = Models { fast: replacement.clone(), quality: None };
+        let models = Models {
+            fast: replacement.clone(),
+            quality: None,
+        };
         let authority = Authority {
             load: Box::new(move |_, _, _, _| Ok(models.clone())),
         };
@@ -415,7 +582,9 @@ fn valid_but_foreign_source_receipts_never_change_live_selection() {
                 0 => sources[0].content = "different content".to_owned(),
                 1 => sources[0].title = Some("different title".to_owned()),
                 2 => {
-                    sources[0].metadata.insert("scope".to_owned(), "different".to_owned());
+                    sources[0]
+                        .metadata
+                        .insert("scope".to_owned(), "different".to_owned());
                 }
                 _ => sources[0].id = "different-id".to_owned(),
             }
@@ -423,22 +592,43 @@ fn valid_but_foreign_source_receipts_never_change_live_selection() {
                 &cx,
                 &root.path().join(format!("different-{variant}")),
                 2,
-                Models { fast: replacement.clone(), quality: None },
+                Models {
+                    fast: replacement.clone(),
+                    quality: None,
+                },
                 sources,
                 true,
-            ).await;
+            )
+            .await;
             let receipt = root.path().join(format!("different-{variant}.json"));
             save_selection(&selection, &receipt).unwrap();
             drop(candidate);
             let request: Request = serde_json::from_value(request(&receipt, true)).unwrap();
             let mut output = Vec::new();
-            execute((&live).into(), &cx, &request, 1, Some(&authority), &mut output).await.unwrap();
+            execute(
+                (&live).into(),
+                &cx,
+                &request,
+                1,
+                Some(&authority),
+                &mut output,
+            )
+            .await
+            .unwrap();
             let output = frames(&output);
             assert_eq!(output.len(), 1);
             assert_eq!(output[0]["ok"], false);
             assert_eq!(output[0]["selection_changed"], false);
-            assert!(output[0]["error"].as_str().unwrap().contains("native_ann.live.migration.source"));
-            assert!(std::ptr::eq(live.snapshot(&cx).await.unwrap().index(), base.index()));
+            assert!(
+                output[0]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("native_ann.live.migration.source")
+            );
+            assert!(std::ptr::eq(
+                live.snapshot(&cx).await.unwrap().index(),
+                base.index()
+            ));
         }
         assert_eq!(replacement.documents.load(Ordering::SeqCst), 12);
         assert_eq!(replacement.queries.load(Ordering::SeqCst), 0);
@@ -454,21 +644,41 @@ fn source_update_during_model_loading_makes_even_a_higher_migration_stale() {
         let root = tempfile::tempdir().unwrap();
         let old = Provider::new("old", 2);
         let (built, _) = sealed(
-            &cx, &root.path().join("old"), 1,
-            Models { fast: old, quality: None }, documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast: old,
+                quality: None,
+            },
+            documents(),
+            true,
+        )
+        .await;
         let live = Arc::new(NativeLiveHybridIndex::new(&cx, built).unwrap());
         let base = live.snapshot(&cx).await.unwrap();
-        let update = Arc::new(base
-            .begin_update(&cx, root.path().join("source-update"), generation(2))
-            .unwrap()
-            .upsert_document(IndexableDocument::new("winner", "new document"))
-            .build(&cx).await.unwrap());
+        let update = Arc::new(
+            base.begin_update(&cx, root.path().join("source-update"), generation(2))
+                .unwrap()
+                .upsert_document(IndexableDocument::new("winner", "new document"))
+                .build(&cx)
+                .await
+                .unwrap(),
+        );
         let fast = Provider::new("new-fast", 3);
-        let models = Models { fast, quality: None };
+        let models = Models {
+            fast,
+            quality: None,
+        };
         let (candidate, selection) = sealed(
-            &cx, &root.path().join("model-update"), 9, models.clone(), documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("model-update"),
+            9,
+            models.clone(),
+            documents(),
+            true,
+        )
+        .await;
         let receipt = root.path().join("model-update.json");
         save_selection(&selection, &receipt).unwrap();
         drop(candidate);
@@ -479,7 +689,8 @@ fn source_update_during_model_loading_makes_even_a_higher_migration_stale() {
                 // sequence change. No executor, thread or detached task needed.
                 let mut install = Box::pin(competing_live.install(cx, &update));
                 let Poll::Ready(Ok(installed)) = install
-                    .as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
                 else {
                     panic!("uncontended native installation should complete");
                 };
@@ -489,11 +700,25 @@ fn source_update_during_model_loading_makes_even_a_higher_migration_stale() {
         };
         let request: Request = serde_json::from_value(request(&receipt, true)).unwrap();
         let mut output = Vec::new();
-        execute(live.as_ref().into(), &cx, &request, 1, Some(&authority), &mut output).await.unwrap();
+        execute(
+            live.as_ref().into(),
+            &cx,
+            &request,
+            1,
+            Some(&authority),
+            &mut output,
+        )
+        .await
+        .unwrap();
         let output = frames(&output);
         assert_eq!(output[0]["ok"], false);
         assert_eq!(output[0]["selection_changed"], false);
-        assert!(output[0]["error"].as_str().unwrap().contains("native_ann.live.expected_current"));
+        assert!(
+            output[0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("native_ann.live.expected_current")
+        );
         let selected = live.snapshot(&cx).await.unwrap();
         assert_eq!(selected.generation(), generation(2));
         assert!(selected.index().vectors().document("winner").is_some());
@@ -507,16 +732,33 @@ fn failed_or_cancelled_loading_does_not_fall_back_or_replace_old_models() {
         let root = tempfile::tempdir().unwrap();
         let old = Provider::new("old", 2);
         let (built, _) = sealed(
-            &cx, &root.path().join("old"), 1,
-            Models { fast: old.clone(), quality: None }, documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast: old.clone(),
+                quality: None,
+            },
+            documents(),
+            true,
+        )
+        .await;
         let live = NativeLiveHybridIndex::new(&cx, built).unwrap();
         let base = live.snapshot(&cx).await.unwrap();
         let replacement = Provider::new("replacement", 3);
-        let models = Models { fast: replacement.clone(), quality: None };
+        let models = Models {
+            fast: replacement.clone(),
+            quality: None,
+        };
         let (candidate, selection) = sealed(
-            &cx, &root.path().join("next"), 2, models.clone(), documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("next"),
+            2,
+            models.clone(),
+            documents(),
+            true,
+        )
+        .await;
         let receipt = root.path().join("next.json");
         save_selection(&selection, &receipt).unwrap();
         drop(candidate);
@@ -536,21 +778,48 @@ fn failed_or_cancelled_loading_does_not_fall_back_or_replace_old_models() {
             };
             let request: Request = serde_json::from_value(request(&receipt, true)).unwrap();
             let mut output = Vec::new();
-            execute((&live).into(), &cx, &request, 1, Some(&authority), &mut output).await.unwrap();
+            execute(
+                (&live).into(),
+                &cx,
+                &request,
+                1,
+                Some(&authority),
+                &mut output,
+            )
+            .await
+            .unwrap();
             cx.set_cancel_requested(false);
             let output = frames(&output);
             assert_eq!(output[0]["ok"], false);
             assert_eq!(output[0]["selection_changed"], false);
             if variant == 0 {
                 assert_eq!(output[0]["status"], "failed");
-                assert!(output[0]["error"].as_str().unwrap().contains("model loader failed"));
+                assert!(
+                    output[0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("model loader failed")
+                );
             } else {
                 assert_eq!(output[0]["status"], "cancelled");
                 assert_eq!(output[0]["code"], "cancelled");
-                assert!(output[0]["error"].as_str().unwrap().contains("native_cli.model_migration"));
-                assert!(!output[0]["error"].as_str().unwrap().contains("model loader failed"));
+                assert!(
+                    output[0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("native_cli.model_migration")
+                );
+                assert!(
+                    !output[0]["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("model loader failed")
+                );
             }
-            assert!(std::ptr::eq(live.snapshot(&cx).await.unwrap().index(), base.index()));
+            assert!(std::ptr::eq(
+                live.snapshot(&cx).await.unwrap().index(),
+                base.index()
+            ));
         }
         assert_eq!(old.queries.load(Ordering::SeqCst), 0);
         assert_eq!(replacement.queries.load(Ordering::SeqCst), 0);
@@ -565,15 +834,32 @@ fn quality_removal_is_explicit_and_later_requests_do_not_use_the_old_quality() {
         let old = Provider::new("old", 2);
         let old_quality = Provider::new("old-quality", 3);
         let (built, _) = sealed(
-            &cx, &root.path().join("old"), 1,
-            Models { fast: old, quality: Some(old_quality.clone()) }, documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast: old,
+                quality: Some(old_quality.clone()),
+            },
+            documents(),
+            true,
+        )
+        .await;
         let live = NativeLiveHybridIndex::new(&cx, built).unwrap();
         let fast = Provider::new("replacement", 4);
-        let models = Models { fast: fast.clone(), quality: None };
+        let models = Models {
+            fast: fast.clone(),
+            quality: None,
+        };
         let (candidate, selection) = sealed(
-            &cx, &root.path().join("next"), 2, models.clone(), documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("next"),
+            2,
+            models.clone(),
+            documents(),
+            true,
+        )
+        .await;
         let receipt = root.path().join("next.json");
         save_selection(&selection, &receipt).unwrap();
         drop(candidate);
@@ -584,17 +870,30 @@ fn quality_removal_is_explicit_and_later_requests_do_not_use_the_old_quality() {
         ]);
         let mut output = Vec::new();
         run_with_controls(
-            &live, &cx, &mut reader, &mut output, (crate::Mode::Full, 3),
-            permitted(models, Arc::new(AtomicUsize::new(0))), None,
+            &live,
+            &cx,
+            &mut reader,
+            &mut output,
+            (crate::Mode::Full, 3),
+            permitted(models, Arc::new(AtomicUsize::new(0))),
+            None,
             &query::Policy::new(&cx, None).unwrap(),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
         let output = frames(&output);
         assert_eq!(output[1]["ok"], true);
         assert_eq!(output[1]["quality"], false);
         assert!(output[1]["quality_producer"].is_null());
-        let quality = output.iter().find(|frame| frame["id"] == "quality" && frame["event"] == "terminal").unwrap();
+        let quality = output
+            .iter()
+            .find(|frame| frame["id"] == "quality" && frame["event"] == "terminal")
+            .unwrap();
         assert_eq!(quality["ok"], false);
-        let full: Vec<_> = output.iter().filter(|frame| frame["id"] == "full").collect();
+        let full: Vec<_> = output
+            .iter()
+            .filter(|frame| frame["id"] == "full")
+            .collect();
         assert!(full.iter().any(|frame| frame["phase"] == "initial"));
         assert!(!full.iter().any(|frame| frame["phase"] == "refined"));
         assert_eq!(full.last().unwrap()["ok"], true);
@@ -609,35 +908,72 @@ fn activation_policy_and_producer_mismatches_preserve_the_predecessor() {
         let root = tempfile::tempdir().unwrap();
         let old = Provider::new("old", 2);
         let (built, _) = sealed(
-            &cx, &root.path().join("old"), 1,
-            Models { fast: old, quality: None }, documents(), true,
-        ).await;
+            &cx,
+            &root.path().join("old"),
+            1,
+            Models {
+                fast: old,
+                quality: None,
+            },
+            documents(),
+            true,
+        )
+        .await;
         let live = NativeLiveHybridIndex::new(&cx, built).unwrap();
         let base = live.snapshot(&cx).await.unwrap();
         let replacement = Provider::new("replacement", 3);
-        let models = Models { fast: replacement.clone(), quality: None };
+        let models = Models {
+            fast: replacement.clone(),
+            quality: None,
+        };
         let (candidate, selection) = sealed(
-            &cx, &root.path().join("next"), 2, models.clone(), documents(), false,
-        ).await;
+            &cx,
+            &root.path().join("next"),
+            2,
+            models.clone(),
+            documents(),
+            false,
+        )
+        .await;
         let receipt = root.path().join("next.json");
         save_selection(&selection, &receipt).unwrap();
         drop(candidate);
         for variant in 0..3 {
             let request: Request = serde_json::from_value(request(&receipt, variant == 0)).unwrap();
             let loaded = if variant == 1 {
-                Models { fast: Provider::new("foreign-same-width", 3), quality: None }
+                Models {
+                    fast: Provider::new("foreign-same-width", 3),
+                    quality: None,
+                }
             } else if variant == 2 {
-                Models { fast: replacement.clone(), quality: Some(Provider::new("extra-quality", 4)) }
+                Models {
+                    fast: replacement.clone(),
+                    quality: Some(Provider::new("extra-quality", 4)),
+                }
             } else {
                 models.clone()
             };
-            let authority = Authority { load: Box::new(move |_, _, _, _| Ok(loaded.clone())) };
+            let authority = Authority {
+                load: Box::new(move |_, _, _, _| Ok(loaded.clone())),
+            };
             let mut output = Vec::new();
-            execute((&live).into(), &cx, &request, 1, Some(&authority), &mut output).await.unwrap();
+            execute(
+                (&live).into(),
+                &cx,
+                &request,
+                1,
+                Some(&authority),
+                &mut output,
+            )
+            .await
+            .unwrap();
             let output = frames(&output);
             assert_eq!(output[0]["ok"], false);
             assert_eq!(output[0]["selection_changed"], false);
-            assert!(std::ptr::eq(live.snapshot(&cx).await.unwrap().index(), base.index()));
+            assert!(std::ptr::eq(
+                live.snapshot(&cx).await.unwrap().index(),
+                base.index()
+            ));
         }
         assert_eq!(replacement.queries.load(Ordering::SeqCst), 0);
         assert_eq!(replacement.documents.load(Ordering::SeqCst), 3);

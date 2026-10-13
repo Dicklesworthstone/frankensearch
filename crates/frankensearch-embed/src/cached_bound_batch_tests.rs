@@ -97,16 +97,25 @@ impl Producer {
         if mode == Mode::DimensionDrift {
             self.dimension.store(5, Ordering::Relaxed);
         }
-        if matches!(mode, Mode::UnavailableAfter | Mode::CancelledUnavailableAfter) {
+        if matches!(
+            mode,
+            Mode::UnavailableAfter | Mode::CancelledUnavailableAfter
+        ) {
             self.unavailable.store(true, Ordering::Relaxed);
         }
-        if matches!(mode, Mode::CancelSuccess | Mode::CancelFailure | Mode::CancelDrift) {
+        if matches!(
+            mode,
+            Mode::CancelSuccess | Mode::CancelFailure | Mode::CancelDrift
+        ) {
             cx.set_cancel_requested(true);
         }
         if matches!(mode, Mode::Failure | Mode::CancelFailure) {
             return Err(Self::failure());
         }
-        if matches!(mode, Mode::ProviderCancelled | Mode::CancelledUnavailableAfter) {
+        if matches!(
+            mode,
+            Mode::ProviderCancelled | Mode::CancelledUnavailableAfter
+        ) {
             return Err(SearchError::Cancelled {
                 phase: "synthetic.provider.cancelled".to_owned(),
                 reason: "provider cancellation without cancelling caller context".to_owned(),
@@ -164,7 +173,10 @@ impl Embedder for Producer {
     ) -> SearchFuture<'a, IdentityBoundEmbedding> {
         Box::pin(async move {
             self.single_calls.fetch_add(1, Ordering::Relaxed);
-            self.invoke(cx, &[text]).await?.pop().ok_or_else(Self::failure)
+            self.invoke(cx, &[text])
+                .await?
+                .pop()
+                .ok_or_else(Self::failure)
         })
     }
 
@@ -205,10 +217,10 @@ impl Embedder for Producer {
     fn dimension(&self) -> usize {
         self.dimension.load(Ordering::Relaxed)
     }
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "cached-batch-fixture"
     }
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "Synthetic cache batch producer"
     }
     fn is_semantic(&self) -> bool {
@@ -263,7 +275,10 @@ fn homogeneous_foreign_batch_is_rejected_even_when_every_row_validates() {
             foreign.validate().unwrap();
             let cached = CachedEmbedder::new(inner.clone(), capacity);
             let before = cached.cache_stats();
-            let error = cached.embed_batch_bound(&cx, &["alpha", "beta"]).await.unwrap_err();
+            let error = cached
+                .embed_batch_bound(&cx, &["alpha", "beta"])
+                .await
+                .unwrap_err();
             assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
             assert!(!error.to_string().contains("CANARY_PRIVATE"));
             assert_eq!(cached.cache_stats(), before);
@@ -275,20 +290,37 @@ fn homogeneous_foreign_batch_is_rejected_even_when_every_row_validates() {
 #[test]
 fn malformed_batches_never_mutate_or_evict_existing_raw_and_bound_entries() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
-        for mode in [Mode::ForeignLast, Mode::MalformedForeign, Mode::Short, Mode::Long,
-                     Mode::NanLast, Mode::InfiniteLast, Mode::WrongWidthLast] {
+        for mode in [
+            Mode::ForeignLast,
+            Mode::MalformedForeign,
+            Mode::Short,
+            Mode::Long,
+            Mode::NanLast,
+            Mode::InfiniteLast,
+            Mode::WrongWidthLast,
+        ] {
             let inner = Arc::new(Producer::new());
             let cached = CachedEmbedder::new(inner.clone(), 2);
             let raw = cached.embed(&cx, "resident-raw").await.unwrap();
             let bound = cached.embed_bound(&cx, "resident-bound").await.unwrap();
             let before = cached.cache_stats();
             inner.set_mode(mode);
-            let error = cached.embed_batch_bound(&cx, &["alpha", "beta"]).await.unwrap_err();
+            let error = cached
+                .embed_batch_bound(&cx, &["alpha", "beta"])
+                .await
+                .unwrap_err();
             assert!(!error.to_string().contains("CANARY_PRIVATE"));
             assert_eq!(cached.cache_stats(), before);
             inner.set_mode(Mode::Valid);
             assert_eq!(cached.embed(&cx, "resident-raw").await.unwrap(), raw);
-            assert_eq!(cached.embed_bound(&cx, "resident-bound").await.unwrap().values, bound.values);
+            assert_eq!(
+                cached
+                    .embed_bound(&cx, "resident-bound")
+                    .await
+                    .unwrap()
+                    .values,
+                bound.values
+            );
             assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 1);
             assert_eq!(inner.single_calls.load(Ordering::Relaxed), 1);
         }
@@ -423,7 +455,10 @@ fn metadata_callback_cancellation_outranks_its_success_or_error() {
                     Err(SearchError::Cancelled { .. })
                 ));
                 cx.set_cancel_requested(false);
-                assert_eq!(inner.batch_calls.load(Ordering::Relaxed), usize::from(at == 2));
+                assert_eq!(
+                    inner.batch_calls.load(Ordering::Relaxed),
+                    usize::from(at == 2)
+                );
                 assert_eq!(cached.cache_stats(), before);
             }
         }
@@ -441,7 +476,10 @@ fn dropped_pending_batch_leaves_no_partial_result_and_explicit_retry_succeeds() 
         {
             let mut future = cached.embed_batch_bound(&cx, &inputs);
             let mut context = Context::from_waker(Waker::noop());
-            assert!(matches!(Future::poll(future.as_mut(), &mut context), Poll::Pending));
+            assert!(matches!(
+                Future::poll(future.as_mut(), &mut context),
+                Poll::Pending
+            ));
         }
         assert_eq!(cached.cache_stats(), before);
         inner.set_mode(Mode::Valid);

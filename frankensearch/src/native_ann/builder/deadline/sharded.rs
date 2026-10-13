@@ -12,13 +12,13 @@
 //! poll returns. Cancellation is an error and does not cancel unrelated queries.
 
 use super::NativeSearchDeadline;
-use crate::native_ann::{
-    NativeShardedProgressiveSearch, NativeShardedResult, NativeShardedSearchPhase, checkpoint,
-    invalid,
-};
 use crate::native_ann::builder::sharded::NativeBuiltShardedHybridIndex;
 use crate::native_ann::builder::sharded::live::{
     NativeLiveShardedHybridIndex, NativeShardedResults,
+};
+use crate::native_ann::{
+    NativeShardedProgressiveSearch, NativeShardedResult, NativeShardedSearchPhase, checkpoint,
+    invalid,
 };
 use crate::{Cx, Reranker, SearchError, SearchResult};
 
@@ -160,7 +160,9 @@ impl NativeDeadlineShardedProgressiveSearch<'_> {
                         | NativeShardedSearchPhase::Refined { results, .. }
                         | NativeShardedSearchPhase::Reranked { results, .. } => page = results,
                         NativeShardedSearchPhase::RefinementFailed { error, .. }
-                        | NativeShardedSearchPhase::RerankFailed { error, .. } => return Err(error),
+                        | NativeShardedSearchPhase::RerankFailed { error, .. } => {
+                            return Err(error);
+                        }
                     }
                 }
                 Ok(page)
@@ -529,8 +531,14 @@ mod tests {
                 let root = tempfile::tempdir().unwrap();
                 let fast = Arc::new(Provider::new("fast", 2));
                 let quality = Arc::new(Provider::new("quality", 3));
-                let index =
-                    build(&cx, &root.path().join("index"), &fast, Some(&quality), graph).await;
+                let index = build(
+                    &cx,
+                    &root.path().join("index"),
+                    &fast,
+                    Some(&quality),
+                    graph,
+                )
+                .await;
                 assert_eq!(index.vectors().partitions().len(), 3);
                 let (_, budget) = deadline(&cx, 100);
                 let expected = index.search(&cx, "vertical", 3).await.unwrap();
@@ -615,7 +623,14 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &root.path().join("index"), &fast, Some(&quality), false).await;
+            let index = build(
+                &cx,
+                &root.path().join("index"),
+                &fast,
+                Some(&quality),
+                false,
+            )
+            .await;
             let live = NativeLiveShardedHybridIndex::new(&cx, index).unwrap();
             let (_, budget) = deadline(&cx, 0);
             assert!(matches!(
@@ -623,16 +638,19 @@ mod tests {
                 Err(SearchError::SearchTimeout { .. })
             ));
             assert!(matches!(
-                live.search_quality_before(&cx, "vertical", 3, &budget).await,
+                live.search_quality_before(&cx, "vertical", 3, &budget)
+                    .await,
                 Err(SearchError::SearchTimeout { .. })
             ));
             assert!(matches!(
-                live.search_refined_before(&cx, "vertical", 3, &budget).await,
+                live.search_refined_before(&cx, "vertical", 3, &budget)
+                    .await,
                 Err(SearchError::SearchTimeout { .. })
             ));
             cx.set_cancel_requested(true);
             assert!(matches!(
-                live.search_refined_before(&cx, "vertical", 3, &budget).await,
+                live.search_refined_before(&cx, "vertical", 3, &budget)
+                    .await,
                 Err(SearchError::Cancelled { .. })
             ));
             cx.set_cancel_requested(false);
@@ -701,7 +719,14 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &root.path().join("index"), &fast, Some(&quality), false).await;
+            let index = build(
+                &cx,
+                &root.path().join("index"),
+                &fast,
+                Some(&quality),
+                false,
+            )
+            .await;
             for provider in [&fast, &quality] {
                 for ending in 0..3 {
                     fast.reset();
@@ -884,7 +909,12 @@ mod tests {
                         .unwrap();
                     let mut actual = index
                         .progressive_with_reranker_before(
-                            &cx, "vertical", 1, &reranker, 3, budget.clone(),
+                            &cx,
+                            "vertical",
+                            1,
+                            &reranker,
+                            3,
+                            budget.clone(),
                         )
                         .unwrap();
                     assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
@@ -932,7 +962,12 @@ mod tests {
                 let (clock, budget) = deadline(&cx, 10);
                 let mut query = index
                     .progressive_with_reranker_before(
-                        &cx, "vertical", 1, &reranker, 3, budget.clone(),
+                        &cx,
+                        "vertical",
+                        1,
+                        &reranker,
+                        3,
+                        budget.clone(),
                     )
                     .unwrap();
                 let NativeShardedSearchPhase::Initial {
@@ -973,8 +1008,14 @@ mod tests {
                         budget_ms: 10
                     }
                 ));
-                assert_eq!(quality.calls.load(Ordering::SeqCst), usize::from(start_quality));
-                assert_eq!(quality.drops.load(Ordering::SeqCst), usize::from(start_quality));
+                assert_eq!(
+                    quality.calls.load(Ordering::SeqCst),
+                    usize::from(start_quality)
+                );
+                assert_eq!(
+                    quality.drops.load(Ordering::SeqCst),
+                    usize::from(start_quality)
+                );
                 assert_eq!(reranker.calls.load(Ordering::SeqCst), 0);
                 assert!(query.is_finished());
                 assert!(query.next_phase().await.unwrap().is_none());
@@ -1004,7 +1045,12 @@ mod tests {
                 let (clock, budget) = deadline(&cx, 10);
                 let mut query = index
                     .progressive_with_reranker_before(
-                        &cx, "vertical", 1, &reranker, 3, budget.clone(),
+                        &cx,
+                        "vertical",
+                        1,
+                        &reranker,
+                        3,
+                        budget.clone(),
                     )
                     .unwrap();
                 let NativeShardedSearchPhase::Initial {
@@ -1064,7 +1110,14 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &root.path().join("index"), &fast, Some(&quality), false).await;
+            let index = build(
+                &cx,
+                &root.path().join("index"),
+                &fast,
+                Some(&quality),
+                false,
+            )
+            .await;
             for ending in 0..3 {
                 quality.reset();
                 let (clock, budget) = deadline(&cx, 10);
@@ -1077,11 +1130,15 @@ mod tests {
                     query.next_phase().await.unwrap(),
                     Some(NativeShardedSearchPhase::Initial { .. })
                 ));
-                quality.mode.store(if ending == 2 { 3 } else { 1 }, Ordering::SeqCst);
+                quality
+                    .mode
+                    .store(if ending == 2 { 3 } else { 1 }, Ordering::SeqCst);
                 let mut pending = Box::pin(query.next_phase());
                 if ending == 2 {
-                    assert!(matches!(pending.await, Err(SearchError::Cancelled { ref phase, .. })
-                        if phase == "deadline.sharded.test"));
+                    assert!(
+                        matches!(pending.await, Err(SearchError::Cancelled { ref phase, .. })
+                        if phase == "deadline.sharded.test")
+                    );
                 } else {
                     assert!(
                         pending
@@ -1114,7 +1171,14 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &root.path().join("index"), &fast, Some(&quality), false).await;
+            let index = build(
+                &cx,
+                &root.path().join("index"),
+                &fast,
+                Some(&quality),
+                false,
+            )
+            .await;
             let reranker = RerankProbe::default();
             let (_, budget) = deadline(&cx, 10);
             let mut started = index
@@ -1131,7 +1195,12 @@ mod tests {
             let make_query = || {
                 index
                     .progressive_with_reranker_before(
-                        &cx, "vertical", 1, &reranker, 3, budget.clone(),
+                        &cx,
+                        "vertical",
+                        1,
+                        &reranker,
+                        3,
+                        budget.clone(),
                     )
                     .unwrap()
             };
@@ -1190,7 +1259,14 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let fast = Arc::new(Provider::new("fast", 2));
             let quality = Arc::new(Provider::new("quality", 3));
-            let index = build(&cx, &root.path().join("index"), &fast, Some(&quality), false).await;
+            let index = build(
+                &cx,
+                &root.path().join("index"),
+                &fast,
+                Some(&quality),
+                false,
+            )
+            .await;
             for pending_reranker in [false, true] {
                 quality.reset();
                 let reranker = RerankProbe::default();
@@ -1202,7 +1278,12 @@ mod tests {
                 let (clock, budget) = deadline(&cx, 10);
                 let query = index
                     .progressive_with_reranker_before(
-                        &cx, "vertical", 1, &reranker, 3, budget.clone(),
+                        &cx,
+                        "vertical",
+                        1,
+                        &reranker,
+                        3,
+                        budget.clone(),
                     )
                     .unwrap();
                 let mut pending = Box::pin(query.collect());

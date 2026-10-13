@@ -343,9 +343,9 @@ impl TargetModels {
         if after.fast().index().owner_witness().generation != self.generation
             || after.fast().producer_identity != self.fast
             || after.quality().map(|tier| &tier.producer_identity) != self.quality.as_ref()
-            || after.quality().is_some_and(|tier| {
-                tier.index().owner_witness().generation != self.generation
-            })
+            || after
+                .quality()
+                .is_some_and(|tier| tier.index().owner_witness().generation != self.generation)
         {
             return Err(invalid(
                 "live.migration.target",

@@ -49,8 +49,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
 mod admission;
-pub use admission::{CoalescerLimits, CoalescerUsage};
 use admission::{AdmissionBudget, AdmissionPermit};
+pub use admission::{CoalescerLimits, CoalescerUsage};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -414,13 +414,13 @@ impl BatchCoalescer {
                     Priority::Interactive => self.config.max_wait_ms / 2,
                     Priority::Background => self.config.max_wait_ms,
                 });
-                let deadline = now.checked_add(wait).ok_or_else(|| {
-                    SearchError::InvalidConfig {
+                let deadline = now
+                    .checked_add(wait)
+                    .ok_or_else(|| SearchError::InvalidConfig {
                         field: "batch_coalescer.max_wait_ms".to_owned(),
                         value: self.config.max_wait_ms.to_string(),
                         reason: "dispatch deadline exceeds the platform clock range".to_owned(),
-                    }
-                })?;
+                    })?;
                 let permit = self.admission.reserve(text.capacity())?;
                 Ok((deadline, permit))
             })();

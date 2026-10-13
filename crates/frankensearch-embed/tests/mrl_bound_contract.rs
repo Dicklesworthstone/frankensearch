@@ -9,7 +9,9 @@ use std::task::{Context, Poll, Waker};
 use asupersync::test_utils::run_test_with_cx;
 use asupersync::{CancelKind, Cx};
 use frankensearch_core::traits::{Embedder, IdentityBoundEmbedding, ModelCategory, SearchFuture};
-use frankensearch_core::{EmbeddingIdentityBundleV1, QuantizationFormat, SearchError, SearchResult};
+use frankensearch_core::{
+    EmbeddingIdentityBundleV1, QuantizationFormat, SearchError, SearchResult,
+};
 use frankensearch_embed::{CachedEmbedder, DimReduceEmbedder, ModelArtifactManifestV1};
 
 const PRIVATE: &str = "private-mrl-provider-canary";
@@ -68,7 +70,10 @@ impl Provider {
             .unwrap()
             .declared_identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
             .unwrap();
-        assert_eq!(usize::try_from(identity.space.dimension).unwrap(), DIMENSION);
+        assert_eq!(
+            usize::try_from(identity.space.dimension).unwrap(),
+            DIMENSION
+        );
         Self {
             identity,
             foreign: EmbeddingIdentityBundleV1::explicit_test_model(PRIVATE, 768),
@@ -102,7 +107,8 @@ impl Provider {
     }
 
     fn corrupt(&self, response: &mut IdentityBoundEmbedding) {
-        match *self.fault.lock().unwrap() {
+        let fault = *self.fault.lock().unwrap();
+        match fault {
             Fault::None | Fault::ShortBatch | Fault::LongBatch => {}
             Fault::Foreign => response.identity.clone_from(&self.foreign),
             Fault::Storage => response.identity.storage.format = format!("in-memory-{PRIVATE}"),
@@ -228,14 +234,12 @@ impl Embedder for Provider {
                     source: "non-native bound batch must not be dispatched".into(),
                 });
             }
-            let mut responses = texts
-                .iter()
-                .map(|text| self.full(text))
-                .collect::<Vec<_>>();
+            let mut responses = texts.iter().map(|text| self.full(text)).collect::<Vec<_>>();
             if let Some(last) = responses.last_mut() {
                 self.corrupt(last);
             }
-            match *self.fault.lock().unwrap() {
+            let fault = *self.fault.lock().unwrap();
+            match fault {
                 Fault::ShortBatch => {
                     let _ = responses.pop();
                 }
@@ -299,11 +303,11 @@ impl Embedder for Provider {
         DefaultProjection.truncate_embedding(values, target_dim)
     }
 
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "mrl-fixture"
     }
 
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "MRL fixture"
     }
 
@@ -331,11 +335,11 @@ impl Embedder for DefaultProjection {
         DIMENSION
     }
 
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "projection-only"
     }
 
-    fn model_name(&self) -> &str {
+    fn model_name(&self) -> &'static str {
         "Projection only"
     }
 
@@ -385,7 +389,10 @@ fn assert_projected(
             .iter()
             .map(|value| value.to_bits())
             .collect::<Vec<_>>(),
-        expected.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        expected
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -425,7 +432,13 @@ fn native_batches_preserve_order_duplicates_and_empty_dispatch() {
             assert_projected(response, &source.full(text), reduced.identity().unwrap());
         }
         source.assert_calls(0, 0, 1, 0);
-        assert!(reduced.embed_batch_bound(&cx, &[]).await.unwrap().is_empty());
+        assert!(
+            reduced
+                .embed_batch_bound(&cx, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
         source.assert_calls(0, 0, 2, 0);
         assert_eq!(
             *source.inputs.lock().unwrap(),
@@ -446,7 +459,13 @@ fn non_native_batches_use_bound_singles_and_never_the_raw_backed_batch() {
         for (response, text) in responses.iter().zip(texts) {
             assert_projected(response, &source.full(text), reduced.identity().unwrap());
         }
-        assert!(reduced.embed_batch_bound(&cx, &[]).await.unwrap().is_empty());
+        assert!(
+            reduced
+                .embed_batch_bound(&cx, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
         source.assert_calls(0, 3, 0, 0);
         assert_eq!(
             *source.inputs.lock().unwrap(),
@@ -476,8 +495,7 @@ fn foreign_and_malformed_full_responses_are_refused_before_any_projection() {
                 let error = infer(&reduced, &cx, batch).await.unwrap_err();
                 assert!(matches!(
                     error,
-                    SearchError::UnverifiableRemoteSpace { .. }
-                        | SearchError::InvalidConfig { .. }
+                    SearchError::UnverifiableRemoteSpace { .. } | SearchError::InvalidConfig { .. }
                 ));
                 assert_redacted(&error);
                 source.assert_calls(0, usize::from(!batch), usize::from(batch), 0);

@@ -69,7 +69,9 @@ impl AdmissionBudget {
     }
 
     fn lock(&self) -> MutexGuard<'_, CoalescerUsage> {
-        self.used.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub(super) const fn limits(&self) -> CoalescerLimits {
@@ -107,6 +109,7 @@ impl AdmissionBudget {
         }
         used.outstanding_requests += 1;
         used.outstanding_text_bytes += bytes;
+        drop(used);
         Ok(AdmissionPermit {
             budget: Arc::clone(self),
             bytes,
@@ -187,18 +190,32 @@ mod tests {
         assert_eq!(queue.pending_count(), 1);
         assert_eq!(queue.usage().outstanding_requests, 2);
         let rejected = queue.submit("c".into(), Priority::Background);
-        assert!(matches!(rejected.try_recv().unwrap(),
-            Err(SearchError::QueueFull { pending: 2, capacity: 2 })));
+        assert!(matches!(
+            rejected.try_recv().unwrap(),
+            Err(SearchError::QueueFull {
+                pending: 2,
+                capacity: 2
+            })
+        ));
         batch.deliver(Ok(vec![vec![11.0]]));
         assert_eq!(first.try_recv().unwrap().unwrap(), vec![11.0]);
         let third = queue.submit("c".into(), Priority::Background);
         assert_eq!(queue.usage().outstanding_requests, 2);
-        queue.try_form_batch().unwrap().deliver(Ok(vec![vec![22.0]]));
-        queue.try_form_batch().unwrap().deliver(Ok(vec![vec![33.0]]));
+        queue
+            .try_form_batch()
+            .unwrap()
+            .deliver(Ok(vec![vec![22.0]]));
+        queue
+            .try_form_batch()
+            .unwrap()
+            .deliver(Ok(vec![vec![33.0]]));
         assert_eq!(second.try_recv().unwrap().unwrap(), vec![22.0]);
         assert_eq!(third.try_recv().unwrap().unwrap(), vec![33.0]);
         assert_eq!(queue.usage(), CoalescerUsage::default());
-        assert_eq!(queue.metrics().rejected_submissions.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            queue.metrics().rejected_submissions.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -210,12 +227,16 @@ mod tests {
         let first = queue.submit(text, Priority::Background);
         let batch = queue.try_form_batch().unwrap();
         assert_eq!(queue.usage().outstanding_text_bytes, bytes);
-        assert!(matches!(queue.submit("y".into(), Priority::Background).try_recv().unwrap(),
-            Err(SearchError::QueueFull { pending, capacity }) if pending == bytes && capacity == bytes));
+        assert!(
+            matches!(queue.submit("y".into(), Priority::Background).try_recv().unwrap(),
+            Err(SearchError::QueueFull { pending, capacity }) if pending == bytes && capacity == bytes)
+        );
         let mut oversized = String::with_capacity(bytes + 1);
         oversized.push('z');
-        assert!(matches!(queue.submit(oversized, Priority::Background).try_recv().unwrap(),
-            Err(SearchError::InvalidConfig { ref field, .. }) if field == "batch_coalescer.text_capacity"));
+        assert!(
+            matches!(queue.submit(oversized, Priority::Background).try_recv().unwrap(),
+            Err(SearchError::InvalidConfig { ref field, .. }) if field == "batch_coalescer.text_capacity")
+        );
         // Empty, zero-capacity strings still consume request credits, not bytes.
         let empty = queue.submit(String::new(), Priority::Interactive);
         assert_eq!(queue.usage().outstanding_requests, 2);
@@ -233,7 +254,13 @@ mod tests {
         let held = queue.submit(String::new(), Priority::Interactive);
         let before = queue.usage();
         for _ in 0..16 {
-            assert!(queue.submit(String::new(), Priority::Background).try_recv().unwrap().is_err());
+            assert!(
+                queue
+                    .submit(String::new(), Priority::Background)
+                    .try_recv()
+                    .unwrap()
+                    .is_err()
+            );
             assert_eq!(queue.pending_count(), 1);
             assert_eq!(queue.usage(), before);
         }
@@ -251,15 +278,22 @@ mod tests {
         queue.shutdown();
         for _ in 0..2 {
             queue.shutdown();
-            assert!(matches!(queue.submit("after".into(), Priority::Interactive).try_recv().unwrap(),
-                Err(SearchError::Cancelled { ref phase, .. }) if phase == "batch_coalescer.submit"));
+            assert!(
+                matches!(queue.submit("after".into(), Priority::Interactive).try_recv().unwrap(),
+                Err(SearchError::Cancelled { ref phase, .. }) if phase == "batch_coalescer.submit")
+            );
         }
         assert_eq!(queue.pending_count(), 1);
         queue.wait_for_batch().unwrap().deliver(Ok(vec![vec![1.0]]));
         assert_eq!(queued.try_recv().unwrap().unwrap(), vec![1.0]);
         assert!(queue.wait_for_batch().is_none());
-        assert!(matches!(queue.submit("late".into(), Priority::Background).try_recv().unwrap(),
-            Err(SearchError::Cancelled { .. })));
+        assert!(matches!(
+            queue
+                .submit("late".into(), Priority::Background)
+                .try_recv()
+                .unwrap(),
+            Err(SearchError::Cancelled { .. })
+        ));
         assert!(queue.try_form_batch().is_none());
         assert_eq!(queue.usage(), CoalescerUsage::default());
     }
@@ -276,7 +310,8 @@ mod tests {
         assert_eq!(budget.usage().outstanding_requests, 1);
         assert!(matches!(first.try_recv(), Err(TryRecvError::Empty)));
         batch.deliver(Err(SearchError::Cancelled {
-            phase: "fixture".into(), reason: "stopped".into(),
+            phase: "fixture".into(),
+            reason: "stopped".into(),
         }));
         assert!(first.try_recv().unwrap().is_err());
         assert_eq!(budget.usage(), CoalescerUsage::default());
@@ -289,15 +324,17 @@ mod tests {
     fn simultaneous_submitters_cannot_overbook_or_cross_deliver() {
         let queue = Arc::new(bounded(8, 128, 3));
         let barrier = Arc::new(Barrier::new(33));
-        let workers: Vec<_> = (0..32).map(|id| {
-            let queue = Arc::clone(&queue);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                let text = id.to_string().into_boxed_str().into_string();
-                (id, queue.submit(text, Priority::Background))
+        let workers: Vec<_> = (0..32)
+            .map(|id| {
+                let queue = Arc::clone(&queue);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let text = id.to_string().into_boxed_str().into_string();
+                    (id, queue.submit(text, Priority::Background))
+                })
             })
-        }).collect();
+            .collect();
         barrier.wait();
         let mut accepted = Vec::new();
         let mut rejected = 0;
@@ -319,11 +356,18 @@ mod tests {
         assert_eq!(queue.pending_count(), 0);
         assert_eq!(queue.usage().outstanding_requests, 8);
         for batch in batches {
-            let results = batch.texts().iter().map(|text| vec![text.parse::<f32>().unwrap()]).collect();
+            let results = batch
+                .texts()
+                .iter()
+                .map(|text| vec![text.parse::<f32>().unwrap()])
+                .collect();
             batch.deliver(Ok(results));
         }
         for (id, receiver) in accepted {
-            assert_eq!(receiver.try_recv().unwrap().unwrap(), vec![id.to_string().parse::<f32>().unwrap()]);
+            assert_eq!(
+                receiver.try_recv().unwrap().unwrap(),
+                vec![id.to_string().parse::<f32>().unwrap()]
+            );
         }
         assert_eq!(queue.usage(), CoalescerUsage::default());
     }
@@ -332,23 +376,34 @@ mod tests {
     fn submit_shutdown_race_accounts_for_every_caller_without_sleeping() {
         let queue = Arc::new(bounded(32, 1_024, 3));
         let barrier = Arc::new(Barrier::new(17));
-        let workers: Vec<_> = (0..16).map(|id| {
-            let queue = Arc::clone(&queue);
-            let barrier = Arc::clone(&barrier);
-            thread::spawn(move || {
-                barrier.wait();
-                queue.submit(id.to_string(), Priority::Background)
+        // Every worker must be spawned before the barrier below; a lazy
+        // iterator would spawn none and deadlock the 17-party barrier.
+        #[allow(clippy::needless_collect)]
+        let workers: Vec<_> = (0..16)
+            .map(|id| {
+                let queue = Arc::clone(&queue);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    queue.submit(id.to_string(), Priority::Background)
+                })
             })
-        }).collect();
+            .collect();
         barrier.wait();
         queue.shutdown();
-        let receivers: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        let receivers: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
         while let Some(batch) = queue.wait_for_batch() {
             let results = vec![vec![1.0]; batch.len()];
             batch.deliver(Ok(results));
         }
         for receiver in receivers {
-            assert!(matches!(receiver.try_recv().unwrap(), Ok(_) | Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                receiver.try_recv().unwrap(),
+                Ok(_) | Err(SearchError::Cancelled { .. })
+            ));
         }
         assert_eq!(queue.usage(), CoalescerUsage::default());
         assert_eq!(queue.metrics().total_submitted.load(Ordering::Relaxed), 16);
@@ -362,9 +417,15 @@ mod tests {
         }));
         // Exercise integer admission without allocating an address space of text.
         let permit = budget.reserve(usize::MAX).unwrap();
-        assert!(matches!(budget.reserve(1), Err(SearchError::QueueFull { .. })));
+        assert!(matches!(
+            budget.reserve(1),
+            Err(SearchError::QueueFull { .. })
+        ));
         let empty = budget.reserve(0).unwrap();
-        assert!(matches!(budget.reserve(0), Err(SearchError::QueueFull { .. })));
+        assert!(matches!(
+            budget.reserve(0),
+            Err(SearchError::QueueFull { .. })
+        ));
         drop(permit);
         assert_eq!(budget.usage().outstanding_text_bytes, 0);
         drop(empty);

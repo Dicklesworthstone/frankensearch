@@ -461,13 +461,7 @@ fn migration_and_source_updates_have_one_expected_predecessor_winner() {
             .await
             .unwrap();
         let migration = current
-            .begin_model_migration(
-                &cx,
-                root.path().join("winner"),
-                generation(4),
-                model,
-                None,
-            )
+            .begin_model_migration(&cx, root.path().join("winner"), generation(4), model, None)
             .unwrap()
             .build(&cx)
             .await
@@ -531,7 +525,10 @@ fn changed_prepared_input_and_non_newer_sequences_fail_before_writes_or_inferenc
         let stale = root.path().join("stale");
         let result =
             old.begin_model_migration(&cx, &stale, generation(1), replacement.clone(), None);
-        assert_field(result.err().unwrap(), "native_ann.live.migration.generation");
+        assert_field(
+            result.err().unwrap(),
+            "native_ann.live.migration.generation",
+        );
         assert!(!stale.exists());
         let mut incompatible = Provider::new("other-input", 3, true);
         Arc::get_mut(&mut incompatible)
@@ -612,7 +609,11 @@ fn failed_cancelled_and_dropped_required_quality_never_return_installable_prefix
                 original
             );
             assert_eq!(
-                old.index().search(&cx, "horizontal", 3).await.unwrap().len(),
+                old.index()
+                    .search(&cx, "horizontal", 3)
+                    .await
+                    .unwrap()
+                    .len(),
                 3
             );
         }

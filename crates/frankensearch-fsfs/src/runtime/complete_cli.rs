@@ -1788,9 +1788,9 @@ mod diagnostic_retention_tests {
 #[cfg(all(test, unix, not(feature = "embedded-models")))]
 mod tests {
     use super::super::{
-        DashboardSearchStage, FSFS_EXPLAIN_SESSION_FILE, SearchDashboardState, SearchExecutionMode,
-        set_test_fast_embedder, set_test_quality_embedder, test_fast_embedder_override,
-        test_quality_embedder_override,
+        DashboardSearchStage, FSFS_EXPLAIN_SESSION_FILE, IndexSentinel, SearchDashboardState,
+        SearchExecutionMode, set_test_fast_embedder, set_test_quality_embedder,
+        test_fast_embedder_override, test_quality_embedder_override,
     };
     use super::*;
     use crate::output_schema::{SearchHitPayload, SearchOutputPhase};

@@ -148,7 +148,10 @@ fn valid_foreign_receipts_cannot_substitute_any_retained_source_field() {
             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                 if field == "native_ann.sharded_live.migration.source"));
             assert_no_inference(&fast, &quality);
-            assert!(Arc::ptr_eq(&base.index, &live.snapshot(&cx).await.unwrap().index));
+            assert!(Arc::ptr_eq(
+                &base.index,
+                &live.snapshot(&cx).await.unwrap().index
+            ));
             assert_eq!(image(&path), target_image);
             assert_eq!(image(base.index().vectors().directory()), old_image);
         }
@@ -194,10 +197,8 @@ fn selected_migration_requires_exact_generation_and_every_storage_parameter() {
                         .unwrap();
                 }
                 "exact" => {
-                    intent = intent.with_fast_storage(
-                        NativeBuildPrecision::F16,
-                        NativeBuildRetrieval::Exact,
-                    );
+                    intent = intent
+                        .with_fast_storage(NativeBuildPrecision::F16, NativeBuildRetrieval::Exact);
                 }
                 "seed" => {
                     intent = intent.with_fast_storage(NativeBuildPrecision::F16, graph(18));
@@ -222,7 +223,10 @@ fn selected_migration_requires_exact_generation_and_every_storage_parameter() {
                     );
                 }
             }
-            let error = intent.open_selected(&cx, &receipt, limits).await.unwrap_err();
+            let error = intent
+                .open_selected(&cx, &receipt, limits)
+                .await
+                .unwrap_err();
             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                 if field == "native_ann.sharded_live.migration.target"));
             assert_no_inference(&fast, &quality);
@@ -275,16 +279,26 @@ fn selected_migration_refuses_missing_quality_and_same_name_wrong_producer() {
             } else {
                 quality.clone()
             };
-            let error = requested(&cx, &base, &path, generation(2), &target_fast, &target_quality)
-                .open_selected(&cx, &receipt, limits)
-                .await
-                .unwrap_err();
+            let error = requested(
+                &cx,
+                &base,
+                &path,
+                generation(2),
+                &target_fast,
+                &target_quality,
+            )
+            .open_selected(&cx, &receipt, limits)
+            .await
+            .unwrap_err();
             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                 if field == "native_ann.builder.producer"));
             assert_no_inference(&target_fast, &target_quality);
         }
         assert_no_inference(&fast, &quality);
-        assert!(Arc::ptr_eq(&base.index, &live.snapshot(&cx).await.unwrap().index));
+        assert!(Arc::ptr_eq(
+            &base.index,
+            &live.snapshot(&cx).await.unwrap().index
+        ));
     });
 }
 
@@ -296,10 +310,17 @@ fn selected_migration_rejects_limits_cancellation_and_corrupt_final_partition() 
         let base = live.snapshot(&cx).await.unwrap();
         let path = root.path().join("target");
         let (build_fast, build_quality) = targets();
-        let built = requested(&cx, &base, &path, generation(2), &build_fast, &build_quality)
-            .build(&cx, 3)
-            .await
-            .unwrap();
+        let built = requested(
+            &cx,
+            &base,
+            &path,
+            generation(2),
+            &build_fast,
+            &build_quality,
+        )
+        .build(&cx, 3)
+        .await
+        .unwrap();
         let last = built.index().vectors().partitions().last().unwrap();
         let last_vector = last.fast().vector_path().to_path_buf();
         let last_graph = last.quality().unwrap().graph_path().unwrap().to_path_buf();
@@ -326,7 +347,10 @@ fn selected_migration_rejects_limits_cancellation_and_corrupt_final_partition() 
         }
         let intent = requested(&cx, &base, &path, generation(2), &fast, &quality);
         cx.set_cancel_requested(true);
-        let error = intent.open_selected(&cx, &receipt, limits).await.unwrap_err();
+        let error = intent
+            .open_selected(&cx, &receipt, limits)
+            .await
+            .unwrap_err();
         cx.set_cancel_requested(false);
         assert!(matches!(error, SearchError::Cancelled { .. }));
         for file in [&last_vector, &last_graph] {
@@ -341,7 +365,10 @@ fn selected_migration_rejects_limits_cancellation_and_corrupt_final_partition() 
             // by production code, and the candidate is not retained while damaged.
             fs::write(file, original).unwrap();
             assert!(response.is_err());
-            assert!(Arc::ptr_eq(&base.index, &live.snapshot(&cx).await.unwrap().index));
+            assert!(Arc::ptr_eq(
+                &base.index,
+                &live.snapshot(&cx).await.unwrap().index
+            ));
         }
         assert_no_inference(&fast, &quality);
         assert_eq!(image(base.index().vectors().directory()), old_image);
@@ -374,7 +401,10 @@ fn selected_model_upgrade_cannot_overwrite_an_intervening_source_commit() {
         let error = live.install(&cx, &candidate).await.unwrap_err();
         assert!(matches!(error, SearchError::InvalidConfig { field, .. }
             if field == "native_ann.sharded_live.expected_current"));
-        assert!(Arc::ptr_eq(&edited.index, &live.snapshot(&cx).await.unwrap().index));
+        assert!(Arc::ptr_eq(
+            &edited.index,
+            &live.snapshot(&cx).await.unwrap().index
+        ));
         assert_eq!(
             edited.index().vectors().document("doc-6").unwrap().content,
             "newly committed source"

@@ -255,7 +255,10 @@ fn assert_rows(snapshot: &NativeShardedSnapshot, hits: &[NativeShardedResult]) {
             }
         }
     }
-    assert!(resolved > 0, "must exercise original physical shard coordinates");
+    assert!(
+        resolved > 0,
+        "must exercise original physical shard coordinates"
+    );
 }
 
 fn graph(seed: u64) -> NativeBuildRetrieval {
@@ -319,7 +322,10 @@ fn migration_repartitions_every_target_tier_and_keeps_old_progressive_queries() 
         let fresh = live.install(&cx, &candidate).await.unwrap();
         for partition in fresh.index().vectors().partitions() {
             assert_eq!(partition.fast().producer_identity, fast.identity);
-            assert_eq!(partition.quality().unwrap().producer_identity, quality.identity);
+            assert_eq!(
+                partition.quality().unwrap().producer_identity,
+                quality.identity
+            );
             assert_eq!(partition.fast().precision, NativeBuildPrecision::F16);
             assert!(partition.fast().graph_path().is_some());
             assert!(partition.quality().unwrap().graph_path().is_some());
@@ -384,8 +390,21 @@ fn migration_can_explicitly_add_and_remove_quality_without_reusing_fast_vectors(
         assert!(without_quality.index().vectors().quality().is_none());
         assert!(with_quality.index().vectors().quality().is_some());
         assert_eq!(replacement.submitted().len(), 7);
-        assert!(without_quality.index().search_quality(&cx, "vertical", 3).await.is_err());
-        assert!(!with_quality.index().search_quality(&cx, "vertical", 3).await.unwrap().is_empty());
+        assert!(
+            without_quality
+                .index()
+                .search_quality(&cx, "vertical", 3)
+                .await
+                .is_err()
+        );
+        assert!(
+            !with_quality
+                .index()
+                .search_quality(&cx, "vertical", 3)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     });
 }
 
@@ -424,9 +443,17 @@ fn migration_and_source_updates_share_the_exact_predecessor_fence() {
             let error = live.install(&cx, loser).await.unwrap_err();
             assert!(matches!(error, SearchError::InvalidConfig { field, .. }
                 if field == "native_ann.sharded_live.expected_current"));
-            assert!(Arc::ptr_eq(&installed.index, &live.snapshot(&cx).await.unwrap().index));
+            assert!(Arc::ptr_eq(
+                &installed.index,
+                &live.snapshot(&cx).await.unwrap().index
+            ));
             assert_eq!(
-                installed.index().vectors().document("doc-6").unwrap().content,
+                installed
+                    .index()
+                    .vectors()
+                    .document("doc-6")
+                    .unwrap()
+                    .content,
                 if update_first { "newsource" } else { "lastdoc" }
             );
         }
@@ -458,7 +485,11 @@ fn migration_late_required_quality_failure_never_installs_a_successful_prefix() 
                 .await
                 .unwrap_err();
             cx.set_cancel_requested(false);
-            assert_eq!(quality.submitted().len(), 7, "failure must be in the last partition");
+            assert_eq!(
+                quality.submitted().len(),
+                7,
+                "failure must be in the last partition"
+            );
             if fault == CANCEL_LATE {
                 assert!(matches!(error, SearchError::Cancelled { .. }));
             } else if fault == FAIL_LATE {
@@ -466,7 +497,10 @@ fn migration_late_required_quality_failure_never_installs_a_successful_prefix() 
             } else {
                 assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
             }
-            assert!(Arc::ptr_eq(&base.index, &live.snapshot(&cx).await.unwrap().index));
+            assert!(Arc::ptr_eq(
+                &base.index,
+                &live.snapshot(&cx).await.unwrap().index
+            ));
             assert_eq!(image(base.index().vectors().directory()), original);
         }
     });
@@ -495,11 +529,21 @@ fn dropped_migration_releases_the_pending_model_without_holding_selection() {
             assert!(future.as_mut().poll(&mut context).is_pending());
         }
         assert_eq!(fast.submitted().len(), 7);
-        assert!(Arc::ptr_eq(&base.index, &live.snapshot(&cx).await.unwrap().index));
+        assert!(Arc::ptr_eq(
+            &base.index,
+            &live.snapshot(&cx).await.unwrap().index
+        ));
         drop(future);
         assert_eq!(fast.dropped.load(Ordering::SeqCst), 1);
         assert_eq!(fast.submitted().len(), 7);
-        assert!(!live.search(&cx, "legacytoken", 3).await.unwrap().results.is_empty());
+        assert!(
+            !live
+                .search(&cx, "legacytoken", 3)
+                .await
+                .unwrap()
+                .results
+                .is_empty()
+        );
     });
 }
 
@@ -523,17 +567,21 @@ fn migration_admits_source_contracts_and_all_limits_before_creating_partitions()
         assert!(!path.exists());
         assert!(wrong.submitted().is_empty());
         let fast = Arc::new(Provider::new("target", 4));
-        assert!(base.begin_model_migration(&cx, &path, generation(1), fast.clone(), None).is_err());
+        assert!(
+            base.begin_model_migration(&cx, &path, generation(1), fast.clone(), None)
+                .is_err()
+        );
         for (suffix, shard_size, byte_limit) in [("zero", 0, 1024), ("bytes", 2, 1)] {
             let path = root.path().join(suffix);
-            assert!(base
-                .begin_model_migration(&cx, &path, generation(2), fast.clone(), None)
-                .unwrap()
-                .with_max_batch_input_bytes(byte_limit)
-                .unwrap()
-                .build(&cx, shard_size)
-                .await
-                .is_err());
+            assert!(
+                base.begin_model_migration(&cx, &path, generation(2), fast.clone(), None)
+                    .unwrap()
+                    .with_max_batch_input_bytes(byte_limit)
+                    .unwrap()
+                    .build(&cx, shard_size)
+                    .await
+                    .is_err()
+            );
             assert!(!path.exists());
         }
         assert!(fast.submitted().is_empty());
@@ -573,7 +621,9 @@ fn empty_migrations_preserve_an_identity_bearing_partition_without_inference() {
         assert!(fast.submitted().is_empty());
         assert_eq!(fast.queries.load(Ordering::SeqCst), 0);
         assert_eq!(
-            installed.index().vectors().partitions()[0].fast().producer_identity,
+            installed.index().vectors().partitions()[0]
+                .fast()
+                .producer_identity,
             fast.identity
         );
     });
@@ -589,19 +639,20 @@ fn failed_old_models_do_not_block_rebuilding_the_retained_source() {
         old_quality.unavailable.store(true, Ordering::SeqCst);
         let fast = Arc::new(Provider::new("replacement", 4));
         let candidate = base
-            .begin_model_migration(
-                &cx,
-                root.path().join("recovery"),
-                generation(2),
-                fast,
-                None,
-            )
+            .begin_model_migration(&cx, root.path().join("recovery"), generation(2), fast, None)
             .unwrap()
             .build(&cx, 2)
             .await
             .unwrap();
         live.install(&cx, &candidate).await.unwrap();
-        assert!(!live.search(&cx, "legacytoken", 3).await.unwrap().results.is_empty());
+        assert!(
+            !live
+                .search(&cx, "legacytoken", 3)
+                .await
+                .unwrap()
+                .results
+                .is_empty()
+        );
         assert_eq!(old_fast.queries.load(Ordering::SeqCst), 0);
         assert_eq!(old_quality.queries.load(Ordering::SeqCst), 0);
         assert_eq!(old_fast.submitted().len(), 7);
