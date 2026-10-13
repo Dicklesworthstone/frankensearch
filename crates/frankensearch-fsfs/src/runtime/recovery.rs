@@ -52,6 +52,32 @@ impl PreparedRetainedRecovery {
         self.reader.generation()
     }
 
+    /// Export the original selection guard after admission and any preview.
+    ///
+    /// Save this fingerprint with `generation().id()` and its manifest digest
+    /// in trusted caller storage. [`FsfsRuntime::resume_retained_recovery`] can
+    /// then re-admit the same target without recopying or decoding it. Export
+    /// never rereads the selection, so it cannot renew a stale preparation.
+    /// A failed or abandoned preview must be retried successfully before export.
+    ///
+    /// This receipt is not a disk-retention pin, a signature, or durable preview
+    /// evidence. A resumed process rechecks all producers and performs any preview
+    /// it requests anew. A previously exported receipt is not revoked by a later
+    /// failure in this process; keep receipt ownership in the caller's workflow.
+    ///
+    /// # Errors
+    /// Returns cancellation, incomplete preview or changed retained resources.
+    pub fn expected_selection_sha256(&self, cx: &Cx) -> SearchResult<String> {
+        retained_search_checkpoint(cx)?;
+        if !self.preview_ready {
+            return Err(retained_recovery_error(
+                "the recovery preview did not complete successfully; no resume receipt can be exported",
+            ));
+        }
+        self.reader.validate_retained_recovery_resources(cx)?;
+        Ok(self.plan.expected_selection_sha256())
+    }
+
     /// Preview the retained target without changing the active selection.
     ///
     /// Once polled, this preview must complete successfully before restoration.
@@ -137,6 +163,53 @@ impl PreparedRetainedRecovery {
 }
 
 impl FsfsRuntime {
+    /// Re-admit a saved preparation without accepting a newer selected head.
+    ///
+    /// All three receipt fields must come from the same successful preparation:
+    /// its target ID, target manifest and exported selection fingerprint. The
+    /// store checks that fingerprint under publication ownership BEFORE opening
+    /// the target or loading models. The matched plan is retained across every
+    /// await, rather than recaptured after model admission. `restore` checks it
+    /// again, so publication during loading or preview cannot be overwritten.
+    ///
+    /// Every stored tier must admit its producer, even for a fast-only preview.
+    /// No earlier process's model admission or preview is trusted. No copy,
+    /// repair, source rescan or selection write occurs. Dropping this future
+    /// leaves selection unchanged; a removed target fails rather than rebuilding.
+    /// As with the store's resume API, receipts are caller-owned evidence, not
+    /// authentication, persistent retention pins or an antirollback mechanism.
+    ///
+    /// # Errors
+    /// Returns stale/malformed receipt, missing/corrupt target, producer mismatch,
+    /// unsupported configuration, I/O or cancellation errors.
+    pub async fn resume_retained_recovery(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        generation_id: &str,
+        manifest_sha256: &str,
+        expected_selection_sha256: &str,
+    ) -> SearchResult<PreparedRetainedRecovery> {
+        self.preflight_retained_recovery(cx)?;
+        let store = crate::generation_store::CompleteGenerationStore::open(cx, store_root)?;
+        let plan = store.resume_restore(
+            cx,
+            generation_id,
+            manifest_sha256,
+            expected_selection_sha256,
+        )?;
+        let generation = plan.target().clone();
+        let reader = self
+            .open_retained_recovery_target(cx, &store, generation)
+            .await?;
+        retained_search_checkpoint(cx)?;
+        Ok(PreparedRetainedRecovery {
+            plan,
+            reader,
+            preview_ready: true,
+        })
+    }
+
     /// Prepare a searchable rollback or repair using a trusted publication receipt.
     ///
     /// Capture the expected selection before asynchronous model admission, so a
@@ -1147,6 +1220,145 @@ mod retained_recovery_tests {
             assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(winner));
             assert_eq!(pinned.generation(), &selected);
             assert_eq!(pinned.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 2);
+        });
+    }
+
+    #[test]
+    fn resumed_repair_reuses_the_verified_copy_without_rebuilding_sources() {
+        use std::os::unix::fs::MetadataExt;
+
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let original = protected_publication(&runtime, &cx, &root).await;
+            damage_recovery_vector(&original, FSFS_VECTOR_INDEX_FILE);
+            fs::rename(source, directory.path().join("source-unavailable")).unwrap();
+            let damaged = file_bytes(original.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut plan = runtime
+                .prepare_retained_vector_repair(
+                    &cx, &root, original.id(), original.manifest_sha256(), 1 << 30,
+                )
+                .await
+                .unwrap();
+            plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            let token = plan.expected_selection_sha256(&cx).unwrap();
+            // Retain a reader pin for the fixture, as a live operator session
+            // may; a serialized receipt alone does not prevent retention.
+            let target = plan.generation().clone();
+            let before = file_bytes(target.path());
+            let vector_path = target.path().join(FSFS_VECTOR_INDEX_FILE);
+            let inode = fs::metadata(&vector_path).unwrap().ino();
+            let count = fs::read_dir(root.join("generations")).unwrap().count();
+            drop(plan);
+            let mut resumed = fresh_runtime(&runtime)
+                .resume_retained_recovery(
+                    &cx, &root, target.id(), target.manifest_sha256(), &token,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resumed.expected_selection_sha256(&cx).unwrap(), token);
+            assert_eq!(resumed.generation(), &target);
+            assert!(resumed.reader.resources.fast_embedder.is_some());
+            assert!(resumed.reader.resources.quality_embedder.is_some());
+            let page = resumed.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(page.last().unwrap().hits[0].path, "alpha.md");
+            assert_eq!(fs::metadata(&vector_path).unwrap().ino(), inode);
+            assert_eq!(file_bytes(target.path()), before);
+            assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), count);
+            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            let (publication, mut reader) = resumed.restore(&cx).unwrap();
+            assert!(matches!(publication,
+                GenerationPublication::Durable(ref value) if value == &target));
+            assert_eq!(reader.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(), 1);
+            assert_eq!(file_bytes(original.path()), damaged);
+            assert!(fresh_runtime(&runtime)
+                .resume_retained_recovery(
+                    &cx, &root, target.id(), target.manifest_sha256(), &token,
+                )
+                .await
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn runtime_resume_refuses_staleness_before_missing_target_or_changed_models() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let plan = runtime
+                .prepare_retained_recovery(&cx, &root, old.id(), old.manifest_sha256())
+                .await
+                .unwrap();
+            let token = plan.expected_selection_sha256(&cx).unwrap();
+            drop(plan);
+            fs::write(source.join("beta.md"), "sharedtoken later publication").unwrap();
+            let winner = publish(&runtime, &cx, &root).await;
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            fs::rename(old.path(), directory.path().join("saved-old")).unwrap();
+            models.quality.changed.store(true, Ordering::Relaxed);
+            let error = fresh_runtime(&runtime)
+                .resume_retained_recovery(
+                    &cx, &root, old.id(), old.manifest_sha256(), &token,
+                )
+                .await
+                .unwrap_err();
+            models.quality.changed.store(false, Ordering::Relaxed);
+            assert!(matches!(error, SearchError::InvalidConfig { ref reason, .. }
+                if reason.contains("cannot rebase")));
+            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(winner));
+        });
+    }
+
+    #[test]
+    fn resume_receipt_export_preserves_preview_and_required_producer_barriers() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            let target = publish(&runtime, &cx, &root).await;
+            runtime.config.search.fast_only = true;
+            let mut plan = runtime
+                .prepare_retained_recovery(&cx, &root, target.id(), target.manifest_sha256())
+                .await
+                .unwrap();
+            let token = plan.expected_selection_sha256(&cx).unwrap();
+            cx.set_cancel_requested(true);
+            assert!(matches!(plan.expected_selection_sha256(&cx), Err(SearchError::Cancelled { .. })));
+            assert!(matches!(plan.search(&cx, "sharedtoken", 10).await, Err(SearchError::Cancelled { .. })));
+            cx.set_cancel_requested(false);
+            assert!(plan.expected_selection_sha256(&cx).is_err());
+            plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(plan.expected_selection_sha256(&cx).unwrap(), token);
+            for producer in [&models.fast, &models.quality] {
+                producer.changed.store(true, Ordering::Relaxed);
+                assert!(plan.expected_selection_sha256(&cx).is_err());
+                let result = fresh_runtime(&runtime)
+                    .resume_retained_recovery(
+                        &cx, &root, target.id(), target.manifest_sha256(), &token,
+                    )
+                    .await;
+                producer.changed.store(false, Ordering::Relaxed);
+                assert!(matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })));
+            }
+            let resumed = fresh_runtime(&runtime)
+                .resume_retained_recovery(
+                    &cx, &root, target.id(), target.manifest_sha256(), &token,
+                )
+                .await
+                .unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken concurrent update").unwrap();
+            let winner = publish(&runtime, &cx, &root).await;
+            // Exporting either old plan still carries the old selection. Neither
+            // successful re-admission nor export can erase the publication race.
+            assert_eq!(plan.expected_selection_sha256(&cx).unwrap(), token);
+            assert_eq!(resumed.expected_selection_sha256(&cx).unwrap(), token);
+            assert!(resumed.restore(&cx).is_err());
+            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(winner));
         });
     }
 }
