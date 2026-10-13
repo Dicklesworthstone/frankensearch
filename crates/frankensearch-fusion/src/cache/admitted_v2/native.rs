@@ -16,6 +16,8 @@ use frankensearch_index::{FsviV2IdentityBinding, TwoTierIndex, TwoTierIndexPaths
 use super::super::{IndexCache, IndexOpenSpec, StalenessDetector, absolute_from};
 use super::{checkpoint, open_exact, rejected, validate_retained_replacement};
 
+mod loading;
+
 /// One persisted native graph and the construction policy it must retain.
 ///
 /// The associated receipt is the existing native-HNSW receipt beside this path.
