@@ -61,10 +61,12 @@ pub enum RerankCombine {
 ///
 /// # Graceful Failure
 ///
-/// This function **never** prevents search results from being returned:
+/// Except for cancellation, this function preserves usable search results:
 /// - If `candidates.len() < min_candidates`: returns `Ok(())` unchanged.
 /// - If `text_fn` returns `None` for a document: that document is skipped.
-/// - If the reranker returns an error: returns `Ok(())` with candidates unchanged.
+/// - If the reranker returns a non-cancellation error: returns `Ok(())` unchanged.
+/// - If any returned score has an invalid rank, document ID, score or logit:
+///   rejects the whole response and returns `Ok(())` with candidates unchanged.
 /// - If fewer than `min_candidates` have text available: returns `Ok(())` unchanged.
 ///
 /// # Parameters
@@ -112,6 +114,14 @@ pub async fn rerank_step(
 /// positive the retrieval stage ranked low. [`rerank_step`] is the stable convenience
 /// wrapper that uses [`RerankCombine::PureReorder`] (unchanged legacy behavior).
 ///
+/// Response admission is all-or-nothing, including existing rerank scores and
+/// explanations. Every submitted document must have exactly one finite score
+/// bound to its input rank and ID; a supplied raw logit must also be finite.
+/// Cancellation is checked around text lookup and inference, during admission,
+/// and immediately before mutation. The subsequent synchronous score/order
+/// update has no await or cancellation return; it is the commit boundary, not
+/// a promise to preempt an already-running model call or sort.
+///
 /// # Errors
 ///
 /// Returns `SearchError::Cancelled` if the operation was cancelled via `cx`.
@@ -132,6 +142,7 @@ pub async fn rerank_step_with_combine(
     min_candidates: usize,
     combine: RerankCombine,
 ) -> SearchResult<()> {
+    rerank_checkpoint(cx, "reranker_entry")?;
     if candidates.len() < min_candidates {
         tracing::debug!(
             count = candidates.len(),
@@ -142,6 +153,9 @@ pub async fn rerank_step_with_combine(
     }
 
     let rerank_count = candidates.len().min(top_k_rerank);
+    if rerank_count == 0 {
+        return Ok(());
+    }
 
     // Build RerankDocument pairs for candidates that have retrievable text.
     // Track which original indices were included (some may be skipped if text_fn returns None).
@@ -149,7 +163,10 @@ pub async fn rerank_step_with_combine(
     let mut included_indices: Option<Vec<usize>> = None;
 
     for (i, candidate) in candidates.iter().take(rerank_count).enumerate() {
-        if let Some(text) = text_fn(&candidate.doc_id) {
+        rerank_checkpoint(cx, "reranker_before_text")?;
+        let text = text_fn(&candidate.doc_id);
+        rerank_checkpoint(cx, "reranker_after_text")?;
+        if let Some(text) = text {
             rerank_docs.push(RerankDocument {
                 doc_id: candidate.doc_id.to_string(),
                 text,
@@ -164,7 +181,7 @@ pub async fn rerank_step_with_combine(
         }
     }
 
-    if rerank_docs.len() < min_candidates {
+    if rerank_docs.is_empty() || rerank_docs.len() < min_candidates {
         tracing::debug!(
             with_text = rerank_docs.len(),
             min = min_candidates,
@@ -173,32 +190,24 @@ pub async fn rerank_step_with_combine(
         return Ok(());
     }
 
-    // Run the reranker (graceful failure: catch non-cancellation errors)
-    let scores = match reranker.rerank(cx, query, &rerank_docs).await {
+    // Cancellation outranks BOTH successful output and an ordinary provider
+    // error. Do not return a graceful skip before observing the invocation.
+    rerank_checkpoint(cx, "reranker_before_inference")?;
+    let response = reranker.rerank(cx, query, &rerank_docs).await;
+    rerank_checkpoint(cx, "reranker_to_score_validation")?;
+    let scores = match response {
         Ok(scores) => scores,
         Err(SearchError::Cancelled { phase, reason }) => {
             // Cancellation propagates up — this is not a graceful skip.
             return Err(SearchError::Cancelled { phase, reason });
         }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                model = reranker.id(),
-                "reranker failed — keeping original scores"
-            );
+        Err(_) => {
+            // The exception can contain query/document text or an arbitrary
+            // formatter. Logging it is not required to retain valid results.
+            tracing::warn!("reranker failed — keeping original scores");
             return Ok(());
         }
     };
-
-    // A reranker may cancel the supplied invocation context while still
-    // successfully returning scores. Observe that authority before score
-    // validation, candidate mutation, or reordering begins.
-    cx.checkpoint().map_err(|error| SearchError::Cancelled {
-        phase: "reranker_to_score_validation".to_owned(),
-        reason: cx
-            .cancel_reason()
-            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
-    })?;
 
     // Validate score count matches
     if scores.len() != rerank_docs.len() {
@@ -210,57 +219,56 @@ pub async fn rerank_step_with_combine(
         return Ok(());
     }
 
+    // Equal cardinality alone does not prove coverage: duplicates can conceal
+    // an omitted input. Check the complete permutation before clearing even a
+    // single stale score, including when text lookup compacted the input list.
+    let mut seen = vec![false; rerank_docs.len()];
+    for score in &scores {
+        rerank_checkpoint(cx, "reranker_score_validation")?;
+        let Some(document) = rerank_docs.get(score.original_rank) else {
+            tracing::warn!("reranker returned an invalid input rank — skipping rerank");
+            return Ok(());
+        };
+        if seen[score.original_rank]
+            || document.doc_id != score.doc_id
+            || !score.score.is_finite()
+            || score.raw_logit.is_some_and(|logit| !logit.is_finite())
+        {
+            tracing::warn!("reranker returned an invalid response — skipping rerank");
+            return Ok(());
+        }
+        seen[score.original_rank] = true;
+    }
+
+    // Resolve the last provider callback before the commit checkpoint. Nothing
+    // below invokes the provider or can return cancellation after mutating data.
+    let model = reranker.id().to_owned();
+    rerank_checkpoint(cx, "reranker_commit")?;
     clear_rerank_scores(candidates, rerank_count);
 
     // Apply rerank scores to the original candidates using `original_rank`.
     // This keeps scores aligned with the correct doc_id even after the reranker sorts its output.
     for score in scores {
-        let candidate_idx = included_indices.as_ref().map_or_else(
-            || (score.original_rank < rerank_docs.len()).then_some(score.original_rank),
-            |indices| indices.get(score.original_rank).copied(),
+        let candidate_idx = included_indices.as_ref().map_or(
+            score.original_rank,
+            |indices| indices[score.original_rank],
         );
-        if let Some(candidate_idx) = candidate_idx {
-            if candidates[candidate_idx].doc_id != score.doc_id {
-                tracing::warn!(
-                    expected = %candidates[candidate_idx].doc_id,
-                    got = %score.doc_id,
-                    "reranker returned mismatched doc_id for original_rank {}; \
-                     skipping score to prevent cross-document contamination",
-                    score.original_rank
-                );
-                continue;
-            }
-            // Guard against NaN/Inf rerank scores — downstream consumers may use
-            // ordinary float comparisons that silently fail on non-finite values.
-            if !score.score.is_finite() {
-                tracing::warn!(
-                    doc_id = %score.doc_id,
-                    "reranker returned non-finite score; skipping"
-                );
-                continue;
-            }
-            candidates[candidate_idx].rerank_score = Some(score.score);
-            candidates[candidate_idx].source = ScoreSource::Reranked;
+        candidates[candidate_idx].rerank_score = Some(score.score);
+        candidates[candidate_idx].source = ScoreSource::Reranked;
 
-            if let Some(explanation) = &mut candidates[candidate_idx].explanation {
-                explanation.final_score = f64::from(score.score);
-                explanation.components.push(ScoreComponent {
-                    source: ExplainedSource::Rerank {
-                        model: reranker.id().to_owned(),
-                        logit: f64::from(score.raw_logit.unwrap_or(0.0)),
-                        sigmoid: f64::from(score.score),
-                    },
-                    raw_score: f64::from(score.score),
-                    normalized_score: f64::from(score.score),
-                    rrf_contribution: 0.0,
-                    weight: 1.0,
-                });
-            }
-        } else {
-            tracing::warn!(
-                rank = score.original_rank,
-                "reranker returned original_rank outside included candidates"
-            );
+        if let Some(explanation) = &mut candidates[candidate_idx].explanation {
+            explanation.final_score = f64::from(score.score);
+            explanation.components.push(ScoreComponent {
+                source: ExplainedSource::Rerank {
+                    model: model.clone(),
+                    logit: f64::from(score.raw_logit.unwrap_or(0.0)),
+                    sigmoid: f64::from(score.score),
+                },
+                raw_score: f64::from(score.score),
+                normalized_score: f64::from(score.score),
+                rrf_contribution: 0.0,
+                weight: 1.0,
+            });
         }
     }
 
@@ -280,10 +288,24 @@ pub async fn rerank_step_with_combine(
 
     tracing::debug!(
         reranked = rerank_docs.len(),
-        model = reranker.id(),
+        model = %model,
         "rerank step complete"
     );
 
+    Ok(())
+}
+
+fn rerank_checkpoint(cx: &Cx, phase: &str) -> SearchResult<()> {
+    let checkpoint = cx.checkpoint();
+    if checkpoint.is_err() || cx.is_cancel_requested() {
+        return Err(SearchError::Cancelled {
+            phase: phase.to_owned(),
+            reason: cx.cancel_reason().map_or_else(
+                || "rerank operation cancelled".to_owned(),
+                |reason| reason.to_string(),
+            ),
+        });
+    }
     Ok(())
 }
 
@@ -1661,4 +1683,381 @@ mod tests {
     }
 
     // ─── bd-1lni tests end ───
+
+    mod response_admission {
+        use super::*;
+        use std::future::Future;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use std::task::{Context, Poll, Wake, Waker};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Reply {
+            Valid,
+            Short,
+            Long,
+            Duplicate,
+            InvalidRank,
+            WrongId,
+            InvalidScore(f32),
+            InvalidLogit(f32),
+            CancelSuccess,
+            CancelError,
+            ProviderCancelled,
+            Pending,
+        }
+
+        struct Probe {
+            reply: Reply,
+            calls: AtomicUsize,
+            drops: AtomicUsize,
+            cancel_on_id: Option<Cx>,
+        }
+
+        impl Probe {
+            fn new(reply: Reply) -> Self {
+                Self {
+                    reply,
+                    calls: AtomicUsize::new(0),
+                    drops: AtomicUsize::new(0),
+                    cancel_on_id: None,
+                }
+            }
+        }
+
+        struct CallGuard<'a>(&'a AtomicUsize);
+
+        impl Drop for CallGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        impl Reranker for Probe {
+            #[allow(clippy::cast_precision_loss)]
+            fn rerank<'a>(
+                &'a self,
+                cx: &'a Cx,
+                _query: &'a str,
+                documents: &'a [RerankDocument],
+            ) -> SearchFuture<'a, Vec<RerankScore>> {
+                self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+                Box::pin(async move {
+                    let _guard = CallGuard(&self.drops);
+                    if matches!(self.reply, Reply::Pending) {
+                        return std::future::pending().await;
+                    }
+                    if matches!(self.reply, Reply::ProviderCancelled) {
+                        return Err(SearchError::Cancelled {
+                            phase: "fixture.provider".to_owned(),
+                            reason: "provider stopped".to_owned(),
+                        });
+                    }
+                    let mut scores: Vec<_> = documents
+                        .iter()
+                        .enumerate()
+                        .map(|(original_rank, doc)| RerankScore {
+                            doc_id: doc.doc_id.clone(),
+                            score: (original_rank + 1) as f32 / (documents.len() + 1) as f32,
+                            original_rank,
+                            raw_logit: Some(original_rank as f32 - 2.0),
+                        })
+                        .collect();
+                    scores.reverse();
+                    if scores.is_empty() {
+                        return Ok(scores);
+                    }
+                    let last = scores.len() - 1;
+                    match self.reply {
+                        Reply::Short => { let _ = scores.pop(); }
+                        Reply::Long => scores.push(RerankScore {
+                            doc_id: scores[0].doc_id.clone(),
+                            score: scores[0].score,
+                            original_rank: scores[0].original_rank,
+                            raw_logit: scores[0].raw_logit,
+                        }),
+                        Reply::Duplicate => {
+                            scores[last].doc_id = scores[0].doc_id.clone();
+                            scores[last].original_rank = scores[0].original_rank;
+                        }
+                        Reply::InvalidRank => scores[last].original_rank = usize::MAX,
+                        Reply::WrongId => scores[last].doc_id = "foreign-document".to_owned(),
+                        Reply::InvalidScore(value) => scores[last].score = value,
+                        Reply::InvalidLogit(value) => scores[last].raw_logit = Some(value),
+                        Reply::CancelSuccess | Reply::CancelError => {
+                            cx.cancel_with(asupersync::CancelKind::User, Some("response cancelled"));
+                            if matches!(self.reply, Reply::CancelError) {
+                                return Err(SearchError::RerankFailed {
+                                    model: "probe".to_owned(),
+                                    source: "ordinary provider error after cancellation".into(),
+                                });
+                            }
+                        }
+                        Reply::Valid | Reply::ProviderCancelled | Reply::Pending => {}
+                    }
+                    Ok(scores)
+                })
+            }
+
+            fn id(&self) -> &str {
+                if let Some(cx) = &self.cancel_on_id {
+                    cx.cancel_with(asupersync::CancelKind::User, Some("model label cancelled"));
+                }
+                "admission-probe"
+            }
+
+            fn model_name(&self) -> &str { "admission-probe" }
+        }
+
+        fn candidates() -> Vec<ScoredResult> {
+            let mut candidates = make_candidates(7);
+            for (i, candidate) in candidates.iter_mut().enumerate() {
+                candidate.index = Some(u32::try_from(i + 20).unwrap());
+                candidate.fast_score = Some(-0.0);
+                candidate.quality_score = Some(0.7);
+                candidate.lexical_score = Some(4.0);
+                candidate.rerank_score = Some(0.125);
+                candidate.source = ScoreSource::Reranked;
+                candidate.metadata = Some(Arc::new(serde_json::json!({"row": i})));
+                candidate.explanation = Some(Box::new(frankensearch_core::HitExplanation {
+                    final_score: 0.125,
+                    components: vec![ScoreComponent {
+                        source: ExplainedSource::Rerank {
+                            model: "previous-model".to_owned(), logit: -1.0, sigmoid: 0.125,
+                        },
+                        raw_score: 0.125, normalized_score: 0.125,
+                        rrf_contribution: 0.0, weight: 1.0,
+                    }],
+                    phase: frankensearch_core::ExplanationPhase::Refined,
+                    rank_movement: None,
+                }));
+            }
+            candidates
+        }
+
+        fn assert_unchanged(actual: &[ScoredResult], expected: &[ScoredResult]) {
+            assert_eq!(serde_json::to_vec(actual).unwrap(), serde_json::to_vec(expected).unwrap());
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+                assert_eq!(actual.fast_score.map(f32::to_bits), expected.fast_score.map(f32::to_bits));
+                assert!(Arc::ptr_eq(actual.metadata.as_ref().unwrap(), expected.metadata.as_ref().unwrap()));
+            }
+        }
+
+        const STRATEGIES: [RerankCombine; 2] = [
+            RerankCombine::PureReorder,
+            RerankCombine::RrfCombine { k: DEFAULT_RRF_COMBINE_K },
+        ];
+
+        #[test]
+        fn malformed_responses_leave_full_and_compacted_windows_unchanged() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for combine in STRATEGIES {
+                    for partial in [false, true] {
+                        for reply in [
+                            Reply::Short, Reply::Long, Reply::Duplicate,
+                            Reply::InvalidRank, Reply::WrongId,
+                            Reply::InvalidScore(f32::NAN), Reply::InvalidScore(f32::INFINITY),
+                            Reply::InvalidScore(f32::NEG_INFINITY), Reply::InvalidLogit(f32::NAN),
+                            Reply::InvalidLogit(f32::INFINITY), Reply::InvalidLogit(f32::NEG_INFINITY),
+                        ] {
+                            let provider = Probe::new(reply);
+                            let mut values = candidates();
+                            let before = values.clone();
+                            rerank_step_with_combine(
+                                &cx, &provider, "query", &mut values,
+                                |id| if partial { text_for_doc_partial(id) } else { text_for_doc(id) },
+                                6, 2, combine,
+                            ).await.unwrap();
+                            assert_unchanged(&values, &before);
+                            assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 1);
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn valid_permuted_scores_keep_compacted_mapping_explanations_and_tail() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for combine in STRATEGIES {
+                    let provider = Probe::new(Reply::Valid);
+                    let mut values = candidates();
+                    let before = values.clone();
+                    rerank_step_with_combine(
+                        &cx, &provider, "query", &mut values, text_for_doc_partial,
+                        6, 2, combine,
+                    ).await.unwrap();
+                    let mut expected_order = before.clone();
+                    for (i, value) in expected_order.iter_mut().take(6).enumerate() {
+                        #[allow(clippy::cast_precision_loss)]
+                        { value.rerank_score = i.is_multiple_of(2).then_some((i / 2 + 1) as f32 / 4.0); }
+                    }
+                    match combine {
+                        RerankCombine::PureReorder => expected_order[..6].sort_by(compare_by_rerank_score),
+                        RerankCombine::RrfCombine { k } => apply_rrf_combine_reference(&mut expected_order[..6], k),
+                    }
+                    assert_eq!(
+                        values.iter().map(|value| value.doc_id.as_str()).collect::<Vec<_>>(),
+                        expected_order.iter().map(|value| value.doc_id.as_str()).collect::<Vec<_>>(),
+                    );
+                    for value in &values[..6] {
+                        let i: usize = value.doc_id.strip_prefix("doc-").unwrap().parse().unwrap();
+                        let original = &before[i];
+                        assert_eq!(value.index, original.index);
+                        assert_eq!(value.score.to_bits(), original.score.to_bits());
+                        assert_eq!(value.fast_score.map(f32::to_bits), original.fast_score.map(f32::to_bits));
+                        assert_eq!(value.quality_score, original.quality_score);
+                        assert_eq!(value.lexical_score, original.lexical_score);
+                        assert!(Arc::ptr_eq(value.metadata.as_ref().unwrap(), original.metadata.as_ref().unwrap()));
+                        let explanation = value.explanation.as_ref().unwrap();
+                        if i.is_multiple_of(2) {
+                            #[allow(clippy::cast_precision_loss)]
+                            let expected = (i / 2 + 1) as f32 / 4.0;
+                            assert_eq!(value.rerank_score, Some(expected));
+                            assert_eq!(explanation.final_score, f64::from(expected));
+                            assert_eq!(explanation.components.len(), 2);
+                            #[allow(clippy::cast_precision_loss)]
+                            let expected_logit = (i / 2) as f64 - 2.0;
+                            assert!(matches!(
+                                &explanation.components[1].source,
+                                ExplainedSource::Rerank { model, logit, sigmoid }
+                                    if model == "admission-probe" && *logit == expected_logit
+                                        && *sigmoid == f64::from(expected)
+                            ));
+                        } else {
+                            assert!(value.rerank_score.is_none());
+                            assert_eq!(explanation.components.len(), 1);
+                        }
+                    }
+                    assert_unchanged(&values[6..], &before[6..]);
+                    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 1);
+                }
+            });
+        }
+
+        #[test]
+        fn pre_cancelled_requests_skip_text_and_inference_even_for_noops() {
+            for (count, top_k, minimum) in [(0, 10, 0), (7, 0, 0), (7, 7, 100), (7, 7, 1)] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let provider = Probe::new(Reply::Valid);
+                    let mut values = candidates();
+                    values.truncate(count);
+                    let before = values.clone();
+                    let lookups = AtomicUsize::new(0);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("cancel before rerank"));
+                    let result = rerank_step(&cx, &provider, "query", &mut values, |id| {
+                        lookups.fetch_add(1, AtomicOrdering::Relaxed);
+                        text_for_doc(id)
+                    }, top_k, minimum).await;
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                    assert_unchanged(&values, &before);
+                    assert_eq!(lookups.load(AtomicOrdering::Relaxed), 0);
+                    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 0);
+                });
+            }
+        }
+
+        #[test]
+        fn text_lookup_cancellation_stops_before_later_lookups_or_inference() {
+            for missing in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let provider = Probe::new(Reply::Valid);
+                    let mut values = candidates();
+                    let before = values.clone();
+                    let lookups = AtomicUsize::new(0);
+                    let result = rerank_step(&cx, &provider, "query", &mut values, |id| {
+                        lookups.fetch_add(1, AtomicOrdering::Relaxed);
+                        cx.cancel_with(asupersync::CancelKind::User, Some("text lookup cancelled"));
+                        if missing { None } else { text_for_doc(id) }
+                    }, 6, 0).await;
+                    assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                    assert_unchanged(&values, &before);
+                    assert_eq!(lookups.load(AtomicOrdering::Relaxed), 1);
+                    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 0);
+                });
+            }
+        }
+
+        #[test]
+        fn cancellation_wins_over_success_and_ordinary_provider_failure() {
+            for reply in [Reply::CancelSuccess, Reply::CancelError, Reply::ProviderCancelled] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let provider = Probe::new(reply);
+                    let mut values = candidates();
+                    let before = values.clone();
+                    let error = rerank_step(&cx, &provider, "query", &mut values, text_for_doc, 6, 1)
+                        .await.unwrap_err();
+                    let expected = if matches!(reply, Reply::ProviderCancelled) {
+                        "fixture.provider"
+                    } else {
+                        "reranker_to_score_validation"
+                    };
+                    assert!(matches!(error, SearchError::Cancelled { ref phase, .. } if phase == expected));
+                    assert_unchanged(&values, &before);
+                    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 1);
+                    assert_eq!(provider.drops.load(AtomicOrdering::Relaxed), 1);
+                });
+            }
+        }
+
+        #[test]
+        fn no_work_does_not_infer_or_clear_existing_rerank_state() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for (count, top_k, missing) in [(0, 6, false), (7, 0, false), (7, 6, true)] {
+                    let provider = Probe::new(Reply::Valid);
+                    let mut values = candidates();
+                    values.truncate(count);
+                    let before = values.clone();
+                    rerank_step(&cx, &provider, "query", &mut values, |id| {
+                        if missing { None } else { text_for_doc(id) }
+                    }, top_k, 0).await.unwrap();
+                    assert_unchanged(&values, &before);
+                    assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 0);
+                }
+            });
+        }
+
+        struct NoopWake;
+        impl Wake for NoopWake { fn wake(self: Arc<Self>) {} }
+
+        #[test]
+        fn abandoned_inference_preserves_candidates_and_allows_explicit_retry() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let pending = Probe::new(Reply::Pending);
+                let mut values = candidates();
+                let before = values.clone();
+                let mut future = Box::pin(rerank_step(
+                    &cx, &pending, "query", &mut values, text_for_doc, 6, 1,
+                ));
+                let waker = Waker::from(Arc::new(NoopWake));
+                assert!(matches!(future.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Pending));
+                drop(future);
+                assert_unchanged(&values, &before);
+                assert_eq!(pending.calls.load(AtomicOrdering::Relaxed), 1);
+                assert_eq!(pending.drops.load(AtomicOrdering::Relaxed), 1);
+                assert!(!cx.is_cancel_requested());
+                let ready = Probe::new(Reply::Valid);
+                rerank_step(&cx, &ready, "query", &mut values, text_for_doc, 6, 1).await.unwrap();
+                assert_eq!(values[0].doc_id, "doc-5");
+                assert_unchanged(&values[6..], &before[6..]);
+                assert_eq!(ready.calls.load(AtomicOrdering::Relaxed), 1);
+            });
+        }
+
+        #[test]
+        fn cancellation_from_model_label_is_observed_before_commit() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let mut provider = Probe::new(Reply::Valid);
+                provider.cancel_on_id = Some(cx.clone());
+                let mut values = candidates();
+                let before = values.clone();
+                let error = rerank_step(&cx, &provider, "query", &mut values, text_for_doc, 6, 1)
+                    .await.unwrap_err();
+                assert!(matches!(error, SearchError::Cancelled { ref phase, .. } if phase == "reranker_commit"));
+                assert_unchanged(&values, &before);
+                assert_eq!(provider.calls.load(AtomicOrdering::Relaxed), 1);
+            });
+        }
+    }
 }
