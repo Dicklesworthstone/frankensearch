@@ -18,6 +18,10 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use super::super::super::FSFS_DAEMON_RESPONSE_MAX_BYTES;
 use super::{IO_POLL_INTERVAL, complete_cli_error, retained_search_checkpoint};
 
+#[path = "complete_daemon_stream/drain.rs"]
+mod drain;
+use drain::{DrainState, drain_pending};
+
 /// Observe a disconnected response consumer without reading request bytes or
 /// writing a probe into the response. EOF on the input half alone is NOT a
 /// disconnect: clients may shutdown(Write) and continue receiving the answer.
@@ -58,25 +62,21 @@ struct Output {
 }
 
 impl Output {
-    fn drain(&mut self) -> io::Result<()> {
+    fn drain(&mut self) -> io::Result<DrainState> {
         // Check even with an empty queue: quality inference or generation
         // admission can suspend long after Initial was completely delivered.
         check_peer(&self.peer)?;
-        while self.offset < self.pending.len() {
-            match self.peer.write(&self.pending[self.offset..]) {
-                Ok(0) => return Err(io::Error::new(ErrorKind::WriteZero, "stream peer closed")),
-                Ok(count) => {
-                    self.emitted = true;
-                    self.offset += count;
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(()),
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
+        let state = drain_pending(
+            &mut self.peer,
+            &self.pending,
+            &mut self.offset,
+            &mut self.emitted,
+        )?;
+        if state == DrainState::Drained {
+            self.pending.clear();
+            self.offset = 0;
         }
-        self.pending.clear();
-        self.offset = 0;
-        Ok(())
+        Ok(state)
     }
 }
 
@@ -143,7 +143,8 @@ impl Write for PhaseWriter {
             } = &mut *output;
             pending.append(staged);
         }
-        output.drain()
+        // The owning driver finishes a blocked or cooperatively yielded flush.
+        output.drain().map(|_| ())
     }
 }
 
@@ -165,8 +166,15 @@ pub(super) async fn drive<T>(
             if let Err(error) = retained_search_checkpoint(cx) {
                 return Poll::Ready(Err(error));
             }
-            if let Err(error) = output.lock().and_then(|mut state| state.drain()) {
-                return Poll::Ready(Err(SearchError::Io(error)));
+            match output.lock().and_then(|mut state| state.drain()) {
+                Ok(DrainState::Yielded) => {
+                    // Give the parent deadline and other tasks a turn without
+                    // adding an I/O-timer delay to a normally writable stream.
+                    task.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Ok(DrainState::Drained | DrainState::Blocked) => {}
+                Err(error) => return Poll::Ready(Err(SearchError::Io(error))),
             }
             if let Some(future) = producer.as_mut()
                 && let Poll::Ready(result) = future.as_mut().poll(task)
@@ -189,9 +197,10 @@ pub(super) async fn drive<T>(
                 // follow any exposed stream bytes.
                 state.staged.clear();
             }
-            if let Err(error) = state.drain() {
-                return Poll::Ready(Err(error.into()));
-            }
+            let drain_state = match state.drain() {
+                Ok(state) => state,
+                Err(error) => return Poll::Ready(Err(error.into())),
+            };
             if state.pending.is_empty()
                 && let Some(result) = finished.take()
             {
@@ -204,6 +213,10 @@ pub(super) async fn drive<T>(
                 return Poll::Ready(result.map(Some));
             }
             drop(state);
+            if drain_state == DrainState::Yielded {
+                task.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             if tick.as_mut().poll(task).is_ready() {
                 Poll::Ready(Ok(None))
             } else {
