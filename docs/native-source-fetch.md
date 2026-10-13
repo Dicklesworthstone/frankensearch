@@ -5,6 +5,22 @@ operation. It resolves document IDs through the same retained source cohort as
 search, not through current files, vector row ordinals, or a new model invocation.
 This works for both single and sharded hybrid cohorts without flattening shards.
 
+The same protocol is available in `serve --lexical-only`, with no embedding
+model options or model initialization:
+
+```sh
+frankensearch-native serve --receipt /absolute/path/to/selection.json --lexical-only
+```
+
+Keyword-only startup uses the existing selected source/Quill reader and never
+opens semantic vectors or graphs. Sources therefore remain retrievable when
+those artifacts are damaged or the old embedding models are unavailable,
+provided the trusted source/Quill selection still validates. A bad source or
+lexical receipt remains an error, not permission to read unauthenticated text.
+Keyword search, fetch and status requests can share one fixed-snapshot session.
+Its readiness still reports `semantic_components_verified: false`; fetching
+retained text does not establish semantic-index health or repair an artifact.
+
 ## Request and response
 
 Copy `expected_generation` from the search response whose source you need,
@@ -92,6 +108,7 @@ The executable tests are under `serve::source::tests`:
 
 ```sh
 cargo test -p frankensearch --features quill --bin frankensearch-native serve::source
+cargo test -p frankensearch --features quill --bin frankensearch-native lexical::source_tests
 ```
 
 They cover strict requests, UTF-8 continuation, source-scope non-disclosure,
