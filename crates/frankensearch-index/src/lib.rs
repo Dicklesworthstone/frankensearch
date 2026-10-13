@@ -118,12 +118,12 @@ pub use simd::{
     quantize_f16_le_bytes_to_i8, quantize_f16_le_bytes_to_i8_generic, quantize_f16_slab_to_i8,
     quantize_f16_slab_to_i8_generic,
 };
+#[cfg(feature = "ann")]
+pub use two_tier::VECTOR_ANN_FAST_FILENAME;
 pub use two_tier::{
     TwoTierIndex, TwoTierIndexBuilder, TwoTierIndexPaths, VECTOR_INDEX_FALLBACK_FILENAME,
     VECTOR_INDEX_FAST_FILENAME, VECTOR_INDEX_QUALITY_FILENAME,
 };
-#[cfg(feature = "ann")]
-pub use two_tier::{VECTOR_ANN_FAST_FILENAME, VECTOR_ANN_QUALITY_FILENAME};
 pub use wal::{
     CompactionStats, StrictWalImage, StrictWalInspection, WalConfig, inspect_wal_strict,
     wal_path_for,

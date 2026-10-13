@@ -48,28 +48,24 @@ pub const VECTOR_INDEX_FALLBACK_FILENAME: &str = "vector.idx";
 /// Serialized fast-tier ANN sidecar.
 #[cfg(feature = "ann")]
 pub const VECTOR_ANN_FAST_FILENAME: &str = "vector.fast.hnsw";
-/// Serialized quality-tier ANN sidecar.
-#[cfg(feature = "ann")]
-pub const VECTOR_ANN_QUALITY_FILENAME: &str = "vector.quality.hnsw";
 
 /// Explicit filesystem layout for opening a [`TwoTierIndex`].
 ///
 /// Use this when a consumer owns the index naming convention instead of using
 /// the default `vector.fast.idx` / `vector.quality.idx` layout. Every configured
 /// role must resolve to a distinct artifact. When the `ann` feature is enabled,
-/// omitting an ANN sidecar path explicitly disables ANN for that tier even if
-/// the configured record-count threshold is met. ANN paths are writable:
-/// opening an index may create or replace those sidecars. Callers must keep all
-/// configured artifact directories trusted and stable for the duration of
-/// [`TwoTierIndex::open_with_paths`].
+/// omitting the fast-tier ANN sidecar path explicitly disables ANN even if the
+/// configured record-count threshold is met. This graph serves only the fast
+/// tier; the quality tier is searched exactly or through its opt-in native
+/// graph. The ANN path is writable: opening an index may create or replace
+/// that sidecar. Callers must keep all configured artifact directories trusted
+/// and stable for the duration of [`TwoTierIndex::open_with_paths`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TwoTierIndexPaths {
     fast_index: PathBuf,
     quality_index: Option<PathBuf>,
     #[cfg(feature = "ann")]
     fast_ann: Option<PathBuf>,
-    #[cfg(feature = "ann")]
-    quality_ann: Option<PathBuf>,
 }
 
 impl TwoTierIndexPaths {
@@ -81,8 +77,6 @@ impl TwoTierIndexPaths {
             quality_index: None,
             #[cfg(feature = "ann")]
             fast_ann: None,
-            #[cfg(feature = "ann")]
-            quality_ann: None,
         }
     }
 
@@ -98,14 +92,6 @@ impl TwoTierIndexPaths {
     #[must_use]
     pub fn with_fast_ann(mut self, fast_ann: impl Into<PathBuf>) -> Self {
         self.fast_ann = Some(fast_ann.into());
-        self
-    }
-
-    /// Add an explicit quality-tier ANN sidecar path.
-    #[cfg(feature = "ann")]
-    #[must_use]
-    pub fn with_quality_ann(mut self, quality_ann: impl Into<PathBuf>) -> Self {
-        self.quality_ann = Some(quality_ann.into());
         self
     }
 
@@ -126,13 +112,6 @@ impl TwoTierIndexPaths {
     #[must_use]
     pub fn fast_ann(&self) -> Option<&Path> {
         self.fast_ann.as_deref()
-    }
-
-    /// Optional quality-tier ANN sidecar path.
-    #[cfg(feature = "ann")]
-    #[must_use]
-    pub fn quality_ann(&self) -> Option<&Path> {
-        self.quality_ann.as_deref()
     }
 
     /// Freeze every relative artifact path against the process's current
@@ -175,7 +154,6 @@ impl TwoTierIndexPaths {
         #[cfg(feature = "ann")]
         {
             self.fast_ann = self.fast_ann.map(|path| make_path_absolute(base, path));
-            self.quality_ann = self.quality_ann.map(|path| make_path_absolute(base, path));
         }
         Ok(self)
     }
@@ -245,18 +223,6 @@ fn reject_final_symlink(role: &str, path: &Path) -> SearchResult<()> {
 }
 
 fn validate_index_paths(paths: &TwoTierIndexPaths) -> SearchResult<()> {
-    #[cfg(feature = "ann")]
-    if paths.quality_ann.is_some() && paths.quality_index.is_none() {
-        return Err(SearchError::InvalidConfig {
-            field: "quality_ann".to_owned(),
-            value: paths
-                .quality_ann
-                .as_deref()
-                .map_or_else(String::new, |path| path.display().to_string()),
-            reason: "a quality ANN sidecar requires a quality index path".to_owned(),
-        });
-    }
-
     let mut roles = vec![("fast_index", paths.fast_index())];
     if let Some(path) = paths.quality_index() {
         roles.push(("quality_index", path));
@@ -264,10 +230,6 @@ fn validate_index_paths(paths: &TwoTierIndexPaths) -> SearchResult<()> {
     #[cfg(feature = "ann")]
     if let Some(path) = paths.fast_ann() {
         roles.push(("fast_ann", path));
-    }
-    #[cfg(feature = "ann")]
-    if let Some(path) = paths.quality_ann() {
-        roles.push(("quality_ann", path));
     }
 
     for (role, path) in &roles {
@@ -294,116 +256,48 @@ fn validate_index_paths(paths: &TwoTierIndexPaths) -> SearchResult<()> {
 }
 
 #[cfg(feature = "ann")]
-fn validate_ann_save_lock_identities(
-    paths: &TwoTierIndexPaths,
-    fast_ann_enabled: bool,
-    quality_ann_enabled: bool,
-) -> SearchResult<()> {
-    let configured_roles = {
-        let mut roles = vec![("fast_index", paths.fast_index())];
-        if let Some(path) = paths.quality_index() {
-            roles.push(("quality_index", path));
-        }
-        if let Some(path) = paths.fast_ann() {
-            roles.push(("fast_ann", path));
-        }
-        if let Some(path) = paths.quality_ann() {
-            roles.push(("quality_ann", path));
-        }
-        roles
+fn validate_ann_save_lock_identity(paths: &TwoTierIndexPaths) -> SearchResult<()> {
+    let Some(fast_ann) = paths.fast_ann() else {
+        return Ok(());
     };
-
-    let mut lock_roles = Vec::with_capacity(2);
-    for (role, path, enabled) in [
-        ("fast_ann_lock", paths.fast_ann(), fast_ann_enabled),
-        ("quality_ann_lock", paths.quality_ann(), quality_ann_enabled),
-    ] {
-        let Some(path) = path.filter(|_| enabled) else {
-            continue;
-        };
-        let lock_path = crate::hnsw::hnsw_save_lock_artifact_path(path).map_err(|error| {
-            SearchError::InvalidConfig {
-                field: role.to_owned(),
-                value: path.display().to_string(),
-                reason: error.to_string(),
-            }
-        })?;
-        for (artifact_role, artifact_path) in &configured_roles {
-            if paths_alias(&lock_path, artifact_path)? {
-                return Err(SearchError::InvalidConfig {
-                    field: "index_paths".to_owned(),
-                    value: format!(
-                        "{role}={}, {artifact_role}={}",
-                        lock_path.display(),
-                        artifact_path.display()
-                    ),
-                    reason: "an ANN save-lock artifact must not alias any configured index or ANN \
-                             role"
-                        .to_owned(),
-                });
-            }
+    let lock_path = crate::hnsw::hnsw_save_lock_artifact_path(fast_ann).map_err(|error| {
+        SearchError::InvalidConfig {
+            field: "fast_ann_lock".to_owned(),
+            value: fast_ann.display().to_string(),
+            reason: error.to_string(),
         }
-        lock_roles.push((role, lock_path));
+    })?;
+    let mut configured_roles = vec![("fast_index", paths.fast_index())];
+    if let Some(path) = paths.quality_index() {
+        configured_roles.push(("quality_index", path));
     }
-
-    for (index, (left_role, left_path)) in lock_roles.iter().enumerate() {
-        for (right_role, right_path) in &lock_roles[index + 1..] {
-            if paths_alias(left_path, right_path)? {
-                return Err(SearchError::InvalidConfig {
-                    field: "index_paths".to_owned(),
-                    value: format!(
-                        "{left_role}={}, {right_role}={}",
-                        left_path.display(),
-                        right_path.display()
-                    ),
-                    reason: "configured ANN roles resolve to the same filesystem artifact"
-                        .to_owned(),
-                });
-            }
+    configured_roles.push(("fast_ann", fast_ann));
+    for (artifact_role, artifact_path) in configured_roles {
+        if paths_alias(&lock_path, artifact_path)? {
+            return Err(SearchError::InvalidConfig {
+                field: "index_paths".to_owned(),
+                value: format!(
+                    "fast_ann_lock={}, {artifact_role}={}",
+                    lock_path.display(),
+                    artifact_path.display()
+                ),
+                reason: "an ANN save-lock artifact must not alias any configured index or ANN role"
+                    .to_owned(),
+            });
         }
     }
 
-    // Materializing the persistent lock artifacts turns still-missing,
-    // potentially case/normalization-equivalent ANN leaves into real files.
-    // Comparing those files delegates collation to the mounted filesystem
-    // instead of guessing from the operating system.
-    let mut materialized = Vec::with_capacity(lock_roles.len());
-    for (role, lock_path) in lock_roles {
-        let identity = crate::hnsw::materialize_hnsw_save_lock_artifact(&lock_path)?;
-        materialized.push((role, lock_path, identity));
-    }
-    for (index, (left_role, left_path, left_identity)) in materialized.iter().enumerate() {
-        for (right_role, right_path, right_identity) in &materialized[index + 1..] {
-            if left_identity == right_identity
-                || crate::file_identity::is_same_file(left_path, right_path)
-                    .map_err(SearchError::Io)?
-            {
-                return Err(SearchError::InvalidConfig {
-                    field: "index_paths".to_owned(),
-                    value: format!(
-                        "{left_role}={}, {right_role}={}",
-                        left_path.display(),
-                        right_path.display()
-                    ),
-                    reason: "configured ANN roles alias under the mounted filesystem's path \
-                             comparison rules"
-                        .to_owned(),
-                });
-            }
-        }
-    }
-
+    // The save takes this lock anyway. Creating it before the save lets the
+    // next pre-save validation compare the configured roles against a real
+    // lock file instead of a missing leaf.
+    let _identity = crate::hnsw::materialize_hnsw_save_lock_artifact(&lock_path)?;
     Ok(())
 }
 
 #[cfg(feature = "ann")]
-fn validate_ann_persistence_paths(
-    paths: &TwoTierIndexPaths,
-    fast_ann_enabled: bool,
-    quality_ann_enabled: bool,
-) -> SearchResult<()> {
+fn validate_ann_persistence_paths(paths: &TwoTierIndexPaths) -> SearchResult<()> {
     validate_index_paths(paths)?;
-    validate_ann_save_lock_identities(paths, fast_ann_enabled, quality_ann_enabled)
+    validate_ann_save_lock_identity(paths)
 }
 
 #[derive(Debug)]
@@ -535,8 +429,6 @@ pub struct TwoTierIndex {
     #[cfg(feature = "ann")]
     fast_ann: Option<HnswIndex>,
     #[cfg(feature = "ann")]
-    quality_ann: Option<HnswIndex>,
-    #[cfg(feature = "ann")]
     ann_fallback_count: AtomicU64,
     /// Last state-scoped [`ZeroSignalReason`] observed on the fast tier,
     /// encoded via [`zero_signal_code`]; [`ZERO_SIGNAL_NONE`] when the last
@@ -612,9 +504,6 @@ impl TwoTierIndex {
         #[cfg(feature = "ann")]
         {
             paths = paths.with_fast_ann(dir.join(VECTOR_ANN_FAST_FILENAME));
-            if paths.quality_index().is_some() {
-                paths = paths.with_quality_ann(dir.join(VECTOR_ANN_QUALITY_FILENAME));
-            }
         }
         Self::open_with_paths_inner(&paths, config, true)
     }
@@ -623,8 +512,8 @@ impl TwoTierIndex {
     ///
     /// Unlike [`Self::open`], this constructor performs no filename discovery.
     /// A supplied quality path is required to exist; omit it to open a
-    /// fast-only index. ANN sidecars are used only when explicitly configured
-    /// on [`TwoTierIndexPaths`].
+    /// fast-only index. The fast-tier ANN sidecar is used only when explicitly
+    /// configured on [`TwoTierIndexPaths`].
     ///
     /// # Errors
     ///
@@ -905,67 +794,17 @@ impl TwoTierIndex {
         });
 
         #[cfg(feature = "ann")]
-        let quality_ann_plan = quality_index.and_then(|quality_index| {
-            paths.quality_ann.as_deref().and_then(|quality_ann_path| {
-                plan_load_or_build_ann(
-                    quality_index,
-                    quality_ann_path,
-                    config.hnsw_threshold,
-                    &config,
-                    "quality",
-                )
-            })
-        });
-
-        #[cfg(feature = "ann")]
+        if let (Some(plan), Some(path)) = (fast_ann_plan.as_ref(), paths.fast_ann())
+            && plan.needs_persistence()
         {
-            let fast_needs_persistence = fast_ann_plan
-                .as_ref()
-                .is_some_and(AnnOpenPlan::needs_persistence);
-            let quality_needs_persistence = quality_ann_plan
-                .as_ref()
-                .is_some_and(AnnOpenPlan::needs_persistence);
-            let persistence_prepared = if fast_needs_persistence || quality_needs_persistence {
-                match validate_ann_persistence_paths(
-                    paths,
-                    fast_needs_persistence,
-                    quality_needs_persistence,
-                ) {
-                    Ok(()) => true,
-                    Err(error @ SearchError::InvalidConfig { .. }) => return Err(error),
-                    Err(error) => {
-                        warn!(
-                            ?error,
-                            fast_needs_persistence,
-                            quality_needs_persistence,
-                            "failed to prepare ANN persistence identities; all rebuilt ANN tiers \
-                             stay in-memory for this process and the next startup may rebuild them"
-                        );
-                        false
-                    }
-                }
-            } else {
-                true
-            };
-            if persistence_prepared {
-                if let (Some(plan), Some(path)) = (fast_ann_plan.as_ref(), paths.fast_ann()) {
-                    persist_ann_plan(
-                        plan,
-                        path,
-                        "fast",
-                        paths,
-                        fast_needs_persistence,
-                        quality_needs_persistence,
-                    );
-                }
-                if let (Some(plan), Some(path)) = (quality_ann_plan.as_ref(), paths.quality_ann()) {
-                    persist_ann_plan(
-                        plan,
-                        path,
-                        "quality",
-                        paths,
-                        fast_needs_persistence,
-                        quality_needs_persistence,
+            match validate_ann_persistence_paths(paths) {
+                Ok(()) => persist_ann_plan(plan, path, "fast", paths),
+                Err(error @ SearchError::InvalidConfig { .. }) => return Err(error),
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "failed to prepare ANN persistence identities; the rebuilt fast-tier ANN \
+                         stays in-memory for this process and the next startup may rebuild it"
                     );
                 }
             }
@@ -975,15 +814,11 @@ impl TwoTierIndex {
         let fast_ann = fast_ann_plan.map(|plan| plan.index);
 
         #[cfg(feature = "ann")]
-        let quality_ann = quality_ann_plan.map(|plan| plan.index);
-
-        #[cfg(feature = "ann")]
         debug!(
             fast_path = %paths.fast_index().display(),
             quality_path = ?paths.quality_index(),
             quality_available = quality_index.is_some(),
             fast_ann = fast_ann.is_some(),
-            quality_ann = quality_ann.is_some(),
             doc_count = fast_index.record_count(),
             "opened two-tier index"
         );
@@ -1016,8 +851,6 @@ impl TwoTierIndex {
             native_quality_hnsw: None,
             #[cfg(feature = "ann")]
             fast_ann,
-            #[cfg(feature = "ann")]
-            quality_ann,
             #[cfg(feature = "ann")]
             ann_fallback_count: AtomicU64::new(0),
             last_zero_signal: AtomicU8::new(ZERO_SIGNAL_NONE),
@@ -2101,13 +1934,6 @@ impl TwoTierIndex {
     #[must_use]
     pub const fn has_fast_ann(&self) -> bool {
         self.fast_ann.is_some()
-    }
-
-    /// Returns true when quality-tier ANN is loaded/enabled.
-    #[cfg(feature = "ann")]
-    #[must_use]
-    pub const fn has_quality_ann(&self) -> bool {
-        self.quality_ann.is_some()
     }
 
     /// Number of fast-tier ANN queries that degraded to an exact scan.
@@ -3638,19 +3464,12 @@ fn plan_load_or_build_ann(
 }
 
 #[cfg(feature = "ann")]
-fn persist_ann_plan(
-    plan: &AnnOpenPlan,
-    ann_path: &Path,
-    tier: &str,
-    paths: &TwoTierIndexPaths,
-    fast_ann_enabled: bool,
-    quality_ann_enabled: bool,
-) {
+fn persist_ann_plan(plan: &AnnOpenPlan, ann_path: &Path, tier: &str, paths: &TwoTierIndexPaths) {
     let Some(reason) = plan.persistence else {
         return;
     };
-    if let Err(error) = validate_ann_persistence_paths(paths, fast_ann_enabled, quality_ann_enabled)
-        .and_then(|()| HnswIndex::save(&plan.index, ann_path))
+    if let Err(error) =
+        validate_ann_persistence_paths(paths).and_then(|()| HnswIndex::save(&plan.index, ann_path))
     {
         warn!(
             tier,
@@ -4663,16 +4482,13 @@ mod tests {
         let fast_index = PathBuf::from("index-fast.fsvi");
         let quality_index = PathBuf::from("index-quality.fsvi");
         let fast_ann = PathBuf::from("index-fast.hnsw");
-        let quality_ann = PathBuf::from("index-quality.hnsw");
         let paths = TwoTierIndexPaths::new(&fast_index)
             .with_quality_index(&quality_index)
-            .with_fast_ann(&fast_ann)
-            .with_quality_ann(&quality_ann);
+            .with_fast_ann(&fast_ann);
 
         assert_eq!(paths.fast_index(), fast_index);
         assert_eq!(paths.quality_index(), Some(quality_index.as_path()));
         assert_eq!(paths.fast_ann(), Some(fast_ann.as_path()));
-        assert_eq!(paths.quality_ann(), Some(quality_ann.as_path()));
     }
 
     #[cfg(feature = "ann")]
@@ -4683,17 +4499,7 @@ mod tests {
             TwoTierIndexPaths::new("fast.fsvi").with_fast_ann("fast.fsvi"),
             TwoTierIndexPaths::new("fast.fsvi")
                 .with_quality_index("quality.fsvi")
-                .with_quality_ann("fast.fsvi"),
-            TwoTierIndexPaths::new("fast.fsvi")
-                .with_quality_index("quality.fsvi")
                 .with_fast_ann("quality.fsvi"),
-            TwoTierIndexPaths::new("fast.fsvi")
-                .with_quality_index("quality.fsvi")
-                .with_quality_ann("quality.fsvi"),
-            TwoTierIndexPaths::new("fast.fsvi")
-                .with_quality_index("quality.fsvi")
-                .with_fast_ann("shared.hnsw")
-                .with_quality_ann("shared.hnsw"),
         ];
 
         for paths in cases {
@@ -4706,21 +4512,6 @@ mod tests {
                 "unexpected alias error: {error:?}"
             );
         }
-    }
-
-    #[cfg(feature = "ann")]
-    #[test]
-    fn quality_ann_requires_a_quality_index() {
-        let paths = TwoTierIndexPaths::new("fast.fsvi").with_quality_ann("orphan-quality.hnsw");
-        let error = validate_index_paths(&paths).expect_err("orphan quality ANN must be rejected");
-
-        assert!(
-            matches!(
-                error,
-                SearchError::InvalidConfig { ref field, .. } if field == "quality_ann"
-            ),
-            "unexpected quality ANN error: {error:?}"
-        );
     }
 
     #[cfg(feature = "ann")]
@@ -4835,13 +4626,12 @@ mod tests {
 
     #[cfg(feature = "ann")]
     #[test]
-    fn custom_fast_and_quality_ann_paths_reopen_through_native_sidecars() {
+    fn custom_two_tier_ann_path_reopens_through_its_native_sidecar() {
         let dir = temp_index_dir("explicit-custom-two-tier-ann");
         fs::create_dir_all(&dir).expect("create temp dir");
         let fast_path = dir.join("index-fnv1a-4.fsvi");
         let quality_path = dir.join("index-minilm-4.fsvi");
         let fast_ann_path = dir.join("index-fnv1a-4.hnsw");
-        let quality_ann_path = dir.join("index-minilm-4.hnsw");
         let rows = [
             ("doc-a", &[1.0, 0.0, 0.0, 0.0][..]),
             ("doc-b", &[0.0, 1.0, 0.0, 0.0][..]),
@@ -4851,177 +4641,64 @@ mod tests {
         write_index_file(&quality_path, &rows).expect("write custom quality index");
         let paths = TwoTierIndexPaths::new(&fast_path)
             .with_quality_index(&quality_path)
-            .with_fast_ann(&fast_ann_path)
-            .with_quality_ann(&quality_ann_path);
+            .with_fast_ann(&fast_ann_path);
         let config = TwoTierConfig {
             hnsw_threshold: 1,
             ..TwoTierConfig::default()
         };
 
         let first = TwoTierIndex::open_with_paths(&paths, config.clone())
-            .expect("build both custom ANN tiers");
+            .expect("build the custom fast ANN tier");
         assert!(first.has_fast_ann());
-        assert!(first.has_quality_ann());
+        assert!(first.has_quality_index());
         load_native_ann_sidecar(&fast_ann_path, first.fast_tier());
-        load_native_ann_sidecar(
-            &quality_ann_path,
-            first.quality_tier().expect("quality index"),
-        );
         let fast_metadata = fs::read(&fast_ann_path).expect("read fast ANN metadata");
-        let quality_metadata = fs::read(&quality_ann_path).expect("read quality ANN metadata");
         drop(first);
 
         let reopened =
-            TwoTierIndex::open_with_paths(&paths, config).expect("reopen both custom ANN tiers");
+            TwoTierIndex::open_with_paths(&paths, config).expect("reopen the custom ANN tier");
         assert!(reopened.has_fast_ann());
-        assert!(reopened.has_quality_ann());
         load_native_ann_sidecar(&fast_ann_path, reopened.fast_tier());
-        load_native_ann_sidecar(
-            &quality_ann_path,
-            reopened.quality_tier().expect("quality index"),
-        );
         assert_eq!(
             fs::read(&fast_ann_path).expect("reread fast ANN metadata"),
             fast_metadata,
             "native reopen must not republish fast ANN metadata"
         );
-        assert_eq!(
-            fs::read(&quality_ann_path).expect("reread quality ANN metadata"),
-            quality_metadata,
-            "native reopen must not republish quality ANN metadata"
-        );
         assert!(!dir.join(VECTOR_ANN_FAST_FILENAME).exists());
-        assert!(!dir.join(VECTOR_ANN_QUALITY_FILENAME).exists());
     }
 
     #[cfg(feature = "ann")]
     #[test]
-    fn custom_quality_only_ann_path_does_not_enable_or_create_fast_ann() {
-        let dir = temp_index_dir("explicit-custom-quality-only-ann");
+    fn a_quality_tier_at_the_ann_threshold_gets_no_graph() {
+        // No search reads an ann-lane quality graph, so one would be built,
+        // persisted and held for nothing (bd-ckddr): opening a two-tier
+        // directory whose quality tier meets the threshold builds the fast
+        // tier's graph alone.
+        let dir = temp_index_dir("ann-quality-tier-no-graph");
         fs::create_dir_all(&dir).expect("create temp dir");
-        let fast_path = dir.join("index-fnv1a-4.fsvi");
-        let quality_path = dir.join("index-minilm-4.fsvi");
-        let quality_ann_path = dir.join("index-minilm-4.hnsw");
         let rows = [
             ("doc-a", &[1.0, 0.0, 0.0, 0.0][..]),
             ("doc-b", &[0.0, 1.0, 0.0, 0.0][..]),
+            ("doc-c", &[0.0, 0.0, 1.0, 0.0][..]),
         ];
-        write_index_file(&fast_path, &rows).expect("write custom fast index");
-        write_index_file(&quality_path, &rows).expect("write custom quality index");
-        let paths = TwoTierIndexPaths::new(&fast_path)
-            .with_quality_index(&quality_path)
-            .with_quality_ann(&quality_ann_path);
+        write_index_file(&dir.join(VECTOR_INDEX_FAST_FILENAME), &rows).expect("write fast index");
+        write_index_file(&dir.join(VECTOR_INDEX_QUALITY_FILENAME), &rows)
+            .expect("write quality index");
         let config = TwoTierConfig {
             hnsw_threshold: 1,
             ..TwoTierConfig::default()
         };
 
-        let first = TwoTierIndex::open_with_paths(&paths, config.clone())
-            .expect("build only the custom quality ANN tier");
-        assert!(!first.has_fast_ann());
-        assert!(first.has_quality_ann());
-        load_native_ann_sidecar(
-            &quality_ann_path,
-            first.quality_tier().expect("quality index"),
-        );
-        drop(first);
-
-        let reopened =
-            TwoTierIndex::open_with_paths(&paths, config).expect("reopen quality-only custom ANN");
-        assert!(!reopened.has_fast_ann());
-        assert!(reopened.has_quality_ann());
-        load_native_ann_sidecar(
-            &quality_ann_path,
-            reopened.quality_tier().expect("quality index"),
-        );
-        assert!(!dir.join("index-fnv1a-4.hnsw").exists());
-        assert!(!dir.join(VECTOR_ANN_FAST_FILENAME).exists());
-        assert!(!dir.join(VECTOR_ANN_QUALITY_FILENAME).exists());
-    }
-
-    #[cfg(feature = "ann")]
-    #[test]
-    fn missing_ann_role_aliases_follow_the_mounted_filesystem_not_the_os_name() {
-        let dir = temp_index_dir("ann-volume-collation");
-        fs::create_dir_all(&dir).expect("create temp dir");
-        let fast_path = dir.join("fast.fsvi");
-        let quality_path = dir.join("quality.fsvi");
-        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast index");
-        write_index_file(&quality_path, &[("doc-a", &[1.0, 0.0])]).expect("write quality index");
-
-        for (label, probe_name, alternate_probe_name, left_name, right_name) in [
-            (
-                "ascii",
-                "ascii-Probe",
-                "ASCII-pROBE",
-                "shared-ascii.hnsw",
-                "SHARED-ASCII.HNSW",
-            ),
-            (
-                "unicode-full-case-fold",
-                "unicode-Straße",
-                "unicode-STRASSE",
-                "shared-Straße.hnsw",
-                "shared-STRASSE.hnsw",
-            ),
-            (
-                "unicode-one-to-one-case",
-                "unicode-É-probe",
-                "unicode-é-probe",
-                "shared-É.hnsw",
-                "shared-é.hnsw",
-            ),
-            (
-                "unicode-normalization",
-                "unicode-é-normalization-probe",
-                "unicode-e\u{301}-normalization-probe",
-                "shared-é-normalization.hnsw",
-                "shared-e\u{301}-normalization.hnsw",
-            ),
-        ] {
-            let probe = dir.join(probe_name);
-            fs::write(&probe, b"filesystem collation probe").expect("write collation probe");
-            let alternate_probe = dir.join(alternate_probe_name);
-            let volume_aliases = crate::file_identity::is_same_file(&probe, &alternate_probe)
-                .unwrap_or_else(|error| {
-                    assert_eq!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound,
-                        "unexpected collation probe error"
-                    );
-                    false
-                });
-            eprintln!(
-                "bd-07os filesystem-alias probe: label={label} primary={} alternate={} \
-                 aliases={volume_aliases}",
-                probe.display(),
-                alternate_probe.display()
-            );
-
-            let paths = TwoTierIndexPaths::new(&fast_path)
-                .with_quality_index(&quality_path)
-                .with_fast_ann(dir.join(left_name))
-                .with_quality_ann(dir.join(right_name));
-            validate_index_paths(&paths).expect("missing leaves are initially distinct");
-            let validation = validate_ann_save_lock_identities(&paths, true, true);
-            if volume_aliases {
-                assert!(
-                    matches!(
-                        validation,
-                        Err(SearchError::InvalidConfig { ref field, .. })
-                            if field == "index_paths"
-                    ),
-                    "mounted filesystem must reject {label} ANN aliases: {validation:?}"
-                );
-            } else {
-                validation.unwrap_or_else(|error| {
-                    panic!(
-                        "mounted filesystem must preserve distinct {label} ANN roles: \
-                         {error:?}"
-                    )
-                });
-            }
-        }
+        let index = TwoTierIndex::open(&dir, config).expect("open both tiers with ann");
+        assert!(index.has_quality_index());
+        assert!(index.has_fast_ann());
+        assert!(dir.join(VECTOR_ANN_FAST_FILENAME).exists());
+        let quality_graph_files = fs::read_dir(&dir)
+            .expect("list index directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .filter(|name| name.to_string_lossy().starts_with("vector.quality.hnsw"))
+            .count();
+        assert_eq!(quality_graph_files, 0, "a quality tier gets no ANN graph");
     }
 
     #[cfg(feature = "ann")]
@@ -5037,14 +4714,14 @@ mod tests {
             .with_quality_index(&missing_quality_path)
             .with_fast_ann(&ann_path);
 
-        validate_ann_persistence_paths(&paths, true, false)
+        validate_ann_persistence_paths(&paths)
             .expect("initial roles and materialized save lock are distinct");
         let lock_path =
             crate::hnsw::hnsw_save_lock_artifact_path(&ann_path).expect("derive save-lock path");
         fs::hard_link(&lock_path, &missing_quality_path)
             .expect("inject a configured-role alias to the materialized save lock");
 
-        let error = validate_ann_persistence_paths(&paths, true, false)
+        let error = validate_ann_persistence_paths(&paths)
             .expect_err("complete immediate pre-save validation must reject the new lock alias");
         assert!(
             matches!(
@@ -5094,7 +4771,7 @@ mod tests {
             "fast",
             || {
                 fs::hard_link(&fast_path, &ann_path).expect("inject hardlink alias before save");
-                validate_ann_persistence_paths(&paths, true, false)
+                validate_ann_persistence_paths(&paths)
             },
             |_, _| {
                 save_called.set(true);
@@ -5122,19 +4799,16 @@ mod tests {
         let dir = temp_index_dir("ann-rebuilt-save-alias-race");
         fs::create_dir_all(&dir).expect("create temp dir");
         let fast_path = dir.join("index-fnv1a-4.fsvi");
-        let quality_path = dir.join("index-minilm-4.fsvi");
+        let missing_quality_path = dir.join("quality-will-alias-ann.fsvi");
         let fast_ann_path = dir.join("index-fnv1a-4.hnsw");
-        let quality_ann_path = dir.join("index-minilm-4.hnsw");
         let rows = [
             ("doc-a", &[1.0, 0.0, 0.0, 0.0][..]),
             ("doc-b", &[0.0, 1.0, 0.0, 0.0][..]),
         ];
         write_index_file(&fast_path, &rows).expect("write custom fast index");
-        write_index_file(&quality_path, &rows).expect("write custom quality index");
         let paths = TwoTierIndexPaths::new(&fast_path)
-            .with_quality_index(&quality_path)
-            .with_fast_ann(&fast_ann_path)
-            .with_quality_ann(&quality_ann_path);
+            .with_quality_index(&missing_quality_path)
+            .with_fast_ann(&fast_ann_path);
         let config = TwoTierConfig {
             hnsw_threshold: 1,
             ..TwoTierConfig::default()
@@ -5163,7 +4837,6 @@ mod tests {
         let vector_index = VectorIndex::open(&fast_path).expect("reopen custom fast index");
         validate_index_paths(&paths).expect("paths start distinct");
         let save_called = Cell::new(false);
-        let quality_original = fs::read(&quality_path).expect("read original quality FSVI");
         let ann = maybe_load_or_build_ann_with_save(
             &vector_index,
             &fast_ann_path,
@@ -5171,9 +4844,9 @@ mod tests {
             &config,
             "fast",
             || {
-                fs::hard_link(&quality_path, &quality_ann_path)
-                    .expect("inject quality-role hardlink alias before rebuilt resave");
-                validate_ann_persistence_paths(&paths, true, true)
+                fs::hard_link(&fast_ann_path, &missing_quality_path)
+                    .expect("inject a quality-role hardlink alias before rebuilt resave");
+                validate_ann_persistence_paths(&paths)
             },
             |_, _| {
                 save_called.set(true);
@@ -5188,12 +4861,8 @@ mod tests {
         );
         assert_eq!(ann.len(), 2);
         assert!(
-            crate::file_identity::is_same_file(&quality_path, &quality_ann_path)
+            crate::file_identity::is_same_file(&fast_ann_path, &missing_quality_path)
                 .expect("compare aliases")
-        );
-        assert_eq!(
-            fs::read(&quality_path).expect("read preserved quality FSVI"),
-            quality_original
         );
     }
 
@@ -5392,21 +5061,18 @@ mod tests {
         fs::create_dir_all(&indirection_dir).expect("create indirection directory");
 
         let fast_path = artifact_dir.join("fast.fsvi");
-        let quality_path = artifact_dir.join("quality.fsvi");
         write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast index");
-        write_index_file(&quality_path, &[("doc-a", &[1.0, 0.0])]).expect("write quality index");
 
         let ancestor_link = indirection_dir.join("link");
         symlink(&nested_dir, &ancestor_link).expect("create symlinked ancestor");
-        let fast_ann_path = artifact_dir.join("shared.hnsw");
-        let quality_ann_path = ancestor_link.join("..").join("shared.hnsw");
+        let fast_ann_path = artifact_dir.join("shared.artifact");
+        let quality_path = ancestor_link.join("..").join("shared.artifact");
         assert!(!fast_ann_path.exists());
-        assert!(!quality_ann_path.exists());
+        assert!(!quality_path.exists());
 
         let paths = TwoTierIndexPaths::new(&fast_path)
             .with_quality_index(&quality_path)
-            .with_fast_ann(&fast_ann_path)
-            .with_quality_ann(&quality_ann_path);
+            .with_fast_ann(&fast_ann_path);
         let error = validate_index_paths(&paths)
             .expect_err("missing leaves with the same OS-resolved identity must be rejected");
 
@@ -5418,7 +5084,7 @@ mod tests {
             "unexpected missing-leaf alias error: {error:?}"
         );
         assert!(!fast_ann_path.exists());
-        assert!(!quality_ann_path.exists());
+        assert!(!quality_path.exists());
     }
 
     #[test]
