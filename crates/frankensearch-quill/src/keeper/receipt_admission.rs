@@ -4,6 +4,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use frankensearch_index::mapped_file::ReadOnlyMappedFile;
 use rayon::prelude::*;
@@ -45,6 +46,40 @@ struct CheckedWitness {
     receipt: Option<Receipt>,
     guard: Option<Guard>,
     reused: bool,
+}
+
+// Stop starting expensive opens beyond a known failure, without making the
+// reported error depend on Rayon completion order. Earlier MANIFEST entries
+// must still run: one of them may contain the error a strict open would report.
+// The ordinary indexed collection joins already-running work and retains its
+// results for normal RAII cleanup; this does not interrupt an executing open.
+struct AdmissionFrontier {
+    first_error: AtomicUsize,
+}
+
+impl AdmissionFrontier {
+    fn new() -> Self {
+        Self {
+            first_error: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    fn run<T, E>(
+        &self,
+        position: usize,
+        open: impl FnOnce() -> Result<T, E>,
+    ) -> Option<Result<T, E>> {
+        if position > self.first_error.load(Ordering::Relaxed) {
+            return None;
+        }
+        let result = open();
+        if result.is_err() {
+            // This atomic carries only a pruning bound, not borrowed error or
+            // segment data. Rayon joins publish the actual owned results.
+            self.first_error.fetch_min(position, Ordering::Relaxed);
+        }
+        Some(result)
+    }
 }
 
 // Retaining every opened descriptor makes the optional fast path exhaust
@@ -223,18 +258,23 @@ impl KeeperSnapshot {
             drop(book);
             return Self::open_once(directory, schema);
         }
+        let frontier = AdmissionFrontier::new();
         let open = |(position, manifest): (usize, &ManifestSegment)| {
-            open_segment(
-                directory,
-                schema,
-                schema_id,
-                manifest,
-                &book,
-                candidates.allows(position),
-            )
+            frontier.run(position, || {
+                open_segment(
+                    directory,
+                    schema,
+                    schema_id,
+                    manifest,
+                    &book,
+                    candidates.allows(position),
+                )
+            })
         };
-        // Collect in MANIFEST order so parallel work does not randomize errors.
-        let opened: Vec<Result<AdmittedSegment, KeeperError>> = pool.map_or_else(
+        // Keep indexed MANIFEST order. A skipped entry is strictly after an
+        // actual retained error; flattening cannot turn failure into success.
+        // Do not use parallel Result collection, whose chosen error can race.
+        let opened: Vec<Option<Result<AdmittedSegment, KeeperError>>> = pool.map_or_else(
             || records.iter().enumerate().map(&open).collect(),
             |pool| pool.install(|| records.par_iter().enumerate().map(&open).collect()),
         );
@@ -255,7 +295,7 @@ impl KeeperSnapshot {
                 source: std::io::Error::other(error.to_string()),
             })?;
         let mut receipt_hits = 0_usize;
-        for result in opened {
+        for result in opened.into_iter().flatten() {
             let admitted = result?;
             receipt_hits += usize::from(admitted.reused);
             if let Some(receipt) = admitted.receipt {
@@ -459,6 +499,160 @@ fn check_witness(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_admission_stops_later_sequential_work_without_poisoning_reopen() {
+        let frontier = AdmissionFrontier::new();
+        let calls = AtomicUsize::new(0);
+        let results: Vec<_> = (0..10_000)
+            .map(|position| {
+                frontier.run(position, || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    if position == 7 {
+                        Err(position)
+                    } else {
+                        Ok(position)
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(calls.load(Ordering::Relaxed), 8);
+        assert_eq!(
+            results.into_iter().flatten().collect::<Result<Vec<_>, _>>(),
+            Err(7)
+        );
+
+        let reopened = AdmissionFrontier::new();
+        let values: Result<Vec<_>, usize> = (0..12)
+            .filter_map(|position| reopened.run(position, || Ok(position)))
+            .collect();
+        assert_eq!(values.unwrap(), (0..12).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn admission_error_is_manifest_first_for_every_small_schedule() {
+        fn check(schedule: &[usize; 5]) {
+            for failed in 0_u32..32 {
+                let frontier = AdmissionFrontier::new();
+                let mut results = vec![None; 5];
+                let mut called = [false; 5];
+                for &position in schedule {
+                    results[position] = frontier.run(position, || {
+                        called[position] = true;
+                        if failed & (1 << position) == 0 {
+                            Ok(position)
+                        } else {
+                            Err(position)
+                        }
+                    });
+                }
+                let first = (0..5).find(|&position| failed & (1 << position) != 0);
+                let required = first.map_or(5, |position| position + 1);
+                assert!(called[..required].iter().all(|&called| called));
+                let actual = results.into_iter().flatten().collect::<Result<Vec<_>, _>>();
+                match first {
+                    Some(position) => assert_eq!(actual, Err(position)),
+                    None => assert_eq!(actual, Ok((0..5).collect())),
+                }
+            }
+        }
+
+        fn permute(schedule: &mut [usize; 5], start: usize) {
+            if start == schedule.len() {
+                check(schedule);
+                return;
+            }
+            for position in start..schedule.len() {
+                schedule.swap(start, position);
+                permute(schedule, start + 1);
+                schedule.swap(start, position);
+            }
+        }
+
+        permute(&mut [0, 1, 2, 3, 4], 0);
+    }
+
+    #[test]
+    fn parallel_admission_preserves_earliest_error_and_drops_partial_results() {
+        use std::sync::Arc;
+
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for failed in [None, Some(0), Some(3), Some(31)] {
+            let frontier = AdmissionFrontier::new();
+            let constructed = AtomicUsize::new(0);
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let results: Vec<_> = pool.install(|| {
+                (0..64)
+                    .into_par_iter()
+                    .map(|position| {
+                        frontier.run(position, || {
+                            if failed
+                                .is_some_and(|first| position == first || position == first + 1)
+                            {
+                                Err(position)
+                            } else {
+                                constructed.fetch_add(1, Ordering::Relaxed);
+                                Ok(Tracked(Arc::clone(&dropped)))
+                            }
+                        })
+                    })
+                    .collect()
+            });
+            let result = results.into_iter().flatten().collect::<Result<Vec<_>, _>>();
+            match failed {
+                Some(position) => assert!(matches!(result, Err(error) if error == position)),
+                None => assert_eq!(result.as_ref().unwrap().len(), 64),
+            }
+            drop(result);
+            assert_eq!(
+                dropped.load(Ordering::Relaxed),
+                constructed.load(Ordering::Relaxed)
+            );
+        }
+    }
+
+    #[test]
+    fn already_running_admission_finishes_but_new_later_work_is_skipped() {
+        use std::sync::Barrier;
+
+        let frontier = AdmissionFrontier::new();
+        let entered = Barrier::new(2);
+        let release = Barrier::new(2);
+        let later_calls = AtomicUsize::new(0);
+        let (failure, skipped, running) = std::thread::scope(|scope| {
+            let pending = scope.spawn(|| {
+                frontier.run(9, || {
+                    entered.wait();
+                    release.wait();
+                    Ok::<_, usize>(9)
+                })
+            });
+            entered.wait();
+            let failure = frontier.run(2, || Err::<usize, _>(2));
+            let skipped = frontier.run(10, || {
+                later_calls.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, usize>(10)
+            });
+            // Release and join before assertions so even a failing assertion
+            // cannot leave a test thread blocked at the rendezvous.
+            release.wait();
+            (failure, skipped, pending.join().unwrap())
+        });
+        assert_eq!(failure, Some(Err(2)));
+        assert_eq!(skipped, None);
+        assert_eq!(running, Some(Ok(9)));
+        assert_eq!(later_calls.load(Ordering::Relaxed), 0);
+    }
 
     fn records(sizes: &[u64]) -> Vec<ManifestSegment> {
         sizes

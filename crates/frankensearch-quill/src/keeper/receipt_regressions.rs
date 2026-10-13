@@ -408,3 +408,112 @@ fn low_descriptor_receipt_case() -> TestResult {
         "a failed mixed admission must not publish partial receipts");
     Ok(())
 }
+
+#[test]
+fn failed_receipt_admission_preserves_proofs_and_reopens_a_completed_manifest() -> TestResult {
+    let (_root, index, cache, first) = local_receipt_fixture()?;
+    drop(eager_local_open(&index, &cache)?);
+    let book_path = cache.join("read-open-receipts-v3");
+    let original_book = std::fs::read(&book_path)?;
+    let middle = encoded_identity_test_segment(0xea502, 100, &[Some("middle")])?;
+    let last = encoded_identity_test_segment(0xea503, 200, &[Some("last")])?;
+    std::fs::write(index.join(canonical_segment_name(0xea503)), last.as_bytes())?;
+    let mut manifest = durable_test_manifest(
+        2,
+        vec![
+            manifest_segment(&first, 1),
+            manifest_segment(&middle, 2),
+            manifest_segment(&last, 3),
+        ],
+    );
+    manifest.field_stats = receipt_manifest(2, &first).field_stats;
+    for field in &mut manifest.field_stats {
+        field.doc_count = 4;
+    }
+    let manifest_path = index.join("MANIFEST");
+    write_manifest(&manifest_path, &manifest)?;
+    let manifest_bytes = std::fs::read(&manifest_path)?;
+
+    assert!(eager_local_open(&index, &cache).is_err());
+    assert_eq!(std::fs::read(&book_path)?, original_book);
+    assert_eq!(std::fs::read(&manifest_path)?, manifest_bytes);
+    // A failed open must release both retained proof guards and speculative
+    // segment descriptors before returning, not leave pool work detached.
+    for entry in std::fs::read_dir("/proc/self/fd")? {
+        if let Ok(target) = std::fs::read_link(entry?.path()) {
+            assert!(!target.starts_with(&index) && !target.starts_with(&cache));
+        }
+    }
+
+    std::fs::write(index.join(canonical_segment_name(0xea502)), middle.as_bytes())?;
+    let reopened = eager_local_open(&index, &cache)?;
+    let counts: Vec<_> = reopened
+        .segments()
+        .iter()
+        .map(RecoveredSegment::authenticated_file_witness_hash_count)
+        .collect();
+    // Even if the last segment completed speculatively before the failure,
+    // its proof was not persisted. A fresh request must authenticate it again.
+    assert_eq!(counts, [0, 1, 1]);
+    for (id, expected) in [("receipt-two", 1), ("middle", 100), ("last", 200)] {
+        assert_eq!(
+            reopened.resolve_document_id(id)?.map(|hit| hit.global_docid),
+            Some(expected)
+        );
+    }
+    drop(reopened);
+    let warm = eager_local_open(&index, &cache)?;
+    assert!(warm.segments().iter().all(|segment| {
+        segment.authenticated_file_witness_hash_count() == 0
+    }));
+    drop(warm);
+    let strict = KeeperSnapshot::open(&index, DEFAULT_SCHEMA)?;
+    assert_eq!(strict.segments().len(), 3);
+    assert!(strict.segments().iter().all(|segment| {
+        segment.authenticated_file_witness_hash_count() == 1
+    }));
+    Ok(())
+}
+
+#[test]
+fn corrupted_receipt_admission_is_not_cached_and_a_repaired_file_reopens() -> TestResult {
+    let (_root, index, cache, encoded) = local_receipt_fixture()?;
+    drop(eager_local_open(&index, &cache)?);
+    let retained = eager_local_open(&index, &cache)?;
+    assert_eq!(retained.segments()[0].authenticated_file_witness_hash_count(), 0);
+    let path = index.join(canonical_segment_name(0xea501));
+    let staged = index.join("reopen-replacement");
+    let offset = encoded
+        .section_entries()
+        .iter()
+        .find(|entry| entry.kind == SectionKind::TERMDICT)
+        .expect("termdict")
+        .offset;
+    let mut damaged = encoded.as_bytes().to_vec();
+    damaged[usize::try_from(offset)?] ^= 1;
+    // Replace the directory entry, never mutate the inode pinned by retained.
+    std::fs::write(&staged, damaged)?;
+    std::fs::rename(&staged, &path)?;
+    let book_path = cache.join("read-open-receipts-v3");
+    let before = std::fs::read(&book_path)?;
+    assert!(eager_local_open(&index, &cache).is_err());
+    assert!(KeeperSnapshot::open(&index, DEFAULT_SCHEMA).is_err());
+    assert_eq!(std::fs::read(&book_path)?, before);
+    assert!(retained.resolve_document_id("receipt-two")?.is_some());
+
+    std::fs::write(&staged, encoded.as_bytes())?;
+    std::fs::rename(&staged, &path)?;
+    let repaired = eager_local_open(&index, &cache)?;
+    assert_eq!(repaired.segments()[0].authenticated_file_witness_hash_count(), 1);
+    assert_eq!(
+        repaired.resolve_document_id("receipt-two")?.map(|hit| hit.global_docid),
+        retained.resolve_document_id("receipt-two")?.map(|hit| hit.global_docid)
+    );
+    drop(repaired);
+    let warm = eager_local_open(&index, &cache)?;
+    assert_eq!(warm.segments()[0].authenticated_file_witness_hash_count(), 0);
+    drop(warm);
+    let strict = KeeperSnapshot::open(&index, DEFAULT_SCHEMA)?;
+    assert_eq!(strict.segments()[0].authenticated_file_witness_hash_count(), 1);
+    Ok(())
+}
