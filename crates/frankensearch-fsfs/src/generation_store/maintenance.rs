@@ -22,6 +22,9 @@ use super::{
     read_bounded_regular, require_directory, sync_tree, write_new_synced,
 };
 
+#[cfg(unix)]
+mod repair;
+
 /// An explicit restore bound to one store, one target and one observed selection.
 ///
 /// This does not hold a publisher lease between preparation and execution. A
