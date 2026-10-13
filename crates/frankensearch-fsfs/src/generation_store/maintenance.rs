@@ -239,7 +239,7 @@ impl CompleteGenerationStore {
     ///
     /// # Errors
     /// Returns contention, absent/corrupt selection, I/O or cancellation errors.
-    /// A failed final directory sync returns the distinct visible outcome.
+    /// A failed final directory sync preserves the distinct visible outcome.
     pub fn flush_selected(&self, cx: &Cx) -> SearchResult<GenerationPublication> {
         self.flush_with_sync(cx, sync_directory)
     }
@@ -293,7 +293,7 @@ impl CompleteGenerationStore {
             invalid(
                 &self.root,
                 "no complete generation is selected; nothing can be flushed",
-            ))
+            )
         })?;
         if expected_generation.is_some_and(|expected| expected != &generation) {
             return Err(invalid(
