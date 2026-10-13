@@ -390,27 +390,55 @@ impl FsfsRuntime {
         }
         // Check directory entries, not Path::exists: a dangling symlink or an
         // unreadable descriptor is not permission to enter the legacy path.
-        // A staging tree also prevents fallback after an interrupted first build
-        // or after the active descriptor has been removed out of protocol.
-        let selected = complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
-            || complete_entry_exists(&root.join("generations"))?;
-        // Only a build chooses a layout: the explicit opt-in for any root, the
-        // new-root default for a root with no legacy index that a complete
-        // build accepts (outside the source tree, or beneath one of its hidden
-        // directories like the default in-project `.frankensearch`). Every
-        // other command follows the layout on disk, so before the first
-        // complete build it neither fails on the absent store nor hides a
-        // legacy index.
+        let selected = complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?;
+        let staging = complete_entry_exists(&root.join("generations"))?;
+        let legacy = legacy_index_exists(&root)?;
+        // Routing uses completion only to decide whether a safe predecessor
+        // exists. Malformed legacy metadata stays on a fail-closed path and is
+        // diagnosed by the ordinary legacy admission instead of being upgraded.
+        let legacy_complete = legacy
+            && Self::read_index_sentinel(&root)
+                .ok()
+                .flatten()
+                .is_some_and(|sentinel| sentinel.generation_complete);
+
+        // A one-shot migration builds entirely below generations/ and leaves
+        // the legacy predecessor untouched until FSFS-CURRENT is published.
+        // Keep read-only traffic on that predecessor while the first complete
+        // generation is staging, including after an interrupted migration.
+        // Once a pointer exists it is authoritative: corruption there must be
+        // surfaced rather than hidden by a legacy fallback.
+        let read_only = matches!(
+            self.cli_input.command,
+            CliCommand::Search
+                | CliCommand::Serve
+                | CliCommand::Status
+                | CliCommand::Doctor
+                | CliCommand::Daemon
+                | CliCommand::Explain
+                | CliCommand::Tui
+        );
+        if !selected && staging && legacy_complete && read_only {
+            return Ok(None);
+        }
+
+        // Only a build chooses a layout. Explicit opt-in still accepts any
+        // admissible root. The platform default starts new roots and also
+        // migrates a completed legacy root on a one-shot index rebuild; an
+        // interrupted legacy root stays on the legacy recovery path. Watch
+        // keeps its existing layout unless explicitly opted in.
         let builds = matches!(
             self.cli_input.command,
             CliCommand::Index | CliCommand::Watch
         );
-        let starts_complete = builds
-            && (initialize_store
-                || (self.complete_generations_for_new_roots
-                    && !legacy_index_exists(&root)?
-                    && store_admits_source(&root, &self.resolve_target_root()?)));
-        Ok((selected || starts_complete).then_some(root))
+        let one_shot_index = self.cli_input.command == CliCommand::Index
+            && !self.cli_input.watch
+            && !self.config.indexing.watch_mode;
+        let default_complete_build = self.complete_generations_for_new_roots
+            && store_admits_source(&root, &self.resolve_target_root()?)
+            && (!legacy || (one_shot_index && legacy_complete));
+        let starts_complete = builds && (initialize_store || default_complete_build);
+        Ok((selected || staging || starts_complete).then_some(root))
     }
 
     /// Confirm durability of the selected immutable bundle without rescanning
@@ -3090,7 +3118,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_cli_new_root_default_starts_only_roots_without_a_legacy_index() {
+    fn complete_cli_default_migrates_only_completed_legacy_one_shot_indexes() {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, source, root) = fixture(directory.path());
         let runtime = runtime.with_complete_generations_for_new_roots(true);
@@ -3139,8 +3167,8 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        // A legacy index, or an interrupted legacy build, keeps its layout
-        // unless the build opts it in explicitly.
+        // An interrupted or only partially recognizable legacy build keeps its
+        // layout unless the build opts it in explicitly.
         for marker in LEGACY_INDEX_ENTRIES {
             let legacy = directory.path().join(format!("legacy-{marker}"));
             fs::create_dir(&legacy).unwrap();
@@ -3152,13 +3180,88 @@ mod tests {
                     .complete_generation_command_root(false)
                     .unwrap()
                     .is_none(),
-                "{marker} marks a legacy index"
+                "{marker} alone does not prove a completed legacy predecessor"
             );
             assert_eq!(
                 build.complete_generation_command_root(true).unwrap(),
                 Some(legacy)
             );
         }
+
+        // A completed legacy predecessor migrates on the default one-shot
+        // index route. While its first immutable successor is only staging,
+        // read-only commands still use that predecessor; mutation continues on
+        // the complete route, and a published pointer becomes authoritative.
+        let legacy = directory.path().join("legacy-complete");
+        fs::create_dir(&legacy).unwrap();
+        let sentinel = IndexSentinel {
+            schema_version: 1,
+            generation_complete: true,
+            generated_at_ms: 1,
+            command: "index".to_owned(),
+            target_root: source.display().to_string(),
+            index_root: legacy.display().to_string(),
+            discovered_files: 1,
+            indexed_files: 1,
+            skipped_files: 0,
+            reason_codes: Vec::new(),
+            total_canonical_bytes: 1,
+            source_hash_hex: "fixture".to_owned(),
+            fast_window_max_per_file: 1,
+        };
+        runtime.write_index_sentinel(&legacy, &sentinel).unwrap();
+        let mut build = runtime.clone();
+        build.cli_input.index_dir = Some(legacy.clone());
+        assert_eq!(
+            build.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "a healthy legacy one-shot rebuild should stage an immutable successor"
+        );
+        let disabled = build
+            .clone()
+            .with_complete_generations_for_new_roots(false);
+        assert!(
+            disabled
+                .complete_generation_command_root(false)
+                .unwrap()
+                .is_none(),
+            "an explicit false policy must retain the legacy layout"
+        );
+        fs::create_dir(legacy.join("generations")).unwrap();
+        let search = search_runtime(&build);
+        assert!(
+            search
+                .complete_generation_command_root(false)
+                .unwrap()
+                .is_none(),
+            "search must keep serving the legacy predecessor until selection publishes"
+        );
+        let mut status = build.clone();
+        status.cli_input.command = CliCommand::Status;
+        assert!(
+            status
+                .complete_generation_command_root(false)
+                .unwrap()
+                .is_none(),
+            "status must describe the still-authoritative legacy predecessor"
+        );
+        let mut append = build.clone();
+        append.cli_input.command = CliCommand::AppendBatch;
+        assert_eq!(
+            append.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "mutators must not write into the predecessor during migration"
+        );
+        fs::write(
+            legacy.join(COMPLETE_GENERATION_POINTER),
+            b"corrupt-pointer",
+        )
+        .unwrap();
+        assert_eq!(
+            search.complete_generation_command_root(false).unwrap(),
+            Some(legacy),
+            "once selection exists, read-only commands must never hide it by falling back"
+        );
     }
 
     #[test]
