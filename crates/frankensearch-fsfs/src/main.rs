@@ -260,11 +260,11 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         );
     }
 
-    // The layout of a first build. Unset, a new root starts as a complete
-    // store on Linux, the platform its generations are qualified on, and a
-    // legacy index keeps its layout; true also converts a legacy root on its
-    // next build (and opts in on macOS); false keeps building legacy indexes.
-    // Existing selections are always recognized.
+    // The layout of a build. Unset, Linux starts new roots as complete
+    // stores and a one-shot rebuild of a completed legacy root migrates it by
+    // staging an immutable successor; watch and unfinished legacy builds keep
+    // their layout. True also opts in on macOS and forces conversion; false
+    // keeps building legacy indexes. Existing selections are always recognized.
     let complete_generations = parse_env_bool(
         &env_map,
         "FRANKENSEARCH_COMPLETE_GENERATIONS",

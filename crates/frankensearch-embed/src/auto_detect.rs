@@ -47,7 +47,7 @@ use frankensearch_core::generation::FrozenEmbeddingIdentityBundleV1;
     any(feature = "model2vec", feature = "fastembed")
 ))]
 use frankensearch_core::generation::QuantizationFormat;
-use frankensearch_core::traits::{Embedder, SearchFuture};
+use frankensearch_core::traits::{Embedder, IdentityBoundEmbedding, SearchFuture};
 #[cfg(all(
     feature = "download",
     any(feature = "model2vec", feature = "fastembed")
@@ -844,12 +844,19 @@ impl EmbedderStack {
 }
 
 /// MRL dimension reduction wrapper.
+///
+/// Bound inference retains the source identity captured at construction and
+/// validates the provider's complete response before canonical truncation. A
+/// projection cannot launder a foreign producer or discard malformed tail
+/// coordinates. Raw inference retains the provider's truncation hook; bound
+/// inference uses the core prefix projection named by its identity contract.
 pub struct DimReduceEmbedder {
     inner: Arc<dyn Embedder>,
     target_dim: usize,
     id: String,
     model_name: String,
     identity: EmbeddingIdentityBundleV1,
+    source_identity: EmbeddingIdentityBundleV1,
 }
 
 impl fmt::Debug for DimReduceEmbedder {
@@ -866,7 +873,9 @@ impl DimReduceEmbedder {
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::InvalidConfig` when requested dimension is invalid.
+    /// Returns `SearchError::InvalidConfig` when requested dimension is invalid,
+    /// or a typed identity error when the source contract is not native f32 or
+    /// disagrees with the provider's dimensionality.
     pub fn new(inner: Arc<dyn Embedder>, target_dim: usize) -> SearchResult<Self> {
         if target_dim == 0 {
             return Err(SearchError::InvalidConfig {
@@ -898,19 +907,130 @@ impl DimReduceEmbedder {
                 value: target_dim.to_string(),
                 reason: "target dimension does not fit the identity schema".to_owned(),
             })?;
-        let identity = inner.identity()?.derive_projection(
+        let source_identity = inner
+            .identity()
+            .map_err(|_| Self::bound_identity_error())?
+            .clone();
+        if source_identity.validate().is_err()
+            || usize::try_from(source_identity.space.dimension).ok() != Some(inner.dimension())
+            || source_identity.storage.quantization != frankensearch_core::QuantizationFormat::F32
+            || !source_identity.storage.format.starts_with("in-memory-")
+            || !matches!(
+                source_identity.storage.endianness.as_str(),
+                "native-f32-values" | "native-test-only"
+            )
+        {
+            return Err(Self::bound_identity_error());
+        }
+        let identity = source_identity.derive_projection(
             target_dimension,
             "prefix-truncate-first-n-dimensions-v1",
             "l2-f32-zero-on-degenerate-v1",
         )?;
 
-        Ok(Self {
+        let reduced = Self {
             id: format!("{}-mrl-{target_dim}", inner.id()),
             model_name: format!("{} (MRL {target_dim})", inner.model_name()),
             identity,
+            source_identity,
             inner,
             target_dim,
+        };
+        reduced.validate_bound_producer()?;
+        Ok(reduced)
+    }
+
+    fn bound_identity_error() -> SearchError {
+        SearchError::UnverifiableRemoteSpace {
+            producer: "embedding.mrl.bound".to_owned(),
+            reason: "source producer or response does not retain the complete identity admitted for projection"
+                .to_owned(),
+        }
+    }
+
+    fn invalid_bound_response() -> SearchError {
+        SearchError::InvalidConfig {
+            field: "embedding.mrl.bound_response".to_owned(),
+            value: String::new(),
+            reason: "projection requires a valid complete native-f32 response, exact dimensions and finite coordinates"
+                .to_owned(),
+        }
+    }
+
+    fn checkpoint(cx: &Cx) -> SearchResult<()> {
+        cx.checkpoint().map_err(|_| SearchError::Cancelled {
+            phase: "embedding.mrl.bound".to_owned(),
+            reason: "embedding projection cancelled".to_owned(),
         })
+    }
+
+    fn validate_bound_producer(&self) -> SearchResult<()> {
+        if self
+            .inner
+            .identity()
+            .is_ok_and(|identity| identity == &self.source_identity)
+            && usize::try_from(self.source_identity.space.dimension).ok()
+                == Some(self.inner.dimension())
+            && self.inner.supports_mrl()
+        {
+            Ok(())
+        } else {
+            Err(Self::bound_identity_error())
+        }
+    }
+
+    fn check_bound_producer(&self, cx: &Cx) -> SearchResult<()> {
+        Self::checkpoint(cx)?;
+        let admission = self.validate_bound_producer();
+        Self::checkpoint(cx)?;
+        admission
+    }
+
+    fn admit_bound_outcome<T>(&self, cx: &Cx, outcome: SearchResult<T>) -> SearchResult<T> {
+        Self::checkpoint(cx)?;
+        match outcome {
+            // An explicit provider cancellation must not call back into the
+            // provider simply to classify cancellation as another failure.
+            Err(error @ SearchError::Cancelled { .. }) => Err(error),
+            outcome => {
+                self.check_bound_producer(cx)?;
+                outcome
+            }
+        }
+    }
+
+    fn validate_bound_response(&self, response: &IdentityBoundEmbedding) -> SearchResult<()> {
+        // Compare before formatting or validating foreign metadata. Neither
+        // provider-controlled identities nor vector values enter diagnostics.
+        if response.identity != self.source_identity {
+            return Err(Self::bound_identity_error());
+        }
+        response
+            .validate()
+            .map_err(|_| Self::invalid_bound_response())
+    }
+
+    fn project_bound(
+        &self,
+        cx: &Cx,
+        response: &IdentityBoundEmbedding,
+    ) -> SearchResult<IdentityBoundEmbedding> {
+        self.check_bound_producer(cx)?;
+        self.validate_bound_response(response)?;
+        // The derived identity names this exact core operation. An arbitrary
+        // provider truncation override cannot supply differently transformed
+        // values under the canonical prefix-projection identity.
+        let values = frankensearch_core::truncate_embedding(&response.values, self.target_dim);
+        self.check_bound_producer(cx)?;
+        let projected = IdentityBoundEmbedding {
+            values,
+            identity: self.identity.clone(),
+        };
+        projected
+            .validate()
+            .map_err(|_| Self::invalid_bound_response())?;
+        Self::checkpoint(cx)?;
+        Ok(projected)
     }
 }
 
@@ -936,8 +1056,64 @@ impl Embedder for DimReduceEmbedder {
         })
     }
 
-    /// Both bound operations are the core defaults over this wrapper's own
-    /// `embed`/`embed_batch`, so a bound batch binds what singles would.
+    fn embed_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+    ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+        Box::pin(async move {
+            self.check_bound_producer(cx)?;
+            let outcome = self.inner.embed_bound(cx, text).await;
+            let response = self.admit_bound_outcome(cx, outcome)?;
+            self.project_bound(cx, &response)
+        })
+    }
+
+    fn embed_batch_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+        Box::pin(async move {
+            self.check_bound_producer(cx)?;
+            let native = self.inner.bound_batch_is_native();
+            self.check_bound_producer(cx)?;
+            if !native {
+                // A provider overriding only bound-single inference must never
+                // be sent through an inherited, raw-backed batch operation.
+                let mut projected = Vec::with_capacity(texts.len());
+                for text in texts {
+                    projected.push(self.embed_bound(cx, text).await?);
+                }
+                self.check_bound_producer(cx)?;
+                return Ok(projected);
+            }
+            let outcome = self.inner.embed_batch_bound(cx, texts).await;
+            let responses = self.admit_bound_outcome(cx, outcome)?;
+            if responses.len() != texts.len() {
+                return Err(SearchError::InvalidConfig {
+                    field: "embedding.mrl.batch_length".to_owned(),
+                    value: responses.len().to_string(),
+                    reason: format!("expected exactly {} bound responses", texts.len()),
+                });
+            }
+            // Validate the entire full-width batch before calling the first
+            // projection, including coordinates outside the retained prefix.
+            for response in &responses {
+                Self::checkpoint(cx)?;
+                self.validate_bound_response(response)?;
+            }
+            let mut projected = Vec::with_capacity(responses.len());
+            for response in &responses {
+                projected.push(self.project_bound(cx, response)?);
+            }
+            self.check_bound_producer(cx)?;
+            Ok(projected)
+        })
+    }
+
+    /// Native providers use one bound batch. Other providers use checked bound
+    /// singles, so both routes preserve the same per-input projection contract.
     fn bound_batch_is_native(&self) -> bool {
         true
     }
@@ -947,6 +1123,8 @@ impl Embedder for DimReduceEmbedder {
     }
 
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        // Warm outer caches must also notice that the source lost admission.
+        self.validate_bound_producer()?;
         Ok(&self.identity)
     }
 

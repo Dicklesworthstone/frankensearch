@@ -283,9 +283,12 @@ impl CacheState {
 /// hits and fills require the producer to retain that identity. A response's
 /// identity must exactly match, and its actual values and identity are retained.
 /// Bound batches retain the original input order and duplicate slots and invoke
-/// the provider's bound batch operation once, even for empty input. Responses
-/// are validated all-or-error without relabeling; admission against a stored
-/// generation remains the caller's responsibility. Bound batches do not affect
+/// the provider's bound batch operation once, even for empty input. Each batch
+/// independently admits the producer before inference and requires it to retain
+/// that identity afterward. Every response must match the admitted identity and
+/// validate before any result is returned; agreement among rows is insufficient.
+/// Admission against a stored generation remains the caller's responsibility.
+/// Bound batches do not affect
 /// cache statistics or contents, whether they succeed or fail.
 ///
 /// Raw responses are validated before insertion: batches must contain exactly
@@ -403,6 +406,26 @@ impl CachedEmbedder {
         } else {
             Err(Self::bound_identity_error())
         }
+    }
+
+    fn admit_bound_outcome<T>(
+        &self,
+        cx: &Cx,
+        expected: &EmbeddingIdentityBundleV1,
+        outcome: SearchResult<T>,
+    ) -> SearchResult<T> {
+        cache_checkpoint(cx)?;
+        // An explicit provider cancellation is terminal even when the provider
+        // did not cancel our context. Do not replace it with a metadata failure.
+        if matches!(&outcome, Err(SearchError::Cancelled { .. })) {
+            return outcome;
+        }
+        let producer = self.validate_bound_producer(expected);
+        // Metadata callbacks may themselves cancel while returning success or
+        // failure. Cancellation outranks both metadata and inference failures.
+        cache_checkpoint(cx)?;
+        producer?;
+        outcome
     }
 
     fn validate_vector(&self, values: &[f32]) -> SearchResult<()> {
@@ -552,11 +575,7 @@ impl Embedder for CachedEmbedder {
                 return Ok(response);
             }
             let outcome = self.inner.embed_bound(cx, text).await;
-            cache_checkpoint(cx)?;
-            let producer = self.validate_bound_producer(&key.identity);
-            cache_checkpoint(cx)?;
-            producer?;
-            let response = outcome?;
+            let response = self.admit_bound_outcome(cx, &key.identity, outcome)?;
             // Compare before diagnostics inspect provider-controlled fields.
             // Equal names, dimensions, or mathematical spaces are insufficient.
             if response.identity != *key.identity {
@@ -582,11 +601,15 @@ impl Embedder for CachedEmbedder {
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
             cache_checkpoint(cx)?;
-            // Never route this through the raw cache or deduplicate its inputs.
-            // The batch provider owns response identity and per-input ordering.
-            let outcome = self.inner.embed_batch_bound(cx, texts).await;
+            // Admit the producer independently of its response. Agreement among
+            // returned rows alone would accept an entirely foreign batch.
+            let identity = self.capture_bound_identity();
             cache_checkpoint(cx)?;
-            let responses = outcome?;
+            let identity = identity?;
+            // Preserve the exact input, including duplicate and empty slots.
+            // Bound batches bypass both cache namespaces and their statistics.
+            let outcome = self.inner.embed_batch_bound(cx, texts).await;
+            let responses = self.admit_bound_outcome(cx, &identity, outcome)?;
             if responses.len() != texts.len() {
                 return Err(SearchError::InvalidConfig {
                     field: "embedder.batch_length".to_owned(),
@@ -597,18 +620,13 @@ impl Embedder for CachedEmbedder {
                     ),
                 });
             }
-            if let Some(first) = responses.first() {
-                for response in &responses {
-                    cache_checkpoint(cx)?;
-                    Self::validate_bound_response(response)?;
-                    if response.identity != first.identity {
-                        return Err(SearchError::UnverifiableRemoteSpace {
-                            producer: "embedding.cache.bound_batch".to_owned(),
-                            reason: "a bound embedding batch must carry one producing identity"
-                                .to_owned(),
-                        });
-                    }
+            for response in &responses {
+                cache_checkpoint(cx)?;
+                // Compare before validation can inspect foreign identity fields.
+                if response.identity != identity {
+                    return Err(Self::bound_identity_error());
                 }
+                Self::validate_bound_response(response)?;
             }
             cache_checkpoint(cx)?;
             Ok(responses)
@@ -735,6 +753,10 @@ impl Embedder for CachedEmbedder {
         self.inner.supports_mrl()
     }
 }
+
+#[cfg(test)]
+#[path = "cached_bound_batch_tests.rs"]
+mod bound_batch_admission_tests;
 
 #[cfg(test)]
 mod tests {
