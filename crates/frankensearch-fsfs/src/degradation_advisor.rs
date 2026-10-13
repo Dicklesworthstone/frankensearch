@@ -98,6 +98,8 @@ pub struct DegradationNextAction {
     pub order: u16,
     pub reason_code: String,
     pub action: String,
+    /// Generated POSIX-shell command, absent when its arguments cannot be
+    /// represented losslessly within the diagnostic limits. Never executed here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 }
@@ -110,10 +112,13 @@ pub struct DegradationAdvice {
     pub severity: DegradationAdviceSeverity,
     pub reason_code: String,
     pub operator_summary: String,
+    /// Public error projection, not the provider's original exception text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original_error: Option<String>,
     pub preserves_initial_results: bool,
     pub next_actions: Vec<DegradationNextAction>,
+    /// Generated POSIX-shell replay; empty when bounded, lossless rendering is
+    /// unavailable. Explicit caller overrides retain the caller's trust contract.
     pub replay_command: String,
     pub output_surfaces: Vec<AdviceOutputSurface>,
 }
@@ -124,6 +129,7 @@ pub struct DegradationAdviceInput<'a> {
     pub query: &'a str,
     pub index_dir: Option<&'a Path>,
     pub original_error: Option<&'a SearchError>,
+    /// Trusted, caller-authored command override, not untrusted provider text.
     pub replay_command: Option<&'a str>,
 }
 
@@ -131,7 +137,11 @@ impl DegradationAdvice {
     #[must_use]
     pub fn from_input(input: DegradationAdviceInput<'_>) -> Self {
         let failure = input.failure;
-        let original_error = input.original_error.map(ToString::to_string);
+        // Degradation advice travels inside successful result payloads as well
+        // as TUI/stream output. Do not bypass the terminal error boundary here.
+        let original_error = input
+            .original_error
+            .map(|error| crate::output_schema::output_error_from(error).message);
         let replay_command = input
             .replay_command
             .map(str::to_owned)
@@ -281,9 +291,12 @@ fn next_actions_for(
     failure: DegradationFailureKind,
     index_dir: Option<&Path>,
 ) -> Vec<DegradationNextAction> {
-    let index_dir = index_dir
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "$FSFS_INDEX_DIR".to_owned());
+    let index_dir = quoted_index_dir(index_dir);
+    let with_index = |prefix: &str, suffix: &str| {
+        index_dir
+            .as_ref()
+            .map(|index| format!("{prefix} --index-dir {index}{suffix}"))
+    };
     match failure {
         DegradationFailureKind::RefinementFailed => vec![
             action(
@@ -296,7 +309,7 @@ fn next_actions_for(
                 2,
                 "degrade.action.inspect_status",
                 "Inspect model, index, and degraded-mode status before retrying.",
-                Some(format!("fsfs status --index-dir {index_dir} --format json")),
+                with_index("fsfs status", " --format json"),
             ),
         ],
         DegradationFailureKind::LexicalFallback => vec![
@@ -304,13 +317,13 @@ fn next_actions_for(
                 1,
                 "degrade.action.verify_vector_index",
                 "Verify the vector index and semantic embedder before depending on semantic scores.",
-                Some(format!("fsfs doctor --index-dir {index_dir} --format json")),
+                with_index("fsfs doctor", " --format json"),
             ),
             action(
                 2,
                 "degrade.action.rebuild_vector_index",
                 "Rebuild index artifacts in place when the semantic index is stale or unreadable.",
-                Some(format!("fsfs index . --full --index-dir {index_dir}")),
+                with_index("fsfs index . --full", ""),
             ),
         ],
         DegradationFailureKind::MissingQualityModel => vec![
@@ -344,7 +357,7 @@ fn next_actions_for(
                 3,
                 "degrade.action.reindex_after_identity_change",
                 "Rebuild in place only if you intentionally change the canonical embedding identity.",
-                Some(format!("fsfs index . --full --index-dir {index_dir}")),
+                with_index("fsfs index . --full", ""),
             ),
         ],
         DegradationFailureKind::Timeout => vec![
@@ -352,7 +365,7 @@ fn next_actions_for(
                 1,
                 "degrade.action.use_fast_only",
                 "Use fast-only results for latency-sensitive workflows.",
-                Some("fsfs search --fast-only --format json -- <query>".to_owned()),
+                Some("fsfs search --fast-only --format json -- '<query>'".to_owned()),
             ),
             action(
                 2,
@@ -372,7 +385,7 @@ fn next_actions_for(
                 2,
                 "degrade.action.reindex_in_place",
                 "Rebuild index artifacts in place from source content; no cleanup is required.",
-                Some(format!("fsfs index . --full --index-dir {index_dir}")),
+                with_index("fsfs index . --full", ""),
             ),
         ],
         DegradationFailureKind::CacheMiss => vec![
@@ -380,15 +393,13 @@ fn next_actions_for(
                 1,
                 "degrade.action.verify_cache_key",
                 "Verify index-dir, config source, and cache key before assuming there are no results.",
-                Some(format!("fsfs status --index-dir {index_dir} --format json")),
+                with_index("fsfs status", " --format json"),
             ),
             action(
                 2,
                 "degrade.action.replay_search",
                 "Replay the search with explicit index-dir and machine-readable output.",
-                Some(format!(
-                    "fsfs search --index-dir {index_dir} --format json -- <query>"
-                )),
+                with_index("fsfs search", " --format json -- '<query>'"),
             ),
         ],
         DegradationFailureKind::SemanticZeroSignal => vec![
@@ -396,13 +407,13 @@ fn next_actions_for(
                 1,
                 "degrade.action.inspect_zero_signal_census",
                 "Run doctor to see the typed zero-signal census (records, live, tombstones, usable vectors).",
-                Some(format!("fsfs doctor --index-dir {index_dir} --format json")),
+                with_index("fsfs doctor", " --format json"),
             ),
             action(
                 2,
                 "degrade.action.rebuild_unusable_vectors",
                 "Rebuild in place if the census shows live records without usable vectors (zero-norm or corrupt embeddings).",
-                Some(format!("fsfs index . --full --index-dir {index_dir}")),
+                with_index("fsfs index . --full", ""),
             ),
         ],
         DegradationFailureKind::HashControlGeneration => vec![
@@ -410,13 +421,13 @@ fn next_actions_for(
                 1,
                 "degrade.action.do_not_treat_hash_as_semantic",
                 "Do not treat this result set as semantic search; the published FSVI is a hash/fnv control artifact.",
-                Some(format!("fsfs status --index-dir {index_dir} --format json")),
+                with_index("fsfs status", " --format json"),
             ),
             action(
                 2,
                 "degrade.action.rebuild_semantic_generation",
                 "Rebuild with a verified semantic embedder; installing a model alone cannot repair hash vectors.",
-                Some(format!("fsfs index . --full --index-dir {index_dir}")),
+                with_index("fsfs index . --full", ""),
             ),
         ],
     }
@@ -437,11 +448,52 @@ fn action(
 }
 
 fn replay_command_for(query: &str, index_dir: Option<&Path>) -> String {
-    let index_dir = index_dir
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "$FSFS_INDEX_DIR".to_owned());
+    let Some(index_dir) = quoted_index_dir(index_dir) else {
+        return String::new();
+    };
     let query = if query.is_empty() { "<query>" } else { query };
+    let Some(query) = quote_shell_word(query, 64 * 1024) else {
+        return String::new();
+    };
     format!("fsfs search --index-dir {index_dir} --format json -- {query}")
+}
+
+fn quoted_index_dir(index_dir: Option<&Path>) -> Option<String> {
+    match index_dir {
+        Some(path) => {
+            let text = path.to_str().filter(|text| !text.is_empty())?;
+            quote_shell_word(text, 4 * 1024)
+        }
+        // Quote the expansion, and refuse an unset/empty variable before fsfs
+        // starts. An absent path must not accidentally select the current root.
+        None => Some("\"${FSFS_INDEX_DIR:?set FSFS_INDEX_DIR}\"".to_owned()),
+    }
+}
+
+/// Render exactly one POSIX-shell argument. Reject rather than truncate: a
+/// shortened path or query would operate on different data. Check before any
+/// output allocation; quoting grows by at most four bytes per input byte.
+fn quote_shell_word(text: &str, max_bytes: usize) -> Option<String> {
+    if text.len() > max_bytes
+        || text.chars().any(|ch| {
+            ch.is_control()
+                || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}'
+                    | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
+        return None;
+    }
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    Some(quoted)
 }
 
 #[cfg(test)]
@@ -672,5 +724,306 @@ mod tests {
         assert!(rendered.contains("fsfs index . --full"));
         assert!(!action_text.to_ascii_lowercase().contains("delete"));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod public_advice_tests {
+    use super::*;
+    use crate::output_schema::{
+        OutputEnvelope, OutputMeta, SearchHitPayload, SearchOutputPhase, SearchPayload,
+        decode_envelope_toon, encode_envelope_toon, output_error_from,
+    };
+    use crate::stream_protocol::{
+        StreamEvent, StreamFrame, StreamResultEvent, decode_stream_frame_ndjson,
+        decode_stream_frame_toon, encode_stream_frame_ndjson, encode_stream_frame_toon,
+    };
+    use std::fmt;
+    use std::io;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PRIVATE: &str = "private-degradation-provider-body";
+    const TS: &str = "2026-10-13T19:00:00Z";
+
+    #[derive(Clone)]
+    struct Opaque {
+        body: Arc<str>,
+        formatted: Arc<AtomicUsize>,
+        reject_format: bool,
+    }
+
+    impl fmt::Display for Opaque {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.formatted.fetch_add(1, Ordering::Relaxed);
+            if self.reject_format {
+                Err(fmt::Error)
+            } else {
+                formatter.write_str(&self.body)
+            }
+        }
+    }
+
+    impl fmt::Debug for Opaque {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(self, formatter)
+        }
+    }
+
+    impl std::error::Error for Opaque {}
+
+    fn probe(reject_format: bool) -> Opaque {
+        Opaque {
+            body: format!("{PRIVATE}\n\u{001b}[2J{}", "x".repeat(1 << 20)).into(),
+            formatted: Arc::new(AtomicUsize::new(0)),
+            reject_format,
+        }
+    }
+
+    fn failures(source: &Opaque) -> [SearchError; 5] {
+        [
+            SearchError::EmbeddingFailed {
+                model: "test-embedder".to_owned(),
+                source: Box::new(source.clone()),
+            },
+            SearchError::ModelLoadFailed {
+                path: "/models/test/model.onnx".into(),
+                source: Box::new(source.clone()),
+            },
+            SearchError::RerankFailed {
+                model: "test-reranker".to_owned(),
+                source: Box::new(source.clone()),
+            },
+            SearchError::Io(io::Error::new(io::ErrorKind::PermissionDenied, source.clone())),
+            SearchError::SubsystemError {
+                subsystem: PRIVATE,
+                source: Box::new(source.clone()),
+            },
+        ]
+    }
+
+    fn assert_public(text: &str) {
+        assert!(!text.contains(PRIVATE));
+        assert!(!text.contains("[2J"));
+        assert!(!text.contains("xxxxxxxxxxxxxxxx"));
+        assert!(text.len() < 16 * 1024);
+    }
+
+    #[test]
+    fn advice_never_formats_opaque_exceptions_even_when_formatting_would_fail() {
+        for reject_format in [false, true] {
+            let source = probe(reject_format);
+            for error in failures(&source) {
+                let advice = advice_for_search_error("public query", Some(Path::new("/index")), &error);
+                let expected_kind = if matches!(&error, SearchError::ModelLoadFailed { .. }) {
+                    DegradationFailureKind::MissingQualityModel
+                } else {
+                    DegradationFailureKind::RefinementFailed
+                };
+                assert_eq!(advice.failure, expected_kind);
+                assert_eq!(advice.reason_code, expected_kind.reason_code());
+                assert!(advice.preserves_initial_results);
+                assert_eq!(advice.original_error, Some(output_error_from(&error).message));
+                assert_public(&serde_json::to_string(&advice).unwrap());
+            }
+            assert_eq!(source.formatted.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn degraded_success_envelopes_and_result_streams_keep_hits_without_provider_bodies() {
+        let source = probe(false);
+        for error in failures(&source) {
+            let advice = advice_for_search_error("public query", Some(Path::new("/index")), &error);
+            let hit = SearchHitPayload {
+                rank: 1,
+                path: "retained.md".to_owned(),
+                line: Some(7),
+                score: 0.5,
+                snippet: Some("original snippet".to_owned()),
+                lexical_rank: Some(0),
+                semantic_rank: Some(1),
+                hash_rank: None,
+                in_both_sources: true,
+            };
+            let payload = SearchPayload::new(
+                "public query", SearchOutputPhase::RefinementFailed, 3, vec![hit.clone()],
+            ).with_degradation_advice([advice]);
+            let envelope = OutputEnvelope::success(payload.clone(), OutputMeta::new("search", "json"), TS);
+            let json = serde_json::to_string(&envelope).unwrap();
+            assert_public(&json);
+            let decoded: OutputEnvelope<SearchPayload> = serde_json::from_str(&json).unwrap();
+            assert!(decoded.ok && decoded.error.is_none());
+            assert_eq!(decoded.data.as_ref().unwrap().hits, vec![hit]);
+            let toon = encode_envelope_toon(&envelope).unwrap();
+            assert_public(&toon);
+            let decoded: OutputEnvelope<SearchPayload> = decode_envelope_toon(&toon).unwrap();
+            assert_eq!(decoded.data.as_ref(), Some(&payload));
+            let frame = StreamFrame::new(
+                "degraded-stream", 1, TS, "search",
+                StreamEvent::Result(StreamResultEvent { rank: 1, item: payload }),
+            );
+            let ndjson = encode_stream_frame_ndjson(&frame).unwrap();
+            assert_public(&ndjson);
+            assert_eq!(ndjson.lines().count(), 1);
+            let decoded: StreamFrame<SearchPayload> = decode_stream_frame_ndjson(&ndjson).unwrap();
+            assert_eq!(decoded, frame);
+            let toon = encode_stream_frame_toon(&frame).unwrap();
+            assert_public(&toon);
+            let decoded: StreamFrame<SearchPayload> = decode_stream_frame_toon(&toon).unwrap();
+            assert_eq!(decoded, frame);
+        }
+        assert_eq!(source.formatted.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn explicit_constructor_does_not_bypass_the_error_boundary() {
+        let source = probe(true);
+        let error = SearchError::EmbeddingFailed {
+            model: "test-embedder".to_owned(),
+            source: Box::new(source.clone()),
+        };
+        let advice = DegradationAdvice::from_input(DegradationAdviceInput {
+            failure: DegradationFailureKind::LexicalFallback,
+            query: "public query",
+            index_dir: None,
+            original_error: Some(&error),
+            replay_command: Some("trusted caller command"),
+        });
+        assert_eq!(advice.failure, DegradationFailureKind::LexicalFallback);
+        assert_eq!(advice.replay_command, "trusted caller command");
+        assert_eq!(advice.original_error.as_deref(), Some("Embedding inference failed for test-embedder."));
+        assert_eq!(source.formatted.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shell_words_are_lossless_and_bounded_before_escaping() {
+        assert_eq!(quote_shell_word("", 0).as_deref(), Some("''"));
+        assert_eq!(quote_shell_word("a'b", 3).as_deref(), Some("'a'\\''b'"));
+        assert_eq!(quote_shell_word("雪 $HOME *", 32).as_deref(), Some("'雪 $HOME *'"));
+        assert!(quote_shell_word("é", 1).is_none());
+        assert_eq!(quote_shell_word("é", 2).as_deref(), Some("'é'"));
+        for unsafe_text in ["a\nb", "\0", "\t", "\u{001b}[2J", "\u{202e}", "\u{2066}", "\u{061c}"] {
+            assert!(quote_shell_word(unsafe_text, 4096).is_none());
+        }
+        let worst = "'".repeat(64 * 1024);
+        assert_eq!(quote_shell_word(&worst, 64 * 1024).unwrap().len(), 4 * worst.len() + 2);
+        assert!(quote_shell_word(&format!("{worst}x"), 64 * 1024).is_none());
+    }
+
+    #[cfg(unix)]
+    fn shell(command: &str, index_dir: Option<&str>) -> std::process::Output {
+        // Execute only an inert argv-recording shell function, never fsfs or a
+        // suggested mutation. The adversarial inputs also use only printf.
+        let mut process = std::process::Command::new("/bin/sh");
+        process.arg("-c").arg(format!(
+            "fsfs() {{ printf '%s\\000' \"$@\"; }}\n{command}"
+        )).env_remove("FSFS_INDEX_DIR").stdin(std::process::Stdio::null());
+        if let Some(index_dir) = index_dir {
+            process.env("FSFS_INDEX_DIR", index_dir);
+        }
+        process.output().unwrap()
+    }
+
+    #[cfg(unix)]
+    fn argv(output: &std::process::Output) -> Vec<String> {
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        output.stdout.strip_suffix(&[0]).expect("terminated argv")
+            .split(|byte| *byte == 0)
+            .map(|word| String::from_utf8(word.to_vec()).unwrap())
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_round_trips_actual_posix_arguments_without_command_substitution() {
+        let values = [
+            "ordinary words", "owner's index", "$(printf INJECTED >&2)",
+            "; printf INJECTED >&2; #", "`printf INJECTED >&2`", "雪 $HOME * ? [a] \\",
+        ];
+        for path in values {
+            for query in values.into_iter().chain(["--apply", ""]) {
+                let command = replay_command_for(query, Some(Path::new(path)));
+                let observed = argv(&shell(&command, None));
+                assert_eq!(observed, [
+                    "search", "--index-dir", path, "--format", "json", "--",
+                    if query.is_empty() { "<query>" } else { query },
+                ]);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn every_generated_action_quotes_its_index_and_query_placeholder() {
+        let path = "owner's index/$(printf INJECTED >&2); *";
+        let mut checked = 0;
+        for fixture in synthetic_degradation_advice_fixture() {
+            let advice = DegradationAdvice::from_input(DegradationAdviceInput {
+                failure: fixture.failure,
+                query: "public query",
+                index_dir: Some(Path::new(path)),
+                original_error: None,
+                replay_command: None,
+            });
+            for command in advice.next_actions.iter().filter_map(|action| action.command.as_deref()) {
+                let observed = argv(&shell(command, None));
+                if let Some(index) = observed.iter().position(|word| word == "--index-dir") {
+                    assert_eq!(observed[index + 1], path);
+                    checked += 1;
+                }
+                if observed[0] == "search" {
+                    assert_eq!(observed.last().unwrap(), "<query>");
+                }
+            }
+        }
+        assert_eq!(checked, 11);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absent_index_requires_a_nonempty_environment_without_word_splitting() {
+        let command = replay_command_for("two words", None);
+        for index in [None, Some("")] {
+            let output = shell(&command, index);
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty(), "fsfs must not start without a selected path");
+        }
+        let path = "space dir/$(printf INJECTED >&2)";
+        assert_eq!(argv(&shell(&command, Some(path))), [
+            "search", "--index-dir", path, "--format", "json", "--", "two words",
+        ]);
+    }
+
+    #[test]
+    fn unrepresentable_inputs_omit_commands_instead_of_retargeting_or_truncating() {
+        for path in ["".to_owned(), "x".repeat(4097), "index\nsecond line".to_owned(), "\u{202e}index".to_owned()] {
+            let advice = DegradationAdvice::from_input(DegradationAdviceInput {
+                failure: DegradationFailureKind::HashControlGeneration,
+                query: "public query",
+                index_dir: Some(Path::new(&path)),
+                original_error: None,
+                replay_command: None,
+            });
+            assert!(advice.replay_command.is_empty());
+            assert!(advice.next_actions.iter().all(|action| action.command.is_none()));
+            assert!(!advice.operator_summary.is_empty());
+        }
+        for query in ["x".repeat(65537), "query\nsecond line".to_owned()] {
+            assert!(replay_command_for(&query, Some(Path::new("/index"))).is_empty());
+        }
+        let boundary_path = "é".repeat(2048);
+        assert!(quoted_index_dir(Some(Path::new(&boundary_path))).is_some());
+        assert!(quoted_index_dir(Some(Path::new(&format!("{boundary_path}x")))).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_paths_are_not_lossily_rendered_as_another_index() {
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/index/\xff".to_vec()));
+        assert!(quoted_index_dir(Some(&path)).is_none());
+        assert!(replay_command_for("public query", Some(&path)).is_empty());
     }
 }
