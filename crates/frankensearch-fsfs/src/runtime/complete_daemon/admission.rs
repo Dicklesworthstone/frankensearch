@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use asupersync::Cx;
 use frankensearch_core::SearchResult;
 
+use super::streaming::check_peer;
 use super::{IO_POLL_INTERVAL, control, read_request, retained_search_checkpoint};
 
 // At most eight framed/framing peers in addition to the executing request.
@@ -75,6 +76,24 @@ impl Intake {
         self.reading.len() + self.ready.len()
     }
 
+    /// A completed frame is not a live response consumer. Reclaim abandoned
+    /// slots before accepting more peers, and recheck newly completed frames
+    /// before dispatch or control preemption. Share the active driver's probe:
+    /// write-half-closed clients stay valid, and no bytes are read or written.
+    fn discard_disconnected(&mut self, now: Instant) {
+        let before = self.ready.len();
+        self.ready.retain(|peer| check_peer(&peer.peer).is_ok());
+        let discarded = before - self.ready.len();
+        if discarded != 0 {
+            self.last_activity = now;
+            tracing::debug!(
+                reason_code = "daemon.intake.disconnected",
+                discarded,
+                "discarded queued requests without a response consumer"
+            );
+        }
+    }
+
     /// One bounded scheduler turn: four accepts and one poll of each admitted
     /// framing future. read_request itself yields after bounded read work.
     /// Expiry includes time waiting for the single search owner, so queued
@@ -100,6 +119,7 @@ impl Intake {
                 "expired queued request peers"
             );
         }
+        self.discard_disconnected(now);
         let mut accepted = 0;
         for _ in 0..ACCEPTS_PER_TURN {
             if self.len() == MAX_PEERS {
@@ -156,6 +176,7 @@ impl Intake {
             }
         }
         retained_search_checkpoint(cx)?;
+        self.discard_disconnected(now);
         // Drain a still-readable accept backlog on another scheduler turn,
         // not recursively here. A full queue waits for capacity/the I/O tick.
         Ok(accepted == ACCEPTS_PER_TURN && self.len() < MAX_PEERS)
@@ -586,4 +607,6 @@ mod tests {
             assert_eq!(calls.get(), 32);
         });
     }
+
+    include!("queued_peer_tests.rs");
 }

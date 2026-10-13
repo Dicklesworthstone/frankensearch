@@ -28,7 +28,7 @@ use drain::{DrainState, drain_pending};
 /// Request only write readiness, since BSD poll maps a read-side EOF to HUP.
 /// Ignore OUT itself; this zero-time probe never waits or schedules a wake on
 /// a normally writable socket. The owning driver's existing tick sets cadence.
-fn check_peer(peer: &UnixStream) -> io::Result<()> {
+pub(super) fn check_peer(peer: &UnixStream) -> io::Result<()> {
     let mut descriptors = [PollFd::new(peer, PollFlags::OUT)];
     let timeout = Timespec {
         tv_sec: 0,
