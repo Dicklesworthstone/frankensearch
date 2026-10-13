@@ -1,5 +1,6 @@
 //! Receipt-directed complete-store recovery, without normal CLI root discovery.
 //! Inspection is the default; only an explicit --apply can change selection.
+//! Vector reconstruction additionally requires --repair-vectors; originals stay intact.
 
 #![recursion_limit = "512"]
 #![deny(unsafe_code)]
@@ -30,6 +31,7 @@ use serde::Serialize;
 
 const MAX_QUERY_BYTES: usize = 64 * 1024;
 const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_REPAIR_COPY_BYTES: u64 = 1024 * 1024 * 1024;
 const HELP: &str =
     "fsfs-recover --index-dir STORE --generation ID --manifest-sha256 SHA256 [OPTIONS]
 
@@ -40,6 +42,8 @@ No directory scan, source rebuild, model download or automatic fallback is perfo
   --query TEXT        Preview a query against the target before any restoration
   --limit N           Preview results per phase (1..=100; default 10)
   --apply             Explicitly restore the admitted target; default is read-only inspection
+  --repair-vectors    With --apply, reconstruct damaged vectors in a NEW copied generation
+  --max-copy-bytes N  Repair payload copy limit (positive integer; default 1073741824)
   --confirm-durability Confirm the exact selected target without models or republication
   --format FORMAT     json (default), jsonl, or table
   --help              Show this help (use alone)
@@ -48,7 +52,12 @@ Use the generation ID and manifest SHA-256 from a trusted publication receipt.
 All stored vector tiers must admit their configured producers, even in fast-only mode.
 A competing publication refuses restoration; no attempt is automatically retried.
 Predecessors and damaged bundles are retained. No file is deleted.
+Repair requires intact receipted FEC, catalog, lexical and metadata artifacts (Unix only).
+Each damaged vector is limited to 128 MiB and its sidecar to 256 MiB; copy limits are not RSS limits.
+Failed partial copies remain unselected. Repaired results report a NEW receipt plus repaired_from.
+--max-copy-bytes requires --repair-vectors; inspection never creates a repair copy.
 --confirm-durability cannot be combined with --apply, --config, --query, or --limit.
+It also cannot be combined with repair options; confirmation performs no reconstruction.
 Durability confirmation is not model admission or a drained watcher queue.
 This operates on cooperative complete stores, not the fixed-authority antirollback layout.
 ";
@@ -62,6 +71,8 @@ struct Options {
     query: Option<String>,
     limit: usize,
     apply: bool,
+    repair_vectors: bool,
+    max_copy_bytes: u64,
     confirm_durability: bool,
     format: OutputFormat,
 }
@@ -89,6 +100,8 @@ impl Options {
         let mut query = None;
         let mut limit = 10;
         let mut apply = false;
+        let mut repair_vectors = false;
+        let mut max_copy_bytes = DEFAULT_REPAIR_COPY_BYTES;
         let mut confirm_durability = false;
         let mut format = OutputFormat::Json;
         let mut seen = HashSet::new();
@@ -104,6 +117,8 @@ impl Options {
                     | "--query"
                     | "--limit"
                     | "--apply"
+                    | "--repair-vectors"
+                    | "--max-copy-bytes"
                     | "--confirm-durability"
                     | "--format"
             ) {
@@ -120,6 +135,10 @@ impl Options {
                 confirm_durability = true;
                 continue;
             }
+            if flag == "--repair-vectors" {
+                repair_vectors = true;
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| invalid(format!("missing value for {flag}")))?;
@@ -132,6 +151,16 @@ impl Options {
                 "--generation" => generation = Some(text(value)?),
                 "--manifest-sha256" => digest = Some(text(value)?),
                 "--query" => query = Some(text(value)?),
+                "--max-copy-bytes" => {
+                    let value = text(value)?;
+                    max_copy_bytes = value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit())
+                        .then(|| value.parse::<u64>().ok())
+                        .flatten()
+                        .filter(|bytes| *bytes > 0)
+                        .ok_or_else(|| invalid("--max-copy-bytes must be a positive u64 decimal integer"))?;
+                }
                 "--limit" => {
                     limit = text(value)?
                         .parse::<usize>()
@@ -160,13 +189,15 @@ impl Options {
             query,
             limit,
             apply,
+            repair_vectors,
+            max_copy_bytes,
             confirm_durability,
             format,
         }
-        .validate(seen.contains("--limit"))
+        .validate(seen.contains("--limit"), seen.contains("--max-copy-bytes"))
     }
 
-    fn validate(mut self, explicit_limit: bool) -> SearchResult<Self> {
+    fn validate(mut self, explicit_limit: bool, explicit_copy_limit: bool) -> SearchResult<Self> {
         // Bound identity text here; the store's canonical pointer decoder owns
         // the exact generation grammar. Do not accept a pathname as an identity.
         if self.generation.len() != 60
@@ -194,8 +225,22 @@ impl Options {
         if explicit_limit && self.query.is_none() {
             return Err(invalid("--limit requires --query"));
         }
+        if self.repair_vectors && !self.apply {
+            return Err(invalid("--repair-vectors requires --apply; inspection cannot allocate a repair copy"));
+        }
+        if explicit_copy_limit && !self.repair_vectors {
+            return Err(invalid("--max-copy-bytes requires --repair-vectors"));
+        }
+        if self.repair_vectors && self.max_copy_bytes == 0 {
+            return Err(invalid("vector repair requires a positive copy budget"));
+        }
+        #[cfg(not(unix))]
+        if self.repair_vectors {
+            return Err(invalid("vector repair requires Unix directory durability support"));
+        }
         if self.confirm_durability
-            && (self.apply || self.config.is_some() || self.query.is_some() || explicit_limit)
+            && (self.apply || self.config.is_some() || self.query.is_some() || explicit_limit
+                || self.repair_vectors || explicit_copy_limit)
         {
             return Err(invalid(
                 "--confirm-durability cannot be combined with --apply, --config, --query, or --limit",
@@ -217,6 +262,12 @@ enum RecoveryState {
 }
 
 #[derive(Debug, Serialize)]
+struct RepairSource {
+    generation_id: String,
+    manifest_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
 struct Report {
     schema_version: u16,
     state: RecoveryState,
@@ -225,6 +276,10 @@ struct Report {
     selection_write_performed: bool,
     durability_confirmed: bool,
     producer_admission_checked: bool,
+    // The output generation is the new copy, not the damaged original. Keep
+    // its original trusted receipt separate, including uncertain publication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repaired_from: Option<RepairSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_error_kind: Option<String>,
     preview: Vec<SearchPayload>,
@@ -240,6 +295,7 @@ impl Report {
             selection_write_performed: false,
             durability_confirmed: false,
             producer_admission_checked: true,
+            repaired_from: None,
             sync_error_kind: None,
             preview: Vec::new(),
         }
@@ -296,7 +352,11 @@ impl Response {
                 1,
             )
             .with_field("complete_generation.recovery.durability")
-            .with_suggestion("Do not assume an abort or blindly restore again. Use fsfs-recover --confirm-durability with the same trusted generation receipt; a changed selection will be refused.");
+            .with_suggestion(if report.repaired_from.is_some() {
+                "Do not repeat the repair or assume an abort. Use fsfs-recover --confirm-durability with the NEW generation_id and manifest_sha256 in this recovery report, not the original repaired_from receipt; a changed selection will be refused."
+            } else {
+                "Do not assume an abort or blindly restore again. Use fsfs-recover --confirm-durability with the same trusted generation receipt; a changed selection will be refused."
+            });
             (
                 Self {
                     envelope: OutputEnvelope::error(error, meta, now),
@@ -396,10 +456,27 @@ async fn execute(
     }
     let runtime = runtime.ok_or_else(|| invalid("recovery runtime was not initialized"))?;
     if options.apply {
-        let mut plan = runtime
-            .prepare_retained_recovery(cx, &options.root, &options.generation, &options.digest)
-            .await?;
+        let mut plan = if options.repair_vectors {
+            #[cfg(unix)]
+            {
+                runtime.prepare_retained_vector_repair(
+                    cx, &options.root, &options.generation, &options.digest, options.max_copy_bytes,
+                ).await?
+            }
+            #[cfg(not(unix))]
+            return Err(invalid("vector repair requires Unix directory durability support"));
+        } else {
+            runtime
+                .prepare_retained_recovery(cx, &options.root, &options.generation, &options.digest)
+                .await?
+        };
         let mut report = Report::inspected(plan.generation());
+        if options.repair_vectors {
+            report.repaired_from = Some(RepairSource {
+                generation_id: options.generation.clone(),
+                manifest_sha256: options.digest.clone(),
+            });
+        }
         if let Some(query) = &options.query {
             report.preview = plan.search(cx, query, options.limit).await?;
             validate_preview(&report.preview)?;
@@ -508,6 +585,13 @@ fn render(response: &Response, format: OutputFormat) -> SearchResult<Vec<u8>> {
             "Generation: {}\nManifest SHA-256: {}",
             report.generation_id, report.manifest_sha256,
         )?;
+        if let Some(original) = &report.repaired_from {
+            writeln!(
+                output,
+                "Reconstructed from: {}\nOriginal manifest SHA-256: {}",
+                original.generation_id, original.manifest_sha256,
+            )?;
+        }
         writeln!(
             output,
             "Selection write performed: {}\nDurability confirmed: {}",
@@ -679,6 +763,87 @@ mod tests {
     }
 
     #[test]
+    fn repair_is_never_implicit_and_conflicting_copy_authority_is_refused() {
+        assert!(!Options::parse(args()).unwrap().repair_vectors);
+        for suffix in [
+            vec!["--repair-vectors"],
+            vec!["--max-copy-bytes", "1"],
+            vec!["--apply", "--max-copy-bytes", "1"],
+            vec!["--apply", "--repair-vectors", "--repair-vectors"],
+            vec!["--apply", "--repair-vectors", "--confirm-durability"],
+            vec!["--apply", "--repair-vectors", "--max-copy-bytes", "0"],
+            vec!["--apply", "--repair-vectors", "--max-copy-bytes", "-1"],
+            vec!["--apply", "--repair-vectors", "--max-copy-bytes", "+1"],
+            vec!["--apply", "--repair-vectors", "--max-copy-bytes", "18446744073709551616"],
+            vec!["--apply", "--repair-vectors", "--max-copy-bytes", "1", "--max-copy-bytes", "2"],
+        ] {
+            let mut input = args();
+            input.extend(suffix.iter().map(|value| OsString::from(*value)));
+            assert!(Options::parse(input).is_err(), "{suffix:?}");
+        }
+        let mut input = args();
+        input.extend(["--query", "--repair-vectors"].map(OsString::from));
+        let parsed = Options::parse(input).unwrap();
+        assert!(!parsed.repair_vectors && !parsed.apply);
+        assert_eq!(parsed.query.as_deref(), Some("--repair-vectors"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_repair_preserves_receipt_preview_and_the_selected_copy_budget() {
+        for budget in ["1", "1073741824", "18446744073709551615"] {
+            let mut input = args();
+            input.extend([
+                "--apply", "--repair-vectors", "--max-copy-bytes", budget,
+                "--query", "sharedtoken", "--limit", "3",
+            ].map(OsString::from));
+            let options = Options::parse(input).unwrap();
+            assert!(options.apply && options.repair_vectors && !options.confirm_durability);
+            assert_eq!(options.max_copy_bytes, budget.parse::<u64>().unwrap());
+            assert_eq!(options.query.as_deref(), Some("sharedtoken"));
+            assert_eq!(options.limit, 3);
+            assert_eq!(options.digest, "a".repeat(64));
+        }
+        let mut input = args();
+        input.extend(["--apply", "--repair-vectors"].map(OsString::from));
+        assert_eq!(Options::parse(input).unwrap().max_copy_bytes, DEFAULT_REPAIR_COPY_BYTES);
+    }
+
+    #[test]
+    fn repair_reports_new_receipt_and_preserves_original_provenance_on_uncertainty() {
+        for state in [RecoveryState::RestoredDurable, RecoveryState::RestoredDurabilityUncertain] {
+            let mut facts = report(state);
+            facts.generation_id = "new-repaired-generation".to_owned();
+            facts.manifest_sha256 = "b".repeat(64);
+            facts.repaired_from = Some(RepairSource {
+                generation_id: "original-damaged-generation".to_owned(),
+                manifest_sha256: "a".repeat(64),
+            });
+            let (response, code) = Response::from_report(facts, OutputFormat::Json);
+            let value: serde_json::Value = serde_json::from_slice(&encode(&response).unwrap()).unwrap();
+            let durable = state == RecoveryState::RestoredDurable;
+            assert_eq!(code, u8::from(!durable));
+            assert_eq!(value["ok"], durable);
+            let facts = if durable { &value["data"] } else { &value["recovery"] };
+            assert_eq!(facts["generation_id"], "new-repaired-generation");
+            assert_eq!(facts["manifest_sha256"], "b".repeat(64));
+            assert_eq!(facts["repaired_from"]["generation_id"], "original-damaged-generation");
+            assert_eq!(facts["repaired_from"]["manifest_sha256"], "a".repeat(64));
+            assert_eq!(facts["selection_write_performed"], true);
+            assert_eq!(facts["durability_confirmed"], durable);
+            if !durable {
+                assert!(value["error"]["suggestion"].as_str().unwrap().contains("NEW generation_id"));
+            }
+            let table = String::from_utf8(render(&response, OutputFormat::Table).unwrap()).unwrap();
+            assert!(table.contains("Generation: new-repaired-generation"));
+            assert!(table.contains("Reconstructed from: original-damaged-generation"));
+        }
+        let (ordinary, _) = Response::from_report(report(RecoveryState::Inspected), OutputFormat::Json);
+        let value: serde_json::Value = serde_json::from_slice(&encode(&ordinary).unwrap()).unwrap();
+        assert!(value["data"].get("repaired_from").is_none());
+    }
+
+    #[test]
     fn confirmation_is_explicit_and_rejects_ignored_or_conflicting_options() {
         let mut input = args();
         input.push("--confirm-durability".into());
@@ -719,6 +884,7 @@ mod tests {
                 state,
                 RecoveryState::DurabilityConfirmed | RecoveryState::DurabilityStillUncertain
             ),
+            repaired_from: None,
             sync_error_kind: None,
             preview: Vec::new(),
         }

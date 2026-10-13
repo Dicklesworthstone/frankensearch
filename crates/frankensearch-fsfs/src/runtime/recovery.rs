@@ -175,6 +175,54 @@ impl FsfsRuntime {
         })
     }
 
+    /// Repair receipted vector damage in a new generation, then admit every tier.
+    ///
+    /// This explicitly allocates a complete independent copy; ordinary recovery
+    /// and search never invoke it automatically. The original bundle is read-only,
+    /// and only the canonical fast/quality vectors can be reconstructed from
+    /// intact receipted FEC sidecars. The catalog, lexical and metadata artifacts
+    /// must already match the trusted original manifest. No source is reindexed.
+    ///
+    /// The store captures selection BEFORE copying. Retain that same plan across
+    /// asynchronous model admission and optional preview: creating a new restore
+    /// plan afterwards could overwrite a publication that won during decoding.
+    /// Every configured stored producer is required even for fast-only queries.
+    /// Call `restore` explicitly to select the repaired copy; failure or dropping
+    /// this future leaves the original selection and damaged evidence intact.
+    ///
+    /// `max_copy_bytes` limits the observed and original payload inventories;
+    /// individual damaged vectors and sidecars retain the store's 128/256 MiB
+    /// limits. This is not an RSS bound. Copy/codec work is synchronous and must
+    /// run on the caller's blocking lane; cancellation does not preempt a codec
+    /// call already executing. Partial unselected copies are retained on failure.
+    ///
+    /// # Errors
+    /// Returns receipt, damage, copy/decode limit, I/O, producer/engine admission,
+    /// configuration or cancellation errors. Unix-only directory durability.
+    #[cfg(unix)]
+    pub async fn prepare_retained_vector_repair(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        generation_id: &str,
+        manifest_sha256: &str,
+        max_copy_bytes: u64,
+    ) -> SearchResult<PreparedRetainedRecovery> {
+        self.preflight_retained_recovery(cx)?;
+        let store = crate::generation_store::CompleteGenerationStore::open(cx, store_root)?;
+        let plan = store.prepare_vector_repair(cx, generation_id, manifest_sha256, max_copy_bytes)?;
+        let generation = plan.target().clone();
+        let reader = self
+            .open_retained_recovery_target(cx, &store, generation)
+            .await?;
+        retained_search_checkpoint(cx)?;
+        Ok(PreparedRetainedRecovery {
+            plan,
+            reader,
+            preview_ready: true,
+        })
+    }
+
     /// Open an explicitly named retained generation without changing selection.
     ///
     /// The ID and manifest SHA-256 must come from a trusted publication receipt,
@@ -959,6 +1007,146 @@ mod retained_recovery_tests {
                 1
             );
             assert_eq!(fs::read(pointer).unwrap(), b"explicit repair required");
+        });
+    }
+
+    async fn protected_publication(
+        runtime: &FsfsRuntime,
+        cx: &Cx,
+        root: &Path,
+    ) -> PublishedGeneration {
+        use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileProtector};
+
+        let store = CompleteGenerationStore::create(cx, root).unwrap();
+        let build = store.begin(cx).unwrap();
+        let mut input = runtime.cli_input.clone();
+        input.index_dir = Some(build.path().to_path_buf());
+        runtime.clone().with_cli_input(input)
+            .run_retained_index_with_reuse(cx, &store, build.path()).await.unwrap();
+        let protector = FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default()).unwrap();
+        for relative in [FSFS_VECTOR_INDEX_FILE, FSFS_VECTOR_QUALITY_INDEX_FILE] {
+            protector.protect_file(&build.path().join(relative)).unwrap();
+        }
+        // The real writers made these files. Admit all engines/producers before
+        // introducing damage; the fixture's first seal alone is not that proof.
+        let GenerationPublication::Durable(generation) = build.publish(cx, |_, _| Ok(())).unwrap()
+        else {
+            panic!("protected fixture must be durable"); // ubs:ignore — test assertion.
+        };
+        drop(runtime.open_retained_search_from_receipt(
+            cx, root, generation.id(), generation.manifest_sha256(),
+        ).await.unwrap());
+        generation
+    }
+
+    fn damage_recovery_vector(generation: &PublishedGeneration, relative: &str) {
+        let path = generation.path().join(relative);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[10] ^= 0x5a;
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn vector_repair_admits_real_index_arms_and_searches_without_source_files() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let original = protected_publication(&runtime, &cx, &root).await;
+            let healthy = file_bytes(original.path());
+            damage_recovery_vector(&original, FSFS_VECTOR_INDEX_FILE);
+            let quality = original.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE);
+            fs::rename(&quality, directory.path().join("preserved-quality.fsvi")).unwrap();
+            let damaged = file_bytes(original.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            fs::rename(source, directory.path().join("source-unavailable")).unwrap();
+            assert!(runtime.open_retained_search(&cx, &root).await.is_err());
+            let mut plan = fresh_runtime(&runtime).prepare_retained_vector_repair(
+                &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
+            ).await.unwrap();
+            let repaired = plan.generation().clone();
+            assert_ne!(repaired.id(), original.id());
+            assert!(plan.reader.resources.fast_embedder.is_some());
+            assert!(plan.reader.resources.quality_embedder.is_some());
+            let preview = plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert!(preview.iter().all(|phase| phase.phase != SearchOutputPhase::RefinementFailed));
+            assert_eq!(preview.last().unwrap().hits[0].path, "alpha.md");
+            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            assert_eq!(file_bytes(original.path()), damaged);
+            for relative in [FSFS_VECTOR_INDEX_FILE, FSFS_VECTOR_QUALITY_INDEX_FILE] {
+                assert_eq!(fs::read(repaired.path().join(relative)).unwrap(), healthy[Path::new(relative)]);
+            }
+            let (publication, mut retained) = plan.restore(&cx).unwrap();
+            assert!(matches!(publication, GenerationPublication::Durable(ref value) if value == &repaired));
+            assert_eq!(retained.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            let mut reopened = fresh_runtime(&runtime).open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(reopened.generation(), &repaired);
+            assert_eq!(reopened.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            assert_eq!(file_bytes(original.path()), damaged);
+        });
+    }
+
+    #[test]
+    fn repaired_copy_still_requires_both_producers_at_admission_and_selection() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, _, root) = fixture(directory.path());
+            let original = protected_publication(&runtime, &cx, &root).await;
+            damage_recovery_vector(&original, FSFS_VECTOR_INDEX_FILE);
+            let damaged = file_bytes(original.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            runtime.config.search.fast_only = true;
+            for producer in [&models.fast, &models.quality] {
+                producer.changed.store(true, Ordering::Relaxed);
+                let result = fresh_runtime(&runtime).prepare_retained_vector_repair(
+                    &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
+                ).await;
+                producer.changed.store(false, Ordering::Relaxed);
+                assert!(matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })));
+                let plan = fresh_runtime(&runtime).prepare_retained_vector_repair(
+                    &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
+                ).await.unwrap();
+                producer.changed.store(true, Ordering::Relaxed);
+                let result = plan.restore(&cx);
+                producer.changed.store(false, Ordering::Relaxed);
+                assert!(matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })));
+                assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+                assert_eq!(file_bytes(original.path()), damaged);
+            }
+        });
+    }
+
+    #[test]
+    fn repaired_search_plan_keeps_selection_evidence_and_failed_preview_barriers() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let original = protected_publication(&runtime, &cx, &root).await;
+            fs::write(source.join("beta.md"), "sharedtoken second source").unwrap();
+            let selected = publish(&runtime, &cx, &root).await;
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            damage_recovery_vector(&original, FSFS_VECTOR_INDEX_FILE);
+            let plan = fresh_runtime(&runtime).prepare_retained_vector_repair(
+                &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
+            ).await.unwrap();
+            fs::write(source.join("gamma.md"), "sharedtoken concurrent source").unwrap();
+            let winner = publish(&runtime, &cx, &root).await;
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            assert!(plan.restore(&cx).is_err(), "repair cannot overwrite the concurrent publisher");
+            let mut plan = fresh_runtime(&runtime).prepare_retained_vector_repair(
+                &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
+            ).await.unwrap();
+            cx.set_cancel_requested(true);
+            let preview = plan.search(&cx, "sharedtoken", 10).await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(preview, Err(SearchError::Cancelled { .. })));
+            assert!(plan.restore(&cx).is_err(), "clearing cancellation cannot authorize a failed preview");
+            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(winner));
+            assert_eq!(pinned.generation(), &selected);
+            assert_eq!(pinned.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 2);
         });
     }
 }
