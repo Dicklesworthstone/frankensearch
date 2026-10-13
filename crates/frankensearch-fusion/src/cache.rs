@@ -20,6 +20,7 @@ use tracing::{debug, warn};
 use frankensearch_index::{TwoTierIndex, TwoTierIndexPaths};
 
 mod admitted_v2;
+mod sentinel_io;
 pub use admitted_v2::{NativeCachePolicy, NativeCacheTier};
 
 /// Sentinel file name written alongside indices after a successful build.
@@ -101,11 +102,18 @@ pub struct IndexSentinel {
 }
 
 impl IndexSentinel {
-    /// Write this sentinel to a JSON file.
+    /// Atomically replace the sentinel with a complete JSON file.
+    ///
+    /// The encoded sentinel is limited to 1 MiB. A uniquely created sibling is
+    /// written and synced before rename; the parent directory is then synced
+    /// on Unix. Concurrent readers retain either the old or new complete file.
+    /// This does not replace the caller's generation-publication ownership.
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::Io` on write failure.
+    /// Returns `SearchError::Io` on I/O failure or an oversized sentinel.
+    /// Failure before rename preserves the old sentinel. A directory-sync
+    /// failure after rename is reported even though the new file may be visible.
     pub fn write_to(&self, dir: &Path) -> SearchResult<()> {
         let path = dir.join(SENTINEL_FILENAME);
         let json = serde_json::to_string_pretty(self).map_err(|e| SearchError::InvalidConfig {
@@ -113,11 +121,7 @@ impl IndexSentinel {
             value: "<serialization>".to_owned(),
             reason: e.to_string(),
         })?;
-        {
-            let mut file = std::fs::File::create(&path)?;
-            std::io::Write::write_all(&mut file, json.as_bytes())?;
-            file.sync_all()?;
-        }
+        sentinel_io::write(dir, json.as_bytes())?;
         debug!(
             target: "frankensearch.cache",
             path = %path.display(),
@@ -127,25 +131,30 @@ impl IndexSentinel {
         Ok(())
     }
 
-    /// Read a sentinel from a directory, if present.
+    /// Read a sentinel from a directory, if present, consuming at most 1 MiB
+    /// plus one byte to detect an oversized file.
     ///
-    /// Returns `None` if the file does not exist.
+    /// Returns `None` only when opening the file reports that it does not exist.
     ///
     /// # Errors
     ///
     /// Returns `SearchError::Io` for I/O failures other than missing file,
-    /// or `SearchError::InvalidConfig` for malformed JSON.
+    /// non-regular files or oversized input; `SearchError::InvalidConfig` for
+    /// malformed JSON. Diagnostics do not echo sentinel field contents.
     pub fn read_from(dir: &Path) -> SearchResult<Option<Self>> {
-        let path = dir.join(SENTINEL_FILENAME);
-        if !path.exists() {
+        let Some(data) = sentinel_io::read(dir)? else {
             return Ok(None);
-        }
-        let data = std::fs::read_to_string(&path)?;
+        };
         let sentinel: Self =
-            serde_json::from_str(&data).map_err(|e| SearchError::InvalidConfig {
+            serde_json::from_slice(&data).map_err(|e| SearchError::InvalidConfig {
                 field: "sentinel".to_owned(),
-                value: path.display().to_string(),
-                reason: format!("malformed sentinel JSON: {e}"),
+                value: dir.join(SENTINEL_FILENAME).display().to_string(),
+                reason: format!(
+                    "malformed sentinel JSON ({:?} at line {}, column {})",
+                    e.classify(),
+                    e.line(),
+                    e.column()
+                ),
             })?;
         Ok(Some(sentinel))
     }
@@ -1435,7 +1444,10 @@ mod tests {
         let report = detector.check(&dir, &index).expect("check");
         assert!(report.is_stale);
         assert_eq!(report.index_record_count, 3);
-        assert_eq!(report.reason.as_deref(), Some("source hash missing from sentinel"));
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("source hash missing from sentinel")
+        );
         assert!(detector.is_stale(&dir, &index).expect("is_stale"));
     }
 
@@ -1774,13 +1786,51 @@ mod tests {
         .write_to(&dir)
         .expect("sentinel");
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("index");
-        let detector = SentinelFileDetector::new()
-            .with_expected_hash("private-caller-canary".repeat(4096));
+        let detector =
+            SentinelFileDetector::new().with_expected_hash("private-caller-canary".repeat(4096));
         let report = detector.check(&dir, &index).expect("check");
         assert!(report.is_stale);
         assert_eq!(report.reason.as_deref(), Some("source hash mismatch"));
         let json = serde_json::to_string(&report).expect("report");
         assert!(json.len() < 256);
         assert!(!json.contains("private-"));
+    }
+
+    #[test]
+    fn sentinel_public_io_rejects_oversize_without_destroying_the_previous_json() {
+        let dir = temp_dir("sentinel-public-byte-bound");
+        sample_sentinel(3).write_to(&dir).expect("old sentinel");
+        let path = dir.join(SENTINEL_FILENAME);
+        let before = std::fs::read(&path).expect("old bytes");
+        let oversized = IndexSentinel {
+            source_hash: Some("x".repeat(sentinel_io::MAX_SENTINEL_BYTES)),
+            ..sample_sentinel(3)
+        };
+        assert!(matches!(oversized.write_to(&dir), Err(SearchError::Io(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            IndexSentinel::read_from(&dir).unwrap().unwrap().source_count,
+            3
+        );
+        std::fs::write(&path, vec![b' '; sentinel_io::MAX_SENTINEL_BYTES + 1]).unwrap();
+        assert!(matches!(
+            IndexSentinel::read_from(&dir),
+            Err(SearchError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_sentinel_diagnostics_do_not_echo_private_field_contents() {
+        let dir = temp_dir("sentinel-parse-redaction");
+        let mut value = serde_json::to_value(sample_sentinel(3)).expect("sentinel JSON");
+        value["source_count"] = serde_json::json!("private-sentinel-field-canary");
+        std::fs::write(
+            dir.join(SENTINEL_FILENAME),
+            serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        let error = IndexSentinel::read_from(&dir).expect_err("wrong field type");
+        assert!(matches!(error, SearchError::InvalidConfig { .. }));
+        assert!(!format!("{error:?}").contains("private-sentinel-field-canary"));
     }
 }
