@@ -295,3 +295,116 @@ fn public_readers_share_receipt_policy_on_open_and_refresh() -> TestResult {
         Ok(())
     })
 }
+
+#[test]
+fn local_receipt_budget_survives_low_descriptor_limit() -> TestResult {
+    const CHILD: &str = "FRANKENSEARCH_RECEIPT_BUDGET_TEST_CHILD";
+    const FINISHED: &str = "receipt-budget-child-finished";
+    if std::env::var(CHILD).ok().as_deref() == Some("1") {
+        low_descriptor_receipt_case()?;
+        println!("{FINISHED}");
+        return Ok(());
+    }
+    // Never change RLIMIT_NOFILE in the shared parallel test process. The
+    // completion marker also prevents an accidentally empty test filter from
+    // being mistaken for successful execution of the constrained case.
+    let output = std::process::Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "keeper::tests::local_receipt_budget_survives_low_descriptor_limit",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "child failed:\n{stdout}\n{stderr}");
+    assert!(stdout.contains(FINISHED), "child case did not run:\n{stdout}");
+    Ok(())
+}
+
+fn low_descriptor_receipt_case() -> TestResult {
+    use std::cmp::Reverse;
+    use rustix::process::{Resource, Rlimit, getrlimit, setrlimit};
+
+    let (_root, index, cache, first) = local_receipt_fixture()?;
+    let mut records = Vec::new();
+    let mut term_offsets = Vec::new();
+    for (position, docid_lo) in (0..256).step_by(2).enumerate() {
+        let id = 0xea501 + u64::try_from(position)?;
+        let first_id = format!("receipt-{position}-{}", "x".repeat((position % 4) * 80));
+        let second_id = format!("receipt-{position}-second");
+        let encoded = encoded_identity_test_segment(
+            id,
+            docid_lo,
+            &[Some(first_id.as_str()), Some(second_id.as_str())],
+        )?;
+        std::fs::write(index.join(canonical_segment_name(id)), encoded.as_bytes())?;
+        term_offsets.push(encoded.section_entries().iter()
+            .find(|entry| entry.kind == SectionKind::TERMDICT).expect("termdict").offset);
+        records.push(manifest_segment(&encoded, u64::try_from(position)? + 1));
+    }
+    let mut manifest = durable_test_manifest(1, records);
+    manifest.field_stats = receipt_manifest(1, &first).field_stats;
+    for field in &mut manifest.field_stats {
+        field.doc_count = 256;
+    }
+    write_manifest(&index.join("MANIFEST"), &manifest)?;
+    drop(eager_local_open(&index, &cache)?);
+    let warm = eager_local_open(&index, &cache)?;
+    assert!(warm.segments().iter()
+        .all(|segment| segment.authenticated_file_witness_hash_count() == 0));
+    drop(warm);
+
+    let previous = getrlimit(Resource::Nofile);
+    setrlimit(Resource::Nofile, Rlimit {
+        current: Some(64),
+        maximum: previous.maximum,
+    })?;
+    let snapshot = eager_local_open(&index, &cache)?;
+    assert_eq!(snapshot.segments().len(), 128);
+    assert!(snapshot.resolve_document_id("receipt-127-second")?.is_some());
+    let counts: Vec<_> = snapshot.segments().iter()
+        .map(RecoveredSegment::authenticated_file_witness_hash_count)
+        .collect();
+    assert!(counts.iter().all(|&count| count <= 1));
+    let hits = counts.iter().filter(|&&count| count == 0).count();
+    assert!(hits > 0 && hits < 128, "constrained open must retain hits AND hash unselected files");
+    let mut expected: Vec<_> = (0..128).collect();
+    expected.sort_unstable_by_key(|&position| {
+        (Reverse(manifest.segments[position].file_len), position)
+    });
+    expected.truncate(hits);
+    for (position, &count) in counts.iter().enumerate() {
+        assert_eq!(count == 0, expected.contains(&position), "candidate {position}");
+    }
+    drop(snapshot);
+    let strict = KeeperSnapshot::open(&index, DEFAULT_SCHEMA)?;
+    assert!(strict.segments().iter()
+        .all(|segment| segment.authenticated_file_witness_hash_count() == 1));
+    drop(strict);
+
+    // No mapping is alive while injecting this fault. The lowest-ranked
+    // candidate is necessarily outside the constrained descriptor budget.
+    let position = (0..128).min_by_key(|&position| {
+        (manifest.segments[position].file_len, Reverse(position))
+    }).expect("nonempty fixture");
+    assert_eq!(counts[position], 1);
+    let record = &manifest.segments[position];
+    let book_path = cache.join("read-open-receipts-v3");
+    let book_before = std::fs::read(&book_path)?;
+    let mut file = OpenOptions::new().read(true).write(true)
+        .open(index.join(canonical_segment_name(record.segment_id)))?;
+    file.seek(SeekFrom::Start(term_offsets[position]))?;
+    let mut byte = [0_u8];
+    file.read_exact(&mut byte)?;
+    byte[0] ^= 1;
+    file.seek(SeekFrom::Start(term_offsets[position]))?;
+    file.write_all(&byte)?;
+    drop(file);
+    assert!(eager_local_open(&index, &cache).is_err(), "unselected corruption must fail closed");
+    assert_eq!(std::fs::read(&book_path)?, book_before,
+        "a failed mixed admission must not publish partial receipts");
+    Ok(())
+}
