@@ -26,6 +26,9 @@ mod model_migration;
 #[path = "request_tuning.rs"]
 mod request_tuning;
 
+#[path = "source.rs"]
+pub(super) mod source;
+
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Read one bounded nonblank record using the same policy for hybrid and
@@ -108,6 +111,7 @@ impl Controls {
 #[serde(untagged)]
 enum Message {
     Search(Request),
+    Fetch(source::Request),
     TunedSearch(request_tuning::Request),
     Control(activation::Request),
     Update(warm_update::Request),
@@ -398,6 +402,10 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
         "query_tuning_enabled": policy.query_overrides_enabled(),
         "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
         "rerank_window": policy.rerank.as_ref().map(|r| r.window),
+        "source_fetch_supported": true,
+        "source_fetch_max_documents": source::MAX_DOCUMENTS,
+        "source_fetch_max_content_bytes": source::MAX_CONTENT_BYTES,
+        "source_fetch_max_response_bytes": source::MAX_RESPONSE_BYTES,
     });
     index.annotate(&mut ready);
     policy.annotate_full_query(Mode::Full, &mut ready);
@@ -430,6 +438,26 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
             }
         };
         match message {
+            Message::Fetch(request) => {
+                // Pin once for generation admission, every document window and
+                // delivery. IDs resolve through source membership, not FSVI rows.
+                let snapshot = live.snapshot(cx).await?;
+                let index = snapshot.index();
+                source::execute(
+                    cx,
+                    snapshot.generation(),
+                    &request,
+                    ordinal,
+                    base_filter,
+                    policy,
+                    |id| match index {
+                        cohort::Index::Single(index) => index.vectors().document(id),
+                        cohort::Index::Sharded(index) => index.vectors().document(id),
+                    },
+                    output,
+                )
+                .await?;
+            }
             Message::Search(request) => {
                 // Pin once, through Initial, quality, hydration and terminal
                 // delivery. Never resolve the serving selection between phases.
