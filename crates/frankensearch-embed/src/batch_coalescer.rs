@@ -32,6 +32,11 @@
 //!
 //! Result delivery uses [`std::sync::mpsc::sync_channel`] (capacity 1)
 //! per request — **not** tokio channels.
+//!
+//! Admission is bounded across queued AND dispatched work by [`CoalescerLimits`].
+//! Overload returns an immediate error on the submission's result channel;
+//! shutdown closes admission before draining existing requests. These are input
+//! storage limits, not a model-inference memory cap or a dispatch-time guarantee.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,6 +47,10 @@ use std::time::{Duration, Instant};
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
+
+mod admission;
+pub use admission::{CoalescerLimits, CoalescerUsage};
+use admission::{AdmissionBudget, AdmissionPermit};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -104,6 +113,8 @@ struct PendingRequest {
     submitted_at: Instant,
     /// Channel for delivering the result back to the caller.
     result_tx: SyncSender<SearchResult<Vec<f32>>>,
+    /// Released only when this request's owned text is dropped after dispatch.
+    _admission: AdmissionPermit,
 }
 
 // ---------------------------------------------------------------------------
@@ -191,8 +202,10 @@ impl CoalescedBatch {
 /// Lock-free counters for batch coalescer telemetry.
 #[derive(Debug, Default)]
 pub struct CoalescerMetrics {
-    /// Total individual embedding requests submitted.
+    /// Total submission attempts, including rejected requests.
     pub total_submitted: AtomicU64,
+    /// Submissions rejected by shutdown, capacity or invalid deadline/size.
+    pub rejected_submissions: AtomicU64,
     /// Total batches formed and dispatched.
     pub total_batches: AtomicU64,
     /// Total texts included in dispatched batches.
@@ -285,6 +298,7 @@ pub struct BatchCoalescer {
     state: Mutex<CoalescerState>,
     notify: Condvar,
     metrics: Arc<CoalescerMetrics>,
+    admission: Arc<AdmissionBudget>,
 }
 
 impl std::fmt::Debug for BatchCoalescer {
@@ -307,9 +321,23 @@ impl BatchCoalescer {
         })
     }
 
-    /// Create a new batch coalescer with the given configuration.
+    /// Create a coalescer with default queued-plus-in-flight admission limits.
+    /// Use [`Self::with_limits`] to select a different bounded input budget.
     #[must_use]
     pub fn new(config: CoalescerConfig) -> Self {
+        Self::with_validated_limits(config, CoalescerLimits::default())
+    }
+
+    /// Create a coalescer with explicit queued-plus-in-flight admission limits.
+    ///
+    /// # Errors
+    /// Returns `InvalidConfig` if either admission limit is zero.
+    pub fn with_limits(config: CoalescerConfig, limits: CoalescerLimits) -> SearchResult<Self> {
+        limits.validate()?;
+        Ok(Self::with_validated_limits(config, limits))
+    }
+
+    fn with_validated_limits(config: CoalescerConfig, limits: CoalescerLimits) -> Self {
         let mut config = config;
         if config.max_batch_size == 0 {
             warn!(
@@ -321,11 +349,13 @@ impl BatchCoalescer {
 
         Self {
             state: Mutex::new(CoalescerState {
-                pending: VecDeque::with_capacity(config.max_batch_size),
+                // Do not eagerly allocate an arbitrary caller-sized batch.
+                pending: VecDeque::new(),
                 shutdown: false,
             }),
             notify: Condvar::new(),
             metrics: Arc::new(CoalescerMetrics::default()),
+            admission: Arc::new(AdmissionBudget::new(limits)),
             config,
         }
     }
@@ -339,28 +369,19 @@ impl BatchCoalescer {
     /// `.recv()` (blocking) or `.try_recv()` (non-blocking) on the receiver.
     ///
     /// The `priority` controls scheduling: [`Priority::Interactive`] requests
-    /// trigger early batch dispatch to meet latency SLOs.
+    /// trigger early batch dispatch. The caller still owns worker scheduling.
+    ///
+    /// Capacity exhaustion immediately returns `QueueFull` through the channel:
+    /// its counters describe requests for the request limit, or allocated text
+    /// bytes for the byte limit. A single text allocation too large ever to fit
+    /// returns `InvalidConfig`. Post-shutdown submissions return `Cancelled`.
+    /// No request is queued and no retry is started in any of these cases.
     pub fn submit(
         &self,
         text: String,
         priority: Priority,
     ) -> mpsc::Receiver<SearchResult<Vec<f32>>> {
         let (tx, rx) = mpsc::sync_channel(1);
-        let now = Instant::now();
-
-        let deadline = now
-            + Duration::from_millis(match priority {
-                Priority::Interactive => self.config.max_wait_ms / 2,
-                Priority::Background => self.config.max_wait_ms,
-            });
-
-        let request = PendingRequest {
-            text,
-            priority,
-            deadline,
-            submitted_at: now,
-            result_tx: tx,
-        };
 
         // Track metrics
         self.metrics.total_submitted.fetch_add(1, Ordering::Relaxed);
@@ -379,7 +400,49 @@ impl BatchCoalescer {
 
         {
             let mut state = self.lock_state();
-            state.pending.push_back(request);
+            // The queue lock orders admission against shutdown. Dispatched
+            // requests retain their own credit even after leaving this queue.
+            let now = Instant::now();
+            let admitted = (|| {
+                if state.shutdown {
+                    return Err(SearchError::Cancelled {
+                        phase: "batch_coalescer.submit".to_owned(),
+                        reason: "coalescer admission is shut down".to_owned(),
+                    });
+                }
+                let wait = Duration::from_millis(match priority {
+                    Priority::Interactive => self.config.max_wait_ms / 2,
+                    Priority::Background => self.config.max_wait_ms,
+                });
+                let deadline = now.checked_add(wait).ok_or_else(|| {
+                    SearchError::InvalidConfig {
+                        field: "batch_coalescer.max_wait_ms".to_owned(),
+                        value: self.config.max_wait_ms.to_string(),
+                        reason: "dispatch deadline exceeds the platform clock range".to_owned(),
+                    }
+                })?;
+                let permit = self.admission.reserve(text.capacity())?;
+                Ok((deadline, permit))
+            })();
+            let (deadline, permit) = match admitted {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    drop(state);
+                    self.metrics
+                        .rejected_submissions
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = tx.send(Err(error));
+                    return rx;
+                }
+            };
+            state.pending.push_back(PendingRequest {
+                text,
+                priority,
+                deadline,
+                submitted_at: now,
+                result_tx: tx,
+                _admission: permit,
+            });
             trace!(
                 target: "frankensearch.coalescer",
                 pending = state.pending.len(),
@@ -409,6 +472,16 @@ impl BatchCoalescer {
             // Shutdown with empty queue → done
             if state.shutdown && state.pending.is_empty() {
                 return None;
+            }
+
+            // No deadline exists on an empty queue. In particular, a zero-wait
+            // configuration must not spin through zero-duration timed waits.
+            if state.pending.is_empty() {
+                state = self
+                    .notify
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                continue;
             }
 
             // Check if a batch is ready
@@ -450,7 +523,9 @@ impl BatchCoalescer {
     /// Signal the coalescer to shut down.
     ///
     /// After this call, [`wait_for_batch`](Self::wait_for_batch) will drain
-    /// any remaining pending requests as a final batch and then return `None`.
+    /// admitted pending requests in bounded batches and then return `None`.
+    /// Later submissions are refused. Already dispatched batches remain owned
+    /// by their workers; this does not cancel or join inference.
     pub fn shutdown(&self) {
         let mut state = self.lock_state();
         state.shutdown = true;
@@ -475,6 +550,18 @@ impl BatchCoalescer {
     #[must_use]
     pub fn pending_count(&self) -> usize {
         self.lock_state().pending.len()
+    }
+
+    /// Limits retained by this coalescer for all admitted input work.
+    #[must_use]
+    pub fn limits(&self) -> CoalescerLimits {
+        self.admission.limits()
+    }
+
+    /// Current queued-plus-in-flight input usage, sampled under one budget lock.
+    #[must_use]
+    pub fn usage(&self) -> CoalescerUsage {
+        self.admission.usage()
     }
 
     /// Shared reference to the metrics counters.
