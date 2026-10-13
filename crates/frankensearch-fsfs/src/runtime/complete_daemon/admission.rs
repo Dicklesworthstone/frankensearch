@@ -95,7 +95,7 @@ impl Intake {
     }
 
     /// One bounded scheduler turn: four accepts and one poll of each admitted
-    /// framing future. read_request itself yields after bounded read work.
+    /// framing future. `read_request` itself yields after bounded read work.
     /// Expiry includes time waiting for the single search owner, so queued
     /// clients cannot retain their payload/socket indefinitely during inference.
     fn pump(
@@ -359,7 +359,7 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let (_directory, listener) = listener();
             let mut intake = Intake::new(Duration::from_secs(60));
-            let _clients = (0..MAX_PEERS + 1)
+            let _clients = (0..=MAX_PEERS)
                 .map(|_| connect(&listener, b"ready\n"))
                 .collect::<Vec<_>>();
             for _ in 0..3 {
@@ -439,7 +439,7 @@ mod tests {
                     polls.set(polls.get() + 1);
                     Poll::<()>::Pending
                 })
-                .await
+                .await;
             }));
             let mut task = Context::from_waker(Waker::noop());
             assert!(driving.as_mut().poll(&mut task).is_pending());

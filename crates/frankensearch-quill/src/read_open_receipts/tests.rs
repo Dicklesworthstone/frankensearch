@@ -136,9 +136,10 @@ fn boot_expiry_cannot_be_extended_by_wall_clock_rollback_or_cache_hits() {
     }
     for (wall, boot) in [(1000, 199), (800, 261), (100_000, 261)] {
         let miss = ReceiptBook::load_at(dir.path(), policy, clock(wall, boot));
-        assert!(miss
-            .admitted_at(binding, identity, clock(wall, boot))
-            .is_none());
+        assert!(
+            miss.admitted_at(binding, identity, clock(wall, boot))
+                .is_none()
+        );
     }
 }
 
@@ -248,9 +249,11 @@ fn namespace_or_boot_producer_change_invalidates_proofs() {
     .expect("write");
     let reopened = ReceiptBook::load_at(dir.path(), Policy::default(), clock(201, 201));
     assert!(reopened.enabled());
-    assert!(reopened
-        .admitted_at(binding, identity, reopened.clock)
-        .is_none());
+    assert!(
+        reopened
+            .admitted_at(binding, identity, reopened.clock)
+            .is_none()
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -355,7 +358,9 @@ fn receipts_expire_during_one_open_without_reloading_the_book() {
     // Simulate later segment workers using the SAME already-loaded book.
     // Backward wall time cannot renew its original boot-time deadline.
     for now in [clock(1000, 250), clock(900, 259), clock(800, 260)] {
-        let receipt = book.admitted_at(binding, identity, now).expect("live lease");
+        let receipt = book
+            .admitted_at(binding, identity, now)
+            .expect("live lease");
         assert_eq!(receipt.verified_boot_ns, 200 * NANOS_PER_SECOND);
         book.keep(receipt);
     }
@@ -381,9 +386,11 @@ fn receipts_expire_during_one_open_without_reloading_the_book() {
         200 * NANOS_PER_SECOND,
         "keeping cache hits must not renew the persisted proof"
     );
-    assert!(reopened
-        .admitted_at(binding, identity, reopened.clock)
-        .is_none());
+    assert!(
+        reopened
+            .admitted_at(binding, identity, reopened.clock)
+            .is_none()
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -449,10 +456,7 @@ fn retention_is_bounded_cost_prioritized_and_order_independent() {
     let orders: [Vec<usize>; 3] = [
         (0..count).collect(),
         (0..count).rev().collect(),
-        (0..count)
-            .step_by(2)
-            .chain((1..count).step_by(2))
-            .collect(),
+        (0..count).step_by(2).chain((1..count).step_by(2)).collect(),
     ];
     for order in orders {
         // No directory or platform clock is needed to exercise retention.
@@ -566,12 +570,16 @@ fn oversized_snapshots_persist_hits_and_new_proofs_without_renewing_old_leases()
     assert_eq!(reopened.loaded.len(), MAX_RECEIPTS);
     let cheap = &candidates[0];
     let expensive = candidates.last().expect("nonempty snapshot");
-    assert!(reopened
-        .admitted_at(cheap.binding, cheap.identity, reopened.clock)
-        .is_none());
-    assert!(reopened
-        .admitted_at(expensive.binding, expensive.identity, reopened.clock)
-        .is_some());
+    assert!(
+        reopened
+            .admitted_at(cheap.binding, cheap.identity, reopened.clock)
+            .is_none()
+    );
+    assert!(
+        reopened
+            .admitted_at(expensive.binding, expensive.identity, reopened.clock)
+            .is_some()
+    );
     for receipt in reopened.loaded.clone().into_values() {
         let hit = reopened
             .admitted_at(receipt.binding, receipt.identity, reopened.clock)
@@ -596,9 +604,11 @@ fn oversized_snapshots_persist_hits_and_new_proofs_without_renewing_old_leases()
         expired.loaded[&expensive.binding].verified_boot_ns,
         200 * NANOS_PER_SECOND
     );
-    assert!(expired
-        .admitted_at(expensive.binding, expensive.identity, expired.clock)
-        .is_none());
+    assert!(
+        expired
+            .admitted_at(expensive.binding, expensive.identity, expired.clock)
+            .is_none()
+    );
     let fresh = expired
         .admitted_at(added.binding, added.identity, expired.clock)
         .expect("only the freshly verified segment has a later lease");

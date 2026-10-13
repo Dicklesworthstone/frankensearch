@@ -1809,7 +1809,10 @@ mod tests {
         assert!(matches!(oversized.write_to(&dir), Err(SearchError::Io(_))));
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(
-            IndexSentinel::read_from(&dir).unwrap().unwrap().source_count,
+            IndexSentinel::read_from(&dir)
+                .unwrap()
+                .unwrap()
+                .source_count,
             3
         );
         std::fs::write(&path, vec![b' '; sentinel_io::MAX_SENTINEL_BYTES + 1]).unwrap();

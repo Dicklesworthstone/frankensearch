@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use frankensearch_core::SearchError;
 use frankensearch_fsfs::output_schema::{
-    CompatibilityMode, OutputEnvelope, OutputMeta, decode_envelope_toon,
-    encode_envelope_toon, error_code_for, exit_code_for, output_error_from, validate_envelope,
+    CompatibilityMode, OutputEnvelope, OutputMeta, decode_envelope_toon, encode_envelope_toon,
+    error_code_for, exit_code_for, output_error_from, validate_envelope,
 };
 use frankensearch_fsfs::stream_protocol::{
     StreamEvent, StreamFailureCategory, StreamFrame, StreamRetryDirective, StreamTerminalStatus,
@@ -86,7 +86,10 @@ fn failures(source: &OpaqueSource) -> Vec<(SearchError, &'static str, i32, Strea
             StreamFailureCategory::Model,
         ),
         (
-            SearchError::Io(io::Error::new(io::ErrorKind::PermissionDenied, source.clone())),
+            SearchError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                source.clone(),
+            )),
             "io_error",
             1,
             StreamFailureCategory::Io,
@@ -107,7 +110,10 @@ fn assert_public_text(text: &str) {
     assert!(!text.contains(PRIVATE));
     assert!(!text.contains("[2J"));
     assert!(!text.contains("xxxxxxxxxxxxxxxx"));
-    assert!(text.len() < 4_096, "opaque diagnostics must not grow with source size");
+    assert!(
+        text.len() < 4_096,
+        "opaque diagnostics must not grow with source size"
+    );
 }
 
 #[test]
@@ -158,7 +164,11 @@ fn terminal_streams_keep_failure_and_retry_contracts_without_provider_bodies() {
         };
         assert_eq!(terminal.retry, expected_retry);
         let frame: StreamFrame<()> = StreamFrame::new(
-            "diagnostic-stream", 2, TIMESTAMP, "search", StreamEvent::Terminal(terminal),
+            "diagnostic-stream",
+            2,
+            TIMESTAMP,
+            "search",
+            StreamEvent::Terminal(terminal),
         );
         assert!(validate_stream_frame(&frame).valid);
         let ndjson = encode_stream_frame_ndjson(&frame).unwrap();
@@ -170,13 +180,19 @@ fn terminal_streams_keep_failure_and_retry_contracts_without_provider_bodies() {
         assert_public_text(&toon);
         let decoded: StreamFrame<()> = decode_stream_frame_toon(&toon).unwrap();
         assert_eq!(decoded, frame);
-        assert_eq!(terminal_event_from_error(&error, 0, 0).retry, StreamRetryDirective::None);
-        let exhausted = terminal_event_from_error(&error, 3, 3);
-        assert_eq!(exhausted.retry, if retryable {
-            StreamRetryDirective::RetryExhausted { exhausted_after: 3 }
-        } else {
+        assert_eq!(
+            terminal_event_from_error(&error, 0, 0).retry,
             StreamRetryDirective::None
-        });
+        );
+        let exhausted = terminal_event_from_error(&error, 3, 3);
+        assert_eq!(
+            exhausted.retry,
+            if retryable {
+                StreamRetryDirective::RetryExhausted { exhausted_after: 3 }
+            } else {
+                StreamRetryDirective::None
+            }
+        );
     }
     assert_eq!(source.formatted.load(Ordering::Relaxed), 0);
 }
@@ -291,9 +307,18 @@ fn schema_advice_uses_types_with_a_limit_not_matching_error_text() {
         for _ in 0..wrappers {
             inner = Box::new(Layer(inner));
         }
-        let error = SearchError::SubsystemError { subsystem: "quill", source: inner };
+        let error = SearchError::SubsystemError {
+            subsystem: "quill",
+            source: inner,
+        };
         let output = output_error_from(&error);
-        assert_eq!(output.suggestion.as_ref().is_some_and(|s| s.contains("older fsfs")), wrappers < 64);
+        assert_eq!(
+            output
+                .suggestion
+                .as_ref()
+                .is_some_and(|s| s.contains("older fsfs")),
+            wrappers < 64
+        );
         assert_public_text(&serde_json::to_string(&output).unwrap());
     }
     let wrapped = SearchError::SubsystemError {
@@ -301,7 +326,13 @@ fn schema_advice_uses_types_with_a_limit_not_matching_error_text() {
         source: Box::new(io::Error::other(schema_mismatch())),
     };
     let output = output_error_from(&wrapped);
-    assert!(output.suggestion.as_deref().unwrap().contains("fsfs index <directory>"));
+    assert!(
+        output
+            .suggestion
+            .as_deref()
+            .unwrap()
+            .contains("fsfs index <directory>")
+    );
     assert_public_text(&serde_json::to_string(&output).unwrap());
     let impostor = SearchError::SubsystemError {
         subsystem: "quill",
@@ -318,11 +349,17 @@ fn model_labels_and_model_load_paths_cannot_expand_opaque_diagnostics() {
         format!("{PRIVATE}\nforged"),
         "m".repeat(129),
     ] {
-        let error = SearchError::EmbeddingFailed { model: model.clone(), source: Box::new(source.clone()) };
+        let error = SearchError::EmbeddingFailed {
+            model: model.clone(),
+            source: Box::new(source.clone()),
+        };
         let output = output_error_from(&error);
         assert!(output.message.contains("MODEL_ID"));
         assert_public_text(&serde_json::to_string(&output).unwrap());
-        let error = SearchError::RerankFailed { model, source: Box::new(source.clone()) };
+        let error = SearchError::RerankFailed {
+            model,
+            source: Box::new(source.clone()),
+        };
         assert!(output_error_from(&error).message.contains("MODEL_ID"));
     }
     for path in [
@@ -332,15 +369,27 @@ fn model_labels_and_model_load_paths_cannot_expand_opaque_diagnostics() {
         format!("/{PRIVATE}/\u{202e}model.onnx"),
         format!("/{PRIVATE}/\u{2066}model.onnx"),
     ] {
-        let error = SearchError::ModelLoadFailed { path: path.into(), source: Box::new(source.clone()) };
+        let error = SearchError::ModelLoadFailed {
+            path: path.into(),
+            source: Box::new(source.clone()),
+        };
         let output = output_error_from(&error);
-        assert!(output.suggestion.as_ref().unwrap().contains("<redacted-model-path>"));
+        assert!(
+            output
+                .suggestion
+                .as_ref()
+                .unwrap()
+                .contains("<redacted-model-path>")
+        );
         assert_public_text(&serde_json::to_string(&output).unwrap());
     }
     // Ordinary local model paths remain useful; this boundary does not claim
     // to redact valid caller-supplied paths for export as anonymous telemetry.
     for path in ["/models/fixture/model.onnx".to_owned(), "m".repeat(1_024)] {
-        let error = SearchError::ModelLoadFailed { path: path.clone().into(), source: Box::new(source.clone()) };
+        let error = SearchError::ModelLoadFailed {
+            path: path.clone().into(),
+            source: Box::new(source.clone()),
+        };
         let output = output_error_from(&error);
         assert!(output.suggestion.unwrap().contains(&path));
     }

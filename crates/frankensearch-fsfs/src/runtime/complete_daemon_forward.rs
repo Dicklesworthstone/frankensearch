@@ -1629,7 +1629,7 @@ mod buffered_transport_tests {
                 drop(server);
                 let mut reply = Vec::new();
                 client.read_to_end(&mut reply).unwrap();
-                assert_eq!(reply.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                assert_eq!(reply.split(|&byte| byte == b'\n').count(), 2);
                 let encoded: serde_json::Value = serde_json::from_slice(&reply).unwrap();
                 assert!(encoded.get("event").is_none());
                 assert_eq!(encoded["request_id"], request.request_id);

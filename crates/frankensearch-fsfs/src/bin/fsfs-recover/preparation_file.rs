@@ -9,6 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
+use frankensearch_storage::ContentHasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -19,7 +20,7 @@ const MAX_BYTES: u64 = 8192;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SavedPreparation {
+pub struct SavedPreparation {
     format: String,
     schema_version: u16,
     // The native canonical path spelling is deliberately platform-bound, like
@@ -34,7 +35,9 @@ pub(super) struct SavedPreparation {
 
 fn is_hex(value: &str, length: usize) -> bool {
     value.len() == length
-        && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn is_generation(value: &str) -> bool {
@@ -50,7 +53,8 @@ fn store_path_sha256(canonical: &Path) -> String {
     let mut hash = Sha256::new();
     hash.update(b"fsfs.recovery.preparation.store-path.v1\0");
     hash.update(canonical.as_os_str().as_encoded_bytes());
-    format!("{:x}", hash.finalize())
+    let sha256: [u8; 32] = hash.finalize().into();
+    ContentHasher::to_hex(&sha256)
 }
 
 impl SavedPreparation {
@@ -61,7 +65,9 @@ impl SavedPreparation {
             || !report.producer_admission_checked
             || report.sync_error_kind.is_some()
         {
-            return Err(invalid("only an admitted preparation can be saved; a publication outcome is not a resume receipt"));
+            return Err(invalid(
+                "only an admitted preparation can be saved; a publication outcome is not a resume receipt",
+            ));
         }
         let receipt = Self {
             format: FORMAT.to_owned(),
@@ -69,9 +75,9 @@ impl SavedPreparation {
             store_path_sha256: store_path_sha256(root),
             generation_id: report.generation_id.clone(),
             manifest_sha256: report.manifest_sha256.clone(),
-            expected_selection_sha256: report.expected_selection_sha256.clone().ok_or_else(|| {
-                invalid("a saved preparation requires its original selection guard")
-            })?,
+            expected_selection_sha256: report.expected_selection_sha256.clone().ok_or_else(
+                || invalid("a saved preparation requires its original selection guard"),
+            )?,
             repaired_from: report.repaired_from.clone(),
         };
         receipt.validate()?;
@@ -87,7 +93,9 @@ impl SavedPreparation {
             || !is_hex(&self.expected_selection_sha256, 64)
             || !is_hex(&self.store_path_sha256, 64)
         {
-            return Err(invalid("invalid preparation target, manifest, store binding or selection guard"));
+            return Err(invalid(
+                "invalid preparation target, manifest, store binding or selection guard",
+            ));
         }
         if let Some(origin) = &self.repaired_from
             && (!is_generation(&origin.generation_id) || !is_hex(&origin.manifest_sha256, 64))
@@ -109,14 +117,16 @@ fn decode(reader: impl Read) -> SearchResult<SavedPreparation> {
     let receipt: SavedPreparation = serde_json::from_slice(&bytes).map_err(|error| {
         invalid(format!(
             "invalid preparation receipt ({:?} at line {}, column {})",
-            error.classify(), error.line(), error.column(),
+            error.classify(),
+            error.line(),
+            error.column(),
         ))
     })?;
     receipt.validate()?;
     Ok(receipt)
 }
 
-pub(super) fn read(path: &Path, root: &Path) -> SearchResult<SavedPreparation> {
+pub fn read(path: &Path, root: &Path) -> SearchResult<SavedPreparation> {
     #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags};
@@ -126,13 +136,16 @@ pub(super) fn read(path: &Path, root: &Path) -> SearchResult<SavedPreparation> {
             path,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
             Mode::empty(),
-        ).map_err(io::Error::from)?;
+        )
+        .map_err(io::Error::from)?;
         File::from(descriptor)
     };
     #[cfg(not(unix))]
     let file = {
         if !fs::symlink_metadata(path)?.is_file() {
-            return Err(invalid("preparation receipt must be a regular non-symlink file"));
+            return Err(invalid(
+                "preparation receipt must be a regular non-symlink file",
+            ));
         }
         File::open(path)?
     };
@@ -141,7 +154,9 @@ pub(super) fn read(path: &Path, root: &Path) -> SearchResult<SavedPreparation> {
     }
     let receipt = decode(file)?;
     if receipt.store_path_sha256 != store_path_sha256(&fs::canonicalize(root)?) {
-        return Err(invalid("preparation receipt belongs to a different store; it cannot be relocated or rebased"));
+        return Err(invalid(
+            "preparation receipt belongs to a different store; it cannot be relocated or rebased",
+        ));
     }
     Ok(receipt)
 }
@@ -157,19 +172,26 @@ fn checkpoint(cx: &Cx) -> SearchResult<()> {
 /// prevents selection, but may leave a partial file which decode will reject.
 /// Do not delete, truncate, reuse or overwrite that path on a retry.
 /// Parent directories must already exist and remain trusted during the call.
-pub(super) fn write(cx: &Cx, path: &Path, root: &Path, report: &Report) -> SearchResult<()> {
+pub fn write(cx: &Cx, path: &Path, root: &Path, report: &Report) -> SearchResult<()> {
     checkpoint(cx)?;
     let root = fs::canonicalize(root)?;
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty())
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let parent = fs::canonicalize(parent)?;
     if parent.starts_with(&root) {
-        return Err(invalid("preparation receipts must be saved outside the index store; sealed bundles and store control files cannot be modified"));
+        return Err(invalid(
+            "preparation receipts must be saved outside the index store; sealed bundles and store control files cannot be modified",
+        ));
     }
-    let name = path.file_name().ok_or_else(|| invalid("preparation receipt requires a file name"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("preparation receipt requires a file name"))?;
     let destination = parent.join(name);
     let receipt = SavedPreparation::from_report(&root, report)?;
-    let mut bytes = serde_json::to_vec(&receipt).map_err(|_| invalid("cannot encode preparation receipt"))?;
+    let mut bytes =
+        serde_json::to_vec(&receipt).map_err(|_| invalid("cannot encode preparation receipt"))?;
     bytes.push(b'\n');
     if bytes.len() as u64 > MAX_BYTES {
         return Err(invalid("preparation receipt exceeds the 8192-byte limit"));
@@ -194,8 +216,8 @@ pub(super) fn write(cx: &Cx, path: &Path, root: &Path, report: &Report) -> Searc
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{Options, RecoveryAction};
+    use super::*;
     use std::ffi::OsString;
 
     fn report() -> Report {
@@ -219,8 +241,11 @@ mod tests {
 
     fn arguments(root: &Path, receipt: &Path, action: &str) -> Vec<OsString> {
         vec![
-            "--index-dir".into(), root.as_os_str().to_owned(),
-            "--resume-file".into(), receipt.as_os_str().to_owned(), action.into(),
+            "--index-dir".into(),
+            root.as_os_str().to_owned(),
+            "--resume-file".into(),
+            receipt.as_os_str().to_owned(),
+            action.into(),
         ]
     }
 
@@ -237,19 +262,40 @@ mod tests {
             let loaded = read(&path, &root).unwrap();
             assert_eq!(loaded.generation_id, expected.generation_id);
             assert_eq!(loaded.manifest_sha256, expected.manifest_sha256);
-            assert_eq!(Some(loaded.expected_selection_sha256), expected.expected_selection_sha256);
-            assert_eq!(loaded.repaired_from.unwrap().generation_id, expected.repaired_from.as_ref().unwrap().generation_id);
+            assert_eq!(
+                Some(loaded.expected_selection_sha256),
+                expected.expected_selection_sha256
+            );
+            assert_eq!(
+                loaded.repaired_from.unwrap().generation_id,
+                expected.repaired_from.as_ref().unwrap().generation_id
+            );
             let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            for key in ["query", "preview", "config", "state", "selection_write_performed", "durability_confirmed"] {
-                assert!(value.get(key).is_none(), "{key} must not be persisted as a preparation fact");
+            for key in [
+                "query",
+                "preview",
+                "config",
+                "state",
+                "selection_write_performed",
+                "durability_confirmed",
+            ] {
+                assert!(
+                    value.get(key).is_none(),
+                    "{key} must not be persisted as a preparation fact"
+                );
             }
-            assert!(matches!(write(&cx, &path, &root, &expected), Err(SearchError::Io(error))
-                if error.kind() == io::ErrorKind::AlreadyExists));
+            assert!(
+                matches!(write(&cx, &path, &root, &expected), Err(SearchError::Io(error))
+                if error.kind() == io::ErrorKind::AlreadyExists)
+            );
             assert_eq!(fs::read(&path).unwrap(), bytes);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
             }
         });
     }
@@ -265,9 +311,15 @@ mod tests {
             ("schema_version", serde_json::json!(2)),
             ("generation_id", serde_json::json!("../outside")),
             ("manifest_sha256", serde_json::json!("A".repeat(64))),
-            ("expected_selection_sha256", serde_json::json!("f".repeat(63))),
+            (
+                "expected_selection_sha256",
+                serde_json::json!("f".repeat(63)),
+            ),
             ("store_path_sha256", serde_json::json!("g".repeat(64))),
-            ("schema_version", serde_json::json!("private-receipt-canary")),
+            (
+                "schema_version",
+                serde_json::json!("private-receipt-canary"),
+            ),
             ("unexpected", serde_json::json!(true)),
         ] {
             let mut value_json = serde_json::to_value(&receipt).unwrap();
@@ -291,7 +343,10 @@ mod tests {
         assert!(decode(exact.as_slice()).is_ok());
         exact.push(b' ');
         assert!(decode(exact.as_slice()).is_err());
-        assert!(decode(io::repeat(b' ')).is_err(), "an unbounded reader must stop at the byte ceiling");
+        assert!(
+            decode(io::repeat(b' ')).is_err(),
+            "an unbounded reader must stop at the byte ceiling"
+        );
     }
 
     #[test]
@@ -301,7 +356,11 @@ mod tests {
             let root = directory.path().join("store");
             fs::create_dir(&root).unwrap();
             let path = directory.path().join("preparation.json");
-            for state in [RecoveryState::Inspected, RecoveryState::RestoredDurable, RecoveryState::RestoredDurabilityUncertain] {
+            for state in [
+                RecoveryState::Inspected,
+                RecoveryState::RestoredDurable,
+                RecoveryState::RestoredDurabilityUncertain,
+            ] {
                 let mut facts = report();
                 facts.state = state;
                 assert!(write(&cx, &path, &root, &facts).is_err());
@@ -312,7 +371,10 @@ mod tests {
             assert!(write(&cx, &path, &root, &facts).is_err());
             assert!(!path.exists());
             cx.set_cancel_requested(true);
-            assert!(matches!(write(&cx, &path, &root, &report()), Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                write(&cx, &path, &root, &report()),
+                Err(SearchError::Cancelled { .. })
+            ));
             assert!(!path.exists());
             cx.set_cancel_requested(false);
         });
@@ -357,7 +419,12 @@ mod tests {
             assert!(write(&cx, &alias.join("receipt"), &root, &report()).is_err());
             assert!(!root.join("receipt").exists());
             let fifo = directory.path().join("pipe");
-            rustix::fs::mkfifo(&fifo, rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR).unwrap();
+            rustix::fs::mkfifoat(
+                rustix::fs::CWD,
+                &fifo,
+                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+            )
+            .unwrap();
             assert!(read(&fifo, &root).is_err());
         });
     }
@@ -374,15 +441,24 @@ mod tests {
             assert_eq!(resumed.action, RecoveryAction::Apply);
             assert_eq!(resumed.generation, report().generation_id);
             assert_eq!(resumed.digest, report().manifest_sha256);
-            assert_eq!(resumed.expected_selection_sha256, report().expected_selection_sha256);
+            assert_eq!(
+                resumed.expected_selection_sha256,
+                report().expected_selection_sha256
+            );
             assert!(!resumed.repair_vectors);
-            assert_eq!(resumed.resume_origin.unwrap().generation_id, report().repaired_from.unwrap().generation_id);
-            let confirmation = Options::parse(arguments(&root, &path, "--confirm-durability")).unwrap();
+            assert_eq!(
+                resumed.resume_origin.unwrap().generation_id,
+                report().repaired_from.unwrap().generation_id
+            );
+            let confirmation =
+                Options::parse(arguments(&root, &path, "--confirm-durability")).unwrap();
             assert_eq!(confirmation.action, RecoveryAction::ConfirmDurability);
             assert!(confirmation.expected_selection_sha256.is_none());
             assert_eq!(confirmation.generation, report().generation_id);
             for flags in [
-                vec![], vec!["--prepare"], vec!["--apply", "--repair-vectors"],
+                vec![],
+                vec!["--prepare"],
+                vec!["--apply", "--repair-vectors"],
                 vec!["--apply", "--max-copy-bytes", "1"],
                 vec!["--apply", "--generation", "manual"],
                 vec!["--apply", "--manifest-sha256", "manual"],
@@ -407,9 +483,16 @@ mod tests {
             let store = CompleteGenerationStore::create(&cx, &root).unwrap();
             let publish = || {
                 let build = store.begin(&cx).unwrap();
-                fs::write(build.path().join("payload"), b"store fixture, not an engine").unwrap();
-                let GenerationPublication::Durable(generation) = build.publish(&cx, |_, _| Ok(())).unwrap()
-                else { panic!("fixture must publish durably"); };
+                fs::write(
+                    build.path().join("payload"),
+                    b"store fixture, not an engine",
+                )
+                .unwrap();
+                let GenerationPublication::Durable(generation) =
+                    build.publish(&cx, |_, _| Ok(())).unwrap()
+                else {
+                    panic!("fixture must publish durably");
+                };
                 generation
             };
             let target = publish();
@@ -430,7 +513,9 @@ mod tests {
             let runtime = FsfsRuntime::new(config);
             let options = Options::parse(arguments(&root, &path, "--apply")).unwrap();
             let error = execute(&cx, Some(&runtime), &options).await.unwrap_err();
-            assert!(matches!(error, SearchError::InvalidConfig { ref reason, .. } if reason.contains("cannot rebase")));
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref reason, .. } if reason.contains("cannot rebase"))
+            );
             assert_eq!(store.active(&cx).unwrap(), Some(winner));
         });
     }

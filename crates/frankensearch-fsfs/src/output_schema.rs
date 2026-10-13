@@ -955,8 +955,7 @@ pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
             bounded_public_model_id(model)
         ),
         SearchError::ModelLoadFailed { .. } => {
-            "The selected model failed to load. Verify its artifacts and build support."
-                .to_owned()
+            "The selected model failed to load. Verify its artifacts and build support.".to_owned()
         }
         SearchError::RerankFailed { model, .. } => format!(
             "Reranking inference failed for {}.",

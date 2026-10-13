@@ -32,12 +32,8 @@ impl ReloadInput {
             native.validate_paths(&self.paths)?;
         }
         checkpoint(cx)?;
-        let result = super::super::open_exact(
-            &self.paths,
-            self.config,
-            &self.fast,
-            self.quality.as_ref(),
-        );
+        let result =
+            super::super::open_exact(&self.paths, self.config, &self.fast, self.quality.as_ref());
         checkpoint(cx)?;
         let mut index = result?;
         if let Some(native) = &self.native {
@@ -227,7 +223,9 @@ impl IndexCache {
         let base = std::env::current_dir()?;
         let paths = paths.into_absolute_from(&base)?;
         let state_dir = absolute_from(state_dir, &base);
-        let native = native.map(|policy| policy.into_absolute(&base)).transpose()?;
+        let native = native
+            .map(|policy| policy.into_absolute(&base))
+            .transpose()?;
         let fast = fast_binding.clone();
         let quality = quality_binding.cloned();
         on_pool(cx, pool, move |request| match native {
@@ -264,8 +262,8 @@ mod tests {
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
     use frankensearch_core::{BoundQueryEmbedding, TieredQueryEmbeddings};
-    use frankensearch_index::native_hnsw::{HnswParams, native_hnsw_generation_receipt_path};
     use frankensearch_index::VectorIndex;
+    use frankensearch_index::native_hnsw::{HnswParams, native_hnsw_generation_receipt_path};
     use std::collections::BTreeMap;
     use std::fs;
     use std::future::Future;
@@ -285,9 +283,8 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let pool = BlockingPool::new(0, 2);
         let handle = pool.handle();
-        let result = runtime.block_on(async move {
-            body(Cx::current().expect("runtime context"), handle).await
-        });
+        let result = runtime
+            .block_on(async move { body(Cx::current().expect("runtime context"), handle).await });
         assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
         result
     }
@@ -453,9 +450,7 @@ mod tests {
         } else {
             activated.search_fast(10).unwrap()
         };
-        hits.into_iter()
-            .map(|hit| hit.doc_id.to_string())
-            .collect()
+        hits.into_iter().map(|hit| hit.doc_id.to_string()).collect()
     }
 
     #[test]
@@ -563,6 +558,7 @@ mod tests {
         future.poll(&mut Context::from_waker(Waker::noop()))
     }
 
+    #[allow(clippy::future_not_send)] // std's mpsc::Receiver is not Sync; test-only helper
     async fn rendezvous(cx: &Cx, receiver: &mpsc::Receiver<()>) {
         let started = Instant::now();
         loop {
@@ -592,7 +588,13 @@ mod tests {
                 let before = image(fixture.directory.path());
                 assert!(
                     cache
-                        .reload_admitted_v2_with_pool(&cx, &old, &fast, Some(&quality), pool.clone())
+                        .reload_admitted_v2_with_pool(
+                            &cx,
+                            &old,
+                            &fast,
+                            Some(&quality),
+                            pool.clone()
+                        )
                         .await
                         .unwrap()
                 );

@@ -57,9 +57,13 @@ pub(super) fn record_source_inputs(
             continue;
         }
         let Some(text) = text else { continue };
-        let body = documents.get(id).and_then(Option::as_ref)
+        let body = documents
+            .get(id)
+            .and_then(Option::as_ref)
             .ok_or_else(|| invalid("source input has no final prepared body"))?;
-        let source = body.source.as_ref()
+        let source = body
+            .source
+            .as_ref()
             .ok_or_else(|| invalid("opaque document input cannot certify a source"))?;
         // This input is a filename, not bytes read from the source file. Never
         // mint a content witness from it. project_files invalidates any prior
@@ -74,15 +78,18 @@ pub(super) fn record_source_inputs(
         }
         let canonical_lines = crate::runtime::count_non_empty_lines(&body.embedding);
         retained_search_checkpoint(cx)?;
-        inputs.insert(id.clone(), SourceInput {
-            content_hash_hex: crate::runtime::sha256_digest_hex(digest.finalize()),
-            canonical_lines,
-            revision: body.revision(0),
-            ingestion_class: ingestion_class_label(source.ingestion_class).to_owned(),
-            canonical_bytes: u64::try_from(body.embedding.len())
-                .map_err(|_| invalid("source canonical length overflow"))?,
-            reason_code: body.reason(source.ingestion_class).to_owned(),
-        });
+        inputs.insert(
+            id.clone(),
+            SourceInput {
+                content_hash_hex: crate::runtime::sha256_digest_hex(digest.finalize()),
+                canonical_lines,
+                revision: body.revision(0),
+                ingestion_class: ingestion_class_label(source.ingestion_class).to_owned(),
+                canonical_bytes: u64::try_from(body.embedding.len())
+                    .map_err(|_| invalid("source canonical length overflow"))?,
+                reason_code: body.reason(source.ingestion_class).to_owned(),
+            },
+        );
     }
     retained_search_checkpoint(cx)?;
     Ok(inputs)
@@ -96,7 +103,8 @@ fn extend_source_inputs(
 ) -> SearchResult<()> {
     for (id, input) in inputs {
         retained_search_checkpoint(cx)?;
-        let entry = files.get_mut(id)
+        let entry = files
+            .get_mut(id)
             .filter(|_| changed.contains(id))
             .ok_or_else(|| invalid("source evidence does not name a changed member"))?;
         if entry.revision != input.revision
@@ -104,11 +112,13 @@ fn extend_source_inputs(
             || entry.canonical_bytes != input.canonical_bytes
             || entry.reason_code != input.reason_code
         {
-            return Err(invalid("source evidence disagrees with the completed member"));
+            return Err(invalid(
+                "source evidence disagrees with the completed member",
+            ));
         }
         entry.lexical_indexed = true;
-        entry.semantic_indexed = input.ingestion_class
-            == ingestion_class_label(IngestionClass::FullSemanticLexical);
+        entry.semantic_indexed =
+            input.ingestion_class == ingestion_class_label(IngestionClass::FullSemanticLexical);
         entry.content_hash_hex.clone_from(&input.content_hash_hex);
         entry.canonical_lines = Some(input.canonical_lines);
     }
@@ -200,8 +210,11 @@ fn read_receipt(cx: &Cx, predecessor: &PublishedGeneration) -> SearchResult<Opti
     if receipt.checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
         || !receipt.checkpoint.artifacts_durable
         || receipt.checkpoint.index_root != predecessor.path().display().to_string()
-        || FsfsRuntime::read_checkpoint_manifest_generation(predecessor.path(), &receipt.checkpoint)?
-            .is_none()
+        || FsfsRuntime::read_checkpoint_manifest_generation(
+            predecessor.path(),
+            &receipt.checkpoint,
+        )?
+        .is_none()
     {
         return Err(invalid(
             "reuse evidence does not describe its sealed predecessor",
@@ -304,15 +317,23 @@ pub(super) fn retain_inputs(
     receipt.checkpoint.files = project_files(cx, &receipt.checkpoint.files, &manifests, changed)?;
     // An older executable's receipt cannot certify this execution's newly
     // prepared source bytes. Never relabel the inherited scope to make it fit.
-    if !source_inputs.is_empty() && runtime.source_reuse_scope_matches(
-        cx, &receipt.session, receipt.executable_sha256.as_deref(),
-        &receipt.configuration_sha256, &receipt.checkpoint.target_root,
-    )? {
+    if !source_inputs.is_empty()
+        && runtime.source_reuse_scope_matches(
+            cx,
+            &receipt.session,
+            receipt.executable_sha256.as_deref(),
+            &receipt.configuration_sha256,
+            &receipt.checkpoint.target_root,
+        )?
+    {
         extend_source_inputs(cx, &mut receipt.checkpoint.files, changed, source_inputs)?;
     }
     // An upsert can replace a source previously skipped for its content. Its
     // old skip record is no more transferable than its old embedding witness.
-    receipt.checkpoint.content_skipped.retain(|id, _| !changed.contains(id));
+    receipt
+        .checkpoint
+        .content_skipped
+        .retain(|id, _| !changed.contains(id));
     // Opaque replacements remain unproven. A source-owned batch may instead
     // have re-established all witnesses, including when no old member survives.
     if !receipt.checkpoint.files.values().any(|entry| {
@@ -333,7 +354,8 @@ pub(super) fn retain_inputs(
     receipt.checkpoint.discovered_files = sentinel.discovered_files;
     receipt.checkpoint.skipped_files = sentinel.skipped_files;
     receipt.checkpoint.updated_at_ms = sentinel.generated_at_ms;
-    if FsfsRuntime::read_checkpoint_manifest_generation(destination, &receipt.checkpoint)?.is_none() {
+    if FsfsRuntime::read_checkpoint_manifest_generation(destination, &receipt.checkpoint)?.is_none()
+    {
         // Reuse is optional. A checkpoint shape not admitted by the ordinary
         // resume path must stay cold, not weaken that path or fail an otherwise
         // complete document mutation. No receipt has been created at this point.

@@ -23,7 +23,7 @@ fn abandoned_full_queue_admits_shutdown_without_waiting_for_the_search() {
                 polls.set(polls.get() + 1);
                 Poll::<()>::Pending
             })
-            .await
+            .await;
         }));
         let mut task = Context::from_waker(Waker::noop());
         assert!(driving.as_mut().poll(&mut task).is_pending());

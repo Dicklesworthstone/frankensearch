@@ -410,7 +410,13 @@ fn open_segment(
         SegmentLimits::default(),
         |reader, file| {
             Ok(check_witness(
-                &path, schema_id, manifest, reader, file, book, allow_receipt,
+                &path,
+                schema_id,
+                manifest,
+                reader,
+                file,
+                book,
+                allow_receipt,
             ))
         },
     )

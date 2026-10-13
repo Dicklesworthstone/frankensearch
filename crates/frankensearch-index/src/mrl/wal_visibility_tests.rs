@@ -16,14 +16,9 @@ fn crash_window(
     filler_rows: usize,
 ) -> (TempFixturePath, VectorIndex) {
     let path = TempFixturePath::new("mrl-wal-visibility", "index.fsvi");
-    let mut writer = VectorIndex::create_with_revision(
-        &path,
-        "mrl-visibility-control",
-        "r1",
-        2,
-        quantization,
-    )
-    .expect("create main index");
+    let mut writer =
+        VectorIndex::create_with_revision(&path, "mrl-visibility-control", "r1", 2, quantization)
+            .expect("create main index");
     for _ in 0..stale_rows {
         writer.write_record("updated", &[1.0, 0.0]).unwrap();
     }
@@ -47,11 +42,12 @@ fn crash_window(
     let index = VectorIndex::open_read_only(&path).unwrap();
     assert_eq!(index.wal_record_count(), 1);
     let still_live = (0..index.record_count())
-        .filter(|&row| {
-            index.doc_id_at(row).unwrap() == "updated" && !index.is_deleted(row)
-        })
+        .filter(|&row| index.doc_id_at(row).unwrap() == "updated" && !index.is_deleted(row))
         .count();
-    assert_eq!(still_live, stale_rows, "fixture must expose stale main rows");
+    assert_eq!(
+        still_live, stale_rows,
+        "fixture must expose stale main rows"
+    );
     (path, index)
 }
 
@@ -76,7 +72,9 @@ fn persisted_replacements_cannot_consume_mrl_candidate_or_result_slots() {
         let query = [1.0, 0.0];
         let all = index.search_top_k(&query, 4, None).unwrap();
         assert_eq!(
-            all.iter().map(|hit| hit.doc_id.as_str()).collect::<Vec<_>>(),
+            all.iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
             ["survivor", "updated", "tail"]
         );
         for limit in 1..=3 {
@@ -89,7 +87,11 @@ fn persisted_replacements_cannot_consume_mrl_candidate_or_result_slots() {
                 assert!(stats.zero_signal.is_none());
                 assert_eq!(
                     stats.candidates_rescored,
-                    if candidates == 0 { 3 } else { candidates.min(3) }
+                    if candidates == 0 {
+                        3
+                    } else {
+                        candidates.min(3)
+                    }
                 );
             }
         }
@@ -179,7 +181,9 @@ fn mrl_visibility_repair_does_not_mutate_main_or_wal_across_reopens() {
     for _ in 0..3 {
         let index = VectorIndex::open_read_only(&path).unwrap();
         for limit in 1..=3 {
-            let hits = index.mrl_search(&query, limit, &config(limit), None).unwrap();
+            let hits = index
+                .mrl_search(&query, limit, &config(limit), None)
+                .unwrap();
             assert_eq!(signature(&hits), signature(&expected[..limit]));
         }
         drop(index);

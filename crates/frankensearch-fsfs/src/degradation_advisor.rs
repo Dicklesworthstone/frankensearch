@@ -794,7 +794,10 @@ mod public_advice_tests {
                 model: "test-reranker".to_owned(),
                 source: Box::new(source.clone()),
             },
-            SearchError::Io(io::Error::new(io::ErrorKind::PermissionDenied, source.clone())),
+            SearchError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                source.clone(),
+            )),
             SearchError::SubsystemError {
                 subsystem: PRIVATE,
                 source: Box::new(source.clone()),
@@ -814,7 +817,8 @@ mod public_advice_tests {
         for reject_format in [false, true] {
             let source = probe(reject_format);
             for error in failures(&source) {
-                let advice = advice_for_search_error("public query", Some(Path::new("/index")), &error);
+                let advice =
+                    advice_for_search_error("public query", Some(Path::new("/index")), &error);
                 let expected_kind = if matches!(&error, SearchError::ModelLoadFailed { .. }) {
                     DegradationFailureKind::MissingQualityModel
                 } else {
@@ -823,7 +827,10 @@ mod public_advice_tests {
                 assert_eq!(advice.failure, expected_kind);
                 assert_eq!(advice.reason_code, expected_kind.reason_code());
                 assert!(advice.preserves_initial_results);
-                assert_eq!(advice.original_error, Some(output_error_from(&error).message));
+                assert_eq!(
+                    advice.original_error,
+                    Some(output_error_from(&error).message)
+                );
                 assert_public(&serde_json::to_string(&advice).unwrap());
             }
             assert_eq!(source.formatted.load(Ordering::Relaxed), 0);
@@ -847,9 +854,14 @@ mod public_advice_tests {
                 in_both_sources: true,
             };
             let payload = SearchPayload::new(
-                "public query", SearchOutputPhase::RefinementFailed, 3, vec![hit.clone()],
-            ).with_degradation_advice([advice]);
-            let envelope = OutputEnvelope::success(payload.clone(), OutputMeta::new("search", "json"), TS);
+                "public query",
+                SearchOutputPhase::RefinementFailed,
+                3,
+                vec![hit.clone()],
+            )
+            .with_degradation_advice([advice]);
+            let envelope =
+                OutputEnvelope::success(payload.clone(), OutputMeta::new("search", "json"), TS);
             let json = serde_json::to_string(&envelope).unwrap();
             assert_public(&json);
             let decoded: OutputEnvelope<SearchPayload> = serde_json::from_str(&json).unwrap();
@@ -860,8 +872,14 @@ mod public_advice_tests {
             let decoded: OutputEnvelope<SearchPayload> = decode_envelope_toon(&toon).unwrap();
             assert_eq!(decoded.data.as_ref(), Some(&payload));
             let frame = StreamFrame::new(
-                "degraded-stream", 1, TS, "search",
-                StreamEvent::Result(StreamResultEvent { rank: 1, item: payload }),
+                "degraded-stream",
+                1,
+                TS,
+                "search",
+                StreamEvent::Result(StreamResultEvent {
+                    rank: 1,
+                    item: payload,
+                }),
             );
             let ndjson = encode_stream_frame_ndjson(&frame).unwrap();
             assert_public(&ndjson);
@@ -892,7 +910,10 @@ mod public_advice_tests {
         });
         assert_eq!(advice.failure, DegradationFailureKind::LexicalFallback);
         assert_eq!(advice.replay_command, "trusted caller command");
-        assert_eq!(advice.original_error.as_deref(), Some("Embedding inference failed for test-embedder."));
+        assert_eq!(
+            advice.original_error.as_deref(),
+            Some("Embedding inference failed for test-embedder.")
+        );
         assert_eq!(source.formatted.load(Ordering::Relaxed), 0);
     }
 
@@ -900,14 +921,28 @@ mod public_advice_tests {
     fn shell_words_are_lossless_and_bounded_before_escaping() {
         assert_eq!(quote_shell_word("", 0).as_deref(), Some("''"));
         assert_eq!(quote_shell_word("a'b", 3).as_deref(), Some("'a'\\''b'"));
-        assert_eq!(quote_shell_word("雪 $HOME *", 32).as_deref(), Some("'雪 $HOME *'"));
+        assert_eq!(
+            quote_shell_word("雪 $HOME *", 32).as_deref(),
+            Some("'雪 $HOME *'")
+        );
         assert!(quote_shell_word("é", 1).is_none());
         assert_eq!(quote_shell_word("é", 2).as_deref(), Some("'é'"));
-        for unsafe_text in ["a\nb", "\0", "\t", "\u{001b}[2J", "\u{202e}", "\u{2066}", "\u{061c}"] {
+        for unsafe_text in [
+            "a\nb",
+            "\0",
+            "\t",
+            "\u{001b}[2J",
+            "\u{202e}",
+            "\u{2066}",
+            "\u{061c}",
+        ] {
             assert!(quote_shell_word(unsafe_text, 4096).is_none());
         }
         let worst = "'".repeat(64 * 1024);
-        assert_eq!(quote_shell_word(&worst, 64 * 1024).unwrap().len(), 4 * worst.len() + 2);
+        assert_eq!(
+            quote_shell_word(&worst, 64 * 1024).unwrap().len(),
+            4 * worst.len() + 2
+        );
         assert!(quote_shell_word(&format!("{worst}x"), 64 * 1024).is_none());
     }
 
@@ -916,9 +951,11 @@ mod public_advice_tests {
         // Execute only an inert argv-recording shell function, never fsfs or a
         // suggested mutation. The adversarial inputs also use only printf.
         let mut process = std::process::Command::new("/bin/sh");
-        process.arg("-c").arg(format!(
-            "fsfs() {{ printf '%s\\000' \"$@\"; }}\n{command}"
-        )).env_remove("FSFS_INDEX_DIR").stdin(std::process::Stdio::null());
+        process
+            .arg("-c")
+            .arg(format!("fsfs() {{ printf '%s\\000' \"$@\"; }}\n{command}"))
+            .env_remove("FSFS_INDEX_DIR")
+            .stdin(std::process::Stdio::null());
         if let Some(index_dir) = index_dir {
             process.env("FSFS_INDEX_DIR", index_dir);
         }
@@ -929,7 +966,10 @@ mod public_advice_tests {
     fn argv(output: &std::process::Output) -> Vec<String> {
         assert!(output.status.success());
         assert!(output.stderr.is_empty());
-        output.stdout.strip_suffix(&[0]).expect("terminated argv")
+        output
+            .stdout
+            .strip_suffix(&[0])
+            .expect("terminated argv")
             .split(|byte| *byte == 0)
             .map(|word| String::from_utf8(word.to_vec()).unwrap())
             .collect()
@@ -939,17 +979,29 @@ mod public_advice_tests {
     #[test]
     fn replay_round_trips_actual_posix_arguments_without_command_substitution() {
         let values = [
-            "ordinary words", "owner's index", "$(printf INJECTED >&2)",
-            "; printf INJECTED >&2; #", "`printf INJECTED >&2`", "雪 $HOME * ? [a] \\",
+            "ordinary words",
+            "owner's index",
+            "$(printf INJECTED >&2)",
+            "; printf INJECTED >&2; #",
+            "`printf INJECTED >&2`",
+            "雪 $HOME * ? [a] \\",
         ];
         for path in values {
             for query in values.into_iter().chain(["--apply", ""]) {
                 let command = replay_command_for(query, Some(Path::new(path)));
                 let observed = argv(&shell(&command, None));
-                assert_eq!(observed, [
-                    "search", "--index-dir", path, "--format", "json", "--",
-                    if query.is_empty() { "<query>" } else { query },
-                ]);
+                assert_eq!(
+                    observed,
+                    [
+                        "search",
+                        "--index-dir",
+                        path,
+                        "--format",
+                        "json",
+                        "--",
+                        if query.is_empty() { "<query>" } else { query },
+                    ]
+                );
             }
         }
     }
@@ -967,7 +1019,11 @@ mod public_advice_tests {
                 original_error: None,
                 replay_command: None,
             });
-            for command in advice.next_actions.iter().filter_map(|action| action.command.as_deref()) {
+            for command in advice
+                .next_actions
+                .iter()
+                .filter_map(|action| action.command.as_deref())
+            {
                 let observed = argv(&shell(command, None));
                 if let Some(index) = observed.iter().position(|word| word == "--index-dir") {
                     assert_eq!(observed[index + 1], path);
@@ -988,17 +1044,34 @@ mod public_advice_tests {
         for index in [None, Some("")] {
             let output = shell(&command, index);
             assert!(!output.status.success());
-            assert!(output.stdout.is_empty(), "fsfs must not start without a selected path");
+            assert!(
+                output.stdout.is_empty(),
+                "fsfs must not start without a selected path"
+            );
         }
         let path = "space dir/$(printf INJECTED >&2)";
-        assert_eq!(argv(&shell(&command, Some(path))), [
-            "search", "--index-dir", path, "--format", "json", "--", "two words",
-        ]);
+        assert_eq!(
+            argv(&shell(&command, Some(path))),
+            [
+                "search",
+                "--index-dir",
+                path,
+                "--format",
+                "json",
+                "--",
+                "two words",
+            ]
+        );
     }
 
     #[test]
     fn unrepresentable_inputs_omit_commands_instead_of_retargeting_or_truncating() {
-        for path in ["".to_owned(), "x".repeat(4097), "index\nsecond line".to_owned(), "\u{202e}index".to_owned()] {
+        for path in [
+            String::new(),
+            "x".repeat(4097),
+            "index\nsecond line".to_owned(),
+            "\u{202e}index".to_owned(),
+        ] {
             let advice = DegradationAdvice::from_input(DegradationAdviceInput {
                 failure: DegradationFailureKind::HashControlGeneration,
                 query: "public query",
@@ -1007,7 +1080,12 @@ mod public_advice_tests {
                 replay_command: None,
             });
             assert!(advice.replay_command.is_empty());
-            assert!(advice.next_actions.iter().all(|action| action.command.is_none()));
+            assert!(
+                advice
+                    .next_actions
+                    .iter()
+                    .all(|action| action.command.is_none())
+            );
             assert!(!advice.operator_summary.is_empty());
         }
         for query in ["x".repeat(65537), "query\nsecond line".to_owned()] {

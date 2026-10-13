@@ -18,6 +18,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FileProtector, FileRecoveryOutcome,
 };
+use frankensearch_storage::ContentHasher;
 use sha2::{Digest, Sha256};
 
 use super::super::{Artifact, MAX_ARTIFACTS, MAX_TREE_DEPTH};
@@ -79,7 +80,10 @@ impl CompleteGenerationStore {
     ) -> SearchResult<PreparedGenerationRestore> {
         checkpoint(cx)?;
         if max_copy_bytes == 0 || id.len() != 60 || !hex(manifest_sha256, 64) {
-            return Err(invalid(&self.root, "invalid repair receipt or zero copy budget"));
+            return Err(invalid(
+                &self.root,
+                "invalid repair receipt or zero copy budget",
+            ));
         }
         let pointer = format!("{POINTER_MAGIC}\n{id}\n{manifest_sha256}\n");
         decode_pointer(pointer.as_bytes(), &self.root)?;
@@ -92,10 +96,14 @@ impl CompleteGenerationStore {
         require_directory(&source)?;
         let source_pin = pin_generation(&self.root, id)?;
         let bytes = read_bounded_regular(
-            &source.join(COMPLETE_GENERATION_MANIFEST), MAX_MANIFEST_BYTES,
+            &source.join(COMPLETE_GENERATION_MANIFEST),
+            MAX_MANIFEST_BYTES,
         )?;
         if digest(&bytes) != manifest_sha256 {
-            return Err(invalid(&source, "repair inventory differs from the trusted receipt"));
+            return Err(invalid(
+                &source,
+                "repair inventory differs from the trusted receipt",
+            ));
         }
         let mut manifest: BundleManifest = serde_json::from_slice(&bytes)
             .map_err(|error| invalid(&source, &format!("invalid repair inventory: {error}")))?;
@@ -119,11 +127,22 @@ impl CompleteGenerationStore {
                 fs::create_dir_all(parent)?;
             }
             if let Some((size, sha256)) = observed.get(&artifact.path) {
-                copy_checked(cx, &source.join(&artifact.path), &destination, *size, sha256)?;
+                copy_checked(
+                    cx,
+                    &source.join(&artifact.path),
+                    &destination,
+                    *size,
+                    sha256,
+                )?;
             }
         }
-        let protector = FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())?;
-        for artifact in manifest.files.iter().filter(|file| damaged.contains(&file.path)) {
+        let protector =
+            FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())?;
+        for artifact in manifest
+            .files
+            .iter()
+            .filter(|file| damaged.contains(&file.path))
+        {
             checkpoint(cx)?;
             lease.fence("complete-generation vector repair decode")?;
             recover_vector(cx, &candidate, artifact, &protector)?;
@@ -131,13 +150,19 @@ impl CompleteGenerationStore {
         // A successful RaptorQ decode or CRC is not enough. All files must have
         // exactly the previously published content, including non-vector arms.
         if fresh_inventory(cx, &candidate, max_copy_bytes, false)? != expected_files(&manifest) {
-            return Err(invalid(&candidate, "repaired bundle differs from the original inventory"));
+            return Err(invalid(
+                &candidate,
+                "repaired bundle differs from the original inventory",
+            ));
         }
-        manifest.generation = candidate_id.clone();
+        manifest.generation.clone_from(&candidate_id);
         let encoded = serde_json::to_vec(&manifest)
             .map_err(|error| invalid(&candidate, &error.to_string()))?;
         if u64::try_from(encoded.len()).unwrap_or(u64::MAX) > MAX_MANIFEST_BYTES {
-            return Err(invalid(&candidate, "repaired manifest exceeds the descriptor limit"));
+            return Err(invalid(
+                &candidate,
+                "repaired manifest exceeds the descriptor limit",
+            ));
         }
         write_new_synced(&candidate.join(COMPLETE_GENERATION_MANIFEST), &encoded)?;
         sync_tree(cx, &candidate, 0)?;
@@ -157,9 +182,11 @@ impl CompleteGenerationStore {
 }
 
 fn expected_files(manifest: &BundleManifest) -> FileInventory {
-    manifest.files.iter().map(|file| {
-        (file.path.clone(), (file.bytes, file.sha256.clone()))
-    }).collect()
+    manifest
+        .files
+        .iter()
+        .map(|file| (file.path.clone(), (file.bytes, file.sha256.clone())))
+        .collect()
 }
 
 fn validate_manifest(
@@ -168,31 +195,46 @@ fn validate_manifest(
     id: &str,
     budget: u64,
 ) -> SearchResult<()> {
-    if manifest.schema_version != 1 || manifest.generation != id
-        || manifest.files.is_empty() || manifest.files.len() > MAX_ARTIFACTS
+    if manifest.schema_version != 1
+        || manifest.generation != id
+        || manifest.files.is_empty()
+        || manifest.files.len() > MAX_ARTIFACTS
     {
-        return Err(invalid(root, "invalid repair inventory identity, version or file count"));
+        return Err(invalid(
+            root,
+            "invalid repair inventory identity, version or file count",
+        ));
     }
     let mut previous: Option<&str> = None;
     let mut remaining = budget;
     let mut files = BTreeSet::new();
     for file in &manifest.files {
         let path = Path::new(&file.path);
-        if file.path.is_empty() || file.path.contains(['\\', '\0'])
+        if file.path.is_empty()
+            || file.path.contains(['\\', '\0'])
             || file.path.len() > usize::from(u16::MAX)
-            || file.path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
-            || path.components().any(|part| !matches!(part, Component::Normal(_)))
+            || file
+                .path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
             || path.components().count() > MAX_TREE_DEPTH + 1
             || file.path == COMPLETE_GENERATION_MANIFEST
             || previous.is_some_and(|old| old >= file.path.as_str())
-            || !hex(&file.sha256, 64) || file.bytes > remaining
+            || !hex(&file.sha256, 64)
+            || file.bytes > remaining
         {
             return Err(invalid(root, "noncanonical or oversized repair inventory"));
         }
         // A file cannot also be an ancestor directory of another artifact.
         for parent in path.ancestors().skip(1).filter_map(Path::to_str) {
             if files.contains(parent) {
-                return Err(invalid(root, "repair inventory aliases file and directory roles"));
+                return Err(invalid(
+                    root,
+                    "repair inventory aliases file and directory roles",
+                ));
             }
         }
         remaining -= file.bytes;
@@ -217,23 +259,34 @@ fn damaged_vectors(
             continue;
         }
         if !VECTOR_PATHS.contains(&file.path.as_str()) {
-            return Err(invalid(root, "repair requires intact catalog, lexical, metadata and sidecar files"));
+            return Err(invalid(
+                root,
+                "repair requires intact catalog, lexical, metadata and sidecar files",
+            ));
         }
         let sidecar = format!("{}.fec", file.path);
-        let protected = expected.get(&sidecar).ok_or_else(|| {
-            invalid(root, "damaged vector has no receipted repair sidecar")
-        })?;
+        let protected = expected
+            .get(&sidecar)
+            .ok_or_else(|| invalid(root, "damaged vector has no receipted repair sidecar"))?;
         if observed.get(&sidecar) != Some(protected)
             || file.bytes > MAX_REPAIR_SOURCE_BYTES
-            || observed.get(&file.path).is_some_and(|(size, _)| *size > MAX_REPAIR_SOURCE_BYTES)
+            || observed
+                .get(&file.path)
+                .is_some_and(|(size, _)| *size > MAX_REPAIR_SOURCE_BYTES)
             || protected.0 > MAX_REPAIR_SIDECAR_BYTES
         {
-            return Err(invalid(root, "repair sidecar changed or vector recovery exceeds its payload bound"));
+            return Err(invalid(
+                root,
+                "repair sidecar changed or vector recovery exceeds its payload bound",
+            ));
         }
         damaged.insert(file.path.clone());
     }
     if damaged.is_empty() {
-        return Err(invalid(root, "no vector damage; use ordinary receipt-directed restore without a copy"));
+        return Err(invalid(
+            root,
+            "no vector damage; use ordinary receipt-directed restore without a copy",
+        ));
     }
     Ok(damaged)
 }
@@ -269,7 +322,10 @@ fn fresh_inventory(cx: &Cx, root: &Path, budget: u64, sealed: bool) -> SearchRes
                     return Err(invalid(root, "observed repair input exceeds copy budget"));
                 }
                 remaining -= metadata.len();
-                let relative = path.strip_prefix(root).ok().and_then(Path::to_str)
+                let relative = path
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(Path::to_str)
                     .ok_or_else(|| invalid(root, "repair artifact has no relative UTF-8 path"))?;
                 files.insert(relative.to_owned(), metadata.len());
             } else {
@@ -287,7 +343,7 @@ fn fresh_inventory(cx: &Cx, root: &Path, budget: u64, sealed: bool) -> SearchRes
 }
 
 /// One bounded, no-follow regular-file read shared by verification and copying.
-/// Never consult digest_memo, including when ctime/mtime did not change.
+/// Never consult `digest_memo`, including when ctime/mtime did not change.
 fn transfer_checked(
     cx: &Cx,
     source: &Path,
@@ -304,7 +360,8 @@ fn transfer_checked(
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         checkpoint(cx)?;
-        let read_limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read_limit =
+            usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
         // The extra byte detects growth without consuming unbounded input.
         let limit = if read_limit == 0 { 1 } else { read_limit };
         let count = match input.read(&mut buffer[..limit]) {
@@ -326,14 +383,21 @@ fn transfer_checked(
         return Err(invalid(source, "repair input truncated during reading"));
     }
     checkpoint(cx)?;
-    Ok(format!("{:x}", hasher.finalize()))
+    let sha256: [u8; 32] = hasher.finalize().into();
+    Ok(ContentHasher::to_hex(&sha256))
 }
 
 fn copy_checked(cx: &Cx, source: &Path, target: &Path, size: u64, hash: &str) -> SearchResult<()> {
     checkpoint(cx)?;
-    let mut output = OpenOptions::new().write(true).create_new(true).open(target)?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)?;
     if transfer_checked(cx, source, &mut output, size)? != hash {
-        return Err(invalid(source, "repair input changed between observation and copying"));
+        return Err(invalid(
+            source,
+            "repair input changed between observation and copying",
+        ));
     }
     output.sync_all()?;
     checkpoint(cx)
@@ -342,9 +406,13 @@ fn copy_checked(cx: &Cx, source: &Path, target: &Path, size: u64, hash: &str) ->
 fn new_directory(cx: &Cx, parent: &Path) -> SearchResult<(PathBuf, String)> {
     for _ in 0..64 {
         checkpoint(cx)?;
-        let serial = NEXT_GENERATION.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        let serial = NEXT_GENERATION
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| invalid(parent, "generation serial exhausted"))?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         let id = format!("g-{now:032x}-{:08x}-{serial:016x}", std::process::id());
         let path = parent.join(&id);
         match fs::create_dir(&path) {
@@ -353,17 +421,28 @@ fn new_directory(cx: &Cx, parent: &Path) -> SearchResult<(PathBuf, String)> {
             Err(error) => return Err(error.into()),
         }
     }
-    Err(invalid(parent, "cannot allocate an independent repair generation"))
+    Err(invalid(
+        parent,
+        "cannot allocate an independent repair generation",
+    ))
 }
 
-fn recover_vector(cx: &Cx, root: &Path, artifact: &Artifact, protector: &FileProtector) -> SearchResult<()> {
+fn recover_vector(
+    cx: &Cx,
+    root: &Path,
+    artifact: &Artifact,
+    protector: &FileProtector,
+) -> SearchResult<()> {
     let path = root.join(&artifact.path);
     let sidecar = FileProtector::sidecar_path(&path);
     {
         let bytes = read_bounded_regular(&sidecar, MAX_REPAIR_SIDECAR_BYTES)?;
         let (header, _) = frankensearch_durability::deserialize_repair_trailer(&bytes)?;
         if header.source_len != artifact.bytes {
-            return Err(invalid(&sidecar, "repair sidecar does not describe the receipted vector length"));
+            return Err(invalid(
+                &sidecar,
+                "repair sidecar does not describe the receipted vector length",
+            ));
         }
     }
     checkpoint(cx)?;
@@ -373,7 +452,10 @@ fn recover_vector(cx: &Cx, root: &Path, artifact: &Artifact, protector: &FilePro
         FileRecoveryOutcome::Recovered { bytes, .. } => bytes,
         FileRecoveryOutcome::NotNeeded => {
             // A weak sidecar checksum cannot overrule the trusted SHA-256.
-            return Err(invalid(&path, "sidecar claims intact data that differs from the trusted inventory"));
+            return Err(invalid(
+                &path,
+                "sidecar claims intact data that differs from the trusted inventory",
+            ));
         }
         FileRecoveryOutcome::Unrecoverable { reason, .. } => {
             return Err(SearchError::IndexCorrupted {
@@ -383,13 +465,19 @@ fn recover_vector(cx: &Cx, root: &Path, artifact: &Artifact, protector: &FilePro
         }
     };
     if bytes.len() as u64 != artifact.bytes || digest(&bytes) != artifact.sha256 {
-        return Err(invalid(&path, "reconstructed bytes do not match the original SHA-256 and length"));
+        return Err(invalid(
+            &path,
+            "reconstructed bytes do not match the original SHA-256 and length",
+        ));
     }
     checkpoint(cx)?;
     // The source evidence remains in the ORIGINAL bundle. Only our private
     // unselected damaged copy is replaced; readers can never map this candidate
     // before its full seal is admitted. Failed temporary outputs are retained.
-    let temporary = root.join(format!(".FSFS-REPAIRED-{}", artifact.path.replace('/', "-")));
+    let temporary = root.join(format!(
+        ".FSFS-REPAIRED-{}",
+        artifact.path.replace('/', "-")
+    ));
     write_new_synced(&temporary, &bytes)?;
     checkpoint(cx)?;
     fs::rename(&temporary, &path)?;

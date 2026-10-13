@@ -1801,7 +1801,7 @@ mod tests {
                 drop(server);
                 let mut bytes = Vec::new();
                 client.read_to_end(&mut bytes).unwrap();
-                assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                assert_eq!(bytes.split(|&byte| byte == b'\n').count(), 2);
                 let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                 assert_eq!(value["ok"], !fail);
                 assert_eq!(value["query"], "one reply");

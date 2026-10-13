@@ -13,6 +13,7 @@ use std::sync::atomic::Ordering;
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_storage::ContentHasher;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -439,7 +440,8 @@ fn restore_selection_sha256(
         hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
         hasher.update(bytes);
     }
-    format!("{:x}", hasher.finalize())
+    let sha256: [u8; 32] = hasher.finalize().into();
+    ContentHasher::to_hex(&sha256)
 }
 
 fn selection_evidence(root: &Path) -> SearchResult<Option<Vec<u8>>> {
@@ -523,7 +525,9 @@ mod receipt_durability_tests {
             drop(store);
 
             let reopened = CompleteGenerationStore::open(&cx, directory.path()).unwrap();
-            let resumed = reopened.resume_restore(&cx, &id, &manifest, &receipt).unwrap();
+            let resumed = reopened
+                .resume_restore(&cx, &id, &manifest, &receipt)
+                .unwrap();
             assert_eq!(resumed.expected_selection_sha256(), receipt);
             assert_eq!(resumed.target().id(), id);
             assert_eq!(reopened.active(&cx).unwrap(), Some(incumbent));
@@ -533,13 +537,22 @@ mod receipt_durability_tests {
                 fs::read(directory.path().join(COMPLETE_GENERATION_POINTER)).unwrap(),
                 selected
             );
-            assert_eq!(fs::read_dir(directory.path().join(GENERATIONS)).unwrap().count(), 2);
+            assert_eq!(
+                fs::read_dir(directory.path().join(GENERATIONS))
+                    .unwrap()
+                    .count(),
+                2
+            );
             assert!(matches!(
                 resumed.restore(&cx, |_, _| Ok(())).unwrap(),
                 GenerationPublication::Durable(value) if value.id() == id
             ));
             // An activation that became visible is not blindly replayable.
-            assert!(reopened.resume_restore(&cx, &id, &manifest, &receipt).is_err());
+            assert!(
+                reopened
+                    .resume_restore(&cx, &id, &manifest, &receipt)
+                    .is_err()
+            );
         });
     }
 
@@ -557,8 +570,10 @@ mod receipt_durability_tests {
             let error = store
                 .resume_restore(&cx, target.id(), target.manifest_sha256(), &receipt)
                 .unwrap_err();
-            assert!(matches!(error, SearchError::InvalidConfig { ref reason, .. }
-                if reason.contains("cannot rebase")));
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref reason, .. }
+                if reason.contains("cannot rebase"))
+            );
             assert_eq!(store.active(&cx).unwrap(), Some(winner));
         });
     }
@@ -570,22 +585,34 @@ mod receipt_durability_tests {
             let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
             let first = publish(&store, &cx, b"first");
             let second = publish(&store, &cx, b"second");
-            let receipt = store.prepare_restore(&cx, &first).unwrap().expected_selection_sha256();
-            assert!(store
-                .resume_restore(&cx, second.id(), second.manifest_sha256(), &receipt)
-                .is_err());
-            assert!(store.resume_restore(&cx, first.id(), &"0".repeat(64), &receipt).is_err());
+            let receipt = store
+                .prepare_restore(&cx, &first)
+                .unwrap()
+                .expected_selection_sha256();
+            assert!(
+                store
+                    .resume_restore(&cx, second.id(), second.manifest_sha256(), &receipt)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .resume_restore(&cx, first.id(), &"0".repeat(64), &receipt)
+                    .is_err()
+            );
             let foreign_directory = tempfile::tempdir().unwrap();
             let foreign = CompleteGenerationStore::create(&cx, foreign_directory.path()).unwrap();
             fs::copy(
                 directory.path().join(COMPLETE_GENERATION_POINTER),
                 foreign_directory.path().join(COMPLETE_GENERATION_POINTER),
-            ).unwrap();
+            )
+            .unwrap();
             let error = foreign
                 .resume_restore(&cx, first.id(), first.manifest_sha256(), &receipt)
                 .unwrap_err();
-            assert!(matches!(error, SearchError::InvalidConfig { ref reason, .. }
-                if reason.contains("cannot rebase")));
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref reason, .. }
+                if reason.contains("cannot rebase"))
+            );
             assert!(!foreign_directory.path().join(GENERATIONS).exists());
             assert_eq!(store.active(&cx).unwrap(), Some(second));
         });
@@ -599,18 +626,41 @@ mod receipt_durability_tests {
             let target = publish(&store, &cx, b"target");
             let pointer = directory.path().join(COMPLETE_GENERATION_POINTER);
             fs::rename(&pointer, directory.path().join("saved-pointer")).unwrap();
-            let absent = store.prepare_restore(&cx, &target).unwrap().expected_selection_sha256();
-            assert!(store.resume_restore(&cx, target.id(), target.manifest_sha256(), &absent).is_ok());
+            let absent = store
+                .prepare_restore(&cx, &target)
+                .unwrap()
+                .expected_selection_sha256();
+            assert!(
+                store
+                    .resume_restore(&cx, target.id(), target.manifest_sha256(), &absent)
+                    .is_ok()
+            );
             fs::write(&pointer, b"").unwrap();
-            let empty = store.prepare_restore(&cx, &target).unwrap().expected_selection_sha256();
+            let empty = store
+                .prepare_restore(&cx, &target)
+                .unwrap()
+                .expected_selection_sha256();
             assert_ne!(absent, empty);
-            assert!(store.resume_restore(&cx, target.id(), target.manifest_sha256(), &absent).is_err());
+            assert!(
+                store
+                    .resume_restore(&cx, target.id(), target.manifest_sha256(), &absent)
+                    .is_err()
+            );
             fs::write(&pointer, b"private malformed selection").unwrap();
-            let malformed = store.prepare_restore(&cx, &target).unwrap().expected_selection_sha256();
+            let malformed = store
+                .prepare_restore(&cx, &target)
+                .unwrap()
+                .expected_selection_sha256();
             assert_ne!(empty, malformed);
             assert!(hex(&malformed, 64));
-            assert!(store.resume_restore(&cx, target.id(), target.manifest_sha256(), &empty).is_err());
-            let resumed = store.resume_restore(&cx, target.id(), target.manifest_sha256(), &malformed).unwrap();
+            assert!(
+                store
+                    .resume_restore(&cx, target.id(), target.manifest_sha256(), &empty)
+                    .is_err()
+            );
+            let resumed = store
+                .resume_restore(&cx, target.id(), target.manifest_sha256(), &malformed)
+                .unwrap();
             assert!(matches!(
                 resumed.restore(&cx, |_, _| Ok(())).unwrap(),
                 GenerationPublication::Durable(value) if value == target
@@ -624,23 +674,43 @@ mod receipt_durability_tests {
             let directory = tempfile::tempdir().unwrap();
             let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
             let target = publish(&store, &cx, b"target");
-            let receipt = store.prepare_restore(&cx, &target).unwrap().expected_selection_sha256();
-            let resume = || store.resume_restore(&cx, target.id(), target.manifest_sha256(), &receipt);
+            let receipt = store
+                .prepare_restore(&cx, &target)
+                .unwrap()
+                .expected_selection_sha256();
+            let resume =
+                || store.resume_restore(&cx, target.id(), target.manifest_sha256(), &receipt);
             let build = store.begin(&cx).unwrap();
             assert!(resume().is_err());
             drop(build);
             cx.set_cancel_requested(true);
             assert!(matches!(resume(), Err(SearchError::Cancelled { .. })));
             cx.set_cancel_requested(false);
-            for invalid_hash in ["".to_owned(), "a".repeat(63), "F".repeat(64), "g".repeat(64)] {
-                assert!(store.resume_restore(&cx, target.id(), target.manifest_sha256(), &invalid_hash).is_err());
+            for invalid_hash in [
+                String::new(),
+                "a".repeat(63),
+                "F".repeat(64),
+                "g".repeat(64),
+            ] {
+                assert!(
+                    store
+                        .resume_restore(&cx, target.id(), target.manifest_sha256(), &invalid_hash)
+                        .is_err()
+                );
             }
             let resumed = resume().unwrap();
             let winner = publish(&store, &cx, b"winner");
             assert!(resumed.restore(&cx, |_, _| Ok(())).is_err());
-            let fresh = store.prepare_restore(&cx, &target).unwrap().expected_selection_sha256();
+            let fresh = store
+                .prepare_restore(&cx, &target)
+                .unwrap()
+                .expected_selection_sha256();
             fs::write(target.path().join("payload"), b"damage").unwrap();
-            assert!(store.resume_restore(&cx, target.id(), target.manifest_sha256(), &fresh).is_err());
+            assert!(
+                store
+                    .resume_restore(&cx, target.id(), target.manifest_sha256(), &fresh)
+                    .is_err()
+            );
             assert_eq!(store.active(&cx).unwrap(), Some(winner));
         });
     }
@@ -652,13 +722,22 @@ mod receipt_durability_tests {
             let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
             let target = publish(&store, &cx, b"target");
             let _incumbent = publish(&store, &cx, b"incumbent");
-            let receipt = store.prepare_restore(&cx, &target).unwrap().expected_selection_sha256();
-            let resumed = store.resume_restore(&cx, target.id(), target.manifest_sha256(), &receipt).unwrap();
+            let receipt = store
+                .prepare_restore(&cx, &target)
+                .unwrap()
+                .expected_selection_sha256();
+            let resumed = store
+                .resume_restore(&cx, target.id(), target.manifest_sha256(), &receipt)
+                .unwrap();
             assert!(matches!(
                 resumed.restore_with_sync(&cx, |_, _| Ok(()), |_| Err(io::Error::other("sync failed"))).unwrap(),
                 GenerationPublication::VisibleButDurabilityUncertain { generation, .. } if generation == target
             ));
-            assert!(store.resume_restore(&cx, target.id(), target.manifest_sha256(), &receipt).is_err());
+            assert!(
+                store
+                    .resume_restore(&cx, target.id(), target.manifest_sha256(), &receipt)
+                    .is_err()
+            );
             assert!(matches!(
                 store.confirm_retained_durability(&cx, &target).unwrap(),
                 GenerationPublication::Durable(value) if value == target

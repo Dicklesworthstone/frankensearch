@@ -49,12 +49,16 @@ fn projection_preserves_survivors_but_invalidates_even_identical_replacements() 
             ("added".to_owned(), manifest("added")),
         ]);
         let changed = HashSet::from([
-            "replaced".to_owned(), "deleted".to_owned(), "added".to_owned(),
+            "replaced".to_owned(),
+            "deleted".to_owned(),
+            "added".to_owned(),
         ]);
         let projected = project_files(&cx, &old, &current, &changed).unwrap();
         assert_eq!(projected.len(), 3);
-        assert_eq!(serde_json::to_value(&projected["stable"]).unwrap(),
-            serde_json::to_value(&old["stable"]).unwrap());
+        assert_eq!(
+            serde_json::to_value(&projected["stable"]).unwrap(),
+            serde_json::to_value(&old["stable"]).unwrap()
+        );
         for id in ["replaced", "added"] {
             let row = &projected[id];
             assert!(!row.lexical_indexed);
@@ -66,7 +70,10 @@ fn projection_preserves_survivors_but_invalidates_even_identical_replacements() 
         assert!(!projected.contains_key("deleted"));
         // A subsequent unrelated batch cannot promote an already invalidated row.
         let again = project_files(&cx, &projected, &current, &HashSet::new()).unwrap();
-        assert_eq!(serde_json::to_value(&again).unwrap(), serde_json::to_value(&projected).unwrap());
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&projected).unwrap()
+        );
     });
 }
 
@@ -89,11 +96,25 @@ fn changed_survivor_contract_or_unexplained_addition_cannot_borrow_an_old_hash()
         changed.reason_code.push_str("-other");
         variants.push(changed);
         for changed in variants {
-            assert!(project_files(&cx, &old,
-                &BTreeMap::from([("stable".to_owned(), changed)]), &HashSet::new()).is_err());
+            assert!(
+                project_files(
+                    &cx,
+                    &old,
+                    &BTreeMap::from([("stable".to_owned(), changed)]),
+                    &HashSet::new()
+                )
+                .is_err()
+            );
         }
-        assert!(project_files(&cx, &old,
-            &BTreeMap::from([("new".to_owned(), manifest("new"))]), &HashSet::new()).is_err());
+        assert!(
+            project_files(
+                &cx,
+                &old,
+                &BTreeMap::from([("new".to_owned(), manifest("new"))]),
+                &HashSet::new()
+            )
+            .is_err()
+        );
     });
 }
 
@@ -103,8 +124,12 @@ fn cancelled_projection_does_not_return_partial_evidence() {
         let row = manifest("stable");
         let old = BTreeMap::from([("stable".to_owned(), entry(&row))]);
         cx.set_cancel_requested(true);
-        let result = project_files(&cx, &old,
-            &BTreeMap::from([("stable".to_owned(), row)]), &HashSet::new());
+        let result = project_files(
+            &cx,
+            &old,
+            &BTreeMap::from([("stable".to_owned(), row)]),
+            &HashSet::new(),
+        );
         cx.set_cancel_requested(false);
         assert!(matches!(
             result,
@@ -163,7 +188,12 @@ async fn fixture(cx: &Cx, parent: &Path) -> (FsfsRuntime, std::path::PathBuf, Pu
         ..CliInput::default()
     });
     runtime.lexical_only_indexing = true;
-    let first = durable(runtime.rebuild_retained_generation(cx, &root).await.unwrap());
+    let first = durable(
+        runtime
+            .rebuild_retained_generation(cx, &root)
+            .await
+            .unwrap(),
+    );
     (runtime, root, first)
 }
 
@@ -196,7 +226,9 @@ fn projected_checkpoint_is_admitted(
         }
         checkpoint.content_skipped.remove(*id);
     }
-    let sentinel = FsfsRuntime::read_index_sentinel(generation.path()).unwrap().unwrap();
+    let sentinel = FsfsRuntime::read_index_sentinel(generation.path())
+        .unwrap()
+        .unwrap();
     checkpoint.index_root = generation.path().display().to_string();
     checkpoint.source_hash_hex = sentinel.source_hash_hex;
     checkpoint.discovered_files = sentinel.discovered_files;
@@ -222,34 +254,76 @@ fn real_mixed_batches_preserve_only_admitted_witnesses_without_blocking_mutation
         let directory = tempfile::tempdir().unwrap();
         let (runtime, root, first) = fixture(&cx, directory.path()).await;
         let original = receipt_json(&first);
-        assert!(original["checkpoint"]["content_skipped"].get("new.md").is_some());
+        assert!(
+            original["checkpoint"]["content_skipped"]
+                .get("new.md")
+                .is_some()
+        );
         let original_bytes = fs::read(first.path().join(RECEIPT_FILE)).unwrap();
-        let outcome = runtime.apply_retained_batch(&cx, &root, &first, &[
-            RetainedMutation::Upsert { id: "alpha.md".to_owned(), text: "replacementword body".to_owned() },
-            RetainedMutation::Upsert { id: "new.md".to_owned(), text: "addedword body".to_owned() },
-        ]).await.unwrap();
+        let outcome = runtime
+            .apply_retained_batch(
+                &cx,
+                &root,
+                &first,
+                &[
+                    RetainedMutation::Upsert {
+                        id: "alpha.md".to_owned(),
+                        text: "replacementword body".to_owned(),
+                    },
+                    RetainedMutation::Upsert {
+                        id: "new.md".to_owned(),
+                        text: "addedword body".to_owned(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
         assert_eq!((outcome.upserted, outcome.deleted), (2, 0));
         let second = durable(outcome.publication.unwrap());
-        let admitted = projected_checkpoint_is_admitted(
-            &cx, &original, &second, &["alpha.md", "new.md"],
-        );
+        let admitted =
+            projected_checkpoint_is_admitted(&cx, &original, &second, &["alpha.md", "new.md"]);
         if admitted {
             let inherited = receipt_json(&second);
-            assert!(inherited["checkpoint"]["content_skipped"].get("new.md").is_none());
-            for key in ["version", "session", "executable_sha256", "configuration_sha256"] {
+            assert!(
+                inherited["checkpoint"]["content_skipped"]
+                    .get("new.md")
+                    .is_none()
+            );
+            for key in [
+                "version",
+                "session",
+                "executable_sha256",
+                "configuration_sha256",
+            ] {
                 assert_eq!(inherited[key], original[key]);
             }
-            assert_eq!(inherited["checkpoint"]["files"]["stable.md"],
-                original["checkpoint"]["files"]["stable.md"]);
+            assert_eq!(
+                inherited["checkpoint"]["files"]["stable.md"],
+                original["checkpoint"]["files"]["stable.md"]
+            );
             for id in ["alpha.md", "new.md"] {
-                assert_eq!(inherited["checkpoint"]["files"][id]["lexical_indexed"], false);
-                assert_eq!(inherited["checkpoint"]["files"][id]["semantic_indexed"], false);
+                assert_eq!(
+                    inherited["checkpoint"]["files"][id]["lexical_indexed"],
+                    false
+                );
+                assert_eq!(
+                    inherited["checkpoint"]["files"][id]["semantic_indexed"],
+                    false
+                );
                 assert_eq!(inherited["checkpoint"]["files"][id]["content_hash_hex"], "");
             }
         }
-        let outcome = runtime.apply_retained_batch(&cx, &root, &second, &[
-            RetainedMutation::Delete { id: "new.md".to_owned() },
-        ]).await.unwrap();
+        let outcome = runtime
+            .apply_retained_batch(
+                &cx,
+                &root,
+                &second,
+                &[RetainedMutation::Delete {
+                    id: "new.md".to_owned(),
+                }],
+            )
+            .await
+            .unwrap();
         assert_eq!((outcome.upserted, outcome.deleted), (0, 1));
         let third = durable(outcome.publication.unwrap());
         if admitted {
@@ -257,12 +331,21 @@ fn real_mixed_batches_preserve_only_admitted_witnesses_without_blocking_mutation
         } else {
             assert!(read_receipt(&cx, &third).unwrap().is_none());
         }
-        assert_eq!(fs::read(first.path().join(RECEIPT_FILE)).unwrap(), original_bytes);
+        assert_eq!(
+            fs::read(first.path().join(RECEIPT_FILE)).unwrap(),
+            original_bytes
+        );
         assert_eq!(
             fs::read_to_string(directory.path().join("source/alpha.md")).unwrap(),
             "originalword source"
         );
-        assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(third));
+        assert_eq!(
+            CompleteGenerationStore::open(&cx, &root)
+                .unwrap()
+                .active(&cx)
+                .unwrap(),
+            Some(third)
+        );
     });
 }
 
@@ -281,22 +364,43 @@ fn removal_only_batches_keep_full_survivor_evidence_and_failed_precommit_cannot_
         let directory = tempfile::tempdir().unwrap();
         let (runtime, root, first) = fixture(&cx, directory.path()).await;
         let original = receipt_json(&first);
-        let operations = [RetainedMutation::Delete { id: "alpha.md".to_owned() }];
-        let result = runtime.apply_retained_batch_with_precommit(&cx, &root, &first, &operations, |_| {
-            Err(io::Error::other("injected source precommit failure").into())
-        }).await;
+        let operations = [RetainedMutation::Delete {
+            id: "alpha.md".to_owned(),
+        }];
+        let result = runtime
+            .apply_retained_batch_with_precommit(&cx, &root, &first, &operations, |_| {
+                Err(io::Error::other("injected source precommit failure").into())
+            })
+            .await;
         assert!(result.is_err());
         let store = CompleteGenerationStore::open(&cx, &root).unwrap();
         assert_eq!(store.active(&cx).unwrap(), Some(first.clone()));
-        let outcome = runtime.apply_retained_batch(&cx, &root, &first, &operations).await.unwrap();
+        let outcome = runtime
+            .apply_retained_batch(&cx, &root, &first, &operations)
+            .await
+            .unwrap();
         let next = durable(outcome.publication.unwrap());
         let inherited = receipt_json(&next);
-        assert_eq!(inherited["checkpoint"]["files"].as_object().unwrap().len(), 1);
-        assert_eq!(inherited["checkpoint"]["files"]["stable.md"],
-            original["checkpoint"]["files"]["stable.md"]);
-        assert!(FsfsRuntime::read_checkpoint_manifest_generation(next.path(),
-            &read_receipt(&cx, &next).unwrap().unwrap().checkpoint).unwrap().is_some());
-        assert_eq!(fs::read_to_string(directory.path().join("source/alpha.md")).unwrap(), "originalword source");
+        assert_eq!(
+            inherited["checkpoint"]["files"].as_object().unwrap().len(),
+            1
+        );
+        assert_eq!(
+            inherited["checkpoint"]["files"]["stable.md"],
+            original["checkpoint"]["files"]["stable.md"]
+        );
+        assert!(
+            FsfsRuntime::read_checkpoint_manifest_generation(
+                next.path(),
+                &read_receipt(&cx, &next).unwrap().unwrap().checkpoint
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("source/alpha.md")).unwrap(),
+            "originalword source"
+        );
     });
 }
 
@@ -305,10 +409,24 @@ fn replacing_every_source_does_not_mint_a_new_reuse_receipt() {
     run_test_with_cx(|cx| async move {
         let directory = tempfile::tempdir().unwrap();
         let (runtime, root, first) = fixture(&cx, directory.path()).await;
-        let outcome = runtime.apply_retained_batch(&cx, &root, &first, &[
-            RetainedMutation::Upsert { id: "alpha.md".to_owned(), text: "changed alpha".to_owned() },
-            RetainedMutation::Upsert { id: "stable.md".to_owned(), text: "changed stable".to_owned() },
-        ]).await.unwrap();
+        let outcome = runtime
+            .apply_retained_batch(
+                &cx,
+                &root,
+                &first,
+                &[
+                    RetainedMutation::Upsert {
+                        id: "alpha.md".to_owned(),
+                        text: "changed alpha".to_owned(),
+                    },
+                    RetainedMutation::Upsert {
+                        id: "stable.md".to_owned(),
+                        text: "changed stable".to_owned(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
         let next = durable(outcome.publication.unwrap());
         assert!(!next.path().join(RECEIPT_FILE).exists());
         assert!(first.path().join(RECEIPT_FILE).is_file());

@@ -329,7 +329,7 @@ fn text_batch_supported(cx: &Cx, requests: &[(PathBuf, SourceStamp)]) -> SearchR
 /// later I/O failure or unsupported body discards all earlier results, never
 /// returning a partial batch or retrying a failed read with weaker admission.
 /// UTF-8 decoding consumes each byte buffer, so the total owned source payload
-/// is at most MAX_RAW_BYTES; it is moved, not copied, into the mutation batch.
+/// is at most `MAX_RAW_BYTES`; it is moved, not copied, into the mutation batch.
 fn read_text_sources<F>(
     cx: &Cx,
     requests: &[(PathBuf, SourceStamp)],
@@ -515,7 +515,7 @@ mod metadata_tests {
     use std::future::Future;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::AtomicUsize;
-    use std::task::{Context, Poll, Wake, Waker};
+    use std::task::{Context, Poll, Waker};
     use std::time::Instant;
 
     use asupersync::test_utils::run_test_with_cx;
@@ -660,7 +660,7 @@ mod metadata_tests {
                     Ok(())
                 },
             ).await;
-            assert!(is_source_changed(&result.err().expect("source replacement must refuse publication")));
+            assert!(is_source_changed(&result.expect_err("source replacement must refuse publication")));
             assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(old));
         });
     }
@@ -888,12 +888,6 @@ mod metadata_tests {
         });
     }
 
-    struct NoopWake;
-
-    impl Wake for NoopWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
     #[test]
     fn one_owned_submission_reads_all_text_and_noops_do_not_queue_work() {
         run_test_with_cx(|cx| async move {
@@ -949,8 +943,8 @@ mod metadata_tests {
                 assert!(captured.lock().unwrap().replace(job).is_none());
                 std::future::pending()
             }));
-            let waker = Waker::from(Arc::new(NoopWake));
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(&waker)), Poll::Pending));
+            let waker = Waker::noop();
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(waker)), Poll::Pending));
             drop(future);
             // If dropping the future did not stop the queued job, this would
             // now be an I/O/source-changed error, not the exact local cancel.

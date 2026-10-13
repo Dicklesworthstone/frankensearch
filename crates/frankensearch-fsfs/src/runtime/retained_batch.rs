@@ -138,7 +138,9 @@ pub(super) fn prepare_source_batch(
                 .is_some_and(|source| source.ingestion_class == IngestionClass::MetadataOnly)
             && text != id
         {
-            return Err(invalid("metadata-only source input must be its exact document ID"));
+            return Err(invalid(
+                "metadata-only source input must be its exact document ID",
+            ));
         }
     }
     attach_sources(cx, &mut documents, sources)?;
@@ -214,7 +216,9 @@ fn attach_sources(
             && (body.embedding != DefaultCanonicalizer::default().canonicalize(id)
                 || body.lexical != LEXICAL_CANONICALIZER.canonicalize(id))
         {
-            return Err(invalid("metadata-only source bodies must contain only the document ID"));
+            return Err(invalid(
+                "metadata-only source bodies must contain only the document ID",
+            ));
         }
         bytes = bytes
             .checked_add(body.embedding.len())
@@ -465,7 +469,12 @@ impl FsfsRuntime {
     {
         let documents = prepare(cx, operations)?;
         self.apply_prepared_retained_batch(
-            cx, store_root, expected, documents, BTreeMap::new(), precommit,
+            cx,
+            store_root,
+            expected,
+            documents,
+            BTreeMap::new(),
+            precommit,
         )
         .await
     }
@@ -490,7 +499,12 @@ impl FsfsRuntime {
             source_check,
         } = batch;
         self.apply_prepared_retained_batch(
-            cx, store_root, expected, documents, source_inputs, move |cx| {
+            cx,
+            store_root,
+            expected,
+            documents,
+            source_inputs,
+            move |cx| {
                 // Discovery/backend/selection admission remains first. Additional
                 // source evidence cannot override a failure or acknowledge a source
                 // recreated during that admission, even when discovery hides it.
@@ -850,7 +864,12 @@ impl FsfsRuntime {
         .await?;
         drop(resources);
         inherited_reuse::retain_inputs(
-            cx, self, &predecessor, build.path(), &changed_ids, &source_inputs,
+            cx,
+            self,
+            &predecessor,
+            build.path(),
+            &changed_ids,
+            &source_inputs,
         )?;
         for producer in [fast.as_ref(), quality.as_ref()].into_iter().flatten() {
             producer.recheck()?;

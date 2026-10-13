@@ -78,7 +78,10 @@ impl Drop for PendingSentinel {
     }
 }
 
-fn replace_with(dir: &Path, fill: impl FnOnce(&mut File) -> io::Result<()>) -> io::Result<()> {
+fn replace_with(
+    dir: &Path,
+    write_contents: impl FnOnce(&mut File) -> io::Result<()>,
+) -> io::Result<()> {
     let destination = dir.join(SENTINEL_FILENAME);
     let permissions = match fs::symlink_metadata(&destination) {
         Ok(metadata) if metadata.is_file() => Some(metadata.permissions()),
@@ -100,7 +103,7 @@ fn replace_with(dir: &Path, fill: impl FnOnce(&mut File) -> io::Result<()>) -> i
     if let Some(permissions) = permissions {
         file.set_permissions(permissions)?;
     }
-    fill(file)?;
+    write_contents(file)?;
     file.sync_all()?;
     drop(pending.file.take());
     fs::rename(&path, &destination)?;
@@ -153,7 +156,10 @@ mod tests {
         let mut old = File::open(dir.path().join(SENTINEL_FILENAME)).unwrap();
         let before = inventory(dir.path());
         write(dir.path(), b"complete new generation").unwrap();
-        assert_eq!(read(dir.path()).unwrap().unwrap(), b"complete new generation");
+        assert_eq!(
+            read(dir.path()).unwrap().unwrap(),
+            b"complete new generation"
+        );
         let mut old_bytes = Vec::new();
         old.read_to_end(&mut old_bytes).unwrap();
         assert_eq!(old_bytes, b"old generation");
@@ -303,7 +309,10 @@ mod tests {
         let path = dir.path().join(SENTINEL_FILENAME);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         write(dir.path(), b"new private metadata").unwrap();
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(read(dir.path()).unwrap().unwrap(), b"new private metadata");
     }
 }
