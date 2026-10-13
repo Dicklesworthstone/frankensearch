@@ -187,9 +187,12 @@ impl fmt::Debug for dyn StalenessDetector {
 /// File-based staleness detector using the JSON sentinel file.
 ///
 /// Staleness is detected when:
-/// 1. The sentinel file is missing (first run or deleted)
-/// 2. The document count in the sentinel differs from the current index
-/// 3. A source hash is provided and differs from the sentinel
+/// 1. The sentinel file is missing (first run or deleted) or has an unsupported version
+/// 2. The document count in the sentinel differs from the current index or caller expectation
+/// 3. An expected source hash is provided but the sentinel hash is missing or different
+///
+/// Without an expected hash, freshness is count-based only; it does not prove
+/// that a count-identical source corpus still has the same content.
 #[derive(Debug, Clone)]
 pub struct SentinelFileDetector {
     /// Expected source document count, if known by the caller.
@@ -215,7 +218,11 @@ impl SentinelFileDetector {
         self
     }
 
-    /// Set the expected source hash for change detection.
+    /// Require a matching source hash for freshness.
+    ///
+    /// A sentinel without a source hash is stale when this expectation is set,
+    /// even when its document count matches. Hashes are compared as opaque
+    /// strings; callers own the source fingerprint algorithm and revision.
     #[must_use]
     pub fn with_expected_hash(mut self, hash: impl Into<String>) -> Self {
         self.expected_source_hash = Some(hash.into());
@@ -242,6 +249,14 @@ impl StalenessDetector for SentinelFileDetector {
                 "sentinel file missing (first run or deleted)",
             ));
         };
+
+        // Unknown schemas cannot establish freshness from familiar-looking fields.
+        if sentinel.version != SENTINEL_VERSION {
+            return Ok(IndexStaleness::stale(
+                index.doc_count(),
+                format!("unsupported sentinel version: {}", sentinel.version),
+            ));
+        }
 
         // Check document count mismatch between sentinel and index
         if sentinel.source_count != index.doc_count() {
@@ -270,17 +285,17 @@ impl StalenessDetector for SentinelFileDetector {
             });
         }
 
-        // Check source hash from caller
-        if let Some(ref expected_hash) = self.expected_source_hash
-            && let Some(ref sentinel_hash) = sentinel.source_hash
-            && expected_hash != sentinel_hash
-        {
-            return Ok(IndexStaleness::stale(
-                index.doc_count(),
-                format!(
-                    "source hash mismatch: expected '{expected_hash}', sentinel has '{sentinel_hash}'"
-                ),
-            ));
+        // Absence is not a match. Do not echo opaque caller-controlled hashes
+        // into diagnostics: they need not be short or free of private content.
+        if let Some(expected_hash) = self.expected_source_hash.as_deref() {
+            let reason = match sentinel.source_hash.as_deref() {
+                None => Some("source hash missing from sentinel"),
+                Some(actual) if actual != expected_hash => Some("source hash mismatch"),
+                Some(_) => None,
+            };
+            if let Some(reason) = reason {
+                return Ok(IndexStaleness::stale(index.doc_count(), reason));
+            }
         }
 
         Ok(IndexStaleness::fresh(index.doc_count()))
@@ -1410,18 +1425,18 @@ mod tests {
 
     #[test]
     fn sentinel_detector_expected_hash_but_sentinel_has_no_hash() {
-        // Expected hash set, but sentinel lacks source_hash -> should be fresh
-        // because the hash comparison only triggers when BOTH are present.
+        // A caller's content expectation cannot be proved by document count.
         let dir = temp_dir("stale-hash-missing-sentinel");
         write_fast_index(&dir, &sample_records());
-        // Sentinel with no source_hash (default from sample_sentinel)
         sample_sentinel(3).write_to(&dir).expect("write sentinel");
 
         let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open");
         let detector = SentinelFileDetector::new().with_expected_hash("sha256:anything");
         let report = detector.check(&dir, &index).expect("check");
-        // No sentinel hash to compare against, so not stale from hash mismatch.
-        assert!(!report.is_stale);
+        assert!(report.is_stale);
+        assert_eq!(report.index_record_count, 3);
+        assert_eq!(report.reason.as_deref(), Some("source hash missing from sentinel"));
+        assert!(detector.is_stale(&dir, &index).expect("is_stale"));
     }
 
     #[test]
@@ -1666,5 +1681,106 @@ mod tests {
                 .expect("stale token")
         );
         assert!(Arc::ptr_eq(&installed, &cache.current()));
+    }
+
+    #[test]
+    fn unsupported_sentinel_versions_cannot_establish_freshness() {
+        let dir = temp_dir("stale-sentinel-version");
+        write_fast_index(&dir, &sample_records());
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new().with_expected_hash("same")),
+        )
+        .expect("cache");
+        let retained = cache.current();
+        for version in [0, SENTINEL_VERSION + 1, u32::MAX] {
+            let sentinel = IndexSentinel {
+                version,
+                source_hash: Some("same".to_owned()),
+                ..sample_sentinel(3)
+            };
+            sentinel.write_to(&dir).expect("sentinel");
+            let before = std::fs::read(dir.join(SENTINEL_FILENAME)).expect("bytes");
+            let report = cache.check_staleness().expect("check");
+            assert!(report.is_stale);
+            assert_eq!(report.index_record_count, 3);
+            assert_eq!(
+                report.reason,
+                Some(format!("unsupported sentinel version: {version}"))
+            );
+            assert!(cache.is_stale().expect("is_stale"));
+            assert!(Arc::ptr_eq(&retained, &cache.current()));
+            assert_eq!(std::fs::read(dir.join(SENTINEL_FILENAME)).unwrap(), before);
+        }
+        IndexSentinel {
+            source_hash: Some("same".to_owned()),
+            ..sample_sentinel(3)
+        }
+        .write_to(&dir)
+        .expect("supported sentinel");
+        assert!(!cache.is_stale().expect("supported version is fresh"));
+    }
+
+    #[test]
+    fn cache_requires_the_expected_hash_without_replacing_its_snapshot() {
+        let dir = temp_dir("cache-source-hash-contract");
+        write_fast_index(&dir, &sample_records());
+        let cache = IndexCache::open(
+            &dir,
+            TwoTierConfig::default(),
+            Box::new(SentinelFileDetector::new().with_expected_hash("current")),
+        )
+        .expect("cache");
+        let retained = cache.current();
+        for (hash, stale) in [(None, true), (Some("old"), true), (Some("current"), false)] {
+            IndexSentinel {
+                source_hash: hash.map(str::to_owned),
+                ..sample_sentinel(3)
+            }
+            .write_to(&dir)
+            .expect("sentinel");
+            assert_eq!(cache.check_staleness().unwrap().is_stale, stale);
+            assert_eq!(cache.is_stale().unwrap(), stale);
+            assert!(Arc::ptr_eq(&retained, &cache.current()));
+        }
+    }
+
+    #[test]
+    fn absent_hash_expectation_preserves_count_only_detection() {
+        let dir = temp_dir("cache-no-hash-expectation");
+        write_fast_index(&dir, &sample_records());
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("index");
+        let detector = SentinelFileDetector::new();
+        for hash in [None, Some("opaque-source-fingerprint")] {
+            IndexSentinel {
+                source_hash: hash.map(str::to_owned),
+                ..sample_sentinel(3)
+            }
+            .write_to(&dir)
+            .expect("sentinel");
+            assert!(!detector.is_stale(&dir, &index).expect("count-only check"));
+        }
+    }
+
+    #[test]
+    fn hash_mismatch_diagnostics_are_bounded_and_do_not_echo_private_inputs() {
+        let dir = temp_dir("cache-hash-diagnostic");
+        write_fast_index(&dir, &sample_records());
+        IndexSentinel {
+            source_hash: Some("private-sentinel-canary".repeat(4096)),
+            ..sample_sentinel(3)
+        }
+        .write_to(&dir)
+        .expect("sentinel");
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("index");
+        let detector = SentinelFileDetector::new()
+            .with_expected_hash("private-caller-canary".repeat(4096));
+        let report = detector.check(&dir, &index).expect("check");
+        assert!(report.is_stale);
+        assert_eq!(report.reason.as_deref(), Some("source hash mismatch"));
+        let json = serde_json::to_string(&report).expect("report");
+        assert!(json.len() < 256);
+        assert!(!json.contains("private-"));
     }
 }
