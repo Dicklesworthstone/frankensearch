@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -25,7 +26,7 @@ use super::super::super::{
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FsfsRuntime, PeerOutcome, SearchExecutionFlags,
     complete_cli_error, control, encode_response, pressure_timestamp_ms,
-    retained_search_checkpoint, run_request, write_response,
+    retained_search_checkpoint, run_request, streaming, write_response,
 };
 use crate::adapters::format_emitter::meta_for_format;
 use crate::output_schema::{
@@ -555,6 +556,28 @@ pub(super) async fn serve(
         ))
         .await;
     }
+    serve_buffered(cx, peer, bytes, timeout, |request| async move {
+        Box::pin(execute(cx, runtime, session, &request, cache)).await
+    })
+    .await
+}
+
+/// The ordinary buffered transport, with one caller-owned execution future.
+/// Use the same connection driver as progressive delivery but never expose a
+/// writer to the executor: no stream frame or probe can enter the buffered
+/// response. Peer loss releases the execution borrow before the next client;
+/// its own delivery budget still owns deadlines and caller cancellation.
+async fn serve_buffered<F, Fut>(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    bytes: &[u8],
+    timeout: Duration,
+    execute: F,
+) -> SearchResult<PeerOutcome>
+where
+    F: FnOnce(ForwardedSearch) -> Fut,
+    Fut: Future<Output = SearchResult<SearchPayload>>,
+{
     let request = decode_request(bytes);
     let request_id = request
         .as_ref()
@@ -564,10 +587,13 @@ pub(super) async fn serve(
         .map_or_else(|_| String::new(), |value| value.search.query.clone());
     let result = match request {
         Ok(request) => {
+            let connection = streaming::PhaseWriter::new(peer)?;
             run_request(
                 cx,
                 request.search.policy.delivery_budget(),
-                Box::pin(execute(cx, runtime, session, &request, cache)),
+                // Keep even synchronous closure setup behind the first peer
+                // check. Constructing a request after disconnect starts no work.
+                streaming::drive(cx, &connection, async move { execute(request).await }),
             )
             .await
         }
@@ -1479,6 +1505,197 @@ mod generation_tests {
                     .unwrap()
                     .is_some()
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod buffered_transport_tests {
+    use super::*;
+    use asupersync::test_utils::run_test_with_cx;
+    use std::io::{ErrorKind, Read};
+    use std::net::Shutdown;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::task::{Context, Poll, Waker};
+
+    struct Released(Arc<AtomicBool>);
+
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn request() -> ForwardedSearch {
+        ForwardedSearch {
+            fsfs_complete_cli: VERSION,
+            request_id: "buffered-transport-test".to_owned(),
+            search: SearchRequest {
+                query: "transport query".to_owned(),
+                limit: 3,
+                filter: Some("ext:rs".to_owned()),
+                explain: false,
+                store_root: PathBuf::from("/transport-fixture"),
+                configuration: serde_json::Value::Null,
+                policy: SearchPolicy::of(&FsfsConfig::default()),
+            },
+        }
+    }
+
+    fn payload(query: String) -> SearchPayload {
+        SearchPayload::new(query, crate::output_schema::SearchOutputPhase::Initial, 0, Vec::new())
+    }
+
+    #[test]
+    fn closed_buffered_peer_starts_no_executor_or_response_work() {
+        run_test_with_cx(|cx| async move {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let bytes = serde_json::to_vec(&request()).unwrap();
+            let calls = AtomicUsize::new(0);
+            drop(client);
+            let result = serve_buffered(&cx, &mut server, &bytes, Duration::from_secs(1), |request| {
+                // This is outside the returned future: even closure setup must
+                // be behind peer admission, not just model polling.
+                calls.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(payload(request.search.query)) }
+            }).await;
+            assert!(matches!(result, Err(SearchError::Io(error))
+                if error.kind() == ErrorKind::BrokenPipe));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            retained_search_checkpoint(&cx).unwrap();
+        });
+    }
+
+    #[test]
+    fn buffered_disconnect_drops_pending_execution_before_any_new_model_wakeup() {
+        run_test_with_cx(|cx| async move {
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client.set_nonblocking(true).unwrap();
+            let bytes = serde_json::to_vec(&request()).unwrap();
+            let released = Arc::new(AtomicBool::new(false));
+            let owned = Released(Arc::clone(&released));
+            let mut future = Box::pin(serve_buffered(
+                &cx, &mut server, &bytes, Duration::from_secs(1), |_| async move {
+                    let _owned = owned;
+                    std::future::pending().await
+                },
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut task).is_pending());
+            // No Started frame, ready probe, progress record or partial reply.
+            assert_eq!(client.read(&mut [0; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+            drop(client);
+            assert!(matches!(future.as_mut().poll(&mut task),
+                Poll::Ready(Err(SearchError::Io(error))) if error.kind() == ErrorKind::BrokenPipe));
+            assert!(released.load(Ordering::SeqCst));
+            drop(future);
+            retained_search_checkpoint(&cx).unwrap();
+
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            let request = request();
+            let expected = payload(request.search.query.clone());
+            let bytes = serde_json::to_vec(&request).unwrap();
+            assert_eq!(serve_buffered(
+                &cx, &mut server, &bytes, Duration::from_secs(1), |request| async move {
+                    Ok(payload(request.search.query))
+                },
+            ).await.unwrap(), PeerOutcome::Search);
+            drop(server);
+            let mut reply = Vec::new();
+            client.read_to_end(&mut reply).unwrap();
+            assert_eq!(decode_reply(&reply, &request).unwrap(), expected);
+        });
+    }
+
+    #[test]
+    fn buffered_half_closed_client_gets_one_unchanged_correlated_reply() {
+        run_test_with_cx(|cx| async move {
+            for fail in [false, true] {
+                let (mut client, mut server) = UnixStream::pair().unwrap();
+                client.shutdown(Shutdown::Write).unwrap();
+                let request = request();
+                let bytes = serde_json::to_vec(&request).unwrap();
+                let expected = payload(request.search.query.clone());
+                serve_buffered(&cx, &mut server, &bytes, Duration::from_secs(1), |request| async move {
+                    assert_eq!(request.search.filter.as_deref(), Some("ext:rs"));
+                    assert_eq!(request.search.limit, 3);
+                    if fail {
+                        Err(complete_cli_error("fixture", "original executor refusal"))
+                    } else {
+                        Ok(payload(request.search.query))
+                    }
+                }).await.unwrap();
+                drop(server);
+                let mut reply = Vec::new();
+                client.read_to_end(&mut reply).unwrap();
+                assert_eq!(reply.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                let encoded: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+                assert!(encoded.get("event").is_none());
+                assert_eq!(encoded["request_id"], request.request_id);
+                assert_eq!(encoded["query"], request.search.query);
+                if fail {
+                    let error = decode_reply(&reply, &request).unwrap_err();
+                    let original = FsfsRuntime::forwarded_search_error(&error).unwrap();
+                    assert_eq!(original.field.as_deref(), Some("complete_generation.fixture"));
+                    assert!(original.message.contains("original executor refusal"));
+                } else {
+                    assert_eq!(decode_reply(&reply, &request).unwrap(), expected);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn buffered_future_drop_releases_work_without_cancelling_the_daemon() {
+        run_test_with_cx(|cx| async move {
+            for polled in [false, true] {
+                let (mut client, mut server) = UnixStream::pair().unwrap();
+                client.set_nonblocking(true).unwrap();
+                let bytes = serde_json::to_vec(&request()).unwrap();
+                let calls = AtomicUsize::new(0);
+                let released = Arc::new(AtomicBool::new(false));
+                let owned = Released(Arc::clone(&released));
+                let mut future = Box::pin(serve_buffered(
+                    &cx, &mut server, &bytes, Duration::from_secs(1), |_| async {
+                        let _owned = owned;
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::pending().await
+                    },
+                ));
+                if polled {
+                    assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                }
+                drop(future);
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(polled));
+                assert!(released.load(Ordering::SeqCst));
+                assert_eq!(client.read(&mut [0; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+                retained_search_checkpoint(&cx).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn buffered_cancellation_cannot_become_a_success_or_error_envelope() {
+        run_test_with_cx(|cx| async move {
+            for fail in [false, true] {
+                let (mut client, mut server) = UnixStream::pair().unwrap();
+                client.set_nonblocking(true).unwrap();
+                let bytes = serde_json::to_vec(&request()).unwrap();
+                let result = serve_buffered(
+                    &cx, &mut server, &bytes, Duration::from_secs(1), |request| async {
+                        cx.set_cancel_requested(true);
+                        if fail {
+                            Err(complete_cli_error("fixture", "original refusal"))
+                        } else {
+                            Ok(payload(request.search.query))
+                        }
+                    },
+                ).await;
+                cx.set_cancel_requested(false);
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                assert_eq!(client.read(&mut [0; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+            }
         });
     }
 }
