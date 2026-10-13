@@ -17,7 +17,7 @@ use super::{
     DirtyWindow, SourceObservation, SourceRoot, SourceStamp, observation_io, source_changed,
 };
 use crate::config::{DegradationOverrideMode, IngestionClass};
-use crate::file_classification::{DetectedType, IngestAction};
+use crate::file_classification::{DetectedType, FileClassificationDecision, IngestAction};
 use crate::runtime::retained_batch::{
     RetainedMutation, SourceAttributes, SourceBatch, prepare_source_batch,
 };
@@ -227,6 +227,90 @@ fn read_source(cx: &Cx, path: &Path, expected: &SourceStamp) -> SearchResult<(Ve
     Ok((bytes, modified_ms))
 }
 
+struct ReadText {
+    text: String,
+    modified_ms: u64,
+    classification: FileClassificationDecision,
+}
+
+/// One caller-owned blocking-pool job for the complete bounded text delta.
+/// Per-file awaits can each pay a current-thread runtime wake delay (bd-0wxjd).
+/// Metadata-only files and removals are deliberately absent from these requests.
+/// Empty text inventories submit no work, and cancellation dominates no-op and
+/// unsupported plans. The job only reads; abandoning it cannot publish anything.
+async fn read_text_batch(
+    cx: &Cx,
+    requests: Vec<(PathBuf, SourceStamp)>,
+) -> SearchResult<Option<BTreeMap<PathBuf, ReadText>>> {
+    retained_search_checkpoint(cx)?;
+    if !text_batch_supported(cx, &requests)? {
+        return Ok(None);
+    }
+    if requests.is_empty() {
+        return Ok(Some(BTreeMap::new()));
+    }
+    let task_cx = cx.clone();
+    let result = asupersync::runtime::spawn_blocking(move || {
+        read_text_sources(&task_cx, &requests)
+    })
+    .await;
+    retained_search_checkpoint(cx)?;
+    result
+}
+
+/// Check the WHOLE request before any file is opened, not only as it is read.
+/// This repeats the planner's byte/count admission at the owned-work boundary.
+fn text_batch_supported(cx: &Cx, requests: &[(PathBuf, SourceStamp)]) -> SearchResult<bool> {
+    retained_search_checkpoint(cx)?;
+    if requests.len() > MAX_CHANGED_PATHS {
+        return Ok(false);
+    }
+    let mut remaining = MAX_RAW_BYTES;
+    let mut seen = BTreeSet::new();
+    for (path, stamp) in requests {
+        retained_search_checkpoint(cx)?;
+        if stamp.bytes > MAX_SOURCE_BYTES || stamp.bytes > remaining || !seen.insert(path) {
+            return Ok(false);
+        }
+        remaining -= stamp.bytes;
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(true)
+}
+
+/// Preserve every scalar descriptor/path stamp and classification check. A
+/// later I/O failure or unsupported body discards all earlier results, never
+/// returning a partial batch or retrying a failed read with weaker admission.
+/// UTF-8 decoding consumes each byte buffer, so the total owned source payload
+/// is at most MAX_RAW_BYTES; it is moved, not copied, into the mutation batch.
+fn read_text_sources(
+    cx: &Cx,
+    requests: &[(PathBuf, SourceStamp)],
+) -> SearchResult<Option<BTreeMap<PathBuf, ReadText>>> {
+    retained_search_checkpoint(cx)?;
+    let mut results = BTreeMap::new();
+    for (path, stamp) in requests {
+        retained_search_checkpoint(cx)?;
+        let (bytes, modified_ms) = read_source(cx, path, stamp)?;
+        let classification = classify_file_for_ingest(path, &bytes);
+        retained_search_checkpoint(cx)?;
+        if classification.detected_type != DetectedType::Text
+            || classification.ingest_action != IngestAction::Index
+        {
+            return Ok(None);
+        }
+        let text = String::from_utf8(bytes);
+        retained_search_checkpoint(cx)?;
+        let Ok(text) = text else { return Ok(None) };
+        results.insert(
+            path.clone(),
+            ReadText { text, modified_ms, classification },
+        );
+    }
+    retained_search_checkpoint(cx)?;
+    Ok(Some(results))
+}
+
 pub(super) async fn prepare(
     cx: &Cx,
     runtime: &FsfsRuntime,
@@ -259,6 +343,7 @@ pub(super) async fn prepare(
         return Ok(None);
     }
     let mut raw_bytes = 0_u64;
+    let mut text_requests = Vec::new();
     for path in &paths {
         retained_search_checkpoint(cx)?;
         if source_id(&source.path, path).is_none() {
@@ -279,12 +364,17 @@ pub(super) async fn prepare(
             if raw_bytes > MAX_RAW_BYTES {
                 return Ok(None);
             }
+            text_requests.push((path.clone(), stamp.clone()));
         } else if !physically_absent(cx, path)? {
             // An ignore-policy change or a replacement with an unindexed type
             // requires normal reconciliation, not a claimed physical deletion.
             return Ok(None);
         }
     }
+    source.check()?;
+    let Some(mut text_reads) = read_text_batch(cx, text_requests).await? else {
+        return Ok(None);
+    };
     source.check()?;
     let mut operations = Vec::with_capacity(paths.len());
     let mut attributes = BTreeMap::new();
@@ -311,25 +401,8 @@ pub(super) async fn prepare(
             metadata_sources.push((path.clone(), stamp.clone()));
             (id.clone(), modified_ms, None)
         } else {
-            let task_cx = cx.clone();
-            let task_path = path.clone();
-            let stamp = stamp.clone();
-            let read = asupersync::runtime::spawn_blocking(move || {
-                read_source(&task_cx, &task_path, &stamp)
-            })
-            .await;
-            retained_search_checkpoint(cx)?;
-            let (bytes, modified_ms) = read?;
-            let classification = classify_file_for_ingest(&path, &bytes);
-            if classification.detected_type != DetectedType::Text
-                || classification.ingest_action != IngestAction::Index
-            {
-                return Ok(None);
-            }
-            let Ok(text) = String::from_utf8(bytes) else {
-                return Ok(None);
-            };
-            (text, modified_ms, Some(classification))
+            let read = text_reads.remove(&path).ok_or_else(source_changed)?;
+            (read.text, read.modified_ms, Some(read.classification))
         };
         if runtime.lexical_only_indexing && class == IngestionClass::FullSemanticLexical {
             class = IngestionClass::LexicalOnly;
@@ -356,6 +429,9 @@ pub(super) async fn prepare(
             },
         );
         operations.push(RetainedMutation::Upsert { id, text });
+    }
+    if !text_reads.is_empty() {
+        return Err(source_changed());
     }
     source.check()?;
     let Some(batch) = prepare_source_batch(cx, &operations, &attributes)? else {
@@ -573,6 +649,179 @@ mod metadata_tests {
             assert_eq!(pinned.generation(), &old);
             assert_eq!(metadata_reader.generation(), &second);
             assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 4);
+        });
+    }
+
+    fn request(path: &Path) -> (PathBuf, SourceStamp) {
+        (
+            path.to_path_buf(),
+            SourceStamp::from_metadata(&fs::symlink_metadata(path).unwrap()),
+        )
+    }
+
+    #[test]
+    fn text_batch_preserves_full_bodies_timestamps_and_exact_path_identity() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let first = directory.path().join("alpha.md");
+            let second = directory.path().join("βeta.md");
+            fs::write(&first, "first body with repeated words\nfirst body").unwrap();
+            fs::write(&second, "second body with unicode λ\n").unwrap();
+            // Reverse order prevents an accidental positional/source-ID join
+            // from looking correct just because the map sorts the same way.
+            let requests = vec![request(&second), request(&first)];
+            let results = read_text_batch(&cx, requests).await.unwrap().unwrap();
+            assert_eq!(results.len(), 2);
+            for path in [&first, &second] {
+                let result = &results[path];
+                assert_eq!(result.text, fs::read_to_string(path).unwrap());
+                assert_eq!(
+                    result.modified_ms,
+                    system_time_to_ms(fs::metadata(path).unwrap().modified().unwrap())
+                );
+                assert_eq!(result.classification.detected_type, DetectedType::Text);
+                assert_eq!(result.classification.ingest_action, IngestAction::Index);
+            }
+        });
+    }
+
+    #[test]
+    fn text_batch_limits_refuse_before_io_and_accept_the_exact_boundaries() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let seed = directory.path().join("seed.md");
+            fs::write(&seed, "seed text").unwrap();
+            let (_, mut stamp) = request(&seed);
+            stamp.bytes = MAX_SOURCE_BYTES;
+            // The paths do not exist: a late bounds check would report an I/O
+            // error instead of the unsupported-plan result asserted below.
+            let first = (directory.path().join("missing-one.md"), stamp.clone());
+            let second = (directory.path().join("missing-two.md"), stamp.clone());
+            assert!(text_batch_supported(&cx, &[first.clone(), second.clone()]).unwrap());
+            let mut one_byte = stamp.clone();
+            one_byte.bytes = 1;
+            let over_total = vec![first.clone(), second, (seed.clone(), one_byte.clone())];
+            assert!(read_text_batch(&cx, over_total).await.unwrap().is_none());
+            stamp.bytes = MAX_SOURCE_BYTES + 1;
+            assert!(read_text_batch(&cx, vec![(first.0.clone(), stamp)]).await.unwrap().is_none());
+            assert!(read_text_batch(&cx, vec![first.clone(), first]).await.unwrap().is_none());
+            let mut maximum = (0..MAX_CHANGED_PATHS)
+                .map(|number| (directory.path().join(format!("missing-{number}.md")), one_byte.clone()))
+                .collect::<Vec<_>>();
+            assert!(text_batch_supported(&cx, &maximum).unwrap());
+            maximum.push((seed, one_byte));
+            assert!(read_text_batch(&cx, maximum).await.unwrap().is_none());
+            assert!(read_text_batch(&cx, Vec::new()).await.unwrap().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn text_batch_never_returns_partial_success_after_a_later_read_fails() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let first = directory.path().join("first.md");
+            let second = directory.path().join("second.md");
+            fs::write(&first, "first valid text").unwrap();
+            fs::write(&second, "second valid text").unwrap();
+            let stale = request(&second);
+            fs::rename(&second, directory.path().join("preserved-second.md")).unwrap();
+            fs::write(&second, "second valid text").unwrap();
+            let result = read_text_batch(&cx, vec![request(&first), stale]).await;
+            assert!(is_source_changed(&result.err().expect("replacement must refuse the whole batch")));
+
+            // Unsupported content returns no partial text map and stops before
+            // the missing third file. The normal indexer owns this case.
+            for bytes in [b"\0binary\0payload".as_slice(), b"\xff\xfe\xff".as_slice()] {
+                fs::write(&second, bytes).unwrap();
+                let mut missing = request(&first);
+                missing.0 = directory.path().join("not-read-after-refusal.md");
+                assert!(read_text_batch(&cx, vec![request(&first), request(&second), missing])
+                    .await.unwrap().is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn cancelled_text_batches_do_not_become_empty_or_unsupported_success() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("body.md");
+            fs::write(&path, "valid source text").unwrap();
+            for requests in [Vec::new(), vec![request(&path)]] {
+                cx.set_cancel_requested(true);
+                let result = read_text_batch(&cx, requests).await;
+                cx.set_cancel_requested(false);
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            }
+        });
+    }
+
+    #[test]
+    fn complete_watcher_publishes_mixed_batched_text_and_stat_only_sources() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let mut watcher = session(&runtime, &cx, &root);
+            let old = require_durable_publication(
+                watcher.advance(&cx, Instant::now()).await.unwrap().unwrap(),
+            ).unwrap();
+            let mut query_runtime = runtime.clone();
+            query_runtime.config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            let mut pinned = query_runtime.open_retained_search(&cx, &root).await.unwrap();
+            fs::write(source.join("alpha.md"), "batchedreplacement alpha text").unwrap();
+            fs::write(source.join("second.md"), "batchedreplacement second text").unwrap();
+            fs::write(source.join("inventory.pdf"), [0xff, 0x00, 0xfe]).unwrap();
+            grow_metadata_source(&source.join("inventory.pdf"));
+            let next = change(&mut watcher, &cx, &source.join("alpha.md")).await;
+            assert_eq!(FsfsRuntime::read_index_sentinel(next.path()).unwrap().unwrap().command, "retained-batch");
+            let before = FsfsRuntime::read_matching_manifest_generation(old.path()).unwrap().unwrap();
+            let after = FsfsRuntime::read_matching_manifest_generation(next.path()).unwrap().unwrap();
+            assert_eq!(serde_json::to_value(&before["stable.md"]).unwrap(),
+                serde_json::to_value(&after["stable.md"]).unwrap());
+            assert_eq!(after["inventory.pdf"].ingestion_class, "metadata_only");
+            let mut reader = query_runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(reader.search(&cx, "batchedreplacement", 10).await.unwrap().last().unwrap().hits.len(), 2);
+            assert_eq!(reader.search(&cx, "inventory", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            assert!(reader.search(&cx, "privatebody", 10).await.unwrap().last().unwrap().hits.is_empty());
+            assert_eq!(pinned.search(&cx, "privatebody", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            assert_eq!(pinned.generation(), &old);
+        });
+    }
+
+    #[test]
+    fn failed_batched_preparation_leaves_selection_intact_and_retry_keeps_every_change() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source_path, root) = fixture(directory.path());
+            let mut watcher = session(&runtime, &cx, &root);
+            let old = require_durable_publication(
+                watcher.advance(&cx, Instant::now()).await.unwrap().unwrap(),
+            ).unwrap();
+            let source = SourceRoot::open(source_path.clone()).unwrap();
+            let before = source.observe(&cx, &runtime.config.discovery).unwrap();
+            fs::write(source_path.join("alpha.md"), "retrycohort alpha changed").unwrap();
+            let second = source_path.join("second.md");
+            fs::write(&second, "retrycohort second changed").unwrap();
+            let stale = source.observe(&cx, &runtime.config.discovery).unwrap();
+            fs::rename(&second, directory.path().join("preserved-second.md")).unwrap();
+            fs::write(&second, "retrycohort second changed").unwrap();
+            let result = prepare(&cx, &runtime, &source, &before, &stale, None).await;
+            assert!(is_source_changed(&result.err().expect("later changed source must refuse preparation")));
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_eq!(store.active(&cx).unwrap().as_ref(), Some(&old));
+            assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 1);
+            let current = source.observe(&cx, &runtime.config.discovery).unwrap();
+            let batch = prepare(&cx, &runtime, &source, &before, &current, None).await.unwrap().unwrap();
+            let outcome = runtime.apply_retained_source_batch_with_precommit(
+                &cx, &root, &old, batch, |_| Ok(()),
+            ).await.unwrap();
+            assert_eq!((outcome.upserted, outcome.deleted), (2, 0));
+            let next = require_durable_publication(outcome.publication.unwrap()).unwrap();
+            assert_eq!(store.active(&cx).unwrap().as_ref(), Some(&next));
+            let mut query_runtime = runtime.clone();
+            query_runtime.config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            let mut reader = query_runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(reader.search(&cx, "retrycohort", 10).await.unwrap().last().unwrap().hits.len(), 2);
         });
     }
 }
