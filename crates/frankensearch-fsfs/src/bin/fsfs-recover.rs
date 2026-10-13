@@ -41,8 +41,11 @@ No directory scan, source rebuild, model download or automatic fallback is perfo
   --config FILE       Use the normal fsfs configuration loader and model selection
   --query TEXT        Preview a query against the target before any restoration
   --limit N           Preview results per phase (1..=100; default 10)
+  --prepare           Admit a target and export a resume guard WITHOUT changing selection
   --apply             Explicitly restore the admitted target; default is read-only inspection
-  --repair-vectors    With --apply, reconstruct damaged vectors in a NEW copied generation
+  --expected-selection-sha256 HASH
+                      With --apply, resume a previously prepared target under its saved guard
+  --repair-vectors    With --prepare or --apply, repair vectors in a NEW copied generation
   --max-copy-bytes N  Repair payload copy limit (positive integer; default 1073741824)
   --confirm-durability Confirm the exact selected target without models or republication
   --format FORMAT     json (default), jsonl, or table
@@ -56,11 +59,24 @@ Repair requires intact receipted FEC, catalog, lexical and metadata artifacts (U
 Each damaged vector is limited to 128 MiB and its sidecar to 256 MiB; copy limits are not RSS limits.
 Failed partial copies remain unselected. Repaired results report a NEW receipt plus repaired_from.
 --max-copy-bytes requires --repair-vectors; inspection never creates a repair copy.
---confirm-durability cannot be combined with --apply, --config, --query, or --limit.
-It also cannot be combined with repair options; confirmation performs no reconstruction.
+--prepare, --apply and --confirm-durability are mutually exclusive.
+Preparation exports generation_id, manifest_sha256 and expected_selection_sha256 together.
+To resume, use that target receipt and --apply --expected-selection-sha256 HASH, WITHOUT repair.
+Keep all three fields in trusted storage; the guard is not a signature or a retention pin.
+A removed target or changed selection is refused, not rebuilt or automatically rebased.
+Any requested preview must succeed before a prepare report is emitted or selection changes.
+--confirm-durability cannot be combined with configuration, preview, repair or resume options.
 Durability confirmation is not model admission or a drained watcher queue.
 This operates on cooperative complete stores, not the fixed-authority antirollback layout.
 ";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryAction {
+    Inspect,
+    Prepare,
+    Apply,
+    ConfirmDurability,
+}
 
 #[derive(Clone, Debug)]
 struct Options {
@@ -70,10 +86,10 @@ struct Options {
     config: Option<PathBuf>,
     query: Option<String>,
     limit: usize,
-    apply: bool,
+    action: RecoveryAction,
     repair_vectors: bool,
     max_copy_bytes: u64,
-    confirm_durability: bool,
+    expected_selection_sha256: Option<String>,
     format: OutputFormat,
 }
 
@@ -99,10 +115,10 @@ impl Options {
         let mut config = None;
         let mut query = None;
         let mut limit = 10;
-        let mut apply = false;
+        let mut action = RecoveryAction::Inspect;
         let mut repair_vectors = false;
         let mut max_copy_bytes = DEFAULT_REPAIR_COPY_BYTES;
-        let mut confirm_durability = false;
+        let mut expected_selection_sha256 = None;
         let mut format = OutputFormat::Json;
         let mut seen = HashSet::new();
         let mut args = args.into_iter();
@@ -116,7 +132,9 @@ impl Options {
                     | "--config"
                     | "--query"
                     | "--limit"
+                    | "--prepare"
                     | "--apply"
+                    | "--expected-selection-sha256"
                     | "--repair-vectors"
                     | "--max-copy-bytes"
                     | "--confirm-durability"
@@ -127,12 +145,17 @@ impl Options {
             if !seen.insert(flag.clone()) {
                 return Err(invalid(format!("duplicate {flag} is not allowed")));
             }
-            if flag == "--apply" {
-                apply = true;
-                continue;
-            }
-            if flag == "--confirm-durability" {
-                confirm_durability = true;
+            let selected_action = match flag.as_str() {
+                "--prepare" => Some(RecoveryAction::Prepare),
+                "--apply" => Some(RecoveryAction::Apply),
+                "--confirm-durability" => Some(RecoveryAction::ConfirmDurability),
+                _ => None,
+            };
+            if let Some(selected) = selected_action {
+                if action != RecoveryAction::Inspect {
+                    return Err(invalid("--prepare, --apply and --confirm-durability are mutually exclusive"));
+                }
+                action = selected;
                 continue;
             }
             if flag == "--repair-vectors" {
@@ -150,6 +173,7 @@ impl Options {
                 "--config" => config = Some(PathBuf::from(value)),
                 "--generation" => generation = Some(text(value)?),
                 "--manifest-sha256" => digest = Some(text(value)?),
+                "--expected-selection-sha256" => expected_selection_sha256 = Some(text(value)?),
                 "--query" => query = Some(text(value)?),
                 "--max-copy-bytes" => {
                     let value = text(value)?;
@@ -188,10 +212,10 @@ impl Options {
             config,
             query,
             limit,
-            apply,
+            action,
             repair_vectors,
             max_copy_bytes,
-            confirm_durability,
+            expected_selection_sha256,
             format,
         }
         .validate(seen.contains("--limit"), seen.contains("--max-copy-bytes"))
@@ -225,8 +249,10 @@ impl Options {
         if explicit_limit && self.query.is_none() {
             return Err(invalid("--limit requires --query"));
         }
-        if self.repair_vectors && !self.apply {
-            return Err(invalid("--repair-vectors requires --apply; inspection cannot allocate a repair copy"));
+        if self.repair_vectors
+            && !matches!(self.action, RecoveryAction::Prepare | RecoveryAction::Apply)
+        {
+            return Err(invalid("--repair-vectors requires --prepare or --apply; inspection cannot allocate a repair copy"));
         }
         if explicit_copy_limit && !self.repair_vectors {
             return Err(invalid("--max-copy-bytes requires --repair-vectors"));
@@ -238,12 +264,22 @@ impl Options {
         if self.repair_vectors {
             return Err(invalid("vector repair requires Unix directory durability support"));
         }
-        if self.confirm_durability
-            && (self.apply || self.config.is_some() || self.query.is_some() || explicit_limit
+        if let Some(expected) = &self.expected_selection_sha256 {
+            if self.action != RecoveryAction::Apply || self.repair_vectors {
+                return Err(invalid("--expected-selection-sha256 requires --apply without --repair-vectors"));
+            }
+            if expected.len() != 64
+                || !expected.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(invalid("--expected-selection-sha256 must be the saved 64-character lowercase hexadecimal guard"));
+            }
+        }
+        if self.action == RecoveryAction::ConfirmDurability
+            && (self.config.is_some() || self.query.is_some() || explicit_limit
                 || self.repair_vectors || explicit_copy_limit)
         {
             return Err(invalid(
-                "--confirm-durability cannot be combined with --apply, --config, --query, or --limit",
+                "--confirm-durability cannot be combined with configuration, preview, repair or resume options",
             ));
         }
         self.digest.make_ascii_lowercase();
@@ -255,6 +291,7 @@ impl Options {
 #[serde(rename_all = "snake_case")]
 enum RecoveryState {
     Inspected,
+    Prepared,
     RestoredDurable,
     RestoredDurabilityUncertain,
     DurabilityConfirmed,
@@ -280,6 +317,9 @@ struct Report {
     // its original trusted receipt separate, including uncertain publication.
     #[serde(skip_serializing_if = "Option::is_none")]
     repaired_from: Option<RepairSource>,
+    // Only a successful prepare exports a resume guard, never a publication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_selection_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_error_kind: Option<String>,
     preview: Vec<SearchPayload>,
@@ -296,9 +336,16 @@ impl Report {
             durability_confirmed: false,
             producer_admission_checked: true,
             repaired_from: None,
+            expected_selection_sha256: None,
             sync_error_kind: None,
             preview: Vec::new(),
         }
+    }
+
+    fn prepared(mut self, expected_selection_sha256: String) -> Self {
+        self.state = RecoveryState::Prepared;
+        self.expected_selection_sha256 = Some(expected_selection_sha256);
+        self
     }
 
     fn completed(mut self, publication: GenerationPublication, restored: bool) -> Self {
@@ -306,6 +353,9 @@ impl Report {
         // outcome even if a later output write or cancellation fails.
         self.selection_write_performed = restored;
         self.producer_admission_checked = restored;
+        // A visible outcome must point to durability confirmation, not expose
+        // a guard that encourages replaying the original preparation.
+        self.expected_selection_sha256 = None;
         match publication {
             GenerationPublication::Durable(_) => {
                 self.state = if restored {
@@ -445,7 +495,7 @@ async fn execute(
     runtime: Option<&FsfsRuntime>,
     options: &Options,
 ) -> SearchResult<Report> {
-    if options.confirm_durability {
+    if options.action == RecoveryAction::ConfirmDurability {
         let store = CompleteGenerationStore::open(cx, &options.root)?;
         let expected = store.open_retained(cx, &options.generation, &options.digest)?;
         let report = Report::inspected(&expected);
@@ -455,8 +505,14 @@ async fn execute(
         return Ok(report.completed(publication, false));
     }
     let runtime = runtime.ok_or_else(|| invalid("recovery runtime was not initialized"))?;
-    if options.apply {
-        let mut plan = if options.repair_vectors {
+    if matches!(options.action, RecoveryAction::Prepare | RecoveryAction::Apply) {
+        let mut plan = if let Some(expected) = &options.expected_selection_sha256 {
+            runtime
+                .resume_retained_recovery(
+                    cx, &options.root, &options.generation, &options.digest, expected,
+                )
+                .await?
+        } else if options.repair_vectors {
             #[cfg(unix)]
             {
                 runtime.prepare_retained_vector_repair(
@@ -480,6 +536,11 @@ async fn execute(
         if let Some(query) = &options.query {
             report.preview = plan.search(cx, query, options.limit).await?;
             validate_preview(&report.preview)?;
+        }
+        if options.action == RecoveryAction::Prepare {
+            // Use the original plan's guard AFTER preview. Do not recapture
+            // CURRENT here or export an unsuccessful preview as resumable.
+            return Ok(report.prepared(plan.expected_selection_sha256(cx)?));
         }
         let (publication, _reader) = plan.restore(cx)?;
         Ok(report.completed(publication, true))
@@ -535,7 +596,7 @@ fn configured_runtime(options: &Options) -> SearchResult<FsfsRuntime> {
 fn run(options: Options) -> SearchResult<Report> {
     // Pure durability confirmation must work when model/configuration state is
     // unavailable. It never claims the selected generation is semantic-ready.
-    let runtime = if options.confirm_durability {
+    let runtime = if options.action == RecoveryAction::ConfirmDurability {
         None
     } else {
         Some(configured_runtime(&options)?)
@@ -591,6 +652,10 @@ fn render(response: &Response, format: OutputFormat) -> SearchResult<Vec<u8>> {
                 "Reconstructed from: {}\nOriginal manifest SHA-256: {}",
                 original.generation_id, original.manifest_sha256,
             )?;
+        }
+        if let Some(expected) = &report.expected_selection_sha256 {
+            writeln!(output, "Expected selection SHA-256: {expected}")?;
+            writeln!(output, "Resume with --apply --expected-selection-sha256 and this target receipt; do not repeat repair.")?;
         }
         writeln!(
             output,
@@ -691,12 +756,12 @@ mod tests {
     #[test]
     fn inspection_is_default_and_apply_is_explicit() {
         let options = Options::parse(args()).unwrap();
-        assert!(!options.apply);
+        assert_eq!(options.action, RecoveryAction::Inspect);
         assert_eq!(options.limit, 10);
         assert_eq!(options.format, OutputFormat::Json);
         let mut input = args();
         input.push("--apply".into());
-        assert!(Options::parse(input).unwrap().apply);
+        assert_eq!(Options::parse(input).unwrap().action, RecoveryAction::Apply);
     }
 
     #[test]
@@ -738,7 +803,7 @@ mod tests {
         let mut input = args();
         input.extend(["--query", "--apply"].map(OsString::from));
         let options = Options::parse(input).unwrap();
-        assert!(!options.apply);
+        assert_eq!(options.action, RecoveryAction::Inspect);
         assert_eq!(options.query.as_deref(), Some("--apply"));
         for limit in ["0", "101", "all", "-1", "18446744073709551616"] {
             let mut input = args();
@@ -784,7 +849,8 @@ mod tests {
         let mut input = args();
         input.extend(["--query", "--repair-vectors"].map(OsString::from));
         let parsed = Options::parse(input).unwrap();
-        assert!(!parsed.repair_vectors && !parsed.apply);
+        assert!(!parsed.repair_vectors);
+        assert_eq!(parsed.action, RecoveryAction::Inspect);
         assert_eq!(parsed.query.as_deref(), Some("--repair-vectors"));
     }
 
@@ -798,7 +864,8 @@ mod tests {
                 "--query", "sharedtoken", "--limit", "3",
             ].map(OsString::from));
             let options = Options::parse(input).unwrap();
-            assert!(options.apply && options.repair_vectors && !options.confirm_durability);
+            assert_eq!(options.action, RecoveryAction::Apply);
+            assert!(options.repair_vectors);
             assert_eq!(options.max_copy_bytes, budget.parse::<u64>().unwrap());
             assert_eq!(options.query.as_deref(), Some("sharedtoken"));
             assert_eq!(options.limit, 3);
@@ -848,8 +915,7 @@ mod tests {
         let mut input = args();
         input.push("--confirm-durability".into());
         let parsed = Options::parse(input.clone()).unwrap();
-        assert!(parsed.confirm_durability);
-        assert!(!parsed.apply);
+        assert_eq!(parsed.action, RecoveryAction::ConfirmDurability);
         for suffix in [
             vec!["--apply"],
             vec!["--config", "configuration.toml"],
@@ -863,7 +929,7 @@ mod tests {
         }
         let mut query = args();
         query.extend(["--query", "--confirm-durability"].map(OsString::from));
-        assert!(!Options::parse(query).unwrap().confirm_durability);
+        assert_eq!(Options::parse(query).unwrap().action, RecoveryAction::Inspect);
     }
 
     fn report(state: RecoveryState) -> Report {
@@ -885,6 +951,7 @@ mod tests {
                 RecoveryState::DurabilityConfirmed | RecoveryState::DurabilityStillUncertain
             ),
             repaired_from: None,
+            expected_selection_sha256: None,
             sync_error_kind: None,
             preview: Vec::new(),
         }
@@ -977,6 +1044,168 @@ mod tests {
             let successor = publish();
             assert!(execute(&cx, None, &options).await.is_err());
             assert_eq!(store.active(&cx).unwrap(), Some(successor));
+        });
+    }
+
+    #[test]
+    fn prepare_apply_and_confirm_are_mutually_exclusive_actions() {
+        for first in ["--prepare", "--apply", "--confirm-durability"] {
+            for second in ["--prepare", "--apply", "--confirm-durability"] {
+                let mut input = args();
+                input.extend([first, second].map(OsString::from));
+                assert!(Options::parse(input).is_err(), "{first} {second}");
+            }
+        }
+        let mut input = args();
+        input.push("--prepare".into());
+        let prepared = Options::parse(input).unwrap();
+        assert_eq!(prepared.action, RecoveryAction::Prepare);
+        assert!(!prepared.repair_vectors);
+        #[cfg(unix)]
+        {
+            let mut input = args();
+            input.extend(["--prepare", "--repair-vectors", "--max-copy-bytes", "1234"].map(OsString::from));
+            let repair = Options::parse(input).unwrap();
+            assert_eq!(repair.action, RecoveryAction::Prepare);
+            assert!(repair.repair_vectors);
+            assert_eq!(repair.max_copy_bytes, 1234);
+        }
+        let mut input = args();
+        input.extend(["--query", "--prepare"].map(OsString::from));
+        let query = Options::parse(input).unwrap();
+        assert_eq!(query.action, RecoveryAction::Inspect);
+        assert_eq!(query.query.as_deref(), Some("--prepare"));
+    }
+
+    #[test]
+    fn saved_guard_requires_apply_without_new_preparation_or_repair() {
+        let guard = "b".repeat(64);
+        let mut input = args();
+        input.extend(["--apply", "--expected-selection-sha256", &guard].map(OsString::from));
+        let resumed = Options::parse(input).unwrap();
+        assert_eq!(resumed.action, RecoveryAction::Apply);
+        assert_eq!(resumed.expected_selection_sha256.as_deref(), Some(guard.as_str()));
+        assert!(!resumed.repair_vectors);
+        for flags in [
+            vec![],
+            vec!["--prepare"],
+            vec!["--confirm-durability"],
+            vec!["--apply", "--repair-vectors"],
+            vec!["--apply", "--max-copy-bytes", "1"],
+            vec!["--apply", "--expected-selection-sha256", &guard],
+        ] {
+            let mut input = args();
+            input.extend(flags.into_iter().map(OsString::from));
+            input.extend(["--expected-selection-sha256", &guard].map(OsString::from));
+            assert!(Options::parse(input).is_err());
+        }
+        for guard in ["".to_owned(), "a".repeat(63), "a".repeat(65), "F".repeat(64), "g".repeat(64), format!("{} ", "a".repeat(64))] {
+            let mut input = args();
+            input.extend(["--apply", "--expected-selection-sha256", &guard].map(OsString::from));
+            assert!(Options::parse(input).is_err());
+        }
+        let mut input = args();
+        input.extend(["--query", "--expected-selection-sha256"].map(OsString::from));
+        let query = Options::parse(input).unwrap();
+        assert_eq!(query.action, RecoveryAction::Inspect);
+        assert!(query.expected_selection_sha256.is_none());
+    }
+
+    #[test]
+    fn prepared_report_carries_guard_and_repair_provenance_without_activation() {
+        let guard = "c".repeat(64);
+        let mut facts = report(RecoveryState::Inspected).prepared(guard.clone());
+        facts.generation_id = "copied-target".to_owned();
+        facts.repaired_from = Some(RepairSource {
+            generation_id: "damaged-original".to_owned(),
+            manifest_sha256: "a".repeat(64),
+        });
+        let (response, code) = Response::from_report(facts, OutputFormat::Json);
+        assert_eq!(code, 0);
+        let value: serde_json::Value = serde_json::from_slice(&encode(&response).unwrap()).unwrap();
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["data"]["state"], "prepared");
+        assert_eq!(value["data"]["generation_id"], "copied-target");
+        assert_eq!(value["data"]["expected_selection_sha256"], guard);
+        assert_eq!(value["data"]["repaired_from"]["generation_id"], "damaged-original");
+        assert_eq!(value["data"]["selection_write_performed"], false);
+        assert_eq!(value["data"]["durability_confirmed"], false);
+        assert_eq!(value["data"]["producer_admission_checked"], true);
+        let table = String::from_utf8(render(&response, OutputFormat::Table).unwrap()).unwrap();
+        assert!(table.contains("Expected selection SHA-256:"));
+        assert!(table.contains("do not repeat repair"));
+        let (inspection, _) = Response::from_report(report(RecoveryState::Inspected), OutputFormat::Json);
+        let value: serde_json::Value = serde_json::from_slice(&encode(&inspection).unwrap()).unwrap();
+        assert!(value["data"].get("expected_selection_sha256").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_reports_discard_resume_guards_for_both_durability_outcomes() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let build = store.begin(&cx).unwrap();
+            std::fs::write(build.path().join("payload"), b"report fixture").unwrap();
+            let GenerationPublication::Durable(target) = build.publish(&cx, |_, _| Ok(())).unwrap()
+            else {
+                panic!("fixture must publish durably"); // ubs:ignore — test assertion.
+            };
+            for publication in [
+                GenerationPublication::Durable(target.clone()),
+                GenerationPublication::VisibleButDurabilityUncertain {
+                    generation: target.clone(),
+                    source: io::Error::other("injected report fixture"),
+                },
+            ] {
+                let facts = Report::inspected(&target)
+                    .prepared("b".repeat(64))
+                    .completed(publication, true);
+                assert!(facts.expected_selection_sha256.is_none());
+                let (response, code) = Response::from_report(facts, OutputFormat::Json);
+                let value: serde_json::Value = serde_json::from_slice(&encode(&response).unwrap()).unwrap();
+                let facts = if code == 0 { &value["data"] } else { &value["recovery"] };
+                assert!(facts.get("expected_selection_sha256").is_none());
+                assert_eq!(facts["selection_write_performed"], true);
+                assert_eq!(facts["durability_confirmed"], code == 0);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resumed_cli_execution_checks_saved_selection_before_engine_admission() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, directory.path()).unwrap();
+            let publish = || {
+                let build = store.begin(&cx).unwrap();
+                std::fs::write(build.path().join("payload"), b"not a search engine").unwrap();
+                let GenerationPublication::Durable(target) = build.publish(&cx, |_, _| Ok(())).unwrap()
+                else {
+                    panic!("fixture must publish durably"); // ubs:ignore — test assertion.
+                };
+                target
+            };
+            let target = publish();
+            let guard = store.prepare_restore(&cx, &target).unwrap().expected_selection_sha256();
+            let winner = publish();
+            let mut input = args();
+            input[1] = directory.path().as_os_str().to_owned();
+            input[3] = target.id().into();
+            input[5] = target.manifest_sha256().into();
+            input.extend(["--apply", "--expected-selection-sha256", &guard].map(OsString::from));
+            let options = Options::parse(input).unwrap();
+            let mut config = frankensearch_fsfs::FsfsConfig::default();
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            config.indexing.offline = true;
+            let runtime = FsfsRuntime::new(config);
+            let error = execute(&cx, Some(&runtime), &options).await.unwrap_err();
+            // Ignoring the guard and using ordinary prepare would reach this
+            // fixture's invalid engine instead of the original-selection gate.
+            assert!(matches!(error, SearchError::InvalidConfig { ref reason, .. }
+                if reason.contains("cannot rebase")));
+            assert_eq!(store.active(&cx).unwrap(), Some(winner));
         });
     }
 }
