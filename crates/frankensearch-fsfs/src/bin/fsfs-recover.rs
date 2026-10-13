@@ -5,6 +5,9 @@
 #![recursion_limit = "512"]
 #![deny(unsafe_code)]
 
+#[path = "fsfs-recover/preparation_file.rs"]
+mod preparation_file;
+
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::{self, Write};
@@ -27,13 +30,15 @@ use frankensearch_fsfs::{
     default_user_config_file_path, exit_code_for, init_subscriber, load_from_layered_sources,
     load_from_sources, meta_for_format, output_error_from,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 const MAX_QUERY_BYTES: usize = 64 * 1024;
 const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_REPAIR_COPY_BYTES: u64 = 1024 * 1024 * 1024;
 const HELP: &str =
     "fsfs-recover --index-dir STORE --generation ID --manifest-sha256 SHA256 [OPTIONS]
+fsfs-recover --index-dir STORE --resume-file FILE --apply [OPTIONS]
+fsfs-recover --index-dir STORE --resume-file FILE --confirm-durability
 
 Inspect an explicitly receipted complete generation, even if FSFS-CURRENT is damaged.
 No directory scan, source rebuild, model download or automatic fallback is performed.
@@ -45,6 +50,9 @@ No directory scan, source rebuild, model download or automatic fallback is perfo
   --apply             Explicitly restore the admitted target; default is read-only inspection
   --expected-selection-sha256 HASH
                       With --apply, resume a previously prepared target under its saved guard
+  --save-preparation FILE
+                      Save a create-only preparation file BEFORE any selection write
+  --resume-file FILE  Read a saved preparation; requires explicit --apply or --confirm-durability
   --repair-vectors    With --prepare or --apply, repair vectors in a NEW copied generation
   --max-copy-bytes N  Repair payload copy limit (positive integer; default 1073741824)
   --confirm-durability Confirm the exact selected target without models or republication
@@ -65,7 +73,15 @@ To resume, use that target receipt and --apply --expected-selection-sha256 HASH,
 Keep all three fields in trusted storage; the guard is not a signature or a retention pin.
 A removed target or changed selection is refused, not rebuilt or automatically rebased.
 Any requested preview must succeed before a prepare report is emitted or selection changes.
---confirm-durability cannot be combined with configuration, preview, repair or resume options.
+--save-preparation requires --prepare or --apply and an existing trusted parent outside STORE.
+It never overwrites a path. Failure prevents selection; an incomplete file may remain.
+The file is flushed before selection; on Unix it is created private (0600) and its parent is synced.
+Saved files contain no query or preview. Supply desired --query/--limit/--config again on resume.
+--resume-file cannot mix with manual target/guard fields or repair options. Store relocation is refused.
+A saved file records PREPARATION, not the final outcome, and is not rewritten after publication.
+After a lost response or uncertain publication, use --resume-file FILE --confirm-durability;
+confirmation requires that exact target to be selected and never restores or loads models.
+--confirm-durability cannot be combined with configuration, preview, repair, save or manual guard options.
 Durability confirmation is not model admission or a drained watcher queue.
 This operates on cooperative complete stores, not the fixed-authority antirollback layout.
 ";
@@ -90,6 +106,8 @@ struct Options {
     repair_vectors: bool,
     max_copy_bytes: u64,
     expected_selection_sha256: Option<String>,
+    save_preparation: Option<PathBuf>,
+    resume_origin: Option<RepairSource>,
     format: OutputFormat,
 }
 
@@ -119,6 +137,8 @@ impl Options {
         let mut repair_vectors = false;
         let mut max_copy_bytes = DEFAULT_REPAIR_COPY_BYTES;
         let mut expected_selection_sha256 = None;
+        let mut save_preparation = None;
+        let mut resume_file = None;
         let mut format = OutputFormat::Json;
         let mut seen = HashSet::new();
         let mut args = args.into_iter();
@@ -135,6 +155,8 @@ impl Options {
                     | "--prepare"
                     | "--apply"
                     | "--expected-selection-sha256"
+                    | "--save-preparation"
+                    | "--resume-file"
                     | "--repair-vectors"
                     | "--max-copy-bytes"
                     | "--confirm-durability"
@@ -174,6 +196,8 @@ impl Options {
                 "--generation" => generation = Some(text(value)?),
                 "--manifest-sha256" => digest = Some(text(value)?),
                 "--expected-selection-sha256" => expected_selection_sha256 = Some(text(value)?),
+                "--save-preparation" => save_preparation = Some(PathBuf::from(value)),
+                "--resume-file" => resume_file = Some(PathBuf::from(value)),
                 "--query" => query = Some(text(value)?),
                 "--max-copy-bytes" => {
                     let value = text(value)?;
@@ -203,10 +227,31 @@ impl Options {
                 _ => return Err(invalid("invalid value-bearing argument")),
             }
         }
+        let root = root.ok_or_else(|| {
+            invalid("--index-dir is required; recovery never guesses a store")
+        })?;
+        let mut resume_origin = None;
+        if let Some(path) = resume_file {
+            // Reject conflicting authority before reading a file. Its contents
+            // can supply a target, never an action, configuration or preview.
+            if !matches!(action, RecoveryAction::Apply | RecoveryAction::ConfirmDurability)
+                || generation.is_some() || digest.is_some() || expected_selection_sha256.is_some()
+                || repair_vectors || seen.contains("--max-copy-bytes")
+            {
+                return Err(invalid("--resume-file requires --apply or --confirm-durability without manual target/guard fields or repair options"));
+            }
+            let receipt = preparation_file::read(&path, &root)?;
+            generation = Some(receipt.generation_id);
+            digest = Some(receipt.manifest_sha256);
+            if action == RecoveryAction::Apply {
+                expected_selection_sha256 = Some(receipt.expected_selection_sha256);
+            }
+            // Confirmation uses only this store-bound target, never the old
+            // guard or a fresh prepare. It cannot republish an unselected copy.
+            resume_origin = receipt.repaired_from;
+        }
         Self {
-            root: root.ok_or_else(|| {
-                invalid("--index-dir is required; recovery never guesses a store")
-            })?,
+            root,
             generation: generation.ok_or_else(|| invalid("--generation is required"))?,
             digest: digest.ok_or_else(|| invalid("--manifest-sha256 is required"))?,
             config,
@@ -216,12 +261,19 @@ impl Options {
             repair_vectors,
             max_copy_bytes,
             expected_selection_sha256,
+            save_preparation,
+            resume_origin,
             format,
         }
         .validate(seen.contains("--limit"), seen.contains("--max-copy-bytes"))
     }
 
     fn validate(mut self, explicit_limit: bool, explicit_copy_limit: bool) -> SearchResult<Self> {
+        if self.save_preparation.is_some()
+            && !matches!(self.action, RecoveryAction::Prepare | RecoveryAction::Apply)
+        {
+            return Err(invalid("--save-preparation requires --prepare or --apply"));
+        }
         // Bound identity text here; the store's canonical pointer decoder owns
         // the exact generation grammar. Do not accept a pathname as an identity.
         if self.generation.len() != 60
@@ -298,7 +350,8 @@ enum RecoveryState {
     DurabilityStillUncertain,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct RepairSource {
     generation_id: String,
     manifest_sha256: String,
@@ -498,7 +551,8 @@ async fn execute(
     if options.action == RecoveryAction::ConfirmDurability {
         let store = CompleteGenerationStore::open(cx, &options.root)?;
         let expected = store.open_retained(cx, &options.generation, &options.digest)?;
-        let report = Report::inspected(&expected);
+        let mut report = Report::inspected(&expected);
+        report.repaired_from = options.resume_origin.clone();
         // The API rechecks this exact target under the publication lease.
         // Do not substitute a separate is_selected() check plus unbound flush.
         let publication = store.confirm_retained_durability(cx, &expected)?;
@@ -527,6 +581,7 @@ async fn execute(
                 .await?
         };
         let mut report = Report::inspected(plan.generation());
+        report.repaired_from = options.resume_origin.clone();
         if options.repair_vectors {
             report.repaired_from = Some(RepairSource {
                 generation_id: options.generation.clone(),
@@ -537,10 +592,19 @@ async fn execute(
             report.preview = plan.search(cx, query, options.limit).await?;
             validate_preview(&report.preview)?;
         }
-        if options.action == RecoveryAction::Prepare {
+        if options.action == RecoveryAction::Prepare || options.save_preparation.is_some() {
             // Use the original plan's guard AFTER preview. Do not recapture
             // CURRENT here or export an unsuccessful preview as resumable.
-            return Ok(report.prepared(plan.expected_selection_sha256(cx)?));
+            report = report.prepared(plan.expected_selection_sha256(cx)?);
+            if let Some(path) = &options.save_preparation {
+                // A failed checkpoint write prevents selection. The saved
+                // preparation survives a later restore/output failure and is
+                // never rewritten to pretend to be a publication receipt.
+                preparation_file::write(cx, path, &options.root, &report)?;
+            }
+            if options.action == RecoveryAction::Prepare {
+                return Ok(report);
+            }
         }
         let (publication, _reader) = plan.restore(cx)?;
         Ok(report.completed(publication, true))
