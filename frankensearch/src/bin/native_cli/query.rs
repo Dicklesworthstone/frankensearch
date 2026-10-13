@@ -20,10 +20,11 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
 mod tuning;
 pub use tuning::FullQuery;
+pub(crate) use tuning::{FullQueryOverride, deserialize_query_override};
 
 /// A server budget is both the default and a ceiling on request overrides.
 /// No configured budget preserves the previous unbounded-query policy.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Policy {
     pub(super) maximum_ms: Option<u64>,
     pub(super) timer: Option<TimerDriverHandle>,
@@ -84,6 +85,7 @@ impl Policy {
 
 /// One explicitly loaded model reused by every full-mode request. Sources come
 /// only from the query's retained hybrid cohort, never from mutable file paths.
+#[derive(Clone)]
 pub struct Rerank {
     pub(super) model: Arc<dyn Reranker>,
     pub(super) window: usize,

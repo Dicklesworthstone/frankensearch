@@ -23,6 +23,9 @@ mod warm_update;
 #[path = "model_migration.rs"]
 mod model_migration;
 
+#[path = "request_tuning.rs"]
+mod request_tuning;
+
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Read one bounded nonblank record using the same policy for hybrid and
@@ -105,6 +108,7 @@ impl Controls {
 #[serde(untagged)]
 enum Message {
     Search(Request),
+    TunedSearch(request_tuning::Request),
     Control(activation::Request),
     Update(warm_update::Request),
     ModelMigration(model_migration::Request),
@@ -391,6 +395,7 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
         "update_max_mutations": warm_update::MAX_MUTATIONS,
         "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),
+        "query_tuning_enabled": policy.query_overrides_enabled(),
         "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
         "rerank_window": policy.rerank.as_ref().map(|r| r.window),
     });
@@ -438,6 +443,14 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                     output,
                     base_filter,
                     policy,
+                )
+                .await?;
+            }
+            Message::TunedSearch(request) => {
+                let snapshot = live.snapshot(cx).await?;
+                request_tuning::execute(
+                    snapshot.index(), cx, &request, ordinal, defaults,
+                    output, base_filter, policy,
                 )
                 .await?;
             }
