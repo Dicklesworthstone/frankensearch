@@ -6,7 +6,11 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{
+    Cx, Embedder, EmbeddingIdentityBundleV1, IdentityBoundEmbedding, SearchError, SearchResult,
+};
+
+use super::CoalescedBatch;
 
 /// Bounds shared by queued requests and all outstanding dispatched batches.
 ///
@@ -129,6 +133,188 @@ impl Drop for AdmissionPermit {
         used.outstanding_requests -= 1;
         used.outstanding_text_bytes -= self.bytes;
     }
+}
+
+impl CoalescedBatch {
+    /// Execute admitted inference and deliver only a complete validated batch.
+    ///
+    /// `expected` is the caller's frozen, trusted in-process producer contract,
+    /// not a new identity inferred from model labels or the response. Compare
+    /// it with the selected index before dispatch, and use one selected contract
+    /// for the callers sharing a queue. This method does not bind a queue to an
+    /// index or authenticate a remote provider by itself. The existing result
+    /// channels carry raw values; their receivers must retain that same contract.
+    ///
+    /// Producers declaring `bound_batch_is_native()` receive one ordered bound
+    /// batch. Other producers receive one `embed_bound` per input, preserving
+    /// singleton overrides instead of bypassing them via the default raw batch.
+    /// There is no retry, model substitution, detached task or new runtime.
+    /// Before any delivery, every response must match the complete expected
+    /// identity, exact dimensions, finite coordinates and in-process storage
+    /// contract. An invalid final row cannot expose an earlier successful prefix.
+    ///
+    /// Cancellation wins over both inference success and ordinary failure. After
+    /// the final checkpoint, delivery has no await or provider callback; it does
+    /// not report cancellation after partially sending validated results. Each
+    /// private channel has capacity one and receives at most one message.
+    /// Disconnected receivers are skipped. Completion or dropping this future
+    /// releases input credits; abandoning it disconnects undelivered receivers.
+    /// Provider-owned blocking work is not preempted by dropping its future.
+    ///
+    /// # Errors
+    /// Returns the detailed admission error or original inference error to the
+    /// dispatch owner. Unavailable producer identity is a typed identity refusal.
+    /// Receivers get the same cancellation class, or a bounded generic embedding
+    /// failure for other errors, without formatting opaque provider exceptions.
+    /// Even an empty batch checks expected/advertised identity and cancellation,
+    /// but starts no inference. The low-level `deliver` API remains unchecked.
+    pub async fn embed_and_deliver(
+        self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        expected: &EmbeddingIdentityBundleV1,
+    ) -> SearchResult<()> {
+        let outcome = self.admit_inference(cx, embedder, expected).await;
+        let outcome = match inference_checkpoint(cx, "batch_coalescer.delivery") {
+            Ok(()) => outcome,
+            Err(cancelled) => Err(cancelled),
+        };
+        match outcome {
+            Ok(responses) => {
+                // Count and every row were admitted before this consuming zip.
+                for (request, response) in self.requests.into_iter().zip(responses) {
+                    let _ = request.result_tx.send(Ok(response.values));
+                }
+                Ok(())
+            }
+            Err(error) => {
+                for request in self.requests {
+                    let receiver_error = match &error {
+                        SearchError::Cancelled { phase, reason } => SearchError::Cancelled {
+                            phase: phase.clone(),
+                            reason: reason.clone(),
+                        },
+                        _ => SearchError::EmbeddingFailed {
+                            model: "batch_coalescer".to_owned(),
+                            source: "identity-bound batch failed; dispatcher retains the detailed error"
+                                .into(),
+                        },
+                    };
+                    let _ = request.result_tx.send(Err(receiver_error));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    async fn admit_inference(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        expected: &EmbeddingIdentityBundleV1,
+    ) -> SearchResult<Vec<IdentityBoundEmbedding>> {
+        inference_checkpoint(cx, "batch_coalescer.inference")?;
+        expected.validate()?;
+        check_producer(cx, embedder, expected)?;
+        if self.is_empty() {
+            return Ok(Vec::new());
+        }
+        let native = embedder.bound_batch_is_native();
+        inference_checkpoint(cx, "batch_coalescer.batch_policy")?;
+        let responses = if native {
+            let texts = self.texts();
+            let outcome = embedder.embed_batch_bound(cx, &texts).await;
+            admit_outcome(cx, embedder, expected, outcome)?
+        } else {
+            let mut responses = Vec::with_capacity(self.len());
+            for request in &self.requests {
+                check_producer(cx, embedder, expected)?;
+                let outcome = embedder.embed_bound(cx, &request.text).await;
+                let response = admit_outcome(cx, embedder, expected, outcome)?;
+                check_response(&response, expected)?;
+                responses.push(response);
+            }
+            responses
+        };
+        if responses.len() != self.len() {
+            return Err(SearchError::InvalidConfig {
+                field: "batch_coalescer.response_count".to_owned(),
+                value: responses.len().to_string(),
+                reason: "bound inference must return exactly one output per queued input".to_owned(),
+            });
+        }
+        for response in &responses {
+            inference_checkpoint(cx, "batch_coalescer.response")?;
+            check_response(response, expected)?;
+        }
+        Ok(responses)
+    }
+}
+
+fn inference_checkpoint(cx: &Cx, phase: &str) -> SearchResult<()> {
+    if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+        return Err(SearchError::Cancelled {
+            phase: phase.to_owned(),
+            reason: cx.cancel_reason().map_or_else(
+                || "coalesced embedding cancelled".to_owned(),
+                |reason| reason.to_string(),
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn identity_mismatch() -> SearchError {
+    SearchError::UnverifiableRemoteSpace {
+        producer: "batch_coalescer".to_owned(),
+        reason: "producer or response differs from the caller's frozen embedding contract"
+            .to_owned(),
+    }
+}
+
+fn check_producer(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    expected: &EmbeddingIdentityBundleV1,
+) -> SearchResult<()> {
+    inference_checkpoint(cx, "batch_coalescer.before_identity")?;
+    let actual = embedder.identity();
+    inference_checkpoint(cx, "batch_coalescer.after_identity")?;
+    if !actual.is_ok_and(|identity| identity == expected) {
+        return Err(identity_mismatch());
+    }
+    let dimension = embedder.dimension();
+    inference_checkpoint(cx, "batch_coalescer.after_dimension")?;
+    if usize::try_from(expected.space.dimension).ok() != Some(dimension) {
+        return Err(identity_mismatch());
+    }
+    Ok(())
+}
+
+fn admit_outcome<T>(
+    cx: &Cx,
+    embedder: &dyn Embedder,
+    expected: &EmbeddingIdentityBundleV1,
+    outcome: SearchResult<T>,
+) -> SearchResult<T> {
+    inference_checkpoint(cx, "batch_coalescer.after_inference")?;
+    if matches!(&outcome, Err(SearchError::Cancelled { .. })) {
+        return outcome;
+    }
+    // Losing/changing identity cannot become an ordinary retryable model error.
+    check_producer(cx, embedder, expected)?;
+    outcome
+}
+
+fn check_response(
+    response: &IdentityBoundEmbedding,
+    expected: &EmbeddingIdentityBundleV1,
+) -> SearchResult<()> {
+    // Refuse foreign fields before validators can reflect their diagnostic text.
+    if &response.identity != expected {
+        return Err(identity_mismatch());
+    }
+    response.validate()
 }
 
 #[cfg(test)]
@@ -430,5 +616,378 @@ mod tests {
         assert_eq!(budget.usage().outstanding_text_bytes, 0);
         drop(empty);
         assert_eq!(budget.usage(), CoalescerUsage::default());
+    }
+}
+
+#[cfg(test)]
+mod inference_tests {
+    use super::*;
+    use crate::batch_coalescer::{BatchCoalescer, CoalescerConfig, Priority};
+    use frankensearch_core::{ModelCategory, SearchFuture};
+    use std::fmt;
+    use std::future::Future;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc::{Receiver, TryRecvError};
+    use std::task::{Context, Poll, Waker};
+
+    #[derive(Clone, Copy)]
+    enum Reply {
+        Valid,
+        Short,
+        Long,
+        ForeignSpace,
+        ForeignProducer,
+        ForeignStorage,
+        WrongDimension,
+        NonFinite(f32),
+        Failure,
+        DriftSuccess,
+        DriftFailure,
+        CancelSuccess,
+        CancelFailure,
+        ProviderCancelled,
+        Pending,
+    }
+
+    struct Probe {
+        expected: EmbeddingIdentityBundleV1,
+        foreign: EmbeddingIdentityBundleV1,
+        drifted: AtomicBool,
+        native: bool,
+        reply: Reply,
+        raw_calls: AtomicUsize,
+        bound_calls: AtomicUsize,
+        batch_calls: AtomicUsize,
+        identity_calls: AtomicUsize,
+        formatted: Arc<AtomicUsize>,
+        dropped: AtomicUsize,
+        cancel_metadata: Option<(Cx, usize)>,
+    }
+
+    impl Probe {
+        fn new(native: bool, reply: Reply) -> Self {
+            Self {
+                expected: identity(),
+                foreign: EmbeddingIdentityBundleV1::explicit_test_model("foreign-space", 2),
+                drifted: AtomicBool::new(false),
+                native,
+                reply,
+                raw_calls: AtomicUsize::new(0),
+                bound_calls: AtomicUsize::new(0),
+                batch_calls: AtomicUsize::new(0),
+                identity_calls: AtomicUsize::new(0),
+                formatted: Arc::new(AtomicUsize::new(0)),
+                dropped: AtomicUsize::new(0),
+                cancel_metadata: None,
+            }
+        }
+
+        async fn produce(
+            &self,
+            cx: &Cx,
+            texts: &[&str],
+        ) -> SearchResult<Vec<IdentityBoundEmbedding>> {
+            let _guard = DropGuard(&self.dropped);
+            if matches!(self.reply, Reply::Pending) {
+                return std::future::pending().await;
+            }
+            if matches!(self.reply, Reply::ProviderCancelled) {
+                return Err(SearchError::Cancelled {
+                    phase: "fixture.provider".to_owned(),
+                    reason: "provider stopped".to_owned(),
+                });
+            }
+            let mut values: Vec<_> = texts.iter().map(|text| IdentityBoundEmbedding {
+                values: vec![text.parse().unwrap(), -0.0],
+                identity: self.expected.clone(),
+            }).collect();
+            // Put corruption LAST: a streaming prefix delivery would already
+            // expose two vectors before noticing it. Singleton execution also
+            // fails only on the third input, after two real bound calls succeeded.
+            if texts.contains(&"30") {
+                match self.reply {
+                    Reply::Short => { let _ = values.pop(); }
+                    Reply::Long => values.push(values[0].clone()),
+                    Reply::ForeignSpace => {
+                        values.last_mut().unwrap().identity = self.foreign.clone();
+                    }
+                    Reply::ForeignProducer => {
+                        values.last_mut().unwrap().identity.producer.backend = "foreign".to_owned();
+                    }
+                    Reply::ForeignStorage => {
+                        values.last_mut().unwrap().identity.storage.format = "fsvi-v2".to_owned();
+                    }
+                    Reply::WrongDimension => { let _ = values.last_mut().unwrap().values.pop(); }
+                    Reply::NonFinite(value) => values.last_mut().unwrap().values[1] = value,
+                    _ => {}
+                }
+            }
+            if matches!(self.reply, Reply::DriftSuccess | Reply::DriftFailure) {
+                self.drifted.store(true, Ordering::Relaxed);
+            }
+            if matches!(self.reply, Reply::CancelSuccess | Reply::CancelFailure) {
+                cx.set_cancel_requested(true);
+            }
+            if matches!(self.reply, Reply::Failure | Reply::DriftFailure | Reply::CancelFailure) {
+                return Err(SearchError::EmbeddingFailed {
+                    model: "fixture".to_owned(),
+                    source: Box::new(Opaque(Arc::clone(&self.formatted))),
+                });
+            }
+            Ok(values)
+        }
+    }
+
+    struct DropGuard<'a>(&'a AtomicUsize);
+    impl Drop for DropGuard<'_> {
+        fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+    }
+
+    struct Opaque(Arc<AtomicUsize>);
+    impl fmt::Display for Opaque {
+        fn fmt(&self, _formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Err(fmt::Error)
+        }
+    }
+    impl fmt::Debug for Opaque {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            fmt::Display::fmt(self, formatter)
+        }
+    }
+    impl std::error::Error for Opaque {}
+
+    impl Embedder for Probe {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.raw_calls.fetch_add(1, Ordering::Relaxed);
+            // Raw inference appears healthy, making bypassed bound validation
+            // observable as a wrong successful result rather than a stub panic.
+            Box::pin(async { Ok(vec![99.0, 0.0]) })
+        }
+
+        fn embed_bound<'a>(
+            &'a self, cx: &'a Cx, text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+            self.bound_calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async move {
+                let mut values = self.produce(cx, &[text]).await?;
+                values.pop().ok_or_else(|| SearchError::EmbeddingFailed {
+                    model: "fixture".to_owned(), source: "missing singleton".into(),
+                })
+            })
+        }
+
+        fn embed_batch_bound<'a>(
+            &'a self, cx: &'a Cx, texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(self.produce(cx, texts))
+        }
+
+        fn bound_batch_is_native(&self) -> bool { self.native }
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            let call = self.identity_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some((cx, at)) = &self.cancel_metadata
+                && call == *at
+            {
+                cx.set_cancel_requested(true);
+            }
+            Ok(if self.drifted.load(Ordering::Relaxed) { &self.foreign } else { &self.expected })
+        }
+        fn dimension(&self) -> usize { 2 }
+        fn id(&self) -> &str { "coalescer-fixture" }
+        fn model_name(&self) -> &str { self.id() }
+        fn is_semantic(&self) -> bool { false }
+        fn category(&self) -> ModelCategory { ModelCategory::HashEmbedder }
+    }
+
+    fn identity() -> EmbeddingIdentityBundleV1 {
+        EmbeddingIdentityBundleV1::explicit_test_model("coalescer-fixture", 2)
+    }
+
+    fn work() -> (BatchCoalescer, CoalescedBatch, Vec<Receiver<SearchResult<Vec<f32>>>>) {
+        let queue = BatchCoalescer::with_limits(
+            CoalescerConfig {
+                max_batch_size: 3, max_wait_ms: 0, min_batch_size: 1, use_priority_lanes: true,
+            },
+            CoalescerLimits { max_outstanding_requests: 3, max_outstanding_text_bytes: 32 },
+        ).unwrap();
+        let receivers = ["10", "20", "30"].into_iter()
+            .map(|text| queue.submit(text.to_owned(), Priority::Background)).collect();
+        let batch = queue.try_form_batch().unwrap();
+        (queue, batch, receivers)
+    }
+
+    fn failed_receivers(receivers: Vec<Receiver<SearchResult<Vec<f32>>>>, cancelled: bool) {
+        for receiver in receivers {
+            let error = receiver.try_recv().unwrap().expect_err("no prefix success is allowed");
+            assert_eq!(matches!(error, SearchError::Cancelled { .. }), cancelled);
+            if !cancelled {
+                assert!(matches!(error, SearchError::EmbeddingFailed { .. }));
+                assert!(error.to_string().len() < 256);
+            }
+            assert!(matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)));
+        }
+    }
+
+    #[test]
+    fn bound_executor_delivers_original_bits_in_order_for_native_and_singleton_producers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for native in [false, true] {
+                let probe = Probe::new(native, Reply::Valid);
+                let (queue, batch, receivers) = work();
+                batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap();
+                for (receiver, expected) in receivers.into_iter().zip([10.0_f32, 20.0, 30.0]) {
+                    let values = receiver.try_recv().unwrap().unwrap();
+                    assert_eq!(values[0].to_bits(), expected.to_bits());
+                    assert_eq!(values[1].to_bits(), (-0.0_f32).to_bits());
+                }
+                assert_eq!(probe.raw_calls.load(Ordering::Relaxed), 0);
+                assert_eq!(probe.batch_calls.load(Ordering::Relaxed), usize::from(native));
+                assert_eq!(probe.bound_calls.load(Ordering::Relaxed), if native { 0 } else { 3 });
+                assert_eq!(queue.usage(), CoalescerUsage::default());
+            }
+        });
+    }
+
+    #[test]
+    fn malformed_final_response_rejects_the_entire_batch_before_any_delivery() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for native in [false, true] {
+                for reply in [
+                    Reply::ForeignSpace, Reply::ForeignProducer, Reply::ForeignStorage,
+                    Reply::WrongDimension, Reply::NonFinite(f32::NAN),
+                    Reply::NonFinite(f32::INFINITY), Reply::NonFinite(f32::NEG_INFINITY),
+                ] {
+                    let probe = Probe::new(native, reply);
+                    let (queue, batch, receivers) = work();
+                    assert!(batch.embed_and_deliver(&cx, &probe, &identity()).await.is_err());
+                    failed_receivers(receivers, false);
+                    assert_eq!(queue.usage(), CoalescerUsage::default());
+                    assert_eq!(probe.raw_calls.load(Ordering::Relaxed), 0);
+                    if !native { assert_eq!(probe.bound_calls.load(Ordering::Relaxed), 3); }
+                }
+            }
+            for reply in [Reply::Short, Reply::Long] {
+                let probe = Probe::new(true, reply);
+                let (queue, batch, receivers) = work();
+                let error = batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap_err();
+                assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
+                    if field == "batch_coalescer.response_count"));
+                failed_receivers(receivers, false);
+                assert_eq!(queue.usage(), CoalescerUsage::default());
+            }
+        });
+    }
+
+    #[test]
+    fn advertised_drift_is_rejected_before_inference_and_after_success_or_failure() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for before in [false, true] {
+                for reply in [Reply::DriftSuccess, Reply::DriftFailure] {
+                    let probe = Probe::new(true, reply);
+                    probe.drifted.store(before, Ordering::Relaxed);
+                    let (queue, batch, receivers) = work();
+                    let error = batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap_err();
+                    assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+                    assert_eq!(probe.batch_calls.load(Ordering::Relaxed), usize::from(!before));
+                    assert_eq!(probe.formatted.load(Ordering::Relaxed), 0);
+                    failed_receivers(receivers, false);
+                    assert_eq!(queue.usage(), CoalescerUsage::default());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn cancellation_wins_at_entry_metadata_and_both_provider_outcomes() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for reply in [Reply::CancelSuccess, Reply::CancelFailure, Reply::ProviderCancelled] {
+                for native in [false, true] {
+                    let probe = Probe::new(native, reply);
+                    let (queue, batch, receivers) = work();
+                    let error = batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap_err();
+                    assert!(matches!(error, SearchError::Cancelled { .. }));
+                    failed_receivers(receivers, true);
+                    assert_eq!(probe.formatted.load(Ordering::Relaxed), 0);
+                    assert_eq!(queue.usage(), CoalescerUsage::default());
+                    cx.set_cancel_requested(false);
+                }
+            }
+            for at in [0, 1, 2] {
+                let mut probe = Probe::new(true, Reply::Valid);
+                if at == 0 { cx.set_cancel_requested(true); }
+                else { probe.cancel_metadata = Some((cx.clone(), at)); }
+                let (queue, batch, receivers) = work();
+                assert!(matches!(batch.embed_and_deliver(&cx, &probe, &identity()).await,
+                    Err(SearchError::Cancelled { .. })));
+                failed_receivers(receivers, true);
+                assert_eq!(probe.batch_calls.load(Ordering::Relaxed), usize::from(at == 2));
+                assert_eq!(queue.usage(), CoalescerUsage::default());
+                cx.set_cancel_requested(false);
+            }
+        });
+    }
+
+    #[test]
+    fn opaque_provider_error_is_returned_to_dispatcher_without_formatting_or_fanout_copy() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let probe = Probe::new(true, Reply::Failure);
+            let (queue, batch, receivers) = work();
+            let error = batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap_err();
+            match error {
+                SearchError::EmbeddingFailed { source, .. } => {
+                    let opaque = source.downcast_ref::<Opaque>().expect("original source retained");
+                    assert!(Arc::ptr_eq(&opaque.0, &probe.formatted));
+                }
+                _ => panic!("original provider error must reach dispatcher"),
+            }
+            failed_receivers(receivers, false);
+            assert_eq!(probe.formatted.load(Ordering::Relaxed), 0);
+            assert_eq!(probe.batch_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(queue.usage(), CoalescerUsage::default());
+        });
+    }
+
+    #[test]
+    fn abandoning_pending_inference_releases_credits_and_requires_explicit_resubmission() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let probe = Probe::new(true, Reply::Pending);
+            let (queue, batch, receivers) = work();
+            let expected = identity();
+            let mut future = Box::pin(batch.embed_and_deliver(&cx, &probe, &expected));
+            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert_eq!(queue.usage().outstanding_requests, 3);
+            for receiver in &receivers { assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty))); }
+            drop(future);
+            assert_eq!(probe.dropped.load(Ordering::Relaxed), 1);
+            for receiver in receivers { assert!(matches!(receiver.try_recv(), Err(TryRecvError::Disconnected))); }
+            assert_eq!(queue.usage(), CoalescerUsage::default());
+            assert_eq!(queue.pending_count(), 0);
+            assert!(!cx.is_cancel_requested());
+            let receiver = queue.submit("10".to_owned(), Priority::Interactive);
+            let ready = Probe::new(true, Reply::Valid);
+            queue.try_form_batch().unwrap().embed_and_deliver(&cx, &ready, &expected).await.unwrap();
+            assert_eq!(receiver.try_recv().unwrap().unwrap()[0], 10.0);
+            assert_eq!(queue.usage(), CoalescerUsage::default());
+        });
+    }
+
+    #[test]
+    fn empty_batches_validate_identity_without_model_work_and_unpolled_drop_releases_input() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let probe = Probe::new(true, Reply::Valid);
+            let expected = identity();
+            CoalescedBatch { requests: Vec::new() }.embed_and_deliver(&cx, &probe, &expected).await.unwrap();
+            assert_eq!(probe.batch_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(probe.identity_calls.load(Ordering::Relaxed), 1);
+            probe.drifted.store(true, Ordering::Relaxed);
+            assert!(CoalescedBatch { requests: Vec::new() }.embed_and_deliver(&cx, &probe, &expected).await.is_err());
+            let (queue, batch, receivers) = work();
+            drop(batch.embed_and_deliver(&cx, &probe, &expected));
+            assert_eq!(queue.usage(), CoalescerUsage::default());
+            for receiver in receivers { assert!(matches!(receiver.try_recv(), Err(TryRecvError::Disconnected))); }
+            assert_eq!(probe.batch_calls.load(Ordering::Relaxed), 0);
+        });
     }
 }

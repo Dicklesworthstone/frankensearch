@@ -53,6 +53,10 @@ mod lexical;
 #[cfg(test)]
 mod tests;
 
+#[path = "native_cli/query_tuning_tests.rs"]
+#[cfg(test)]
+mod query_tuning_tests;
+
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
 const SCHEMA: &str = "frankensearch.native.cli.v1";
@@ -84,6 +88,14 @@ Quality options (not with --lexical-only):\n\
   --quality-backend onnx|native-int8|native-f32|native-multilingual\n\
   --quality-model-dir DIR (required for native; exact verified model directory)\n\
 The default backend is always onnx; native-only builds require explicit native selection.\n\n\
+Full-mode query tuning (search/serve, not with --lexical-only):\n\
+  --full-query JSON (one fixed policy for every full-mode request)\n\
+  Fields: candidate_multiplier (1..100, default 3), fast_ef/quality_ef\n\
+  (1..1000000 or null), rrf_k (default 60), lexical_weight/semantic_weight\n\
+  (positive, default 1), quality_weight (0..1, default 0.7).\n\
+  Example: --full-query '{\"candidate_multiplier\":5,\"quality_ef\":128}'\n\
+  Fast/quality-only serve requests retain their ordinary policy. Tuned full\n\
+  queries use progressive candidate reuse, including buffered collection.\n\n\
 Input: one {\"id\":\"...\",\"content\":\"...\",\"title\":null,\"metadata\":{}} per line.\n\
 Updates use op=upsert with those fields, or {\"op\":\"delete\",\"id\":\"...\"}.\n\
 The last update for an ID wins; every input record must be valid.\n\
@@ -151,6 +163,7 @@ struct Options {
     timeout_ms: Option<u64>,
     reranker_dir: Option<PathBuf>,
     rerank_window: usize,
+    full_query: Option<query::FullQuery>,
 }
 
 impl Options {
@@ -198,6 +211,7 @@ impl Options {
             timeout_ms: None,
             reranker_dir: None,
             rerank_window: 50,
+            full_query: None,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -278,6 +292,9 @@ impl Options {
                 "--filter" if matches!(command, Command::Search | Command::Serve) => {
                     options.filter = Some(filter::Filter::parse(&value(&mut args)?)?);
                 }
+                "--full-query" if matches!(command, Command::Search | Command::Serve) => {
+                    options.full_query = Some(query::FullQuery::parse(&value(&mut args)?)?);
+                }
                 _ => return Err(bad("unknown or inapplicable option; use --help")),
             }
         }
@@ -295,6 +312,7 @@ impl Options {
                 "--allow-activation",
                 "--allow-updates",
                 "--allow-model-migration",
+                "--full-query",
             ]
             .iter()
             .any(|flag| seen.contains(*flag))
@@ -304,6 +322,9 @@ impl Options {
             ));
         }
         options.quality.validate_usage(!options.fast_only)?;
+        if command == Command::Search && options.full_query.is_some() && options.mode != Mode::Full {
+            return Err(bad("--full-query requires search --mode full"));
+        }
         if seen.contains("--rerank-window") && options.reranker_dir.is_none() {
             return Err(bad("--rerank-window requires --reranker-dir"));
         }
@@ -764,6 +785,7 @@ async fn execute(
             // its own total budget after that, before scoping or provider work.
             let mut policy = query::Policy::new(cx, options.timeout_ms)?;
             policy.rerank = rerank;
+            policy.full_query = options.full_query;
             if options.command == Command::Serve {
                 let live = live::Serving::new(cx, index)?;
                 let controls = serve::Controls {
