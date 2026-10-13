@@ -27,7 +27,8 @@ access outside the server's source filter.
 
 The nested `request` uses the existing query/id/mode/limit/filter/timeout fields.
 `full_query` is a partial object with `candidate_multiplier`, `fast_ef`,
-`quality_ef`, `rrf_k`, `lexical_weight`, `semantic_weight`, and `quality_weight`.
+`quality_ef`, `rrf_k`, `lexical_weight`, `semantic_weight`, `quality_weight`,
+`rerank`, and `rerank_window`.
 Missing or null fields inherit the startup values; null cannot erase a cap.
 Unknown or duplicate fields and non-object tuning values are rejected rather
 than silently becoming an ordinary query. A request cannot grant itself
@@ -44,8 +45,25 @@ The server filter and nested request filter are intersected, not replaced.
 
 Only full-mode requests accept tuning. Explicit fast/quality-primary modes in
 a tuned envelope fail; ordinary flat fast/quality requests remain available.
-The existing loaded reranker and its candidate window are retained unchanged.
-Candidate requests include the larger of the displayed limit and rerank window.
+The existing loaded reranker is reused, never loaded or replaced by a request.
+`rerank: false` skips only the optional cross-encoder stage; required quality
+refinement still runs. `rerank: true` requires a server-loaded reranker. A
+request's positive `rerank_window` cannot exceed the startup `--rerank-window`.
+Providing a window with `rerank: false`, or without a loaded model, is an error.
+Missing/null rerank settings inherit the server, including its original window.
+
+```jsonl
+{"op":"search","request":{"id":"retrieval-only","query":"retry network","mode":"full"},"full_query":{"rerank":false}}
+{"op":"search","request":{"id":"small-rerank","query":"retry network","mode":"full"},"full_query":{"rerank_window":10,"candidate_multiplier":2}}
+```
+
+The second request requires a server started with `--reranker-dir` and a window
+of at least 10. Candidate requests use the effective multiplier times the larger
+of the displayed limit and the effective rerank window. An opted-out request
+does not retain the larger rerank candidate budget. The next ordinary request
+again uses the original server reranker/window. Started and result frames name
+the effective reranker/window when enabled; a skipped stage emits no invented
+reranked phase, while a requested failing reranker still produces degradation.
 
 Started and result frames carry the effective `full_query`, not the original
 partial patch. They use the same generation, sequence numbers, sharded row

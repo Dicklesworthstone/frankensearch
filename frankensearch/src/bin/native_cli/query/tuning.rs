@@ -46,6 +46,10 @@ pub struct FullQueryOverride {
     lexical_weight: Option<f64>,
     semantic_weight: Option<f64>,
     quality_weight: Option<f32>,
+    /// None inherits; false skips only the optional cross-encoder stage.
+    rerank: Option<bool>,
+    /// A positive window at most the window of the already loaded reranker.
+    rerank_window: Option<usize>,
 }
 
 /// Require an object without first decoding through Value (which would erase
@@ -171,8 +175,9 @@ impl Policy {
             .is_some_and(|policy| policy.request_overrides)
     }
 
-    /// Derive one request's policy. The original timer, timeout ceiling, and
-    /// retained reranker Arc/window are cloned, not reloaded or reconfigured.
+    /// Derive one request's policy. The original timer, timeout ceiling and
+    /// retained reranker Arc are preserved. A request may skip
+    /// optional reranking or reduce its window within the server's maximum.
     /// Limits concern requested hits/beams, not RSS, graph visits or latency.
     pub(crate) fn for_query_override(
         &self,
@@ -214,12 +219,39 @@ impl Policy {
         effective.semantic_weight = requested.semantic_weight.unwrap_or(base.semantic_weight);
         effective.quality_weight = requested.quality_weight.unwrap_or(base.quality_weight);
         effective.validate()?;
+        let rerank = self.request_reranker(requested)?;
         // The derived query is not itself a grant for another override.
         effective.request_overrides = false;
         Ok(Self {
             full_query: Some(effective),
+            rerank,
             ..self.clone()
         })
+    }
+
+    fn request_reranker(&self, requested: &FullQueryOverride) -> Result<Option<super::Rerank>> {
+        if requested.rerank == Some(false) {
+            if requested.rerank_window.is_some() {
+                return Err(bad("rerank_window cannot be combined with rerank=false"));
+            }
+            return Ok(None);
+        }
+        let Some(base) = &self.rerank else {
+            if requested.rerank == Some(true) || requested.rerank_window.is_some() {
+                return Err(bad("request reranking requires a server-loaded reranker"));
+            }
+            return Ok(None);
+        };
+        let window = requested.rerank_window.unwrap_or(base.window);
+        if !(1..=1_000).contains(&base.window) || window == 0 || window > base.window {
+            return Err(bad(
+                "request rerank window must be positive and within the server limit",
+            ));
+        }
+        Ok(Some(super::Rerank {
+            model: base.model.clone(),
+            window,
+        }))
     }
 
     /// Prepare the same full-mode query for buffered and streaming execution.

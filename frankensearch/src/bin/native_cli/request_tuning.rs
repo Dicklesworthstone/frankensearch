@@ -332,6 +332,165 @@ mod tests {
         });
     }
 
+    #[derive(Default)]
+    struct Scorer {
+        inputs: std::sync::Mutex<Vec<Vec<String>>>,
+        fail: AtomicBool,
+    }
+
+    impl frankensearch::Reranker for Scorer {
+        fn id(&self) -> &'static str { "request-rerank-fixture" }
+        fn model_name(&self) -> &'static str { "request-rerank-fixture" }
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            documents: &'a [frankensearch::RerankDocument],
+        ) -> SearchFuture<'a, Vec<frankensearch::RerankScore>> {
+            Box::pin(async move {
+                self.inputs.lock().unwrap().push(
+                    documents.iter().map(|document| document.doc_id.clone()).collect(),
+                );
+                if self.fail.load(Ordering::SeqCst) {
+                    return Err(SearchError::SubsystemError {
+                        subsystem: "request-rerank-fixture", source: "controlled rerank failure".into(),
+                    });
+                }
+                Ok(documents.iter().enumerate().map(|(original_rank, document)| {
+                    frankensearch::RerankScore {
+                        doc_id: document.doc_id.clone(), original_rank,
+                        score: if document.doc_id == "vector" { 1.0 } else { 0.0 },
+                        raw_logit: None,
+                    }
+                }).collect())
+            })
+        }
+    }
+
+    #[test]
+    fn request_rerank_windows_and_opt_out_change_real_work_but_not_server_defaults() {
+        run_test_with_cx(|cx| async move {
+            for partitioned in [false, true] {
+                for exact in [false, true] {
+                    let f = fixture(&cx, partitioned, exact, true).await;
+                    let server = live::Serving::new(&cx, f.index).unwrap();
+                    let scorer = Arc::new(Scorer::default());
+                    let mut policy = policy();
+                    policy.rerank = Some(query::Rerank::new(scorer.clone(), 4).unwrap());
+                    let mut input = Cursor::new(concat!(
+                        "{\"op\":\"search\",\"request\":{\"id\":\"small\",\"query\":\"needle\",\"limit\":1},\"full_query\":{\"candidate_multiplier\":1,\"rerank_window\":1}}\n",
+                        "{\"op\":\"search\",\"request\":{\"id\":\"skip\",\"query\":\"needle\",\"limit\":1},\"full_query\":{\"candidate_multiplier\":1,\"rerank\":false}}\n",
+                        "{\"id\":\"ordinary\",\"query\":\"needle\",\"limit\":1}\n",
+                        "{\"op\":\"search\",\"request\":{\"id\":\"over-limit\",\"query\":\"needle\"},\"full_query\":{\"rerank_window\":5}}\n",
+                    ));
+                    let mut output = Vec::new();
+                    super::super::run_with_controls(
+                        server.borrow(), &cx, &mut input, &mut output, (Mode::Full, 1),
+                        super::super::Controls::default(), None, &policy,
+                    ).await.unwrap();
+                    let output = frames(&output);
+                    let page = |id: &str, phase: &str| output.iter()
+                        .find(|frame| frame["id"] == id && frame["phase"] == phase).unwrap();
+                    assert_eq!(page("small", "initial")["candidates"]["fast"], 1);
+                    assert_eq!(page("small", "reranked")["evaluated"], 1);
+                    assert_eq!(page("small", "reranked")["rerank_window"], 1);
+                    assert_eq!(page("skip", "initial")["candidates"]["fast"], 1);
+                    assert!(page("skip", "refined").get("reranker").is_none());
+                    assert!(!output.iter().any(|frame| frame["id"] == "skip" && frame["phase"] == "reranked"));
+                    assert_eq!(page("ordinary", "reranked")["evaluated"], 4);
+                    assert_eq!(page("ordinary", "reranked")["rerank_window"], 4);
+                    assert_eq!(page("ordinary", "reranked")["results"][0]["doc_id"], "vector");
+                    assert_eq!(page("ordinary", "reranked")["results"][0]["metadata"]["original_id"], "vector");
+                    let calls = scorer.inputs.lock().unwrap();
+                    assert_eq!(calls.len(), 2);
+                    assert_eq!(calls[0].len(), 1);
+                    assert_eq!(calls[1].len(), 4);
+                    assert_eq!(policy.rerank.as_ref().unwrap().window, 4);
+                    assert_eq!(f.fast_calls.load(Ordering::SeqCst), 3);
+                    assert_eq!(f.quality_calls.load(Ordering::SeqCst), 3);
+                    let rejected: Vec<_> = output.iter().filter(|frame| frame["id"] == "over-limit").collect();
+                    assert_eq!(rejected.len(), 1);
+                    assert_eq!(rejected[0]["partial_results"], false);
+                    if partitioned {
+                        let result = &page("ordinary", "reranked")["results"][0];
+                        assert!(result["fast_row"].is_object());
+                        assert!(result["quality_row"].is_object());
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn rerank_overrides_cannot_load_models_widen_windows_or_bypass_the_startup_grant() {
+        let cx = Cx::for_testing();
+        let scorer = Arc::new(Scorer::default());
+        let mut base = policy();
+        base.rerank = Some(query::Rerank::new(scorer.clone(), 4).unwrap());
+        let patch = |text: &str| serde_json::from_str::<query::FullQueryOverride>(text).unwrap();
+        for text in [r#"{"rerank_window":0}"#, r#"{"rerank_window":5}"#,
+            r#"{"rerank":false,"rerank_window":1}"#] {
+            assert!(base.for_query_override(&cx, &patch(text)).is_err());
+        }
+        for text in ["{}", r#"{"rerank":true}"#, r#"{"rerank":null,"rerank_window":null}"#] {
+            let effective = base.for_query_override(&cx, &patch(text)).unwrap();
+            assert_eq!(effective.rerank.as_ref().unwrap().window, 4);
+            assert!(Arc::ptr_eq(&effective.rerank.as_ref().unwrap().model, &base.rerank.as_ref().unwrap().model));
+        }
+        let smaller = base.for_query_override(&cx, &patch(r#"{"rerank_window":2}"#)).unwrap();
+        assert_eq!(smaller.rerank.as_ref().unwrap().window, 2);
+        assert_eq!(base.rerank.as_ref().unwrap().window, 4);
+        assert!(base.for_query_override(&cx, &patch(r#"{"rerank":false}"#)).unwrap().rerank.is_none());
+        let without_model = policy();
+        for text in [r#"{"rerank":true}"#, r#"{"rerank_window":1}"#] {
+            assert!(without_model.for_query_override(&cx, &patch(text)).is_err());
+        }
+        let ungranted = query::Policy { full_query: None, ..base.clone() };
+        assert!(ungranted.for_query_override(&cx, &patch(r#"{"rerank":false}"#)).is_err());
+        assert!(scorer.inputs.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn optional_rerank_opt_out_never_disables_required_quality_or_hides_requested_failures() {
+        run_test_with_cx(|cx| async move {
+            for partitioned in [false, true] {
+                let f = fixture(&cx, partitioned, true, true).await;
+                let scorer = Arc::new(Scorer::default());
+                let mut policy = policy();
+                policy.rerank = Some(query::Rerank::new(scorer.clone(), 4).unwrap());
+                let skip: Request = serde_json::from_str(
+                    r#"{"op":"search","request":{"query":"needle","limit":1},"full_query":{"rerank":false,"quality_weight":0}}"#,
+                ).unwrap();
+                f.fail_quality.store(true, Ordering::SeqCst);
+                let mut output = Vec::new();
+                execute(f.index.borrow(), &cx, &skip, 1, (Mode::Full, 1), &mut output, None, &policy).await.unwrap();
+                let failed_quality = frames(&output);
+                assert_eq!(failed_quality[2]["phase"], "refinement_failed");
+                assert_eq!(failed_quality[2]["results"], failed_quality[1]["results"]);
+                assert_eq!(failed_quality.last().unwrap()["status"], "degraded");
+                assert!(scorer.inputs.lock().unwrap().is_empty());
+                assert_eq!(f.quality_calls.load(Ordering::SeqCst), 1);
+                f.fail_quality.store(false, Ordering::SeqCst);
+                scorer.fail.store(true, Ordering::SeqCst);
+                let enabled: Request = serde_json::from_str(
+                    r#"{"op":"search","request":{"query":"needle","limit":1},"full_query":{"rerank_window":2}}"#,
+                ).unwrap();
+                output.clear();
+                execute(f.index.borrow(), &cx, &enabled, 2, (Mode::Full, 1), &mut output, None, &policy).await.unwrap();
+                let failed_rerank = frames(&output);
+                assert_eq!(failed_rerank[2]["phase"], "refined");
+                assert_eq!(failed_rerank[3]["phase"], "rerank_failed");
+                assert_eq!(failed_rerank[3]["results"], failed_rerank[2]["results"]);
+                assert_eq!(failed_rerank.last().unwrap()["status"], "degraded");
+                output.clear();
+                execute(f.index.borrow(), &cx, &skip, 3, (Mode::Full, 1), &mut output, None, &policy).await.unwrap();
+                assert_eq!(frames(&output).last().unwrap()["status"], "complete");
+                assert_eq!(scorer.inputs.lock().unwrap().len(), 1);
+                assert_eq!(policy.rerank.as_ref().unwrap().window, 4);
+            }
+        });
+    }
+
     #[test]
     fn output_failures_remain_fatal_before_provider_work() {
         struct Broken;
