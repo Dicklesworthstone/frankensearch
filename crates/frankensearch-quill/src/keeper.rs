@@ -2967,6 +2967,9 @@ pub struct RecoveredSegment {
     /// backing and manifest binding. Owned tombstone-only rebinds carry this
     /// receipt unchanged after their O(1) successor admission.
     authenticated_file_witness: AuthenticatedFileWitness,
+    /// How the mapped file stat'ed when this binding's bytes were verified;
+    /// `None` for owned backings and unstamped opens.
+    verified_stamp: Option<VerifiedFileStamp>,
     #[cfg(test)]
     term_dictionary_cache_counters: Arc<TermDictionaryCacheCounters>,
     /// Test-only call/attempt counter; range and tombstone misses are included.
@@ -3245,11 +3248,20 @@ impl RecoveredSegment {
             term_dictionary_metadata,
             stored_meta_lookup_cache,
             authenticated_file_witness,
+            verified_stamp: None,
             #[cfg(test)]
             term_dictionary_cache_counters,
             #[cfg(test)]
             document_id_materialization_calls,
         })
+    }
+
+    /// Record how the mapped file stat'ed when this binding's bytes were
+    /// verified, so a later publication can reuse the verification while the
+    /// file is unchanged.
+    fn with_verified_stamp(mut self, stamp: Option<VerifiedFileStamp>) -> Self {
+        self.verified_stamp = stamp;
+        self
     }
 
     /// Rebind this immutable backing under a successor manifest generation.
@@ -5521,12 +5533,16 @@ impl KeeperWriter {
         let preflight_manifest = manifest.clone();
         let preflight_protection = self.protection.clone();
         let schema = self.snapshot.schema();
+        // Segments the current snapshot verified are reused while their files
+        // are unchanged, so a commit hashes only what it adds (bd-sw905).
+        let retained = self.snapshot.segments().to_vec();
         let verified = spawn_blocking(move || {
             validate_proposed_manifest_segments(
                 &preflight_directory,
                 &preflight_manifest,
                 schema,
                 &preflight_protection,
+                &retained,
             )
         })
         .await?;
@@ -11570,11 +11586,71 @@ fn file_identity(_: &std::fs::Metadata) -> Option<FileIdentity> {
     None
 }
 
+/// A segment file's identity, length and change times, read from the
+/// descriptor whose bytes were then verified. A path that still stats to the
+/// same stamp names that file, neither resized nor written since: a write
+/// advances its mtime and ctime, and only the kernel sets ctime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VerifiedFileStamp {
+    identity: FileIdentity,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "platforms without inode numbers report None"
+)]
+fn verified_file_stamp(metadata: &std::fs::Metadata) -> Option<VerifiedFileStamp> {
+    use std::os::unix::fs::MetadataExt;
+    Some(VerifiedFileStamp {
+        identity: (metadata.dev(), metadata.ino()),
+        len: metadata.len(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    })
+}
+
+#[cfg(not(unix))]
+fn verified_file_stamp(_: &std::fs::Metadata) -> Option<VerifiedFileStamp> {
+    None
+}
+
+/// The current snapshot's binding of a segment this proposal binds unchanged,
+/// when its file still stats exactly as it did when that binding's bytes were
+/// verified: the publication preflight then has nothing new to hash
+/// (bd-sw905). Durable protection keeps its per-publication sidecar check, so
+/// it reuses nothing.
+fn reusable_verified_segment(
+    path: &Path,
+    manifest_segment: &ManifestSegment,
+    protection: &WriterProtection,
+    retained: &[RecoveredSegment],
+) -> Option<RecoveredSegment> {
+    #[cfg(feature = "durability")]
+    if matches!(protection, WriterProtection::Enabled { .. }) {
+        return None;
+    }
+    #[cfg(not(feature = "durability"))]
+    let _ = protection;
+    let segment = retained
+        .iter()
+        .find(|segment| segment.manifest == *manifest_segment)?;
+    let verified = segment.verified_stamp?;
+    let metadata = std::fs::symlink_metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)?;
+    (verified_file_stamp(&metadata)? == verified).then(|| segment.clone())
+}
+
 fn validate_proposed_manifest_segments(
     directory: &Path,
     manifest: &Manifest,
     schema: SchemaDescriptor,
     protection: &WriterProtection,
+    retained: &[RecoveredSegment],
 ) -> Result<Vec<VerifiedProposalSegment>, KeeperError> {
     let mut verified = Vec::new();
     verified
@@ -11586,16 +11662,24 @@ fn validate_proposed_manifest_segments(
         })?;
     for manifest_segment in &manifest.segments {
         let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
-        let (reader, identity) = SegmentReader::open_published_checked(
+        if let Some(segment) =
+            reusable_verified_segment(&path, manifest_segment, protection, retained)
+        {
+            let identity = segment.verified_stamp.map(|stamp| stamp.identity);
+            verified.push(VerifiedProposalSegment { segment, identity });
+            continue;
+        }
+        let (reader, stamp) = SegmentReader::open_published_checked(
             &path,
             schema,
             crate::segment::SegmentLimits::default(),
-            |_, file| Ok(file_identity(&file.metadata()?)),
+            |_, file| Ok(verified_file_stamp(&file.metadata()?)),
         )
         .map_err(|source| KeeperError::SegmentOpen {
             path: path.clone(),
             source,
         })?;
+        let identity = stamp.map(|stamp| stamp.identity);
         let file_xxh3 = fully_verified_file_witness(&path, &reader)?;
         validate_segment_witnesses(&path, manifest_segment, &reader, || Ok(file_xxh3))?;
         #[cfg(test)]
@@ -11633,15 +11717,14 @@ fn validate_proposed_manifest_segments(
                 });
             }
         }
-        #[cfg(not(feature = "durability"))]
-        let _ = protection;
         let segment = RecoveredSegment::bind(
             path,
             manifest_segment.clone(),
             reader,
             schema,
             authenticated_file_witness,
-        )?;
+        )?
+        .with_verified_stamp(stamp);
         verified.push(VerifiedProposalSegment { segment, identity });
     }
     Ok(verified)
@@ -11695,16 +11778,16 @@ fn open_manifest_segment(
     schema: SchemaDescriptor,
 ) -> Result<RecoveredSegment, KeeperError> {
     let path = directory.join(canonical_segment_name(manifest_segment.segment_id));
-    let (reader, authenticated_file_witness) = SegmentReader::open_published_checked(
+    let (reader, (authenticated_file_witness, stamp)) = SegmentReader::open_published_checked(
         &path,
         schema,
         crate::segment::SegmentLimits::default(),
         |reader, file| {
-            Ok(authenticate_segment_witness(
-                &path,
-                manifest_segment,
-                reader,
-                file,
+            // Stamp the descriptor before its bytes are hashed.
+            let stamp = verified_file_stamp(&file.metadata()?);
+            Ok((
+                authenticate_segment_witness(&path, manifest_segment, reader, file),
+                stamp,
             ))
         },
     )
@@ -11713,13 +11796,14 @@ fn open_manifest_segment(
         source,
     })?;
     let authenticated_file_witness = authenticated_file_witness?;
-    RecoveredSegment::bind(
+    Ok(RecoveredSegment::bind(
         path,
         manifest_segment.clone(),
         reader,
         schema,
         authenticated_file_witness,
-    )
+    )?
+    .with_verified_stamp(stamp))
 }
 
 /// Open every MANIFEST segment, verifying independent segments concurrently.
@@ -18384,6 +18468,7 @@ mod tests {
                 &manifest,
                 DEFAULT_SCHEMA,
                 &WriterProtection::Disabled,
+                &[],
             )
         };
 
@@ -18412,6 +18497,130 @@ mod tests {
         std::fs::rename(&replacement, &path)?;
         let snapshot = KeeperSnapshot::open_once_reusing(&directory, DEFAULT_SCHEMA, verified)?;
         assert!(!Arc::ptr_eq(&snapshot.segments()[0].reader, &backing));
+        Ok(())
+    }
+
+    /// bd-sw905: a publication hashes only what the writer's current snapshot
+    /// has not verified unchanged. A file replaced behind a new inode or
+    /// written in place is verified again, so in-place corruption is refused
+    /// rather than trusted through the earlier verification.
+    #[cfg(unix)]
+    #[test]
+    fn the_publication_preflight_hashes_only_segments_it_has_not_verified_unchanged() -> TestResult
+    {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let manifest = publish_fixture_segment(&directory, 0x5e9f_0001)?;
+        let added = write_identity_test_segment(&directory, 0x5e9f_0002, 2, 2, &[Some("added-a")])?;
+        let mut grown = manifest.clone();
+        grown.generation += 1;
+        grown.docid_high_watermark = 3;
+        grown.segments.push(added);
+        let preflight = |proposed: &Manifest, retained: &[RecoveredSegment]| {
+            validate_proposed_manifest_segments(
+                &directory,
+                proposed,
+                DEFAULT_SCHEMA,
+                &WriterProtection::Disabled,
+                retained,
+            )
+        };
+
+        // The retained segment is reused as bound; only the new one is opened.
+        let snapshot = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)?;
+        let retained = snapshot.segments();
+        let verified = preflight(&grown, retained)?;
+        assert!(Arc::ptr_eq(
+            &verified[0].segment.reader,
+            &retained[0].reader
+        ));
+        assert!(verified[1].segment.verified_stamp.is_some());
+        let unshared = preflight(&grown, &[])?;
+        assert!(!Arc::ptr_eq(
+            &unshared[0].segment.reader,
+            &retained[0].reader
+        ));
+
+        // A different binding of the same file is verified again.
+        let mut rebound = grown.clone();
+        rebound.segments[0].seal_seq += 1;
+        let verified = preflight(&rebound, retained)?;
+        assert!(!Arc::ptr_eq(
+            &verified[0].segment.reader,
+            &retained[0].reader
+        ));
+
+        // The same bytes behind a new inode are verified again.
+        let path = directory.join(canonical_segment_name(manifest.segments[0].segment_id));
+        let replacement = directory.join(".tmp-replacement");
+        std::fs::copy(&path, &replacement)?;
+        std::fs::rename(&replacement, &path)?;
+        let verified = preflight(&grown, retained)?;
+        assert!(!Arc::ptr_eq(
+            &verified[0].segment.reader,
+            &retained[0].reader
+        ));
+
+        // Bytes rewritten in place keep the inode but advance the change
+        // times. Past one coarse timestamp tick, corruption written in place
+        // is refused, not trusted through the snapshot's verification.
+        let snapshot = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)?;
+        let retained = snapshot.segments();
+        assert!(Arc::ptr_eq(
+            &preflight(&grown, retained)?[0].segment.reader,
+            &retained[0].reader
+        ));
+        std::thread::sleep(Duration::from_millis(50));
+        let mut bytes = std::fs::read(&path)?;
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .write_all(&bytes)?;
+        assert!(preflight(&grown, retained).is_err());
+        Ok(())
+    }
+
+    /// bd-sw905: a writer's publication keeps the snapshot binding of every
+    /// segment it leaves unchanged instead of reopening and rehashing it.
+    #[cfg(unix)]
+    #[test]
+    fn a_publication_keeps_the_bindings_of_segments_it_does_not_change() -> TestResult {
+        let index = tempdir()?;
+        let directory = index.path().to_path_buf();
+        let manifest = publish_fixture_segment(&directory, 0x5e9f_0003)?;
+        let added = encoded_identity_test_segment(0x5e9f_0004, 2, &[Some("added-b")])?;
+        let grown = durable_test_manifest(
+            3,
+            vec![manifest.segments[0].clone(), manifest_segment(&added, 2)],
+        );
+        let publish_directory = directory.clone();
+        run_with_test_cx(move |cx| async move {
+            let mut writer = KeeperWriter::open(&cx, &publish_directory, DEFAULT_SCHEMA)
+                .await
+                .map_err(|error| error.to_string())?;
+            let before =
+                Arc::clone(&writer.retained_snapshot_for_bookkeeping().segments()[0].reader);
+            let pending = added
+                .write_temp(&publish_directory)
+                .map_err(|error| error.to_string())?;
+            writer
+                .publish_segment(&cx, pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            let published = writer
+                .publish(&cx, &grown)
+                .await
+                .map_err(|error| error.to_string())?;
+            if published.segments().len() != 2
+                || !Arc::ptr_eq(&published.segments()[0].reader, &before)
+            {
+                return Err("the unchanged segment was reopened instead of kept".to_owned());
+            }
+            Ok::<(), String>(())
+        })
+        .map_err(io::Error::other)?;
         Ok(())
     }
 
