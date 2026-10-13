@@ -421,3 +421,186 @@ fn production_admission_samples_the_clock_instead_of_the_load_timestamp() {
         "a fresh-clock lookup must still reuse a proof within its lease"
     );
 }
+
+fn retention_fixture(ordinal: usize) -> Receipt {
+    let (_, _, mut receipt) = fixture();
+    let ordinal = u64::try_from(ordinal).expect("fixture ordinal");
+    receipt.binding.segment_id = ordinal;
+    receipt.binding.file_len = ordinal % 29 + 1;
+    receipt.identity.ino = ordinal + 1;
+    receipt.identity.len = receipt.binding.file_len;
+    receipt
+}
+
+#[test]
+fn retention_is_bounded_cost_prioritized_and_order_independent() {
+    let count = MAX_RECEIPTS + 37;
+    let candidates: Vec<_> = (0..count).map(retention_fixture).collect();
+    // A full sort is an independent oracle for the bounded streaming selector.
+    let mut ranked = candidates.clone();
+    ranked.sort_unstable_by_key(|receipt| {
+        std::cmp::Reverse((receipt.binding.file_len, receipt.binding))
+    });
+    ranked.truncate(MAX_RECEIPTS);
+    let expected: BTreeMap<_, _> = ranked
+        .into_iter()
+        .map(|receipt| (receipt.binding, receipt))
+        .collect();
+    let orders: [Vec<usize>; 3] = [
+        (0..count).collect(),
+        (0..count).rev().collect(),
+        (0..count)
+            .step_by(2)
+            .chain((1..count).step_by(2))
+            .collect(),
+    ];
+    for order in orders {
+        // No directory or platform clock is needed to exercise retention.
+        let mut book = ReceiptBook::load_at(Path::new("unused-cache"), Policy::default(), None);
+        for ordinal in order {
+            book.keep(candidates[ordinal].clone());
+            assert!(book.kept.len() <= MAX_RECEIPTS);
+            assert_eq!(book.kept.len(), book.kept_by_cost.len());
+        }
+        assert_eq!(book.kept, expected);
+        assert_eq!(
+            book.kept_by_cost,
+            expected
+                .keys()
+                .map(|binding| (binding.file_len, *binding))
+                .collect::<BTreeSet<_>>()
+        );
+    }
+}
+
+#[test]
+fn capacity_overflow_still_encodes_a_complete_v3_book() {
+    let uncapped: BTreeMap<_, _> = (0..=MAX_RECEIPTS)
+        .map(retention_fixture)
+        .map(|receipt| (receipt.binding, receipt))
+        .collect();
+    assert!(
+        encode(&uncapped, [42; 32]).is_none(),
+        "the old keep-all policy cannot persist this snapshot"
+    );
+    let mut book = ReceiptBook::load_at(Path::new("unused-cache"), Policy::default(), None);
+    for receipt in uncapped.into_values() {
+        book.keep(receipt);
+    }
+    assert_eq!(book.kept.len(), MAX_RECEIPTS);
+    let bytes = encode(&book.kept, [42; 32]).expect("bounded book must encode");
+    assert_eq!(
+        bytes.len(),
+        HEADER_BYTES + MAX_RECEIPTS * RECORD_BYTES + CHECKSUM_BYTES
+    );
+    assert!(bytes.len() <= MAX_BYTES);
+    assert!(bytes.len() + RECORD_BYTES > MAX_BYTES);
+    assert_eq!(&bytes[..8], MAGIC);
+    assert_eq!(decode(&bytes, [42; 32]), Some(book.kept));
+}
+
+#[test]
+fn replacing_a_retained_proof_neither_leaks_priority_entries_nor_renews_other_proofs() {
+    let mut book = ReceiptBook::load_at(Path::new("unused-cache"), Policy::default(), None);
+    for ordinal in 0..MAX_RECEIPTS {
+        book.keep(retention_fixture(ordinal));
+    }
+    let mut expected = book.kept.clone();
+    let mut replacement = expected.values().next().expect("full book").clone();
+    replacement.identity.ino += 100;
+    replacement.verified_boot_ns -= 1;
+    expected.insert(replacement.binding, replacement.clone());
+    for _ in 0..16 {
+        book.keep(replacement.clone());
+        assert_eq!(book.kept.len(), MAX_RECEIPTS);
+        assert_eq!(book.kept_by_cost.len(), MAX_RECEIPTS);
+    }
+    assert_eq!(book.kept, expected);
+
+    // Neither extreme length overflows a cost sum: costs are ordered, not added.
+    let mut expensive = retention_fixture(MAX_RECEIPTS);
+    expensive.binding.file_len = u64::MAX;
+    expensive.identity.len = u64::MAX;
+    book.keep(expensive.clone());
+    assert_eq!(book.kept.get(&expensive.binding), Some(&expensive));
+    assert_eq!(book.kept.len(), MAX_RECEIPTS);
+    assert_eq!(book.kept_by_cost.len(), MAX_RECEIPTS);
+    let before_miss = book.kept.clone();
+    let mut cheap = retention_fixture(MAX_RECEIPTS + 1);
+    cheap.binding.file_len = 0;
+    cheap.identity.len = 0;
+    book.keep(cheap);
+    assert_eq!(book.kept, before_miss);
+    assert_eq!(book.kept_by_cost.len(), MAX_RECEIPTS);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn oversized_snapshots_persist_hits_and_new_proofs_without_renewing_old_leases() {
+    let dir = private_dir();
+    let policy = Policy {
+        max_age: Duration::from_secs(60),
+        minimum_file_age: Duration::from_secs(10),
+    };
+    let mut first = ReceiptBook::load_at(dir.path(), policy, clock(1000, 200));
+    assert!(first.enabled());
+    let candidates: Vec<_> = (0..=MAX_RECEIPTS)
+        .map(|ordinal| {
+            let mut receipt = retention_fixture(ordinal);
+            receipt.binding.file_len = u64::try_from(ordinal).expect("ordinal") + 100;
+            receipt.identity.len = receipt.binding.file_len;
+            receipt
+        })
+        .collect();
+    for receipt in &candidates {
+        first.keep(
+            first
+                .verified(receipt.binding, receipt.identity, Some(receipt.identity))
+                .expect("fully checked fixture"),
+        );
+    }
+    assert_eq!(first.kept.len(), MAX_RECEIPTS);
+    first.persist();
+
+    let mut reopened = ReceiptBook::load_at(dir.path(), policy, clock(1000, 250));
+    assert_eq!(reopened.loaded.len(), MAX_RECEIPTS);
+    let cheap = &candidates[0];
+    let expensive = candidates.last().expect("nonempty snapshot");
+    assert!(reopened
+        .admitted_at(cheap.binding, cheap.identity, reopened.clock)
+        .is_none());
+    assert!(reopened
+        .admitted_at(expensive.binding, expensive.identity, reopened.clock)
+        .is_some());
+    for receipt in reopened.loaded.clone().into_values() {
+        let hit = reopened
+            .admitted_at(receipt.binding, receipt.identity, reopened.clock)
+            .expect("retained live proof");
+        assert_eq!(hit.verified_boot_ns, 200 * NANOS_PER_SECOND);
+        reopened.keep(hit);
+    }
+    // A new fully verified segment must still update an already-full book.
+    let mut added = retention_fixture(MAX_RECEIPTS + 1);
+    added.binding.file_len = u64::MAX;
+    added.identity.len = u64::MAX;
+    reopened.keep(
+        reopened
+            .verified(added.binding, added.identity, Some(added.identity))
+            .expect("new fully checked fixture"),
+    );
+    reopened.persist();
+
+    let expired = ReceiptBook::load_at(dir.path(), policy, clock(1000, 261));
+    assert_eq!(expired.loaded.len(), MAX_RECEIPTS);
+    assert_eq!(
+        expired.loaded[&expensive.binding].verified_boot_ns,
+        200 * NANOS_PER_SECOND
+    );
+    assert!(expired
+        .admitted_at(expensive.binding, expensive.identity, expired.clock)
+        .is_none());
+    let fresh = expired
+        .admitted_at(added.binding, added.identity, expired.clock)
+        .expect("only the freshly verified segment has a later lease");
+    assert_eq!(fresh.verified_boot_ns, 250 * NANOS_PER_SECOND);
+}

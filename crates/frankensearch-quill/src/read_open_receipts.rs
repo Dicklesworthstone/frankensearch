@@ -13,7 +13,7 @@
 //! Expiry uses `CLOCK_BOOTTIME`, not the adjustable wall clock. Boot and namespace
 //! identities prevent carrying a proof into a different clock or mount domain.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
 #[cfg(target_os = "linux")]
@@ -30,6 +30,9 @@ const MAX_BYTES: usize = 1 << 20;
 const RECORD_BYTES: usize = 12 * 8;
 const HEADER_BYTES: usize = 8 + 32 + 4;
 const CHECKSUM_BYTES: usize = 32;
+// A large snapshot must retain a useful, encodable subset, not disable future
+// cache writes when its complete receipt set outgrows the on-disk limit.
+const MAX_RECEIPTS: usize = (MAX_BYTES - HEADER_BYTES - CHECKSUM_BYTES) / RECORD_BYTES;
 #[cfg(target_os = "linux")]
 const BOOK: &str = "read-open-receipts-v3";
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -150,6 +153,9 @@ pub struct ReceiptBook {
     producer: [u8; 32],
     loaded: BTreeMap<Binding, Receipt>,
     kept: BTreeMap<Binding, Receipt>,
+    // Cost is fixed by the binding, so replacing a receipt cannot leave a
+    // stale priority entry. Both collections are bounded by MAX_RECEIPTS.
+    kept_by_cost: BTreeSet<(u64, Binding)>,
     policy: Policy,
     /// Conservative lower bound for newly verified receipts, not the time at
     /// which later segments are admitted from this book.
@@ -175,6 +181,7 @@ impl ReceiptBook {
             producer,
             loaded,
             kept: BTreeMap::new(),
+            kept_by_cost: BTreeSet::new(),
             policy,
             clock,
         }
@@ -236,7 +243,22 @@ impl ReceiptBook {
     }
 
     pub(crate) fn keep(&mut self, receipt: Receipt) {
+        // All records have the same encoded size. Prefer the largest files to
+        // maximize bytes covered by the bounded cache; full binding order
+        // breaks equal-cost ties independently of worker completion order.
+        // This changes retention ONLY: it never refreshes a proof's timestamp,
+        // changes its identity, or bypasses full verification on a cache miss.
+        self.kept_by_cost
+            .insert((receipt.binding.file_len, receipt.binding));
         self.kept.insert(receipt.binding, receipt);
+        if self.kept.len() > MAX_RECEIPTS
+            && let Some((_, binding)) = self.kept_by_cost.pop_first()
+        {
+            self.kept.remove(&binding);
+        }
+        // One ordered insertion and, at most, one eviction per segment:
+        // O(log MAX_RECEIPTS), not a scan of all previously retained receipts.
+        // There can be at most one transient entry above the capacity.
     }
 
     /// Publish only after the entire snapshot and its retained descriptors pass.
