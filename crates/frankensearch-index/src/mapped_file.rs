@@ -63,8 +63,7 @@ impl ReadOnlyMappedFile {
             )
             .into());
         }
-        let mut file = File::open(path)?;
-        ensure_same_file(&path_metadata, &file.metadata()?)?;
+        let mut file = open_same_regular_file(path, &path_metadata)?;
         let mmap = map_immutable(&file)?;
         inspect(Self { mmap }, &mut file)
     }
@@ -88,29 +87,49 @@ impl ReadOnlyMappedFile {
     }
 }
 
-#[cfg(unix)]
+// The path check alone cannot constrain the subsequent open: publication or
+// another directory writer can replace the entry between those operations.
+// In particular, a blocking open can wait on a substituted FIFO before fstat
+// gets a chance to reject it. A substituted symlink can even resolve back to
+// the original inode and pass an identity-only check.
+fn open_same_regular_file(path: &Path, expected: &std::fs::Metadata) -> io::Result<File> {
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    ensure_same_file(expected, &file.metadata()?)?;
+    Ok(file)
+}
+
 fn ensure_same_file(
     path_metadata: &std::fs::Metadata,
     opened: &std::fs::Metadata,
 ) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    if path_metadata.dev() != opened.dev() || path_metadata.ino() != opened.ino() {
-        return Err(io::Error::other(
-            "published artifact changed while it was being opened",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_same_file(_: &std::fs::Metadata, opened: &std::fs::Metadata) -> io::Result<()> {
+    // Check the actual descriptor on every platform, before mapping or
+    // invoking user validation. Path metadata is only pre-open evidence.
     if !opened.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "published artifact must be a regular file",
         ));
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        if path_metadata.dev() != opened.dev() || path_metadata.ino() != opened.ino() {
+            return Err(io::Error::other(
+                "published artifact changed while it was being opened",
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path_metadata;
     Ok(())
 }
 
@@ -229,6 +248,101 @@ mod tests {
         let error = ReadOnlyMappedFile::open_published(&path).expect_err("symlink must fail");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_same_inode_symlink_inserted_after_metadata() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("published.bin");
+        let retained = directory.path().join("retained.bin");
+        std::fs::write(&path, b"immutable original")?;
+        let expected = path.symlink_metadata()?;
+        std::fs::rename(&path, &retained)?;
+        std::os::unix::fs::symlink(&retained, &path)?;
+
+        // File::open would follow this link to the SAME inode: fstat identity
+        // agreement alone does not enforce the no-symlink publication rule.
+        assert!(open_same_regular_file(&path, &expected).is_err());
+        assert_eq!(std::fs::read(&retained)?, b"immutable original");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_different_regular_file_inserted_after_metadata() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("published.bin");
+        let retained = directory.path().join("retained.bin");
+        std::fs::write(&path, b"immutable original")?;
+        let expected = path.symlink_metadata()?;
+        std::fs::rename(&path, &retained)?;
+        std::fs::write(&path, b"different original")?;
+
+        let error = open_same_regular_file(&path, &expected).expect_err("identity changed");
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_regular_hard_link_identity_after_metadata() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("published.bin");
+        let retained = directory.path().join("retained.bin");
+        std::fs::write(&path, b"immutable original")?;
+        let expected = path.symlink_metadata()?;
+        std::fs::rename(&path, &retained)?;
+        std::fs::hard_link(&retained, &path)?;
+
+        let mut file = open_same_regular_file(&path, &expected)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        assert_eq!(bytes, b"immutable original");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inspected_open_sets_nonblock_before_validation() -> io::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("published.bin");
+        std::fs::write(&path, b"immutable original")?;
+        let mapped = ReadOnlyMappedFile::open_published_with_file(&path, |mapped, file| {
+            assert!(rustix::fs::fcntl_getfl(file)?.contains(rustix::fs::OFlags::NONBLOCK));
+            Ok::<_, io::Error>(mapped)
+        })?;
+        assert_eq!(mapped.as_bytes(), b"immutable original");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rejects_fifo_inserted_after_metadata() -> io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("published.bin");
+        let retained = directory.path().join("retained.bin");
+        std::fs::write(&path, b"immutable original")?;
+        let expected = path.symlink_metadata()?;
+        std::fs::rename(&path, &retained)?;
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        )?;
+
+        // Keep a Linux read/write peer so a regression cannot hang this test.
+        // The separate descriptor-flag test proves NONBLOCK is really set.
+        let _peer = File::options()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)?;
+        let error = open_same_regular_file(&path, &expected).expect_err("FIFO must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        Ok(())
     }
 
     #[test]
