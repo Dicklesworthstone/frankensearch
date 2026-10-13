@@ -935,6 +935,12 @@ pub const fn exit_code_for(err: &frankensearch_core::SearchError) -> i32 {
 
 /// Convert a [`SearchError`] into a structured
 /// [`OutputError`] with actionable suggestion and context.
+///
+/// Opaque provider, model-load, reranker, I/O and subsystem sources are never
+/// formatted for public output. Their original errors remain available to local
+/// callers through `SearchError`; only the outer failure class and bounded
+/// model label/path are reported here. This is not a redactor for arbitrary
+/// caller-authored `OutputError` values or the other structured diagnostic fields.
 #[must_use]
 pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
     use frankensearch_core::SearchError;
@@ -942,6 +948,22 @@ pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
     let code = error_code_for(err);
     let exit = exit_code_for(err);
     let message = match err {
+        // Do not format first and truncate later: Display is arbitrary code,
+        // can allocate without bounds, and can expose private provider bodies.
+        SearchError::EmbeddingFailed { model, .. } => format!(
+            "Embedding inference failed for {}.",
+            bounded_public_model_id(model)
+        ),
+        SearchError::ModelLoadFailed { .. } => {
+            "The selected model failed to load. Verify its artifacts and build support."
+                .to_owned()
+        }
+        SearchError::RerankFailed { model, .. } => format!(
+            "Reranking inference failed for {}.",
+            bounded_public_model_id(model)
+        ),
+        SearchError::Io(error) => format!("I/O operation failed ({:?}).", error.kind()),
+        SearchError::SubsystemError { .. } => "A search subsystem failed.".to_owned(),
         SearchError::UnverifiableRemoteSpace { producer, .. } => format!(
             "Embedding space from {} is unverifiable. Refuse semantic comparison; require a \
              producer-authenticated immutable identity, or use a verified local embedder or \
@@ -959,7 +981,23 @@ pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        _ => err.to_string(),
+        // Keep the established structured/local diagnostics unchanged. Spell
+        // out the remaining variants so adding another opaque source requires
+        // an explicit public-output decision instead of inheriting Display.
+        SearchError::EmbedderUnavailable { .. }
+        | SearchError::ModelNotFound { .. }
+        | SearchError::IndexCorrupted { .. }
+        | SearchError::IndexVersionMismatch { .. }
+        | SearchError::DimensionMismatch { .. }
+        | SearchError::QueryParseError { .. }
+        | SearchError::SearchTimeout { .. }
+        | SearchError::FederatedInsufficientResponses { .. }
+        | SearchError::RerankerUnavailable { .. }
+        | SearchError::InvalidConfig { .. }
+        | SearchError::HashMismatch { .. }
+        | SearchError::Cancelled { .. }
+        | SearchError::QueueFull { .. }
+        | SearchError::DurabilityDisabled => err.to_string(),
     };
 
     let field = match err {
@@ -1023,7 +1061,7 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
              Verify the replacement: fsfs download-models --model MODEL_ID --verify\n\
              Offline recovery: replace the affected entry in FRANKENSEARCH_MODEL_DIR with an approved, verified local copy.\n\
              Run fsfs doctor --format json before retrying semantic search.",
-            path.display()
+            bounded_public_model_path(path)
         )),
         SearchError::UnverifiableRemoteSpace { producer, .. } => Some(format!(
             "The embedding producer {:?} did not prove its canonical model identity.\n\
@@ -1123,16 +1161,41 @@ fn suggestion_for_error(err: &frankensearch_core::SearchError) -> Option<String>
 /// published by an fsfs whose lexical schema (analyzers) differs from this one.
 fn is_stale_lexical_schema(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
-    while let Some(error) = current {
+    // Inspect at most 64 typed nodes, including the first. Custom Error::source
+    // implementations may cycle; reporting an error must not loop indefinitely.
+    // This bounds traversal, not execution inside an arbitrary source() method.
+    for _ in 0..64 {
+        let Some(error) = current else {
+            return false;
+        };
         if matches!(
             error.downcast_ref::<frankensearch_quill::KeeperError>(),
             Some(frankensearch_quill::KeeperError::SchemaMismatch { .. })
         ) {
             return true;
         }
-        current = error.source();
+        // io::Error::source can skip the wrapped error itself. Inspect that
+        // typed payload before its source, without rendering either of them.
+        current = error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| error.source());
     }
     false
+}
+
+fn bounded_public_model_path(path: &std::path::Path) -> &str {
+    path.to_str()
+        .filter(|text| {
+            !text.is_empty()
+                && text.len() <= 1_024
+                && !text.chars().any(|ch| {
+                    ch.is_control()
+                        || matches!(ch, '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+                })
+        })
+        .unwrap_or("<redacted-model-path>")
 }
 
 fn bounded_public_producer(producer: &str) -> &str {
