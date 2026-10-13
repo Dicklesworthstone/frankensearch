@@ -1701,6 +1701,18 @@ impl TwoTierIndex {
                     "fast-tier ANN degraded to exact search"
                 );
             }
+            if self.ann_selected_wal_superseded_row(&hits) {
+                // A durable WAL replacement can outlive its main-file
+                // tombstone after a crash. Exact search excludes such a row
+                // before selection, so the next live row takes its slot
+                // (0dc3df2f); the graph only offers its k nearest physical
+                // rows, so the search defers to exact search (bd-1hp90).
+                debug!(
+                    k,
+                    "fast-tier ANN selected a row its resident WAL supersedes; using exact search"
+                );
+                return self.fast_tier().search_top_k(query_vec, k, None);
+            }
 
             return self.resolve_fast_ann_and_wal(hits, query_vec, k);
         }
@@ -1853,6 +1865,26 @@ impl TwoTierIndex {
         }
     }
 
+    /// Whether an ANN-selected live main row has a resident WAL replacement.
+    #[cfg(feature = "ann")]
+    fn ann_selected_wal_superseded_row(&self, ann_hits: &[VectorHit]) -> bool {
+        let fast = self.fast_tier();
+        if fast.wal_entries.is_empty() {
+            return false;
+        }
+        let base_index = fast.record_count();
+        let wal_doc_ids: HashSet<&str> = fast
+            .wal_entries
+            .iter()
+            .map(|entry| entry.doc_id.as_str())
+            .collect();
+        ann_hits.iter().any(|hit| {
+            usize::try_from(hit.index)
+                .is_ok_and(|position| position < base_index && !fast.is_deleted(position))
+                && wal_doc_ids.contains(hit.doc_id.as_str())
+        })
+    }
+
     #[cfg(feature = "ann")]
     fn resolve_fast_ann_and_wal(
         &self,
@@ -1887,9 +1919,9 @@ impl TwoTierIndex {
         //    exists (including a non-finite/corrupt version);
         // 4. deduplicate public doc_ids best-first.
         //
-        // Suppression must happen after physical top-k selection. Doing it
-        // earlier backfills a lower-ranked hit that canonical exact search
-        // deliberately does not return.
+        // A selected main row its WAL supersedes never reaches this point:
+        // the search defers to exact search, which excludes it before
+        // selection, so step 3 remains only as a safety net.
         for (wal_index, entry) in self.fast_tier().wal_entries.iter().enumerate() {
             let score = dot_product_f32_f32(&entry.embedding, query_vec)?;
             if !score.is_finite() {
@@ -4286,7 +4318,7 @@ mod tests {
 
     #[cfg(feature = "ann")]
     #[test]
-    fn ann_wal_shadowed_top_hit_stays_suppressed_through_post_build_tombstone() {
+    fn ann_wal_superseded_top_hit_yields_the_live_winner_through_post_build_tombstone() {
         use crate::wal::WalEntry;
 
         let dir = temp_index_dir("ann-wal-shadowed-top");
@@ -4317,21 +4349,28 @@ mod tests {
             .expect("path-opened fast tier");
         fast_tier.wal_entries.push(wal_entry.clone());
 
+        let ids = |hits: Vec<VectorHit>| {
+            hits.iter()
+                .map(|hit| hit.doc_id.as_str().to_owned())
+                .collect::<Vec<_>>()
+        };
+        // doc-a's main row is superseded, so the live doc-b takes its slot;
+        // doc-a's WAL version (-1.0) ranks below it.
         let normal_query = [1.0_f32, 0.0];
-        assert!(
-            index
+        assert_eq!(
+            ids(index
                 .fast_tier()
                 .search_top_k(&normal_query, 1, None)
-                .expect("canonical normal search")
-                .is_empty(),
-            "the physical main winner is shadowed after top-k selection"
+                .expect("canonical normal search")),
+            ["doc-b"],
+            "exact search excludes the superseded main row before selection"
         );
-        assert!(
-            index
+        assert_eq!(
+            ids(index
                 .search_fast(&normal_query, 1)
-                .expect("normal ANN search")
-                .is_empty(),
-            "normal ANN must not backfill after suppressing a WAL-shadowed winner"
+                .expect("normal ANN search")),
+            ["doc-b"],
+            "ANN must agree with exact search when its winner is superseded"
         );
         assert_eq!(index.ann_fallback_count(), 0);
 
@@ -4350,21 +4389,23 @@ mod tests {
             .expect("reopened path-opened fast tier")
             .wal_entries
             .push(wal_entry);
+        // doc-tombstone is deleted and doc-a's main row superseded, so doc-a's
+        // WAL version (0.0) outranks doc-b (-0.6).
         let tombstone_query = [0.0_f32, 1.0];
-        assert!(
-            index
+        assert_eq!(
+            ids(index
                 .fast_tier()
                 .search_top_k(&tombstone_query, 1, None)
-                .expect("canonical tombstone search")
-                .is_empty(),
-            "the exact main winner is still shadowed by the WAL"
+                .expect("canonical tombstone search")),
+            ["doc-a"],
+            "exact search returns the WAL version of the superseded winner"
         );
-        assert!(
-            index
+        assert_eq!(
+            ids(index
                 .search_fast(&tombstone_query, 1)
-                .expect("refreshed ANN search")
-                .is_empty(),
-            "the refreshed ANN path must preserve WAL suppression after tombstoning"
+                .expect("refreshed ANN search")),
+            ["doc-a"],
+            "the refreshed ANN path agrees with exact search after tombstoning"
         );
         assert_eq!(
             index.ann_fallback_count(),
