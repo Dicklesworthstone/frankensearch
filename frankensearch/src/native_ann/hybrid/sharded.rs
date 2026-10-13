@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::traits::Reranker;
-use frankensearch_fusion::{RrfConfig, blend_two_tier, rrf_fuse_for_vector_lane};
+use frankensearch_fusion::{blend_two_tier, rrf_fuse_for_vector_lane};
 
 use super::progressive::rerank::RerankRequest;
 use super::refinement::{admit_pair, checked_lexical};
@@ -14,6 +14,9 @@ use crate::native_ann::{NativeShardHit, NativeShardRow, NativeShardSet};
 use crate::{
     Cx, Embedder, LexicalRead, ScoreSource, ScoredResult, SearchError, SearchResult, VectorHit,
 };
+
+mod policy;
+use policy::{QueryPolicy, ShardFusion};
 
 /// A fused winner with separately scoped fast and quality physical locations.
 ///
@@ -102,7 +105,15 @@ impl NativeShardSet {
             checked_lexical(cx, lexical, text, budget),
         )
         .await?;
-        finish(cx, lexical, &batch, &fast, &[], k, is_hash, false).await
+        finish(
+            cx,
+            lexical,
+            &batch,
+            &fast,
+            &[],
+            QueryPolicy::default().fusion(k, is_hash, false),
+        )
+        .await
     }
 
     /// Search this shard set as the primary quality tier, without a fast tier.
@@ -168,7 +179,15 @@ impl NativeShardSet {
             ),
         )
         .await?;
-        finish(cx, lexical, &batch, &fast, &quality, k, is_hash, true).await
+        finish(
+            cx,
+            lexical,
+            &batch,
+            &fast,
+            &quality,
+            QueryPolicy::default().fusion(k, is_hash, true),
+        )
+        .await
     }
 
     /// Prepare lazy fast-then-quality retrieval without starting provider work.
@@ -202,6 +221,7 @@ impl NativeShardSet {
             text,
             k,
             budget: candidate_budget(k)?,
+            policy: QueryPolicy::default(),
             reranker: None,
             allowed_documents: None,
             state: State::Initial,
@@ -241,6 +261,7 @@ pub struct NativeShardedProgressiveSearch<'a> {
     text: &'a str,
     k: usize,
     budget: usize,
+    policy: QueryPolicy,
     reranker: Option<RerankRequest<'a>>,
     allowed_documents: Option<&'a BTreeSet<String>>,
     state: State,
@@ -271,18 +292,19 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         &self,
         shards: &NativeShardSet,
         embedder: &dyn Embedder,
+        ef: Option<usize>,
     ) -> SearchResult<Vec<NativeShardHit>> {
         match self.allowed_documents {
             Some(allowed) => {
                 shards
-                    .search_text_filtered(self.cx, embedder, self.text, self.budget, None, |id| {
+                    .search_text_filtered(self.cx, embedder, self.text, self.budget, ef, |id| {
                         allowed.contains(id)
                     })
                     .await
             }
             None => {
                 shards
-                    .search_text(self.cx, embedder, self.text, self.budget, None)
+                    .search_text(self.cx, embedder, self.text, self.budget, ef)
                     .await
             }
         }
@@ -292,7 +314,9 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
     ///
     /// The model runs once across the tier, not once per partition. `top_k`
     /// bounds its input window independently of the displayed page; retrieval
-    /// requests three times `max(k, top_k)` candidates per tier. This may change
+    /// requests `multiplier * max(k, top_k)` candidates per tier (default three).
+    /// Setting the multiplier before or after the reranker has the same effect.
+    /// This may change
     /// initial fusion relative to a smaller unreranked request. Final ordering
     /// moves the complete result envelope, keeping metadata and both row
     /// coordinates attached to their document. `result.index` stays `None`.
@@ -326,7 +350,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
                 "attach a positive rerank window before requesting any phase",
             ));
         }
-        self.budget = candidate_budget(self.k.max(top_k))?;
+        self.budget = self.policy.budget(self.k.max(top_k))?;
         self.reranker = Some(RerankRequest {
             reranker,
             text: text_fn,
@@ -393,7 +417,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         }
         let (fast, batch) = join_sources(
             self.cx,
-            self.vector_candidates(self.fast, self.fast_embedder),
+            self.vector_candidates(self.fast, self.fast_embedder, self.policy.fast_ef),
             checked_lexical(self.cx, self.lexical, self.text, self.budget),
         )
         .await?;
@@ -420,9 +444,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
             &batch,
             &fast,
             &[],
-            self.result_window(),
-            is_hash,
-            false,
+            self.policy.fusion(self.result_window(), is_hash, false),
         )
         .await?;
         checkpoint(self.cx, "native_ann.shards.initial_complete")?;
@@ -454,7 +476,9 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
                 "refinement requires its admitted quality tier",
             )
         })?;
-        let quality = self.vector_candidates(quality, embedder).await?;
+        let quality = self
+            .vector_candidates(quality, embedder, self.policy.quality_ef)
+            .await?;
         let candidates = NativePhaseCandidates {
             fast: pending.fast.len(),
             quality: quality.len(),
@@ -466,9 +490,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
             &pending.batch,
             &pending.fast,
             &quality,
-            self.result_window(),
-            is_hash,
-            true,
+            self.policy.fusion(self.result_window(), is_hash, true),
         )
         .await?;
         checkpoint(self.cx, "native_ann.shards.refined_complete")?;
@@ -599,24 +621,22 @@ async fn finish(
     batch: &LexicalCandidateBatch,
     fast: &[NativeShardHit],
     quality: &[NativeShardHit],
-    k: usize,
-    is_hash: bool,
-    blend: bool,
+    fusion: ShardFusion<'_>,
 ) -> SearchResult<Vec<NativeShardedResult>> {
     checkpoint(cx, "native_ann.shards.fusion")?;
     let fast_vectors = ranking_vectors(fast);
-    let vectors = if blend {
-        blend_two_tier(&fast_vectors, &ranking_vectors(quality), 0.7)
+    let vectors = if let Some(weight) = fusion.quality_weight {
+        blend_two_tier(&fast_vectors, &ranking_vectors(quality), weight)
     } else {
         fast_vectors
     };
     let mut fused = rrf_fuse_for_vector_lane(
         batch.results(),
         &vectors,
-        k,
+        fusion.k,
         0,
-        &RrfConfig::default(),
-        is_hash,
+        fusion.rrf,
+        fusion.is_hash,
     );
     // The ranking kernels use u32 indices but do not interpret them. Erase
     // their local-row placeholders BEFORE any metadata backend sees winners.
@@ -635,17 +655,17 @@ async fn finish(
         let fast = fast.get(result.doc_id.as_str());
         let quality = quality.get(result.doc_id.as_str());
         result.index = None;
-        result.fast_score = if is_hash {
+        result.fast_score = if fusion.is_hash {
             None
         } else {
             fast.map(|hit| hit.score)
         };
-        result.quality_score = if is_hash {
+        result.quality_score = if fusion.is_hash {
             None
         } else {
             quality.map(|hit| hit.score)
         };
-        if result.lexical_score.is_none() && !is_hash && quality.is_some() {
+        if result.lexical_score.is_none() && !fusion.is_hash && quality.is_some() {
             result.source = ScoreSource::SemanticQuality;
         }
         results.push(NativeShardedResult {
@@ -670,6 +690,8 @@ fn ranking_vectors(hits: &[NativeShardHit]) -> Vec<VectorHit> {
 
 #[cfg(test)]
 mod tests {
+    mod tuning;
+
     use super::*;
     use std::future::Future;
     use std::sync::Arc;
