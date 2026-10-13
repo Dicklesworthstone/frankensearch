@@ -198,8 +198,9 @@ async fn phases<W: Write>(
     frames: &mut Frames<'_, W>,
     filters: filter::Filters<'_>,
     deadline: Option<&frankensearch::native_ann::builder::deadline::NativeSearchDeadline>,
-    rerank: Option<&query::Rerank>,
+    policy: &query::Policy,
 ) -> std::result::Result<bool, Failure> {
+    let rerank = policy.reranker_for(mode);
     let scoped = query::within(cx, deadline, async {
         cohort::Prepared::prepare(index, cx, filters)
     })
@@ -209,6 +210,7 @@ async fn phases<W: Write>(
         "event": "started", "ok": true, "mode": mode, "limit": limit,
     });
     scoped.annotate(&mut started);
+    policy.annotate_full_query(mode, &mut started);
     if let Some(rerank) = rerank {
         rerank.annotate(&mut started);
     }
@@ -221,20 +223,9 @@ async fn phases<W: Write>(
         frames.partial = true;
         return Ok(false);
     }
-    let mut stream = rerank
-        .map_or_else(
-            || scoped.progressive(cx, &request.query, limit),
-            |rerank| {
-                scoped.progressive_with_reranker(
-                    cx,
-                    &request.query,
-                    limit,
-                    rerank.model.as_ref(),
-                    rerank.window,
-                )
-            },
-        )
-        .map_err(|error| Failure::Query(error.into()))?;
+    let mut stream = policy
+        .progressive(&scoped, cx, &request.query, limit)
+        .map_err(Failure::Query)?;
     let mut degraded = false;
     while !stream.is_finished() {
         // One deadline, not a renewed timeout per phase. Do not time output:
@@ -287,6 +278,7 @@ async fn phases<W: Write>(
             }
         };
         scoped.annotate(&mut payload);
+        policy.annotate_full_query(mode, &mut payload);
         if let Some(rerank) = rerank {
             rerank.annotate(&mut payload);
         }
@@ -340,7 +332,7 @@ pub async fn stream_one<'i, W: Write>(
             &mut frames,
             [base_filter, request.filter.as_ref()],
             deadline.as_ref(),
-            policy.reranker_for(mode),
+            policy,
         )
         .await
     }
@@ -403,6 +395,7 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
         "rerank_window": policy.rerank.as_ref().map(|r| r.window),
     });
     index.annotate(&mut ready);
+    policy.annotate_full_query(Mode::Full, &mut ready);
     emit(output, &ready)?;
     drop(initial);
     let mut request_line = Vec::new();

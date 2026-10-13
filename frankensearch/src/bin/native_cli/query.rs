@@ -18,6 +18,9 @@ use super::{
 
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
+mod tuning;
+pub use tuning::FullQuery;
+
 /// A server budget is both the default and a ceiling on request overrides.
 /// No configured budget preserves the previous unbounded-query policy.
 #[derive(Default)]
@@ -25,6 +28,7 @@ pub struct Policy {
     pub(super) maximum_ms: Option<u64>,
     pub(super) timer: Option<TimerDriverHandle>,
     pub(super) rerank: Option<Rerank>,
+    pub(super) full_query: Option<FullQuery>,
 }
 
 impl Policy {
@@ -130,7 +134,7 @@ impl Rerank {
     }
 }
 
-/// Buffered full-mode reranking is strict: every requested stage must succeed.
+/// Tuned or reranked full-mode collection is strict: all stages must succeed.
 /// The phase label comes from the phase actually delivered, so an empty pool is
 /// not described as reranked when the native engine correctly skipped inference.
 #[allow(clippy::too_many_arguments)]
@@ -146,7 +150,8 @@ pub async fn buffered<'i>(
     let index = index.into();
     let deadline = policy.start(cx, None)?;
     within(cx, deadline.as_ref(), async {
-        let Some(rerank) = policy.reranker_for(mode) else {
+        let rerank = policy.reranker_for(mode);
+        if rerank.is_none() && (mode != Mode::Full || policy.full_query.is_none()) {
             if let cohort::Index::Single(index) = index {
                 return search(index, cx, text, mode, limit, filters).await;
             }
@@ -154,16 +159,10 @@ pub async fn buffered<'i>(
             return cohort::Prepared::prepare(index, cx, filters)?
                 .search(cx, text, mode, limit)
                 .await;
-        };
+        }
         validate_query(text)?;
         let scoped = cohort::Prepared::prepare(index, cx, filters)?;
-        let mut stream = scoped.progressive_with_reranker(
-            cx,
-            text,
-            limit,
-            rerank.model.as_ref(),
-            rerank.window,
-        )?;
+        let mut stream = policy.progressive(&scoped, cx, text, limit)?;
         let mut final_page = None;
         while let Some(phase) = stream.next_phase().await? {
             let (phase, results, evaluated) = match phase {
@@ -184,7 +183,10 @@ pub async fn buffered<'i>(
         }
         let mut payload = final_page.ok_or_else(|| bad("native search returned no phase"))?;
         scoped.annotate(&mut payload);
-        rerank.annotate(&mut payload);
+        if let Some(rerank) = rerank {
+            rerank.annotate(&mut payload);
+        }
+        policy.annotate_full_query(mode, &mut payload);
         Ok(payload)
     })
     .await
