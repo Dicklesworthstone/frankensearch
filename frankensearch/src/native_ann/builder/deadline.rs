@@ -23,6 +23,9 @@ use crate::{Cx, ScoredResult, SearchError, SearchResult};
 mod progressive;
 pub use progressive::NativeDeadlineProgressiveSearch;
 
+/// Deadline-bounded queries over complete native shard inventories.
+pub mod sharded;
+
 /// A single absolute query deadline in an explicitly retained timer domain.
 ///
 /// Cloning shares the same expiry; it does not grant another budget. This bounds
