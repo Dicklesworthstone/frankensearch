@@ -51,6 +51,23 @@ enum PeerOutcome {
     Shutdown,
 }
 
+/// A failed search is not authority to stop the daemon. Providers can return
+/// request-local cancellation without cancelling the listener's shared Cx.
+/// Only an acknowledged control or the owner's checkpoint ends the service.
+/// This reports connection disposition, never successful search completion;
+/// the failed peer is closed without inventing or replaying a response.
+fn stop_after_peer(cx: &Cx, result: SearchResult<PeerOutcome>) -> SearchResult<bool> {
+    match result {
+        Ok(PeerOutcome::Shutdown) => Ok(true),
+        Ok(PeerOutcome::Search) => Ok(false),
+        Err(error) => {
+            retained_search_checkpoint(cx)?;
+            tracing::debug!(%error, "complete-generation daemon client ended");
+            Ok(false)
+        }
+    }
+}
+
 /// Keep the singleton lock through listener teardown. The lock file is never
 /// unlinked: replacing it would let two processes lock different inodes.
 struct BoundCompleteSocket {
@@ -430,12 +447,8 @@ impl FsfsRuntime {
                             cache_enabled.then_some(cache),
                         ))
                         .await;
-                        match result {
-                            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                            Err(error) => {
-                                tracing::debug!(%error, "complete-generation forwarded client ended");
-                            }
-                            Ok(_) => {}
+                        if stop_after_peer(cx, result)? {
+                            return Ok(());
                         }
                         last_activity = Instant::now();
                         continue;
@@ -511,15 +524,8 @@ impl FsfsRuntime {
                         },
                     ))
                     .await;
-                    match result {
-                        Ok(PeerOutcome::Shutdown) => return Ok(()),
-                        Ok(PeerOutcome::Search) => {}
-                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                        Err(error) => {
-                            // A broken/slow client does not take down the listener
-                            // or strand a task holding the selected generation.
-                            tracing::debug!(%error, "complete-generation daemon client ended");
-                        }
+                    if stop_after_peer(cx, result)? {
+                        return Ok(());
                     }
                     last_activity = Instant::now();
                 }
@@ -640,6 +646,7 @@ where
     F: FnOnce(SearchServeRequest, Option<streaming::PhaseWriter>) -> Fut,
     Fut: Future<Output = SearchResult<Option<T>>>,
 {
+    retained_search_checkpoint(cx)?;
     match control::is_shutdown_request(bytes) {
         Ok(true) => {
             // No model/search work and no selection refresh for an explicit
@@ -681,7 +688,9 @@ where
                     let result = run_request(
                         cx,
                         search_timeout,
-                        streaming::drive(cx, &output, execute(request, Some(output.clone()))),
+                        streaming::drive(cx, &output, async {
+                            execute(request, Some(output.clone())).await
+                        }),
                     )
                     .await;
                     match result {
@@ -703,7 +712,18 @@ where
                 }
             } else {
                 retained_search_checkpoint(cx)?;
-                match run_request(cx, search_timeout, execute(request, None)).await {
+                // Monitor the response half even before there is anything to
+                // write. Keep executor setup lazy, inside both the connection
+                // and deadline checks. The buffered executor receives no writer:
+                // this driver cannot introduce stream/probe bytes into its reply.
+                let output = streaming::PhaseWriter::new(peer)?;
+                let result = run_request(
+                    cx,
+                    search_timeout,
+                    streaming::drive(cx, &output, async { execute(request, None).await }),
+                )
+                .await;
+                match result {
                     Ok(Some(response)) => match encode_response(&response) {
                         Ok(bytes) => bytes,
                         Err(error) => encode_response(&FsfsRuntime::search_serve_error_response(
@@ -1526,6 +1546,297 @@ mod tests {
                 assert!(
                     matches!(result, Err(SearchError::Io(error)) if error.kind() == ErrorKind::TimedOut)
                 );
+            }
+        });
+    }
+
+    #[test]
+    fn raw_disconnected_clients_never_construct_the_executor() {
+        use std::cell::Cell;
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            for streamed in [false, true] {
+                let (client, mut server) = UnixStream::pair().unwrap();
+                server.set_nonblocking(true).unwrap();
+                drop(client);
+                let called = Cell::new(false);
+                let released = Arc::new(AtomicBool::new(false));
+                let owned = MarkReleased(Arc::clone(&released));
+                let bytes = format!("{{\"query\":\"abandoned\",\"stream\":{streamed}}}\n");
+                let mut request = Box::pin(serve_peer_bytes::<serde_json::Value, _, _>(
+                    &cx,
+                    &mut server,
+                    Duration::from_secs(60),
+                    bytes.as_bytes(),
+                    |_| Duration::from_secs(60),
+                    |_, _| {
+                        // This is synchronous setup, not merely the first poll
+                        // of the returned future. It too must remain uncalled.
+                        called.set(true);
+                        async move {
+                            let _owned = owned;
+                            std::future::pending().await
+                        }
+                    },
+                ));
+                assert!(matches!(
+                    request.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(SearchError::Io(_)))
+                ));
+                drop(request);
+                assert!(!called.get(), "stream={streamed}");
+                assert!(released.load(Ordering::SeqCst));
+                retained_search_checkpoint(&cx).unwrap();
+            }
+        });
+    }
+
+    fn local_provider_cancel() -> SearchError {
+        SearchError::Cancelled {
+            phase: "test.provider_request".to_owned(),
+            reason: "only this inference request was cancelled".to_owned(),
+        }
+    }
+
+    #[test]
+    fn listener_distinguishes_request_cancellation_from_owned_shutdown() {
+        run_test_with_cx(|cx| async move {
+            for error in [
+                local_provider_cancel(),
+                complete_cli_error("test_admission", "rejected generation"),
+                SearchError::Io(io::Error::new(ErrorKind::BrokenPipe, "peer left")),
+                SearchError::Io(io::Error::new(ErrorKind::TimedOut, "request expired")),
+            ] {
+                assert!(!stop_after_peer(&cx, Err(error)).unwrap());
+                retained_search_checkpoint(&cx).unwrap();
+            }
+            assert!(!stop_after_peer(&cx, Ok(PeerOutcome::Search)).unwrap());
+            assert!(stop_after_peer(&cx, Ok(PeerOutcome::Shutdown)).unwrap());
+
+            // The listener's own cancellation cannot be swallowed by any
+            // request error, including a simultaneous ordinary I/O failure.
+            for error in [
+                local_provider_cancel(),
+                SearchError::Io(io::Error::new(ErrorKind::BrokenPipe, "peer left")),
+            ] {
+                cx.set_cancel_requested(true);
+                let result = stop_after_peer(&cx, Err(error));
+                cx.set_cancel_requested(false);
+                assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            }
+        });
+    }
+
+    #[test]
+    fn locally_cancelled_raw_search_ends_only_its_connection_without_fake_success() {
+        run_test_with_cx(|cx| async move {
+            for streamed in [false, true] {
+                let bytes = format!("{{\"query\":\"cancel one\",\"stream\":{streamed}}}\n");
+                let (mut client, mut server) = pair(bytes.as_bytes());
+                let result = serve_peer::<serde_json::Value, _, _>(
+                    &cx,
+                    &mut server,
+                    Duration::from_secs(1),
+                    |_, output| async move {
+                        if let Some(mut writer) = output {
+                            writer.write_all(b"{\"phase\":\"initial\"}\n")?;
+                            writer.flush()?;
+                        }
+                        Err(local_provider_cancel())
+                    },
+                )
+                .await;
+                assert!(matches!(&result, Err(SearchError::Cancelled { phase, .. })
+                    if phase == "test.provider_request"));
+                assert!(!stop_after_peer(&cx, result).unwrap());
+                drop(server);
+                let mut received = Vec::new();
+                client.read_to_end(&mut received).unwrap();
+                // There is no invented success/terminal or buffered envelope
+                // appended to a partial stream. EOF remains a failed request.
+                let expected: &[u8] = if streamed {
+                    b"{\"phase\":\"initial\"}\n"
+                } else {
+                    b""
+                };
+                assert_eq!(received, expected);
+
+                let (client, mut server) = pair(b"{\"query\":\"still serving\"}\n");
+                let result = serve_peer(&cx, &mut server, Duration::from_secs(1), |_, _| async {
+                    Ok(Some(serde_json::json!({"ok": true, "query": "still serving"})))
+                })
+                .await;
+                assert!(!stop_after_peer(&cx, result).unwrap());
+                assert_eq!(response(client)["query"], "still serving");
+            }
+        });
+    }
+
+    #[test]
+    fn owner_cancellation_during_raw_completion_stops_service_without_output() {
+        run_test_with_cx(|cx| async move {
+            for fail in [false, true] {
+                let (mut client, mut server) = pair(b"{\"query\":\"owner shutdown\"}\n");
+                client.set_nonblocking(true).unwrap();
+                let result = serve_peer::<serde_json::Value, _, _>(
+                    &cx,
+                    &mut server,
+                    Duration::from_secs(1),
+                    |_, _| async {
+                        cx.set_cancel_requested(true);
+                        if fail {
+                            Err(local_provider_cancel())
+                        } else {
+                            Ok(Some(serde_json::json!({"ok": true})))
+                        }
+                    },
+                )
+                .await;
+                assert!(matches!(&result, Err(SearchError::Cancelled { .. })));
+                let stopped = stop_after_peer(&cx, result);
+                cx.set_cancel_requested(false);
+                assert!(matches!(stopped, Err(SearchError::Cancelled { .. })));
+                assert_eq!(client.read(&mut [0; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+            }
+        });
+    }
+
+    #[test]
+    fn raw_pending_disconnect_releases_work_before_the_next_request() {
+        use std::cell::Cell;
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            let (client, mut server) = UnixStream::pair().unwrap();
+            server.set_nonblocking(true).unwrap();
+            let polls = Cell::new(0);
+            let released = Arc::new(AtomicBool::new(false));
+            let owned = MarkReleased(Arc::clone(&released));
+            let mut request = Box::pin(serve_peer_bytes::<serde_json::Value, _, _>(
+                &cx,
+                &mut server,
+                Duration::from_secs(60),
+                b"{\"query\":\"pending\"}\n",
+                |_| Duration::from_secs(60),
+                |_, output| {
+                    assert!(output.is_none());
+                    async {
+                        let _owned = owned;
+                        poll_fn(|_| {
+                            polls.set(polls.get() + 1);
+                            Poll::Pending
+                        })
+                        .await
+                    }
+                },
+            ));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(request.as_mut().poll(&mut task).is_pending());
+            assert_eq!(polls.get(), 1);
+            drop(client);
+            // No model wakeup or elapsed deadline: the next owning poll must
+            // observe the actual socket and drop, not poll, the pending model.
+            assert!(matches!(
+                request.as_mut().poll(&mut task),
+                Poll::Ready(Err(SearchError::Io(_)))
+            ));
+            drop(request);
+            assert_eq!(polls.get(), 1);
+            assert!(released.load(Ordering::SeqCst));
+            retained_search_checkpoint(&cx).unwrap();
+
+            let (client, mut server) = pair(b"{\"query\":\"healthy\"}\n");
+            serve_peer(&cx, &mut server, Duration::from_secs(1), |_, output| async move {
+                assert!(output.is_none());
+                Ok(Some(serde_json::json!({"ok": true, "query": "healthy"})))
+            })
+            .await
+            .unwrap();
+            assert_eq!(response(client)["query"], "healthy");
+        });
+    }
+
+    #[test]
+    fn raw_half_closed_clients_keep_exact_buffered_replies_and_no_probe_bytes() {
+        run_test_with_cx(|cx| async move {
+            for fail in [false, true] {
+                let (mut client, mut server) = pair(b"{\"query\":\"one reply\"}\n");
+                let outcome = serve_peer::<serde_json::Value, _, _>(
+                    &cx,
+                    &mut server,
+                    Duration::from_secs(1),
+                    |request, output| async move {
+                        assert!(output.is_none());
+                        if fail {
+                            Err(complete_cli_error("test_refusal", "original refusal"))
+                        } else {
+                            Ok(Some(serde_json::json!({"ok": true, "query": request.query})))
+                        }
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(outcome, PeerOutcome::Search);
+                drop(server);
+                let mut bytes = Vec::new();
+                client.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes.iter().filter(|&&byte| byte == b'\n').count(), 1);
+                let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(value["ok"], !fail);
+                assert_eq!(value["query"], "one reply");
+                assert!(value.get("event").is_none());
+                if fail {
+                    assert!(value.to_string().contains("original refusal"));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn raw_expired_or_cancelled_requests_do_not_run_executor_setup() {
+        use std::cell::Cell;
+
+        run_test_with_cx(|cx| async move {
+            for streamed in [false, true] {
+                for cancel in [false, true] {
+                    let (mut client, mut server) = UnixStream::pair().unwrap();
+                    server.set_nonblocking(true).unwrap();
+                    client.set_nonblocking(true).unwrap();
+                    let called = Cell::new(false);
+                    let bytes = format!("{{\"query\":\"no work\",\"stream\":{streamed}}}\n");
+                    cx.set_cancel_requested(cancel);
+                    let result = serve_peer_bytes(
+                        &cx,
+                        &mut server,
+                        Duration::from_secs(1),
+                        bytes.as_bytes(),
+                        |_| Duration::ZERO,
+                        |_, _| {
+                            called.set(true);
+                            std::future::ready(Ok(Some(serde_json::Value::Null)))
+                        },
+                    )
+                    .await;
+                    cx.set_cancel_requested(false);
+                    assert!(!called.get(), "stream={streamed}, cancel={cancel}");
+                    if cancel {
+                        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                        assert_eq!(
+                            client.read(&mut [0; 1]).unwrap_err().kind(),
+                            ErrorKind::WouldBlock
+                        );
+                    } else {
+                        assert_eq!(result.unwrap(), PeerOutcome::Search);
+                        client.set_nonblocking(false).unwrap();
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .unwrap();
+                        let failure = response(client);
+                        assert_eq!(failure["ok"], false);
+                        assert!(failure.to_string().contains("search deadline exceeded"));
+                    }
+                }
             }
         });
     }
