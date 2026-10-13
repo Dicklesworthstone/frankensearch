@@ -13,6 +13,8 @@ pub mod batch_coalescer;
 #[cfg(feature = "bundled-default-models")]
 pub mod bundled_default_models;
 pub mod cached_embedder;
+pub mod coalescing_embedder;
+pub use coalescing_embedder::{CoalescingDispatcher, CoalescingEmbedder};
 pub mod model_cache;
 pub mod model_manifest;
 pub mod model_registry;
