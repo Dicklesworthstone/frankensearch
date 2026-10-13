@@ -391,7 +391,7 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
         "activation_enabled": controls.controls.activation,
         "updates_enabled": controls.controls.updates,
         "model_migration_enabled": controls.migration.is_some(),
-        "model_migration_supported": matches!(&initial, live::Snapshot::Single(_)),
+        "model_migration_supported": true,
         "update_max_mutations": warm_update::MAX_MUTATIONS,
         "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),
