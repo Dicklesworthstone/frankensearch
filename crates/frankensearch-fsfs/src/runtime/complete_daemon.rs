@@ -43,6 +43,9 @@ mod streaming;
 #[path = "complete_daemon_forward.rs"]
 mod forwarding;
 
+#[path = "complete_daemon/admission.rs"]
+mod admission;
+
 static STREAM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,8 +378,12 @@ impl FsfsRuntime {
         }))
     }
 
-    /// Serve one buffered or progressive request per connection until cancellation or idle
-    /// expiry. No detached worker owns a reader, socket, or request after return.
+    /// Frame up to eight waiting connections while one search owns the retained
+    /// resources. Incomplete senders do not block other clients, and an exactly
+    /// decoded shutdown can interrupt pending execution before acknowledgment.
+    /// Intake/queue time is bounded separately from each search's delivery
+    /// budget. No detached worker owns a reader, socket, or request after return.
+    #[allow(clippy::future_not_send)] // All framing and search futures remain on this task.
     pub(super) async fn run_complete_generation_daemon(
         &self,
         cx: &Cx,
@@ -398,146 +405,143 @@ impl FsfsRuntime {
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         let idle_timeout = control::idle_timeout(self.cli_input.daemon_idle_timeout_ms);
         let peer_timeout = Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS);
-        let mut last_activity = Instant::now();
+        let mut intake = admission::Intake::new(peer_timeout);
         loop {
             retained_search_checkpoint(cx)?;
-            match bound.listener.accept() {
-                Ok((mut peer, _)) => {
-                    peer.set_nonblocking(true)?;
-                    let session = &mut session;
-                    let cache = &mut cache;
-                    let bytes = match read_request(cx, &mut peer, peer_timeout).await {
-                        Ok(bytes) => bytes,
-                        Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                        Err(error) => {
-                            tracing::debug!(%error, "complete-generation daemon request ended");
-                            last_activity = Instant::now();
-                            continue;
-                        }
-                    };
-                    if is_ready_probe(&bytes) {
-                        // The legacy daemon's readiness probe: pid, the admitted
-                        // vector generation and whether a semantic embedder is
-                        // loaded yet, answered without a search or a refresh.
-                        let ready = encode_response(&Self::search_serve_ready_event(
-                            session.reader.runtime.cli_input.format.to_string(),
-                            &session.reader.resources,
-                        ))?;
-                        match write_response(cx, &mut peer, &ready, peer_timeout).await {
-                            Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                            Err(error) => {
-                                tracing::debug!(%error, "complete-generation readiness probe ended");
-                            }
-                            Ok(()) => {}
-                        }
-                        last_activity = Instant::now();
-                        continue;
-                    }
-                    if forwarding::is_forwarded(&bytes) {
-                        // Forwarded and raw requests share the same admitted
-                        // generation and bounded hot cache. The forwarder clears
-                        // it before using a newly selected generation.
-                        let result = Box::pin(forwarding::serve(
-                            cx,
-                            self,
-                            session,
-                            &mut peer,
-                            &bytes,
-                            peer_timeout,
-                            cache_enabled.then_some(cache),
-                        ))
-                        .await;
-                        if stop_after_peer(cx, result)? {
-                            return Ok(());
-                        }
-                        last_activity = Instant::now();
-                        continue;
-                    }
-                    let result = Box::pin(serve_peer_bytes(
+            let Some(request) = intake.next(cx, &bound.listener, idle_timeout).await? else {
+                return Ok(());
+            };
+            let shutdown = request.is_shutdown();
+            let (mut peer, bytes) = request.into_parts();
+            if shutdown {
+                // An acknowledged stop must not subsequently be relabelled by
+                // a driver checkpoint. Only the strict decoder mints this flag.
+                let result = write_response(cx, &mut peer, control::SHUTDOWN_RESPONSE, peer_timeout)
+                    .await
+                    .map(|()| PeerOutcome::Shutdown);
+                if stop_after_peer(cx, result)? {
+                    return Ok(());
+                }
+                intake.completed();
+                continue;
+            }
+            let execution = async {
+                let session = &mut session;
+                let cache = &mut cache;
+                if is_ready_probe(&bytes) {
+                    // Inspect the admitted resources only while owning them;
+                    // a readiness probe never races an in-flight refresh.
+                    let ready = encode_response(&Self::search_serve_ready_event(
+                        session.reader.runtime.cli_input.format.to_string(),
+                        &session.reader.resources,
+                    ))?;
+                    write_response(cx, &mut peer, &ready, peer_timeout).await?;
+                    return Ok(PeerOutcome::Search);
+                }
+                if forwarding::is_forwarded(&bytes) {
+                    // Forwarded and raw requests retain the same generation,
+                    // cache, configuration admission and no-replay contracts.
+                    return Box::pin(forwarding::serve(
                         cx,
+                        self,
+                        session,
                         &mut peer,
-                        peer_timeout,
                         &bytes,
-                        |request| self.complete_request_delivery_budget(request),
-                        |request, output| async move {
-                            // A cached request must pass selection admission too.
-                            // Refresh never swaps on failure and we never consult
-                            // old cache/resources after a failed refresh.
-                            if session.refresh(cx).await? {
-                                cache.clear();
-                            }
-                            if let Some(mut output) = output {
-                                // Reuse direct streaming, including its producer
-                                // annotations, phase ordering and terminal frames.
-                                // Runtime paths and resources retain one generation;
-                                // the client's search policy applies as it does to a
-                                // buffered request.
-                                let mut runtime = session
-                                    .reader
-                                    .runtime
-                                    .with_search_serve_request_policy(&request)?;
-                                runtime.prepare_search_reranker(cx).await?;
-                                runtime.cli_input.command = crate::CliCommand::Search;
-                                runtime.cli_input.format = crate::OutputFormat::Jsonl;
-                                runtime.cli_input.stream = true;
-                                runtime.cli_input.daemon = false;
-                                runtime.cli_input.daemon_socket = None;
-                                runtime.cli_input.query = Some(request.query.clone());
-                                let limit =
-                                    request.limit.unwrap_or(runtime.config.search.default_limit);
-                                let stream_id = format!(
-                                    "complete-{}-{}-{}",
-                                    pressure_timestamp_ms(),
-                                    std::process::id(),
-                                    STREAM_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-                                );
-                                runtime
-                                    .run_search_stream_command_with_writer(
-                                        cx,
-                                        &request.query,
-                                        limit,
-                                        &stream_id,
-                                        &mut output,
-                                        Some((
-                                            &mut session.reader.resources,
-                                            SearchExecutionFlags {
-                                                include_snippets: true,
-                                                persist_explain_session: false,
-                                            },
-                                        )),
-                                    )
-                                    .await?;
-                                return Ok(None);
-                            }
-                            session
-                                .reader
-                                .runtime
-                                .execute_search_serve_request(
-                                    cx,
-                                    request,
-                                    &mut session.reader.resources,
-                                    cache,
-                                    cache_enabled,
-                                )
-                                .await
-                                .map(Some)
-                        },
+                        peer_timeout,
+                        cache_enabled.then_some(cache),
                     ))
                     .await;
-                    if stop_after_peer(cx, result)? {
-                        return Ok(());
-                    }
-                    last_activity = Instant::now();
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    if idle_timeout.is_some_and(|timeout| last_activity.elapsed() >= timeout) {
-                        return Ok(());
-                    }
-                    asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL).await;
+                Box::pin(serve_peer_bytes(
+                    cx,
+                    &mut peer,
+                    peer_timeout,
+                    &bytes,
+                    |request| self.complete_request_delivery_budget(request),
+                    |request, output| async move {
+                        // A cached request must pass selection admission too.
+                        // Refresh never swaps on failure and we never consult
+                        // old cache/resources after a failed refresh.
+                        if session.refresh(cx).await? {
+                            cache.clear();
+                        }
+                        if let Some(mut output) = output {
+                            // Reuse direct streaming, including its producer
+                            // annotations, phase ordering and terminal frames.
+                            let mut runtime = session
+                                .reader
+                                .runtime
+                                .with_search_serve_request_policy(&request)?;
+                            runtime.prepare_search_reranker(cx).await?;
+                            runtime.cli_input.command = crate::CliCommand::Search;
+                            runtime.cli_input.format = crate::OutputFormat::Jsonl;
+                            runtime.cli_input.stream = true;
+                            runtime.cli_input.daemon = false;
+                            runtime.cli_input.daemon_socket = None;
+                            runtime.cli_input.query = Some(request.query.clone());
+                            let limit = request.limit.unwrap_or(runtime.config.search.default_limit);
+                            let stream_id = format!(
+                                "complete-{}-{}-{}",
+                                pressure_timestamp_ms(),
+                                std::process::id(),
+                                STREAM_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                            );
+                            runtime
+                                .run_search_stream_command_with_writer(
+                                    cx,
+                                    &request.query,
+                                    limit,
+                                    &stream_id,
+                                    &mut output,
+                                    Some((
+                                        &mut session.reader.resources,
+                                        SearchExecutionFlags {
+                                            include_snippets: true,
+                                            persist_explain_session: false,
+                                        },
+                                    )),
+                                )
+                                .await?;
+                            return Ok(None);
+                        }
+                        session
+                            .reader
+                            .runtime
+                            .execute_search_serve_request(
+                                cx,
+                                request,
+                                &mut session.reader.resources,
+                                cache,
+                                cache_enabled,
+                            )
+                            .await
+                            .map(Some)
+                    },
+                ))
+                .await
+            };
+            let result = match intake.drive(cx, &bound.listener, execution).await? {
+                admission::DriveOutcome::Finished(result) => result,
+                admission::DriveOutcome::Shutdown(request) => {
+                    // The owned search future (and any phase-writer clones) is
+                    // already dropped. Close its peer before acknowledging stop;
+                    // partial output stays a failed search, never fake success.
+                    drop(peer);
+                    let (mut control_peer, _) = request.into_parts();
+                    write_response(
+                        cx,
+                        &mut control_peer,
+                        control::SHUTDOWN_RESPONSE,
+                        peer_timeout,
+                    )
+                    .await
+                    .map(|()| PeerOutcome::Shutdown)
                 }
-                Err(error) if error.kind() == ErrorKind::Interrupted => {}
-                Err(error) => return Err(error.into()),
+            };
+            if stop_after_peer(cx, result)? {
+                return Ok(());
             }
+            intake.completed();
         }
     }
 
@@ -836,10 +840,12 @@ fn encode_response<T: Serialize>(response: &T) -> SearchResult<Vec<u8>> {
     Ok(bytes)
 }
 
-async fn read_request(cx: &Cx, peer: &mut UnixStream, timeout: Duration) -> SearchResult<Vec<u8>> {
+async fn read_request(cx: &Cx, peer: &mut impl Read, timeout: Duration) -> SearchResult<Vec<u8>> {
     let started = Instant::now();
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 8192];
+    let mut turn_bytes = 0;
+    let mut turn_calls = 0;
     loop {
         retained_search_checkpoint(cx)?;
         if started.elapsed() >= timeout {
@@ -847,7 +853,18 @@ async fn read_request(cx: &Cx, peer: &mut UnixStream, timeout: Duration) -> Sear
                 io::Error::new(ErrorKind::TimedOut, "daemon request deadline exceeded").into(),
             );
         }
-        let remaining = (FSFS_DAEMON_REQUEST_MAX_BYTES + 1 - bytes.len()).min(chunk.len());
+        // A large immediately readable frame or repeated EINTR must yield to
+        // other admitted peers, shutdown controls and the owner checkpoint.
+        if turn_bytes >= 64 * 1024 || turn_calls == 32 {
+            admission::yield_turn(cx).await?;
+            turn_bytes = 0;
+            turn_calls = 0;
+            continue;
+        }
+        let remaining = (FSFS_DAEMON_REQUEST_MAX_BYTES + 1 - bytes.len())
+            .min(chunk.len())
+            .min(64 * 1024 - turn_bytes);
+        turn_calls += 1;
         match peer.read(&mut chunk[..remaining]) {
             Ok(0) if bytes.is_empty() => {
                 return Err(
@@ -856,6 +873,7 @@ async fn read_request(cx: &Cx, peer: &mut UnixStream, timeout: Duration) -> Sear
             }
             Ok(0) => return Ok(bytes),
             Ok(count) => {
+                turn_bytes += count;
                 let newline = chunk[..count].iter().position(|byte| *byte == b'\n');
                 let end = newline.map_or(count, |offset| offset + 1);
                 bytes.extend_from_slice(&chunk[..end]);
@@ -871,6 +889,8 @@ async fn read_request(cx: &Cx, peer: &mut UnixStream, timeout: Duration) -> Sear
             }
             Err(error) if error.kind() == ErrorKind::WouldBlock => {
                 asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL).await;
+                turn_bytes = 0;
+                turn_calls = 0;
             }
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => return Err(error.into()),
@@ -2219,6 +2239,63 @@ mod generation_tests {
                 "{result:?}"
             );
             cx.set_cancel_requested(false);
+        });
+    }
+
+    #[test]
+    fn complete_daemon_serves_around_an_incomplete_sender_then_accepts_its_request() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, root) = published_daemon_fixture(&cx, directory.path()).await;
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);
+            let client_endpoint = endpoint.clone();
+            let cancel = CancelOnDrop(cx.clone());
+            let worker = std::thread::spawn(move || {
+                let _cancel = cancel;
+                let mut stalled = connect_daemon(&client_endpoint);
+                stalled.write_all(b"{").unwrap();
+                let exchange = |request: &[u8]| -> serde_json::Value {
+                    let mut client = connect_daemon(&client_endpoint);
+                    client.write_all(request).unwrap();
+                    let mut line = String::new();
+                    std::io::BufReader::new(client).read_line(&mut line).unwrap();
+                    serde_json::from_str(&line).unwrap()
+                };
+                assert_eq!(exchange(b"ready\n")["event"], "ready");
+                let reply = exchange(b"{\"query\":\"sharedtoken\",\"limit\":10}\n");
+                assert_eq!(reply["ok"], true);
+                assert_eq!(
+                    reply["payloads"].as_array().unwrap().last().unwrap()["hits"]
+                        .as_array().unwrap().len(),
+                    1
+                );
+                // Merely waiting for the first peer's timeout cannot pass:
+                // that same peer must still finish and receive its own result.
+                stalled
+                    .write_all(b"\"query\":\"sharedtoken\",\"limit\":10}\n")
+                    .unwrap();
+                let mut line = String::new();
+                std::io::BufReader::new(stalled).read_line(&mut line).unwrap();
+                let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(reply["ok"], true);
+                assert_eq!(
+                    reply["payloads"].as_array().unwrap().last().unwrap()["query"],
+                    "sharedtoken"
+                );
+                let stop = exchange(control::SHUTDOWN_REQUEST);
+                assert_eq!(stop["ok"], true);
+                assert_eq!(stop["event"], "shutdown");
+            });
+            let result = runtime.run_complete_generation_daemon(&cx, &root).await;
+            worker.join().unwrap();
+            cx.set_cancel_requested(false);
+            result.unwrap();
+            assert!(!endpoint.exists());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
         });
     }
 }
