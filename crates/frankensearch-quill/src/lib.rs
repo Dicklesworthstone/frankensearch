@@ -102,7 +102,7 @@ pub use segment::{
 };
 pub use session_merge::{
     MAX_SESSION_MERGE_FANOUT, SessionMergeError, SessionMergePlan, SessionMergePolicy,
-    plan_session_merge,
+    plan_bounded_session_merge, plan_session_merge,
 };
 pub use snippet::{DEFAULT_SNIPPET_MAX_CHARS, SnippetConfig, SnippetGenerator, SnippetTerm};
 pub use stats::{SegmentStats, SegmentStatsProvider};
