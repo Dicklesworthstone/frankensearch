@@ -1,6 +1,9 @@
 //! Lazy native refinement over the same retained fast and lexical candidates.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
 use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
@@ -46,9 +49,60 @@ impl NativeAnnIndex {
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         let search = NativeProgressiveSearch {
             fast: self,
+            fast_owner: None,
             cx,
             fast_embedder,
             quality,
+            quality_owner: None,
+            pool: None,
+            lexical,
+            text,
+            k,
+            reranker: None,
+            allowed_documents: None,
+            candidate_multiplier: 3,
+            rrf: RrfConfig::default(),
+            quality_weight: 0.7,
+            fast_ef: None,
+            quality_ef: None,
+            budget: k.checked_mul(3).ok_or_else(|| {
+                invalid(
+                    "progressive.candidate_budget",
+                    "overflow",
+                    "three times the requested result count must fit usize",
+                )
+            })?,
+            state: State::Initial,
+        };
+        search.admit()?;
+        Ok(search)
+    }
+
+    /// Prepare progressive retrieval whose retained vector owners are safe to
+    /// move onto the caller-owned blocking pool between phases.
+    ///
+    /// Inference, lexical scoring, hydration and reranking retain their ordinary
+    /// async ownership. Only native/exact traversal may use the supplied pool.
+    /// Scoped queries continue inline until their membership predicate has an
+    /// independently owned worker-safe representation.
+    pub fn search_hybrid_progressive_with_pool<'a>(
+        self: &'a Arc<Self>,
+        cx: &'a Cx,
+        fast_embedder: &'a dyn Embedder,
+        quality: Option<(&'a Arc<Self>, &'a dyn Embedder)>,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let search = NativeProgressiveSearch {
+            fast: self.as_ref(),
+            fast_owner: Some(Arc::clone(self)),
+            cx,
+            fast_embedder,
+            quality: quality.map(|(index, embedder)| (index.as_ref(), embedder)),
+            quality_owner: quality.map(|(index, _)| Arc::clone(index)),
+            pool: Some(pool),
             lexical,
             text,
             k,
@@ -163,9 +217,12 @@ enum State {
 /// Construct with [`NativeAnnIndex::search_hybrid_progressive`].
 pub struct NativeProgressiveSearch<'a> {
     fast: &'a NativeAnnIndex,
+    fast_owner: Option<Arc<NativeAnnIndex>>,
     cx: &'a Cx,
     fast_embedder: &'a dyn Embedder,
     quality: Option<(&'a NativeAnnIndex, &'a dyn Embedder)>,
+    quality_owner: Option<Arc<NativeAnnIndex>>,
+    pool: Option<BlockingPoolHandle>,
     lexical: &'a dyn LexicalRead,
     text: &'a str,
     k: usize,
