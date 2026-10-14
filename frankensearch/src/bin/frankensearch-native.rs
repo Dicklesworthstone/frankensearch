@@ -80,6 +80,7 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--allow-activation] [--allow-updates] [--filter JSON] [--timeout-ms N]\n\
          [--allow-model-migration (explicit sealed replacement models)]\n\
          [--reranker-dir DIR] [--rerank-window N]\n\
+         [--query-cache-entries N (0..1024 per model, default 0)]\n\
          [--lexical-only (fixed snapshot; no models or write controls)]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\
@@ -167,6 +168,7 @@ struct Options {
     reranker_dir: Option<PathBuf>,
     rerank_window: usize,
     full_query: Option<query::FullQuery>,
+    query_cache: query_cache::Config,
 }
 
 impl Options {
@@ -215,6 +217,7 @@ impl Options {
             reranker_dir: None,
             rerank_window: 50,
             full_query: None,
+            query_cache: query_cache::Config::default(),
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -298,6 +301,9 @@ impl Options {
                 "--full-query" if matches!(command, Command::Search | Command::Serve) => {
                     options.full_query = Some(query::FullQuery::parse(&value(&mut args)?)?);
                 }
+                "--query-cache-entries" if command == Command::Serve => {
+                    options.query_cache = query_cache::Config::parse(&value(&mut args)?)?;
+                }
                 _ => return Err(bad("unknown or inapplicable option; use --help")),
             }
         }
@@ -316,6 +322,7 @@ impl Options {
                 "--allow-updates",
                 "--allow-model-migration",
                 "--full-query",
+                "--query-cache-entries",
             ]
             .iter()
             .any(|flag| seen.contains(*flag))
@@ -783,6 +790,7 @@ async fn execute(
                 &options.quality,
                 pool.clone(),
             )?;
+            let models = options.query_cache.wrap(cx, models)?;
             let index = sharded::Opened::open(cx, &selection, models).await?;
             // Index/model admission is startup work. Each accepted query starts
             // its own total budget after that, before scoping or provider work.
