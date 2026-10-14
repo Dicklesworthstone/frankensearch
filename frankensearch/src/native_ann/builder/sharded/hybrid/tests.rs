@@ -158,7 +158,11 @@ impl Embedder for Directional {
 
 #[test]
 fn pooled_sharded_queries_match_inline_results_and_rows() {
-    run_test_with_cx(|cx| async move {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("runtime context");
         let parent = tempfile::tempdir().unwrap();
         let (fast, quality) = models();
         let built = builder(&parent.path().join("partitioned"), &fast, &quality, true)

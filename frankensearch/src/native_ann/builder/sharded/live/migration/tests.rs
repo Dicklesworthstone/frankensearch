@@ -555,6 +555,8 @@ fn migration_admits_source_contracts_and_all_limits_before_creating_partitions()
         let base = live.snapshot(&cx).await.unwrap();
         let mut wrong = Provider::new("different-input", 4);
         wrong.identity.input.document_instruction = "private-input-canary".to_owned();
+        wrong.identity.space.input_contract_fingerprint = wrong.identity.input.fingerprint();
+        wrong.identity.producer.space_fingerprint = wrong.identity.space.fingerprint();
         let wrong = Arc::new(wrong);
         let path = root.path().join("wrong-input");
         let error = base

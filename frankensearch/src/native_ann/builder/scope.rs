@@ -693,6 +693,9 @@ mod tests {
         fn id(&self) -> &str {
             &self.identity.space.logical_model_id
         }
+        fn bound_batch_is_native(&self) -> bool {
+            true
+        }
         fn model_name(&self) -> &str {
             self.id()
         }

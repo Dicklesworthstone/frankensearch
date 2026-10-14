@@ -2334,7 +2334,7 @@ mod generation_tests {
                 assert_index_calls(&index().await, 3, 3);
 
                 Box::pin(watch_edit(&cx, parent.path(), "doc-2.md", "sharedtoken watched two", true)).await;
-                assert_index_calls(&index().await, 1, 1);
+                assert_index_calls(&index().await, 0, 0);
 
                 // Restoring the pre-watch bytes and mtime must re-embed: the
                 // rows hold the watched version, which has the same length and

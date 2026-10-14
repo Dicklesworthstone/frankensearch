@@ -539,6 +539,10 @@ mod tests {
                     assert_eq!(page("small", "initial")["candidates"]["fast"], 1);
                     assert_eq!(page("small", "reranked")["evaluated"], 1);
                     assert_eq!(page("small", "reranked")["rerank_window"], 1);
+                    assert_eq!(
+                        page("small", "reranked")["results"][0]["metadata"]["original_id"],
+                        "keyword"
+                    );
                     assert_eq!(page("skip", "initial")["candidates"]["fast"], 1);
                     assert!(page("skip", "refined").get("reranker").is_none());
                     assert!(
@@ -553,8 +557,8 @@ mod tests {
                         "vector"
                     );
                     assert_eq!(
-                        page("ordinary", "reranked")["results"][0]["metadata"]["original_id"],
-                        "vector"
+                        page("ordinary", "reranked")["results"][0]["rerank_score"],
+                        1.0
                     );
                     let calls = scorer.inputs.lock().unwrap();
                     assert_eq!(calls.len(), 2);

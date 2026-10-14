@@ -589,6 +589,9 @@ mod tests {
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
             self.inner.identity()
         }
+        fn bound_batch_is_native(&self) -> bool {
+            self.inner.bound_batch_is_native()
+        }
         fn id(&self) -> &str {
             self.inner.id()
         }

@@ -43,13 +43,9 @@ pub fn plan_bounded_session_merge(
     segments: &[ManifestSegment],
     policy: SessionMergePolicy,
 ) -> Result<Option<SessionMergePlan>, SessionMergeError> {
-    plan_bounded_session_merge_with_fit(
-        cx,
-        segments,
-        policy,
-        PrefixFitOrder::Arbitrary,
-        |range| manifest_concat_fits(&segments[range]),
-    )
+    plan_bounded_session_merge_with_fit(cx, segments, policy, PrefixFitOrder::Arbitrary, |range| {
+        manifest_concat_fits(&segments[range])
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -576,11 +572,7 @@ mod tests {
     #[test]
     fn input_sum_overflow_cannot_wrap_into_a_small_budget() {
         run_test_with_cx(|cx| async move {
-            let sources = [
-                segment(0, 1, u64::MAX),
-                segment(1, 1, 1),
-                segment(2, 1, 1),
-            ];
+            let sources = [segment(0, 1, u64::MAX), segment(1, 1, 1), segment(2, 1, 1)];
             let policy = SessionMergePolicy {
                 max_input_bytes: u64::MAX,
                 ..SessionMergePolicy::default()
@@ -811,9 +803,13 @@ mod publication_tests {
                 } else {
                     "shared cobalt python"
                 };
-                LexicalWrite::index_document(&index, cx, &IndexableDocument::new(id.as_str(), text))
-                    .await
-                    .expect("stage fixture row");
+                LexicalWrite::index_document(
+                    &index,
+                    cx,
+                    &IndexableDocument::new(id.as_str(), text),
+                )
+                .await
+                .expect("stage fixture row");
             }
             LexicalWrite::commit(&index, cx)
                 .await
@@ -992,7 +988,9 @@ mod publication_tests {
                 .await
                 .unwrap();
             assert_eq!(
-                reopened.search_paginated(&cx, "shared", 20, 0, true).unwrap(),
+                reopened
+                    .search_paginated(&cx, "shared", 20, 0, true)
+                    .unwrap(),
                 index.search_paginated(&cx, "shared", 20, 0, true).unwrap(),
             );
         });
@@ -1073,7 +1071,10 @@ mod publication_tests {
             assert_eq!(std::fs::read(&output_path).unwrap(), output);
             assert_eq!(queries(&recovered, &cx), expected_queries);
             assert_eq!(stored(&held), expected_stored);
-            assert_eq!(stored(&recovered.search_snapshot().unwrap()), expected_stored);
+            assert_eq!(
+                stored(&recovered.search_snapshot().unwrap()),
+                expected_stored
+            );
             assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
             assert_eq!(
                 Manifest::from_bytes(

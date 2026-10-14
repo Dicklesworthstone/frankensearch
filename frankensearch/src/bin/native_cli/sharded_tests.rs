@@ -76,6 +76,9 @@ impl Embedder for Provider {
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
         Ok(&self.identity)
     }
+    fn bound_batch_is_native(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         &self.identity.space.logical_model_id
     }

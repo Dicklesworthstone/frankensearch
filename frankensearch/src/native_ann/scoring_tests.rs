@@ -363,12 +363,12 @@ fn overflowing_finite_scores_cannot_escape_as_a_successful_prefix() {
         },
         SourceRow {
             id: "overflow".to_owned(),
-            values: vec![f32::MAX; 32],
+            values: vec![1.0e18; 32],
             live: true,
         },
     ];
     let index = NativeAnnIndex::exact(&cx, owner(32, QuantizationFormat::F32, &sources)).unwrap();
-    let query = BoundQueryEmbedding::new(vec![2.0; 32], identity(32)).unwrap();
+    let query = BoundQueryEmbedding::new(vec![1.0e21; 32], identity(32)).unwrap();
     let error = index.search(&cx, &query, 1, None).unwrap_err();
     assert!(
         matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "native_ann.score")

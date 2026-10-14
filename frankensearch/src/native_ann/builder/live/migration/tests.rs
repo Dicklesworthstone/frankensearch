@@ -531,11 +531,12 @@ fn changed_prepared_input_and_non_newer_sequences_fail_before_writes_or_inferenc
         );
         assert!(!stale.exists());
         let mut incompatible = Provider::new("other-input", 3, true);
-        Arc::get_mut(&mut incompatible)
-            .unwrap()
-            .identity
-            .input
-            .doc_id_semantics = "other-document-id-policy".to_owned();
+        let incompatible_mut = Arc::get_mut(&mut incompatible).unwrap();
+        incompatible_mut.identity.input.doc_id_semantics = "other-document-id-policy".to_owned();
+        incompatible_mut.identity.space.input_contract_fingerprint =
+            incompatible_mut.identity.input.fingerprint();
+        incompatible_mut.identity.producer.space_fingerprint =
+            incompatible_mut.identity.space.fingerprint();
         let path = root.path().join("incompatible");
         let result =
             old.begin_model_migration(&cx, &path, generation(2), incompatible.clone(), None);

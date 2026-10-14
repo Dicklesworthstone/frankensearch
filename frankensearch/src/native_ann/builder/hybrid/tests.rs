@@ -125,7 +125,11 @@ fn real_quill_and_native_vectors_are_built_from_the_complete_same_cohort() {
 
 #[test]
 fn pooled_built_queries_match_inline_results_and_phases() {
-    asupersync::test_utils::run_test_with_cx(|cx| async move {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("runtime context");
         let dir = tempfile::tempdir().unwrap();
         let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
         let quality = Arc::new(Provider::new("quality", 3, Reply::Correct));
