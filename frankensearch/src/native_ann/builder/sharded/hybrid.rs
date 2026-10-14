@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
 use frankensearch_quill::{QuillConfig, QuillSearchIndex};
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,28 @@ impl NativeBuiltShardedHybridIndex {
             .await
     }
 
+    /// Fast-plus-global-lexical retrieval with the complete shard traversal on
+    /// the caller-owned blocking pool.
+    pub async fn search_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        self.vectors
+            .fast
+            .search_hybrid_text_with_pool(
+                cx,
+                self.vectors.partitions[0].fast.embedder(),
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )
+            .await
+    }
+
     /// Independent quality retrieval, not rescoring only the fast candidates.
     /// A declared fast-only cohort executes fast search; required-tier errors
     /// never silently remove quality or omit a failing partition.
@@ -352,6 +375,39 @@ impl NativeBuiltShardedHybridIndex {
         }
     }
 
+    /// Refined fast/quality shard retrieval with both complete inventories on
+    /// the caller-owned blocking pool.
+    pub async fn search_refined_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        let first = &self.vectors.partitions[0];
+        match (&self.vectors.quality, &first.quality) {
+            (Some(shards), Some(tier)) => {
+                self.vectors
+                    .fast
+                    .search_hybrid_refined_text_with_pool(
+                        cx,
+                        first.fast.embedder(),
+                        (shards, tier.embedder()),
+                        &self.lexical,
+                        text,
+                        k,
+                        pool,
+                    )
+                    .await
+            }
+            (None, None) => self.search_with_pool(cx, text, k, pool).await,
+            _ => Err(rejected(
+                "quality",
+                "quality inventory and provider must travel together",
+            )),
+        }
+    }
+
     /// Quality-primary plus lexical retrieval without invoking the fast provider.
     ///
     /// # Errors
@@ -374,6 +430,36 @@ impl NativeBuiltShardedHybridIndex {
             .ok_or_else(|| rejected("quality", "quality provider was not configured"))?;
         shards
             .search_hybrid_quality_text(cx, tier.embedder(), &self.lexical, text, k)
+            .await
+    }
+
+    /// Quality-primary sharded hybrid retrieval on the caller-owned pool.
+    pub async fn search_quality_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        checkpoint(cx, "native_ann.sharded_hybrid.quality_pool")?;
+        let shards = self
+            .vectors
+            .quality
+            .as_ref()
+            .ok_or_else(|| rejected("quality", "quality tier was not configured"))?;
+        let tier = self.vectors.partitions[0]
+            .quality
+            .as_ref()
+            .ok_or_else(|| rejected("quality", "quality provider was not configured"))?;
+        shards
+            .search_hybrid_quality_text_with_pool(
+                cx,
+                tier.embedder(),
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )
             .await
     }
 
