@@ -37,6 +37,9 @@ mod filter;
 #[path = "native_cli/models.rs"]
 mod models;
 
+#[path = "native_cli/query_cache.rs"]
+mod query_cache;
+
 #[path = "native_cli/cohort.rs"]
 mod cohort;
 
