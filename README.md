@@ -79,7 +79,7 @@ Installer goals:
 - auto-configured model cache path
 - sane defaults for interactive usage
 
-No Windows archive has been published yet: every release through v1.10.0
+No Windows archive has been published yet: every release through v1.12.3
 ships Linux and macOS assets only. When the Windows x86-64 full archive
 ships, it will require the
 [Microsoft Visual C++ v14 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
