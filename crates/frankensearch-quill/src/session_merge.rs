@@ -14,8 +14,13 @@ use crate::keeper::{ConcatMergeSizing, KeeperError, manifest_concat_fits};
 use crate::{KeeperSnapshot, ManifestSegment, QuillIndex, QuillIndexError};
 
 mod bounded;
+mod maintenance;
 
 pub use bounded::plan_bounded_session_merge;
+pub use maintenance::{
+    SessionMergeAttempt, SessionMergeBudget, SessionMergeFailure, SessionMergeProgress,
+    SessionMergeReceipt, SessionMergeReport, SessionMergeStop,
+};
 
 /// Maximum number of source entries examined in one candidate window.
 pub const MAX_SESSION_MERGE_FANOUT: usize = 64;
@@ -131,10 +136,10 @@ pub enum SessionMergeError {
     /// Cancellation was observed before publication was attempted.
     #[error("session merge planning was cancelled")]
     Cancelled,
-    /// The selected source-ID vector could not be reserved.
-    #[error("could not allocate {count} session merge source ids")]
+    /// A source-ID or maintenance-progress vector could not be reserved.
+    #[error("could not allocate {count} session merge entries")]
     Allocation {
-        /// Requested source count.
+        /// Requested entry count.
         count: usize,
     },
     /// The production snapshot, writer, codec, or publication path failed.
