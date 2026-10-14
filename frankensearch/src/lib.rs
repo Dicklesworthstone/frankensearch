@@ -336,6 +336,11 @@ pub use frankensearch_core::traits::{cosine_similarity, l2_normalize, truncate_e
 // ─── Embedder stack (always available) ──────────────────────────────────────
 
 pub use frankensearch_embed::auto_detect::{DimReduceEmbedder, EmbedderStack, TwoTierAvailability};
+pub use frankensearch_embed::batch_coalescer::{
+    BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerLimits, CoalescerMetrics,
+    CoalescerUsage, Priority,
+};
+pub use frankensearch_embed::coalescing_embedder::{CoalescingDispatcher, CoalescingEmbedder};
 pub use frankensearch_embed::model_registry::{EmbedderRegistry, RegisteredEmbedder};
 
 // ─── Vector index (always available) ────────────────────────────────────────

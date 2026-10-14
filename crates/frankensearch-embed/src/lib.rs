@@ -24,7 +24,8 @@ pub use auto_detect::{
     TwoTierAvailability,
 };
 pub use batch_coalescer::{
-    BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerMetrics, Priority,
+    BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerLimits, CoalescerMetrics,
+    CoalescerUsage, Priority,
 };
 #[cfg(feature = "bundled-default-models")]
 pub use bundled_default_models::{EmbeddedModelInstallSummary, ensure_default_semantic_models};
