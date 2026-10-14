@@ -37,6 +37,21 @@ impl Authority {
             }),
         }
     }
+
+    pub(super) fn with_query_cache(self, cache: crate::query_cache::Config) -> Self {
+        if !cache.enabled() {
+            return self;
+        }
+        let load = self.load;
+        Self {
+            load: Box::new(move |cx, directory, quality, options| {
+                checkpoint(cx)?;
+                let outcome = load(cx, directory, quality, options);
+                checkpoint(cx)?;
+                cache.wrap(cx, outcome?)
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
