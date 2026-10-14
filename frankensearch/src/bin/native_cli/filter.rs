@@ -147,6 +147,19 @@ impl<'a> Query<'a> {
         )
     }
 
+    pub(super) fn progressive_on_pool<'q>(
+        &'q self,
+        cx: &'q Cx,
+        query: &'q str,
+        limit: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
+        match (&self.scope, pool) {
+            (None, Some(pool)) => self.index.progressive_with_pool(cx, query, limit, pool),
+            _ => self.progressive(cx, query, limit),
+        }
+    }
+
     pub(super) async fn search(
         &self,
         cx: &Cx,
@@ -218,6 +231,23 @@ impl<'a> Query<'a> {
             },
             |scope| scope.progressive_with_reranker(cx, text, limit, reranker, window),
         )
+    }
+
+    pub(super) fn progressive_with_reranker_on_pool<'q>(
+        &'q self,
+        cx: &'q Cx,
+        text: &'q str,
+        limit: usize,
+        reranker: &'q dyn frankensearch::Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
+        match (&self.scope, pool) {
+            (None, Some(pool)) => self.index.progressive_with_reranker_on_pool(
+                cx, text, limit, reranker, window, pool,
+            ),
+            _ => self.progressive_with_reranker(cx, text, limit, reranker, window),
+        }
     }
 }
 
