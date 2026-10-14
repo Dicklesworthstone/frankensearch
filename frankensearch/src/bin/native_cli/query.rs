@@ -159,12 +159,9 @@ pub async fn buffered<'i>(
     within(cx, deadline.as_ref(), async {
         let rerank = policy.reranker_for(mode);
         if rerank.is_none() && (mode != Mode::Full || policy.full_query.is_none()) {
-            if let cohort::Index::Single(index) = index {
-                return search(index, cx, text, mode, limit, filters).await;
-            }
             validate_query(text)?;
             return cohort::Prepared::prepare(index, cx, filters)?
-                .search(cx, text, mode, limit)
+                .search_with_pool(cx, text, mode, limit, policy.query_pool())
                 .await;
         }
         validate_query(text)?;
