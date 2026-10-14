@@ -4,6 +4,7 @@
 //! library. This adapter only selects those APIs and serializes their complete
 //! result envelopes for the existing buffered/streaming command protocol.
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch::native_ann::builder::scope::sharded::NativeScopedShardedHybridIndex;
 use frankensearch::native_ann::builder::sharded::NativeBuiltShardedHybridIndex;
 use frankensearch::native_ann::{
@@ -162,19 +163,41 @@ impl<'a> Prepared<'a> {
         mode: Mode,
         limit: usize,
     ) -> Result<serde_json::Value> {
+        self.search_with_pool(cx, text, mode, limit, None).await
+    }
+
+    pub async fn search_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        mode: Mode,
+        limit: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> Result<serde_json::Value> {
         let (index, scope) = match self {
-            Self::Single(query) => return query.search(cx, text, mode, limit).await,
+            Self::Single(query) => {
+                return query.search_with_pool(cx, text, mode, limit, pool).await;
+            }
             Self::Sharded { index, scope } => (index, scope),
         };
         validate_query(text)?;
         let full = mode == Mode::Full && index.vectors().quality().is_some();
-        let results = match (scope, mode, full) {
-            (Some(scope), Mode::Quality, _) => scope.search_quality(cx, text, limit).await?,
-            (Some(scope), _, true) => scope.search_refined(cx, text, limit).await?,
-            (Some(scope), _, false) => scope.search(cx, text, limit).await?,
-            (None, Mode::Quality, _) => index.search_quality(cx, text, limit).await?,
-            (None, _, true) => index.search_refined(cx, text, limit).await?,
-            (None, _, false) => index.search(cx, text, limit).await?,
+        let results = match (scope, pool, mode, full) {
+            (Some(scope), _, Mode::Quality, _) => scope.search_quality(cx, text, limit).await?,
+            (Some(scope), _, _, true) => scope.search_refined(cx, text, limit).await?,
+            (Some(scope), _, _, false) => scope.search(cx, text, limit).await?,
+            (None, Some(pool), Mode::Quality, _) => {
+                index.search_quality_with_pool(cx, text, limit, pool).await?
+            }
+            (None, Some(pool), _, true) => {
+                index.search_refined_with_pool(cx, text, limit, pool).await?
+            }
+            (None, Some(pool), _, false) => {
+                index.search_with_pool(cx, text, limit, pool).await?
+            }
+            (None, None, Mode::Quality, _) => index.search_quality(cx, text, limit).await?,
+            (None, None, _, true) => index.search_refined(cx, text, limit).await?,
+            (None, None, _, false) => index.search(cx, text, limit).await?,
         };
         let phase = if mode == Mode::Quality {
             "quality"
