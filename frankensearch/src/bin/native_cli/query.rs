@@ -13,7 +13,7 @@ use frankensearch::SearchError;
 use frankensearch::native_ann::builder::deadline::NativeSearchDeadline;
 
 use super::{
-    Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, search, validate_query,
+    Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, validate_query,
 };
 
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -30,6 +30,7 @@ pub struct Policy {
     pub(super) timer: Option<TimerDriverHandle>,
     pub(super) rerank: Option<Rerank>,
     pub(super) full_query: Option<FullQuery>,
+    pub(super) query_pool: Option<BlockingPoolHandle>,
 }
 
 impl Policy {
@@ -52,6 +53,10 @@ impl Policy {
         } else {
             None
         }
+    }
+
+    pub(super) fn query_pool(&self) -> Option<BlockingPoolHandle> {
+        self.query_pool.clone()
     }
 
     pub(super) fn effective_ms(&self, requested_ms: Option<u64>) -> Result<Option<u64>> {
