@@ -560,3 +560,372 @@ mod tests {
         });
     }
 }
+
+#[cfg(all(test, unix))]
+mod publication_tests {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    use asupersync::test_utils::run_test_with_cx;
+    use frankensearch_core::{IndexableDocument, LexicalWrite};
+
+    use super::*;
+    use crate::{
+        Manifest, QuillConfig, QuillSearchIndex, QuillSearchResult, QuillSearchSnapshot,
+        load_manifest_pair,
+    };
+
+    const QUERIES: [&str; 3] = ["shared", "\"amber rust\"", "amber OR cobalt"];
+    type StoredRows = Vec<Vec<Option<Vec<u8>>>>;
+
+    fn config() -> QuillConfig {
+        QuillConfig {
+            deterministic_ingest: true,
+            ..QuillConfig::default()
+        }
+    }
+
+    async fn fixture(cx: &Cx, directory: &Path) -> QuillIndex {
+        let index = QuillIndex::create(cx, directory, config())
+            .await
+            .expect("create bounded-session fixture");
+        for batch in 0..3 {
+            for row in 0..2 {
+                // The newest source replaces a row in the oldest source. A
+                // newly merged container must not mask the live replacement.
+                let id = if batch == 2 && row == 1 {
+                    "bounded-0-0".to_owned()
+                } else {
+                    format!("bounded-{batch}-{row}")
+                };
+                let text = if row == 0 {
+                    "shared amber rust"
+                } else {
+                    "shared cobalt python"
+                };
+                LexicalWrite::index_document(&index, cx, &IndexableDocument::new(id.as_str(), text))
+                    .await
+                    .expect("stage fixture row");
+            }
+            LexicalWrite::commit(&index, cx)
+                .await
+                .expect("seal a two-row source");
+        }
+        let snapshot = index.snapshot().expect("fixture authority");
+        assert_eq!(snapshot.segments().len(), 3);
+        assert_eq!(snapshot.doc_count(), 5);
+        assert_eq!(
+            snapshot
+                .loaded_manifest()
+                .manifest
+                .segments
+                .iter()
+                .map(|segment| u64::from(segment.doc_count))
+                .sum::<u64>(),
+            6,
+        );
+        assert_eq!(index.collect_docids(cx, "shared").unwrap(), [1, 2, 3, 4, 5]);
+        index
+    }
+
+    fn queries(index: &QuillIndex, cx: &Cx) -> Vec<QuillSearchResult> {
+        QUERIES
+            .iter()
+            .map(|query| index.search_paginated(cx, query, 20, 0, true).unwrap())
+            .collect()
+    }
+
+    fn stored(snapshot: &QuillSearchSnapshot) -> StoredRows {
+        (0..6)
+            .map(|docid| {
+                (0..5)
+                    .map(|field| snapshot.stored_field_value(field, docid).unwrap())
+                    .collect()
+            })
+            .collect()
+    }
+
+    async fn assert_reopened(
+        cx: &Cx,
+        directory: &Path,
+        expected_queries: &[QuillSearchResult],
+        expected_stored: &[Vec<Option<Vec<u8>>>],
+    ) {
+        let reader = QuillSearchIndex::open(cx, directory, config())
+            .await
+            .expect("cold reader opens published authority");
+        for (query, expected) in QUERIES.iter().zip(expected_queries) {
+            assert_eq!(
+                reader.search_paginated(cx, query, 20, 0, true).unwrap(),
+                *expected,
+                "cold query {query} preserves counts, scores, identities, and ordering",
+            );
+        }
+        for (docid, fields) in expected_stored.iter().enumerate() {
+            for (field, expected) in fields.iter().enumerate() {
+                let actual = reader
+                    .stored_field_value(
+                        u16::try_from(field).unwrap(),
+                        u32::try_from(docid).unwrap(),
+                    )
+                    .unwrap();
+                assert_eq!(actual.as_deref(), expected.as_deref());
+            }
+        }
+    }
+
+    fn directory_bytes(directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_type().unwrap().is_file())
+            .map(|entry| {
+                let path = entry.path();
+                let bytes = std::fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn real_bounded_tail_preserves_upserts_stored_fields_search_and_continued_ingest() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let index = fixture(&cx, directory.path()).await;
+            let initial = load_manifest_pair(directory.path()).unwrap().manifest;
+            let expected_queries = queries(&index, &cx);
+            let held = index.search_snapshot().unwrap();
+            let expected_stored = stored(&held);
+            assert!(expected_stored[0].iter().all(Option::is_none));
+            assert_eq!(expected_queries[0].total_count, Some(5));
+            let policy = SessionMergePolicy {
+                max_input_docs: 4,
+                max_input_bytes: u64::MAX,
+                ..SessionMergePolicy::default()
+            };
+            assert!(
+                index
+                    .merge_sessions_once(&cx, policy, 0xb000, 0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let merged = index
+                .merge_sessions_bounded_once(&cx, policy, 0xb001, 0)
+                .await
+                .unwrap()
+                .expect("merge a compatible pair despite a fanout of eight");
+            assert_eq!(merged.segments().len(), 2);
+            assert_eq!(merged.doc_count(), 5);
+            assert_eq!(
+                merged.loaded_manifest().manifest.field_stats,
+                initial.field_stats
+            );
+            assert_eq!(
+                merged.loaded_manifest().manifest.segments[1],
+                initial.segments[2]
+            );
+            assert_eq!(queries(&index, &cx), expected_queries);
+            assert_eq!(stored(&held), expected_stored);
+            assert_eq!(stored(&index.search_snapshot().unwrap()), expected_stored);
+            assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
+
+            let before_noop = directory_bytes(directory.path());
+            assert!(
+                index
+                    .merge_sessions_bounded_once(&cx, policy, 0xb002, 0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(directory_bytes(directory.path()), before_noop);
+            let merged = index
+                .merge_sessions_bounded_once(
+                    &cx,
+                    SessionMergePolicy {
+                        max_input_docs: 6,
+                        ..policy
+                    },
+                    0xb003,
+                    0,
+                )
+                .await
+                .unwrap()
+                .expect("a raised input budget admits the remaining two-source tail");
+            assert_eq!(merged.segments().len(), 1);
+            assert_eq!(merged.doc_count(), 5);
+            assert_eq!(
+                merged.loaded_manifest().manifest.field_stats,
+                initial.field_stats
+            );
+            assert_eq!(queries(&index, &cx), expected_queries);
+            assert_eq!(stored(&index.search_snapshot().unwrap()), expected_stored);
+            assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
+
+            LexicalWrite::index_document(
+                &index,
+                &cx,
+                &IndexableDocument::new("after-bounded", "shared additional document"),
+            )
+            .await
+            .unwrap();
+            LexicalWrite::commit(&index, &cx).await.unwrap();
+            assert_eq!(index.doc_count().unwrap(), 6);
+            assert_eq!(
+                index.collect_docids(&cx, "shared").unwrap(),
+                [1, 2, 3, 4, 5, 6]
+            );
+            assert_eq!(
+                stored(&held),
+                expected_stored,
+                "held authority remains unchanged"
+            );
+            let reopened = QuillSearchIndex::open(&cx, directory.path(), config())
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened.search_paginated(&cx, "shared", 20, 0, true).unwrap(),
+                index.search_paginated(&cx, "shared", 20, 0, true).unwrap(),
+            );
+        });
+    }
+
+    #[test]
+    fn bounded_publication_failure_keeps_old_authority_and_survives_writer_reopen() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let index = fixture(&cx, directory.path()).await;
+            // Start with no live ingest lease, as after a process restart.
+            drop(index);
+            let index = QuillIndex::open(&cx, directory.path(), config())
+                .await
+                .unwrap();
+            let initial = load_manifest_pair(directory.path()).unwrap().manifest;
+            let expected_queries = queries(&index, &cx);
+            let held = index.search_snapshot().unwrap();
+            let expected_stored = stored(&held);
+            let policy = SessionMergePolicy {
+                max_input_docs: 4,
+                max_input_bytes: u64::MAX,
+                ..SessionMergePolicy::default()
+            };
+            let blocked_temp = directory
+                .path()
+                .join(format!(".tmp-manifest-{}", initial.generation + 1));
+            let blocker = b"preserve this conflicting proposal";
+            std::fs::write(&blocked_temp, blocker).unwrap();
+            let error = index
+                .merge_sessions_bounded_once(&cx, policy, 0xb0ff, 0)
+                .await
+                .err()
+                .expect("fail after output installation but before manifest promotion");
+            assert!(
+                error.to_string().contains("temp"),
+                "unexpected error: {error}"
+            );
+            let output_path = directory.path().join("seg-000000000000b0ff.fslx");
+            let output =
+                std::fs::read(&output_path).expect("installed output exists but is unreachable");
+            assert_eq!(std::fs::read(&blocked_temp).unwrap(), blocker);
+            assert_eq!(
+                load_manifest_pair(directory.path()).unwrap().manifest,
+                initial
+            );
+            assert_eq!(stored(&held), expected_stored);
+            assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
+            for source in &initial.segments {
+                assert!(
+                    directory
+                        .path()
+                        .join(format!("seg-{:016x}.fslx", source.segment_id))
+                        .is_file()
+                );
+            }
+
+            drop(index);
+            std::fs::rename(
+                &blocked_temp,
+                directory.path().join("preserved-proposal.fixture"),
+            )
+            .unwrap();
+            let recovered = QuillIndex::open(&cx, directory.path(), config())
+                .await
+                .unwrap();
+            assert_eq!(
+                recovered.snapshot().unwrap().loaded_manifest().manifest,
+                initial
+            );
+            let merged = recovered
+                .merge_sessions_bounded_once(&cx, policy, 0xb0ff, 0)
+                .await
+                .unwrap()
+                .expect("recovered writer can retry the same bounded merge");
+            assert_eq!(merged.segments().len(), 2);
+            assert_eq!(merged.doc_count(), 5);
+            assert_eq!(std::fs::read(&output_path).unwrap(), output);
+            assert_eq!(queries(&recovered, &cx), expected_queries);
+            assert_eq!(stored(&held), expected_stored);
+            assert_eq!(stored(&recovered.search_snapshot().unwrap()), expected_stored);
+            assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
+            assert_eq!(
+                Manifest::from_bytes(
+                    &std::fs::read(directory.path().join("MANIFEST.prev")).unwrap()
+                )
+                .unwrap(),
+                initial,
+            );
+        });
+    }
+
+    #[test]
+    fn bounded_noop_cancellation_and_output_collision_leave_authority_unchanged() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let index = fixture(&cx, directory.path()).await;
+            let initial = load_manifest_pair(directory.path()).unwrap().manifest;
+            let expected_queries = queries(&index, &cx);
+            let expected_stored = stored(&index.search_snapshot().unwrap());
+            let before = directory_bytes(directory.path());
+            // The first pair has three live rows, but four physical rows:
+            // tombstones must not make it pass a three-row concat budget.
+            let policy = SessionMergePolicy {
+                max_input_docs: 3,
+                ..SessionMergePolicy::default()
+            };
+            assert!(
+                index
+                    .merge_sessions_bounded_once(&cx, policy, 0xb010, 0)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(directory_bytes(directory.path()), before);
+
+            cx.set_cancel_requested(true);
+            let cancelled = index
+                .merge_sessions_bounded_once(&cx, SessionMergePolicy::default(), 0xb011, 0)
+                .await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(cancelled, Err(SessionMergeError::Cancelled)));
+            assert_eq!(directory_bytes(directory.path()), before);
+            assert!(
+                index
+                    .merge_sessions_bounded_once(
+                        &cx,
+                        SessionMergePolicy::default(),
+                        initial.segments[0].segment_id,
+                        0,
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(directory_bytes(directory.path()), before);
+            assert_eq!(
+                load_manifest_pair(directory.path()).unwrap().manifest,
+                initial
+            );
+            assert_eq!(queries(&index, &cx), expected_queries);
+            assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
+        });
+    }
+}
