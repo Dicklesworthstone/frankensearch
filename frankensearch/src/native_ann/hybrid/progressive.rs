@@ -235,7 +235,7 @@ pub struct NativeProgressiveSearch<'a> {
     reranker: Option<RerankRequest<'a>>,
     // Installed only by the built-cohort scope adapter, together with its
     // filtered lexical reader. None preserves the ordinary unscoped path.
-    allowed_documents: Option<&'a BTreeSet<String>>,
+    allowed_documents: Option<Arc<BTreeSet<String>>>,
     state: State,
 }
 
@@ -367,8 +367,16 @@ impl<'a> NativeProgressiveSearch<'a> {
 
     #[cfg(feature = "quill")]
     pub(in crate::native_ann) fn with_allowed_documents(
+        self,
+        allowed: &BTreeSet<String>,
+    ) -> SearchResult<Self> {
+        self.with_allowed_documents_arc(Arc::new(allowed.clone()))
+    }
+
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_allowed_documents_arc(
         mut self,
-        allowed: &'a BTreeSet<String>,
+        allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<Self> {
         checkpoint(self.cx, "native_ann.scope.configure")?;
         if !matches!(self.state, State::Initial) {
@@ -401,18 +409,33 @@ impl<'a> NativeProgressiveSearch<'a> {
         embedder: &dyn Embedder,
         ef: Option<usize>,
     ) -> SearchResult<Vec<VectorHit>> {
-        match self.allowed_documents {
+        match self.allowed_documents.as_ref() {
             Some(allowed) => {
-                index
-                    .search_text_filtered(
-                        self.cx,
-                        embedder,
-                        self.text,
-                        self.budget.min(allowed.len()),
-                        ef,
-                        |id| allowed.contains(id),
-                    )
-                    .await
+                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
+                    let query = owner.embed_query(self.cx, embedder, self.text).await?;
+                    let allowed = Arc::clone(allowed);
+                    owner
+                        .search_filtered_with_pool(
+                            self.cx,
+                            query,
+                            self.budget.min(allowed.len()),
+                            ef,
+                            pool,
+                            move |id| allowed.contains(id),
+                        )
+                        .await
+                } else {
+                    index
+                        .search_text_filtered(
+                            self.cx,
+                            embedder,
+                            self.text,
+                            self.budget.min(allowed.len()),
+                            ef,
+                            |id| allowed.contains(id),
+                        )
+                        .await
+                }
             }
             None => {
                 if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
