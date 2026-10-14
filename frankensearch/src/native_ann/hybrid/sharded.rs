@@ -2,6 +2,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+
 use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::traits::Reranker;
@@ -116,6 +118,52 @@ impl NativeShardSet {
         .await
     }
 
+    /// Retrieve one sharded fast tier with retained traversal on the caller pool.
+    ///
+    /// The query is embedded once using the admitted first owner, then the bound
+    /// embedding moves through the complete shard-set worker and global winner heap.
+    /// Lexical scoring/hydration keep the original pinned reader.
+    pub async fn search_hybrid_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        let is_hash = admit_tiers(cx, self, embedder, None)?;
+        let budget = candidate_budget(k)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let owner = self.shard(0).ok_or_else(|| {
+            invalid(
+                "shards.inventory",
+                "empty",
+                "missing admitted fast identity",
+            )
+        })?;
+        let (query, batch) = join_sources(
+            cx,
+            owner.embed_query(cx, embedder, text),
+            checked_lexical(cx, lexical, text, budget),
+        )
+        .await?;
+        let fast = self
+            .search_with_pool(cx, query, budget, None, pool)
+            .await?;
+        finish(
+            cx,
+            lexical,
+            &batch,
+            &fast,
+            &[],
+            QueryPolicy::default().fusion(k, is_hash, false),
+        )
+        .await
+    }
+
     /// Search this shard set as the primary quality tier, without a fast tier.
     ///
     /// # Errors
@@ -134,6 +182,30 @@ impl NativeShardSet {
             .await?;
         for hit in &mut results {
             checkpoint(cx, "native_ann.shards.quality_result")?;
+            hit.quality_row = hit.fast_row.take();
+            hit.result.quality_score = hit.result.fast_score.take();
+            if hit.result.source == ScoreSource::SemanticFast {
+                hit.result.source = ScoreSource::SemanticQuality;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Quality-primary sharded hybrid retrieval on the caller-owned pool.
+    pub async fn search_hybrid_quality_text_with_pool(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        let mut results = self
+            .search_hybrid_text_with_pool(cx, embedder, lexical, text, k, pool)
+            .await?;
+        for hit in &mut results {
+            checkpoint(cx, "native_ann.shards.quality_pool_result")?;
             hit.quality_row = hit.fast_row.take();
             hit.result.quality_score = hit.result.fast_score.take();
             if hit.result.source == ScoreSource::SemanticFast {
@@ -185,6 +257,61 @@ impl NativeShardSet {
             &batch,
             &fast,
             &quality,
+            QueryPolicy::default().fusion(k, is_hash, true),
+        )
+        .await
+    }
+
+    /// Independently retrieve both complete shard inventories on the caller pool.
+    ///
+    /// Fast and quality inference remain independent and each runs once. Their
+    /// retained traversals may occupy separate workers, but every shard remains
+    /// required and the existing global merge/fusion/hydration path is unchanged.
+    pub async fn search_hybrid_refined_text_with_pool(
+        &self,
+        cx: &Cx,
+        fast_embedder: &dyn Embedder,
+        quality: (&Self, &dyn Embedder),
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        let is_hash = admit_tiers(cx, self, fast_embedder, Some(quality))?;
+        let budget = candidate_budget(k)?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let fast_owner = self.shard(0).ok_or_else(|| {
+            invalid("shards.inventory", "empty", "missing admitted fast identity")
+        })?;
+        let quality_owner = quality.0.shard(0).ok_or_else(|| {
+            invalid("shards.inventory", "empty", "missing admitted quality identity")
+        })?;
+        let (fast_query, (quality_query, batch)) = join_sources(
+            cx,
+            fast_owner.embed_query(cx, fast_embedder, text),
+            join_sources(
+                cx,
+                quality_owner.embed_query(cx, quality.1, text),
+                checked_lexical(cx, lexical, text, budget),
+            ),
+        )
+        .await?;
+        let (fast, quality_hits) = join_sources(
+            cx,
+            self.search_with_pool(cx, fast_query, budget, None, pool.clone()),
+            quality
+                .0
+                .search_with_pool(cx, quality_query, budget, None, pool),
+        )
+        .await?;
+        finish(
+            cx,
+            lexical,
+            &batch,
+            &fast,
+            &quality_hits,
             QueryPolicy::default().fusion(k, is_hash, true),
         )
         .await
