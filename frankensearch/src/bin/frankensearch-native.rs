@@ -808,6 +808,7 @@ async fn execute(
                 } else {
                     controls.into()
                 };
+                let controls = controls.with_query_cache(options.query_cache);
                 return serve::run_with_controls(
                     live.borrow(),
                     cx,
