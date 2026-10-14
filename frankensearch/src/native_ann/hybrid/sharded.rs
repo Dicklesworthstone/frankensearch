@@ -454,6 +454,15 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         Ok(self)
     }
 
+    fn owned_shards(&self, shards: &NativeShardSet) -> Option<NativeShardSet> {
+        if std::ptr::eq(shards, self.fast) {
+            return self.fast_owner.clone();
+        }
+        self.quality
+            .filter(|(quality, _)| std::ptr::eq(*quality, shards))
+            .and(self.quality_owner.clone())
+    }
+
     async fn vector_candidates(
         &self,
         shards: &NativeShardSet,
@@ -469,9 +478,23 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
                     .await
             }
             None => {
-                shards
-                    .search_text(self.cx, embedder, self.text, self.budget, ef)
-                    .await
+                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_shards(shards)) {
+                    let first = owner.shard(0).ok_or_else(|| {
+                        invalid(
+                            "shards.inventory",
+                            "empty",
+                            "missing admitted progressive shard identity",
+                        )
+                    })?;
+                    let query = first.embed_query(self.cx, embedder, self.text).await?;
+                    owner
+                        .search_with_pool(self.cx, query, self.budget, ef, pool)
+                        .await
+                } else {
+                    shards
+                        .search_text(self.cx, embedder, self.text, self.budget, ef)
+                        .await
+                }
             }
         }
     }
