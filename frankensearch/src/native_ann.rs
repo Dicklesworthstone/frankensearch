@@ -376,7 +376,7 @@ impl NativeAnnIndex {
     ///
     /// F32 rows need no decoded allocation. The byte kernel matches the slice
     /// kernel through its complete eight-lane chunks, but its scalar tail uses
-    /// mul_add: evaluate that tail here with the original separate mul/add.
+    /// `mul_add`: evaluate that tail here with the original separate mul/add.
     /// F16's byte kernel groups leftover eight-lane chunks differently as well.
     /// Only complete 32-lane groups can use it without changing score bits;
     /// other F16 dimensions retain the original decode-and-score path.
@@ -394,8 +394,8 @@ impl NativeAnnIndex {
                 // Admission proves this immutable row has dimension * 4 bytes.
                 let (chunks, tail) = row.vector_bytes().split_at(prefix * 4);
                 let mut score = dot_product_f32_bytes_f32(chunks, &query[..prefix])?;
-                for (bytes, &value) in tail.chunks_exact(4).zip(&query[prefix..]) {
-                    let stored = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                for (&bytes, &value) in tail.as_chunks::<4>().0.iter().zip(&query[prefix..]) {
+                    let stored = f32::from_le_bytes(bytes);
                     score += stored * value;
                 }
                 Ok(score)

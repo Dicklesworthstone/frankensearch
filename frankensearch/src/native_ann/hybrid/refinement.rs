@@ -50,6 +50,10 @@ impl NativeAnnIndex {
     ///
     /// The provider still runs through the ordinary identity-bound inference path.
     /// Only retained graph/exact traversal moves to the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// Has the same error surface as [`Self::search_hybrid_text_with_pool`].
     pub async fn search_hybrid_quality_text_with_pool(
         self: &Arc<Self>,
         cx: &Cx,
@@ -149,6 +153,10 @@ impl NativeAnnIndex {
     ///
     /// Both vector arms remain required. A failed, cancelled or abandoned worker
     /// never becomes a fast-only successful page.
+    ///
+    /// # Errors
+    ///
+    /// Propagates admission, inference, blocking-pool, lexical, and hydration errors.
     pub async fn search_hybrid_refined_text_with_pool(
         self: &Arc<Self>,
         cx: &Cx,
@@ -179,13 +187,13 @@ impl NativeAnnIndex {
             ),
         )
         .await?;
-        let (fast_hits, quality_hits) = join_sources(
+        let (fast_hits, quality_hits) = Box::pin(join_sources(
             cx,
             self.search_with_pool(cx, fast_query, budget, None, pool.clone()),
             quality
                 .0
                 .search_with_pool(cx, quality_query, budget, None, pool),
-        )
+        ))
         .await?;
         refined_winners(
             cx,

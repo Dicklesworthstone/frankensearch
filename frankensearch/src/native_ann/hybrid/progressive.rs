@@ -85,6 +85,10 @@ impl NativeAnnIndex {
     /// async ownership. Only native/exact traversal may use the supplied pool.
     /// Scoped queries continue inline until their membership predicate has an
     /// independently owned worker-safe representation.
+    ///
+    /// # Errors
+    ///
+    /// Has the same admission and candidate-budget error surface as [`Self::search_hybrid_progressive`].
     pub fn search_hybrid_progressive_with_pool<'a>(
         self: &'a Arc<Self>,
         cx: &'a Cx,
