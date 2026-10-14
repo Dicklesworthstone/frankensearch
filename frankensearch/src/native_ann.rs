@@ -291,6 +291,13 @@ impl NativeAnnIndex {
             .unwrap_or(self.default_ef_search)
             .max(target)
             .min(physical_rows);
+        // A full-width ANN request has exact-search semantics but the graph API
+        // must materialize up to one candidate per physical row before this
+        // caller can truncate to k. Scan the already-retained owner instead:
+        // the exact path keeps only k winners and preserves score/tie bits.
+        if width == physical_rows {
+            return self.search_exact_filtered(cx, query, target, &accept);
+        }
         loop {
             checkpoint(cx, "native_ann.search_window")?;
             let candidates = graph.search(query.vector(), width, Some(width))?;
@@ -324,13 +331,19 @@ impl NativeAnnIndex {
                 });
             }
             hits.sort_unstable_by(VectorHit::cmp_rank);
-            if hits.len() >= target || width == physical_rows {
+            if hits.len() >= target {
                 hits.truncate(target);
                 checkpoint(cx, "native_ann.search_complete")?;
                 return Ok(hits);
             }
-            // width < physical_rows, so the progress floor cannot overflow.
-            width = width.saturating_mul(2).max(width + 1).min(physical_rows);
+            // Do not allocate a corpus-width graph result merely to prove a
+            // filtered underfill. The final widening step has exact semantics
+            // and can use the same bounded-k retained-owner scan.
+            let next_width = width.saturating_mul(2).max(width + 1).min(physical_rows);
+            if next_width == physical_rows {
+                return self.search_exact_filtered(cx, query, target, &accept);
+            }
+            width = next_width;
         }
     }
 
