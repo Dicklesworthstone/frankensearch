@@ -181,3 +181,6 @@ impl NativeShardedProgressiveSearch<'_> {
         Ok(())
     }
 }
+
+// Execution placement is independent of ranking and required-tier policy.
+mod execution;
