@@ -2716,6 +2716,114 @@ impl PreparedWatchBatch {
     }
 }
 
+struct ForeignReactorWakeRelay {
+    owner_thread: std::thread::ThreadId,
+    done: AtomicBool,
+    companion_armed: AtomicBool,
+    companion_waker: Mutex<Option<std::task::Waker>>,
+}
+
+struct ForeignReactorWakeGuard {
+    relay: Arc<ForeignReactorWakeRelay>,
+    companion_task: Option<asupersync::runtime::TaskHandle<()>>,
+}
+
+impl Drop for ForeignReactorWakeGuard {
+    fn drop(&mut self) {
+        self.relay.done.store(true, Ordering::Release);
+        let waker = lock_or_recover(&self.relay.companion_waker).take();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        if let Some(task) = self.companion_task.take() {
+            task.abort();
+        }
+    }
+}
+
+struct ForeignReactorBridgeWaker {
+    local_waker: std::task::Waker,
+    relay: Arc<ForeignReactorWakeRelay>,
+}
+
+impl std::task::Wake for ForeignReactorBridgeWaker {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.local_waker.wake_by_ref();
+        if std::thread::current().id() != self.relay.owner_thread {
+            let waker = lock_or_recover(&self.relay.companion_waker).clone();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+}
+
+/// Bridge foreign-thread wakes (such as `spawn_blocking` / `spawn_blocking_io`
+/// completions) for a `!Send` `spawn_local` task on `asupersync 0.5.0`
+/// (`bd-0wxjd`).
+async fn with_foreign_reactor_wake<'a, T>(
+    cx: &'a Cx,
+    inner: impl std::future::Future<Output = T> + 'a,
+) -> T {
+    let relay = Arc::new(ForeignReactorWakeRelay {
+        owner_thread: std::thread::current().id(),
+        done: AtomicBool::new(false),
+        companion_armed: AtomicBool::new(false),
+        companion_waker: Mutex::new(None),
+    });
+    let relay_for_companion = Arc::clone(&relay);
+    let companion_task = cx
+        .spawn(move |_companion_cx| async move {
+            std::future::poll_fn(move |poll_cx| {
+                if relay_for_companion.done.load(Ordering::Acquire) {
+                    return std::task::Poll::Ready(());
+                }
+                *lock_or_recover(&relay_for_companion.companion_waker) =
+                    Some(poll_cx.waker().clone());
+                relay_for_companion
+                    .companion_armed
+                    .store(true, Ordering::Release);
+                if relay_for_companion.done.load(Ordering::Acquire) {
+                    return std::task::Poll::Ready(());
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+        })
+        .ok();
+    let guard = ForeignReactorWakeGuard {
+        relay: Arc::clone(&relay),
+        companion_task,
+    };
+    if guard.companion_task.is_some() {
+        let mut yielded = false;
+        std::future::poll_fn(|poll_cx| {
+            if relay.companion_armed.load(Ordering::Acquire) || yielded {
+                std::task::Poll::Ready(())
+            } else {
+                yielded = true;
+                poll_cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+    }
+    let mut inner = std::pin::pin!(inner);
+    std::future::poll_fn(|poll_cx| {
+        let bridged_waker = std::task::Waker::from(Arc::new(ForeignReactorBridgeWaker {
+            local_waker: poll_cx.waker().clone(),
+            relay: Arc::clone(&relay),
+        }));
+        let mut bridged_cx = std::task::Context::from_waker(&bridged_waker);
+        inner.as_mut().poll(&mut bridged_cx)
+    })
+    .await
+}
+
 fn run_ingest_loop<'a>(
     cx: &'a Cx,
     roots: &'a [PathBuf],
@@ -2730,7 +2838,7 @@ fn run_ingest_loop<'a>(
     snapshot_collector: &'a SnapshotCollector,
     watching_enabled: &'a dyn Fn() -> bool,
 ) -> WatchIngestFuture<'a, ()> {
-    Box::pin(async move {
+    Box::pin(with_foreign_reactor_wake(cx, async move {
         const IDLE_POLL: Duration = Duration::from_millis(10);
         const MAX_RECONCILIATION_ATTEMPTS: usize = 3;
         let mut reconciliation_attempts = 0_usize;
@@ -2944,7 +3052,7 @@ fn run_ingest_loop<'a>(
                 }
             }
         }
-    })
+    }))
 }
 
 /// The cancellation this task must report, carrying the caller's own reason.
@@ -9782,5 +9890,112 @@ mod tests {
             test(cx).await
         });
         scheduler.block_on(test_task)
+    }
+
+    #[test]
+    fn local_ingest_task_woken_by_blocking_pool_does_not_wait_for_reactor_timer() {
+        struct BlockingHopPipeline {
+            stop: Arc<WatcherStop>,
+            calls: AtomicUsize,
+        }
+
+        impl WatchIngestPipeline for BlockingHopPipeline {
+            fn apply_batch<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                batch: &'a [WatchIngestOp],
+            ) -> WatchIngestFuture<'a, usize> {
+                let count = batch.len();
+                Box::pin(async move {
+                    asupersync::runtime::spawn_blocking(move || {
+                        std::thread::sleep(Duration::from_millis(30));
+                    })
+                    .await;
+                    self.calls.fetch_add(1, Ordering::AcqRel);
+                    self.stop.request();
+                    Ok(count)
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("create watcher temp dir");
+        let doc_path = temp.path().join("doc.rs");
+        fs::write(&doc_path, "fn main() {}\n").expect("write fixture file");
+
+        let scheduler = RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .expect("build current-thread watcher runtime with blocking pool");
+
+        let elapsed = scheduler.block_on(scheduler.handle().spawn(async move {
+            let cx = Cx::current().expect("runtime task installs a spawn-capable Cx");
+            let mut far_timer = cx
+                .spawn(move |timer_cx| async move {
+                    asupersync::time::sleep(timer_cx.now(), Duration::from_secs(5)).await;
+                })
+                .expect("spawn 5s reactor timer task");
+
+            let stop = Arc::new(WatcherStop::default());
+            let pipeline = Arc::new(BlockingHopPipeline {
+                stop: Arc::clone(&stop),
+                calls: AtomicUsize::new(0),
+            });
+            let queue: ReadyBatchQueue =
+                Arc::new(Mutex::new(VecDeque::from([vec![WatchEvent::created(
+                    doc_path,
+                    100,
+                    Some(13),
+                )]])));
+            let reconciliation: ReconciliationTracker =
+                Arc::new(Mutex::new(ReconciliationState::default()));
+            let stats = Arc::new(WatcherStatsInner::default());
+            let producer_done = Arc::new(AtomicBool::new(true));
+            let root = temp.path().to_path_buf();
+            let pipeline_for_task = Arc::clone(&pipeline);
+            let queue_for_task = Arc::clone(&queue);
+            let stop_for_task = Arc::clone(&stop);
+            let stats_for_task = Arc::clone(&stats);
+            let reconciliation_for_task = Arc::clone(&reconciliation);
+
+            let start = Instant::now();
+            let mut local_ingest = cx
+                .spawn_local(move |child_cx| async move {
+                    let discovery = DiscoveryConfig::default();
+                    run_ingest_loop(
+                        &child_cx,
+                        &[root],
+                        &discovery,
+                        pipeline_for_task.as_ref(),
+                        &queue_for_task,
+                        &stop_for_task,
+                        &stats_for_task,
+                        &reconciliation_for_task,
+                        32,
+                        &producer_done,
+                        &collect_snapshot_from_roots,
+                        &|| true,
+                    )
+                    .await
+                })
+                .expect("spawn local ingest task");
+
+            local_ingest
+                .join(&cx)
+                .await
+                .expect("local ingest task join")
+                .expect("local ingest loop should succeed");
+            let elapsed = start.elapsed();
+
+            far_timer.abort();
+            let _ = far_timer.join(&cx).await;
+            assert_eq!(pipeline.calls.load(Ordering::Acquire), 1);
+            assert_eq!(stats.reindexed_files.load(Ordering::Acquire), 1);
+            elapsed
+        }));
+
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "spawn_local watcher ingest task waited {elapsed:?} for reactor timer instead of waking on blocking-pool completion"
+        );
     }
 }
