@@ -235,9 +235,19 @@ async fn phases<W: Write>(
     }
     frames.send(started).map_err(Failure::Delivery)?;
     if mode != Mode::Full {
-        let payload = query::within(cx, deadline, scoped.search(cx, &request.query, mode, limit))
-            .await
-            .map_err(Failure::Query)?;
+        let payload = query::within(
+            cx,
+            deadline,
+            scoped.search_with_pool(
+                cx,
+                &request.query,
+                mode,
+                limit,
+                policy.query_pool(),
+            ),
+        )
+        .await
+        .map_err(Failure::Query)?;
         frames.send(payload).map_err(Failure::Delivery)?;
         frames.partial = true;
         return Ok(false);
