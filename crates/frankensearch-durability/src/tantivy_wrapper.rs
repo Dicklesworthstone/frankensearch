@@ -610,7 +610,35 @@ mod tests {
         }
     }
 
-    fn temp_dir(prefix: &str) -> PathBuf {
+    struct TestTempDir(PathBuf);
+
+    impl TestTempDir {
+        fn as_path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl std::ops::Deref for TestTempDir {
+        type Target = Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for TestTempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(prefix: &str) -> TestTempDir {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -620,7 +648,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
+        TestTempDir(dir)
     }
 
     fn test_schema() -> Schema {
@@ -670,8 +698,9 @@ mod tests {
         writer.commit().expect("commit");
 
         // Create durable wrapper and protect.
-        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
-            .expect("durable index");
+        let durable =
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
 
         let protection = durable.protect_segments().expect("protect");
         assert!(protection.segments_protected > 0);
@@ -712,7 +741,7 @@ mod tests {
         writer.commit().expect("commit");
 
         let durable =
-            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
                 .expect("durable index");
 
         durable.protect_segments().expect("protect");
@@ -762,7 +791,7 @@ mod tests {
         writer.commit().expect("commit");
 
         let durable =
-            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
                 .expect("durable index");
         durable.protect_segments().expect("protect");
 
@@ -793,7 +822,7 @@ mod tests {
         let index = Index::create_in_dir(&dir, schema).expect("create index");
 
         let durable =
-            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
                 .expect("durable index");
 
         // Create a fake orphaned sidecar.
@@ -823,8 +852,9 @@ mod tests {
         writer.add_document(doc).expect("add doc");
         writer.commit().expect("commit");
 
-        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
-            .expect("durable index");
+        let durable =
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
 
         durable.protect_segments().expect("protect");
 
@@ -838,8 +868,9 @@ mod tests {
         let schema = test_schema();
         let index = Index::create_in_dir(&dir, schema).expect("create index");
 
-        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
-            .expect("durable index");
+        let durable =
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
 
         // Should work fine with no segments.
         let protection = durable.protect_segments().expect("protect empty");
@@ -949,7 +980,7 @@ mod tests {
         let index = Index::create_in_dir(&dir, schema).expect("create index");
 
         let durable =
-            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
                 .expect("durable index");
 
         assert_eq!(durable.data_dir(), dir.as_path());
@@ -961,8 +992,9 @@ mod tests {
         let schema = test_schema();
         let index = Index::create_in_dir(&dir, schema).expect("create index");
 
-        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
-            .expect("durable index");
+        let durable =
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
 
         // Verify the accessor returns an index that can list segments (even if empty).
         let metas = durable.index().searchable_segment_metas().expect("metas");
@@ -1035,8 +1067,9 @@ mod tests {
         writer.commit().expect("commit");
 
         // Do NOT call protect_segments — go straight to verify
-        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
-            .expect("durable index");
+        let durable =
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
 
         let health = durable.verify_and_repair().expect("verify");
         assert!(health.files_checked > 0);
@@ -1063,8 +1096,9 @@ mod tests {
         writer.add_document(doc).expect("add doc");
         writer.commit().expect("commit");
 
-        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
-            .expect("durable index");
+        let durable =
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
 
         durable.protect_segments().expect("protect");
 
@@ -1084,8 +1118,9 @@ mod tests {
         let schema = test_schema();
         let index = Index::create_in_dir(&dir, schema).expect("create index");
 
-        let durable = DurableTantivyIndex::new(index, dir, Arc::new(MockCodec), test_config())
-            .expect("durable index");
+        let durable =
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
+                .expect("durable index");
 
         let snap = durable.metrics_snapshot();
         assert_eq!(snap.encode_ops, 0);
@@ -1101,7 +1136,7 @@ mod tests {
         let index = Index::create_in_dir(&dir, schema).expect("create index");
 
         let durable =
-            DurableTantivyIndex::new(index, dir.clone(), Arc::new(MockCodec), test_config())
+            DurableTantivyIndex::new(index, dir.as_path(), Arc::new(MockCodec), test_config())
                 .expect("durable index");
 
         // Create a non-.fec file that should NOT be cleaned up

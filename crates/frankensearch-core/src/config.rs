@@ -882,16 +882,44 @@ mod tests {
         assert!(config.metrics_exporter().is_none());
     }
 
+    struct TempTomlFile(std::path::PathBuf);
+
+    impl TempTomlFile {
+        fn new(label: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "frankensearch-{label}-{}-{unique}.toml",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl std::ops::Deref for TempTomlFile {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for TempTomlFile {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempTomlFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     #[test]
     fn optimized_loader_reads_toml_file() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "frankensearch-optimized-config-{}-{unique}.toml",
-            std::process::id()
-        ));
+        let path = TempTomlFile::new("optimized-config");
         let expected = TwoTierConfig {
             quality_weight: 0.82,
             rrf_k: 73.5,
@@ -915,24 +943,14 @@ mod tests {
 
     #[test]
     fn optimized_loader_falls_back_to_default_for_missing_or_invalid_file() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let missing = std::env::temp_dir().join(format!(
-            "frankensearch-optimized-missing-{}-{unique}.toml",
-            std::process::id()
-        ));
+        let missing = TempTomlFile::new("optimized-missing");
         let from_missing = TwoTierConfig::from_optimized_file(&missing);
         assert!(
             (from_missing.quality_weight - TwoTierConfig::default().quality_weight).abs() < 1e-12
         );
         assert!((from_missing.rrf_k - TwoTierConfig::default().rrf_k).abs() < 1e-12);
 
-        let invalid = std::env::temp_dir().join(format!(
-            "frankensearch-optimized-invalid-{}-{unique}.toml",
-            std::process::id()
-        ));
+        let invalid = TempTomlFile::new("optimized-invalid");
         std::fs::write(&invalid, "quality_weight = \"not-a-number\"")
             .expect("write invalid optimized config");
         let from_invalid = TwoTierConfig::from_optimized_file(&invalid);
@@ -997,14 +1015,7 @@ mod tests {
 
     #[test]
     fn optimized_partial_toml_merges_with_defaults() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "frankensearch-partial-{}-{unique}.toml",
-            std::process::id()
-        ));
+        let path = TempTomlFile::new("partial");
         std::fs::write(&path, "rrf_k = 99.0\n").expect("write partial config");
 
         let loaded = TwoTierConfig::from_optimized_file(&path);
