@@ -19,7 +19,10 @@ use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_index::native_hnsw::{
     HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
 };
-use frankensearch_index::{FsviV2Witness, ValidatedFsviBytes, dot_product_f32_f32};
+use frankensearch_index::{
+    FsviV2Witness, Quantization, ValidatedFsviBytes, dot_product_f16_bytes_f32,
+    dot_product_f32_bytes_f32, dot_product_f32_f32,
+};
 
 use crate::{Cx, Embedder, SearchError, SearchResult, VectorHit};
 
@@ -31,6 +34,9 @@ mod hybrid;
 #[cfg(feature = "quill")]
 mod quill;
 mod shards;
+
+#[cfg(test)]
+mod scoring_tests;
 
 #[cfg(feature = "quill")]
 pub use quill::NativeQuillSnapshot;
@@ -303,8 +309,7 @@ impl NativeAnnIndex {
                         "source row does not fit usize",
                     )
                 })?;
-                let vector = self.owner.vector_at_f32(row)?;
-                let score = dot_product_f32_f32(&vector, query.vector())?;
+                let score = self.score_retained_row(row, query.vector())?;
                 if !score.is_finite() {
                     return Err(invalid(
                         "score",
@@ -351,6 +356,45 @@ impl NativeAnnIndex {
     #[must_use]
     pub fn owner_witness(&self) -> &FsviV2Witness {
         self.owner.witness()
+    }
+
+    /// Score the original stored row without changing the historical f32
+    /// accumulation order. Both exact scans and ANN rescoring use this path.
+    ///
+    /// F32 rows need no decoded allocation. The byte kernel matches the slice
+    /// kernel through its complete eight-lane chunks, but its scalar tail uses
+    /// mul_add: evaluate that tail here with the original separate mul/add.
+    /// F16's byte kernel groups leftover eight-lane chunks differently as well.
+    /// Only complete 32-lane groups can use it without changing score bits;
+    /// other F16 dimensions retain the original decode-and-score path.
+    fn score_retained_row(&self, physical: usize, query: &[f32]) -> SearchResult<f32> {
+        if query.len() != self.owner.dimension() {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.owner.dimension(),
+                found: query.len(),
+            });
+        }
+        let row = self.owner.row(physical)?;
+        match self.owner.quantization() {
+            Quantization::F32 => {
+                let prefix = query.len() - query.len() % 8;
+                // Admission proves this immutable row has dimension * 4 bytes.
+                let (chunks, tail) = row.vector_bytes().split_at(prefix * 4);
+                let mut score = dot_product_f32_bytes_f32(chunks, &query[..prefix])?;
+                for (bytes, &value) in tail.chunks_exact(4).zip(&query[prefix..]) {
+                    let stored = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    score += stored * value;
+                }
+                Ok(score)
+            }
+            Quantization::F16 if query.len().is_multiple_of(32) => {
+                dot_product_f16_bytes_f32(row.vector_bytes(), query)
+            }
+            Quantization::F16 => {
+                let values = self.owner.vector_at_f32(physical)?;
+                dot_product_f32_f32(&values, query)
+            }
+        }
     }
 
     fn admit_identity(&self, identity: &EmbeddingIdentityBundleV1) -> SearchResult<()> {
