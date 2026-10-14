@@ -115,8 +115,8 @@ impl Embedder for Provider {
             }
             let mut output: Vec<_> = texts.iter().map(|text| self.output(text)).collect();
             if self.fault.load(Ordering::SeqCst) == FOREIGN {
-                output.last_mut().unwrap().identity.producer.backend =
-                    "private-foreign-model".to_owned();
+                "private-foreign-model"
+                    .clone_into(&mut output.last_mut().unwrap().identity.producer.backend);
             }
             Ok(output)
         })

@@ -127,11 +127,10 @@ impl NativeHybridSnapshot {
             builder = admission?;
         }
         let before = self.index().vectors();
-        let expected_quality_input = before
-            .quality()
-            .map_or(&before.fast().producer_identity.input, |tier| {
-                &tier.producer_identity.input
-            });
+        let expected_quality_input = before.quality().map_or_else(
+            || &before.fast().producer_identity.input,
+            |tier| &tier.producer_identity.input,
+        );
         if builder.fast.identity.input != before.fast().producer_identity.input
             || builder
                 .quality

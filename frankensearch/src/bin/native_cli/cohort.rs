@@ -156,6 +156,7 @@ impl<'a> Prepared<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn search(
         &self,
         cx: &Cx,
@@ -229,6 +230,7 @@ impl<'a> Prepared<'a> {
         Ok(payload)
     }
 
+    #[allow(dead_code)]
     pub fn progressive<'q>(
         &'q self,
         cx: &'q Cx,
@@ -276,6 +278,7 @@ impl<'a> Prepared<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn progressive_with_reranker<'q>(
         &'q self,
         cx: &'q Cx,

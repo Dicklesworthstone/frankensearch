@@ -11,6 +11,7 @@ enum Operation {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
 pub(super) struct Request {
     #[serde(rename = "op")]
     _operation: Operation,
@@ -57,7 +58,7 @@ pub(super) async fn execute<W: Write>(
     };
     // One retained cohort, intersected scopes, unchanged deadline ceiling and
     // reranker. A delivery error remains fatal; reported query failures do not.
-    super::stream_one(
+    Box::pin(super::stream_one(
         index,
         cx,
         &message.request,
@@ -66,7 +67,7 @@ pub(super) async fn execute<W: Write>(
         output,
         base_filter,
         &effective,
-    )
+    ))
     .await?;
     Ok(())
 }

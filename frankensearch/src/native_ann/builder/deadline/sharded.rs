@@ -78,7 +78,7 @@ impl NativeDeadlineShardedProgressiveSearch<'_> {
         // Nothing replayable remains in self while the provider is suspended.
         let stage = std::mem::replace(&mut self.stage, Stage::Done);
         let previous = std::mem::take(&mut self.previous);
-        let response = self.deadline.run(self.cx, stream.next_phase()).await;
+        let response = Box::pin(self.deadline.run(self.cx, stream.next_phase())).await;
         match response {
             Err(error @ SearchError::SearchTimeout { .. }) => match stage {
                 Stage::Initial | Stage::Done => Err(error),
@@ -144,30 +144,29 @@ impl NativeDeadlineShardedProgressiveSearch<'_> {
         }
         // One timer covers collection itself as well as every underlying phase.
         // There is no displayed fallback page to clone or preserve in this path.
-        self.deadline
-            .run(self.cx, async {
-                let Some(mut stream) = self.stream.take() else {
-                    return Err(invalid(
-                        "deadline.sharded.collect",
-                        "finished",
-                        "collect requires an owned unstarted query",
-                    ));
-                };
-                let mut page = Vec::new();
-                while let Some(phase) = stream.next_phase().await? {
-                    match phase {
-                        NativeShardedSearchPhase::Initial { results, .. }
-                        | NativeShardedSearchPhase::Refined { results, .. }
-                        | NativeShardedSearchPhase::Reranked { results, .. } => page = results,
-                        NativeShardedSearchPhase::RefinementFailed { error, .. }
-                        | NativeShardedSearchPhase::RerankFailed { error, .. } => {
-                            return Err(error);
-                        }
+        Box::pin(self.deadline.run(self.cx, async {
+            let Some(mut stream) = self.stream.take() else {
+                return Err(invalid(
+                    "deadline.sharded.collect",
+                    "finished",
+                    "collect requires an owned unstarted query",
+                ));
+            };
+            let mut page = Vec::new();
+            while let Some(phase) = stream.next_phase().await? {
+                match phase {
+                    NativeShardedSearchPhase::Initial { results, .. }
+                    | NativeShardedSearchPhase::Refined { results, .. }
+                    | NativeShardedSearchPhase::Reranked { results, .. } => page = results,
+                    NativeShardedSearchPhase::RefinementFailed { error, .. }
+                    | NativeShardedSearchPhase::RerankFailed { error, .. } => {
+                        return Err(error);
                     }
                 }
-                Ok(page)
-            })
-            .await
+            }
+            Ok(page)
+        }))
+        .await
     }
 }
 

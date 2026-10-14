@@ -18,8 +18,7 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
 #[path = "query/tuning.rs"]
 mod tuning;
-pub use tuning::FullQuery;
-pub(crate) use tuning::{FullQueryOverride, deserialize_query_override};
+pub use tuning::{FullQuery, FullQueryOverride, deserialize_query_override};
 
 /// A server budget is both the default and a ceiling on request overrides.
 /// No configured budget preserves the previous unbounded-query policy.
@@ -155,7 +154,7 @@ pub async fn buffered<'i>(
 ) -> Result<serde_json::Value> {
     let index = index.into();
     let deadline = policy.start(cx, None)?;
-    within(cx, deadline.as_ref(), async {
+    Box::pin(within(cx, deadline.as_ref(), async {
         let rerank = policy.reranker_for(mode);
         if rerank.is_none() && (mode != Mode::Full || policy.full_query.is_none()) {
             validate_query(text)?;
@@ -191,7 +190,7 @@ pub async fn buffered<'i>(
         }
         policy.annotate_full_query(mode, &mut payload);
         Ok(payload)
-    })
+    }))
     .await
 }
 

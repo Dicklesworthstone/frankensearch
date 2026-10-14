@@ -152,6 +152,9 @@ impl NativeScopedHybridIndex<'_> {
 
     /// Prepare scoped progressive retrieval with retained vector traversal on
     /// the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Refuses invalid candidate budgets, identity mismatches, or cancellation.
     pub fn progressive_with_pool<'a>(
         &'a self,
         cx: &'a Cx,
@@ -194,6 +197,10 @@ impl NativeScopedHybridIndex<'_> {
             .with_reranker(reranker, self.text.as_ref(), window)
     }
 
+    /// Pool-aware scoped progressive retrieval plus retained-source reranking.
+    ///
+    /// # Errors
+    /// Combines scoped progressive admission and native rerank configuration errors.
     pub fn progressive_with_reranker_on_pool<'a>(
         &'a self,
         cx: &'a Cx,
@@ -215,6 +222,10 @@ impl NativeScopedHybridIndex<'_> {
         collect(self.primary(cx, text, k, false)?).await
     }
 
+    /// Pool-aware scoped fast-plus-lexical search; never starts the quality provider.
+    ///
+    /// # Errors
+    /// Propagates native retrieval, lexical expansion, hydration and cancellation errors.
     pub async fn search_with_pool(
         &self,
         cx: &Cx,
@@ -242,6 +253,10 @@ impl NativeScopedHybridIndex<'_> {
         collect(self.progressive(cx, text, k)?).await
     }
 
+    /// Pool-aware collection of the scoped progressive pipeline, requiring configured refinement.
+    ///
+    /// # Errors
+    /// Propagates every required phase's errors, including refinement failure.
     pub async fn search_refined_with_pool(
         &self,
         cx: &Cx,
@@ -274,6 +289,10 @@ impl NativeScopedHybridIndex<'_> {
         Ok(results)
     }
 
+    /// Pool-aware scoped quality-primary retrieval, without running the fast model.
+    ///
+    /// # Errors
+    /// Refuses an absent quality tier and propagates retrieval/hydration errors.
     pub async fn search_quality_with_pool(
         &self,
         cx: &Cx,

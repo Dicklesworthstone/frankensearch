@@ -178,8 +178,8 @@ fn pooled_built_queries_match_inline_results_and_phases() {
             let left = inline.next_phase().await.unwrap();
             let right = pooled.next_phase().await.unwrap();
             assert_eq!(
-                serde_json::to_value(&right.as_ref().map(|phase| format!("{phase:?}"))).unwrap(),
-                serde_json::to_value(&left.as_ref().map(|phase| format!("{phase:?}"))).unwrap()
+                serde_json::to_value(right.as_ref().map(|phase| format!("{phase:?}"))).unwrap(),
+                serde_json::to_value(left.as_ref().map(|phase| format!("{phase:?}"))).unwrap()
             );
             if left.is_none() {
                 break;

@@ -27,7 +27,7 @@ mod model_migration;
 mod request_tuning;
 
 #[path = "source.rs"]
-pub(super) mod source;
+pub mod source;
 
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
@@ -235,11 +235,11 @@ async fn phases<W: Write>(
     }
     frames.send(started).map_err(Failure::Delivery)?;
     if mode != Mode::Full {
-        let payload = query::within(
+        let payload = Box::pin(query::within(
             cx,
             deadline,
             scoped.search_with_pool(cx, &request.query, mode, limit, policy.query_pool()),
-        )
+        ))
         .await
         .map_err(Failure::Query)?;
         frames.send(payload).map_err(Failure::Delivery)?;
@@ -253,9 +253,9 @@ async fn phases<W: Write>(
     while !stream.is_finished() {
         // One deadline, not a renewed timeout per phase. Do not time output:
         // delivery may already be visible and must never be reported undone.
-        let phase = query::within(cx, deadline, async {
+        let phase = Box::pin(query::within(cx, deadline, async {
             stream.next_phase().await.map_err(Into::into)
-        })
+        }))
         .await
         .map_err(Failure::Query)?;
         let Some(phase) = phase else {
@@ -341,12 +341,12 @@ pub async fn stream_one<'i, W: Write>(
     let mut frames = Frames::new(output, ordinal, request.id.as_deref(), index.generation());
     let mode = request.mode.unwrap_or(defaults.0);
     let limit = request.limit.unwrap_or(defaults.1);
-    let result = async {
+    let result = Box::pin(async {
         request.validate().map_err(Failure::Query)?;
         let deadline = policy
             .start(cx, request.timeout_ms)
             .map_err(Failure::Query)?;
-        phases(
+        Box::pin(phases(
             index,
             cx,
             request,
@@ -356,9 +356,9 @@ pub async fn stream_one<'i, W: Write>(
             [base_filter, request.filter.as_ref()],
             deadline.as_ref(),
             policy,
-        )
+        ))
         .await
-    }
+    })
     .await;
     match result {
         Ok(degraded) => {
@@ -477,7 +477,7 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                 // Pin once, through Initial, quality, hydration and terminal
                 // delivery. Never resolve the serving selection between phases.
                 let snapshot = live.snapshot(cx).await?;
-                let _complete = stream_one(
+                let _complete = Box::pin(stream_one(
                     snapshot.index(),
                     cx,
                     &request,
@@ -486,12 +486,12 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                     output,
                     base_filter,
                     policy,
-                )
+                ))
                 .await?;
             }
             Message::TunedSearch(request) => {
                 let snapshot = live.snapshot(cx).await?;
-                request_tuning::execute(
+                Box::pin(request_tuning::execute(
                     snapshot.index(),
                     cx,
                     &request,
@@ -500,7 +500,7 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                     output,
                     base_filter,
                     policy,
-                )
+                ))
                 .await?;
             }
             Message::Control(request) => {

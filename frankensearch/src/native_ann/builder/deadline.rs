@@ -125,7 +125,7 @@ impl NativeSearchDeadline {
         cx: &Cx,
         query: NativeProgressiveSearch<'_>,
     ) -> SearchResult<Vec<ScoredResult>> {
-        self.run(cx, query.collect()).await
+        Box::pin(self.run(cx, query.collect())).await
     }
 
     fn expired(&self) -> bool {
@@ -289,7 +289,7 @@ impl NativeScopedHybridIndex<'_> {
         k: usize,
         deadline: &NativeSearchDeadline,
     ) -> SearchResult<Vec<ScoredResult>> {
-        deadline.collect(cx, self.progressive(cx, text, k)?).await
+        Box::pin(deadline.collect(cx, self.progressive(cx, text, k)?)).await
     }
 }
 

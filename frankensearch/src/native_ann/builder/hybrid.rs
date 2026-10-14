@@ -188,6 +188,9 @@ impl NativeBuiltHybridIndex {
     ///
     /// Inference, lexical scoring and hydration retain the ordinary async path;
     /// only native/exact vector traversal is placed on the supplied blocking pool.
+    ///
+    /// # Errors
+    /// Propagates embedding, native retrieval, lexical, fusion and hydration errors.
     pub async fn search_with_pool(
         &self,
         cx: &Cx,
@@ -232,6 +235,9 @@ impl NativeBuiltHybridIndex {
     }
 
     /// Refined two-tier hybrid search with both retained traversals on the pool.
+    ///
+    /// # Errors
+    /// Propagates all configured retrieval and hydration errors.
     pub async fn search_refined_with_pool(
         &self,
         cx: &Cx,
@@ -283,6 +289,9 @@ impl NativeBuiltHybridIndex {
     }
 
     /// Quality-primary hybrid search with retained traversal on the caller pool.
+    ///
+    /// # Errors
+    /// Refuses a missing quality tier; otherwise propagates native quality errors.
     pub async fn search_quality_with_pool(
         &self,
         cx: &Cx,
@@ -336,6 +345,9 @@ impl NativeBuiltHybridIndex {
 
     /// Prepare progressive native retrieval with retained vector traversal on
     /// the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Refuses invalid query topology, identity, candidate budget or cancellation.
     pub fn progressive_with_pool<'a>(
         &'a self,
         cx: &'a Cx,
@@ -378,6 +390,9 @@ impl NativeBuiltHybridIndex {
     }
 
     /// Pool-aware variant of progressive retrieval plus retained-source reranking.
+    ///
+    /// # Errors
+    /// Combines [`Self::progressive_with_pool`] admission and native rerank configuration errors.
     pub fn progressive_with_reranker_on_pool<'a>(
         &'a self,
         cx: &'a Cx,

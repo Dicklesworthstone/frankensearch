@@ -703,6 +703,7 @@ fn save_selection(selection: &Selection, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn search(
     index: &NativeBuiltHybridIndex,
     cx: &Cx,
@@ -811,7 +812,7 @@ async fn execute(
                     controls.into()
                 };
                 let controls = controls.with_query_cache(options.query_cache);
-                return serve::run_with_controls(
+                return Box::pin(serve::run_with_controls(
                     live.borrow(),
                     cx,
                     &mut io::stdin().lock(),
@@ -820,7 +821,7 @@ async fn execute(
                     controls,
                     options.filter.as_ref(),
                     &policy,
-                )
+                ))
                 .await;
             }
             if options.stream {
@@ -832,7 +833,7 @@ async fn execute(
                     filter: options.filter,
                     timeout_ms: None,
                 };
-                return if serve::stream_one(
+                return if Box::pin(serve::stream_one(
                     index.borrow(),
                     cx,
                     &request,
@@ -841,7 +842,7 @@ async fn execute(
                     output,
                     None,
                     &policy,
-                )
+                ))
                 .await?
                 {
                     Ok(())
@@ -851,7 +852,7 @@ async fn execute(
                     ))
                 };
             }
-            let page = query::buffered(
+            let page = Box::pin(query::buffered(
                 index.borrow(),
                 cx,
                 options
@@ -862,7 +863,7 @@ async fn execute(
                 options.limit,
                 [None, options.filter.as_ref()],
                 &policy,
-            )
+            ))
             .await?;
             emit(output, &page)
         }

@@ -553,6 +553,7 @@ fn sharded_timeout_after_initial_starts_no_quality_or_rerank_and_later_query_rec
             maximum_ms: Some(10),
             timer: Some(timer),
             rerank: Some(query::Rerank::new(scorer.clone(), 4).unwrap()),
+            ..query::Policy::default()
         };
         let mut output = Delivery {
             bytes: Vec::new(),

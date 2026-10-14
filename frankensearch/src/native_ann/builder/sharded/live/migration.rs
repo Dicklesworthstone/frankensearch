@@ -313,6 +313,7 @@ impl TargetTier {
         }
     }
 
+    #[allow(clippy::suspicious_operation_groupings)]
     fn matches(&self, tier: &NativeBuiltTier) -> bool {
         if self.identity != tier.producer_identity || self.precision != tier.precision {
             return false;

@@ -320,6 +320,9 @@ impl NativeBuiltShardedHybridIndex {
 
     /// Fast-plus-global-lexical retrieval with the complete shard traversal on
     /// the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Propagates embedding, shard retrieval, lexical, fusion, and hydration errors.
     pub async fn search_with_pool(
         &self,
         cx: &Cx,
@@ -377,6 +380,9 @@ impl NativeBuiltShardedHybridIndex {
 
     /// Refined fast/quality shard retrieval with both complete inventories on
     /// the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Propagates all configured retrieval, fusion and hydration failures.
     pub async fn search_refined_with_pool(
         &self,
         cx: &Cx,
@@ -434,6 +440,9 @@ impl NativeBuiltShardedHybridIndex {
     }
 
     /// Quality-primary sharded hybrid retrieval on the caller-owned pool.
+    ///
+    /// # Errors
+    /// Refuses absent quality, including zero-result queries, and propagates errors.
     pub async fn search_quality_with_pool(
         &self,
         cx: &Cx,
@@ -485,6 +494,9 @@ impl NativeBuiltShardedHybridIndex {
 
     /// Prepare progressive sharded retrieval with retained inventory traversal
     /// on the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Refuses invalid identity, topology, candidate budgets or cancellation.
     pub fn progressive_with_pool<'a>(
         &'a self,
         cx: &'a Cx,
@@ -529,6 +541,9 @@ impl NativeBuiltShardedHybridIndex {
     }
 
     /// Pool-aware progressive sharded retrieval plus retained-source reranking.
+    ///
+    /// # Errors
+    /// Combines progressive admission and native reranker configuration errors.
     pub fn progressive_with_reranker_on_pool<'a>(
         &'a self,
         cx: &'a Cx,

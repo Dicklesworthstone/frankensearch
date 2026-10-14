@@ -122,7 +122,7 @@ impl NativeDeadlineProgressiveSearch<'_> {
         };
         let stage = std::mem::replace(&mut self.stage, Stage::Done);
         let previous = std::mem::take(&mut self.previous);
-        let response = self.deadline.run(self.cx, stream.next_phase()).await;
+        let response = Box::pin(self.deadline.run(self.cx, stream.next_phase())).await;
         match response {
             Err(error @ SearchError::SearchTimeout { .. }) => match stage {
                 Stage::Initial | Stage::Done => Err(error),

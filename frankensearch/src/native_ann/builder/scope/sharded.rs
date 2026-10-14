@@ -149,6 +149,9 @@ impl NativeScopedShardedHybridIndex<'_> {
 
     /// Prepare scoped sharded progressive retrieval with complete retained
     /// inventory traversal on the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Refuses invalid quality topology, candidate budget, identity, or cancellation.
     pub fn progressive_with_pool<'a>(
         &'a self,
         cx: &'a Cx,
@@ -204,6 +207,10 @@ impl NativeScopedShardedHybridIndex<'_> {
             .with_reranker(reranker, self.text.as_ref(), window)
     }
 
+    /// Pool-aware scoped sharded progressive retrieval plus retained-source reranking.
+    ///
+    /// # Errors
+    /// Combines scoped progressive admission and existing rerank-window errors.
     pub fn progressive_with_reranker_on_pool<'a>(
         &'a self,
         cx: &'a Cx,
@@ -230,6 +237,10 @@ impl NativeScopedShardedHybridIndex<'_> {
         collect(self.primary(cx, text, k, false)?).await
     }
 
+    /// Pool-aware scoped fast-plus-keyword retrieval without invoking the quality provider.
+    ///
+    /// # Errors
+    /// Propagates required retrieval, widening, hydration and cancellation errors.
     pub async fn search_with_pool(
         &self,
         cx: &Cx,
@@ -253,6 +264,10 @@ impl NativeScopedShardedHybridIndex<'_> {
         collect(self.progressive(cx, text, k)?).await
     }
 
+    /// Pool-aware collection of the scoped progressive query, requiring every configured phase.
+    ///
+    /// # Errors
+    /// A failed required quality phase is an error, not Initial-only success.
     pub async fn search_refined_with_pool(
         &self,
         cx: &Cx,
@@ -286,6 +301,11 @@ impl NativeScopedShardedHybridIndex<'_> {
         Ok(results)
     }
 
+    /// Pool-aware independent scoped quality-plus-keyword retrieval without fast inference.
+    ///
+    /// # Errors
+    /// Refuses absent quality before the empty-scope/zero-k fast paths and
+    /// propagates ordinary identity, retrieval, hydration and cancellation errors.
     pub async fn search_quality_with_pool(
         &self,
         cx: &Cx,

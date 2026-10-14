@@ -161,6 +161,7 @@ impl<'a> Query<'a> {
         }
     }
 
+    #[cfg(test)]
     pub(super) async fn search(
         &self,
         cx: &Cx,
