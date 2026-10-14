@@ -429,7 +429,7 @@ pub struct NativeShardedProgressiveSearch<'a> {
     budget: usize,
     policy: QueryPolicy,
     reranker: Option<RerankRequest<'a>>,
-    allowed_documents: Option<&'a BTreeSet<String>>,
+    allowed_documents: Option<std::sync::Arc<BTreeSet<String>>>,
     state: State,
 }
 
@@ -439,8 +439,16 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
     // attach a vector-only filter and silently leave the keyword lane unscoped.
     #[cfg(feature = "quill")]
     pub(crate) fn with_allowed_documents(
+        self,
+        allowed: &BTreeSet<String>,
+    ) -> SearchResult<Self> {
+        self.with_allowed_documents_arc(std::sync::Arc::new(allowed.clone()))
+    }
+
+    #[cfg(feature = "quill")]
+    pub(crate) fn with_allowed_documents_arc(
         mut self,
-        allowed: &'a BTreeSet<String>,
+        allowed: std::sync::Arc<BTreeSet<String>>,
     ) -> SearchResult<Self> {
         checkpoint(self.cx, "native_ann.shards.scope_configuration")?;
         if !matches!(self.state, State::Initial) {
@@ -469,13 +477,40 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         embedder: &dyn Embedder,
         ef: Option<usize>,
     ) -> SearchResult<Vec<NativeShardHit>> {
-        match self.allowed_documents {
+        match self.allowed_documents.as_ref() {
             Some(allowed) => {
-                shards
-                    .search_text_filtered(self.cx, embedder, self.text, self.budget, ef, |id| {
-                        allowed.contains(id)
-                    })
-                    .await
+                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_shards(shards)) {
+                    let first = owner.shard(0).ok_or_else(|| {
+                        invalid(
+                            "shards.inventory",
+                            "empty",
+                            "missing admitted progressive shard identity",
+                        )
+                    })?;
+                    let query = first.embed_query(self.cx, embedder, self.text).await?;
+                    let allowed = std::sync::Arc::clone(allowed);
+                    owner
+                        .search_filtered_with_pool(
+                            self.cx,
+                            query,
+                            self.budget.min(allowed.len()),
+                            ef,
+                            pool,
+                            move |id| allowed.contains(id),
+                        )
+                        .await
+                } else {
+                    shards
+                        .search_text_filtered(
+                            self.cx,
+                            embedder,
+                            self.text,
+                            self.budget.min(allowed.len()),
+                            ef,
+                            |id| allowed.contains(id),
+                        )
+                        .await
+                }
             }
             None => {
                 if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_shards(shards)) {
@@ -598,7 +633,12 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
 
     async fn initial(&mut self) -> SearchResult<NativeShardedSearchPhase> {
         let is_hash = admit_tiers(self.cx, self.fast, self.fast_embedder, self.quality)?;
-        if self.k == 0 || self.allowed_documents.is_some_and(BTreeSet::is_empty) {
+        if self.k == 0
+            || self
+                .allowed_documents
+                .as_ref()
+                .is_some_and(|allowed| allowed.is_empty())
+        {
             return Ok(NativeShardedSearchPhase::Initial {
                 results: Vec::new(),
                 candidates: NativePhaseCandidates::default(),
@@ -610,7 +650,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
             checked_lexical(self.cx, self.lexical, self.text, self.budget),
         )
         .await?;
-        if let Some(allowed) = self.allowed_documents {
+        if let Some(allowed) = self.allowed_documents.as_ref() {
             for result in batch.results() {
                 checkpoint(self.cx, "native_ann.shards.lexical_scope")?;
                 if !allowed.contains(result.doc_id.as_str()) {
