@@ -106,6 +106,17 @@ impl Controls {
     }
 }
 
+impl SessionControls {
+    /// Apply the startup query-cache policy to models loaded by later migrations.
+    /// Existing warm caches are never transferred across a model replacement.
+    pub(super) fn with_query_cache(mut self, cache: crate::query_cache::Config) -> Self {
+        if let Some(authority) = self.migration.take() {
+            self.migration = Some(authority.with_query_cache(cache));
+        }
+        self
+    }
+}
+
 // Unknown control fields cannot fall through into an unrestricted search.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
