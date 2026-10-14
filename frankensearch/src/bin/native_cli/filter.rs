@@ -2,6 +2,7 @@
 //! Membership is evaluated before retrieval and fusion, never on a displayed
 //! top-k page. An owner-supplied server scope cannot be widened by a request.
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch::native_ann::NativeProgressiveSearch;
 use frankensearch::native_ann::builder::scope::NativeScopedHybridIndex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -153,15 +154,38 @@ impl<'a> Query<'a> {
         mode: Mode,
         limit: usize,
     ) -> Result<serde_json::Value> {
+        self.search_with_pool(cx, query, mode, limit, None).await
+    }
+
+    pub(super) async fn search_with_pool(
+        &self,
+        cx: &Cx,
+        query: &str,
+        mode: Mode,
+        limit: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> Result<serde_json::Value> {
         validate_query(query)?;
         let full = mode == Mode::Full && self.index.vectors().quality().is_some();
-        let results = match (&self.scope, mode, full) {
-            (Some(scope), Mode::Quality, _) => scope.search_quality(cx, query, limit).await?,
-            (Some(scope), _, true) => scope.search_refined(cx, query, limit).await?,
-            (Some(scope), _, false) => scope.search(cx, query, limit).await?,
-            (None, Mode::Quality, _) => self.index.search_quality(cx, query, limit).await?,
-            (None, _, true) => self.index.search_refined(cx, query, limit).await?,
-            (None, _, false) => self.index.search(cx, query, limit).await?,
+        let results = match (&self.scope, pool, mode, full) {
+            // Scoped predicates borrow this retained query object. Keep their
+            // existing synchronous traversal until the scope layer owns a
+            // stable 'static membership predicate for worker execution.
+            (Some(scope), _, Mode::Quality, _) => scope.search_quality(cx, query, limit).await?,
+            (Some(scope), _, _, true) => scope.search_refined(cx, query, limit).await?,
+            (Some(scope), _, _, false) => scope.search(cx, query, limit).await?,
+            (None, Some(pool), Mode::Quality, _) => {
+                self.index.search_quality_with_pool(cx, query, limit, pool).await?
+            }
+            (None, Some(pool), _, true) => {
+                self.index.search_refined_with_pool(cx, query, limit, pool).await?
+            }
+            (None, Some(pool), _, false) => {
+                self.index.search_with_pool(cx, query, limit, pool).await?
+            }
+            (None, None, Mode::Quality, _) => self.index.search_quality(cx, query, limit).await?,
+            (None, None, _, true) => self.index.search_refined(cx, query, limit).await?,
+            (None, None, _, false) => self.index.search(cx, query, limit).await?,
         };
         let phase = if mode == Mode::Quality {
             "quality"
