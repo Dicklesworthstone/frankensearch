@@ -265,14 +265,20 @@ impl Policy {
         limit: usize,
     ) -> Result<cohort::Progressive<'a>> {
         let query = match &self.rerank {
-            Some(rerank) => scoped.progressive_with_reranker(
+            Some(rerank) => scoped.progressive_with_reranker_on_pool(
                 cx,
                 text,
                 limit,
                 rerank.model.as_ref(),
                 rerank.window,
+                self.query_pool(),
             )?,
-            None => scoped.progressive(cx, text, limit)?,
+            None => scoped.progressive_on_pool(
+                cx,
+                text,
+                limit,
+                self.query_pool(),
+            )?,
         };
         match &self.full_query {
             Some(policy) => policy.apply(query),
