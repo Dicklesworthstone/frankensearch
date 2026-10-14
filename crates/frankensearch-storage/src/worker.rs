@@ -463,10 +463,7 @@ impl PersistentEmbeddingWorker {
                 if should_stop(cx, shutdown)? {
                     return Ok(WorkerDrainOutcome::Stopped { report });
                 }
-                return Ok(WorkerDrainOutcome::DeadlineReached {
-                    report,
-                    remaining,
-                });
+                return Ok(WorkerDrainOutcome::DeadlineReached { report, remaining });
             }
             self.recover_if_due(cx.now(), &mut schedule, &mut report)?;
             // A synchronous scan can take time; do not start another batch if
@@ -479,10 +476,7 @@ impl PersistentEmbeddingWorker {
                 if should_stop(cx, shutdown)? {
                     return Ok(WorkerDrainOutcome::Stopped { report });
                 }
-                return Ok(WorkerDrainOutcome::DeadlineReached {
-                    report,
-                    remaining,
-                });
+                return Ok(WorkerDrainOutcome::DeadlineReached { report, remaining });
             }
             let batch = self.process_batch(cx, worker_id).await?;
             record_batch(&mut report, batch);
@@ -599,10 +593,16 @@ fn record_batch(report: &mut PersistentWorkerReport, batch: BatchProcessResult) 
     }
     report.work.idle_cycles = 0;
     report.work.batches_processed = report.work.batches_processed.saturating_add(1);
-    report.work.jobs_completed = report.work.jobs_completed.saturating_add(batch.jobs_completed);
+    report.work.jobs_completed = report
+        .work
+        .jobs_completed
+        .saturating_add(batch.jobs_completed);
     report.work.jobs_failed = report.work.jobs_failed.saturating_add(batch.jobs_failed);
     report.work.jobs_skipped = report.work.jobs_skipped.saturating_add(batch.jobs_skipped);
-    report.work.jobs_suppressed = report.work.jobs_suppressed.saturating_add(batch.jobs_suppressed);
+    report.work.jobs_suppressed = report
+        .work
+        .jobs_suppressed
+        .saturating_add(batch.jobs_suppressed);
     report.work.terminal_failures_encountered = report
         .work
         .terminal_failures_encountered
@@ -643,13 +643,13 @@ mod tests {
     #![allow(clippy::arc_with_non_send_sync)]
 
     use std::future::{Future, poll_fn};
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
     use std::task::Poll;
 
+    use frankensearch_core::EmbeddingIdentityBundleV1;
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
-    use frankensearch_core::EmbeddingIdentityBundleV1;
     use fsqlite_types::value::SqliteValue;
 
     use super::*;
@@ -679,7 +679,9 @@ mod tests {
                 }
                 if self
                     .failures
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1))
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
                     .is_ok()
                 {
                     return Err(SearchError::EmbeddingFailed {
@@ -744,7 +746,12 @@ mod tests {
             recovery_interval: Duration::from_millis(10),
         })
         .unwrap();
-        Fixture { worker, storage, sink, probe }
+        Fixture {
+            worker,
+            storage,
+            sink,
+            probe,
+        }
     }
 
     fn expire_claims(storage: &Storage) {
@@ -765,23 +772,47 @@ mod tests {
                 cancel: AtomicBool::new(false),
                 inputs: Mutex::new(Vec::new()),
             });
-            let worker = f.worker.with_database_publication().with_quality_embedder(quality.clone());
+            let worker = f
+                .worker
+                .with_database_publication()
+                .with_quality_embedder(quality.clone());
             let text = "searchable café 数据 complete content ".repeat(80);
-            worker.runner().ingest(IngestRequest::new("doc", &text)).unwrap();
+            worker
+                .runner()
+                .ingest(IngestRequest::new("doc", &text))
+                .unwrap();
             let expected = f.storage.get_document_content("doc").unwrap().unwrap();
             assert!(expected.chars().count() > 400);
-            let outcome = worker.drain(&cx, "worker", &AtomicBool::new(false), Duration::from_secs(2)).await.unwrap();
+            let outcome = worker
+                .drain(
+                    &cx,
+                    "worker",
+                    &AtomicBool::new(false),
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
             let WorkerDrainOutcome::Drained { report, remaining } = outcome else {
                 panic!("expected a complete database drain: {outcome:?}");
             };
             assert_eq!(report.work.jobs_completed, 2);
             assert_eq!(remaining.completed, 2);
-            assert_eq!(remaining.failed + remaining.pending + remaining.processing, 0);
+            assert_eq!(
+                remaining.failed + remaining.pending + remaining.processing,
+                0
+            );
             assert!(f.sink.entries().is_empty());
-            assert_eq!(f.probe.inputs.lock().unwrap().as_slice(), std::slice::from_ref(&expected));
+            assert_eq!(
+                f.probe.inputs.lock().unwrap().as_slice(),
+                std::slice::from_ref(&expected)
+            );
             assert_eq!(quality.inputs.lock().unwrap().as_slice(), [expected]);
             for probe in [&f.probe, &quality] {
-                let published = f.storage.get_published_embedding("doc", probe.id, &probe.identity).unwrap().unwrap();
+                let published = f
+                    .storage
+                    .get_published_embedding("doc", probe.id, &probe.identity)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(published.embedding.values, vec![0.6, 0.8]);
             }
             assert_eq!(worker.queue().metrics().snapshot().total_completed, 2);
@@ -792,11 +823,25 @@ mod tests {
     #[test]
     fn database_publication_retries_provider_failures_without_waiting_for_a_lease() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let f = fixture(JobQueueConfig { retry_base_delay_ms: 5, ..JobQueueConfig::default() });
+            let f = fixture(JobQueueConfig {
+                retry_base_delay_ms: 5,
+                ..JobQueueConfig::default()
+            });
             f.probe.failures.store(1, Ordering::SeqCst);
             let worker = f.worker.with_database_publication();
-            worker.runner().ingest(IngestRequest::new("retry", "complete input")).unwrap();
-            let outcome = worker.drain(&cx, "worker", &AtomicBool::new(false), Duration::from_secs(2)).await.unwrap();
+            worker
+                .runner()
+                .ingest(IngestRequest::new("retry", "complete input"))
+                .unwrap();
+            let outcome = worker
+                .drain(
+                    &cx,
+                    "worker",
+                    &AtomicBool::new(false),
+                    Duration::from_secs(2),
+                )
+                .await
+                .unwrap();
             let WorkerDrainOutcome::Drained { report, remaining } = outcome else {
                 panic!("delayed retry must drain without lease expiry: {outcome:?}");
             };
@@ -804,35 +849,63 @@ mod tests {
             assert_eq!(report.work.jobs_failed, 1);
             assert_eq!(report.work.terminal_failures_encountered, 0);
             assert_eq!(remaining.completed, 1);
-            assert_eq!(remaining.failed + remaining.processing + remaining.pending, 0);
+            assert_eq!(
+                remaining.failed + remaining.processing + remaining.pending,
+                0
+            );
             assert!(f.sink.entries().is_empty());
             let metrics = worker.queue().metrics().snapshot();
             assert_eq!(metrics.total_completed, 1);
             assert_eq!(metrics.total_retried, 1);
             assert_eq!(metrics.total_failed, 0);
             assert_eq!(worker.runner().metrics().snapshot().total_jobs_claimed, 2);
-            assert!(f.storage.get_published_embedding("retry", f.probe.id, &f.probe.identity).unwrap().is_some());
+            assert!(
+                f.storage
+                    .get_published_embedding("retry", f.probe.id, &f.probe.identity)
+                    .unwrap()
+                    .is_some()
+            );
         });
     }
 
     #[test]
     fn database_publication_terminal_failure_does_not_block_the_next_job() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            let f = fixture(JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            });
             f.probe.failures.store(1, Ordering::SeqCst);
-            let worker = f.worker.with_database_publication().with_batch_size(2).unwrap();
+            let worker = f
+                .worker
+                .with_database_publication()
+                .with_batch_size(2)
+                .unwrap();
             for id in ["reject", "good"] {
                 worker.runner().ingest(IngestRequest::new(id, id)).unwrap();
             }
-            f.storage.connection().execute_sync("UPDATE embedding_jobs SET priority = 100 WHERE doc_id = 'reject';").unwrap();
+            f.storage
+                .connection()
+                .execute_sync("UPDATE embedding_jobs SET priority = 100 WHERE doc_id = 'reject';")
+                .unwrap();
             let result = worker.process_batch(&cx, "worker").await.unwrap();
             assert_eq!(result.jobs_claimed, 2);
             assert_eq!(result.jobs_completed, 1);
             assert_eq!(result.jobs_failed, 1);
             assert_eq!(result.terminal_failures, 1);
             assert!(f.sink.entries().is_empty());
-            assert!(f.storage.get_published_embedding("reject", f.probe.id, &f.probe.identity).unwrap().is_none());
-            assert!(f.storage.get_published_embedding("good", f.probe.id, &f.probe.identity).unwrap().is_some());
+            assert!(
+                f.storage
+                    .get_published_embedding("reject", f.probe.id, &f.probe.identity)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                f.storage
+                    .get_published_embedding("good", f.probe.id, &f.probe.identity)
+                    .unwrap()
+                    .is_some()
+            );
             let queue = worker.queue().metrics().snapshot();
             assert_eq!(queue.total_failed, 1);
             assert_eq!(queue.total_completed, 1);
@@ -845,10 +918,19 @@ mod tests {
     #[test]
     fn database_publication_missing_input_consumes_only_the_bounded_job_retry() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            let f = fixture(JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            });
             let worker = f.worker.with_database_publication();
-            worker.runner().ingest(IngestRequest::new("missing", "input")).unwrap();
-            f.storage.connection().execute_sync("DELETE FROM document_contents;").unwrap();
+            worker
+                .runner()
+                .ingest(IngestRequest::new("missing", "input"))
+                .unwrap();
+            f.storage
+                .connection()
+                .execute_sync("DELETE FROM document_contents;")
+                .unwrap();
             let result = worker.process_batch(&cx, "worker").await.unwrap();
             assert_eq!(result.terminal_failures, 1);
             assert_eq!(result.jobs_completed, 0);
@@ -861,16 +943,28 @@ mod tests {
     #[test]
     fn database_publication_failure_rolls_back_without_becoming_a_provider_failure() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            let f = fixture(JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            });
             let worker = f.worker.with_database_publication();
-            worker.runner().ingest(IngestRequest::new("rollback", "input")).unwrap();
+            worker
+                .runner()
+                .ingest(IngestRequest::new("rollback", "input"))
+                .unwrap();
             // The last catalog write fails, after vector and queue writes.
             f.storage.connection().execute_sync("ALTER TABLE embedding_status RENAME COLUMN embedded_at TO unavailable_embedded_at;").unwrap();
             assert!(worker.process_batch(&cx, "worker").await.is_err());
             let depth = worker.queue().queue_depth().unwrap();
             assert_eq!(depth.processing, 1);
             assert_eq!(depth.completed + depth.failed + depth.pending, 0);
-            assert!(f.storage.connection().query_sync("SELECT doc_id FROM published_embeddings;").unwrap().is_empty());
+            assert!(
+                f.storage
+                    .connection()
+                    .query_sync("SELECT doc_id FROM published_embeddings;")
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(worker.queue().metrics().snapshot().total_completed, 0);
             assert_eq!(worker.queue().metrics().snapshot().total_failed, 0);
             assert_eq!(worker.runner().metrics().snapshot().total_jobs_failed, 0);
@@ -883,11 +977,18 @@ mod tests {
     fn database_publication_counts_prior_commits_when_later_input_is_corrupt() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let f = fixture(JobQueueConfig::default());
-            let worker = f.worker.with_database_publication().with_batch_size(2).unwrap();
+            let worker = f
+                .worker
+                .with_database_publication()
+                .with_batch_size(2)
+                .unwrap();
             for id in ["good", "corrupt"] {
                 worker.runner().ingest(IngestRequest::new(id, id)).unwrap();
             }
-            f.storage.connection().execute_sync("UPDATE embedding_jobs SET priority = 100 WHERE doc_id = 'good';").unwrap();
+            f.storage
+                .connection()
+                .execute_sync("UPDATE embedding_jobs SET priority = 100 WHERE doc_id = 'good';")
+                .unwrap();
             f.storage.connection().execute_sync("UPDATE document_contents SET canonical_text = 'wrong bytes' WHERE doc_id = 'corrupt';").unwrap();
             assert!(worker.process_batch(&cx, "worker").await.is_err());
             let depth = worker.queue().queue_depth().unwrap();
@@ -899,7 +1000,12 @@ mod tests {
             assert_eq!(metrics.total_jobs_completed, 1);
             assert_eq!(metrics.total_jobs_failed, 0);
             assert_eq!(metrics.total_jobs_claimed, 2);
-            assert!(f.storage.get_published_embedding("good", f.probe.id, &f.probe.identity).unwrap().is_some());
+            assert!(
+                f.storage
+                    .get_published_embedding("good", f.probe.id, &f.probe.identity)
+                    .unwrap()
+                    .is_some()
+            );
             assert!(f.sink.entries().is_empty());
         });
     }
@@ -907,16 +1013,30 @@ mod tests {
     #[test]
     fn database_publication_propagates_typed_cancellation_without_consuming_retry_budget() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            let f = fixture(JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            });
             f.probe.cancel.store(true, Ordering::SeqCst);
             let worker = f.worker.with_database_publication();
-            worker.runner().ingest(IngestRequest::new("cancel", "input")).unwrap();
-            assert!(matches!(worker.process_batch(&cx, "worker").await, Err(SearchError::Cancelled { .. })));
+            worker
+                .runner()
+                .ingest(IngestRequest::new("cancel", "input"))
+                .unwrap();
+            assert!(matches!(
+                worker.process_batch(&cx, "worker").await,
+                Err(SearchError::Cancelled { .. })
+            ));
             assert_eq!(worker.queue().queue_depth().unwrap().processing, 1);
             assert_eq!(worker.queue().metrics().snapshot().total_failed, 0);
             assert_eq!(worker.runner().metrics().snapshot().total_jobs_failed, 0);
             assert!(f.sink.entries().is_empty());
-            assert!(f.storage.get_published_embedding("cancel", f.probe.id, &f.probe.identity).unwrap().is_none());
+            assert!(
+                f.storage
+                    .get_published_embedding("cancel", f.probe.id, &f.probe.identity)
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -924,35 +1044,64 @@ mod tests {
     fn external_worker_processing_keeps_its_explicit_sink_policy() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let f = fixture(JobQueueConfig::default());
-            f.worker.runner().ingest(IngestRequest::new("external", "input")).unwrap();
-            assert_eq!(f.worker.process_batch(&cx, "worker").await.unwrap().jobs_completed, 1);
+            f.worker
+                .runner()
+                .ingest(IngestRequest::new("external", "input"))
+                .unwrap();
+            assert_eq!(
+                f.worker
+                    .process_batch(&cx, "worker")
+                    .await
+                    .unwrap()
+                    .jobs_completed,
+                1
+            );
             assert_eq!(f.sink.entries().len(), 1);
-            assert!(f.storage.get_published_embedding("external", f.probe.id, &f.probe.identity).unwrap().is_none());
+            assert!(
+                f.storage
+                    .get_published_embedding("external", f.probe.id, &f.probe.identity)
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
     #[test]
     fn service_rejects_non_progressing_configuration() {
         for bad in [Duration::ZERO, Duration::MAX] {
-            assert!(WorkerServiceConfig {
-                idle_poll_interval: bad,
-                ..WorkerServiceConfig::default()
-            }.validate().is_err());
-            assert!(WorkerServiceConfig {
-                recovery_interval: bad,
-                ..WorkerServiceConfig::default()
-            }.validate().is_err());
+            assert!(
+                WorkerServiceConfig {
+                    idle_poll_interval: bad,
+                    ..WorkerServiceConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
+            assert!(
+                WorkerServiceConfig {
+                    recovery_interval: bad,
+                    ..WorkerServiceConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
         }
         let f = fixture(JobQueueConfig::default());
         assert!(f.worker.with_batch_size(0).is_err());
         let f = fixture(JobQueueConfig::default());
-        assert!(PersistentEmbeddingWorker::new(
-            f.storage,
-            JobQueueConfig { batch_size: 0, ..JobQueueConfig::default() },
-            Arc::new(DefaultCanonicalizer::default()),
-            f.probe,
-            f.sink,
-        ).is_err());
+        assert!(
+            PersistentEmbeddingWorker::new(
+                f.storage,
+                JobQueueConfig {
+                    batch_size: 0,
+                    ..JobQueueConfig::default()
+                },
+                Arc::new(DefaultCanonicalizer::default()),
+                f.probe,
+                f.sink,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -960,36 +1109,65 @@ mod tests {
         let mut schedule = RecoverySchedule::new(Duration::from_millis(10)).unwrap();
         assert!(schedule.due(Time::from_millis(100)));
         schedule.last = Some(Time::from_millis(100));
-        assert_eq!(schedule.remaining(Time::from_millis(104)), Duration::from_millis(6));
+        assert_eq!(
+            schedule.remaining(Time::from_millis(104)),
+            Duration::from_millis(6)
+        );
         assert!(!schedule.due(Time::from_millis(109)));
         assert!(schedule.due(Time::from_millis(110)));
         assert!(schedule.due(Time::from_millis(99)));
         schedule.last = Some(Time::from_nanos(u64::MAX - 2));
-        assert_eq!(schedule.remaining(Time::MAX), Duration::from_nanos(9_999_998));
+        assert_eq!(
+            schedule.remaining(Time::MAX),
+            Duration::from_nanos(9_999_998)
+        );
     }
 
     #[test]
     fn late_expiring_claim_is_recovered_and_processed_without_restarting() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let f = fixture(JobQueueConfig::default());
-            f.worker.runner().ingest(IngestRequest::new("late", "durable input")).unwrap();
-            let old = f.worker.queue().claim_batch("old-owner", 1).unwrap().pop().unwrap();
+            f.worker
+                .runner()
+                .ingest(IngestRequest::new("late", "durable input"))
+                .unwrap();
+            let old = f
+                .worker
+                .queue()
+                .claim_batch("old-owner", 1)
+                .unwrap()
+                .pop()
+                .unwrap();
             let mut schedule = RecoverySchedule::new(Duration::from_millis(10)).unwrap();
             let mut report = PersistentWorkerReport::default();
-            f.worker.recover_if_due(Time::ZERO, &mut schedule, &mut report).unwrap();
+            f.worker
+                .recover_if_due(Time::ZERO, &mut schedule, &mut report)
+                .unwrap();
             assert_eq!(report.work.reclaimed_on_startup, 0);
             expire_claims(&f.storage);
-            f.worker.recover_if_due(Time::from_millis(9), &mut schedule, &mut report).unwrap();
+            f.worker
+                .recover_if_due(Time::from_millis(9), &mut schedule, &mut report)
+                .unwrap();
             assert_eq!(f.worker.queue().queue_depth().unwrap().processing, 1);
-            f.worker.recover_if_due(Time::from_millis(10), &mut schedule, &mut report).unwrap();
+            f.worker
+                .recover_if_due(Time::from_millis(10), &mut schedule, &mut report)
+                .unwrap();
             assert_eq!(report.recovery_passes, 2);
             assert_eq!(report.reclaimed_after_startup, 1);
             assert_eq!(f.worker.runner().metrics().snapshot().total_reclaimed, 1);
-            let batch = f.worker.runner().process_batch(&cx, "new-owner").await.unwrap();
+            let batch = f
+                .worker
+                .runner()
+                .process_batch(&cx, "new-owner")
+                .await
+                .unwrap();
             assert_eq!(batch.jobs_completed, 1);
             assert_eq!(f.sink.entries().len(), 1);
             assert_eq!(
-                f.worker.queue().complete(&old, &old.content_hash.unwrap()).unwrap(),
+                f.worker
+                    .queue()
+                    .complete(&old, &old.content_hash.unwrap())
+                    .unwrap(),
                 ClaimOutcome::LostClaim
             );
         });
@@ -997,14 +1175,24 @@ mod tests {
 
     #[test]
     fn ongoing_recovery_honors_the_persisted_crash_retry_budget() {
-        let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
-        f.worker.runner().ingest(IngestRequest::new("exhausted", "input")).unwrap();
+        let f = fixture(JobQueueConfig {
+            max_retries: 0,
+            ..JobQueueConfig::default()
+        });
+        f.worker
+            .runner()
+            .ingest(IngestRequest::new("exhausted", "input"))
+            .unwrap();
         assert_eq!(f.worker.queue().claim_batch("old", 1).unwrap().len(), 1);
         let mut schedule = RecoverySchedule::new(Duration::from_millis(10)).unwrap();
         let mut report = PersistentWorkerReport::default();
-        f.worker.recover_if_due(Time::ZERO, &mut schedule, &mut report).unwrap();
+        f.worker
+            .recover_if_due(Time::ZERO, &mut schedule, &mut report)
+            .unwrap();
         expire_claims(&f.storage);
-        f.worker.recover_if_due(Time::from_millis(10), &mut schedule, &mut report).unwrap();
+        f.worker
+            .recover_if_due(Time::from_millis(10), &mut schedule, &mut report)
+            .unwrap();
         assert_eq!(report.reclaimed_after_startup, 1);
         assert_eq!(f.worker.queue().queue_depth().unwrap().failed, 1);
         assert_eq!(f.storage.count_by_status("worker-probe").unwrap().failed, 1);
@@ -1014,20 +1202,32 @@ mod tests {
     #[test]
     fn failed_recovery_does_not_advance_schedule_or_metrics() {
         let f = fixture(JobQueueConfig::default());
-        f.storage.connection().execute_sync(
-            "ALTER TABLE embedding_jobs RENAME COLUMN started_at TO unavailable_started_at;",
-        ).unwrap();
+        f.storage
+            .connection()
+            .execute_sync(
+                "ALTER TABLE embedding_jobs RENAME COLUMN started_at TO unavailable_started_at;",
+            )
+            .unwrap();
         let mut schedule = RecoverySchedule::new(Duration::from_millis(10)).unwrap();
         let mut report = PersistentWorkerReport::default();
         let metrics = f.worker.runner().metrics().snapshot();
-        assert!(f.worker.recover_if_due(Time::ZERO, &mut schedule, &mut report).is_err());
+        assert!(
+            f.worker
+                .recover_if_due(Time::ZERO, &mut schedule, &mut report)
+                .is_err()
+        );
         assert!(schedule.last.is_none());
         assert_eq!(report, PersistentWorkerReport::default());
         assert_eq!(f.worker.runner().metrics().snapshot(), metrics);
-        f.storage.connection().execute_sync(
-            "ALTER TABLE embedding_jobs RENAME COLUMN unavailable_started_at TO started_at;",
-        ).unwrap();
-        f.worker.recover_if_due(Time::ZERO, &mut schedule, &mut report).unwrap();
+        f.storage
+            .connection()
+            .execute_sync(
+                "ALTER TABLE embedding_jobs RENAME COLUMN unavailable_started_at TO started_at;",
+            )
+            .unwrap();
+        f.worker
+            .recover_if_due(Time::ZERO, &mut schedule, &mut report)
+            .unwrap();
         assert_eq!(report.recovery_passes, 1);
     }
 
@@ -1036,7 +1236,10 @@ mod tests {
         for cancel in [false, true] {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let f = fixture(JobQueueConfig::default());
-                f.worker.runner().ingest(IngestRequest::new("stop", "input")).unwrap();
+                f.worker
+                    .runner()
+                    .ingest(IngestRequest::new("stop", "input"))
+                    .unwrap();
                 assert_eq!(f.worker.queue().claim_batch("old", 1).unwrap().len(), 1);
                 expire_claims(&f.storage);
                 let before = f.worker.queue().queue_depth().unwrap();
@@ -1061,7 +1264,10 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let f = fixture(JobQueueConfig::default());
             for id in ["first", "second"] {
-                f.worker.runner().ingest(IngestRequest::new(id, "input")).unwrap();
+                f.worker
+                    .runner()
+                    .ingest(IngestRequest::new(id, "input"))
+                    .unwrap();
             }
             let shutdown = AtomicBool::new(false);
             let mut future = std::pin::pin!(f.worker.run(&cx, "busy", &shutdown));
@@ -1073,7 +1279,9 @@ mod tests {
                     Poll::Pending
                 }
                 Poll::Ready(result) => Poll::Ready(result),
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert!(yields > 0, "immediately-ready embedders must still yield");
             assert_eq!(report.work.jobs_completed, 1);
             assert_eq!(f.sink.entries().len(), 1);
@@ -1089,7 +1297,10 @@ mod tests {
                 ..JobQueueConfig::default()
             });
             f.probe.failures.store(1, Ordering::SeqCst);
-            f.worker.runner().ingest(IngestRequest::new("retry", "input")).unwrap();
+            f.worker
+                .runner()
+                .ingest(IngestRequest::new("retry", "input"))
+                .unwrap();
             let shutdown = AtomicBool::new(false);
             let mut future = std::pin::pin!(f.worker.run(&cx, "retry-worker", &shutdown));
             let mut polls = 0;
@@ -1110,11 +1321,16 @@ mod tests {
                     if !f.sink.entries().is_empty() {
                         shutdown.store(true, Ordering::Release);
                     }
-                    assert!(polls < 10_000, "worker must eventually process the mature retry");
+                    assert!(
+                        polls < 10_000,
+                        "worker must eventually process the mature retry"
+                    );
                     Poll::Pending
                 }
                 Poll::Ready(result) => Poll::Ready(result),
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert!(report.idle_polls > 0);
             assert_eq!(report.work.jobs_failed, 1);
             assert_eq!(report.work.jobs_completed, 1);
@@ -1127,15 +1343,22 @@ mod tests {
     fn processing_storage_error_escapes_without_an_unbounded_restart_loop() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let f = fixture(JobQueueConfig::default());
-            f.worker.runner().ingest(IngestRequest::new("corrupt", "input")).unwrap();
-            f.storage.connection().execute_sync(
-                "UPDATE documents SET content_hash = X'01' WHERE doc_id = 'corrupt';",
-            ).unwrap();
+            f.worker
+                .runner()
+                .ingest(IngestRequest::new("corrupt", "input"))
+                .unwrap();
+            f.storage
+                .connection()
+                .execute_sync("UPDATE documents SET content_hash = X'01' WHERE doc_id = 'corrupt';")
+                .unwrap();
             let result = f.worker.run(&cx, "worker", &AtomicBool::new(false)).await;
             assert!(result.is_err());
             assert!(f.sink.entries().is_empty());
             let depth = f.worker.queue().queue_depth().unwrap();
-            assert_eq!(depth.processing, 1, "failed batch retains its recoverable claim");
+            assert_eq!(
+                depth.processing, 1,
+                "failed batch retains its recoverable claim"
+            );
             assert_eq!(depth.failed + depth.completed + depth.pending, 0);
             assert_eq!(f.worker.queue().metrics().snapshot().total_retried, 0);
         });
@@ -1144,14 +1367,27 @@ mod tests {
     #[test]
     fn drain_reports_terminal_failures_without_leaving_runnable_work() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let f = fixture(JobQueueConfig { max_retries: 0, ..JobQueueConfig::default() });
+            let f = fixture(JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            });
             f.probe.failures.store(1, Ordering::SeqCst);
             for id in ["one", "two", "three"] {
-                f.worker.runner().ingest(IngestRequest::new(id, "input")).unwrap();
+                f.worker
+                    .runner()
+                    .ingest(IngestRequest::new(id, "input"))
+                    .unwrap();
             }
-            let outcome = f.worker.drain(
-                &cx, "drain", &AtomicBool::new(false), Duration::from_secs(5),
-            ).await.unwrap();
+            let outcome = f
+                .worker
+                .drain(
+                    &cx,
+                    "drain",
+                    &AtomicBool::new(false),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
             let WorkerDrainOutcome::Drained { report, remaining } = outcome else {
                 panic!("expected a fully processed queue, got {outcome:?}");
             };
@@ -1169,20 +1405,28 @@ mod tests {
         for claimed in [false, true] {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let f = fixture(JobQueueConfig::default());
-                f.worker.runner().ingest(IngestRequest::new("budget", "input")).unwrap();
+                f.worker
+                    .runner()
+                    .ingest(IngestRequest::new("budget", "input"))
+                    .unwrap();
                 if claimed {
                     assert_eq!(f.worker.queue().claim_batch("old", 1).unwrap().len(), 1);
                     expire_claims(&f.storage);
                 }
                 let depth = f.worker.queue().queue_depth().unwrap();
                 let metrics = f.worker.queue().metrics().snapshot();
-                let outcome = f.worker.drain(
-                    &cx, "drain", &AtomicBool::new(false), Duration::ZERO,
-                ).await.unwrap();
-                assert_eq!(outcome, WorkerDrainOutcome::DeadlineReached {
-                    report: PersistentWorkerReport::default(),
-                    remaining: depth,
-                });
+                let outcome = f
+                    .worker
+                    .drain(&cx, "drain", &AtomicBool::new(false), Duration::ZERO)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    outcome,
+                    WorkerDrainOutcome::DeadlineReached {
+                        report: PersistentWorkerReport::default(),
+                        remaining: depth,
+                    }
+                );
                 assert_eq!(f.worker.queue().queue_depth().unwrap(), depth);
                 assert_eq!(f.worker.queue().metrics().snapshot(), metrics);
                 assert!(f.sink.entries().is_empty());
@@ -1194,26 +1438,42 @@ mod tests {
     fn drain_waits_for_a_live_claim_instead_of_declaring_an_empty_queue() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let f = fixture(JobQueueConfig::default());
-            f.worker.runner().ingest(IngestRequest::new("live", "input")).unwrap();
-            let claim = f.worker.queue().claim_batch("other", 1).unwrap().pop().unwrap();
+            f.worker
+                .runner()
+                .ingest(IngestRequest::new("live", "input"))
+                .unwrap();
+            let claim = f
+                .worker
+                .queue()
+                .claim_batch("other", 1)
+                .unwrap()
+                .pop()
+                .unwrap();
             let shutdown = AtomicBool::new(false);
-            let mut future = std::pin::pin!(f.worker.drain(
-                &cx, "drain", &shutdown, Duration::from_secs(5),
-            ));
+            let mut future =
+                std::pin::pin!(
+                    f.worker
+                        .drain(&cx, "drain", &shutdown, Duration::from_secs(5),)
+                );
             let outcome = poll_fn(|task_cx| match future.as_mut().poll(task_cx) {
                 Poll::Pending => {
                     shutdown.store(true, Ordering::Release);
                     Poll::Pending
                 }
                 Poll::Ready(result) => Poll::Ready(result),
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             let WorkerDrainOutcome::Stopped { report } = outcome else {
                 panic!("a live claim is outstanding work, got {outcome:?}");
             };
             assert_eq!(report.idle_polls, 1);
             assert_eq!(f.worker.queue().queue_depth().unwrap().processing, 1);
             assert_eq!(
-                f.worker.queue().complete(&claim, &claim.content_hash.unwrap()).unwrap(),
+                f.worker
+                    .queue()
+                    .complete(&claim, &claim.content_hash.unwrap())
+                    .unwrap(),
                 ClaimOutcome::Applied(())
             );
         });
@@ -1224,25 +1484,34 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let f = fixture(JobQueueConfig::default());
             for id in ["first", "second"] {
-                f.worker.runner().ingest(IngestRequest::new(id, "input")).unwrap();
+                f.worker
+                    .runner()
+                    .ingest(IngestRequest::new(id, "input"))
+                    .unwrap();
             }
             let shutdown = AtomicBool::new(false);
-            let mut future = std::pin::pin!(f.worker.drain(
-                &cx, "drain", &shutdown, Duration::from_secs(5),
-            ));
+            let mut future =
+                std::pin::pin!(
+                    f.worker
+                        .drain(&cx, "drain", &shutdown, Duration::from_secs(5),)
+                );
             let outcome = poll_fn(|task_cx| match future.as_mut().poll(task_cx) {
                 Poll::Pending => {
                     shutdown.store(true, Ordering::Release);
                     Poll::Pending
                 }
                 Poll::Ready(result) => Poll::Ready(result),
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             assert!(matches!(outcome, WorkerDrainOutcome::Stopped { .. }));
             assert_eq!(outcome.report().work.jobs_completed, 1);
             shutdown.store(false, Ordering::Release);
-            let resumed = f.worker.drain(
-                &cx, "drain", &shutdown, Duration::from_secs(5),
-            ).await.unwrap();
+            let resumed = f
+                .worker
+                .drain(&cx, "drain", &shutdown, Duration::from_secs(5))
+                .await
+                .unwrap();
             assert!(matches!(resumed, WorkerDrainOutcome::Drained { .. }));
             assert_eq!(resumed.report().work.jobs_completed, 1);
             assert_eq!(f.sink.entries().len(), 2);
@@ -1258,11 +1527,16 @@ mod tests {
                 ..JobQueueConfig::default()
             });
             f.probe.failures.store(1, Ordering::SeqCst);
-            f.worker.runner().ingest(IngestRequest::new("retry", "input")).unwrap();
+            f.worker
+                .runner()
+                .ingest(IngestRequest::new("retry", "input"))
+                .unwrap();
             let shutdown = AtomicBool::new(false);
-            let mut future = std::pin::pin!(f.worker.drain(
-                &cx, "drain", &shutdown, Duration::from_secs(5),
-            ));
+            let mut future =
+                std::pin::pin!(
+                    f.worker
+                        .drain(&cx, "drain", &shutdown, Duration::from_secs(5),)
+                );
             let mut polls = 0;
             let outcome = poll_fn(|task_cx| match future.as_mut().poll(task_cx) {
                 Poll::Pending => {
@@ -1277,14 +1551,19 @@ mod tests {
                     Poll::Pending
                 }
                 Poll::Ready(result) => Poll::Ready(result),
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             let WorkerDrainOutcome::Drained { report, remaining } = outcome else {
                 panic!("expected quiescence after retry, got {outcome:?}");
             };
             assert!(report.idle_polls > 0);
             assert_eq!(report.work.jobs_failed, 1);
             assert_eq!(report.work.jobs_completed, 1);
-            assert_eq!(remaining.pending + remaining.processing + remaining.failed, 0);
+            assert_eq!(
+                remaining.pending + remaining.processing + remaining.failed,
+                0
+            );
             assert_eq!(f.sink.entries().len(), 1);
         });
     }
@@ -1302,8 +1581,14 @@ mod tests {
             idle_wait(config, &schedule, Time::ZERO, Some(deadline)),
             Duration::from_millis(3)
         );
-        assert_eq!(idle_wait(config, &schedule, deadline, Some(deadline)), Duration::ZERO);
-        assert_eq!(drain_deadline(Time::MAX, Duration::ZERO).unwrap(), Time::MAX);
+        assert_eq!(
+            idle_wait(config, &schedule, deadline, Some(deadline)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            drain_deadline(Time::MAX, Duration::ZERO).unwrap(),
+            Time::MAX
+        );
         assert!(drain_deadline(Time::MAX, Duration::from_nanos(1)).is_err());
         assert!(drain_deadline(Time::ZERO, Duration::MAX).is_err());
     }
@@ -1312,15 +1597,23 @@ mod tests {
     fn drain_budget_expires_while_delayed_work_remains_outstanding() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let f = fixture(JobQueueConfig::default());
-            f.worker.runner().ingest(IngestRequest::new("future", "input")).unwrap();
-            f.storage.connection().execute_with_params_sync(
-                "UPDATE embedding_jobs SET submitted_at = ?1 WHERE status = 'pending';",
-                &[SqliteValue::Integer(i64::MAX)],
-            ).unwrap();
+            f.worker
+                .runner()
+                .ingest(IngestRequest::new("future", "input"))
+                .unwrap();
+            f.storage
+                .connection()
+                .execute_with_params_sync(
+                    "UPDATE embedding_jobs SET submitted_at = ?1 WHERE status = 'pending';",
+                    &[SqliteValue::Integer(i64::MAX)],
+                )
+                .unwrap();
             let shutdown = AtomicBool::new(false);
-            let mut future = std::pin::pin!(f.worker.drain(
-                &cx, "drain", &shutdown, Duration::from_millis(2),
-            ));
+            let mut future =
+                std::pin::pin!(
+                    f.worker
+                        .drain(&cx, "drain", &shutdown, Duration::from_millis(2),)
+                );
             let mut polls = 0;
             let outcome = poll_fn(|task_cx| match future.as_mut().poll(task_cx) {
                 Poll::Pending => {
@@ -1329,12 +1622,17 @@ mod tests {
                     Poll::Pending
                 }
                 Poll::Ready(result) => Poll::Ready(result),
-            }).await.unwrap();
+            })
+            .await
+            .unwrap();
             let WorkerDrainOutcome::DeadlineReached { report, remaining } = outcome else {
                 panic!("unready work must not be reported drained: {outcome:?}");
             };
             assert_eq!(remaining.pending, 1);
-            assert_eq!(remaining.processing + remaining.failed + remaining.completed, 0);
+            assert_eq!(
+                remaining.processing + remaining.failed + remaining.completed,
+                0
+            );
             assert_eq!(report.work.jobs_completed + report.work.jobs_failed, 0);
             assert!(f.sink.entries().is_empty());
         });

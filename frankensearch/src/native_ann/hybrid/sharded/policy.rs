@@ -34,13 +34,15 @@ pub(super) struct ShardFusion<'a> {
 
 impl QueryPolicy {
     pub(super) fn budget(&self, window: usize) -> SearchResult<usize> {
-        window.checked_mul(self.candidate_multiplier).ok_or_else(|| {
-            invalid(
-                "shards.candidate_budget",
-                "overflow",
-                "the configured candidate budget must fit usize",
-            )
-        })
+        window
+            .checked_mul(self.candidate_multiplier)
+            .ok_or_else(|| {
+                invalid(
+                    "shards.candidate_budget",
+                    "overflow",
+                    "the configured candidate budget must fit usize",
+                )
+            })
     }
 
     pub(super) fn fusion(&self, k: usize, is_hash: bool, refined: bool) -> ShardFusion<'_> {
@@ -129,13 +131,16 @@ impl NativeShardedProgressiveSearch<'_> {
                 "candidate multiplier must be positive",
             ));
         }
-        let budget = self.result_window().checked_mul(multiplier).ok_or_else(|| {
-            invalid(
-                "shards.candidate_budget",
-                "overflow",
-                "the configured candidate budget must fit usize",
-            )
-        })?;
+        let budget = self
+            .result_window()
+            .checked_mul(multiplier)
+            .ok_or_else(|| {
+                invalid(
+                    "shards.candidate_budget",
+                    "overflow",
+                    "the configured candidate budget must fit usize",
+                )
+            })?;
         self.policy.candidate_multiplier = multiplier;
         self.budget = budget;
         Ok(self)

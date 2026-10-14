@@ -197,14 +197,7 @@ impl NativeBuiltHybridIndex {
     ) -> SearchResult<Vec<ScoredResult>> {
         let fast = self.vectors.fast();
         fast.index
-            .search_hybrid_text_with_pool(
-                cx,
-                fast.embedder(),
-                &self.lexical,
-                text,
-                k,
-                pool,
-            )
+            .search_hybrid_text_with_pool(cx, fast.embedder(), &self.lexical, text, k, pool)
             .await
     }
 

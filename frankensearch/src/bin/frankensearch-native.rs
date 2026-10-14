@@ -332,7 +332,8 @@ impl Options {
             ));
         }
         options.quality.validate_usage(!options.fast_only)?;
-        if command == Command::Search && options.full_query.is_some() && options.mode != Mode::Full {
+        if command == Command::Search && options.full_query.is_some() && options.mode != Mode::Full
+        {
             return Err(bad("--full-query requires search --mode full"));
         }
         if seen.contains("--rerank-window") && options.reranker_dir.is_none() {

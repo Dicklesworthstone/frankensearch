@@ -123,6 +123,10 @@ impl NativeShardSet {
     /// The query is embedded once using the admitted first owner, then the bound
     /// embedding moves through the complete shard-set worker and global winner heap.
     /// Lexical scoring/hydration keep the original pinned reader.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the ordinary sharded hybrid errors plus blocking-pool admission failure.
     pub async fn search_hybrid_text_with_pool(
         &self,
         cx: &Cx,
@@ -150,9 +154,7 @@ impl NativeShardSet {
             checked_lexical(cx, lexical, text, budget),
         )
         .await?;
-        let fast = self
-            .search_with_pool(cx, query, budget, None, pool)
-            .await?;
+        let fast = self.search_with_pool(cx, query, budget, None, pool).await?;
         finish(
             cx,
             lexical,
@@ -192,6 +194,10 @@ impl NativeShardSet {
     }
 
     /// Quality-primary sharded hybrid retrieval on the caller-owned pool.
+    ///
+    /// # Errors
+    ///
+    /// Has the same error surface as [`Self::search_hybrid_text_with_pool`].
     pub async fn search_hybrid_quality_text_with_pool(
         &self,
         cx: &Cx,
@@ -267,6 +273,10 @@ impl NativeShardSet {
     /// Fast and quality inference remain independent and each runs once. Their
     /// retained traversals may occupy separate workers, but every shard remains
     /// required and the existing global merge/fusion/hydration path is unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Propagates tier admission, inference, blocking-pool, shard, lexical, and hydration errors.
     pub async fn search_hybrid_refined_text_with_pool(
         &self,
         cx: &Cx,
@@ -283,10 +293,18 @@ impl NativeShardSet {
             return Ok(Vec::new());
         }
         let fast_owner = self.shard(0).ok_or_else(|| {
-            invalid("shards.inventory", "empty", "missing admitted fast identity")
+            invalid(
+                "shards.inventory",
+                "empty",
+                "missing admitted fast identity",
+            )
         })?;
         let quality_owner = quality.0.shard(0).ok_or_else(|| {
-            invalid("shards.inventory", "empty", "missing admitted quality identity")
+            invalid(
+                "shards.inventory",
+                "empty",
+                "missing admitted quality identity",
+            )
         })?;
         let (fast_query, (quality_query, batch)) = join_sources(
             cx,
@@ -298,13 +316,13 @@ impl NativeShardSet {
             ),
         )
         .await?;
-        let (fast, quality_hits) = join_sources(
+        let (fast, quality_hits) = Box::pin(join_sources(
             cx,
             self.search_with_pool(cx, fast_query, budget, None, pool.clone()),
             quality
                 .0
                 .search_with_pool(cx, quality_query, budget, None, pool),
-        )
+        ))
         .await?;
         finish(
             cx,
@@ -361,6 +379,10 @@ impl NativeShardSet {
     /// Prepare progressive sharded retrieval with owned admitted inventories for
     /// caller-pool traversal. Every partition owner is retained by the cloned
     /// shard set; no file or model is reopened.
+    ///
+    /// # Errors
+    ///
+    /// Has the same admission and candidate-budget error surface as [`Self::search_hybrid_progressive`].
     pub fn search_hybrid_progressive_with_pool<'a>(
         &'a self,
         cx: &'a Cx,
@@ -438,10 +460,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
     // its equally scoped immutable lexical adapter. Public raw readers cannot
     // attach a vector-only filter and silently leave the keyword lane unscoped.
     #[cfg(feature = "quill")]
-    pub(crate) fn with_allowed_documents(
-        self,
-        allowed: &BTreeSet<String>,
-    ) -> SearchResult<Self> {
+    pub(crate) fn with_allowed_documents(self, allowed: &BTreeSet<String>) -> SearchResult<Self> {
         self.with_allowed_documents_arc(std::sync::Arc::new(allowed.clone()))
     }
 
@@ -468,7 +487,7 @@ impl<'a> NativeShardedProgressiveSearch<'a> {
         }
         self.quality
             .filter(|(quality, _)| std::ptr::eq(*quality, shards))
-            .and(self.quality_owner.clone())
+            .and_then(|_| self.quality_owner.clone())
     }
 
     async fn vector_candidates(

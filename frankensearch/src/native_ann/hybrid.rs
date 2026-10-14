@@ -148,6 +148,10 @@ impl NativeAnnIndex {
     ///
     /// The same bound query and lexical batch are retained through fusion. An
     /// abandoned blocking traversal cannot publish a late page.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the ordinary hybrid candidate errors plus blocking-pool admission failure.
     pub async fn search_hybrid_candidates_with_pool(
         self: &Arc<Self>,
         cx: &Cx,
@@ -179,15 +183,7 @@ impl NativeAnnIndex {
         )
         .await?;
         let hits = self
-            .fuse_candidates_with_pool(
-                cx,
-                query,
-                &batch,
-                k,
-                None,
-                &RrfConfig::default(),
-                pool,
-            )
+            .fuse_candidates_with_pool(cx, query, &batch, k, None, &RrfConfig::default(), pool)
             .await?;
         Ok((hits, batch))
     }

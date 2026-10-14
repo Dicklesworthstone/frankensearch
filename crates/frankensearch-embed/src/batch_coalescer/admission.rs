@@ -196,8 +196,9 @@ impl CoalescedBatch {
                         },
                         _ => SearchError::EmbeddingFailed {
                             model: "batch_coalescer".to_owned(),
-                            source: "identity-bound batch failed; dispatcher retains the detailed error"
-                                .into(),
+                            source:
+                                "identity-bound batch failed; dispatcher retains the detailed error"
+                                    .into(),
                         },
                     };
                     let _ = request.result_tx.send(Err(receiver_error));
@@ -240,7 +241,8 @@ impl CoalescedBatch {
             return Err(SearchError::InvalidConfig {
                 field: "batch_coalescer.response_count".to_owned(),
                 value: responses.len().to_string(),
-                reason: "bound inference must return exactly one output per queued input".to_owned(),
+                reason: "bound inference must return exactly one output per queued input"
+                    .to_owned(),
             });
         }
         for response in &responses {
@@ -697,16 +699,21 @@ mod inference_tests {
                     reason: "provider stopped".to_owned(),
                 });
             }
-            let mut values: Vec<_> = texts.iter().map(|text| IdentityBoundEmbedding {
-                values: vec![text.parse().unwrap(), -0.0],
-                identity: self.expected.clone(),
-            }).collect();
+            let mut values: Vec<_> = texts
+                .iter()
+                .map(|text| IdentityBoundEmbedding {
+                    values: vec![text.parse().unwrap(), -0.0],
+                    identity: self.expected.clone(),
+                })
+                .collect();
             // Put corruption LAST: a streaming prefix delivery would already
             // expose two vectors before noticing it. Singleton execution also
             // fails only on the third input, after two real bound calls succeeded.
             if texts.contains(&"30") {
                 match self.reply {
-                    Reply::Short => { let _ = values.pop(); }
+                    Reply::Short => {
+                        let _ = values.pop();
+                    }
                     Reply::Long => values.push(values[0].clone()),
                     Reply::ForeignSpace => {
                         values.last_mut().unwrap().identity = self.foreign.clone();
@@ -717,7 +724,9 @@ mod inference_tests {
                     Reply::ForeignStorage => {
                         values.last_mut().unwrap().identity.storage.format = "fsvi-v2".to_owned();
                     }
-                    Reply::WrongDimension => { let _ = values.last_mut().unwrap().values.pop(); }
+                    Reply::WrongDimension => {
+                        let _ = values.last_mut().unwrap().values.pop();
+                    }
                     Reply::NonFinite(value) => values.last_mut().unwrap().values[1] = value,
                     _ => {}
                 }
@@ -728,7 +737,10 @@ mod inference_tests {
             if matches!(self.reply, Reply::CancelSuccess | Reply::CancelFailure) {
                 cx.set_cancel_requested(true);
             }
-            if matches!(self.reply, Reply::Failure | Reply::DriftFailure | Reply::CancelFailure) {
+            if matches!(
+                self.reply,
+                Reply::Failure | Reply::DriftFailure | Reply::CancelFailure
+            ) {
                 return Err(SearchError::EmbeddingFailed {
                     model: "fixture".to_owned(),
                     source: Box::new(Opaque(Arc::clone(&self.formatted))),
@@ -740,7 +752,9 @@ mod inference_tests {
 
     struct DropGuard<'a>(&'a AtomicUsize);
     impl Drop for DropGuard<'_> {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::Relaxed); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     struct Opaque(Arc<AtomicUsize>);
@@ -766,25 +780,32 @@ mod inference_tests {
         }
 
         fn embed_bound<'a>(
-            &'a self, cx: &'a Cx, text: &'a str,
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
         ) -> SearchFuture<'a, IdentityBoundEmbedding> {
             self.bound_calls.fetch_add(1, Ordering::Relaxed);
             Box::pin(async move {
                 let mut values = self.produce(cx, &[text]).await?;
                 values.pop().ok_or_else(|| SearchError::EmbeddingFailed {
-                    model: "fixture".to_owned(), source: "missing singleton".into(),
+                    model: "fixture".to_owned(),
+                    source: "missing singleton".into(),
                 })
             })
         }
 
         fn embed_batch_bound<'a>(
-            &'a self, cx: &'a Cx, texts: &'a [&'a str],
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
         ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
             self.batch_calls.fetch_add(1, Ordering::Relaxed);
             Box::pin(self.produce(cx, texts))
         }
 
-        fn bound_batch_is_native(&self) -> bool { self.native }
+        fn bound_batch_is_native(&self) -> bool {
+            self.native
+        }
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
             let call = self.identity_calls.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some((cx, at)) = &self.cancel_metadata
@@ -792,41 +813,74 @@ mod inference_tests {
             {
                 cx.set_cancel_requested(true);
             }
-            Ok(if self.drifted.load(Ordering::Relaxed) { &self.foreign } else { &self.expected })
+            Ok(if self.drifted.load(Ordering::Relaxed) {
+                &self.foreign
+            } else {
+                &self.expected
+            })
         }
-        fn dimension(&self) -> usize { 2 }
-        fn id(&self) -> &str { "coalescer-fixture" }
-        fn model_name(&self) -> &str { self.id() }
-        fn is_semantic(&self) -> bool { false }
-        fn category(&self) -> ModelCategory { ModelCategory::HashEmbedder }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &'static str {
+            "coalescer-fixture"
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+        fn is_semantic(&self) -> bool {
+            false
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::HashEmbedder
+        }
     }
 
     fn identity() -> EmbeddingIdentityBundleV1 {
         EmbeddingIdentityBundleV1::explicit_test_model("coalescer-fixture", 2)
     }
 
-    fn work() -> (BatchCoalescer, CoalescedBatch, Vec<Receiver<SearchResult<Vec<f32>>>>) {
+    fn work() -> (
+        BatchCoalescer,
+        CoalescedBatch,
+        Vec<Receiver<SearchResult<Vec<f32>>>>,
+    ) {
         let queue = BatchCoalescer::with_limits(
             CoalescerConfig {
-                max_batch_size: 3, max_wait_ms: 0, min_batch_size: 1, use_priority_lanes: true,
+                max_batch_size: 3,
+                max_wait_ms: 0,
+                min_batch_size: 1,
+                use_priority_lanes: true,
             },
-            CoalescerLimits { max_outstanding_requests: 3, max_outstanding_text_bytes: 32 },
-        ).unwrap();
-        let receivers = ["10", "20", "30"].into_iter()
-            .map(|text| queue.submit(text.to_owned(), Priority::Background)).collect();
+            CoalescerLimits {
+                max_outstanding_requests: 3,
+                max_outstanding_text_bytes: 32,
+            },
+        )
+        .unwrap();
+        let receivers = ["10", "20", "30"]
+            .into_iter()
+            .map(|text| queue.submit(text.to_owned(), Priority::Background))
+            .collect();
         let batch = queue.try_form_batch().unwrap();
         (queue, batch, receivers)
     }
 
     fn failed_receivers(receivers: Vec<Receiver<SearchResult<Vec<f32>>>>, cancelled: bool) {
         for receiver in receivers {
-            let error = receiver.try_recv().unwrap().expect_err("no prefix success is allowed");
+            let error = receiver
+                .try_recv()
+                .unwrap()
+                .expect_err("no prefix success is allowed");
             assert_eq!(matches!(error, SearchError::Cancelled { .. }), cancelled);
             if !cancelled {
                 assert!(matches!(error, SearchError::EmbeddingFailed { .. }));
                 assert!(error.to_string().len() < 256);
             }
-            assert!(matches!(receiver.try_recv(), Err(TryRecvError::Disconnected)));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(TryRecvError::Disconnected)
+            ));
         }
     }
 
@@ -836,15 +890,24 @@ mod inference_tests {
             for native in [false, true] {
                 let probe = Probe::new(native, Reply::Valid);
                 let (queue, batch, receivers) = work();
-                batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap();
+                batch
+                    .embed_and_deliver(&cx, &probe, &identity())
+                    .await
+                    .unwrap();
                 for (receiver, expected) in receivers.into_iter().zip([10.0_f32, 20.0, 30.0]) {
                     let values = receiver.try_recv().unwrap().unwrap();
                     assert_eq!(values[0].to_bits(), expected.to_bits());
                     assert_eq!(values[1].to_bits(), (-0.0_f32).to_bits());
                 }
                 assert_eq!(probe.raw_calls.load(Ordering::Relaxed), 0);
-                assert_eq!(probe.batch_calls.load(Ordering::Relaxed), usize::from(native));
-                assert_eq!(probe.bound_calls.load(Ordering::Relaxed), if native { 0 } else { 3 });
+                assert_eq!(
+                    probe.batch_calls.load(Ordering::Relaxed),
+                    usize::from(native)
+                );
+                assert_eq!(
+                    probe.bound_calls.load(Ordering::Relaxed),
+                    if native { 0 } else { 3 }
+                );
                 assert_eq!(queue.usage(), CoalescerUsage::default());
             }
         });
@@ -855,23 +918,37 @@ mod inference_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for native in [false, true] {
                 for reply in [
-                    Reply::ForeignSpace, Reply::ForeignProducer, Reply::ForeignStorage,
-                    Reply::WrongDimension, Reply::NonFinite(f32::NAN),
-                    Reply::NonFinite(f32::INFINITY), Reply::NonFinite(f32::NEG_INFINITY),
+                    Reply::ForeignSpace,
+                    Reply::ForeignProducer,
+                    Reply::ForeignStorage,
+                    Reply::WrongDimension,
+                    Reply::NonFinite(f32::NAN),
+                    Reply::NonFinite(f32::INFINITY),
+                    Reply::NonFinite(f32::NEG_INFINITY),
                 ] {
                     let probe = Probe::new(native, reply);
                     let (queue, batch, receivers) = work();
-                    assert!(batch.embed_and_deliver(&cx, &probe, &identity()).await.is_err());
+                    assert!(
+                        batch
+                            .embed_and_deliver(&cx, &probe, &identity())
+                            .await
+                            .is_err()
+                    );
                     failed_receivers(receivers, false);
                     assert_eq!(queue.usage(), CoalescerUsage::default());
                     assert_eq!(probe.raw_calls.load(Ordering::Relaxed), 0);
-                    if !native { assert_eq!(probe.bound_calls.load(Ordering::Relaxed), 3); }
+                    if !native {
+                        assert_eq!(probe.bound_calls.load(Ordering::Relaxed), 3);
+                    }
                 }
             }
             for reply in [Reply::Short, Reply::Long] {
                 let probe = Probe::new(true, reply);
                 let (queue, batch, receivers) = work();
-                let error = batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap_err();
+                let error = batch
+                    .embed_and_deliver(&cx, &probe, &identity())
+                    .await
+                    .unwrap_err();
                 assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
                     if field == "batch_coalescer.response_count"));
                 failed_receivers(receivers, false);
@@ -888,9 +965,15 @@ mod inference_tests {
                     let probe = Probe::new(true, reply);
                     probe.drifted.store(before, Ordering::Relaxed);
                     let (queue, batch, receivers) = work();
-                    let error = batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap_err();
+                    let error = batch
+                        .embed_and_deliver(&cx, &probe, &identity())
+                        .await
+                        .unwrap_err();
                     assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
-                    assert_eq!(probe.batch_calls.load(Ordering::Relaxed), usize::from(!before));
+                    assert_eq!(
+                        probe.batch_calls.load(Ordering::Relaxed),
+                        usize::from(!before)
+                    );
                     assert_eq!(probe.formatted.load(Ordering::Relaxed), 0);
                     failed_receivers(receivers, false);
                     assert_eq!(queue.usage(), CoalescerUsage::default());
@@ -902,11 +985,18 @@ mod inference_tests {
     #[test]
     fn cancellation_wins_at_entry_metadata_and_both_provider_outcomes() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            for reply in [Reply::CancelSuccess, Reply::CancelFailure, Reply::ProviderCancelled] {
+            for reply in [
+                Reply::CancelSuccess,
+                Reply::CancelFailure,
+                Reply::ProviderCancelled,
+            ] {
                 for native in [false, true] {
                     let probe = Probe::new(native, reply);
                     let (queue, batch, receivers) = work();
-                    let error = batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap_err();
+                    let error = batch
+                        .embed_and_deliver(&cx, &probe, &identity())
+                        .await
+                        .unwrap_err();
                     assert!(matches!(error, SearchError::Cancelled { .. }));
                     failed_receivers(receivers, true);
                     assert_eq!(probe.formatted.load(Ordering::Relaxed), 0);
@@ -916,13 +1006,21 @@ mod inference_tests {
             }
             for at in [0, 1, 2] {
                 let mut probe = Probe::new(true, Reply::Valid);
-                if at == 0 { cx.set_cancel_requested(true); }
-                else { probe.cancel_metadata = Some((cx.clone(), at)); }
+                if at == 0 {
+                    cx.set_cancel_requested(true);
+                } else {
+                    probe.cancel_metadata = Some((cx.clone(), at));
+                }
                 let (queue, batch, receivers) = work();
-                assert!(matches!(batch.embed_and_deliver(&cx, &probe, &identity()).await,
-                    Err(SearchError::Cancelled { .. })));
+                assert!(matches!(
+                    batch.embed_and_deliver(&cx, &probe, &identity()).await,
+                    Err(SearchError::Cancelled { .. })
+                ));
                 failed_receivers(receivers, true);
-                assert_eq!(probe.batch_calls.load(Ordering::Relaxed), usize::from(at == 2));
+                assert_eq!(
+                    probe.batch_calls.load(Ordering::Relaxed),
+                    usize::from(at == 2)
+                );
                 assert_eq!(queue.usage(), CoalescerUsage::default());
                 cx.set_cancel_requested(false);
             }
@@ -934,10 +1032,15 @@ mod inference_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let probe = Probe::new(true, Reply::Failure);
             let (queue, batch, receivers) = work();
-            let error = batch.embed_and_deliver(&cx, &probe, &identity()).await.unwrap_err();
+            let error = batch
+                .embed_and_deliver(&cx, &probe, &identity())
+                .await
+                .unwrap_err();
             match error {
                 SearchError::EmbeddingFailed { source, .. } => {
-                    let opaque = source.downcast_ref::<Opaque>().expect("original source retained");
+                    let opaque = source
+                        .downcast_ref::<Opaque>()
+                        .expect("original source retained");
                     assert!(Arc::ptr_eq(&opaque.0, &probe.formatted));
                 }
                 _ => panic!("original provider error must reach dispatcher"),
@@ -956,18 +1059,35 @@ mod inference_tests {
             let (queue, batch, receivers) = work();
             let expected = identity();
             let mut future = Box::pin(batch.embed_and_deliver(&cx, &probe, &expected));
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
+            ));
             assert_eq!(queue.usage().outstanding_requests, 3);
-            for receiver in &receivers { assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty))); }
+            for receiver in &receivers {
+                assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+            }
             drop(future);
             assert_eq!(probe.dropped.load(Ordering::Relaxed), 1);
-            for receiver in receivers { assert!(matches!(receiver.try_recv(), Err(TryRecvError::Disconnected))); }
+            for receiver in receivers {
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(TryRecvError::Disconnected)
+                ));
+            }
             assert_eq!(queue.usage(), CoalescerUsage::default());
             assert_eq!(queue.pending_count(), 0);
             assert!(!cx.is_cancel_requested());
             let receiver = queue.submit("10".to_owned(), Priority::Interactive);
             let ready = Probe::new(true, Reply::Valid);
-            queue.try_form_batch().unwrap().embed_and_deliver(&cx, &ready, &expected).await.unwrap();
+            queue
+                .try_form_batch()
+                .unwrap()
+                .embed_and_deliver(&cx, &ready, &expected)
+                .await
+                .unwrap();
             assert_eq!(receiver.try_recv().unwrap().unwrap()[0], 10.0);
             assert_eq!(queue.usage(), CoalescerUsage::default());
         });
@@ -978,15 +1098,32 @@ mod inference_tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let probe = Probe::new(true, Reply::Valid);
             let expected = identity();
-            CoalescedBatch { requests: Vec::new() }.embed_and_deliver(&cx, &probe, &expected).await.unwrap();
+            CoalescedBatch {
+                requests: Vec::new(),
+            }
+            .embed_and_deliver(&cx, &probe, &expected)
+            .await
+            .unwrap();
             assert_eq!(probe.batch_calls.load(Ordering::Relaxed), 0);
             assert_eq!(probe.identity_calls.load(Ordering::Relaxed), 1);
             probe.drifted.store(true, Ordering::Relaxed);
-            assert!(CoalescedBatch { requests: Vec::new() }.embed_and_deliver(&cx, &probe, &expected).await.is_err());
+            assert!(
+                CoalescedBatch {
+                    requests: Vec::new()
+                }
+                .embed_and_deliver(&cx, &probe, &expected)
+                .await
+                .is_err()
+            );
             let (queue, batch, receivers) = work();
             drop(batch.embed_and_deliver(&cx, &probe, &expected));
             assert_eq!(queue.usage(), CoalescerUsage::default());
-            for receiver in receivers { assert!(matches!(receiver.try_recv(), Err(TryRecvError::Disconnected))); }
+            for receiver in receivers {
+                assert!(matches!(
+                    receiver.try_recv(),
+                    Err(TryRecvError::Disconnected)
+                ));
+            }
             assert_eq!(probe.batch_calls.load(Ordering::Relaxed), 0);
         });
     }

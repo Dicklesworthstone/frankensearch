@@ -255,9 +255,8 @@ mod tests {
         let runtime = RuntimeBuilder::current_thread().build().unwrap();
         let pool = BlockingPool::new(0, workers);
         let handle = pool.handle();
-        let result = runtime.block_on(async move {
-            body(Cx::current().expect("runtime context"), handle).await
-        });
+        let result = runtime
+            .block_on(async move { body(Cx::current().expect("runtime context"), handle).await });
         assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
         result
     }
@@ -422,17 +421,10 @@ mod tests {
                     .search_filtered(&cx, &query(), k, Some(1), |id| id != "first")
                     .unwrap();
                 let actual = shards
-                    .search_filtered_with_pool(
-                        &cx,
-                        query(),
-                        k,
-                        Some(1),
-                        pool.clone(),
-                        |id| {
-                            assert!(!Cx::is_active());
-                            id != "first"
-                        },
-                    )
+                    .search_filtered_with_pool(&cx, query(), k, Some(1), pool.clone(), |id| {
+                        assert!(!Cx::is_active());
+                        id != "first"
+                    })
                     .await
                     .unwrap();
                 assert_eq!(actual, expected);
@@ -458,17 +450,33 @@ mod tests {
                     EmbeddingIdentityBundleV1::explicit_test_model("foreign", 2),
                 )
                 .unwrap();
-                assert!(index.search_filtered_with_pool(
-                    &cx, foreign, k, None, pool.clone(), |_| panic!("foreign query predicate"),
-                ).await.is_err());
+                assert!(
+                    index
+                        .search_filtered_with_pool(&cx, foreign, k, None, pool.clone(), |_| panic!(
+                            "foreign query predicate"
+                        ),)
+                        .await
+                        .is_err()
+                );
             }
-            assert!(index.search_filtered_with_pool(
-                &cx, query(), 0, None, pool.clone(), |_| panic!("zero-k predicate"),
-            ).await.unwrap().is_empty());
+            assert!(
+                index
+                    .search_filtered_with_pool(&cx, query(), 0, None, pool.clone(), |_| panic!(
+                        "zero-k predicate"
+                    ),)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             cx.set_cancel_requested(true);
-            assert!(matches!(index.search_filtered_with_pool(
-                &cx, query(), 0, None, pool, |_| panic!("cancelled predicate"),
-            ).await, Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                index
+                    .search_filtered_with_pool(&cx, query(), 0, None, pool, |_| panic!(
+                        "cancelled predicate"
+                    ),)
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
             cx.set_cancel_requested(false);
         });
     }
@@ -481,12 +489,19 @@ mod tests {
             let handle = stopped.handle();
             assert!(stopped.shutdown_and_wait(Duration::from_secs(10)));
             for k in [0, 1] {
-                let error = index.search_filtered_with_pool(
-                    &cx, query(), k, None, handle.clone(), |_| panic!("inline fallback"),
-                ).await.unwrap_err();
-                assert!(matches!(error, SearchError::SubsystemError {
-                    subsystem: "native_ann.query_worker", ..
-                }));
+                let error = index
+                    .search_filtered_with_pool(&cx, query(), k, None, handle.clone(), |_| {
+                        panic!("inline fallback")
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    SearchError::SubsystemError {
+                        subsystem: "native_ann.query_worker",
+                        ..
+                    }
+                ));
             }
         });
     }
@@ -502,24 +517,45 @@ mod tests {
                 gate.recv_timeout(Duration::from_secs(10)).unwrap();
                 Ok(())
             }));
-            assert!(blocker.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                blocker
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             wait_for_worker(entered).await;
             let index = index(&cx, QuantizationFormat::F32, true, &rows());
             let calls = Arc::new(AtomicUsize::new(0));
             let seen = Arc::clone(&calls);
             let mut queued = Box::pin(index.search_filtered_with_pool(
-                &cx, query(), 2, None, pool.clone(), move |_| {
+                &cx,
+                query(),
+                2,
+                None,
+                pool.clone(),
+                move |_| {
                     seen.fetch_add(1, Ordering::SeqCst);
                     true
                 },
             ));
-            assert!(queued.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                queued
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             drop(queued);
             release.send(()).unwrap();
             blocker.await.unwrap();
             assert!(!cx.is_cancel_requested());
             // A later request is valid and does not need to reset a shared Cx.
-            assert!(!index.search_with_pool(&cx, query(), 1, None, pool).await.unwrap().is_empty());
+            assert!(
+                !index
+                    .search_with_pool(&cx, query(), 1, None, pool)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             calls
         });
         // Check after runtime AND pool drain, not before queued work could run.
@@ -535,16 +571,29 @@ mod tests {
             let gate = Mutex::new(gate);
             let first = AtomicBool::new(true);
             let mut pending = Box::pin(index.search_filtered_with_pool(
-                &cx, query(), 3, None, pool.clone(), move |_| {
+                &cx,
+                query(),
+                3,
+                None,
+                pool.clone(),
+                move |_| {
                     assert!(!Cx::is_active());
                     if first.swap(false, Ordering::SeqCst) {
                         started.send(()).unwrap();
-                        gate.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
+                        gate.lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
                     }
                     true
                 },
             ));
-            assert!(pending.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             wait_for_worker(entered).await;
             // The real worker is still gated; this unrelated executor future
             // completes without waiting for graph work or moving the gate.
@@ -553,7 +602,13 @@ mod tests {
             release.send(()).unwrap();
             assert!(matches!(pending.await, Err(SearchError::Cancelled { .. })));
             cx.set_cancel_requested(false);
-            assert!(!index.search_with_pool(&cx, query(), 1, None, pool).await.unwrap().is_empty());
+            assert!(
+                !index
+                    .search_with_pool(&cx, query(), 1, None, pool)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -566,24 +621,39 @@ mod tests {
             let (release, gate) = mpsc::channel();
             let gate = Mutex::new(gate);
             let first = AtomicBool::new(true);
-            let mut pending = Box::pin(index.search_filtered_with_pool(
-                &cx, query(), 1, None, pool, move |_| {
-                    if first.swap(false, Ordering::SeqCst) {
-                        started.send(()).unwrap();
-                        gate.lock().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
-                    }
-                    true
-                },
+            let mut pending =
+                Box::pin(
+                    index.search_filtered_with_pool(&cx, query(), 1, None, pool, move |_| {
+                        if first.swap(false, Ordering::SeqCst) {
+                            started.send(()).unwrap();
+                            gate.lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(10))
+                                .unwrap();
+                        }
+                        true
+                    }),
+                );
+            assert!(matches!(
+                pending
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Pending
             ));
-            assert!(matches!(pending.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
             wait_for_worker(entered).await;
             drop(pending);
             drop(index);
-            assert!(weak.upgrade().is_some(), "running worker must retain its exact bytes");
+            assert!(
+                weak.upgrade().is_some(),
+                "running worker must retain its exact bytes"
+            );
             assert!(!cx.is_cancel_requested());
             release.send(()).unwrap();
             weak
         });
-        assert!(weak.upgrade().is_none(), "pool drain must release abandoned query owners");
+        assert!(
+            weak.upgrade().is_none(),
+            "pool drain must release abandoned query owners"
+        );
     }
 }

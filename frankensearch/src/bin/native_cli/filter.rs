@@ -183,10 +183,14 @@ impl<'a> Query<'a> {
         let full = mode == Mode::Full && self.index.vectors().quality().is_some();
         let results = match (&self.scope, pool, mode, full) {
             (Some(scope), Some(pool), Mode::Quality, _) => {
-                scope.search_quality_with_pool(cx, query, limit, pool).await?
+                scope
+                    .search_quality_with_pool(cx, query, limit, pool)
+                    .await?
             }
             (Some(scope), Some(pool), _, true) => {
-                scope.search_refined_with_pool(cx, query, limit, pool).await?
+                scope
+                    .search_refined_with_pool(cx, query, limit, pool)
+                    .await?
             }
             (Some(scope), Some(pool), _, false) => {
                 scope.search_with_pool(cx, query, limit, pool).await?
@@ -195,10 +199,14 @@ impl<'a> Query<'a> {
             (Some(scope), None, _, true) => scope.search_refined(cx, query, limit).await?,
             (Some(scope), None, _, false) => scope.search(cx, query, limit).await?,
             (None, Some(pool), Mode::Quality, _) => {
-                self.index.search_quality_with_pool(cx, query, limit, pool).await?
+                self.index
+                    .search_quality_with_pool(cx, query, limit, pool)
+                    .await?
             }
             (None, Some(pool), _, true) => {
-                self.index.search_refined_with_pool(cx, query, limit, pool).await?
+                self.index
+                    .search_refined_with_pool(cx, query, limit, pool)
+                    .await?
             }
             (None, Some(pool), _, false) => {
                 self.index.search_with_pool(cx, query, limit, pool).await?
@@ -250,12 +258,12 @@ impl<'a> Query<'a> {
         pool: Option<BlockingPoolHandle>,
     ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
         match (&self.scope, pool) {
-            (Some(scope), Some(pool)) => scope.progressive_with_reranker_on_pool(
-                cx, text, limit, reranker, window, pool,
-            ),
-            (None, Some(pool)) => self.index.progressive_with_reranker_on_pool(
-                cx, text, limit, reranker, window, pool,
-            ),
+            (Some(scope), Some(pool)) => {
+                scope.progressive_with_reranker_on_pool(cx, text, limit, reranker, window, pool)
+            }
+            (None, Some(pool)) => self
+                .index
+                .progressive_with_reranker_on_pool(cx, text, limit, reranker, window, pool),
             _ => self.progressive_with_reranker(cx, text, limit, reranker, window),
         }
     }

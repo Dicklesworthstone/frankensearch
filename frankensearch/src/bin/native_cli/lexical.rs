@@ -4,13 +4,13 @@
 
 use std::collections::BTreeSet;
 
+use super::serve::source;
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 use frankensearch::native_ann::builder::sharded::{
     NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits,
 };
 use frankensearch::{LexicalRead, SearchError};
 use frankensearch_quill::QuillSearchIndex;
-use super::serve::source;
 
 use super::{
     ArtifactGenerationIdentityV1, BufRead, Cx, Deserialize, GenerationComponentReceiptV1,

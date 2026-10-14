@@ -110,7 +110,9 @@ enum DocumentResponse<'a> {
     },
     // Missing and out-of-scope sources have the identical response shape. No
     // source length, title, metadata, or reason can disclose which case occurred.
-    Unavailable { doc_id: &'a str },
+    Unavailable {
+        doc_id: &'a str,
+    },
 }
 
 #[derive(Serialize)]
@@ -130,10 +132,11 @@ struct Response<'a> {
 }
 
 fn checkpoint(cx: &Cx) -> Result<()> {
-    cx.checkpoint().map_err(|_| frankensearch::SearchError::Cancelled {
-        phase: "native_cli.source".to_owned(),
-        reason: "source retrieval cancelled".to_owned(),
-    })?;
+    cx.checkpoint()
+        .map_err(|_| frankensearch::SearchError::Cancelled {
+            phase: "native_cli.source".to_owned(),
+            reason: "source retrieval cancelled".to_owned(),
+        })?;
     Ok(())
 }
 
@@ -154,7 +157,9 @@ fn render<'a>(
         ..
     } = request;
     if *expected_generation != generation {
-        return Err(bad("fetch expected_generation differs from the retained snapshot; search again or use the original selection"));
+        return Err(bad(
+            "fetch expected_generation differs from the retained snapshot; search again or use the original selection",
+        ));
     }
     if let Some(filter) = base_filter {
         filter.validate()?;
@@ -178,12 +183,16 @@ fn render<'a>(
         // The supplied reader must resolve the requested ID, never merely the
         // same ordinal in another partition. Do not echo foreign source fields.
         if document.id != window.doc_id {
-            return Err(bad("retained source lookup returned a different document ID"));
+            return Err(bad(
+                "retained source lookup returned a different document ID",
+            ));
         }
         let start = window.offset_bytes;
         let text = &document.content;
         if start > text.len() || !text.is_char_boundary(start) {
-            return Err(bad("fetch offset_bytes must be a UTF-8 boundary within the document"));
+            return Err(bad(
+                "fetch offset_bytes must be a UTF-8 boundary within the document",
+            ));
         }
         let mut end = start.saturating_add(window.max_bytes).min(text.len());
         while !text.is_char_boundary(end) {
@@ -266,7 +275,11 @@ pub async fn execute<'a, W: Write>(
             payload["partial_results"] = serde_json::json!(false);
             payload["generation"] = serde_json::json!(generation);
             payload["request"] = serde_json::json!(ordinal);
-            payload["id"] = serde_json::json!(request.id().filter(|id| serve::validate_id(Some(id)).is_ok()));
+            payload["id"] = serde_json::json!(
+                request
+                    .id()
+                    .filter(|id| serve::validate_id(Some(id)).is_ok())
+            );
             payload["seq"] = serde_json::json!(0);
             encode(&payload, MAX_RESPONSE_BYTES)?
         }
@@ -279,4 +292,5 @@ pub async fn execute<'a, W: Write>(
 }
 
 #[cfg(test)]
+#[path = "source/tests.rs"]
 mod tests;

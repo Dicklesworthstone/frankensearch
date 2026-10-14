@@ -12,12 +12,11 @@ use frankensearch::Reranker;
 use frankensearch::SearchError;
 use frankensearch::native_ann::builder::deadline::NativeSearchDeadline;
 
-use super::{
-    Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, validate_query,
-};
+use super::{Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, validate_query};
 
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
+#[path = "query/tuning.rs"]
 mod tuning;
 pub use tuning::FullQuery;
 pub(crate) use tuning::{FullQueryOverride, deserialize_query_override};

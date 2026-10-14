@@ -956,20 +956,37 @@ mod tests {
         conn.execute_sync(
             "INSERT INTO document_contents(doc_id, content_hash, canonical_text) \
              VALUES ('legacy-vector', X'0102', 'body');",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute_sync(
             "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, claim_epoch) \
              VALUES ('legacy-vector', 'model', 175, 'processing', 17);",
-        ).unwrap();
+        )
+        .unwrap();
         bootstrap(&conn).unwrap();
         assert_eq!(current_version(&conn).unwrap(), SCHEMA_VERSION);
         assert!(table_exists(&conn, "published_embeddings"));
-        assert!(conn.query_sync("SELECT doc_id FROM published_embeddings;").unwrap().is_empty());
-        let rows = conn.query_sync("SELECT claim_epoch FROM embedding_jobs;").unwrap();
+        assert!(
+            conn.query_sync("SELECT doc_id FROM published_embeddings;")
+                .unwrap()
+                .is_empty()
+        );
+        let rows = conn
+            .query_sync("SELECT claim_epoch FROM embedding_jobs;")
+            .unwrap();
         assert_eq!(super::row_i64(&rows[0], 0, "claim_epoch").unwrap(), 17);
-        assert_eq!(conn.query_sync("SELECT canonical_text FROM document_contents;").unwrap().len(), 1);
+        assert_eq!(
+            conn.query_sync("SELECT canonical_text FROM document_contents;")
+                .unwrap()
+                .len(),
+            1
+        );
         bootstrap(&conn).unwrap();
-        assert!(conn.query_sync("SELECT doc_id FROM published_embeddings;").unwrap().is_empty());
+        assert!(
+            conn.query_sync("SELECT doc_id FROM published_embeddings;")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

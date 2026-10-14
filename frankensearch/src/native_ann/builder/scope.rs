@@ -165,9 +165,7 @@ impl NativeScopedHybridIndex<'_> {
             .search_hybrid_progressive_with_pool(
                 cx,
                 fast.embedder(),
-                vectors
-                    .quality()
-                    .map(|tier| (&tier.index, tier.embedder())),
+                vectors.quality().map(|tier| (&tier.index, tier.embedder())),
                 &self.lexical,
                 text,
                 k,

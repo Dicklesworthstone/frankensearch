@@ -452,14 +452,7 @@ impl NativeBuiltShardedHybridIndex {
             .as_ref()
             .ok_or_else(|| rejected("quality", "quality provider was not configured"))?;
         shards
-            .search_hybrid_quality_text_with_pool(
-                cx,
-                tier.embedder(),
-                &self.lexical,
-                text,
-                k,
-                pool,
-            )
+            .search_hybrid_quality_text_with_pool(cx, tier.embedder(), &self.lexical, text, k, pool)
             .await
     }
 

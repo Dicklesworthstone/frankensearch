@@ -184,10 +184,14 @@ impl<'a> Prepared<'a> {
         let full = mode == Mode::Full && index.vectors().quality().is_some();
         let results = match (scope, pool, mode, full) {
             (Some(scope), Some(pool), Mode::Quality, _) => {
-                scope.search_quality_with_pool(cx, text, limit, pool).await?
+                scope
+                    .search_quality_with_pool(cx, text, limit, pool)
+                    .await?
             }
             (Some(scope), Some(pool), _, true) => {
-                scope.search_refined_with_pool(cx, text, limit, pool).await?
+                scope
+                    .search_refined_with_pool(cx, text, limit, pool)
+                    .await?
             }
             (Some(scope), Some(pool), _, false) => {
                 scope.search_with_pool(cx, text, limit, pool).await?
@@ -196,14 +200,16 @@ impl<'a> Prepared<'a> {
             (Some(scope), None, _, true) => scope.search_refined(cx, text, limit).await?,
             (Some(scope), None, _, false) => scope.search(cx, text, limit).await?,
             (None, Some(pool), Mode::Quality, _) => {
-                index.search_quality_with_pool(cx, text, limit, pool).await?
+                index
+                    .search_quality_with_pool(cx, text, limit, pool)
+                    .await?
             }
             (None, Some(pool), _, true) => {
-                index.search_refined_with_pool(cx, text, limit, pool).await?
+                index
+                    .search_refined_with_pool(cx, text, limit, pool)
+                    .await?
             }
-            (None, Some(pool), _, false) => {
-                index.search_with_pool(cx, text, limit, pool).await?
-            }
+            (None, Some(pool), _, false) => index.search_with_pool(cx, text, limit, pool).await?,
             (None, None, Mode::Quality, _) => index.search_quality(cx, text, limit).await?,
             (None, None, _, true) => index.search_refined(cx, text, limit).await?,
             (None, None, _, false) => index.search(cx, text, limit).await?,
@@ -303,9 +309,7 @@ impl<'a> Prepared<'a> {
     ) -> SearchResult<Progressive<'q>> {
         match self {
             Self::Single(query) => Ok(Progressive::Single(Box::new(
-                query.progressive_with_reranker_on_pool(
-                    cx, text, limit, reranker, window, pool,
-                )?,
+                query.progressive_with_reranker_on_pool(cx, text, limit, reranker, window, pool)?,
             ))),
             Self::Sharded { index, scope } => {
                 let stream = match (scope, pool) {

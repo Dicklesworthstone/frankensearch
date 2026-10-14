@@ -176,11 +176,19 @@ fn pooled_sharded_queries_match_inline_results_and_rows() {
                 .unwrap();
             assert_eq!(
                 serde_json::to_value(
-                    inline.iter().map(|hit| (&hit.result, hit.fast_row, hit.quality_row)).collect::<Vec<_>>()
-                ).unwrap(),
+                    inline
+                        .iter()
+                        .map(|hit| (&hit.result, hit.fast_row, hit.quality_row))
+                        .collect::<Vec<_>>()
+                )
+                .unwrap(),
                 serde_json::to_value(
-                    pooled.iter().map(|hit| (&hit.result, hit.fast_row, hit.quality_row)).collect::<Vec<_>>()
-                ).unwrap()
+                    pooled
+                        .iter()
+                        .map(|hit| (&hit.result, hit.fast_row, hit.quality_row))
+                        .collect::<Vec<_>>()
+                )
+                .unwrap()
             );
 
             let inline = built.search_refined(&cx, query, 5).await.unwrap();
@@ -189,8 +197,24 @@ fn pooled_sharded_queries_match_inline_results_and_rows() {
                 .await
                 .unwrap();
             assert_eq!(
-                inline.iter().map(|hit| (hit.result.doc_id.as_str(), hit.fast_row, hit.quality_row, hit.result.score.to_bits())).collect::<Vec<_>>(),
-                pooled.iter().map(|hit| (hit.result.doc_id.as_str(), hit.fast_row, hit.quality_row, hit.result.score.to_bits())).collect::<Vec<_>>()
+                inline
+                    .iter()
+                    .map(|hit| (
+                        hit.result.doc_id.as_str(),
+                        hit.fast_row,
+                        hit.quality_row,
+                        hit.result.score.to_bits()
+                    ))
+                    .collect::<Vec<_>>(),
+                pooled
+                    .iter()
+                    .map(|hit| (
+                        hit.result.doc_id.as_str(),
+                        hit.fast_row,
+                        hit.quality_row,
+                        hit.result.score.to_bits()
+                    ))
+                    .collect::<Vec<_>>()
             );
 
             let inline = built.search_quality(&cx, query, 5).await.unwrap();
@@ -199,8 +223,24 @@ fn pooled_sharded_queries_match_inline_results_and_rows() {
                 .await
                 .unwrap();
             assert_eq!(
-                inline.iter().map(|hit| (hit.result.doc_id.as_str(), hit.fast_row, hit.quality_row, hit.result.score.to_bits())).collect::<Vec<_>>(),
-                pooled.iter().map(|hit| (hit.result.doc_id.as_str(), hit.fast_row, hit.quality_row, hit.result.score.to_bits())).collect::<Vec<_>>()
+                inline
+                    .iter()
+                    .map(|hit| (
+                        hit.result.doc_id.as_str(),
+                        hit.fast_row,
+                        hit.quality_row,
+                        hit.result.score.to_bits()
+                    ))
+                    .collect::<Vec<_>>(),
+                pooled
+                    .iter()
+                    .map(|hit| (
+                        hit.result.doc_id.as_str(),
+                        hit.fast_row,
+                        hit.quality_row,
+                        hit.result.score.to_bits()
+                    ))
+                    .collect::<Vec<_>>()
             );
         }
 

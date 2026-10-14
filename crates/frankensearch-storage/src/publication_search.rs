@@ -7,7 +7,9 @@
 
 use asupersync::Cx;
 use frankensearch_core::types::{BoundQueryEmbedding, VectorHit};
-use frankensearch_core::{Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult};
+use frankensearch_core::{
+    Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult,
+};
 use fsqlite::AsyncConnection;
 use fsqlite_types::value::SqliteValue;
 
@@ -16,8 +18,8 @@ use crate::document::get_document_inner;
 use crate::document_content::read_document_content;
 use crate::schema::row_i64;
 use crate::{
-    DocumentRecord, PublishedEmbedding, PublishedEmbeddingReadLimits,
-    PublishedEmbeddingScanStats, PublishedEmbeddingSnapshot,
+    DocumentRecord, PublishedEmbedding, PublishedEmbeddingReadLimits, PublishedEmbeddingScanStats,
+    PublishedEmbeddingSnapshot,
 };
 
 // Measure stored bytes, not SQLite's character count (which also stops at NUL
@@ -214,7 +216,10 @@ impl PublishedSearchSnapshot {
         self.admit_query_producer(cx, embedder)?;
         let response = response?;
         if response.identity != self.identity {
-            return Err(invalid("identity", "query response has a foreign producer contract"));
+            return Err(invalid(
+                "identity",
+                "query response has a foreign producer contract",
+            ));
         }
         let query = BoundQueryEmbedding::new(response.values, response.identity)?;
         checkpoint(cx)?;
@@ -226,18 +231,26 @@ impl PublishedSearchSnapshot {
         // Capture errors before checking cancellation: metadata accessors can
         // request cancellation while returning a different error or identity.
         let admitted = (|| {
-            if matches!(self.identity.space.kind,
-                frankensearch_core::generation::EmbeddingSpaceKindV1::HashControl)
-            {
-                return Err(invalid("identity", "hash-control input is not semantic search"));
+            if matches!(
+                self.identity.space.kind,
+                frankensearch_core::generation::EmbeddingSpaceKindV1::HashControl
+            ) {
+                return Err(invalid(
+                    "identity",
+                    "hash-control input is not semantic search",
+                ));
             }
             let id = embedder.id();
             let dimension = embedder.dimension();
             let identity = embedder.identity()?;
-            if id != self.embedder_id.as_str() || identity != &self.identity
+            if id != self.embedder_id.as_str()
+                || identity != &self.identity
                 || usize::try_from(self.identity.space.dimension).ok() != Some(dimension)
             {
-                return Err(invalid("identity", "query provider does not match the captured producer"));
+                return Err(invalid(
+                    "identity",
+                    "query provider does not match the captured producer",
+                ));
             }
             Ok(())
         })();
@@ -259,17 +272,27 @@ impl PublishedSearchSnapshot {
     ) -> SearchResult<Vec<PublishedSearchHit<'_>>> {
         checkpoint(cx)?;
         if query.identity() != &self.identity {
-            return Err(invalid("identity", "query does not match the captured producer"));
+            return Err(invalid(
+                "identity",
+                "query does not match the captured producer",
+            ));
         }
         let hits = self.vectors.search(cx, query, limit)?;
         let mut results = Vec::new();
-        results.try_reserve_exact(hits.len()).map_err(map_storage_error)?;
+        results
+            .try_reserve_exact(hits.len())
+            .map_err(map_storage_error)?;
         for hit in hits {
             checkpoint(cx)?;
             let index = usize::try_from(hit.index).map_err(map_storage_error)?;
-            let publication = self.vectors.records.get(index)
+            let publication = self
+                .vectors
+                .records
+                .get(index)
                 .ok_or_else(|| invalid("hit", "result is outside the captured vector set"))?;
-            let document = self.documents.get(index)
+            let document = self
+                .documents
+                .get(index)
                 .ok_or_else(|| invalid("hit", "result has no captured source"))?;
             if hit.doc_id.as_str() != document.catalog.doc_id.as_str()
                 || publication.doc_id != document.catalog.doc_id
@@ -277,7 +300,11 @@ impl PublishedSearchSnapshot {
             {
                 return Err(invalid("hit", "result and source revisions disagree"));
             }
-            results.push(PublishedSearchHit { hit, publication, document });
+            results.push(PublishedSearchHit {
+                hit,
+                publication,
+                document,
+            });
         }
         checkpoint(cx)?;
         Ok(results)
@@ -293,18 +320,24 @@ pub(crate) fn read_search_document(
     remaining_bytes: usize,
 ) -> SearchResult<(PublishedSearchDocument, usize)> {
     checkpoint(cx)?;
-    let rows = conn.query_with_params_sync(
-        SOURCE_LENGTHS_SQL,
-        &[
-            SqliteValue::Text(publication.doc_id.clone().into()),
-            SqliteValue::Blob(publication.content_hash.to_vec().into()),
-        ],
-    ).map_err(map_storage_error)?;
+    let rows = conn
+        .query_with_params_sync(
+            SOURCE_LENGTHS_SQL,
+            &[
+                SqliteValue::Text(publication.doc_id.clone().into()),
+                SqliteValue::Blob(publication.content_hash.to_vec().into()),
+            ],
+        )
+        .map_err(map_storage_error)?;
     checkpoint(cx)?;
-    let row = rows.first()
+    let row = rows
+        .first()
         .ok_or_else(|| invalid("source", "publication has no matching catalog revision"))?;
     if matches!(row.get(0), Some(SqliteValue::Null)) {
-        return Err(invalid("source", "complete canonical input is missing; re-ingest the document"));
+        return Err(invalid(
+            "source",
+            "complete canonical input is missing; re-ingest the document",
+        ));
     }
     let mut bytes = 0_usize;
     for index in 0..4 {
@@ -313,20 +346,39 @@ pub(crate) fn read_search_document(
         }
         let length = usize::try_from(row_i64(row, index, "publication_source.byte_length")?)
             .map_err(|_| invalid("source", "invalid source byte length"))?;
-        bytes = bytes.checked_add(length)
+        bytes = bytes
+            .checked_add(length)
             .filter(|total| *total <= remaining_bytes)
-            .ok_or_else(|| invalid("max_source_bytes", "complete source snapshot exceeds its byte budget"))?;
+            .ok_or_else(|| {
+                invalid(
+                    "max_source_bytes",
+                    "complete source snapshot exceeds its byte budget",
+                )
+            })?;
     }
     checkpoint(cx)?;
     let catalog = get_document_inner(conn, &publication.doc_id)?
         .ok_or_else(|| invalid("source", "catalog record disappeared within a snapshot"))?;
     if catalog.content_hash != publication.content_hash {
-        return Err(invalid("source", "catalog revision changed within a snapshot"));
+        return Err(invalid(
+            "source",
+            "catalog revision changed within a snapshot",
+        ));
     }
-    let canonical_text = read_document_content(conn, &catalog)?
-        .ok_or_else(|| invalid("source", "retained input does not cover the publication revision"))?;
+    let canonical_text = read_document_content(conn, &catalog)?.ok_or_else(|| {
+        invalid(
+            "source",
+            "retained input does not cover the publication revision",
+        )
+    })?;
     checkpoint(cx)?;
-    Ok((PublishedSearchDocument { catalog, canonical_text }, bytes))
+    Ok((
+        PublishedSearchDocument {
+            catalog,
+            canonical_text,
+        },
+        bytes,
+    ))
 }
 
 fn checkpoint(cx: &Cx) -> SearchResult<()> {
@@ -348,14 +400,14 @@ fn invalid(field: &str, reason: &str) -> SearchError {
 mod tests {
     #![allow(clippy::arc_with_non_send_sync)]
 
+    use super::*;
+    use crate::{ClaimOutcome, ContentHasher, JobQueueConfig, PersistentJobQueue, Storage};
+    use frankensearch_core::IdentityBoundEmbedding;
+    use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
+    use frankensearch_core::traits::{ModelCategory, SearchFuture};
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
-    use frankensearch_core::IdentityBoundEmbedding;
-    use frankensearch_core::traits::{ModelCategory, SearchFuture};
-    use crate::{ClaimOutcome, ContentHasher, JobQueueConfig, PersistentJobQueue, Storage};
-    use super::*;
 
     fn identity(name: &str) -> EmbeddingIdentityBundleV1 {
         // Synthetic semantic contract for API tests, not real-model evidence.
@@ -364,7 +416,9 @@ mod tests {
         identity.space.hash_control = None;
         identity.space.artifact_manifest_fingerprint = "a".repeat(64);
         identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
-            role: "weights".to_owned(), sha256: "b".repeat(64), size: 1,
+            role: "weights".to_owned(),
+            sha256: "b".repeat(64),
+            size: 1,
         }];
         identity.producer.space_fingerprint = identity.space.fingerprint();
         identity.validate().unwrap();
@@ -377,10 +431,21 @@ mod tests {
         (storage, queue)
     }
 
-    fn publish(storage: &Storage, queue: &PersistentJobQueue, id: &str, body: &str, values: [f32; 2]) {
+    fn publish(
+        storage: &Storage,
+        queue: &PersistentJobQueue,
+        id: &str,
+        body: &str,
+        values: [f32; 2],
+    ) {
         let hash = ContentHasher::hash(body);
         let mut document = DocumentRecord::new(
-            id, body.chars().take(400).collect::<String>(), hash, body.chars().count(), 1, 2,
+            id,
+            body.chars().take(400).collect::<String>(),
+            hash,
+            body.chars().count(),
+            1,
+            2,
         );
         document.source_path = Some("missing://never-read".to_owned());
         document.metadata = Some(serde_json::json!({"tag": body}));
@@ -388,18 +453,41 @@ mod tests {
         storage.set_document_content(id, body).unwrap();
         queue.enqueue(id, "model", &hash, 0).unwrap();
         let claim = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
-        let response = IdentityBoundEmbedding { values: values.to_vec(), identity: identity("model") };
-        assert_eq!(storage.publish_claimed_embedding(&claim, &hash, &response.identity, &response).unwrap(), ClaimOutcome::Applied(()));
+        let response = IdentityBoundEmbedding {
+            values: values.to_vec(),
+            identity: identity("model"),
+        };
+        assert_eq!(
+            storage
+                .publish_claimed_embedding(&claim, &hash, &response.identity, &response)
+                .unwrap(),
+            ClaimOutcome::Applied(())
+        );
     }
 
     fn load(storage: &Storage, cx: &Cx) -> PublishedSearchSnapshot {
-        storage.load_published_search_snapshot(cx, "model", &identity("model"), PublishedSearchReadLimits::default()).unwrap()
+        storage
+            .load_published_search_snapshot(
+                cx,
+                "model",
+                &identity("model"),
+                PublishedSearchReadLimits::default(),
+            )
+            .unwrap()
     }
 
     #[derive(Clone, Copy)]
     enum QueryReply {
-        Normal, Foreign, BadDimension, NonFinite, Zero, Error,
-        DriftSuccess, DriftError, CancelError, ExplicitCancel,
+        Normal,
+        Foreign,
+        BadDimension,
+        NonFinite,
+        Zero,
+        Error,
+        DriftSuccess,
+        DriftError,
+        CancelError,
+        ExplicitCancel,
     }
 
     thread_local! {
@@ -412,7 +500,9 @@ mod tests {
 
     impl Drop for ClearQueryMetadataCancel {
         fn drop(&mut self) {
-            QUERY_METADATA_CANCEL.with(|slot| { let _ = slot.borrow_mut().take(); });
+            QUERY_METADATA_CANCEL.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
         }
     }
 
@@ -433,9 +523,12 @@ mod tests {
             foreign.producer.backend = "foreign-test-backend".to_owned();
             foreign.validate().unwrap();
             Self {
-                identity: admitted, foreign, reply,
+                identity: admitted,
+                foreign,
+                reply,
                 drift: Arc::new(AtomicBool::new(false)),
-                calls: AtomicUsize::new(0), metadata_calls: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+                metadata_calls: AtomicUsize::new(0),
                 inputs: Mutex::new(Vec::new()),
             }
         }
@@ -449,26 +542,43 @@ mod tests {
                 cx.cancel_with(asupersync::CancelKind::User, Some("metadata cancellation"));
                 return Err(invalid("provider", "metadata failed"));
             }
-            Ok(if self.drift.load(Ordering::SeqCst) { &self.foreign } else { &self.identity })
+            Ok(if self.drift.load(Ordering::SeqCst) {
+                &self.foreign
+            } else {
+                &self.identity
+            })
         }
         fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async { Err(invalid("provider", "raw embedding must not be used")) })
         }
-        fn embed_bound<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, IdentityBoundEmbedding> {
+        fn embed_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> SearchFuture<'a, IdentityBoundEmbedding> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 self.inputs.lock().unwrap().push(text.to_owned());
                 asupersync::runtime::yield_now().await;
-                if matches!(self.reply, QueryReply::DriftSuccess | QueryReply::DriftError) {
+                if matches!(
+                    self.reply,
+                    QueryReply::DriftSuccess | QueryReply::DriftError
+                ) {
                     self.drift.store(true, Ordering::SeqCst);
                 }
                 if matches!(self.reply, QueryReply::CancelError) {
                     cx.cancel_with(asupersync::CancelKind::User, Some("inference cancellation"));
                 }
                 if matches!(self.reply, QueryReply::ExplicitCancel) {
-                    return Err(SearchError::Cancelled { phase: "probe".to_owned(), reason: "explicit".to_owned() });
+                    return Err(SearchError::Cancelled {
+                        phase: "probe".to_owned(),
+                        reason: "explicit".to_owned(),
+                    });
                 }
-                if matches!(self.reply, QueryReply::Error | QueryReply::DriftError | QueryReply::CancelError) {
+                if matches!(
+                    self.reply,
+                    QueryReply::Error | QueryReply::DriftError | QueryReply::CancelError
+                ) {
                     return Err(invalid("provider", "inference failed"));
                 }
                 let values = match self.reply {
@@ -480,15 +590,29 @@ mod tests {
                 };
                 Ok(IdentityBoundEmbedding {
                     values,
-                    identity: if matches!(self.reply, QueryReply::Foreign) { self.foreign.clone() } else { self.identity.clone() },
+                    identity: if matches!(self.reply, QueryReply::Foreign) {
+                        self.foreign.clone()
+                    } else {
+                        self.identity.clone()
+                    },
                 })
             })
         }
-        fn dimension(&self) -> usize { 2 }
-        fn id(&self) -> &'static str { "model" }
-        fn model_name(&self) -> &'static str { "source-query-probe" }
-        fn is_semantic(&self) -> bool { true }
-        fn category(&self) -> ModelCategory { ModelCategory::StaticEmbedder }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &'static str {
+            "model"
+        }
+        fn model_name(&self) -> &'static str {
+            "source-query-probe"
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
     }
 
     struct QueryCanonicalizer {
@@ -501,39 +625,83 @@ mod tests {
             panic!("document canonicalization must not run for search text")
         }
         fn canonicalize_query(&self, text: &str) -> String {
-            if let Some(drift) = &self.drift { drift.store(true, Ordering::SeqCst); }
-            if self.empty { String::new() } else { text.trim().to_owned() }
+            if let Some(drift) = &self.drift {
+                drift.store(true, Ordering::SeqCst);
+            }
+            if self.empty {
+                String::new()
+            } else {
+                text.trim().to_owned()
+            }
         }
     }
 
     #[test]
     fn text_queries_use_bound_inference_and_captured_sources_after_database_reopen() {
-        use frankensearch_core::canonicalize::DefaultCanonicalizer;
         use crate::{InMemoryVectorSink, IngestRequest, PersistentEmbeddingWorker, StorageConfig};
+        use frankensearch_core::canonicalize::DefaultCanonicalizer;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
-            let config = StorageConfig { db_path: directory.path().join("query.sqlite3"), ..StorageConfig::default() };
+            let config = StorageConfig {
+                db_path: directory.path().join("query.sqlite3"),
+                ..StorageConfig::default()
+            };
             let probe = Arc::new(QueryProbe::new(QueryReply::Normal));
             let sink = Arc::new(InMemoryVectorSink::default());
             {
                 let storage = Arc::new(Storage::open(config.clone()).unwrap());
-                let worker = PersistentEmbeddingWorker::new(storage, JobQueueConfig::default(),
-                    Arc::new(DefaultCanonicalizer::default()), probe.clone(), sink.clone()).unwrap().with_database_publication();
-                worker.runner().ingest(IngestRequest::new("fruit", "apple orchard")).unwrap();
-                worker.runner().ingest(IngestRequest::new("systems", "database transaction")).unwrap();
-                assert_eq!(worker.process_batch(&cx, "publisher").await.unwrap().jobs_completed, 2);
+                let worker = PersistentEmbeddingWorker::new(
+                    storage,
+                    JobQueueConfig::default(),
+                    Arc::new(DefaultCanonicalizer::default()),
+                    probe.clone(),
+                    sink.clone(),
+                )
+                .unwrap()
+                .with_database_publication();
+                worker
+                    .runner()
+                    .ingest(IngestRequest::new("fruit", "apple orchard"))
+                    .unwrap();
+                worker
+                    .runner()
+                    .ingest(IngestRequest::new("systems", "database transaction"))
+                    .unwrap();
+                assert_eq!(
+                    worker
+                        .process_batch(&cx, "publisher")
+                        .await
+                        .unwrap()
+                        .jobs_completed,
+                    2
+                );
             }
             let storage = Storage::open(config).unwrap();
             let captured = load(&storage, &cx);
-            storage.connection().execute_sync("DELETE FROM documents;").unwrap();
+            storage
+                .connection()
+                .execute_sync("DELETE FROM documents;")
+                .unwrap();
             drop(storage);
-            let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
-            let hits = captured.search_text(&cx, probe.as_ref(), &canonicalizer, "  apple orchard  ", 1).await.unwrap();
+            let canonicalizer = QueryCanonicalizer {
+                drift: None,
+                empty: false,
+            };
+            let hits = captured
+                .search_text(&cx, probe.as_ref(), &canonicalizer, "  apple orchard  ", 1)
+                .await
+                .unwrap();
             assert_eq!(hits[0].hit().doc_id.as_str(), "fruit");
             assert_eq!(hits[0].document().canonical_text(), "apple orchard");
-            assert_eq!(hits[0].publication().content_hash, ContentHasher::hash("apple orchard"));
+            assert_eq!(
+                hits[0].publication().content_hash,
+                ContentHasher::hash("apple orchard")
+            );
             assert_eq!(probe.calls.load(Ordering::SeqCst), 3);
-            assert_eq!(probe.inputs.lock().unwrap().last().unwrap(), "apple orchard");
+            assert_eq!(
+                probe.inputs.lock().unwrap().last().unwrap(),
+                "apple orchard"
+            );
             assert!(sink.entries().is_empty());
         });
     }
@@ -546,14 +714,32 @@ mod tests {
             publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
             let full = load(&storage, &cx);
             let probe = QueryProbe::new(QueryReply::Normal);
-            let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
-            for (snapshot, text, k) in [(&empty, "orchard", 1), (&full, "orchard", 0), (&full, " \t ", 1)] {
-                assert!(snapshot.search_text(&cx, &probe, &canonicalizer, text, k).await.unwrap().is_empty());
+            let canonicalizer = QueryCanonicalizer {
+                drift: None,
+                empty: false,
+            };
+            for (snapshot, text, k) in [
+                (&empty, "orchard", 1),
+                (&full, "orchard", 0),
+                (&full, " \t ", 1),
+            ] {
+                assert!(
+                    snapshot
+                        .search_text(&cx, &probe, &canonicalizer, text, k)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
             }
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
             probe.drift.store(true, Ordering::SeqCst);
             for (snapshot, k) in [(&empty, 1), (&full, 0)] {
-                assert!(snapshot.search_text(&cx, &probe, &canonicalizer, "", k).await.is_err());
+                assert!(
+                    snapshot
+                        .search_text(&cx, &probe, &canonicalizer, "", k)
+                        .await
+                        .is_err()
+                );
             }
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
         });
@@ -561,20 +747,36 @@ mod tests {
 
     #[test]
     fn text_queries_reject_foreign_malformed_and_drifting_outputs() {
-        for reply in [QueryReply::Foreign, QueryReply::BadDimension, QueryReply::NonFinite,
-            QueryReply::Zero, QueryReply::DriftSuccess, QueryReply::DriftError, QueryReply::Error]
-        {
+        for reply in [
+            QueryReply::Foreign,
+            QueryReply::BadDimension,
+            QueryReply::NonFinite,
+            QueryReply::Zero,
+            QueryReply::DriftSuccess,
+            QueryReply::DriftError,
+            QueryReply::Error,
+        ] {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let (storage, queue) = fixture();
                 publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
                 let captured = load(&storage, &cx);
                 let probe = QueryProbe::new(reply);
-                let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
-                let error = captured.search_text(&cx, &probe, &canonicalizer, "orchard", 1).await.unwrap_err();
+                let canonicalizer = QueryCanonicalizer {
+                    drift: None,
+                    empty: false,
+                };
+                let error = captured
+                    .search_text(&cx, &probe, &canonicalizer, "orchard", 1)
+                    .await
+                    .unwrap_err();
                 if matches!(reply, QueryReply::DriftError | QueryReply::DriftSuccess) {
-                    assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.identity"));
+                    assert!(
+                        matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.identity")
+                    );
                 } else if matches!(reply, QueryReply::Error) {
-                    assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.provider"));
+                    assert!(
+                        matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.provider")
+                    );
                 }
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
                 assert_eq!(queue.queue_depth().unwrap().completed, 1);
@@ -590,8 +792,16 @@ mod tests {
                 publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
                 let captured = load(&storage, &cx);
                 let probe = QueryProbe::new(QueryReply::Normal);
-                let canonicalizer = QueryCanonicalizer { drift: Some(Arc::clone(&probe.drift)), empty };
-                assert!(captured.search_text(&cx, &probe, &canonicalizer, "orchard", 1).await.is_err());
+                let canonicalizer = QueryCanonicalizer {
+                    drift: Some(Arc::clone(&probe.drift)),
+                    empty,
+                };
+                assert!(
+                    captured
+                        .search_text(&cx, &probe, &canonicalizer, "orchard", 1)
+                        .await
+                        .is_err()
+                );
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
             });
         }
@@ -605,9 +815,21 @@ mod tests {
                 publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
                 let captured = load(&storage, &cx);
                 let probe = QueryProbe::new(reply);
-                let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
-                assert!(matches!(captured.search_text(&cx, &probe, &canonicalizer, "orchard", 1).await, Err(SearchError::Cancelled { .. })));
-                assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 2, "cancelled inference never calls provider metadata again");
+                let canonicalizer = QueryCanonicalizer {
+                    drift: None,
+                    empty: false,
+                };
+                assert!(matches!(
+                    captured
+                        .search_text(&cx, &probe, &canonicalizer, "orchard", 1)
+                        .await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert_eq!(
+                    probe.metadata_calls.load(Ordering::SeqCst),
+                    2,
+                    "cancelled inference never calls provider metadata again"
+                );
             });
         }
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -615,9 +837,19 @@ mod tests {
             let captured = load(&storage, &cx);
             let probe = QueryProbe::new(QueryReply::Normal);
             let _guard = ClearQueryMetadataCancel;
-            QUERY_METADATA_CANCEL.with(|slot| { *slot.borrow_mut() = Some(cx.clone()); });
-            let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
-            assert!(matches!(captured.search_text(&cx, &probe, &canonicalizer, "", 0).await, Err(SearchError::Cancelled { .. })));
+            QUERY_METADATA_CANCEL.with(|slot| {
+                *slot.borrow_mut() = Some(cx.clone());
+            });
+            let canonicalizer = QueryCanonicalizer {
+                drift: None,
+                empty: false,
+            };
+            assert!(matches!(
+                captured
+                    .search_text(&cx, &probe, &canonicalizer, "", 0)
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
         });
     }
@@ -628,9 +860,17 @@ mod tests {
             let (storage, _) = fixture();
             let captured = load(&storage, &cx);
             let probe = QueryProbe::new(QueryReply::Normal);
-            let canonicalizer = QueryCanonicalizer { drift: None, empty: false };
+            let canonicalizer = QueryCanonicalizer {
+                drift: None,
+                empty: false,
+            };
             cx.cancel_with(asupersync::CancelKind::User, Some("stop before query"));
-            assert!(matches!(captured.search_text(&cx, &probe, &canonicalizer, "", 0).await, Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                captured
+                    .search_text(&cx, &probe, &canonicalizer, "", 0)
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
             assert_eq!(probe.metadata_calls.load(Ordering::SeqCst), 0);
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
         });
@@ -645,13 +885,22 @@ mod tests {
             let old = load(&storage, &cx);
             publish(&storage, &queue, "doc", "replacement body", [-1.0, 0.0]);
             let new = load(&storage, &cx);
-            storage.connection().execute_sync("DELETE FROM documents WHERE doc_id = 'doc';").unwrap();
+            storage
+                .connection()
+                .execute_sync("DELETE FROM documents WHERE doc_id = 'doc';")
+                .unwrap();
             let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
             let old_hits = old.search(&cx, &query, 1).unwrap();
             let new_hits = new.search(&cx, &query, 1).unwrap();
             assert_eq!(old_hits[0].document().canonical_text(), body);
-            assert_eq!(old_hits[0].document().catalog().metadata.as_ref().unwrap()["tag"].as_str(), Some(body.as_str()));
-            assert_eq!(old_hits[0].publication().content_hash, ContentHasher::hash(&body));
+            assert_eq!(
+                old_hits[0].document().catalog().metadata.as_ref().unwrap()["tag"].as_str(),
+                Some(body.as_str())
+            );
+            assert_eq!(
+                old_hits[0].publication().content_hash,
+                ContentHasher::hash(&body)
+            );
             assert_eq!(new_hits[0].document().canonical_text(), "replacement body");
             assert!(old_hits[0].hit().score > 0.99 && new_hits[0].hit().score < -0.99);
             assert!(load(&storage, &cx).is_empty());
@@ -662,23 +911,58 @@ mod tests {
     fn exact_source_budget_and_empty_zero_budget_do_not_truncate() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (storage, queue) = fixture();
-            let zero = PublishedSearchReadLimits { max_source_bytes: 0, ..PublishedSearchReadLimits::default() };
-            assert!(storage.load_published_search_snapshot(&cx, "model", &identity("model"), zero).unwrap().is_empty());
+            let zero = PublishedSearchReadLimits {
+                max_source_bytes: 0,
+                ..PublishedSearchReadLimits::default()
+            };
+            assert!(
+                storage
+                    .load_published_search_snapshot(&cx, "model", &identity("model"), zero)
+                    .unwrap()
+                    .is_empty()
+            );
             for (id, body) in [("a\0tail", "数据\0tail"), ("é", "second body")] {
                 publish(&storage, &queue, id, body, [1.0, 0.0]);
             }
             let captured = load(&storage, &cx);
             assert_eq!(captured.len(), 2);
-            let expected_bytes: usize = ["数据\0tail", "second body"].iter().map(|body| {
-                body.len() * 2 + "missing://never-read".len()
-                    + serde_json::to_string(&serde_json::json!({"tag": body})).unwrap().len()
-            }).sum();
+            let expected_bytes: usize = ["数据\0tail", "second body"]
+                .iter()
+                .map(|body| {
+                    body.len() * 2
+                        + "missing://never-read".len()
+                        + serde_json::to_string(&serde_json::json!({"tag": body}))
+                            .unwrap()
+                            .len()
+                })
+                .sum();
             assert_eq!(captured.source_payload_bytes(), expected_bytes);
-            let exact = PublishedSearchReadLimits { max_source_bytes: expected_bytes, ..zero };
-            assert_eq!(storage.load_published_search_snapshot(&cx, "model", &identity("model"), exact).unwrap().len(), 2);
+            let exact = PublishedSearchReadLimits {
+                max_source_bytes: expected_bytes,
+                ..zero
+            };
+            assert_eq!(
+                storage
+                    .load_published_search_snapshot(&cx, "model", &identity("model"), exact)
+                    .unwrap()
+                    .len(),
+                2
+            );
             for budget in [0, exact.max_source_bytes - 1] {
-                let error = storage.load_published_search_snapshot(&cx, "model", &identity("model"), PublishedSearchReadLimits { max_source_bytes: budget, ..exact }).unwrap_err();
-                assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.max_source_bytes"));
+                let error = storage
+                    .load_published_search_snapshot(
+                        &cx,
+                        "model",
+                        &identity("model"),
+                        PublishedSearchReadLimits {
+                            max_source_bytes: budget,
+                            ..exact
+                        },
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.max_source_bytes")
+                );
                 assert!(!storage.connection().in_transaction());
             }
         });
@@ -686,17 +970,43 @@ mod tests {
 
     #[test]
     fn source_admission_precedes_large_or_malformed_payload_decoding() {
-        for column in ["canonical_text", "metadata_json", "source_path", "content_preview"] {
+        for column in [
+            "canonical_text",
+            "metadata_json",
+            "source_path",
+            "content_preview",
+        ] {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let (storage, queue) = fixture();
                 publish(&storage, &queue, "doc", "original", [1.0, 0.0]);
-                let table = if column == "canonical_text" { "document_contents" } else { "documents" };
-                storage.connection().execute_with_params_sync(
-                    &format!("UPDATE {table} SET {column} = ?1;"),
-                    &[SqliteValue::Text("private-invalid-json\0数据".repeat(1000).into())],
-                ).unwrap();
-                let error = storage.load_published_search_snapshot(&cx, "model", &identity("model"), PublishedSearchReadLimits { max_source_bytes: 100, ..PublishedSearchReadLimits::default() }).unwrap_err();
-                assert!(matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.max_source_bytes"));
+                let table = if column == "canonical_text" {
+                    "document_contents"
+                } else {
+                    "documents"
+                };
+                storage
+                    .connection()
+                    .execute_with_params_sync(
+                        &format!("UPDATE {table} SET {column} = ?1;"),
+                        &[SqliteValue::Text(
+                            "private-invalid-json\0数据".repeat(1000).into(),
+                        )],
+                    )
+                    .unwrap();
+                let error = storage
+                    .load_published_search_snapshot(
+                        &cx,
+                        "model",
+                        &identity("model"),
+                        PublishedSearchReadLimits {
+                            max_source_bytes: 100,
+                            ..PublishedSearchReadLimits::default()
+                        },
+                    )
+                    .unwrap_err();
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, .. } if field == "publication_search.max_source_bytes")
+                );
                 assert!(!storage.connection().in_transaction());
             });
         }
@@ -712,9 +1022,20 @@ mod tests {
         ] {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let (storage, queue) = fixture();
-                for id in ["a", "z"] { publish(&storage, &queue, id, "valid preview", [1.0, 0.0]); }
+                for id in ["a", "z"] {
+                    publish(&storage, &queue, id, "valid preview", [1.0, 0.0]);
+                }
                 storage.connection().execute_sync(sql).unwrap();
-                assert!(storage.load_published_search_snapshot(&cx, "model", &identity("model"), PublishedSearchReadLimits::default()).is_err());
+                assert!(
+                    storage
+                        .load_published_search_snapshot(
+                            &cx,
+                            "model",
+                            &identity("model"),
+                            PublishedSearchReadLimits::default()
+                        )
+                        .is_err()
+                );
                 assert_eq!(queue.queue_depth().unwrap().completed, 2);
                 assert!(!storage.connection().in_transaction());
             });
@@ -729,8 +1050,16 @@ mod tests {
                 publish(&storage, &queue, id, "original", [1.0, 0.0]);
             }
             storage.connection().execute_sync("UPDATE embedding_status SET status = doc_id WHERE doc_id IN ('pending', 'failed', 'skipped');").unwrap();
-            storage.connection().execute_sync("UPDATE documents SET content_hash = zeroblob(32) WHERE doc_id = 'obsolete';").unwrap();
-            storage.connection().execute_sync("DELETE FROM document_contents WHERE doc_id != 'current';").unwrap();
+            storage
+                .connection()
+                .execute_sync(
+                    "UPDATE documents SET content_hash = zeroblob(32) WHERE doc_id = 'obsolete';",
+                )
+                .unwrap();
+            storage
+                .connection()
+                .execute_sync("DELETE FROM document_contents WHERE doc_id != 'current';")
+                .unwrap();
             let captured = load(&storage, &cx);
             assert_eq!(captured.len(), 1);
             assert_eq!(captured.documents()[0].catalog().doc_id, "current");
@@ -747,7 +1076,9 @@ mod tests {
             let full = load(&storage, &cx);
             let foreign = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("foreign")).unwrap();
             for corpus in [&empty, &full] {
-                for k in [0, 1] { assert!(corpus.search(&cx, &foreign, k).is_err()); }
+                for k in [0, 1] {
+                    assert!(corpus.search(&cx, &foreign, k).is_err());
+                }
             }
         });
     }
@@ -761,8 +1092,19 @@ mod tests {
             let before = storage.metrics_snapshot();
             let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
             cx.cancel_with(asupersync::CancelKind::User, Some("stop"));
-            assert!(matches!(storage.load_published_search_snapshot(&cx, "model", &identity("model"), PublishedSearchReadLimits::default()), Err(SearchError::Cancelled { .. })));
-            assert!(matches!(captured.search(&cx, &query, 0), Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                storage.load_published_search_snapshot(
+                    &cx,
+                    "model",
+                    &identity("model"),
+                    PublishedSearchReadLimits::default()
+                ),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                captured.search(&cx, &query, 0),
+                Err(SearchError::Cancelled { .. })
+            ));
             assert_eq!(storage.metrics_snapshot(), before);
         });
     }
