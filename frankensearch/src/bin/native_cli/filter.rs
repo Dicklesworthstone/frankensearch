@@ -155,6 +155,7 @@ impl<'a> Query<'a> {
         pool: Option<BlockingPoolHandle>,
     ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
         match (&self.scope, pool) {
+            (Some(scope), Some(pool)) => scope.progressive_with_pool(cx, query, limit, pool),
             (None, Some(pool)) => self.index.progressive_with_pool(cx, query, limit, pool),
             _ => self.progressive(cx, query, limit),
         }
@@ -181,12 +182,18 @@ impl<'a> Query<'a> {
         validate_query(query)?;
         let full = mode == Mode::Full && self.index.vectors().quality().is_some();
         let results = match (&self.scope, pool, mode, full) {
-            // Scoped predicates borrow this retained query object. Keep their
-            // existing synchronous traversal until the scope layer owns a
-            // stable 'static membership predicate for worker execution.
-            (Some(scope), _, Mode::Quality, _) => scope.search_quality(cx, query, limit).await?,
-            (Some(scope), _, _, true) => scope.search_refined(cx, query, limit).await?,
-            (Some(scope), _, _, false) => scope.search(cx, query, limit).await?,
+            (Some(scope), Some(pool), Mode::Quality, _) => {
+                scope.search_quality_with_pool(cx, query, limit, pool).await?
+            }
+            (Some(scope), Some(pool), _, true) => {
+                scope.search_refined_with_pool(cx, query, limit, pool).await?
+            }
+            (Some(scope), Some(pool), _, false) => {
+                scope.search_with_pool(cx, query, limit, pool).await?
+            }
+            (Some(scope), None, Mode::Quality, _) => scope.search_quality(cx, query, limit).await?,
+            (Some(scope), None, _, true) => scope.search_refined(cx, query, limit).await?,
+            (Some(scope), None, _, false) => scope.search(cx, query, limit).await?,
             (None, Some(pool), Mode::Quality, _) => {
                 self.index.search_quality_with_pool(cx, query, limit, pool).await?
             }
@@ -243,6 +250,9 @@ impl<'a> Query<'a> {
         pool: Option<BlockingPoolHandle>,
     ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
         match (&self.scope, pool) {
+            (Some(scope), Some(pool)) => scope.progressive_with_reranker_on_pool(
+                cx, text, limit, reranker, window, pool,
+            ),
             (None, Some(pool)) => self.index.progressive_with_reranker_on_pool(
                 cx, text, limit, reranker, window, pool,
             ),
