@@ -245,7 +245,16 @@ impl<'a> Prepared<'a> {
             Self::Single(query) => Ok(Progressive::Single(Box::new(
                 query.progressive_on_pool(cx, text, limit, pool)?,
             ))),
-            Self::Sharded { .. } => self.progressive(cx, text, limit),
+            Self::Sharded { index, scope } => {
+                let stream = match (scope, pool) {
+                    (None, Some(pool)) => index.progressive_with_pool(cx, text, limit, pool)?,
+                    _ => scope.as_ref().map_or_else(
+                        || index.progressive(cx, text, limit),
+                        |scope| scope.progressive(cx, text, limit),
+                    )?,
+                };
+                Ok(Progressive::Sharded(Box::new(stream)))
+            }
         }
     }
 
@@ -286,8 +295,17 @@ impl<'a> Prepared<'a> {
                     cx, text, limit, reranker, window, pool,
                 )?,
             ))),
-            Self::Sharded { .. } => {
-                self.progressive_with_reranker(cx, text, limit, reranker, window)
+            Self::Sharded { index, scope } => {
+                let stream = match (scope, pool) {
+                    (None, Some(pool)) => index.progressive_with_reranker_on_pool(
+                        cx, text, limit, reranker, window, pool,
+                    )?,
+                    _ => scope.as_ref().map_or_else(
+                        || index.progressive_with_reranker(cx, text, limit, reranker, window),
+                        |scope| scope.progressive_with_reranker(cx, text, limit, reranker, window),
+                    )?,
+                };
+                Ok(Progressive::Sharded(Box::new(stream)))
             }
         }
     }
