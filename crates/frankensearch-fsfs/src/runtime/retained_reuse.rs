@@ -2415,6 +2415,48 @@ mod generation_tests {
         }
 
         #[test]
+        fn an_mtime_only_change_keeps_vectors_and_records_the_new_revision() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, root) = fixture(parent.path(), 2);
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
+
+                let path = source.join("doc-0.md");
+                let before_modified = fs::metadata(&path).unwrap().modified().unwrap();
+                let before_revision = FsfsRuntime::read_matching_manifest_generation(&root)
+                    .unwrap()
+                    .unwrap()["doc-0.md"]
+                    .revision;
+                let touched_modified = before_modified + std::time::Duration::from_secs(60);
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(touched_modified))
+                    .unwrap();
+                let expected_revision = i64::try_from(
+                    super::super::super::system_time_to_ms(
+                        fs::metadata(&path).unwrap().modified().unwrap(),
+                    ),
+                )
+                .unwrap();
+                assert!(expected_revision > before_revision);
+
+                let touched = run_counted_legacy(&cx, parent.path(), "index").await;
+                assert_index_calls(&touched, 0, 0);
+                let after_revision = FsfsRuntime::read_matching_manifest_generation(&root)
+                    .unwrap()
+                    .unwrap()["doc-0.md"]
+                    .revision;
+                assert_eq!(after_revision, expected_revision);
+
+                fs::write(&path, "sharedtoken edited after touch").unwrap();
+                let edited = run_counted_legacy(&cx, parent.path(), "index").await;
+                assert_index_calls(&edited, 1, 1);
+            });
+        }
+
+        #[test]
         fn completed_legacy_reuse_revalidates_configuration_and_independent_producers() {
             run_test_with_cx(|cx| async move {
                 let parent = tempfile::tempdir().unwrap();

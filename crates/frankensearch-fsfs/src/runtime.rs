@@ -17860,12 +17860,13 @@ impl FsfsRuntime {
                 let Some(manifest) = previous_manifests.get(&candidate.file_key) else {
                     continue;
                 };
-                if entry.revision != revision
-                    || entry.ingestion_class != ingestion_class_label(candidate.ingestion_class)
-                {
+                if entry.ingestion_class != ingestion_class_label(candidate.ingestion_class) {
                     continue;
                 }
-                let unchanged = entry.canonical_lines.is_some()
+                let revision_changed =
+                    entry.revision != revision || manifest.revision != revision;
+                let unchanged = !revision_changed
+                    && entry.canonical_lines.is_some()
                     && (observed_unchanged(&candidate.file_path)
                         || same_stamp(candidate, entry.stamp.as_ref()));
                 let content_hash_hex = if unchanged {
@@ -17893,8 +17894,11 @@ impl FsfsRuntime {
                 if reuse == CheckpointReuse::None {
                     continue;
                 }
-                // Complete reuse already requires the recorded digest.
-                let carriable = unchanged || (receipt_carry && entry.canonical_lines.is_some());
+                // Complete reuse already requires the recorded digest. A file
+                // whose mtime changed still rewrites its lexical metadata and
+                // manifest revision, so it is never carried without reading.
+                let carriable = !revision_changed
+                    && (unchanged || (receipt_carry && entry.canonical_lines.is_some()));
                 if carriable && reuse == CheckpointReuse::Complete {
                     unchanged_complete.insert(
                         candidate.file_key.clone(),
@@ -28842,14 +28846,11 @@ fn checkpoint_entry_reuse(
 ) -> CheckpointReuse {
     let ingestion_class = ingestion_class_label(candidate.ingestion_class);
     let reason_code = ingestion_plan_reason(candidate.ingestion_class);
-    let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
-    if entry.revision != revision
-        || entry.ingestion_class != ingestion_class
+    if entry.ingestion_class != ingestion_class
         || entry.content_hash_hex != content_hash_hex
         || entry.content_hash_hex.is_empty()
         || entry.reason_code != reason_code
         || manifest.file_key != candidate.file_key
-        || manifest.revision != revision
         || manifest.ingestion_class != ingestion_class
         || manifest.canonical_bytes != entry.canonical_bytes
         || manifest.reason_code != reason_code
@@ -52567,7 +52568,7 @@ mod tests {
         stale_entry.revision = 41;
         assert_eq!(
             reuse(&checkpoint, &stale_entry, "abc123", &live_vector_ids),
-            super::CheckpointReuse::None
+            super::CheckpointReuse::Complete
         );
 
         let mut deferred_entry = entry.clone();
