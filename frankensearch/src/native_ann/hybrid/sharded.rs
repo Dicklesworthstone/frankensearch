@@ -341,9 +341,45 @@ impl NativeShardSet {
         admit_tiers(cx, self, fast_embedder, quality)?;
         Ok(NativeShardedProgressiveSearch {
             fast: self,
+            fast_owner: None,
             cx,
             fast_embedder,
             quality,
+            quality_owner: None,
+            pool: None,
+            lexical,
+            text,
+            k,
+            budget: candidate_budget(k)?,
+            policy: QueryPolicy::default(),
+            reranker: None,
+            allowed_documents: None,
+            state: State::Initial,
+        })
+    }
+
+    /// Prepare progressive sharded retrieval with owned admitted inventories for
+    /// caller-pool traversal. Every partition owner is retained by the cloned
+    /// shard set; no file or model is reopened.
+    pub fn search_hybrid_progressive_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast_embedder: &'a dyn Embedder,
+        quality: Option<(&'a Self, &'a dyn Embedder)>,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        admit_tiers(cx, self, fast_embedder, quality)?;
+        Ok(NativeShardedProgressiveSearch {
+            fast: self,
+            fast_owner: Some(self.clone()),
+            cx,
+            fast_embedder,
+            quality,
+            quality_owner: quality.map(|(shards, _)| shards.clone()),
+            pool: Some(pool),
             lexical,
             text,
             k,
@@ -381,9 +417,12 @@ enum State {
 /// polling executor; this type provides no hidden timeout or worker runtime.
 pub struct NativeShardedProgressiveSearch<'a> {
     fast: &'a NativeShardSet,
+    fast_owner: Option<NativeShardSet>,
     cx: &'a Cx,
     fast_embedder: &'a dyn Embedder,
     quality: Option<(&'a NativeShardSet, &'a dyn Embedder)>,
+    quality_owner: Option<NativeShardSet>,
+    pool: Option<BlockingPoolHandle>,
     lexical: &'a dyn LexicalRead,
     text: &'a str,
     k: usize,
