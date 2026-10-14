@@ -229,16 +229,22 @@ impl QuillIndex {
                 };
                 // Reserve before publishing so a recoverable allocation error
                 // cannot lose the receipt for an already successful publication.
-                progress.merges.try_reserve(1).map_err(|_| {
-                    SessionMergeError::Allocation {
+                progress
+                    .merges
+                    .try_reserve(1)
+                    .map_err(|_| SessionMergeError::Allocation {
                         count: progress.merges.len() + 1,
-                    }
-                })?;
+                    })?;
                 // validate() checked the complete sequence before any I/O.
                 let output_segment_id = first_output_segment_id + progress.merges.len() as u64;
                 checkpoint(cx)?;
                 match self
-                    .concat_merge(cx, &plan.source_segment_ids, output_segment_id, created_unix_s)
+                    .concat_merge(
+                        cx,
+                        &plan.source_segment_ids,
+                        output_segment_id,
+                        created_unix_s,
+                    )
                     .await
                 {
                     Ok(published) => {
@@ -305,21 +311,48 @@ mod tests {
     fn budget_rejects_zero_limits_and_id_wrap_before_any_work() {
         let valid = SessionMergeBudget::default();
         for invalid in [
-            SessionMergeBudget { max_merges: 0, ..valid },
-            SessionMergeBudget { max_input_docs: 0, ..valid },
-            SessionMergeBudget { max_input_bytes: 0, ..valid },
+            SessionMergeBudget {
+                max_merges: 0,
+                ..valid
+            },
+            SessionMergeBudget {
+                max_input_docs: 0,
+                ..valid
+            },
+            SessionMergeBudget {
+                max_input_bytes: 0,
+                ..valid
+            },
         ] {
-            assert!(matches!(invalid.validate(0), Err(SessionMergeError::InvalidPolicy { .. })));
+            assert!(matches!(
+                invalid.validate(0),
+                Err(SessionMergeError::InvalidPolicy { .. })
+            ));
         }
         assert!(valid.validate(u64::MAX - 7).is_ok());
         assert!(valid.validate(u64::MAX - 6).is_err());
-        assert!(SessionMergeBudget { max_merges: 1, ..valid }.validate(u64::MAX).is_ok());
+        assert!(
+            SessionMergeBudget {
+                max_merges: 1,
+                ..valid
+            }
+            .validate(u64::MAX)
+            .is_ok()
+        );
     }
 
     #[test]
     fn remaining_budget_clamps_work_without_changing_tier_radix() {
-        let policy = SessionMergePolicy { fanout: 8, max_input_docs: 40, max_input_bytes: 400 };
-        let budget = SessionMergeBudget { max_merges: 3, max_input_docs: 100, max_input_bytes: 1000 };
+        let policy = SessionMergePolicy {
+            fanout: 8,
+            max_input_docs: 40,
+            max_input_bytes: 400,
+        };
+        let budget = SessionMergeBudget {
+            max_merges: 3,
+            max_input_docs: 100,
+            max_input_bytes: 1000,
+        };
         let mut progress = SessionMergeProgress::default();
         assert_eq!(budget.remaining_policy(policy, &progress), policy);
         progress.input_docs = 75;
@@ -349,12 +382,18 @@ mod tests {
             ..SessionMergeProgress::default()
         };
         let remaining = budget.remaining_policy(SessionMergePolicy::default(), &progress);
-        assert_eq!((remaining.max_input_docs, remaining.max_input_bytes), (7, 11));
+        assert_eq!(
+            (remaining.max_input_docs, remaining.max_input_bytes),
+            (7, 11)
+        );
     }
 
     #[test]
     fn publication_limit_terminates_even_zero_row_zero_byte_plans() {
-        let budget = SessionMergeBudget { max_merges: 1, ..SessionMergeBudget::default() };
+        let budget = SessionMergeBudget {
+            max_merges: 1,
+            ..SessionMergeBudget::default()
+        };
         let progress = SessionMergeProgress {
             merges: vec![SessionMergeReceipt {
                 plan: SessionMergePlan {

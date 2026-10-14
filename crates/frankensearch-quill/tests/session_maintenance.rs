@@ -62,7 +62,10 @@ async fn fixture(cx: &Cx, directory: &Path) -> QuillIndex {
     }
     assert_eq!(index.snapshot().unwrap().segments().len(), 6);
     assert_eq!(index.doc_count().unwrap(), 11);
-    assert_eq!(index.collect_docids(cx, "shared").unwrap(), (1..12).collect::<Vec<_>>());
+    assert_eq!(
+        index.collect_docids(cx, "shared").unwrap(),
+        (1..12).collect::<Vec<_>>()
+    );
     // Reopen without a live ingest lease so a publication-failure fixture can
     // target the second manifest generation rather than a lease-retirement step.
     drop(index);
@@ -92,9 +95,14 @@ async fn assert_reopened(
     expected_queries: &[QuillSearchResult],
     expected_stored: &StoredRows,
 ) {
-    let reader = QuillSearchIndex::open(cx, directory, config()).await.unwrap();
+    let reader = QuillSearchIndex::open(cx, directory, config())
+        .await
+        .unwrap();
     for (query, expected) in QUERIES.iter().zip(expected_queries) {
-        assert_eq!(reader.search_paginated(cx, query, 20, 0, true).unwrap(), *expected);
+        assert_eq!(
+            reader.search_paginated(cx, query, 20, 0, true).unwrap(),
+            *expected
+        );
     }
     for (docid, fields) in expected_stored.iter().enumerate() {
         for (field, expected) in fields.iter().enumerate() {
@@ -132,8 +140,14 @@ fn repeated_merges_charge_rewritten_inputs_and_preserve_search_and_ingest() {
         let report = index
             .merge_sessions(
                 &cx,
-                SessionMergePolicy { max_input_docs: 100, ..policy() },
-                SessionMergeBudget { max_merges: 4, ..budget() },
+                SessionMergePolicy {
+                    max_input_docs: 100,
+                    ..policy()
+                },
+                SessionMergeBudget {
+                    max_merges: 4,
+                    ..budget()
+                },
                 0xc100,
                 0,
             )
@@ -147,22 +161,44 @@ fn repeated_merges_charge_rewritten_inputs_and_preserve_search_and_ingest() {
         let originals: u64 = initial.segments.iter().map(|source| source.file_len).sum();
         let rewritten: u64 = [0xc100, 0xc101]
             .iter()
-            .map(|id| std::fs::metadata(output_path(directory.path(), *id)).unwrap().len())
+            .map(|id| {
+                std::fs::metadata(output_path(directory.path(), *id))
+                    .unwrap()
+                    .len()
+            })
             .sum();
         assert_eq!(report.progress.input_bytes, originals + rewritten);
-        for (receipt, sources) in report.progress.merges[..3].iter().zip(initial.segments.chunks(2)) {
+        for (receipt, sources) in report.progress.merges[..3]
+            .iter()
+            .zip(initial.segments.chunks(2))
+        {
             assert_eq!(
                 receipt.plan.source_segment_ids,
-                sources.iter().map(|source| source.segment_id).collect::<Vec<_>>(),
+                sources
+                    .iter()
+                    .map(|source| source.segment_id)
+                    .collect::<Vec<_>>(),
             );
             assert_eq!(receipt.plan.input_docs, 4);
         }
-        assert_eq!(report.progress.merges[3].plan.source_segment_ids, [0xc100, 0xc101]);
-        assert!(report.progress.merges.windows(2).all(|pair| pair[0].generation < pair[1].generation));
+        assert_eq!(
+            report.progress.merges[3].plan.source_segment_ids,
+            [0xc100, 0xc101]
+        );
+        assert!(
+            report
+                .progress
+                .merges
+                .windows(2)
+                .all(|pair| pair[0].generation < pair[1].generation)
+        );
         let published = index.snapshot().unwrap();
         assert_eq!(published.segments().len(), 2);
         assert_eq!(published.doc_count(), 11);
-        assert_eq!(published.loaded_manifest().manifest.field_stats, initial.field_stats);
+        assert_eq!(
+            published.loaded_manifest().manifest.field_stats,
+            initial.field_stats
+        );
         assert_eq!(queries(&index, &cx), expected_queries);
         assert_eq!(stored(&held), expected_stored);
         assert_eq!(stored(&index.search_snapshot().unwrap()), expected_stored);
@@ -177,7 +213,9 @@ fn repeated_merges_charge_rewritten_inputs_and_preserve_search_and_ingest() {
         LexicalWrite::commit(&index, &cx).await.unwrap();
         assert_eq!(index.doc_count().unwrap(), 12);
         assert_eq!(stored(&held), expected_stored);
-        let cold = QuillSearchIndex::open(&cx, directory.path(), config()).await.unwrap();
+        let cold = QuillSearchIndex::open(&cx, directory.path(), config())
+            .await
+            .unwrap();
         assert_eq!(
             cold.search_paginated(&cx, "shared", 20, 0, true).unwrap(),
             index.search_paginated(&cx, "shared", 20, 0, true).unwrap(),
@@ -194,18 +232,52 @@ fn cumulative_row_byte_and_publication_caps_stop_before_another_attempt() {
             let initial = load_manifest_pair(directory.path()).unwrap().manifest;
             let first_four_bytes: u64 = initial.segments[..4].iter().map(|s| s.file_len).sum();
             let (limits, count, stop) = match case {
-                0 => (SessionMergeBudget { max_input_docs: 8, ..budget() }, 2, SessionMergeStop::InputBudget),
-                1 => (SessionMergeBudget { max_input_bytes: first_four_bytes, ..budget() }, 2, SessionMergeStop::InputBudget),
-                2 => (SessionMergeBudget { max_merges: 1, ..budget() }, 1, SessionMergeStop::MergeLimit),
-                _ => (SessionMergeBudget { max_input_docs: 9, ..budget() }, 2, SessionMergeStop::NoEligibleRunWithinBudget),
+                0 => (
+                    SessionMergeBudget {
+                        max_input_docs: 8,
+                        ..budget()
+                    },
+                    2,
+                    SessionMergeStop::InputBudget,
+                ),
+                1 => (
+                    SessionMergeBudget {
+                        max_input_bytes: first_four_bytes,
+                        ..budget()
+                    },
+                    2,
+                    SessionMergeStop::InputBudget,
+                ),
+                2 => (
+                    SessionMergeBudget {
+                        max_merges: 1,
+                        ..budget()
+                    },
+                    1,
+                    SessionMergeStop::MergeLimit,
+                ),
+                _ => (
+                    SessionMergeBudget {
+                        max_input_docs: 9,
+                        ..budget()
+                    },
+                    2,
+                    SessionMergeStop::NoEligibleRunWithinBudget,
+                ),
             };
-            let report = index.merge_sessions(&cx, policy(), limits, 0xc200, 0).await.unwrap();
+            let report = index
+                .merge_sessions(&cx, policy(), limits, 0xc200, 0)
+                .await
+                .unwrap();
             assert_eq!(report.stop, stop);
             assert_eq!(report.progress.merges.len(), count);
             assert_eq!(report.progress.input_docs, 4 * count as u64);
             assert_eq!(
                 report.progress.input_bytes,
-                initial.segments[..2 * count].iter().map(|s| s.file_len).sum::<u64>(),
+                initial.segments[..2 * count]
+                    .iter()
+                    .map(|s| s.file_len)
+                    .sum::<u64>(),
             );
             assert!(report.progress.input_docs <= limits.max_input_docs);
             assert!(report.progress.input_bytes <= limits.max_input_bytes);
@@ -225,7 +297,9 @@ fn failed_second_publication_keeps_first_receipt_and_resumes_after_reconciliatio
         let expected_queries = queries(&index, &cx);
         let held = index.search_snapshot().unwrap();
         let expected_stored = stored(&held);
-        let blocked = directory.path().join(format!(".tmp-manifest-{}", initial.generation + 2));
+        let blocked = directory
+            .path()
+            .join(format!(".tmp-manifest-{}", initial.generation + 2));
         let blocker = b"preserve the conflicting second proposal";
         std::fs::write(&blocked, blocker).unwrap();
         let failure = index
@@ -234,13 +308,31 @@ fn failed_second_publication_keeps_first_receipt_and_resumes_after_reconciliatio
             .unwrap_err();
         assert_eq!(failure.progress.merges.len(), 1);
         assert_eq!(failure.progress.input_docs, 4);
-        assert_eq!(failure.progress.input_bytes, initial.segments[..2].iter().map(|s| s.file_len).sum::<u64>());
+        assert_eq!(
+            failure.progress.input_bytes,
+            initial.segments[..2]
+                .iter()
+                .map(|s| s.file_len)
+                .sum::<u64>()
+        );
         assert_eq!(failure.progress.merges[0].output_segment_id, 0xc300);
-        let attempt = failure.attempted.as_ref().expect("the second concat was attempted");
+        let attempt = failure
+            .attempted
+            .as_ref()
+            .expect("the second concat was attempted");
         assert_eq!(attempt.output_segment_id, 0xc301);
         assert_eq!(attempt.created_unix_s, 0);
-        assert_eq!(attempt.plan.source_segment_ids, initial.segments[2..4].iter().map(|s| s.segment_id).collect::<Vec<_>>());
-        assert!(matches!(failure.source.as_ref(), SessionMergeError::Index(_)));
+        assert_eq!(
+            attempt.plan.source_segment_ids,
+            initial.segments[2..4]
+                .iter()
+                .map(|s| s.segment_id)
+                .collect::<Vec<_>>()
+        );
+        assert!(matches!(
+            failure.source.as_ref(),
+            SessionMergeError::Index(_)
+        ));
         assert!(failure.source.to_string().contains("temp"));
         let first_bytes = std::fs::read(output_path(directory.path(), 0xc300)).unwrap();
         let attempted_bytes = std::fs::read(output_path(directory.path(), 0xc301)).unwrap();
@@ -257,14 +349,27 @@ fn failed_second_publication_keeps_first_receipt_and_resumes_after_reconciliatio
         drop(index);
         // Preserve the blocker instead of deleting it, then use the real writer
         // reopen contract before resuming at the reconciled attempted identity.
-        std::fs::rename(&blocked, directory.path().join("preserved-proposal.fixture")).unwrap();
-        let recovered = QuillIndex::open(&cx, directory.path(), config()).await.unwrap();
-        assert_eq!(recovered.snapshot().unwrap().loaded_manifest().manifest, authority);
+        std::fs::rename(
+            &blocked,
+            directory.path().join("preserved-proposal.fixture"),
+        )
+        .unwrap();
+        let recovered = QuillIndex::open(&cx, directory.path(), config())
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered.snapshot().unwrap().loaded_manifest().manifest,
+            authority
+        );
         let resumed = recovered
             .merge_sessions(
                 &cx,
                 policy(),
-                SessionMergeBudget { max_merges: 2, max_input_docs: 8, ..budget() },
+                SessionMergeBudget {
+                    max_merges: 2,
+                    max_input_docs: 8,
+                    ..budget()
+                },
                 attempt.output_segment_id,
                 attempt.created_unix_s,
             )
@@ -275,8 +380,14 @@ fn failed_second_publication_keeps_first_receipt_and_resumes_after_reconciliatio
         assert_eq!(resumed.progress.merges[0].plan, attempt.plan);
         assert_eq!(recovered.snapshot().unwrap().segments().len(), 3);
         assert_eq!(recovered.doc_count().unwrap(), 11);
-        assert_eq!(std::fs::read(output_path(directory.path(), 0xc300)).unwrap(), first_bytes);
-        assert_eq!(std::fs::read(output_path(directory.path(), 0xc301)).unwrap(), attempted_bytes);
+        assert_eq!(
+            std::fs::read(output_path(directory.path(), 0xc300)).unwrap(),
+            first_bytes
+        );
+        assert_eq!(
+            std::fs::read(output_path(directory.path(), 0xc301)).unwrap(),
+            attempted_bytes
+        );
         assert_eq!(queries(&recovered, &cx), expected_queries);
         assert_eq!(stored(&held), expected_stored);
         assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
@@ -298,16 +409,28 @@ fn no_op_invalid_sequence_cancellation_and_collision_preserve_authority() {
         assert_eq!(report.stop, SessionMergeStop::NoEligibleRunWithinBudget);
         assert_eq!(directory_bytes(directory.path()), before);
 
-        let invalid = index.merge_sessions(&cx, policy(), budget(), u64::MAX, 0).await.unwrap_err();
-        assert!(matches!(invalid.source.as_ref(), SessionMergeError::InvalidPolicy { .. }));
+        let invalid = index
+            .merge_sessions(&cx, policy(), budget(), u64::MAX, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            invalid.source.as_ref(),
+            SessionMergeError::InvalidPolicy { .. }
+        ));
         assert!(invalid.progress.merges.is_empty());
         assert!(invalid.attempted.is_none());
         assert_eq!(directory_bytes(directory.path()), before);
 
         cx.set_cancel_requested(true);
-        let cancelled = index.merge_sessions(&cx, policy(), budget(), 0xc400, 0).await.unwrap_err();
+        let cancelled = index
+            .merge_sessions(&cx, policy(), budget(), 0xc400, 0)
+            .await
+            .unwrap_err();
         cx.set_cancel_requested(false);
-        assert!(matches!(cancelled.source.as_ref(), SessionMergeError::Cancelled));
+        assert!(matches!(
+            cancelled.source.as_ref(),
+            SessionMergeError::Cancelled
+        ));
         assert!(cancelled.progress.merges.is_empty());
         assert!(cancelled.attempted.is_none());
         assert_eq!(directory_bytes(directory.path()), before);
@@ -317,8 +440,14 @@ fn no_op_invalid_sequence_cancellation_and_collision_preserve_authority() {
             .await
             .unwrap_err();
         assert!(collision.progress.merges.is_empty());
-        assert_eq!(collision.attempted.unwrap().output_segment_id, initial.segments[0].segment_id);
+        assert_eq!(
+            collision.attempted.unwrap().output_segment_id,
+            initial.segments[0].segment_id
+        );
         assert_eq!(directory_bytes(directory.path()), before);
-        assert_eq!(load_manifest_pair(directory.path()).unwrap().manifest, initial);
+        assert_eq!(
+            load_manifest_pair(directory.path()).unwrap().manifest,
+            initial
+        );
     });
 }
