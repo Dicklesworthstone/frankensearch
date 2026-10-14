@@ -1,7 +1,10 @@
 //! Native ANN/lexical fusion with caller-owned execution and snapshot pins.
 
 use std::future::{Future, poll_fn};
+use std::sync::Arc;
 use std::task::Poll;
+
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::{BoundQueryEmbedding, FusedHit, LexicalCandidateBatch, LexicalRead};
@@ -52,6 +55,30 @@ impl NativeAnnIndex {
     ) -> SearchResult<Vec<ScoredResult>> {
         let (hits, batch) = self
             .search_hybrid_candidates(cx, embedder, lexical, text, k)
+            .await?;
+        hydrate_winners(cx, lexical, hits, &batch).await
+    }
+
+    /// Run fast vector traversal on the caller-owned blocking pool while
+    /// preserving the ordinary lexical snapshot, fusion and hydration path.
+    ///
+    /// Inference and lexical candidate collection are still cooperatively polled
+    /// on the caller runtime. Only retained vector traversal/rescoring moves to
+    /// the supplied pool; no files, models or generations are reopened.
+    ///
+    /// # Errors
+    /// Propagates the ordinary hybrid errors plus blocking-pool admission failure.
+    pub async fn search_hybrid_text_with_pool(
+        self: &Arc<Self>,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let (hits, batch) = self
+            .search_hybrid_candidates_with_pool(cx, embedder, lexical, text, k, pool)
             .await?;
         hydrate_winners(cx, lexical, hits, &batch).await
     }
@@ -116,6 +143,55 @@ impl NativeAnnIndex {
         Ok((hits, batch))
     }
 
+    /// Search lexical candidates and execute retained vector traversal on the
+    /// caller-owned blocking pool before applying the ordinary default RRF.
+    ///
+    /// The same bound query and lexical batch are retained through fusion. An
+    /// abandoned blocking traversal cannot publish a late page.
+    pub async fn search_hybrid_candidates_with_pool(
+        self: &Arc<Self>,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<(Vec<FusedHit>, LexicalCandidateBatch)> {
+        checkpoint(cx, "native_ann.hybrid_pool_start")?;
+        self.admit_identity(embedder.identity()?)?;
+        if k == 0 {
+            return Ok((Vec::new(), LexicalCandidateBatch::eager(Vec::new())));
+        }
+        let budget = candidate_count(k, 0, 3);
+        let lexical_text = lexical.query_text(text);
+        if self.live_count() == 0 {
+            let batch = lexical.search_candidates(cx, &lexical_text, budget).await?;
+            validate_lexical(cx, &batch)?;
+            let hits =
+                rrf_fuse_for_vector_lane(batch.results(), &[], k, 0, &RrfConfig::default(), false);
+            checkpoint(cx, "native_ann.hybrid_pool_complete")?;
+            return Ok((hits, batch));
+        }
+        let (query, batch) = join_sources(
+            cx,
+            self.embed_query(cx, embedder, text),
+            lexical.search_candidates(cx, &lexical_text, budget),
+        )
+        .await?;
+        let hits = self
+            .fuse_candidates_with_pool(
+                cx,
+                query,
+                &batch,
+                k,
+                None,
+                &RrfConfig::default(),
+                pool,
+            )
+            .await?;
+        Ok((hits, batch))
+    }
+
     /// Fuse a pinned lexical batch with retrieval from a bound native query.
     ///
     /// The vector budget is three times `k`; a caller needing another candidate
@@ -147,6 +223,36 @@ impl NativeAnnIndex {
         );
         let hits = rrf_fuse_for_vector_lane(batch.results(), &vectors, k, 0, config, is_hash);
         checkpoint(cx, "native_ann.hybrid_complete")?;
+        Ok(hits)
+    }
+    /// Fuse a pinned lexical batch with vector candidates produced on the
+    /// caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Returns identity, lexical, pool, traversal or cancellation errors.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fuse_candidates_with_pool(
+        self: &Arc<Self>,
+        cx: &Cx,
+        query: BoundQueryEmbedding,
+        batch: &LexicalCandidateBatch,
+        k: usize,
+        ef: Option<usize>,
+        config: &RrfConfig,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<FusedHit>> {
+        checkpoint(cx, "native_ann.hybrid_pool_fusion")?;
+        self.admit_identity(query.identity())?;
+        validate_lexical(cx, batch)?;
+        let is_hash = matches!(
+            query.identity().space.kind,
+            EmbeddingSpaceKindV1::HashControl
+        );
+        let vectors = self
+            .search_with_pool(cx, query, candidate_count(k, 0, 3), ef, pool)
+            .await?;
+        let hits = rrf_fuse_for_vector_lane(batch.results(), &vectors, k, 0, config, is_hash);
+        checkpoint(cx, "native_ann.hybrid_pool_complete")?;
         Ok(hits)
     }
 }
