@@ -16,6 +16,7 @@ fn generation(sequence: u64) -> ArtifactGenerationIdentityV1 {
     ArtifactGenerationIdentityV1::new(sequence, [91; 16]).unwrap()
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn request(windows: serde_json::Value) -> Request {
     serde_json::from_value(serde_json::json!({
         "op": "fetch", "id": "source-request", "expected_generation": generation(1),
@@ -111,7 +112,7 @@ fn utf8_windows_reconstruct_exact_source_without_gaps_or_normalization() {
         let text = document["content"].as_str().unwrap();
         assert!(text.len() <= 4);
         collected.push_str(text);
-        let end = document["end_offset_bytes"].as_u64().unwrap() as usize;
+        let end = usize::try_from(document["end_offset_bytes"].as_u64().unwrap()).unwrap();
         assert_eq!(end, offset + text.len());
         if document["next_offset_bytes"].is_null() {
             assert_eq!(end, source.content.len());

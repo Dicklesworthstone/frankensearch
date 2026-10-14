@@ -881,21 +881,21 @@ fn bounded_buffered_search_keeps_all_modes_and_scopes_on_the_same_results() {
                     .await
                     .unwrap();
                 let deadline = policy.start(&cx, None).unwrap();
-                let result = query::within(
+                let result = Box::pin(query::within(
                     &cx,
                     deadline.as_ref(),
                     search(&index, &cx, "retry", mode, 2, [None, scope]),
-                )
+                ))
                 .await
                 .unwrap();
                 assert_eq!(result, expected);
                 let before = (fast.load(Ordering::SeqCst), quality.load(Ordering::SeqCst));
                 clock.advance(10_000_000);
-                let error = query::within(
+                let error = Box::pin(query::within(
                     &cx,
                     deadline.as_ref(),
                     search(&index, &cx, "retry", mode, 2, [None, scope]),
-                )
+                ))
                 .await
                 .unwrap_err();
                 assert_eq!(query::failure(error.as_ref())["code"], "search_timeout");
