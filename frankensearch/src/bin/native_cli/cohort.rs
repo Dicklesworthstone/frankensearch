@@ -234,6 +234,21 @@ impl<'a> Prepared<'a> {
         }
     }
 
+    pub fn progressive_on_pool<'q>(
+        &'q self,
+        cx: &'q Cx,
+        text: &'q str,
+        limit: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<Progressive<'q>> {
+        match self {
+            Self::Single(query) => Ok(Progressive::Single(Box::new(
+                query.progressive_on_pool(cx, text, limit, pool)?,
+            ))),
+            Self::Sharded { .. } => self.progressive(cx, text, limit),
+        }
+    }
+
     pub fn progressive_with_reranker<'q>(
         &'q self,
         cx: &'q Cx,
@@ -252,6 +267,27 @@ impl<'a> Prepared<'a> {
                     |scope| scope.progressive_with_reranker(cx, text, limit, reranker, window),
                 )?;
                 Ok(Progressive::Sharded(Box::new(stream)))
+            }
+        }
+    }
+
+    pub fn progressive_with_reranker_on_pool<'q>(
+        &'q self,
+        cx: &'q Cx,
+        text: &'q str,
+        limit: usize,
+        reranker: &'q dyn Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> SearchResult<Progressive<'q>> {
+        match self {
+            Self::Single(query) => Ok(Progressive::Single(Box::new(
+                query.progressive_with_reranker_on_pool(
+                    cx, text, limit, reranker, window, pool,
+                )?,
+            ))),
+            Self::Sharded { .. } => {
+                self.progressive_with_reranker(cx, text, limit, reranker, window)
             }
         }
     }
