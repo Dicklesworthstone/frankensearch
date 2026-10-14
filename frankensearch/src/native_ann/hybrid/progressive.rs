@@ -382,6 +382,19 @@ impl<'a> NativeProgressiveSearch<'a> {
         Ok(self)
     }
 
+    fn owned_index(&self, index: &NativeAnnIndex) -> Option<Arc<NativeAnnIndex>> {
+        self.fast_owner
+            .as_ref()
+            .filter(|owner| std::ptr::eq(owner.as_ref(), index))
+            .cloned()
+            .or_else(|| {
+                self.quality_owner
+                    .as_ref()
+                    .filter(|owner| std::ptr::eq(owner.as_ref(), index))
+                    .cloned()
+            })
+    }
+
     async fn search_tier(
         &self,
         index: &NativeAnnIndex,
@@ -402,9 +415,16 @@ impl<'a> NativeProgressiveSearch<'a> {
                     .await
             }
             None => {
-                index
-                    .search_text(self.cx, embedder, self.text, self.budget, ef)
-                    .await
+                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
+                    let query = owner.embed_query(self.cx, embedder, self.text).await?;
+                    owner
+                        .search_with_pool(self.cx, query, self.budget, ef, pool)
+                        .await
+                } else {
+                    index
+                        .search_text(self.cx, embedder, self.text, self.budget, ef)
+                        .await
+                }
             }
         }
     }
