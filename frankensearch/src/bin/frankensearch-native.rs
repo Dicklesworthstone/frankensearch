@@ -797,6 +797,7 @@ async fn execute(
             let mut policy = query::Policy::new(cx, options.timeout_ms)?;
             policy.rerank = rerank;
             policy.full_query = options.full_query;
+            policy.query_pool = pool.clone();
             if options.command == Command::Serve {
                 let live = live::Serving::new(cx, index)?;
                 let controls = serve::Controls {
