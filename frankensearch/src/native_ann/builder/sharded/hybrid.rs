@@ -490,6 +490,33 @@ impl NativeBuiltShardedHybridIndex {
         )
     }
 
+    /// Prepare progressive sharded retrieval with retained inventory traversal
+    /// on the caller-owned blocking pool.
+    pub fn progressive_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        let first = &self.vectors.partitions[0];
+        let quality = self
+            .vectors
+            .quality
+            .as_ref()
+            .zip(first.quality.as_ref())
+            .map(|(shards, tier)| (shards, tier.embedder()));
+        self.vectors.fast.search_hybrid_progressive_with_pool(
+            cx,
+            first.fast.embedder(),
+            quality,
+            &self.lexical,
+            text,
+            k,
+            pool,
+        )
+    }
+
     /// Add lazy cross-encoder ordering of source text from this exact cohort.
     /// The window can exceed displayed k. Source and per-tier shard rows remain
     /// tied to this handle throughout every phase, including scorer failure.
@@ -505,6 +532,20 @@ impl NativeBuiltShardedHybridIndex {
         window: usize,
     ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
         self.progressive(cx, text, k)?
+            .with_reranker(reranker, self.text.as_ref(), window)
+    }
+
+    /// Pool-aware progressive sharded retrieval plus retained-source reranking.
+    pub fn progressive_with_reranker_on_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        self.progressive_with_pool(cx, text, k, pool)?
             .with_reranker(reranker, self.text.as_ref(), window)
     }
 
