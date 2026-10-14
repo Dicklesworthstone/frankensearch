@@ -31,25 +31,42 @@ use crate::{KeeperSnapshot, ManifestSegment, QuillIndex, QuillIndexError};
 /// files or authorize publication. The manifest-only bound is conservative;
 /// [`QuillIndex::merge_sessions_bounded_once`] uses the snapshot's section and
 /// term metadata to enforce the actual schema and default reader budgets.
+/// The schema-free estimate can decrease when a later source tightens its
+/// field-count bound, so every longer prefix is checked before selecting one.
 ///
 /// # Errors
 ///
 /// Returns a typed error for invalid policy, malformed manifest ranges/counts,
-/// cancellation, or allocation failure. `Ok(None)` means no eligible pair fits.
+/// cancellation, or allocation failure. `Ok(None)` means no eligible run fits.
 pub fn plan_bounded_session_merge(
     cx: &Cx,
     segments: &[ManifestSegment],
     policy: SessionMergePolicy,
 ) -> Result<Option<SessionMergePlan>, SessionMergeError> {
-    plan_bounded_session_merge_with_fit(cx, segments, policy, |range| {
-        manifest_concat_fits(&segments[range])
-    })
+    plan_bounded_session_merge_with_fit(
+        cx,
+        segments,
+        policy,
+        PrefixFitOrder::Arbitrary,
+        |range| manifest_concat_fits(&segments[range]),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PrefixFitOrder {
+    // Manifest-only field-count bounds take minima across the sources. Adding
+    // a wide, compact source can make a formerly rejected hull fit again.
+    Arbitrary,
+    // Native sizing fixes the schema and uses increasing hulls/prefix sums.
+    // Once a prefix fails those bounds, extending it cannot make it fit.
+    Monotone,
 }
 
 fn plan_bounded_session_merge_with_fit(
     cx: &Cx,
     segments: &[ManifestSegment],
     policy: SessionMergePolicy,
+    fit_order: PrefixFitOrder,
     mut fits: impl FnMut(Range<usize>) -> bool,
 ) -> Result<Option<SessionMergePlan>, SessionMergeError> {
     validate_session_merge(cx, segments, policy)?;
@@ -84,7 +101,7 @@ fn plan_bounded_session_merge_with_fit(
         if count < 2 {
             continue;
         }
-        let Some(count) = longest_fitting_prefix(cx, start, count, &mut fits)? else {
+        let Some(count) = longest_fitting_prefix(cx, start, count, fit_order, &mut fits)? else {
             continue;
         };
         let (docs, bytes) = totals[count];
@@ -115,14 +132,16 @@ fn plan_bounded_session_merge_with_fit(
     }))
 }
 
-// Both production fit predicates are monotone for a fixed starting entry:
-// extending a run cannot reduce its projected layout or reader-budget bounds.
-// Check the full candidate first; an oversized candidate needs at most six
-// further probes at the maximum fanout of 64. Never probe or select a singleton.
+// Check the full candidate first. Only native, fixed-schema sizing is monotone
+// and permits binary search (at most seven probes at fanout 64). Schema-free
+// manifest estimates can alternate between fit/refusal as field bounds tighten;
+// scan their prefixes longest-first (at most 63 probes). Neither path probes or
+// selects a singleton, and every fit callback is followed by a cancel check.
 fn longest_fitting_prefix(
     cx: &Cx,
     start: usize,
     count: usize,
+    fit_order: PrefixFitOrder,
     fits: &mut impl FnMut(Range<usize>) -> bool,
 ) -> Result<Option<usize>, SessionMergeError> {
     debug_assert!((2..=MAX_SESSION_MERGE_FANOUT).contains(&count));
@@ -130,6 +149,18 @@ fn longest_fitting_prefix(
     if fits(start..start + count) {
         checkpoint(cx)?;
         return Ok(Some(count));
+    }
+    if matches!(fit_order, PrefixFitOrder::Arbitrary) {
+        for end in (2..count).rev() {
+            checkpoint(cx)?;
+            let accepted = fits(start..start + end);
+            checkpoint(cx)?;
+            if accepted {
+                return Ok(Some(end));
+            }
+        }
+        checkpoint(cx)?;
+        return Ok(None);
     }
     let mut accepted = 1;
     let mut rejected = count;
@@ -186,6 +217,7 @@ impl QuillIndex {
             cx,
             &snapshot.loaded_manifest().manifest.segments,
             policy,
+            PrefixFitOrder::Monotone,
             |range| sizing.check(range).is_ok(),
         )?;
         drop(snapshot);
@@ -225,6 +257,165 @@ mod tests {
             docid_hi: lo + u64::from(docs).max(1),
             doc_count: docs,
             tombstones: TombstoneSet::new(),
+        }
+    }
+
+    // Sizing-only manifests: large declared files/spans do not allocate their
+    // bytes. A wide source tightens the shared schema-field upper bound.
+    fn layout_segment(id: u64, lo: u64, span: u64, bytes: u64) -> ManifestSegment {
+        let mut source = segment(id, 1, bytes);
+        source.docid_lo = lo;
+        source.docid_hi = lo + span;
+        source
+    }
+
+    #[test]
+    fn manifest_bound_recovery_keeps_the_earliest_maximal_run() {
+        run_test_with_cx(|cx| async move {
+            let gap = 1_u64 << 20;
+            let small = 16 * 1024;
+            let sources = [
+                layout_segment(1, 0, 1, small),
+                layout_segment(2, gap, 1, small),
+                layout_segment(3, gap + 1, 1, small),
+                layout_segment(4, gap + 2, 1, small),
+                layout_segment(5, gap + 3, gap, 40 * 1024 * 1024),
+                layout_segment(6, 2 * gap + 3, 1, small),
+                layout_segment(7, 2 * gap + 4, 1, small),
+                layout_segment(8, 1 << 27, 1, small),
+            ];
+            // This is the real production manifest bound, not a mocked fit
+            // callback. Binary search probes 8, 4, 2 and misses prefixes 5..7.
+            assert_eq!(
+                (2..=sources.len())
+                    .map(|end| manifest_concat_fits(&sources[..end]))
+                    .collect::<Vec<_>>(),
+                [false, false, false, true, true, true, false],
+            );
+            let plan = plan_bounded_session_merge(&cx, &sources, SessionMergePolicy::default())
+                .unwrap()
+                .expect("a recovered prefix at the earliest start must not be skipped");
+            assert_eq!(plan.source_segment_ids, [1, 2, 3, 4, 5, 6, 7]);
+            assert_eq!(plan.tier, 0);
+            assert_eq!(plan.input_docs, 7);
+            assert_eq!(plan.input_bytes, 40 * 1024 * 1024 + 6 * small);
+            assert_eq!((plan.docid_lo, plan.docid_hi), (0, 2 * gap + 5));
+        });
+    }
+
+    #[test]
+    fn manifest_bound_recovery_does_not_truncate_at_an_earlier_fit() {
+        run_test_with_cx(|cx| async move {
+            let gap = 1_u64 << 20;
+            let small = 16 * 1024;
+            let sources = [
+                layout_segment(1, 0, 1, small),
+                layout_segment(2, 1, 1, small),
+                layout_segment(3, gap, 1, small),
+                layout_segment(4, gap + 1, gap, 40 * 1024 * 1024),
+                layout_segment(5, 1 << 27, 1, small),
+            ];
+            assert_eq!(
+                (2..=sources.len())
+                    .map(|end| manifest_concat_fits(&sources[..end]))
+                    .collect::<Vec<_>>(),
+                [true, false, true, false],
+            );
+            let plan = plan_bounded_session_merge(&cx, &sources, SessionMergePolicy::default())
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.source_segment_ids, [1, 2, 3, 4]);
+            assert_eq!(plan.input_docs, 4);
+            assert_eq!(plan.input_bytes, 40 * 1024 * 1024 + 3 * small);
+            assert_eq!((plan.docid_lo, plan.docid_hi), (0, 2 * gap + 1));
+        });
+    }
+
+    #[test]
+    fn arbitrary_prefix_search_matches_every_small_acceptance_mask() {
+        run_test_with_cx(|cx| async move {
+            for count in 2..=12 {
+                for mask in 0..(1_u64 << (count - 1)) {
+                    let expected = (2..=count)
+                        .filter(|&end| mask & (1_u64 << (end - 2)) != 0)
+                        .max();
+                    let mut probes = Vec::new();
+                    let got = longest_fitting_prefix(
+                        &cx,
+                        17,
+                        count,
+                        PrefixFitOrder::Arbitrary,
+                        &mut |range| {
+                            assert_eq!(range.start, 17);
+                            assert!((2..=count).contains(&range.len()));
+                            probes.push(range.len());
+                            mask & (1_u64 << (range.len() - 2)) != 0
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(got, expected, "count={count}, mask={mask:#x}");
+                    assert_eq!(
+                        probes.len(),
+                        expected.map_or(count - 1, |end| count - end + 1)
+                    );
+                    assert!(probes.windows(2).all(|pair| pair[0] > pair[1]));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn arbitrary_prefix_search_covers_every_fanout_without_probing_singletons() {
+        run_test_with_cx(|cx| async move {
+            for count in 2..=MAX_SESSION_MERGE_FANOUT {
+                for only_fit in 1..=count {
+                    let mut probes = 0;
+                    let got = longest_fitting_prefix(
+                        &cx,
+                        17,
+                        count,
+                        PrefixFitOrder::Arbitrary,
+                        &mut |range| {
+                            assert_eq!(range.start, 17);
+                            assert!((2..=count).contains(&range.len()));
+                            probes += 1;
+                            range.len() == only_fit
+                        },
+                    )
+                    .unwrap();
+                    assert_eq!(got, (only_fit >= 2).then_some(only_fit));
+                    assert!(probes < count);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn arbitrary_prefix_cancellation_stops_after_any_accepted_or_rejected_probe() {
+        for count in [2, 8, MAX_SESSION_MERGE_FANOUT] {
+            for cancel_on in 1..count {
+                for accepted in [false, true] {
+                    run_test_with_cx(move |cx| async move {
+                        let mut probes = 0;
+                        let result = longest_fitting_prefix(
+                            &cx,
+                            17,
+                            count,
+                            PrefixFitOrder::Arbitrary,
+                            &mut |_| {
+                                probes += 1;
+                                if probes == cancel_on {
+                                    cx.cancel_fast(asupersync::CancelKind::User);
+                                    return accepted;
+                                }
+                                false
+                            },
+                        );
+                        assert!(matches!(result, Err(SessionMergeError::Cancelled)));
+                        assert_eq!(probes, cancel_on);
+                    });
+                }
+            }
         }
     }
 
@@ -285,6 +476,7 @@ mod tests {
                 &cx,
                 &sources,
                 SessionMergePolicy::default(),
+                PrefixFitOrder::Monotone,
                 |range| range.len() <= 3,
             )
             .unwrap()
@@ -393,9 +585,15 @@ mod tests {
                 max_input_bytes: u64::MAX,
                 ..SessionMergePolicy::default()
             };
-            let plan = plan_bounded_session_merge_with_fit(&cx, &sources, policy, |_| true)
-                .unwrap()
-                .unwrap();
+            let plan = plan_bounded_session_merge_with_fit(
+                &cx,
+                &sources,
+                policy,
+                PrefixFitOrder::Monotone,
+                |_| true,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(plan.source_segment_ids, [1, 2]);
             assert_eq!(plan.input_bytes, 2);
         });
@@ -459,12 +657,18 @@ mod tests {
             for count in 2..=MAX_SESSION_MERGE_FANOUT {
                 for limit in 0..=count {
                     let mut probes = 0;
-                    let got = longest_fitting_prefix(&cx, 17, count, &mut |range| {
-                        probes += 1;
-                        assert_eq!(range.start, 17);
-                        assert!((2..=count).contains(&range.len()));
-                        range.len() <= limit
-                    })
+                    let got = longest_fitting_prefix(
+                        &cx,
+                        17,
+                        count,
+                        PrefixFitOrder::Monotone,
+                        &mut |range| {
+                            probes += 1;
+                            assert_eq!(range.start, 17);
+                            assert!((2..=count).contains(&range.len()));
+                            range.len() <= limit
+                        },
+                    )
                     .unwrap();
                     assert_eq!(got, (limit >= 2).then_some(limit));
                     assert!(probes <= 7);
@@ -493,6 +697,7 @@ mod tests {
                     &cx,
                     &sources,
                     SessionMergePolicy::default(),
+                    PrefixFitOrder::Monotone,
                     |_| {
                         cx.cancel_fast(asupersync::CancelKind::User);
                         true
@@ -512,6 +717,7 @@ mod tests {
                     &cx,
                     &sources,
                     SessionMergePolicy::default(),
+                    PrefixFitOrder::Monotone,
                     |_| {
                         cx.cancel_fast(asupersync::CancelKind::User);
                         false
@@ -530,6 +736,7 @@ mod tests {
                 &cx,
                 &sources,
                 SessionMergePolicy::default(),
+                PrefixFitOrder::Monotone,
                 |range| !range.contains(&1),
             )
             .unwrap()
@@ -547,6 +754,7 @@ mod tests {
                 &cx,
                 &sources,
                 SessionMergePolicy::default(),
+                PrefixFitOrder::Monotone,
                 |_| {
                     probes += 1;
                     if probes == 2 {
