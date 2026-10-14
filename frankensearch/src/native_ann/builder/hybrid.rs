@@ -341,6 +341,29 @@ impl NativeBuiltHybridIndex {
         )
     }
 
+    /// Prepare progressive native retrieval with retained vector traversal on
+    /// the caller-owned blocking pool.
+    pub fn progressive_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let fast = self.vectors.fast();
+        fast.index.search_hybrid_progressive_with_pool(
+            cx,
+            fast.embedder(),
+            self.vectors
+                .quality()
+                .map(|quality| (&quality.index, quality.embedder())),
+            &self.lexical,
+            text,
+            k,
+            pool,
+        )
+    }
+
     /// Prepare lazy native retrieval and cross-encoder reranking using the EXACT
     /// source content from this build. The caller supplies only the reranker,
     /// never a "latest text" resolver that could silently change document versions.
@@ -358,6 +381,20 @@ impl NativeBuiltHybridIndex {
         window: usize,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         self.progressive(cx, text, k)?
+            .with_reranker(reranker, self.text.as_ref(), window)
+    }
+
+    /// Pool-aware variant of progressive retrieval plus retained-source reranking.
+    pub fn progressive_with_reranker_on_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.progressive_with_pool(cx, text, k, pool)?
             .with_reranker(reranker, self.text.as_ref(), window)
     }
 }
