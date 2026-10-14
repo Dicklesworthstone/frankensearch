@@ -29,12 +29,19 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA: &str = "frankensearch-index.hnsw-patch-ab.v4";
+const SCHEMA: &str = "frankensearch-index.hnsw-patch-ab.v5";
 const CHILD_SENTINEL: &str = "HNSW_PATCH_AB_CHILD_JSON=";
 const CANDIDATE_REV: &str = "18a5a1a9982138822c34d4c3fb29f4c883715069";
 const CANDIDATE_REVERSE_EDGE_REV: &str = "461bedfb992f3461a25f6d6daed1e70c2de05f6a";
 const CANDIDATE_LOGICAL_LAYER_REV: &str = "18a5a1a9982138822c34d4c3fb29f4c883715069";
+const CANDIDATE_PACKAGE: &str = "frankenhnsw";
+const CANDIDATE_VERSION: &str = "0.3.5";
+const CANDIDATE_CHECKSUM: &str =
+    "69c225b9e728f788474e9d63c6d494aac83f8a7ba5795a0a6f91d4ef68445a32";
+const BASELINE_PACKAGE: &str = "hnsw_rs";
 const BASELINE_VERSION: &str = "0.3.4";
+const BASELINE_CHECKSUM: &str =
+    "43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07";
 const WORKSPACE_SOURCE_RECEIPT_SCHEMA: &str = "frankensearch.hnsw-workspace-source-receipt.v1";
 const WORKSPACE_SOURCE_FIXED_INPUTS: &[&str] = &[
     "Cargo.lock",
@@ -1233,10 +1240,8 @@ struct Provenance {
     candidate_logical_layer_revision: String,
     candidate_cumulative_revision: String,
     candidate_revision_note: String,
-    candidate_checkout_head: String,
-    candidate_reverse_edge_is_ancestor: bool,
-    candidate_logical_layer_is_ancestor: bool,
-    candidate_checkout_tracked_clean: bool,
+    candidate_registry_checksum: String,
+    baseline_registry_checksum: String,
     candidate_source_sha256: String,
     baseline_source_sha256: String,
     build: BuildAttestation,
@@ -4026,9 +4031,8 @@ fn validate_report(
             &provenance.cargo_lock_sha256,
         )
         || provenance.resolved_hnsw_packages.len() != 2
-        || !provenance.candidate_reverse_edge_is_ancestor
-        || !provenance.candidate_logical_layer_is_ancestor
-        || !provenance.candidate_checkout_tracked_clean
+        || provenance.candidate_registry_checksum != CANDIDATE_CHECKSUM
+        || provenance.baseline_registry_checksum != BASELINE_CHECKSUM
         || provenance.candidate_source_sha256 != provenance.build.candidate_source_sha256
         || provenance.baseline_source_sha256 != provenance.build.baseline_source_sha256
         || provenance.runtime_rustc_vv_sha256 != provenance.build.rustc_vv_sha256
@@ -4464,12 +4468,12 @@ fn provenance(
     let resolved_hnsw_packages = resolved_hnsw_packages(&cargo_lock)?;
     let candidate_package = resolved_hnsw_packages
         .iter()
-        .find(|package| package.contains(CANDIDATE_REV))
+        .find(|package| package.starts_with(&format!("{CANDIDATE_PACKAGE} {CANDIDATE_VERSION} ")))
         .cloned()
-        .ok_or("Cargo.lock does not attest the compiled candidate revision")?;
+        .ok_or("Cargo.lock does not attest the published candidate")?;
     let baseline_package = resolved_hnsw_packages
         .iter()
-        .find(|package| package.contains("registry+"))
+        .find(|package| package.starts_with(&format!("{BASELINE_PACKAGE} {BASELINE_VERSION} ")))
         .cloned()
         .ok_or("Cargo.lock does not attest the published baseline")?;
     let workspace_git = workspace_git_provenance(&workspace)?;
@@ -4518,18 +4522,15 @@ fn provenance(
         candidate_logical_layer_revision: CANDIDATE_LOGICAL_LAYER_REV.to_owned(),
         candidate_cumulative_revision: CANDIDATE_REV.to_owned(),
         candidate_revision_note:
-            "cumulative candidate through 18a5a1a includes both production topology repairs: \
-             461bedf corrects reverse-edge layer placement and 18a5a1a searches logical layers \
-             through all participating higher-level points. It also includes the entry-point \
-             inspection API, regression tests, and a packaging-only default-FFI opt-out needed \
-             to link baseline and candidate into one evidence executable. This runner decides \
-             the cumulative candidate; it cannot isolate either repair's causal performance \
-             contribution."
+            "The compiled candidate is published frankenhnsw 0.3.5. Revision IDs record its \
+             historical source lineage (461bedf reverse-edge repair; 18a5a1a logical-layer \
+             repair) but are not re-proven from a local Git checkout. Decision-grade identity \
+             uses the pinned Cargo.lock registry checksum and build/runtime equality of the \
+             complete hashed package source tree. This runner evaluates the cumulative published \
+             candidate and cannot isolate either repair's causal performance contribution."
                 .to_owned(),
-        candidate_checkout_head: dependency_sources.candidate_checkout_head,
-        candidate_reverse_edge_is_ancestor: dependency_sources.candidate_reverse_edge_is_ancestor,
-        candidate_logical_layer_is_ancestor: dependency_sources.candidate_logical_layer_is_ancestor,
-        candidate_checkout_tracked_clean: dependency_sources.candidate_checkout_tracked_clean,
+        candidate_registry_checksum: CANDIDATE_CHECKSUM.to_owned(),
+        baseline_registry_checksum: BASELINE_CHECKSUM.to_owned(),
         candidate_source_sha256: dependency_sources.candidate_source_sha256,
         baseline_source_sha256: dependency_sources.baseline_source_sha256,
         build,
@@ -4541,10 +4542,6 @@ fn provenance(
 }
 
 struct DependencySourceAttestation {
-    candidate_checkout_head: String,
-    candidate_reverse_edge_is_ancestor: bool,
-    candidate_logical_layer_is_ancestor: bool,
-    candidate_checkout_tracked_clean: bool,
     candidate_source_sha256: String,
     baseline_source_sha256: String,
 }
@@ -4749,90 +4746,32 @@ fn untracked_file_sha256(workspace: &Path) -> Result<BTreeMap<String, String>, D
 }
 
 fn attest_dependency_sources(_workspace: &Path) -> Result<DependencySourceAttestation, DynError> {
-    // Do not invoke `cargo metadata --offline` here. Cargo can require source
-    // archives for unrelated optional workspace dependencies even after this
-    // binary was built, which made an otherwise complete remote smoke run die
-    // during provenance collection. The build script already located and
-    // hashed the two exact sources; find those same cache roots directly and
-    // compare their runtime hashes to the embedded build attestations.
-    let (checkout, baseline) = locate_hnsw_dependency_sources()?;
-    let head = command_text_in("git", &["rev-parse", "HEAD"], &checkout, false)?;
-    if head != CANDIDATE_REV {
-        return Err(format!(
-            "candidate checkout HEAD {head} does not match pinned {CANDIDATE_REV}"
-        )
-        .into());
-    }
-    let reverse_edge_ancestry = command_status_in(
-        "git",
-        &[
-            "merge-base",
-            "--is-ancestor",
-            CANDIDATE_REVERSE_EDGE_REV,
-            CANDIDATE_REV,
-        ],
-        &checkout,
-    )?;
-    let logical_layer_ancestry = command_status_in(
-        "git",
-        &[
-            "merge-base",
-            "--is-ancestor",
-            CANDIDATE_LOGICAL_LAYER_REV,
-            CANDIDATE_REV,
-        ],
-        &checkout,
-    )?;
-    let tracked_clean = [
-        ["diff", "--quiet", "HEAD", "--"].as_slice(),
-        ["diff", "--cached", "--quiet", "HEAD", "--"].as_slice(),
-    ]
-    .iter()
-    .all(|args| command_status_in("git", args, &checkout).is_ok_and(|status| status.success()));
+    let (candidate, baseline) = locate_hnsw_dependency_sources()?;
     Ok(DependencySourceAttestation {
-        candidate_checkout_head: head,
-        candidate_reverse_edge_is_ancestor: reverse_edge_ancestry.success(),
-        candidate_logical_layer_is_ancestor: logical_layer_ancestry.success(),
-        candidate_checkout_tracked_clean: tracked_clean,
-        candidate_source_sha256: hash_dependency_source_tree(&checkout)?,
+        candidate_source_sha256: hash_dependency_source_tree(&candidate)?,
         baseline_source_sha256: hash_dependency_source_tree(&baseline)?,
     })
 }
 
 fn locate_hnsw_dependency_sources() -> Result<(PathBuf, PathBuf), DynError> {
     let cargo_home = std::env::var_os("CARGO_HOME").map_or_else(
-        || {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".cargo"))
-                .ok_or_else(|| -> DynError { "neither CARGO_HOME nor HOME is available".into() })
-        },
+        || std::env::var_os("HOME").map(PathBuf::from).map(|home| home.join(".cargo"))
+            .ok_or_else(|| -> DynError { "neither CARGO_HOME nor HOME is available".into() }),
         |path| Ok(PathBuf::from(path)),
     )?;
-    let mut candidate_matches = Vec::new();
-    for repository in read_directory_paths(&cargo_home.join("git/checkouts"))? {
-        if !repository.is_dir() {
-            continue;
-        }
-        for checkout in read_directory_paths(&repository)? {
-            if checkout.join("Cargo.toml").is_file()
-                && command_text_in("git", &["rev-parse", "HEAD"], &checkout, false)
-                    .is_ok_and(|head| head == CANDIDATE_REV)
-            {
-                candidate_matches.push(checkout);
-            }
-        }
-    }
-    let mut baseline_matches = Vec::new();
-    for registry in read_directory_paths(&cargo_home.join("registry/src"))? {
-        let baseline = registry.join(format!("hnsw_rs-{BASELINE_VERSION}"));
-        if baseline.join("Cargo.toml").is_file() {
-            baseline_matches.push(baseline);
-        }
+    let registry_src = cargo_home.join("registry/src");
+    let mut candidates = Vec::new();
+    let mut baselines = Vec::new();
+    for registry in read_directory_paths(&registry_src)? {
+        if !registry.is_dir() { continue; }
+        let candidate = registry.join(format!("{CANDIDATE_PACKAGE}-{CANDIDATE_VERSION}"));
+        if candidate.join("Cargo.toml").is_file() { candidates.push(candidate); }
+        let baseline = registry.join(format!("{BASELINE_PACKAGE}-{BASELINE_VERSION}"));
+        if baseline.join("Cargo.toml").is_file() { baselines.push(baseline); }
     }
     Ok((
-        require_unique_path(candidate_matches, "candidate hnsw_rs source")?,
-        require_unique_path(baseline_matches, "published hnsw_rs 0.3.4 source")?,
+        require_unique_path(candidates, "published frankenhnsw 0.3.5 candidate source")?,
+        require_unique_path(baselines, "published hnsw_rs 0.3.4 baseline source")?,
     ))
 }
 
@@ -4872,33 +4811,22 @@ fn compiled_target_features() -> Vec<String> {
 fn resolved_hnsw_packages(cargo_lock: &str) -> Result<Vec<String>, DynError> {
     let mut packages = Vec::new();
     for block in cargo_lock.split("[[package]]") {
-        let name = lock_value(block, "name");
-        let version = lock_value(block, "version");
-        if name.as_deref() != Some("hnsw_rs") || version.as_deref() != Some(BASELINE_VERSION) {
-            continue;
+        let Some(name) = lock_value(block, "name") else { continue; };
+        let Some(version) = lock_value(block, "version") else { continue; };
+        let expected = if name == CANDIDATE_PACKAGE && version == CANDIDATE_VERSION {
+            CANDIDATE_CHECKSUM
+        } else if name == BASELINE_PACKAGE && version == BASELINE_VERSION {
+            BASELINE_CHECKSUM
+        } else { continue; };
+        let source = lock_value(block, "source").ok_or_else(|| format!("{name} {version} lock entry lacks source"))?;
+        let checksum = lock_value(block, "checksum").ok_or_else(|| format!("{name} {version} lock entry lacks checksum"))?;
+        if !source.starts_with("registry+") || checksum != expected {
+            return Err(format!("unexpected {name} {version} source identity: source={source:?}, checksum={checksum:?}").into());
         }
-        let source = lock_value(block, "source").ok_or("hnsw_rs lock entry lacks source")?;
-        let checksum = lock_value(block, "checksum");
-        packages.push(checksum.map_or_else(
-            || format!("hnsw_rs {BASELINE_VERSION} {source}"),
-            |checksum| format!("hnsw_rs {BASELINE_VERSION} {source} checksum={checksum}"),
-        ));
+        packages.push(format!("{name} {version} {source} checksum={checksum}"));
     }
     packages.sort();
-    let candidate_source = format!("#{CANDIDATE_REV}");
-    if packages.len() != 2
-        || !packages.iter().any(|package| {
-            package.contains("registry+")
-                && package.contains(
-                    "checksum=43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07",
-                )
-        })
-        || !packages
-            .iter()
-            .any(|package| package.contains("git+") && package.contains(&candidate_source))
-    {
-        return Err(format!("unexpected hnsw_rs dependency attestation: {packages:?}").into());
-    }
+    if packages.len() != 2 { return Err(format!("unexpected HNSW dependency attestation: {packages:?}").into()); }
     Ok(packages)
 }
 
@@ -6015,6 +5943,67 @@ mod tests {
             cargo_lock_sha256: inputs[0].sha256.clone(),
             inputs,
         }
+    }
+
+    #[test]
+    fn hnsw_lock_attestation_accepts_only_the_pinned_registry_pair() {
+        let lock = format!(
+            r#"
+[[package]]
+name = "{CANDIDATE_PACKAGE}"
+version = "{CANDIDATE_VERSION}"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{CANDIDATE_CHECKSUM}"
+
+[[package]]
+name = "{BASELINE_PACKAGE}"
+version = "{BASELINE_VERSION}"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{BASELINE_CHECKSUM}"
+"#
+        );
+        let packages = resolved_hnsw_packages(&lock).unwrap();
+        assert_eq!(packages.len(), 2);
+        assert!(packages.iter().any(|package| package.starts_with("frankenhnsw 0.3.5 ")));
+        assert!(packages.iter().any(|package| package.starts_with("hnsw_rs 0.3.4 ")));
+    }
+
+    #[test]
+    fn hnsw_lock_attestation_rejects_wrong_checksum_or_git_candidate() {
+        let wrong_checksum = format!(
+            r#"
+[[package]]
+name = "{CANDIDATE_PACKAGE}"
+version = "{CANDIDATE_VERSION}"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{}"
+
+[[package]]
+name = "{BASELINE_PACKAGE}"
+version = "{BASELINE_VERSION}"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{BASELINE_CHECKSUM}"
+"#,
+            "0".repeat(64)
+        );
+        assert!(resolved_hnsw_packages(&wrong_checksum).is_err());
+
+        let git_candidate = format!(
+            r#"
+[[package]]
+name = "{CANDIDATE_PACKAGE}"
+version = "{CANDIDATE_VERSION}"
+source = "git+https://example.invalid/frankenhnsw#{CANDIDATE_REV}"
+checksum = "{CANDIDATE_CHECKSUM}"
+
+[[package]]
+name = "{BASELINE_PACKAGE}"
+version = "{BASELINE_VERSION}"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "{BASELINE_CHECKSUM}"
+"#
+        );
+        assert!(resolved_hnsw_packages(&git_candidate).is_err());
     }
 
     #[test]
