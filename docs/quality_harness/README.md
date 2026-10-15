@@ -41,7 +41,7 @@ directories (do not overwrite existing datasets):
 
 ```bash
 for ds in scifact nfcorpus arguana scidocs; do
-  curl -fSL -A 'OpenAI File Downloader, XaiImageApiFetch/1.0' \
+  curl -fSL -A 'frankensearch-quality-harness (+https://github.com/Dicklesworthstone/frankensearch)' \
     "https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/$ds.zip" -o "$ds.zip"
   unzip -n "$ds.zip"
 done

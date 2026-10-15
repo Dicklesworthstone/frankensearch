@@ -22,7 +22,7 @@ FAST_CMAES=""
 CACHE="/data/tmp/fsfs-gnu-release"
 MAX_GLIBC="2.39"
 BASE_IMAGE="ubuntu:24.04"
-UA="OpenAI File Downloader, XaiImageApiFetch/1.0"
+UA="frankensearch-release (+https://github.com/Dicklesworthstone/frankensearch)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
