@@ -9989,7 +9989,7 @@ mod tests {
             far_timer.abort();
             let _ = far_timer.join(&cx).await;
             assert_eq!(pipeline.calls.load(Ordering::Acquire), 1);
-            assert_eq!(stats.reindexed_files.load(Ordering::Acquire), 1);
+            assert_eq!(stats.files_reindexed.load(Ordering::Acquire), 1);
             elapsed
         }));
 
