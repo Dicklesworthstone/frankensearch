@@ -9989,7 +9989,10 @@ mod tests {
             far_timer.abort();
             let _ = far_timer.join(&cx).await;
             assert_eq!(pipeline.calls.load(Ordering::Acquire), 1);
-            assert_eq!(stats.reindexed_files.load(Ordering::Acquire), 1);
+            // The pipeline requests stop inside apply_batch, and a stop after the
+            // sink mutation turns the batch into reconciliation debt instead of
+            // committed bookkeeping (719930d9), so nothing is counted here.
+            assert_eq!(stats.files_reindexed.load(Ordering::Acquire), 0);
             elapsed
         }));
 
