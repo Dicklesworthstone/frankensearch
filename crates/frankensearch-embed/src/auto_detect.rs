@@ -3938,9 +3938,7 @@ mod remote_intent_tests {
         use super::{Arc, Embedder, EmbedderStack};
         use crate::HashEmbedder;
         use crate::batch_coalescer::{CoalescerConfig, CoalescerLimits};
-        use crate::{Embedder, EmbedderStack, HashEmbedder};
         use asupersync::test_utils::run_test_with_cx;
-        use std::sync::Arc;
         use std::task::{Context, Poll, Waker};
 
         run_test_with_cx(|cx| async move {
