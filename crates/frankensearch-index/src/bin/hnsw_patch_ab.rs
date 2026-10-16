@@ -36,12 +36,10 @@ const CANDIDATE_REVERSE_EDGE_REV: &str = "461bedfb992f3461a25f6d6daed1e70c2de05f
 const CANDIDATE_LOGICAL_LAYER_REV: &str = "18a5a1a9982138822c34d4c3fb29f4c883715069";
 const CANDIDATE_PACKAGE: &str = "frankenhnsw";
 const CANDIDATE_VERSION: &str = "0.3.5";
-const CANDIDATE_CHECKSUM: &str =
-    "69c225b9e728f788474e9d63c6d494aac83f8a7ba5795a0a6f91d4ef68445a32";
+const CANDIDATE_CHECKSUM: &str = "69c225b9e728f788474e9d63c6d494aac83f8a7ba5795a0a6f91d4ef68445a32";
 const BASELINE_PACKAGE: &str = "hnsw_rs";
 const BASELINE_VERSION: &str = "0.3.4";
-const BASELINE_CHECKSUM: &str =
-    "43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07";
+const BASELINE_CHECKSUM: &str = "43a5258f079b97bf2e8311ff9579e903c899dcbac0d9a138d62e9a066778bd07";
 const WORKSPACE_SOURCE_RECEIPT_SCHEMA: &str = "frankensearch.hnsw-workspace-source-receipt.v1";
 const WORKSPACE_SOURCE_FIXED_INPUTS: &[&str] = &[
     "Cargo.lock",
@@ -4755,19 +4753,29 @@ fn attest_dependency_sources(_workspace: &Path) -> Result<DependencySourceAttest
 
 fn locate_hnsw_dependency_sources() -> Result<(PathBuf, PathBuf), DynError> {
     let cargo_home = std::env::var_os("CARGO_HOME").map_or_else(
-        || std::env::var_os("HOME").map(PathBuf::from).map(|home| home.join(".cargo"))
-            .ok_or_else(|| -> DynError { "neither CARGO_HOME nor HOME is available".into() }),
+        || {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cargo"))
+                .ok_or_else(|| -> DynError { "neither CARGO_HOME nor HOME is available".into() })
+        },
         |path| Ok(PathBuf::from(path)),
     )?;
     let registry_src = cargo_home.join("registry/src");
     let mut candidates = Vec::new();
     let mut baselines = Vec::new();
     for registry in read_directory_paths(&registry_src)? {
-        if !registry.is_dir() { continue; }
+        if !registry.is_dir() {
+            continue;
+        }
         let candidate = registry.join(format!("{CANDIDATE_PACKAGE}-{CANDIDATE_VERSION}"));
-        if candidate.join("Cargo.toml").is_file() { candidates.push(candidate); }
+        if candidate.join("Cargo.toml").is_file() {
+            candidates.push(candidate);
+        }
         let baseline = registry.join(format!("{BASELINE_PACKAGE}-{BASELINE_VERSION}"));
-        if baseline.join("Cargo.toml").is_file() { baselines.push(baseline); }
+        if baseline.join("Cargo.toml").is_file() {
+            baselines.push(baseline);
+        }
     }
     Ok((
         require_unique_path(candidates, "published frankenhnsw 0.3.5 candidate source")?,
@@ -4811,22 +4819,32 @@ fn compiled_target_features() -> Vec<String> {
 fn resolved_hnsw_packages(cargo_lock: &str) -> Result<Vec<String>, DynError> {
     let mut packages = Vec::new();
     for block in cargo_lock.split("[[package]]") {
-        let Some(name) = lock_value(block, "name") else { continue; };
-        let Some(version) = lock_value(block, "version") else { continue; };
+        let Some(name) = lock_value(block, "name") else {
+            continue;
+        };
+        let Some(version) = lock_value(block, "version") else {
+            continue;
+        };
         let expected = if name == CANDIDATE_PACKAGE && version == CANDIDATE_VERSION {
             CANDIDATE_CHECKSUM
         } else if name == BASELINE_PACKAGE && version == BASELINE_VERSION {
             BASELINE_CHECKSUM
-        } else { continue; };
-        let source = lock_value(block, "source").ok_or_else(|| format!("{name} {version} lock entry lacks source"))?;
-        let checksum = lock_value(block, "checksum").ok_or_else(|| format!("{name} {version} lock entry lacks checksum"))?;
+        } else {
+            continue;
+        };
+        let source = lock_value(block, "source")
+            .ok_or_else(|| format!("{name} {version} lock entry lacks source"))?;
+        let checksum = lock_value(block, "checksum")
+            .ok_or_else(|| format!("{name} {version} lock entry lacks checksum"))?;
         if !source.starts_with("registry+") || checksum != expected {
             return Err(format!("unexpected {name} {version} source identity: source={source:?}, checksum={checksum:?}").into());
         }
         packages.push(format!("{name} {version} {source} checksum={checksum}"));
     }
     packages.sort();
-    if packages.len() != 2 { return Err(format!("unexpected HNSW dependency attestation: {packages:?}").into()); }
+    if packages.len() != 2 {
+        return Err(format!("unexpected HNSW dependency attestation: {packages:?}").into());
+    }
     Ok(packages)
 }
 
@@ -5964,8 +5982,16 @@ checksum = "{BASELINE_CHECKSUM}"
         );
         let packages = resolved_hnsw_packages(&lock).unwrap();
         assert_eq!(packages.len(), 2);
-        assert!(packages.iter().any(|package| package.starts_with("frankenhnsw 0.3.5 ")));
-        assert!(packages.iter().any(|package| package.starts_with("hnsw_rs 0.3.4 ")));
+        assert!(
+            packages
+                .iter()
+                .any(|package| package.starts_with("frankenhnsw 0.3.5 "))
+        );
+        assert!(
+            packages
+                .iter()
+                .any(|package| package.starts_with("hnsw_rs 0.3.4 "))
+        );
     }
 
     #[test]
