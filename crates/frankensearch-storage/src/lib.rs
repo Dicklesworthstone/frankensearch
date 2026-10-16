@@ -25,6 +25,7 @@ pub mod job_queue;
 pub mod metrics;
 pub mod pipeline;
 pub mod publication_cohort;
+pub mod publication_progressive;
 pub mod publication_recovery;
 pub mod publication_search;
 pub mod schema;
@@ -73,6 +74,7 @@ pub use publication_cohort::{
     PublishedSearchCohort, PublishedSearchTextQuery, PublishedSearchTierHits,
     PublishedSearchTierQuery, PublishedSearchTierRequest,
 };
+pub use publication_progressive::{PublishedSearchStream, PublishedSearchStreamState};
 pub use publication_recovery::{PublicationRecoveryConfig, PublicationRecoveryPage};
 pub use publication_search::{
     PublishedSearchDocument, PublishedSearchHit, PublishedSearchReadLimits, PublishedSearchSnapshot,
