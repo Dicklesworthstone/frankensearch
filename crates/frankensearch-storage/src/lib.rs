@@ -69,7 +69,10 @@ pub use pipeline::{
     IngestRequest, IngestResult, PersistedEmbedding, PipelineConfig, PipelineMetrics,
     PipelineMetricsSnapshot, StorageBackedJobRunner, WorkerReport,
 };
-pub use publication_cohort::{PublishedSearchCohort, PublishedSearchTierRequest};
+pub use publication_cohort::{
+    PublishedSearchCohort, PublishedSearchTextQuery, PublishedSearchTierHits,
+    PublishedSearchTierQuery, PublishedSearchTierRequest,
+};
 pub use publication_recovery::{PublicationRecoveryConfig, PublicationRecoveryPage};
 pub use publication_search::{
     PublishedSearchDocument, PublishedSearchHit, PublishedSearchReadLimits, PublishedSearchSnapshot,
