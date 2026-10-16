@@ -256,37 +256,13 @@ impl Storage {
     ) -> SearchResult<crate::publication_search::PublishedSearchSnapshot> {
         validate_read_request(cx, embedder_id, expected_identity)?;
         let result = self.transaction(|conn| {
-            let mut records = Vec::new();
-            let mut documents = Vec::new();
-            let mut source_payload_bytes = 0_usize;
-            let stats = scan_on(
+            crate::publication_search::PublishedSearchSnapshot::capture_on(
                 conn,
                 cx,
                 embedder_id,
                 expected_identity,
-                limits.embeddings,
-                |record| {
-                    let (document, bytes) = crate::publication_search::read_search_document(
-                        conn,
-                        cx,
-                        &record,
-                        limits.max_source_bytes - source_payload_bytes,
-                    )?;
-                    records.try_reserve(1).map_err(map_storage_error)?;
-                    documents.try_reserve(1).map_err(map_storage_error)?;
-                    source_payload_bytes += bytes;
-                    records.push(record);
-                    documents.push(document);
-                    Ok(())
-                },
-            )?;
-            Ok(crate::publication_search::PublishedSearchSnapshot {
-                vectors: PublishedEmbeddingSnapshot { records, stats },
-                documents,
-                identity: expected_identity.clone(),
-                embedder_id: embedder_id.to_owned(),
-                source_payload_bytes,
-            })
+                limits,
+            )
         });
         publication_checkpoint(cx)?;
         result
@@ -330,6 +306,62 @@ impl Storage {
         });
         publication_checkpoint(cx)?;
         result
+    }
+}
+
+impl crate::publication_search::PublishedSearchSnapshot {
+    /// Shared admission for single-tier and coherent multi-tier capture.
+    pub(crate) fn validate_capture_request(
+        cx: &Cx,
+        embedder_id: &str,
+        identity: &EmbeddingIdentityBundleV1,
+    ) -> SearchResult<()> {
+        validate_read_request(cx, embedder_id, identity)
+    }
+
+    /// The caller owns the transaction. Never begin a nested transaction or
+    /// hydrate sources through a second connection. Every retry starts here
+    /// with fresh vectors, sources and accounting.
+    pub(crate) fn capture_on(
+        conn: &AsyncConnection,
+        cx: &Cx,
+        embedder_id: &str,
+        expected_identity: &EmbeddingIdentityBundleV1,
+        limits: crate::publication_search::PublishedSearchReadLimits,
+    ) -> SearchResult<Self> {
+        validate_read_request(cx, embedder_id, expected_identity)?;
+        let mut records = Vec::new();
+        let mut documents = Vec::new();
+        let mut source_payload_bytes = 0_usize;
+        let stats = scan_on(
+            conn,
+            cx,
+            embedder_id,
+            expected_identity,
+            limits.embeddings,
+            |record| {
+                let (document, bytes) = crate::publication_search::read_search_document(
+                    conn,
+                    cx,
+                    &record,
+                    limits.max_source_bytes - source_payload_bytes,
+                )?;
+                records.try_reserve(1).map_err(map_storage_error)?;
+                documents.try_reserve(1).map_err(map_storage_error)?;
+                source_payload_bytes += bytes;
+                records.push(record);
+                documents.push(document);
+                Ok(())
+            },
+        )?;
+        publication_checkpoint(cx)?;
+        Ok(Self {
+            vectors: PublishedEmbeddingSnapshot { records, stats },
+            documents,
+            identity: expected_identity.clone(),
+            embedder_id: embedder_id.to_owned(),
+            source_payload_bytes,
+        })
     }
 }
 

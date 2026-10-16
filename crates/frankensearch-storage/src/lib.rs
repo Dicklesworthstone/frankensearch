@@ -24,6 +24,7 @@ pub mod index_metadata;
 pub mod job_queue;
 pub mod metrics;
 pub mod pipeline;
+pub mod publication_cohort;
 pub mod publication_recovery;
 pub mod publication_search;
 pub mod schema;
@@ -68,6 +69,7 @@ pub use pipeline::{
     IngestRequest, IngestResult, PersistedEmbedding, PipelineConfig, PipelineMetrics,
     PipelineMetricsSnapshot, StorageBackedJobRunner, WorkerReport,
 };
+pub use publication_cohort::{PublishedSearchCohort, PublishedSearchTierRequest};
 pub use publication_recovery::{PublicationRecoveryConfig, PublicationRecoveryPage};
 pub use publication_search::{
     PublishedSearchDocument, PublishedSearchHit, PublishedSearchReadLimits, PublishedSearchSnapshot,
