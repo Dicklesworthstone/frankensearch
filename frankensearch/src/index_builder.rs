@@ -2040,8 +2040,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    #[cfg(target_os = "linux")]
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     #[cfg(not(any(feature = "lexical", feature = "quill")))]
     use asupersync::types::CancelKind;
@@ -3736,6 +3734,13 @@ mod tests {
     impl AsRef<std::path::Path> for TantivyBuilderTestDir {
         fn as_ref(&self) -> &std::path::Path {
             self
+        }
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    impl AsRef<std::ffi::OsStr> for TantivyBuilderTestDir {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.as_os_str()
         }
     }
 
