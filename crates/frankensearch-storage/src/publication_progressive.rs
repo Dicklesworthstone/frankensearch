@@ -4,11 +4,18 @@
 //! does not start until the consumer asks for it; no producer, queue, task or
 //! database transaction survives independently of the caller's future.
 
+use std::future::{Future, poll_fn};
+use std::task::Poll;
+use std::time::{Duration, Instant};
+
 use asupersync::Cx;
+use asupersync::types::Time;
 use frankensearch_core::{SearchError, SearchResult};
 
 use crate::connection::map_storage_error;
 use crate::{PublishedSearchCohort, PublishedSearchTextQuery, PublishedSearchTierHits};
+
+const MAX_TIER_TIMEOUT_MS: u64 = 86_400_000;
 
 /// Progress is explicit: interrupted work must not masquerade as completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,7 +36,8 @@ pub enum PublishedSearchStreamState {
 /// Results borrow the cohort, not the stream, and remain usable after this
 /// stream is dropped. Already delivered tiers survive a later error. They are
 /// NOT silently blended or relabelled as refined results: ranking/fusion is
-/// still the consumer's explicit policy. Provider deadlines remain caller-owned.
+/// still the consumer's explicit policy. Optional per-tier deadlines cover
+/// admission, canonicalization, inference and exact retrieval in each pull.
 ///
 /// There is no speculative work. Dropping an unpolled pull changes nothing;
 /// dropping a pending pull drops its provider future and terminally interrupts
@@ -41,6 +49,7 @@ pub struct PublishedSearchStream<'cohort, 'query> {
     cohort: &'cohort PublishedSearchCohort,
     text: &'query str,
     requests: Vec<PublishedSearchTextQuery<'query>>,
+    timeout_ms: Vec<Option<u64>>,
     state: PublishedSearchStreamState,
 }
 
@@ -96,11 +105,17 @@ impl PublishedSearchCohort {
             .try_reserve_exact(requests.len())
             .map_err(map_storage_error)?;
         owned.extend_from_slice(requests);
+        let mut timeout_ms = Vec::new();
+        timeout_ms
+            .try_reserve_exact(requests.len())
+            .map_err(map_storage_error)?;
+        timeout_ms.resize(requests.len(), None);
         checkpoint(cx)?;
         Ok(PublishedSearchStream {
             cohort: self,
             text,
             requests: owned,
+            timeout_ms,
             state: if requests.is_empty() {
                 PublishedSearchStreamState::Complete
             } else {
@@ -111,6 +126,42 @@ impl PublishedSearchCohort {
 }
 
 impl<'cohort> PublishedSearchStream<'cohort, '_> {
+    /// Bound one selected tier before the stream's first pull.
+    ///
+    /// The budget starts when that tier is requested, not at construction or
+    /// during consumer backpressure between tiers. Each tier may have a distinct
+    /// budget of 1 ms through 24 hours; omitted budgets retain caller-owned
+    /// deadlines. Configuration never calls providers or starts timers.
+    ///
+    /// Expiry returns `SearchTimeout` and terminally fails the stream. Pending
+    /// work is dropped; already delivered results are unchanged. Synchronous
+    /// callbacks/scoring cannot be preempted, but a late successful poll is
+    /// refused. Cancellation dominates; observed identity/provider failures are
+    /// retained rather than disguised as retryable timeouts. No shared `Cx` is
+    /// cancelled.
+    pub fn with_tier_timeout(
+        mut self,
+        cx: &Cx,
+        embedder_id: &str,
+        timeout_ms: u64,
+    ) -> SearchResult<Self> {
+        checkpoint(cx)?;
+        if self.state != (PublishedSearchStreamState::Ready { next_tier: 0 }) {
+            return Err(invalid("deadlines must be configured before the first pull"));
+        }
+        if !(1..=MAX_TIER_TIMEOUT_MS).contains(&timeout_ms) {
+            return Err(invalid("tier timeout must be between 1 ms and 24 hours"));
+        }
+        let index = self
+            .requests
+            .iter()
+            .position(|request| request.embedder_id == embedder_id)
+            .ok_or_else(|| invalid("timeout names a tier not selected by this stream"))?;
+        self.timeout_ms[index] = Some(timeout_ms);
+        checkpoint(cx)?;
+        Ok(self)
+    }
+
     #[must_use]
     pub const fn state(&self) -> PublishedSearchStreamState {
         self.state
@@ -134,11 +185,13 @@ impl<'cohort> PublishedSearchStream<'cohort, '_> {
         // Only returning a complete outcome below may advance this cursor.
         self.state = PublishedSearchStreamState::Interrupted { tier: next_tier };
         let cohort = self.cohort;
+        let text = self.text;
         let request = self.requests[next_tier];
-        let result = async {
+        let timeout_ms = self.timeout_ms[next_tier];
+        let work = async move {
             checkpoint(cx)?;
             let result = cohort
-                .search_text(cx, self.text, std::slice::from_ref(&request))
+                .search_text(cx, text, std::slice::from_ref(&request))
                 .await;
             checkpoint(cx)?;
             let mut results = result?;
@@ -150,8 +203,11 @@ impl<'cohort> PublishedSearchStream<'cohort, '_> {
             results
                 .pop()
                 .ok_or_else(|| invalid("the requested tier result is missing"))
-        }
-        .await;
+        };
+        let result = match timeout_ms {
+            Some(timeout_ms) => run_bounded(cx, timeout_ms, work).await,
+            None => work.await,
+        };
         self.state = if result.is_err() {
             PublishedSearchStreamState::Failed { tier: next_tier }
         } else if next_tier + 1 == self.requests.len() {
@@ -162,6 +218,79 @@ impl<'cohort> PublishedSearchStream<'cohort, '_> {
             }
         };
         Some(result)
+    }
+}
+
+#[allow(clippy::future_not_send)] // Caller-owned local futures are supported.
+async fn run_bounded<T>(
+    cx: &Cx,
+    budget_ms: u64,
+    work: impl Future<Output = SearchResult<T>>,
+) -> SearchResult<T> {
+    checkpoint(cx)?;
+    let started = cx.now();
+    let wall_started = Instant::now();
+    run_bounded_with_elapsed(cx, started, budget_ms, work, || {
+        // Virtual runtime time drives deterministic scheduling. Wall time also
+        // catches a blocking callback that did not advance the runtime clock.
+        Duration::from_nanos(cx.now().duration_since(started)).max(wall_started.elapsed())
+    })
+    .await
+}
+
+/// The same polling path accepts an elapsed clock for deterministic boundary
+/// tests; production always uses the caller runtime and monotonic wall clock.
+#[allow(clippy::future_not_send)] // The guard must not add a Send requirement.
+async fn run_bounded_with_elapsed<T>(
+    cx: &Cx,
+    started: Time,
+    budget_ms: u64,
+    work: impl Future<Output = SearchResult<T>>,
+    elapsed: impl Fn() -> Duration,
+) -> SearchResult<T> {
+    checkpoint(cx)?;
+    let budget = Duration::from_millis(budget_ms);
+    let expired = || {
+        let duration = elapsed();
+        (duration >= budget).then(|| timeout_error(budget_ms, duration))
+    };
+    let mut work = Box::pin(work);
+    let guarded = poll_fn(|context| {
+        if let Err(error) = checkpoint(cx) {
+            return Poll::Ready(Err(error));
+        }
+        if let Some(error) = expired() {
+            return Poll::Ready(Err(error));
+        }
+        let outcome = work.as_mut().poll(context);
+        if let Err(error) = checkpoint(cx) {
+            return Poll::Ready(Err(error));
+        }
+        // An actual failure, especially a producer-identity mismatch, must
+        // not be changed into a weaker timeout by an elapsed clock.
+        if matches!(&outcome, Poll::Ready(Err(_))) {
+            return outcome;
+        }
+        if let Some(error) = expired() {
+            return Poll::Ready(Err(error));
+        }
+        outcome
+    });
+    // The runtime timer wakes a parked provider even if it never wakes itself.
+    // Poll checks above also reject synchronous completion after the deadline.
+    let outcome = asupersync::time::timeout(started, budget, guarded).await;
+    drop(work);
+    checkpoint(cx)?;
+    match outcome {
+        Ok(result) => result,
+        Err(_) => Err(timeout_error(budget_ms, elapsed().max(budget))),
+    }
+}
+
+fn timeout_error(budget_ms: u64, elapsed: Duration) -> SearchError {
+    SearchError::SearchTimeout {
+        elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+        budget_ms,
     }
 }
 
@@ -184,10 +313,9 @@ fn invalid(reason: &str) -> SearchError {
 mod tests {
     #![allow(clippy::arc_with_non_send_sync)]
 
-    use std::future::Future;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Poll, Waker};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::task::{Context, Waker};
 
     use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
@@ -573,6 +701,195 @@ mod tests {
                 );
             }
             assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn tier_deadlines_are_preflight_only_and_cannot_reconfigure_started_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_, cohort) = fixture(&cx);
+            let fast = Probe::new("fast", Reply::Ready);
+            let quality = Probe::new("quality", Reply::Ready);
+            for (name, budget) in [
+                ("quality", 0),
+                ("quality", MAX_TIER_TIMEOUT_MS + 1),
+                ("unknown", 100),
+            ] {
+                let stream = cohort
+                    .search_text_stream(&cx, "query", &[fast.request(1), quality.request(1)])
+                    .unwrap();
+                assert!(stream.with_tier_timeout(&cx, name, budget).is_err());
+            }
+            let fast_only = cohort
+                .search_text_stream(&cx, "query", &[fast.request(1)])
+                .unwrap();
+            assert!(fast_only.with_tier_timeout(&cx, "quality", 100).is_err());
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            let mut stream = cohort
+                .search_text_stream(&cx, "query", &[fast.request(1), quality.request(1)])
+                .unwrap()
+                .with_tier_timeout(&cx, "quality", MAX_TIER_TIMEOUT_MS)
+                .unwrap();
+            assert_eq!(stream.timeout_ms, [None, Some(MAX_TIER_TIMEOUT_MS)]);
+            let initial = stream.next(&cx).await.unwrap().unwrap();
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            assert!(stream.with_tier_timeout(&cx, "quality", 10).is_err());
+            assert_eq!(initial.hits()[0].hit().doc_id.as_str(), "fast-only");
+        });
+    }
+
+    #[test]
+    fn a_configured_tier_keeps_the_normal_bound_response_and_source_contract() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_, cohort) = fixture(&cx);
+            for reply in [Reply::Ready, Reply::Foreign] {
+                let quality = Probe::new("quality", reply);
+                let mut stream = cohort
+                    .search_text_stream(&cx, "query", &[quality.request(1)])
+                    .unwrap()
+                    .with_tier_timeout(&cx, "quality", MAX_TIER_TIMEOUT_MS)
+                    .unwrap();
+                let outcome = stream.next(&cx).await.unwrap();
+                if matches!(reply, Reply::Ready) {
+                    let hits = outcome.unwrap();
+                    assert_eq!(hits.hits()[0].hit().doc_id.as_str(), "quality-only");
+                    assert!(std::ptr::eq(hits.snapshot(), cohort.get("quality").unwrap()));
+                    assert_eq!(stream.state(), PublishedSearchStreamState::Complete);
+                } else {
+                    assert!(outcome.is_err());
+                    assert_eq!(
+                        stream.state(),
+                        PublishedSearchStreamState::Failed { tier: 0 }
+                    );
+                }
+                assert!(stream.next(&cx).await.is_none());
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn a_ready_poll_crossing_the_budget_is_rejected_at_the_exact_boundary() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for finish_ms in [49, 50, 51] {
+                let elapsed = AtomicU64::new(0);
+                let result = run_bounded_with_elapsed(
+                    &cx,
+                    cx.now(),
+                    50,
+                    async {
+                        elapsed.store(finish_ms, Ordering::SeqCst);
+                        Ok(7)
+                    },
+                    || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+                )
+                .await;
+                if finish_ms < 50 {
+                    assert_eq!(result.unwrap(), 7);
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(SearchError::SearchTimeout { elapsed_ms, budget_ms: 50 })
+                            if elapsed_ms == finish_ms
+                    ));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn expiry_drops_pending_work_without_repolling_or_cancelling_the_caller() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let elapsed = AtomicU64::new(0);
+            let polls = AtomicUsize::new(0);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let work = async {
+                let _dropped = Dropped(Arc::clone(&drops));
+                poll_fn(|_| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    Poll::<SearchResult<()>>::Pending
+                })
+                .await
+            };
+            let mut bounded = Box::pin(run_bounded_with_elapsed(
+                &cx,
+                cx.now(),
+                50,
+                work,
+                || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(bounded.as_mut().poll(&mut context).is_pending());
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            elapsed.store(50, Ordering::SeqCst);
+            assert!(matches!(
+                bounded.as_mut().poll(&mut context),
+                Poll::Ready(Err(SearchError::SearchTimeout { budget_ms: 50, .. }))
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn expired_work_is_not_started_and_observed_identity_failure_is_not_a_timeout() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let calls = AtomicUsize::new(0);
+            let result = run_bounded_with_elapsed(
+                &cx,
+                cx.now(),
+                50,
+                async {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                || Duration::from_millis(50),
+            )
+            .await;
+            assert!(matches!(result, Err(SearchError::SearchTimeout { .. })));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            let elapsed = AtomicU64::new(0);
+            let result = run_bounded_with_elapsed(
+                &cx,
+                cx.now(),
+                50,
+                async {
+                    elapsed.store(60, Ordering::SeqCst);
+                    Err::<(), _>(SearchError::UnverifiableRemoteSpace {
+                        producer: "test".to_owned(),
+                        reason: "changed producer".to_owned(),
+                    })
+                },
+                || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(SearchError::UnverifiableRemoteSpace { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn cancellation_wins_over_a_late_ready_poll_or_provider_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let elapsed = AtomicU64::new(0);
+            let result = run_bounded_with_elapsed(
+                &cx,
+                cx.now(),
+                50,
+                async {
+                    elapsed.store(60, Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("budget cancellation"));
+                    Err::<(), _>(invalid("provider failed"))
+                },
+                || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+            )
+            .await;
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
         });
     }
 }
