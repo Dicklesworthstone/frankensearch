@@ -3932,10 +3932,13 @@ mod remote_intent_tests {
         expect_unverifiable(&env, "empty identity object");
     }
 
+    #[cfg(feature = "hash")]
     #[test]
     fn embedder_stack_into_coalescing_batches_fast_and_quality_tiers() {
         use crate::batch_coalescer::{CoalescerConfig, CoalescerLimits};
+        use crate::{Embedder, EmbedderStack, HashEmbedder};
         use asupersync::test_utils::run_test_with_cx;
+        use std::sync::Arc;
         use std::task::{Context, Poll, Waker};
 
         run_test_with_cx(|cx| async move {
