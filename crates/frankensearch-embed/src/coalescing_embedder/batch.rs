@@ -5,6 +5,37 @@ use std::task::Poll;
 
 use super::{Cx, IdentityBoundEmbedding, SearchFuture, SearchResult, checkpoint, invalid};
 
+/// Largest nonempty ordered prefix fitting both queue ceilings. Use byte
+/// lengths (not character counts), and subtract from the remaining budget so
+/// arithmetic cannot wrap. Other clients still compete for real queue credit:
+/// this is grouping, not an unaccounted reservation or a retry policy.
+pub(super) fn prefix_len(
+    cx: &Cx,
+    texts: &[&str],
+    max_rows: usize,
+    max_bytes: usize,
+) -> SearchResult<usize> {
+    checkpoint(cx)?;
+    if texts.is_empty() {
+        return Ok(0);
+    }
+    let mut remaining = max_bytes;
+    let mut count = 0;
+    for text in texts.iter().take(max_rows) {
+        checkpoint(cx)?;
+        if text.len() > remaining {
+            break;
+        }
+        remaining -= text.len();
+        count += 1;
+    }
+    if count == 0 {
+        return Err(invalid("batch", "input cannot fit a nonempty bounded group"));
+    }
+    checkpoint(cx)?;
+    Ok(count)
+}
+
 /// Keep successes in input order, but return the first observed failure without
 /// waiting for pending siblings. All sibling futures are dropped before the
 /// error leaves this boundary; no successful prefix escapes and no shared
@@ -60,3 +91,7 @@ pub(super) async fn collect(
 #[cfg(test)]
 #[path = "batch_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "batch_limits_tests.rs"]
+mod limits_tests;

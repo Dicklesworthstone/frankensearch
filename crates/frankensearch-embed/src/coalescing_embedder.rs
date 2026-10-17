@@ -196,6 +196,10 @@ impl CoalescingEmbedder {
     /// after admission so same-turn arrivals accumulate in the queue, and then
     /// use work-conserving leader-follower dispatch (zero idle timer delay for
     /// solo queries while batching same-turn and in-flight arrivals).
+    /// Explicit bound batches use the same dispatch path, with groups bounded
+    /// by both request count and UTF-8 input bytes. An individually oversized
+    /// input is refused before any prefix is submitted. Other callers still
+    /// compete for the real queue credits; grouping does not bypass admission.
     ///
     /// # Errors
     /// Returns the same validation and identity admission errors as [`Self::new`].
@@ -399,7 +403,19 @@ impl Embedder for CoalescingEmbedder {
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
             checkpoint(cx)?;
-            let mut outputs = Vec::with_capacity(texts.len());
+            let max_text_bytes = self.shared.queue.limits().max_outstanding_text_bytes;
+            // Refuse a known impossible input anywhere in the call before
+            // submitting an earlier prefix or running any provider callback.
+            for text in texts {
+                checkpoint(cx)?;
+                if text.len() > max_text_bytes {
+                    return Err(invalid("input", "text exceeds the entire input budget"));
+                }
+            }
+            let mut outputs = Vec::new();
+            outputs
+                .try_reserve_exact(texts.len())
+                .map_err(|_| invalid("batch", "batch output allocation failed"))?;
             if self.auto_dispatcher.is_some() {
                 let chunk_limit = self
                     .shared
@@ -408,15 +424,19 @@ impl Embedder for CoalescingEmbedder {
                     .max_batch_size
                     .min(self.shared.queue.limits().max_outstanding_requests)
                     .max(1);
-                for chunk in texts.chunks(chunk_limit) {
-                    checkpoint(cx)?;
-                    let futures = chunk
-                        .iter()
-                        .map(|text| self.embed_bound(cx, text))
-                        .collect::<Vec<_>>();
+                let mut remaining = texts;
+                while !remaining.is_empty() {
+                    let count = batch::prefix_len(cx, remaining, chunk_limit, max_text_bytes)?;
+                    let (chunk, rest) = remaining.split_at(count);
+                    let mut futures = Vec::new();
+                    futures
+                        .try_reserve_exact(count)
+                        .map_err(|_| invalid("batch", "batch future allocation failed"))?;
+                    futures.extend(chunk.iter().map(|text| self.embed_bound(cx, text)));
                     // A known error ends the whole call; do not wait for an
                     // unrelated pending provider before returning that error.
                     outputs.extend(batch::collect(cx, futures).await?);
+                    remaining = rest;
                 }
             } else {
                 for text in texts {
@@ -428,9 +448,14 @@ impl Embedder for CoalescingEmbedder {
         })
     }
 
-    // A single caller's batch remains sequential in manual mode; in auto mode
-    // chunks are polled concurrently through embed_bound. Never bypass our real
-    // bound singleton.
+    // Auto batching preserves every bound-single override through the same
+    // dispatcher. Advertise it so bound-aware indexers do not serialize all
+    // requests before the coalescer has a chance to form a group. Manual mode
+    // remains conservative and still requires its external dispatch owner.
+    fn bound_batch_is_native(&self) -> bool {
+        self.auto_dispatcher.is_some()
+    }
+
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
         Ok(&self.shared.identity)
     }
