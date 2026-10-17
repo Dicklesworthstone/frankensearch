@@ -27,6 +27,7 @@ pub mod pipeline;
 pub mod publication_cohort;
 pub mod publication_progressive;
 pub mod publication_recovery;
+pub mod publication_rerank;
 pub mod publication_search;
 pub mod schema;
 pub mod staleness;
@@ -76,6 +77,7 @@ pub use publication_cohort::{
 };
 pub use publication_progressive::{PublishedSearchStream, PublishedSearchStreamState};
 pub use publication_recovery::{PublicationRecoveryConfig, PublicationRecoveryPage};
+pub use publication_rerank::{PublishedRerankLimits, PublishedRerankedHit};
 pub use publication_search::{
     PublishedSearchDocument, PublishedSearchHit, PublishedSearchReadLimits, PublishedSearchSnapshot,
 };
