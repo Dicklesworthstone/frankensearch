@@ -37,16 +37,44 @@ fn full_query_parsing_is_bounded_strict_and_explicitly_full_mode() {
     assert_eq!(encoded["candidate_multiplier"], 1);
     assert_eq!(encoded["quality_ef"], 7);
     assert_eq!(encoded["semantic_weight"], 1.0);
-    assert!(Options::parse(["serve", "--receipt", "r", "--mode", "fast", "--full-query", TUNED]
-        .into_iter().map(str::to_owned)).is_ok());
+    assert!(
+        Options::parse(
+            [
+                "serve",
+                "--receipt",
+                "r",
+                "--mode",
+                "fast",
+                "--full-query",
+                TUNED
+            ]
+            .into_iter()
+            .map(str::to_owned)
+        )
+        .is_ok()
+    );
     for mode in ["fast", "quality"] {
         assert!(self::parsed(&["--mode", mode, "--full-query", TUNED]).is_err());
     }
     assert!(self::parsed(&["--lexical-only", "--full-query", "{}"]).is_err());
     assert!(self::parsed(&["--full-query", "{}", "--full-query", "{}"]).is_err());
     for command in ["index", "update", "rebuild"] {
-        assert!(Options::parse([command, "--receipt", "r", "--index-dir", "new", "--full-query", "{}"]
-            .into_iter().map(str::to_owned)).is_err());
+        assert!(
+            Options::parse(
+                [
+                    command,
+                    "--receipt",
+                    "r",
+                    "--index-dir",
+                    "new",
+                    "--full-query",
+                    "{}"
+                ]
+                .into_iter()
+                .map(str::to_owned)
+            )
+            .is_err()
+        );
     }
     for invalid in [
         r#"{"candidate_multiplier":0}"#,
@@ -62,7 +90,9 @@ fn full_query_parsing_is_bounded_strict_and_explicitly_full_mode() {
         r#"{"candidate_multiplier":1,"candidate_multiplier":2}"#,
         r#"{"unknown":"private-policy-canary"}"#,
         r#"{"candidate_multiplier":"private-policy-canary"}"#,
-        "null", "[]", "NaN",
+        "null",
+        "[]",
+        "NaN",
     ] {
         let error = query::FullQuery::parse(invalid).unwrap_err();
         assert!(!error.to_string().contains("private-policy-canary"));
@@ -70,8 +100,12 @@ fn full_query_parsing_is_bounded_strict_and_explicitly_full_mode() {
     assert!(query::FullQuery::parse(&" ".repeat(8193)).is_err());
     let boundary = query::FullQuery::parse(
         r#"{"candidate_multiplier":100,"fast_ef":1000000,"quality_ef":null,"quality_weight":1}"#,
-    ).unwrap();
-    assert_eq!(serde_json::to_value(boundary).unwrap()["quality_weight"], 1.0);
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(boundary).unwrap()["quality_weight"],
+        1.0
+    );
     assert!(self::parsed(&[]).unwrap().unwrap().full_query.is_none());
 }
 
@@ -95,23 +129,38 @@ impl Model {
 
 struct Dropped<'a>(&'a AtomicUsize);
 impl Drop for Dropped<'_> {
-    fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Embedder for Model {
-    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { Ok(&self.identity) }
-    fn dimension(&self) -> usize { 2 }
-    fn id(&self) -> &str { &self.identity.space.logical_model_id }
-    fn model_name(&self) -> &str { self.id() }
-    fn is_semantic(&self) -> bool { false }
-    fn category(&self) -> ModelCategory { ModelCategory::HashEmbedder }
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+    fn dimension(&self) -> usize {
+        2
+    }
+    fn id(&self) -> &str {
+        &self.identity.space.logical_model_id
+    }
+    fn model_name(&self) -> &str {
+        self.id()
+    }
+    fn is_semantic(&self) -> bool {
+        false
+    }
+    fn category(&self) -> ModelCategory {
+        ModelCategory::HashEmbedder
+    }
     fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let _drop = Dropped(&self.drops);
             match self.mode.load(Ordering::SeqCst) {
                 1 => Err(SearchError::EmbeddingFailed {
-                    model: self.id().to_owned(), source: "controlled quality failure".into(),
+                    model: self.id().to_owned(),
+                    source: "controlled quality failure".into(),
                 }),
                 2 => std::future::pending().await,
                 _ => Ok(vec![1.0, 0.0]),
@@ -120,20 +169,30 @@ impl Embedder for Model {
     }
 }
 
-async fn fixture(cx: &Cx, partitioned: bool, exact: bool)
-    -> (tempfile::TempDir, sharded::Opened, Arc<Model>, Arc<Model>)
-{
+async fn fixture(
+    cx: &Cx,
+    partitioned: bool,
+    exact: bool,
+) -> (tempfile::TempDir, sharded::Opened, Arc<Model>, Arc<Model>) {
     let parent = tempfile::tempdir().unwrap();
     let fast = Arc::new(Model::new("cli-tuning-fast"));
     let quality = Arc::new(Model::new("cli-tuning-quality"));
     let generation = ArtifactGenerationIdentityV1::new(1, [19; 16]).unwrap();
-    let retrieval = if exact { NativeBuildRetrieval::Exact } else {
-        NativeBuildRetrieval::Hnsw { params: HnswParams::default(), seed: 19 }
+    let retrieval = if exact {
+        NativeBuildRetrieval::Exact
+    } else {
+        NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 19,
+        }
     };
     let builder = NativeIndexBuilder::new(parent.path().join("index"), generation, fast.clone())
-        .unwrap().with_quality_embedder(quality.clone()).unwrap()
+        .unwrap()
+        .with_quality_embedder(quality.clone())
+        .unwrap()
         .with_fast_storage(NativeBuildPrecision::F32, retrieval)
-        .with_quality_storage(NativeBuildPrecision::F32, retrieval).unwrap()
+        .with_quality_storage(NativeBuildPrecision::F32, retrieval)
+        .unwrap()
         .add_documents([
             IndexableDocument::new("a", "ordinary alpha").with_metadata("epoch", "old"),
             IndexableDocument::new("b", "ordinary beta").with_metadata("epoch", "old"),
@@ -148,8 +207,11 @@ async fn fixture(cx: &Cx, partitioned: bool, exact: bool)
 }
 
 fn frames(bytes: &[u8]) -> Vec<serde_json::Value> {
-    bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap()).collect()
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
 }
 
 #[test]
@@ -159,24 +221,58 @@ fn buffered_and_streaming_tuning_reaches_both_layouts_and_changes_real_ranking()
             for exact in [false, true] {
                 let (_parent, index, fast, quality) = fixture(&cx, partitioned, exact).await;
                 let defaults = query::Policy::new(&cx, None).unwrap();
-                let ordinary = query::buffered(index.borrow(), &cx, "needle", Mode::Full, 1,
-                    [None, None], &defaults).await.unwrap();
+                let ordinary = query::buffered(
+                    index.borrow(),
+                    &cx,
+                    "needle",
+                    Mode::Full,
+                    1,
+                    [None, None],
+                    &defaults,
+                )
+                .await
+                .unwrap();
                 assert!(ordinary.get("full_query").is_none());
                 assert!(ordinary["results"][0]["score"].as_f64().unwrap() < 1.0);
                 let policy = policy(&cx);
-                let before = (fast.calls.load(Ordering::SeqCst), quality.calls.load(Ordering::SeqCst));
-                let tuned = query::buffered(index.borrow(), &cx, "needle", Mode::Full, 1,
-                    [None, None], &policy).await.unwrap();
+                let before = (
+                    fast.calls.load(Ordering::SeqCst),
+                    quality.calls.load(Ordering::SeqCst),
+                );
+                let tuned = query::buffered(
+                    index.borrow(),
+                    &cx,
+                    "needle",
+                    Mode::Full,
+                    1,
+                    [None, None],
+                    &policy,
+                )
+                .await
+                .unwrap();
                 assert_eq!(tuned["phase"], "refined");
                 assert_eq!(tuned["results"][0]["doc_id"], "z");
                 assert_eq!(tuned["results"][0]["score"], 7.0);
                 assert_eq!(tuned["full_query"]["candidate_multiplier"], 1);
                 assert_eq!(fast.calls.load(Ordering::SeqCst), before.0 + 1);
                 assert_eq!(quality.calls.load(Ordering::SeqCst), before.1 + 1);
-                let request: serve::Request = serde_json::from_str(r#"{"query":"needle","limit":1}"#).unwrap();
+                let request: serve::Request =
+                    serde_json::from_str(r#"{"query":"needle","limit":1}"#).unwrap();
                 let mut output = Vec::new();
-                assert!(serve::stream_one(index.borrow(), &cx, &request, 1, (Mode::Full, 1),
-                    &mut output, None, &policy).await.unwrap());
+                assert!(
+                    serve::stream_one(
+                        index.borrow(),
+                        &cx,
+                        &request,
+                        1,
+                        (Mode::Full, 1),
+                        &mut output,
+                        None,
+                        &policy
+                    )
+                    .await
+                    .unwrap()
+                );
                 let frames = frames(&output);
                 assert_eq!(frames.last().unwrap()["status"], "complete");
                 let pages: Vec<_> = frames.iter().filter(|f| f["event"] == "results").collect();
@@ -196,20 +292,35 @@ fn buffered_and_streaming_tuning_reaches_both_layouts_and_changes_real_ranking()
 }
 
 #[derive(Default)]
-struct Scorer { ids: Mutex<Vec<String>> }
+struct Scorer {
+    ids: Mutex<Vec<String>>,
+}
 impl Reranker for Scorer {
     #[allow(clippy::unnecessary_literal_bound)]
-    fn id(&self) -> &str { "cli-tuning-scorer" }
-    fn model_name(&self) -> &str { self.id() }
-    fn rerank<'a>(&'a self, _cx: &'a Cx, _text: &'a str, documents: &'a [RerankDocument])
-        -> SearchFuture<'a, Vec<RerankScore>>
-    {
+    fn id(&self) -> &str {
+        "cli-tuning-scorer"
+    }
+    fn model_name(&self) -> &str {
+        self.id()
+    }
+    fn rerank<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _text: &'a str,
+        documents: &'a [RerankDocument],
+    ) -> SearchFuture<'a, Vec<RerankScore>> {
         Box::pin(async move {
             *self.ids.lock().unwrap() = documents.iter().map(|d| d.doc_id.clone()).collect();
-            Ok(documents.iter().enumerate().map(|(original_rank, document)| RerankScore {
-                doc_id: document.doc_id.clone(), original_rank,
-                score: if document.doc_id == "a" { 1.0 } else { 0.0 }, raw_logit: None,
-            }).collect())
+            Ok(documents
+                .iter()
+                .enumerate()
+                .map(|(original_rank, document)| RerankScore {
+                    doc_id: document.doc_id.clone(),
+                    original_rank,
+                    score: if document.doc_id == "a" { 1.0 } else { 0.0 },
+                    raw_logit: None,
+                })
+                .collect())
         })
     }
 }
@@ -222,8 +333,17 @@ fn tuned_rerank_windows_and_intersected_filters_preserve_rows_and_owned_sources(
             let mut policy = policy(&cx);
             let scorer = Arc::new(Scorer::default());
             policy.rerank = Some(query::Rerank::new(scorer.clone(), 2).unwrap());
-            let unfiltered = query::buffered(index.borrow(), &cx, "needle", Mode::Full, 1,
-                [None, None], &policy).await.unwrap();
+            let unfiltered = query::buffered(
+                index.borrow(),
+                &cx,
+                "needle",
+                Mode::Full,
+                1,
+                [None, None],
+                &policy,
+            )
+            .await
+            .unwrap();
             assert_eq!(unfiltered["phase"], "reranked");
             assert_eq!(unfiltered["results"][0]["doc_id"], "a");
             assert_eq!(scorer.ids.lock().unwrap().len(), 2);
@@ -233,8 +353,17 @@ fn tuned_rerank_windows_and_intersected_filters_preserve_rows_and_owned_sources(
             }
             let base = filter::Filter::parse(r#"{"ids":["z"]}"#).unwrap();
             let requested = filter::Filter::parse(r#"{"ids":["a","z"]}"#).unwrap();
-            let scoped = query::buffered(index.borrow(), &cx, "needle", Mode::Full, 1,
-                [Some(&base), Some(&requested)], &policy).await.unwrap();
+            let scoped = query::buffered(
+                index.borrow(),
+                &cx,
+                "needle",
+                Mode::Full,
+                1,
+                [Some(&base), Some(&requested)],
+                &policy,
+            )
+            .await
+            .unwrap();
             assert_eq!(scoped["results"][0]["doc_id"], "z");
             assert_eq!(*scorer.ids.lock().unwrap(), ["z"]);
             assert_eq!(scoped["scope"]["eligible_documents"], 1);
@@ -254,7 +383,10 @@ fn warm_session_reports_fixed_full_policy_without_changing_primary_modes() {
             let (_parent, index, fast, quality) = fixture(&cx, partitioned, true).await;
             let serving = live::Serving::new(&cx, index).unwrap();
             let policy = policy(&cx);
-            let before = (fast.calls.load(Ordering::SeqCst), quality.calls.load(Ordering::SeqCst));
+            let before = (
+                fast.calls.load(Ordering::SeqCst),
+                quality.calls.load(Ordering::SeqCst),
+            );
             let mut input = Cursor::new(concat!(
                 "{\"query\":\"needle\",\"mode\":\"fast\"}\n",
                 "{\"query\":\"needle\",\"mode\":\"quality\"}\n",
@@ -263,8 +395,18 @@ fn warm_session_reports_fixed_full_policy_without_changing_primary_modes() {
                 "{\"query\":\"needle\",\"mode\":\"full\"}\nexit\n",
             ));
             let mut output = Vec::new();
-            serve::run_with_controls(serving.borrow(), &cx, &mut input, &mut output,
-                (Mode::Full, 1), serve::Controls::default(), None, &policy).await.unwrap();
+            serve::run_with_controls(
+                serving.borrow(),
+                &cx,
+                &mut input,
+                &mut output,
+                (Mode::Full, 1),
+                serve::Controls::default(),
+                None,
+                &policy,
+            )
+            .await
+            .unwrap();
             let frames = frames(&output);
             assert_eq!(frames[0]["event"], "ready");
             assert_eq!(frames[0]["full_query"]["candidate_multiplier"], 1);
@@ -292,12 +434,35 @@ fn tuned_zero_weight_quality_failure_is_not_buffered_success_or_stream_completio
             let (_parent, index, _, quality) = fixture(&cx, partitioned, true).await;
             let policy = policy(&cx);
             quality.mode.store(1, Ordering::SeqCst);
-            assert!(query::buffered(index.borrow(), &cx, "needle", Mode::Full, 1,
-                [None, None], &policy).await.is_err());
+            assert!(
+                query::buffered(
+                    index.borrow(),
+                    &cx,
+                    "needle",
+                    Mode::Full,
+                    1,
+                    [None, None],
+                    &policy
+                )
+                .await
+                .is_err()
+            );
             let request: serve::Request = serde_json::from_str(r#"{"query":"needle"}"#).unwrap();
             let mut output = Vec::new();
-            assert!(!serve::stream_one(index.borrow(), &cx, &request, 1, (Mode::Full, 1),
-                &mut output, None, &policy).await.unwrap());
+            assert!(
+                !serve::stream_one(
+                    index.borrow(),
+                    &cx,
+                    &request,
+                    1,
+                    (Mode::Full, 1),
+                    &mut output,
+                    None,
+                    &policy
+                )
+                .await
+                .unwrap()
+            );
             let frames = frames(&output);
             assert_eq!(frames[2]["phase"], "refinement_failed");
             assert_eq!(frames[1]["results"], frames[2]["results"]);
@@ -318,9 +483,21 @@ fn tuned_queries_keep_the_original_timer_and_release_pending_quality_on_expiry()
             policy.timer = Some(timer.clone());
             quality.mode.store(2, Ordering::SeqCst);
             let before = quality.drops.load(Ordering::SeqCst);
-            let mut waiting = Box::pin(query::buffered(index.borrow(), &cx, "needle", Mode::Full, 1,
-                [None, None], &policy));
-            assert!(waiting.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            let mut waiting = Box::pin(query::buffered(
+                index.borrow(),
+                &cx,
+                "needle",
+                Mode::Full,
+                1,
+                [None, None],
+                &policy,
+            ));
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
             assert_eq!(timer.pending_count(), 1);
             clock.advance(10_000_000);
             let _ = timer.process_timers();
