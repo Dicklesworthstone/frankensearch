@@ -30113,7 +30113,9 @@ mod tests {
                 true
             }
 
-            fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+            fn identity(
+                &self,
+            ) -> super::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
                 Ok(&self.identity)
             }
 
@@ -30155,7 +30157,7 @@ mod tests {
                 .iter()
                 .map(|q| Box::pin(admitted.embed_admitted(&cx, q)))
                 .collect::<Vec<_>>();
-            let mut results: Vec<Option<SearchResult<Vec<f32>>>> =
+            let mut results: Vec<Option<super::SearchResult<Vec<f32>>>> =
                 (0..futures.len()).map(|_| None).collect();
             std::future::poll_fn(|task_cx| {
                 let mut all_ready = true;
@@ -30206,7 +30208,7 @@ mod tests {
                 .iter()
                 .map(|q| Box::pin(uncoalesced.embed_admitted(&cx, q)))
                 .collect::<Vec<_>>();
-            let mut results: Vec<Option<SearchResult<Vec<f32>>>> =
+            let mut results: Vec<Option<super::SearchResult<Vec<f32>>>> =
                 (0..futures.len()).map(|_| None).collect();
             std::future::poll_fn(|task_cx| {
                 let mut all_ready = true;
