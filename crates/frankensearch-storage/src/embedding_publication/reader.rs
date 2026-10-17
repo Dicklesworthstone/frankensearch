@@ -10,6 +10,7 @@ use super::{
     validate_response,
 };
 use asupersync::Cx;
+use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
 use frankensearch_core::types::{BoundQueryEmbedding, VectorHit};
 use frankensearch_core::{SearchError, SearchResult};
@@ -97,6 +98,44 @@ impl PublishedEmbeddingSnapshot {
         query: &BoundQueryEmbedding,
         limit: usize,
     ) -> SearchResult<Vec<VectorHit>> {
+        self.search_filtered(cx, query, limit, None)
+    }
+
+    /// Exact top-k over matching documents, not a filter over truncated hits.
+    ///
+    /// Uses the core filter's full document-ID predicate with no metadata: this
+    /// vector-only value does not retain catalog fields. Metadata-dependent
+    /// predicates retain their documented `None` behavior. This vector-only
+    /// entry point does not enforce metadata-based access restrictions.
+    /// Hash hints never replace the full predicate on this scan.
+    ///
+    /// Every record still passes producer, dimension, coordinate, norm, tier and
+    /// ordering admission, including excluded records. Only matching records
+    /// are scored and compete for the bounded heap. Original snapshot indices,
+    /// negative scores and deterministic ties are preserved. Cancellation is
+    /// checked before and after each callback; zero limits validate only the
+    /// query and invoke no filter. No database transaction or source read occurs.
+    pub fn search_filtered(
+        &self,
+        cx: &Cx,
+        query: &BoundQueryEmbedding,
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.search_matching(cx, query, limit, |_, record| {
+            Ok(filter.is_none_or(|filter| filter.matches(&record.doc_id, None)))
+        })
+    }
+
+    /// One kernel for ID-only and captured-metadata predicates. This callback
+    /// runs on the already materialized snapshot, never in a SQL transaction.
+    pub(crate) fn search_matching(
+        &self,
+        cx: &Cx,
+        query: &BoundQueryEmbedding,
+        limit: usize,
+        mut matches: impl FnMut(usize, &PublishedEmbedding) -> SearchResult<bool>,
+    ) -> SearchResult<Vec<VectorHit>> {
         publication_checkpoint(cx)?;
         validate_read_identity(query.identity())?;
         if matches!(
@@ -129,9 +168,19 @@ impl PublishedEmbeddingSnapshot {
                 ));
             }
             validate_response(query.identity(), &record.embedding)?;
-            let index = u32::try_from(index).map_err(|_| {
+            let position = u32::try_from(index).map_err(|_| {
                 publication_error("snapshot position exceeds vector-hit index width")
             })?;
+            // Advance the order witness even when this document is excluded.
+            // A filter must not hide duplicates or descending IDs in the tail.
+            previous = Some(record.doc_id.as_str());
+            publication_checkpoint(cx)?;
+            let included = matches(index, record);
+            publication_checkpoint(cx)?;
+            if !included? {
+                continue;
+            }
+            let index = position;
             let score = cosine(cx, query.vector(), &record.embedding.values, query_norm)?;
             let hit = RankedHit(VectorHit {
                 index,
@@ -139,7 +188,6 @@ impl PublishedEmbeddingSnapshot {
                 doc_id: record.doc_id.clone().into(),
             });
             retain_hit(&mut heap, hit, limit)?;
-            previous = Some(record.doc_id.as_str());
         }
         publication_checkpoint(cx)?;
         // The greatest heap element is the worst hit. Ascending heap order
@@ -256,37 +304,13 @@ impl Storage {
     ) -> SearchResult<crate::publication_search::PublishedSearchSnapshot> {
         validate_read_request(cx, embedder_id, expected_identity)?;
         let result = self.transaction(|conn| {
-            let mut records = Vec::new();
-            let mut documents = Vec::new();
-            let mut source_payload_bytes = 0_usize;
-            let stats = scan_on(
+            crate::publication_search::PublishedSearchSnapshot::capture_on(
                 conn,
                 cx,
                 embedder_id,
                 expected_identity,
-                limits.embeddings,
-                |record| {
-                    let (document, bytes) = crate::publication_search::read_search_document(
-                        conn,
-                        cx,
-                        &record,
-                        limits.max_source_bytes - source_payload_bytes,
-                    )?;
-                    records.try_reserve(1).map_err(map_storage_error)?;
-                    documents.try_reserve(1).map_err(map_storage_error)?;
-                    source_payload_bytes += bytes;
-                    records.push(record);
-                    documents.push(document);
-                    Ok(())
-                },
-            )?;
-            Ok(crate::publication_search::PublishedSearchSnapshot {
-                vectors: PublishedEmbeddingSnapshot { records, stats },
-                documents,
-                identity: expected_identity.clone(),
-                embedder_id: embedder_id.to_owned(),
-                source_payload_bytes,
-            })
+                limits,
+            )
         });
         publication_checkpoint(cx)?;
         result
@@ -330,6 +354,62 @@ impl Storage {
         });
         publication_checkpoint(cx)?;
         result
+    }
+}
+
+impl crate::publication_search::PublishedSearchSnapshot {
+    /// Shared admission for single-tier and coherent multi-tier capture.
+    pub(crate) fn validate_capture_request(
+        cx: &Cx,
+        embedder_id: &str,
+        identity: &EmbeddingIdentityBundleV1,
+    ) -> SearchResult<()> {
+        validate_read_request(cx, embedder_id, identity)
+    }
+
+    /// The caller owns the transaction. Never begin a nested transaction or
+    /// hydrate sources through a second connection. Every retry starts here
+    /// with fresh vectors, sources and accounting.
+    pub(crate) fn capture_on(
+        conn: &AsyncConnection,
+        cx: &Cx,
+        embedder_id: &str,
+        expected_identity: &EmbeddingIdentityBundleV1,
+        limits: crate::publication_search::PublishedSearchReadLimits,
+    ) -> SearchResult<Self> {
+        validate_read_request(cx, embedder_id, expected_identity)?;
+        let mut records = Vec::new();
+        let mut documents = Vec::new();
+        let mut source_payload_bytes = 0_usize;
+        let stats = scan_on(
+            conn,
+            cx,
+            embedder_id,
+            expected_identity,
+            limits.embeddings,
+            |record| {
+                let (document, bytes) = crate::publication_search::read_search_document(
+                    conn,
+                    cx,
+                    &record,
+                    limits.max_source_bytes - source_payload_bytes,
+                )?;
+                records.try_reserve(1).map_err(map_storage_error)?;
+                documents.try_reserve(1).map_err(map_storage_error)?;
+                source_payload_bytes += bytes;
+                records.push(record);
+                documents.push(document);
+                Ok(())
+            },
+        )?;
+        publication_checkpoint(cx)?;
+        Ok(Self {
+            vectors: PublishedEmbeddingSnapshot { records, stats },
+            documents,
+            identity: expected_identity.clone(),
+            embedder_id: embedder_id.to_owned(),
+            source_payload_bytes,
+        })
     }
 }
 
@@ -1207,5 +1287,206 @@ mod tests {
                 assert!(error.to_string().contains("hash-control"));
             }
         });
+    }
+
+    #[test]
+    fn filtered_top_k_matches_full_sort_for_every_subset_and_limit() {
+        use frankensearch_core::filter::BitsetFilter;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let snapshot = captured(&[
+                ("a\0best", [1.0, 0.0]),
+                ("b", [0.0, 1.0]),
+                ("c", [-1.0, 0.0]),
+                ("d", [1.0, 1.0]),
+                ("é", [2.0, 0.0]),
+                ("数据", [-2.0, 0.0]),
+            ]);
+            let before = snapshot.clone();
+            let query =
+                BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            let mut reference: Vec<_> = snapshot
+                .records
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let x = f64::from(row.embedding.values[0]);
+                    let y = f64::from(row.embedding.values[1]);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let score = (x / x.hypot(y)) as f32;
+                    VectorHit {
+                        index: u32::try_from(index).unwrap(),
+                        score: if score == 0.0 { 0.0 } else { score },
+                        doc_id: row.doc_id.clone().into(),
+                    }
+                })
+                .collect();
+            reference.sort_by(VectorHit::cmp_rank);
+            for mask in 0_u64..(1 << snapshot.records.len()) {
+                let included = |index: usize| mask & (1 << index) != 0;
+                let allowed = BitsetFilter::from_doc_ids(
+                    snapshot
+                        .records
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| included(*index))
+                        .map(|(_, row)| row.doc_id.as_str()),
+                );
+                let expected: Vec<_> = reference
+                    .iter()
+                    .filter(|hit| included(usize::try_from(hit.index).unwrap()))
+                    .cloned()
+                    .collect();
+                for limit in (0..=snapshot.records.len() + 1).chain([usize::MAX]) {
+                    let hits = snapshot
+                        .search_filtered(&cx, &query, limit, Some(&allowed))
+                        .unwrap();
+                    assert_eq!(
+                        hits,
+                        expected[..limit.min(expected.len())],
+                        "mask={mask} k={limit}",
+                    );
+                    for hit in &hits {
+                        assert_eq!(
+                            snapshot.records[usize::try_from(hit.index).unwrap()].doc_id,
+                            hit.doc_id.as_str(),
+                        );
+                    }
+                }
+            }
+            assert_eq!(snapshot, before);
+            assert_eq!(
+                snapshot.search_filtered(&cx, &query, 4, None).unwrap(),
+                snapshot.search(&cx, &query, 4).unwrap(),
+            );
+        });
+    }
+
+    #[test]
+    fn excluded_records_still_require_valid_identity_vectors_and_order() {
+        use frankensearch_core::filter::PredicateFilter;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let original = captured(&[
+                ("a", [1.0, 0.0]),
+                ("b", [0.0, 1.0]),
+                ("c", [-1.0, 0.0]),
+            ]);
+            let query =
+                BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            let exclude_all = PredicateFilter::new("exclude all", |_| false);
+            for corruption in [
+                "nan", "zero", "dimension", "producer", "duplicate", "order", "tier",
+            ] {
+                let mut snapshot = original.clone();
+                match corruption {
+                    "nan" => snapshot.records[1].embedding.values[0] = f32::NAN,
+                    "zero" => snapshot.records[1].embedding.values.fill(0.0),
+                    "dimension" => {
+                        snapshot.records[1].embedding.values.pop();
+                    }
+                    "producer" => {
+                        snapshot.records[1].embedding.identity = semantic_identity("foreign");
+                    }
+                    "duplicate" => snapshot.records[2].doc_id = "b".to_owned(),
+                    "order" => snapshot.records.swap(1, 2),
+                    "tier" => snapshot.records[1].embedder_id = "foreign".to_owned(),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    snapshot.search_filtered(&cx, &query, 1, Some(&exclude_all)).is_err(),
+                    "{corruption}",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn full_id_predicate_is_used_without_invented_metadata_or_hash_shortcuts() {
+        use frankensearch_core::filter::{DocIdHashSet, ExcludeDocIdsFilter};
+
+        struct ExactOnly;
+        impl SearchFilter for ExactOnly {
+            fn matches(&self, id: &str, metadata: Option<&serde_json::Value>) -> bool {
+                assert!(metadata.is_none());
+                id == "keep\0suffix"
+            }
+            fn matches_doc_id_hash(
+                &self,
+                _: u64,
+                _: Option<&serde_json::Value>,
+            ) -> Option<bool> {
+                panic!("the exact snapshot scan must use the full predicate")
+            }
+            fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
+                panic!("a hash inventory cannot bypass full snapshot validation")
+            }
+            fn name(&self) -> &str {
+                panic!("no diagnostic callback is required")
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let snapshot = captured(&[("keep", [1.0, 0.0]), ("keep\0suffix", [0.0, 1.0])]);
+            let query =
+                BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            let filter = ExcludeDocIdsFilter::new(Some(&ExactOnly), ["keep"]);
+            let hits = snapshot
+                .search_filtered(&cx, &query, 1, Some(&filter))
+                .unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id.as_str(), "keep\0suffix");
+            assert_eq!(hits[0].index, 1);
+        });
+    }
+
+    #[test]
+    fn filter_callbacks_observe_noop_admission_and_cancellation_precedence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use frankensearch_core::filter::PredicateFilter;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let snapshot = captured(&[("a", [1.0, 0.0]), ("b", [0.0, 1.0])]);
+            let query =
+                BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let filter_calls = Arc::clone(&calls);
+            let filter = PredicateFilter::new("count", move |_| {
+                filter_calls.fetch_add(1, Ordering::SeqCst);
+                true
+            });
+            assert!(snapshot
+                .search_filtered(&cx, &query, 0, Some(&filter))
+                .unwrap().is_empty());
+            assert!(captured(&[])
+                .search_filtered(&cx, &query, 1, Some(&filter))
+                .unwrap().is_empty());
+            let zero =
+                BoundQueryEmbedding::new(vec![0.0, 0.0], semantic_identity("model")).unwrap();
+            assert!(snapshot.search_filtered(&cx, &zero, 0, Some(&filter)).is_err());
+            let hash = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
+            assert!(snapshot.search_filtered(&cx, &hash, 0, Some(&filter)).is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            cx.cancel_with(asupersync::CancelKind::User, Some("before filter"));
+            assert!(matches!(
+                snapshot.search_filtered(&cx, &query, 1, Some(&filter)),
+                Err(SearchError::Cancelled { .. }),
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        });
+        for accept in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let snapshot = captured(&[("a", [1.0, 0.0]), ("b", [0.0, 1.0])]);
+                let query =
+                    BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+                let calls = AtomicUsize::new(0);
+                let outcome = snapshot.search_matching(&cx, &query, 1, |_, _| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("inside filter"));
+                    Ok(accept)
+                });
+                assert!(matches!(outcome, Err(SearchError::Cancelled { .. })));
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            });
+        }
     }
 }

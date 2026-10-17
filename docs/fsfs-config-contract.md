@@ -95,10 +95,16 @@ a cooperative threshold: synchronous model loading and individual allocations
 can temporarily exceed it. The `strict` profile does not impose an OS memory cap.
 
 SIGINT and SIGTERM cancel an active one-shot pass at its next checkpoint. A second
-SIGINT within three seconds exits immediately with status 130, including during a
-synchronous model load. An interrupted pass leaves its existing checkpoint safety
-rules in force: an incomplete generation may refuse searches until indexing is
-retried. The previous complete generation is not retained as an atomic snapshot.
+stop signal within three seconds (SIGINT or SIGTERM, in either order) exits
+immediately with status 130, including during a synchronous model load.
+
+On a legacy-layout index, an interrupted pass leaves its existing checkpoint
+safety rules in force: the incomplete generation refuses searches until indexing
+is retried, and `fsfs status` and `fsfs doctor` name the `fsfs index` command that
+finishes the run. A complete-generation store (see
+[`tutorials/complete-generation-rebuilds.md`](tutorials/complete-generation-rebuilds.md))
+selects a new generation only after it completes, so an interrupted pass leaves
+the previously selected generation searchable.
 
 ## `[tui]`
 

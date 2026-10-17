@@ -6,6 +6,7 @@
 //! backend for one publication tier, not ANN or a live-refreshing index.
 
 use asupersync::Cx;
+use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::types::{BoundQueryEmbedding, VectorHit};
 use frankensearch_core::{
     Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult,
@@ -195,6 +196,28 @@ impl PublishedSearchSnapshot {
         text: &str,
         limit: usize,
     ) -> SearchResult<Vec<PublishedSearchHit<'_>>> {
+        self.search_text_filtered(cx, embedder, canonicalizer, text, limit, None)
+            .await
+    }
+
+    /// Bound query inference followed by pre-top-k filtering on captured metadata.
+    ///
+    /// Preserves every producer and response check in [`Self::search_text`]. The
+    /// filter runs only after inference succeeds, against the ID and metadata
+    /// retained in this snapshot, never a later catalog lookup. No-op queries
+    /// still admit the producer but invoke neither inference nor the filter.
+    /// Predicate callbacks are synchronous and cannot be preempted; cancellation
+    /// is checked around each one. See [`Self::search_filtered`] for the exact
+    /// missing-metadata and retained-policy semantics.
+    pub async fn search_text_filtered(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        canonicalizer: &dyn Canonicalizer,
+        text: &str,
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<PublishedSearchHit<'_>>> {
         self.admit_query_producer(cx, embedder)?;
         if limit == 0 || self.is_empty() {
             return Ok(Vec::new());
@@ -223,7 +246,7 @@ impl PublishedSearchSnapshot {
         }
         let query = BoundQueryEmbedding::new(response.values, response.identity)?;
         checkpoint(cx)?;
-        self.search(cx, &query, limit)
+        self.search_filtered(cx, &query, limit, filter)
     }
 
     fn admit_query_producer(&self, cx: &Cx, embedder: &dyn Embedder) -> SearchResult<()> {
@@ -270,6 +293,31 @@ impl PublishedSearchSnapshot {
         query: &BoundQueryEmbedding,
         limit: usize,
     ) -> SearchResult<Vec<PublishedSearchHit<'_>>> {
+        self.search_filtered(cx, query, limit, None)
+    }
+
+    /// Exact top-k among matching captured documents, with source-owned metadata.
+    ///
+    /// Unlike filtering a truncated result list, every eligible record competes
+    /// for the bounded heap. The callback receives exactly `catalog().metadata`
+    /// from the same capture as its vector and text. Catalog timestamps/paths
+    /// are not synthesized into that JSON, and no live database is consulted.
+    /// `None` stays `None`: core metadata filters are permissive when metadata
+    /// is absent, so callers requiring rejection must supply such a predicate.
+    /// A retained snapshot is not a live authorization or revocation mechanism.
+    ///
+    /// Every vector and source binding is checked before its predicate, including
+    /// excluded records. Original positions, scores and tie ordering survive.
+    /// Cancellation before/after a callback discards the whole result. Zero
+    /// limits admit the query without invoking the filter. No source cloning,
+    /// database transaction, hash-hint shortcut or extra candidate pool is used.
+    pub fn search_filtered(
+        &self,
+        cx: &Cx,
+        query: &BoundQueryEmbedding,
+        limit: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<PublishedSearchHit<'_>>> {
         checkpoint(cx)?;
         if query.identity() != &self.identity {
             return Err(invalid(
@@ -277,7 +325,27 @@ impl PublishedSearchSnapshot {
                 "query does not match the captured producer",
             ));
         }
-        let hits = self.vectors.search(cx, query, limit)?;
+        let hits = if let Some(filter) = filter {
+            if limit != 0 && self.documents.len() != self.vectors.records.len() {
+                return Err(invalid("filter", "captured vectors and sources disagree"));
+            }
+            self.vectors
+                .search_matching(cx, query, limit, |index, publication| {
+                    let document = self
+                        .documents
+                        .get(index)
+                        .ok_or_else(|| invalid("filter", "candidate has no captured source"))?;
+                    if publication.doc_id != document.catalog.doc_id
+                        || publication.content_hash != document.catalog.content_hash
+                        || publication.embedder_id != self.embedder_id
+                    {
+                        return Err(invalid("filter", "candidate and source revisions disagree"));
+                    }
+                    Ok(filter.matches(&publication.doc_id, document.catalog.metadata.as_ref()))
+                })?
+        } else {
+            self.vectors.search(cx, query, limit)?
+        };
         let mut results = Vec::new();
         results
             .try_reserve_exact(hits.len())
@@ -1107,5 +1175,386 @@ mod tests {
             ));
             assert_eq!(storage.metrics_snapshot(), before);
         });
+    }
+
+    fn set_filter_metadata(storage: &Storage, id: &str, metadata: Option<serde_json::Value>) {
+        storage
+            .connection()
+            .execute_with_params_sync(
+                "UPDATE documents SET metadata_json = ?1 WHERE doc_id = ?2;",
+                &[
+                    metadata.map_or(SqliteValue::Null, |value| {
+                        SqliteValue::Text(value.to_string().into())
+                    }),
+                    SqliteValue::Text(id.to_owned().into()),
+                ],
+            )
+            .unwrap();
+    }
+
+    struct SourceFilterProbe<'a> {
+        calls: AtomicUsize,
+        cancel: Option<&'a Cx>,
+        accept: bool,
+    }
+
+    impl SearchFilter for SourceFilterProbe<'_> {
+        fn matches(&self, _: &str, metadata: Option<&serde_json::Value>) -> bool {
+            assert!(metadata.and_then(|value| value.get("tag")).is_some());
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(cx) = self.cancel {
+                cx.cancel_with(asupersync::CancelKind::User, Some("filter cancellation"));
+            }
+            self.accept
+        }
+
+        fn name(&self) -> &str {
+            panic!("filter diagnostics must not invoke another callback")
+        }
+    }
+
+    #[test]
+    fn captured_metadata_filters_before_top_k_and_survives_catalog_changes() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            publish(&storage, &queue, "a-blocked", "old blocked", [1.0, 0.0]);
+            publish(&storage, &queue, "b-keep", "old retained", [1.0, 1.0]);
+            set_filter_metadata(
+                &storage,
+                "a-blocked",
+                Some(serde_json::json!({"doc_type": "skip"})),
+            );
+            set_filter_metadata(
+                &storage,
+                "b-keep",
+                Some(serde_json::json!({"doc_type": "keep"})),
+            );
+            let old = load(&storage, &cx);
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
+            let filter = DocTypeFilter::new(["keep"]);
+            let before = storage.metrics_snapshot();
+            assert_eq!(
+                old.search(&cx, &query, 1).unwrap()[0].hit().doc_id.as_str(),
+                "a-blocked",
+            );
+            let hits = old.search_filtered(&cx, &query, 1, Some(&filter)).unwrap();
+            assert_eq!(
+                hits.len(), 1,
+                "excluded top scorer must not consume the only slot",
+            );
+            assert_eq!(hits[0].hit().doc_id.as_str(), "b-keep");
+            assert_eq!(hits[0].hit().index, 1);
+            assert!(std::ptr::eq(hits[0].document(), &old.documents()[1]));
+            assert_eq!(
+                storage.metrics_snapshot(), before,
+                "filtering does no SQL work",
+            );
+
+            set_filter_metadata(
+                &storage,
+                "a-blocked",
+                Some(serde_json::json!({"doc_type": "keep"})),
+            );
+            set_filter_metadata(
+                &storage,
+                "b-keep",
+                Some(serde_json::json!({"doc_type": "skip"})),
+            );
+            let fresh = load(&storage, &cx);
+            storage
+                .connection()
+                .execute_sync("DELETE FROM documents;")
+                .unwrap();
+            drop(queue);
+            drop(storage);
+            let retained = old.search_filtered(&cx, &query, 1, Some(&filter)).unwrap();
+            let refreshed = fresh.search_filtered(&cx, &query, 1, Some(&filter)).unwrap();
+            assert_eq!(retained[0].hit().doc_id.as_str(), "b-keep");
+            assert_eq!(retained[0].document().canonical_text(), "old retained");
+            assert_eq!(refreshed[0].hit().doc_id.as_str(), "a-blocked");
+            assert_eq!(
+                retained[0].document().catalog().metadata.as_ref().unwrap()["doc_type"],
+                "keep",
+            );
+            assert_eq!(
+                old.search_filtered(&cx, &query, 2, None)
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit.hit().clone())
+                    .collect::<Vec<_>>(),
+                old.search(&cx, &query, 2)
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit.hit().clone())
+                    .collect::<Vec<_>>(),
+            );
+        });
+    }
+
+    #[test]
+    fn metadata_chains_and_exact_exclusions_keep_the_core_missing_metadata_contract() {
+        use frankensearch_core::filter::{
+            DateRangeFilter, DocTypeFilter, ExcludeDocIdsFilter, FilterChain, FilterMode,
+        };
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            for id in [
+                "a-old", "b-excluded", "c\0keep", "d-prose", "e-absent", "f-empty",
+            ] {
+                publish(&storage, &queue, id, "body", [-1.0, 0.0]);
+            }
+            for (id, value) in [
+                (
+                    "a-old",
+                    Some(serde_json::json!({"doc_type": "code", "created_at": 5})),
+                ),
+                (
+                    "b-excluded",
+                    Some(serde_json::json!({"doc_type": "code", "created_at": 15})),
+                ),
+                (
+                    "c\0keep",
+                    Some(serde_json::json!({"doc_type": "code", "created_at": 15})),
+                ),
+                (
+                    "d-prose",
+                    Some(serde_json::json!({"doc_type": "prose", "created_at": 15})),
+                ),
+                ("e-absent", None),
+                ("f-empty", Some(serde_json::json!({}))),
+            ] {
+                set_filter_metadata(&storage, id, value);
+            }
+            let snapshot = load(&storage, &cx);
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
+            let chain = FilterChain::new(FilterMode::All)
+                .with(Box::new(DocTypeFilter::new(["code"])))
+                .with(Box::new(DateRangeFilter::between(10, 20)));
+            let filter = ExcludeDocIdsFilter::new(Some(&chain), ["b-excluded"]);
+            let hits = snapshot
+                .search_filtered(&cx, &query, usize::MAX, Some(&filter))
+                .unwrap();
+            assert_eq!(
+                hits.iter()
+                    .map(|hit| hit.hit().doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["c\0keep", "e-absent"],
+                "None is permissive; present-but-incomplete JSON is rejected by these filters",
+            );
+            assert!(hits.iter().all(|hit| hit.hit().score < -0.99));
+            assert_eq!(hits[0].document().catalog().created_at, 1);
+            assert_eq!(
+                hits[0].document().catalog().metadata.as_ref().unwrap()["created_at"],
+                15,
+            );
+        });
+    }
+
+    #[test]
+    fn excluded_source_bindings_are_validated_before_filter_callbacks() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            publish(&storage, &queue, "a", "source a", [1.0, 0.0]);
+            publish(&storage, &queue, "b", "source b", [0.0, 1.0]);
+            let original = load(&storage, &cx);
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
+            for corruption in ["id", "revision", "length", "vector"] {
+                let mut snapshot = original.clone();
+                match corruption {
+                    "id" => snapshot.documents[1].catalog.doc_id = "foreign".to_owned(),
+                    "revision" => snapshot.documents[1].catalog.content_hash = [0; 32],
+                    "length" => {
+                        snapshot.documents.pop();
+                    }
+                    "vector" => snapshot.vectors.records[1].embedding.values[0] = f32::NAN,
+                    _ => unreachable!(),
+                }
+                let filter = SourceFilterProbe {
+                    calls: AtomicUsize::new(0),
+                    cancel: None,
+                    accept: false,
+                };
+                assert!(
+                    snapshot.search_filtered(&cx, &query, 1, Some(&filter)).is_err(),
+                    "{corruption}",
+                );
+                assert_eq!(
+                    filter.calls.load(Ordering::SeqCst),
+                    usize::from(corruption != "length"),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn filtered_text_queries_keep_bound_dispatch_and_reject_bad_providers_before_filters() {
+        use frankensearch_core::filter::DocTypeFilter;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            publish(&storage, &queue, "a-blocked", "blocked", [1.0, 0.0]);
+            publish(&storage, &queue, "b-keep", "retained", [0.0, 1.0]);
+            set_filter_metadata(
+                &storage,
+                "a-blocked",
+                Some(serde_json::json!({"doc_type": "skip"})),
+            );
+            set_filter_metadata(
+                &storage,
+                "b-keep",
+                Some(serde_json::json!({"doc_type": "keep"})),
+            );
+            let captured = load(&storage, &cx);
+            drop(queue);
+            drop(storage);
+            let probe = QueryProbe::new(QueryReply::Normal);
+            let canonicalizer = QueryCanonicalizer {
+                drift: None,
+                empty: false,
+            };
+            let filter = DocTypeFilter::new(["keep"]);
+            let hits = captured
+                .search_text_filtered(&cx, &probe, &canonicalizer, "  orchard  ", 1, Some(&filter))
+                .await
+                .unwrap();
+            assert_eq!(hits[0].hit().doc_id.as_str(), "b-keep");
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(*probe.inputs.lock().unwrap(), ["orchard"]);
+            assert!(std::ptr::eq(hits[0].document(), &captured.documents()[1]));
+            for reply in [
+                QueryReply::Foreign,
+                QueryReply::BadDimension,
+                QueryReply::NonFinite,
+                QueryReply::Zero,
+                QueryReply::DriftSuccess,
+                QueryReply::DriftError,
+                QueryReply::Error,
+            ] {
+                let probe = QueryProbe::new(reply);
+                let filter = SourceFilterProbe {
+                    calls: AtomicUsize::new(0),
+                    cancel: None,
+                    accept: false,
+                };
+                assert!(
+                    captured
+                        .search_text_filtered(&cx, &probe, &canonicalizer, "orchard", 1, Some(&filter))
+                        .await
+                        .is_err()
+                );
+                assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+            }
+            for empty in [false, true] {
+                let probe = QueryProbe::new(QueryReply::Normal);
+                let canonicalizer = QueryCanonicalizer {
+                    drift: Some(Arc::clone(&probe.drift)),
+                    empty,
+                };
+                let filter = SourceFilterProbe {
+                    calls: AtomicUsize::new(0),
+                    cancel: None,
+                    accept: false,
+                };
+                assert!(
+                    captured
+                        .search_text_filtered(&cx, &probe, &canonicalizer, "orchard", 1, Some(&filter))
+                        .await
+                        .is_err()
+                );
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn filtered_noops_and_wrong_queries_never_run_the_predicate() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            let empty = load(&storage, &cx);
+            publish(&storage, &queue, "doc", "source", [1.0, 0.0]);
+            let full = load(&storage, &cx);
+            let query = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
+            let wrong = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("foreign")).unwrap();
+            let probe = QueryProbe::new(QueryReply::Normal);
+            let canonicalizer = QueryCanonicalizer {
+                drift: None,
+                empty: false,
+            };
+            let filter = SourceFilterProbe {
+                calls: AtomicUsize::new(0),
+                cancel: None,
+                accept: true,
+            };
+            for snapshot in [&empty, &full] {
+                assert!(
+                    snapshot
+                        .search_filtered(&cx, &query, 0, Some(&filter))
+                        .unwrap()
+                        .is_empty()
+                );
+                for k in [0, 1] {
+                    assert!(snapshot.search_filtered(&cx, &wrong, k, Some(&filter)).is_err());
+                }
+            }
+            for (snapshot, text, k) in [
+                (&empty, "query", 1), (&full, "query", 0), (&full, " \t ", 1),
+            ] {
+                assert!(
+                    snapshot
+                        .search_text_filtered(&cx, &probe, &canonicalizer, text, k, Some(&filter))
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+            probe.drift.store(true, Ordering::SeqCst);
+            assert!(
+                full.search_text_filtered(&cx, &probe, &canonicalizer, "", 0, Some(&filter))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+            cx.cancel_with(asupersync::CancelKind::User, Some("before filtered search"));
+            assert!(matches!(
+                full.search_filtered(&cx, &query, 1, Some(&filter)),
+                Err(SearchError::Cancelled { .. }),
+            ));
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn captured_metadata_callback_cancellation_discards_results_for_accept_and_reject() {
+        for accept in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (storage, queue) = fixture();
+                for id in ["a", "b"] {
+                    publish(&storage, &queue, id, "source", [1.0, 0.0]);
+                }
+                let snapshot = load(&storage, &cx);
+                let probe = QueryProbe::new(QueryReply::Normal);
+                let canonicalizer = QueryCanonicalizer {
+                    drift: None,
+                    empty: false,
+                };
+                let filter = SourceFilterProbe {
+                    calls: AtomicUsize::new(0),
+                    cancel: Some(&cx),
+                    accept,
+                };
+                let outcome = snapshot
+                    .search_text_filtered(&cx, &probe, &canonicalizer, "orchard", 1, Some(&filter))
+                    .await;
+                assert!(matches!(outcome, Err(SearchError::Cancelled { .. })));
+                assert_eq!(filter.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+            });
+        }
     }
 }
