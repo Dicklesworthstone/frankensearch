@@ -17860,12 +17860,16 @@ impl FsfsRuntime {
                 let Some(manifest) = previous_manifests.get(&candidate.file_key) else {
                     continue;
                 };
-                if entry.revision != revision
-                    || entry.ingestion_class != ingestion_class_label(candidate.ingestion_class)
-                {
+                if entry.ingestion_class != ingestion_class_label(candidate.ingestion_class) {
                     continue;
                 }
-                let unchanged = entry.canonical_lines.is_some()
+                // A new mtime over the same bytes keeps the file's vectors once
+                // its digest confirms them, but the file is reread, never
+                // carried, so its rows and manifest take the new revision
+                // (bd-rhpnx).
+                let revision_changed = entry.revision != revision;
+                let unchanged = !revision_changed
+                    && entry.canonical_lines.is_some()
                     && (observed_unchanged(&candidate.file_path)
                         || same_stamp(candidate, entry.stamp.as_ref()));
                 let content_hash_hex = if unchanged {
@@ -17894,7 +17898,8 @@ impl FsfsRuntime {
                     continue;
                 }
                 // Complete reuse already requires the recorded digest.
-                let carriable = unchanged || (receipt_carry && entry.canonical_lines.is_some());
+                let carriable = !revision_changed
+                    && (unchanged || (receipt_carry && entry.canonical_lines.is_some()));
                 if carriable && reuse == CheckpointReuse::Complete {
                     unchanged_complete.insert(
                         candidate.file_key.clone(),
@@ -28842,14 +28847,18 @@ fn checkpoint_entry_reuse(
 ) -> CheckpointReuse {
     let ingestion_class = ingestion_class_label(candidate.ingestion_class);
     let reason_code = ingestion_plan_reason(candidate.ingestion_class);
-    let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
-    if entry.revision != revision
+    // Reuse follows the bytes, not the mtime: vectors derive from content
+    // alone, so a file whose mtime changed over the same digest keeps them
+    // (bd-rhpnx). Its rows still take the new revision, since such a file is
+    // reread rather than carried. The entry must still describe the rows the
+    // generation holds: a manifest at another revision means they were built
+    // from other bytes (a watched edit since restored), so nothing is reused.
+    if entry.revision != manifest.revision
         || entry.ingestion_class != ingestion_class
         || entry.content_hash_hex != content_hash_hex
         || entry.content_hash_hex.is_empty()
         || entry.reason_code != reason_code
         || manifest.file_key != candidate.file_key
-        || manifest.revision != revision
         || manifest.ingestion_class != ingestion_class
         || manifest.canonical_bytes != entry.canonical_bytes
         || manifest.reason_code != reason_code
@@ -52563,10 +52572,47 @@ mod tests {
             super::CheckpointReuse::LexicalOnly
         );
 
+        // An entry at another revision than the manifest no longer describes
+        // the rows the generation holds.
         let mut stale_entry = entry.clone();
         stale_entry.revision = 41;
         assert_eq!(
             reuse(&checkpoint, &stale_entry, "abc123", &live_vector_ids),
+            super::CheckpointReuse::None
+        );
+
+        // A later mtime over the same digest is the same source: reuse follows
+        // the bytes, not the mtime (bd-rhpnx).
+        let touched = super::IndexCandidate {
+            modified_ms: 43,
+            ..candidate.clone()
+        };
+        assert_eq!(
+            super::checkpoint_entry_reuse(
+                &checkpoint,
+                &entry,
+                &manifest,
+                &touched,
+                "abc123",
+                "hash-fnv1a",
+                256,
+                false,
+                &live_vector_ids,
+            ),
+            super::CheckpointReuse::Complete
+        );
+        assert_eq!(
+            super::checkpoint_entry_reuse(
+                &checkpoint,
+                &entry,
+                &manifest,
+                &touched,
+                "changed",
+                "hash-fnv1a",
+                256,
+                false,
+                &live_vector_ids,
+            ),
             super::CheckpointReuse::None
         );
 

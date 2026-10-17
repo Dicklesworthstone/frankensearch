@@ -2049,6 +2049,47 @@ mod generation_tests {
             });
         }
 
+        /// A file whose mtime moved over unchanged bytes keeps both of its
+        /// vectors: its digest confirms the bytes, so only its rows and
+        /// manifest take the new revision (bd-rhpnx). Changed bytes are still
+        /// embedded again.
+        #[test]
+        fn an_mtime_only_change_keeps_vectors_and_records_the_new_revision() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, root) = fixture(parent.path(), 2);
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
+
+                let touched = source.join("doc-0.md");
+                let later = fs::metadata(&touched).unwrap().modified().unwrap()
+                    + std::time::Duration::from_secs(60);
+                fs::File::options()
+                    .write(true)
+                    .open(&touched)
+                    .unwrap()
+                    .set_modified(later)
+                    .unwrap();
+                let report = run_counted_legacy(&cx, parent.path(), "index").await;
+                assert_index_calls(&report, 0, 0);
+                assert_eq!(report["indexed_files"], 2);
+                let revision = FsfsRuntime::read_index_manifest(&root)
+                    .unwrap()
+                    .unwrap()
+                    .into_iter()
+                    .find(|entry| entry.file_key == "doc-0.md")
+                    .unwrap()
+                    .revision;
+                assert_eq!(
+                    revision,
+                    i64::try_from(super::super::super::system_time_to_ms(later)).unwrap(),
+                    "the touched file's rows take its new modification time"
+                );
+
+                fs::write(&touched, "sharedtoken rewritten document").unwrap();
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 1, 1);
+            });
+        }
+
         #[test]
         fn fast_window_later_batch_failure_never_publishes_a_partial_source() {
             run_test_with_cx(|cx| async move {

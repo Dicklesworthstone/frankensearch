@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use asupersync::channel::oneshot;
 use frankensearch_core::generation::QuantizationFormat;
 use frankensearch_core::{
-    Cx, Embedder, EmbeddingIdentityBundleV1, IdentityBoundEmbedding, ModelCategory,
-    SearchError, SearchFuture, SearchResult,
+    Cx, Embedder, EmbeddingIdentityBundleV1, IdentityBoundEmbedding, ModelCategory, SearchError,
+    SearchFuture, SearchResult,
 };
 
 use crate::batch_coalescer::{
@@ -128,9 +128,15 @@ impl CoalescingEmbedder {
         expected.validate()?;
         if expected.storage.quantization != QuantizationFormat::F32
             || !expected.storage.format.starts_with("in-memory-")
-            || !matches!(expected.storage.endianness.as_str(), "native-f32-values" | "native-test-only")
+            || !matches!(
+                expected.storage.endianness.as_str(),
+                "native-f32-values" | "native-test-only"
+            )
         {
-            return Err(invalid("identity", "expected an in-memory native f32 contract"));
+            return Err(invalid(
+                "identity",
+                "expected an in-memory native f32 contract",
+            ));
         }
         check_provider(cx, provider.as_ref(), &expected)?;
         let description = Description {
@@ -152,7 +158,10 @@ impl CoalescingEmbedder {
             state: Mutex::new(State::default()),
         });
         Ok((
-            Self { shared: Arc::clone(&shared), priority: Priority::Interactive },
+            Self {
+                shared: Arc::clone(&shared),
+                priority: Priority::Interactive,
+            },
             CoalescingDispatcher { shared, provider },
         ))
     }
@@ -160,7 +169,10 @@ impl CoalescingEmbedder {
     /// Another handle to the same queue/producer with a different priority.
     #[must_use]
     pub fn with_priority(&self, priority: Priority) -> Self {
-        Self { shared: Arc::clone(&self.shared), priority }
+        Self {
+            shared: Arc::clone(&self.shared),
+            priority,
+        }
     }
 
     /// Explicitly close admission for all clones; already queued work can drain.
@@ -175,7 +187,11 @@ impl CoalescingEmbedder {
         self.shared.queue.usage()
     }
 
-    fn submit(&self, cx: &Cx, text: &str) -> SearchResult<oneshot::Receiver<SearchResult<IdentityBoundEmbedding>>> {
+    fn submit(
+        &self,
+        cx: &Cx,
+        text: &str,
+    ) -> SearchResult<oneshot::Receiver<SearchResult<IdentityBoundEmbedding>>> {
         checkpoint(cx)?;
         // Reject an impossible input before copying the borrowed caller text.
         if text.len() > self.shared.queue.limits().max_outstanding_text_bytes {
@@ -189,7 +205,10 @@ impl CoalescingEmbedder {
             }
             // Reserve reply capacity BEFORE queue admission. Once submit succeeds,
             // no allocation is needed to establish its ordered reply mapping.
-            state.replies.try_reserve(1).map_err(|_| invalid("replies", "reply allocation failed"))?;
+            state
+                .replies
+                .try_reserve(1)
+                .map_err(|_| invalid("replies", "reply allocation failed"))?;
             let raw = self.shared.queue.submit(text.to_owned(), self.priority);
             match raw.try_recv() {
                 Err(TryRecvError::Empty) => state.replies.push_back(Reply { raw, bound }),
@@ -208,7 +227,11 @@ impl Embedder for CoalescingEmbedder {
         Box::pin(async move { self.embed_bound(cx, text).await.map(|output| output.values) })
     }
 
-    fn embed_bound<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, IdentityBoundEmbedding> {
+    fn embed_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+    ) -> SearchFuture<'a, IdentityBoundEmbedding> {
         Box::pin(async move {
             let mut receiver = self.submit(cx, text)?;
             let outcome = receiver.recv(cx).await;
@@ -225,7 +248,11 @@ impl Embedder for CoalescingEmbedder {
         })
     }
 
-    fn embed_batch_bound<'a>(&'a self, cx: &'a Cx, texts: &'a [&'a str]) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+    fn embed_batch_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
             checkpoint(cx)?;
             let mut outputs = Vec::with_capacity(texts.len());
@@ -239,13 +266,27 @@ impl Embedder for CoalescingEmbedder {
 
     // A single caller's batch remains sequential; independent concurrent callers
     // are coalesced by the dispatcher. Never bypass our real bound singleton.
-    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> { Ok(&self.shared.identity) }
-    fn dimension(&self) -> usize { self.shared.description.dimension }
-    fn id(&self) -> &str { &self.shared.description.id }
-    fn model_name(&self) -> &str { &self.shared.description.name }
-    fn is_semantic(&self) -> bool { self.shared.description.semantic }
-    fn category(&self) -> ModelCategory { self.shared.description.category }
-    fn supports_mrl(&self) -> bool { self.shared.description.mrl }
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.shared.identity)
+    }
+    fn dimension(&self) -> usize {
+        self.shared.description.dimension
+    }
+    fn id(&self) -> &str {
+        &self.shared.description.id
+    }
+    fn model_name(&self) -> &str {
+        &self.shared.description.name
+    }
+    fn is_semantic(&self) -> bool {
+        self.shared.description.semantic
+    }
+    fn category(&self) -> ModelCategory {
+        self.shared.description.category
+    }
+    fn supports_mrl(&self) -> bool {
+        self.shared.description.mrl
+    }
     fn is_ready(&self) -> bool {
         self.shared.description.ready && self.shared.state.lock().is_ok_and(|state| !state.closed)
     }
@@ -255,37 +296,56 @@ impl Shared {
     fn lock(&self) -> SearchResult<MutexGuard<'_, State>> {
         // Poison can mean queue admission happened without its matching reply.
         // Do not repair that invariant by guessing an association.
-        self.state.lock().map_err(|_| invalid("state", "coalescing reply state is poisoned"))
+        self.state
+            .lock()
+            .map_err(|_| invalid("state", "coalescing reply state is poisoned"))
     }
 
     fn take_work(&self) -> SearchResult<Option<Work>> {
         let mut state = self.lock()?;
-        let Some(batch) = self.queue.try_form_batch() else { return Ok(None); };
+        let Some(batch) = self.queue.try_form_batch() else {
+            return Ok(None);
+        };
         let count = batch.len();
         if count > state.replies.len() {
             state.closed = true;
             self.queue.shutdown();
-            return Err(invalid("replies", "coalesced request/reply inventory differs"));
+            return Err(invalid(
+                "replies",
+                "coalesced request/reply inventory differs",
+            ));
         }
         let replies = state.replies.drain(..count).collect();
+        drop(state);
         Ok(Some(Work { batch, replies }))
     }
 
+    // The queue shuts down under the state lock, as in abort_pending, so
+    // take_work cannot pair a batch between the two.
+    #[allow(clippy::significant_drop_tightening)]
     fn close(&self) {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.closed = true;
         self.queue.shutdown();
     }
 
     fn abort_pending(&self) {
         let replies = {
-            let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.closed = true;
             self.queue.shutdown();
             std::mem::take(&mut state.replies)
         };
         // Channel close can wake arbitrary caller code: no adapter lock is held.
-        while let Some(batch) = self.queue.try_form_batch() { drop(batch); }
+        while let Some(batch) = self.queue.try_form_batch() {
+            drop(batch);
+        }
         drop(replies);
     }
 }
@@ -304,11 +364,13 @@ impl CoalescingDispatcher {
     /// queued batches. The owner decides whether to continue or drop the dispatcher.
     pub async fn dispatch_ready(&mut self, cx: &Cx) -> SearchResult<usize> {
         checkpoint(cx)?;
-        let Some(work) = self.shared.take_work()? else { return Ok(0); };
+        let Some(work) = self.shared.take_work()? else {
+            return Ok(0);
+        };
         self.execute(cx, work).await
     }
 
-    async fn execute(&mut self, cx: &Cx, work: Work) -> SearchResult<usize> {
+    async fn execute(&self, cx: &Cx, work: Work) -> SearchResult<usize> {
         let Work { batch, replies } = work;
         let count = replies.len();
         if replies.iter().all(|reply| reply.bound.is_closed()) {
@@ -319,19 +381,29 @@ impl CoalescingDispatcher {
         // exact equality of every actual response with our immutable contract.
         // Reattaching that same contract below translates the validated transport;
         // it does not bind unchecked raw provider output to advertised metadata.
-        let outcome = batch.embed_and_deliver(cx, self.provider.as_ref(), &self.shared.identity).await;
+        let outcome = batch
+            .embed_and_deliver(cx, self.provider.as_ref(), &self.shared.identity)
+            .await;
         let outcome = checkpoint(cx).and(outcome);
         let outputs = outcome.and_then(|()| {
-            replies.iter().map(|reply| {
-                checkpoint(cx)?;
-                let values = match reply.raw.try_recv() {
-                    Ok(Ok(values)) => values,
-                    _ => return Err(invalid("replies", "validated batch did not deliver its complete result")),
-                };
-                let output = IdentityBoundEmbedding { values, identity: self.shared.identity.clone() };
-                output.validate()?;
-                Ok(output)
-            }).collect::<SearchResult<Vec<_>>>()
+            replies
+                .iter()
+                .map(|reply| {
+                    checkpoint(cx)?;
+                    let Ok(Ok(values)) = reply.raw.try_recv() else {
+                        return Err(invalid(
+                            "replies",
+                            "validated batch did not deliver its complete result",
+                        ));
+                    };
+                    let output = IdentityBoundEmbedding {
+                        values,
+                        identity: self.shared.identity.clone(),
+                    };
+                    output.validate()?;
+                    Ok(output)
+                })
+                .collect::<SearchResult<Vec<_>>>()
         });
         let outputs = checkpoint(cx).and(outputs);
         match outputs {
@@ -355,7 +427,9 @@ impl CoalescingDispatcher {
 }
 
 impl Drop for CoalescingDispatcher {
-    fn drop(&mut self) { self.shared.abort_pending(); }
+    fn drop(&mut self) {
+        self.shared.abort_pending();
+    }
 }
 
 fn invalid(field: &str, reason: &str) -> SearchError {
@@ -367,13 +441,18 @@ fn invalid(field: &str, reason: &str) -> SearchError {
 }
 
 fn stopped(reason: &str) -> SearchError {
-    SearchError::Cancelled { phase: "coalescing_embedder".to_owned(), reason: reason.to_owned() }
+    SearchError::Cancelled {
+        phase: "coalescing_embedder".to_owned(),
+        reason: reason.to_owned(),
+    }
 }
 
 fn checkpoint(cx: &Cx) -> SearchResult<()> {
     if cx.checkpoint().is_err() || cx.is_cancel_requested() {
         Err(stopped("coalesced operation cancelled"))
-    } else { Ok(()) }
+    } else {
+        Ok(())
+    }
 }
 
 fn identity_mismatch() -> SearchError {
@@ -383,13 +462,21 @@ fn identity_mismatch() -> SearchError {
     }
 }
 
-fn check_provider(cx: &Cx, provider: &dyn Embedder, expected: &EmbeddingIdentityBundleV1) -> SearchResult<()> {
+fn check_provider(
+    cx: &Cx,
+    provider: &dyn Embedder,
+    expected: &EmbeddingIdentityBundleV1,
+) -> SearchResult<()> {
     let identity = provider.identity();
     checkpoint(cx)?;
-    if !identity.is_ok_and(|actual| actual == expected) { return Err(identity_mismatch()); }
+    if !identity.is_ok_and(|actual| actual == expected) {
+        return Err(identity_mismatch());
+    }
     let dimension = provider.dimension();
     checkpoint(cx)?;
-    if usize::try_from(expected.space.dimension).ok() != Some(dimension) { return Err(identity_mismatch()); }
+    if usize::try_from(expected.space.dimension).ok() != Some(dimension) {
+        return Err(identity_mismatch());
+    }
     Ok(())
 }
 
@@ -397,8 +484,9 @@ fn public_failure(error: &SearchError) -> SearchError {
     match error {
         SearchError::Cancelled { .. } => stopped("coalesced inference cancelled"),
         SearchError::UnverifiableRemoteSpace { .. } => identity_mismatch(),
-        SearchError::InvalidConfig { .. } | SearchError::DimensionMismatch { .. } =>
-            invalid("response", "coalesced response failed admission"),
+        SearchError::InvalidConfig { .. } | SearchError::DimensionMismatch { .. } => {
+            invalid("response", "coalesced response failed admission")
+        }
         _ => SearchError::EmbeddingFailed {
             model: "coalescing_embedder".to_owned(),
             source: "coalesced inference failed; dispatcher retains the detailed error".into(),
