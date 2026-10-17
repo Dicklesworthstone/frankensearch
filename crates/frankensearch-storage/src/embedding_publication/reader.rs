@@ -1367,16 +1367,18 @@ mod tests {
         use frankensearch_core::filter::PredicateFilter;
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let original = captured(&[
-                ("a", [1.0, 0.0]),
-                ("b", [0.0, 1.0]),
-                ("c", [-1.0, 0.0]),
-            ]);
+            let original = captured(&[("a", [1.0, 0.0]), ("b", [0.0, 1.0]), ("c", [-1.0, 0.0])]);
             let query =
                 BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
             let exclude_all = PredicateFilter::new("exclude all", |_| false);
             for corruption in [
-                "nan", "zero", "dimension", "producer", "duplicate", "order", "tier",
+                "nan",
+                "zero",
+                "dimension",
+                "producer",
+                "duplicate",
+                "order",
+                "tier",
             ] {
                 let mut snapshot = original.clone();
                 match corruption {
@@ -1394,7 +1396,9 @@ mod tests {
                     _ => unreachable!(),
                 }
                 assert!(
-                    snapshot.search_filtered(&cx, &query, 1, Some(&exclude_all)).is_err(),
+                    snapshot
+                        .search_filtered(&cx, &query, 1, Some(&exclude_all))
+                        .is_err(),
                     "{corruption}",
                 );
             }
@@ -1411,11 +1415,7 @@ mod tests {
                 assert!(metadata.is_none());
                 id == "keep\0suffix"
             }
-            fn matches_doc_id_hash(
-                &self,
-                _: u64,
-                _: Option<&serde_json::Value>,
-            ) -> Option<bool> {
+            fn matches_doc_id_hash(&self, _: u64, _: Option<&serde_json::Value>) -> Option<bool> {
                 panic!("the exact snapshot scan must use the full predicate")
             }
             fn candidate_hashes(&self) -> Option<&DocIdHashSet> {
@@ -1441,8 +1441,8 @@ mod tests {
 
     #[test]
     fn filter_callbacks_observe_noop_admission_and_cancellation_precedence() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use frankensearch_core::filter::PredicateFilter;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let snapshot = captured(&[("a", [1.0, 0.0]), ("b", [0.0, 1.0])]);
@@ -1454,17 +1454,31 @@ mod tests {
                 filter_calls.fetch_add(1, Ordering::SeqCst);
                 true
             });
-            assert!(snapshot
-                .search_filtered(&cx, &query, 0, Some(&filter))
-                .unwrap().is_empty());
-            assert!(captured(&[])
-                .search_filtered(&cx, &query, 1, Some(&filter))
-                .unwrap().is_empty());
+            assert!(
+                snapshot
+                    .search_filtered(&cx, &query, 0, Some(&filter))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                captured(&[])
+                    .search_filtered(&cx, &query, 1, Some(&filter))
+                    .unwrap()
+                    .is_empty()
+            );
             let zero =
                 BoundQueryEmbedding::new(vec![0.0, 0.0], semantic_identity("model")).unwrap();
-            assert!(snapshot.search_filtered(&cx, &zero, 0, Some(&filter)).is_err());
+            assert!(
+                snapshot
+                    .search_filtered(&cx, &zero, 0, Some(&filter))
+                    .is_err()
+            );
             let hash = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("model")).unwrap();
-            assert!(snapshot.search_filtered(&cx, &hash, 0, Some(&filter)).is_err());
+            assert!(
+                snapshot
+                    .search_filtered(&cx, &hash, 0, Some(&filter))
+                    .is_err()
+            );
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             cx.cancel_with(asupersync::CancelKind::User, Some("before filter"));
             assert!(matches!(

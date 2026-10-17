@@ -97,7 +97,9 @@ impl PublishedSearchCohort {
     ) -> SearchResult<Vec<PublishedRerankedHit<'cohort>>> {
         checkpoint(cx)?;
         if !(1..=86_400_000).contains(&options.timeout_ms) {
-            return Err(invalid("reranking timeout must be between 1 ms and 24 hours"));
+            return Err(invalid(
+                "reranking timeout must be between 1 ms and 24 hours",
+            ));
         }
         let result = crate::publication_progressive::run_bounded(
             cx,
@@ -222,7 +224,9 @@ impl PublishedSearchCohort {
                 .is_some_and(|owner| std::ptr::eq(owner, snapshot))
                 || !tier_ids.insert(snapshot.embedder_id())
             {
-                return Err(invalid("candidate tiers must be distinct owners from this cohort"));
+                return Err(invalid(
+                    "candidate tiers must be distinct owners from this cohort",
+                ));
             }
             let mut seen = BTreeSet::new();
             for hit in tier.hits() {
@@ -240,7 +244,9 @@ impl PublishedSearchCohort {
                     || !hit.hit().score.is_finite()
                     || !seen.insert(id)
                 {
-                    return Err(invalid("candidate does not bind a unique retained document"));
+                    return Err(invalid(
+                        "candidate does not bind a unique retained document",
+                    ));
                 }
                 if let Some(&position) = positions.get(id) {
                     let previous: &PublishedSearchDocument = candidates[position];
@@ -285,7 +291,9 @@ fn validate_scores(
 ) -> SearchResult<()> {
     checkpoint(cx)?;
     if scores.len() != documents.len() {
-        return Err(invalid_response("one reranking result is required per candidate"));
+        return Err(invalid_response(
+            "one reranking result is required per candidate",
+        ));
     }
     let mut seen = Vec::new();
     seen.try_reserve_exact(documents.len())
@@ -294,14 +302,18 @@ fn validate_scores(
     for score in scores {
         checkpoint(cx)?;
         let Some(document) = documents.get(score.original_rank) else {
-            return Err(invalid_response("reranker returned an out-of-range original rank"));
+            return Err(invalid_response(
+                "reranker returned an out-of-range original rank",
+            ));
         };
         if score.doc_id != document.doc_id
             || seen[score.original_rank]
             || !score.score.is_finite()
             || score.raw_logit.is_some_and(|logit| !logit.is_finite())
         {
-            return Err(invalid_response("reranker returned invalid membership, rank or score"));
+            return Err(invalid_response(
+                "reranker returned invalid membership, rank or score",
+            ));
         }
         seen[score.original_rank] = true;
     }
@@ -342,7 +354,9 @@ mod tests {
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
     use frankensearch_core::traits::SearchFuture;
-    use frankensearch_core::{BoundQueryEmbedding, EmbeddingIdentityBundleV1, IdentityBoundEmbedding};
+    use frankensearch_core::{
+        BoundQueryEmbedding, EmbeddingIdentityBundleV1, IdentityBoundEmbedding,
+    };
 
     use super::*;
     use crate::{
@@ -398,8 +412,14 @@ mod tests {
             .load_published_search_cohort(
                 cx,
                 &[
-                    PublishedSearchTierRequest { embedder_id: "fast", identity: &identity("fast") },
-                    PublishedSearchTierRequest { embedder_id: "quality", identity: &identity("quality") },
+                    PublishedSearchTierRequest {
+                        embedder_id: "fast",
+                        identity: &identity("fast"),
+                    },
+                    PublishedSearchTierRequest {
+                        embedder_id: "quality",
+                        identity: &identity("quality"),
+                    },
                 ],
                 PublishedSearchReadLimits::default(),
             )
@@ -410,20 +430,57 @@ mod tests {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
         publish(&storage, &queue, "a", "fast", "first source", [1.0, 0.0]);
-        publish(&storage, &queue, "shared", "fast", "shared α source", [0.0, 1.0]);
-        publish(&storage, &queue, "shared", "quality", "shared α source", [1.0, 0.0]);
-        publish(&storage, &queue, "quality-only", "quality", "target source", [-1.0, 0.0]);
+        publish(
+            &storage,
+            &queue,
+            "shared",
+            "fast",
+            "shared α source",
+            [0.0, 1.0],
+        );
+        publish(
+            &storage,
+            &queue,
+            "shared",
+            "quality",
+            "shared α source",
+            [1.0, 0.0],
+        );
+        publish(
+            &storage,
+            &queue,
+            "quality-only",
+            "quality",
+            "target source",
+            [-1.0, 0.0],
+        );
         let cohort = load(&storage, cx);
         (storage, cohort)
     }
 
-    fn retrieve<'a>(cohort: &'a PublishedSearchCohort, cx: &Cx) -> Vec<PublishedSearchTierHits<'a>> {
+    fn retrieve<'a>(
+        cohort: &'a PublishedSearchCohort,
+        cx: &Cx,
+    ) -> Vec<PublishedSearchTierHits<'a>> {
         let fast = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("fast")).unwrap();
         let quality = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("quality")).unwrap();
-        cohort.search(cx, &[
-            PublishedSearchTierQuery { embedder_id: "fast", query: &fast, limit: 10 },
-            PublishedSearchTierQuery { embedder_id: "quality", query: &quality, limit: 10 },
-        ]).unwrap()
+        cohort
+            .search(
+                cx,
+                &[
+                    PublishedSearchTierQuery {
+                        embedder_id: "fast",
+                        query: &fast,
+                        limit: 10,
+                    },
+                    PublishedSearchTierQuery {
+                        embedder_id: "quality",
+                        query: &quality,
+                        limit: 10,
+                    },
+                ],
+            )
+            .unwrap()
     }
 
     #[derive(Clone, Copy)]
@@ -482,8 +539,10 @@ mod tests {
                 let _guard = OnDrop(Arc::clone(&self.dropped));
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(query, "query");
-                *self.inputs.lock().unwrap() = documents.iter()
-                    .map(|document| (document.doc_id.clone(), document.text.clone())).collect();
+                *self.inputs.lock().unwrap() = documents
+                    .iter()
+                    .map(|document| (document.doc_id.clone(), document.text.clone()))
+                    .collect();
                 if matches!(self.reply, Reply::Pending) {
                     std::future::pending::<()>().await;
                 }
@@ -493,23 +552,33 @@ mod tests {
                 }
                 if matches!(self.reply, Reply::ExplicitCancel) {
                     return Err(SearchError::Cancelled {
-                        phase: "test-provider".to_owned(), reason: "explicit stop".to_owned(),
+                        phase: "test-provider".to_owned(),
+                        reason: "explicit stop".to_owned(),
                     });
                 }
                 if matches!(self.reply, Reply::Error) {
                     return Err(invalid_response("ordinary provider error"));
                 }
-                let mut scores: Vec<_> = documents.iter().enumerate().map(|(rank, document)| {
-                    RerankScore {
+                let mut scores: Vec<_> = documents
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, document)| RerankScore {
                         doc_id: document.doc_id.clone(),
-                        score: if matches!(self.reply, Reply::Ties) { -2.0 }
-                            else if document.text == "target source" { 7.0 } else { -2.0 },
+                        score: if matches!(self.reply, Reply::Ties) {
+                            -2.0
+                        } else if document.text == "target source" {
+                            7.0
+                        } else {
+                            -2.0
+                        },
                         original_rank: rank,
                         raw_logit: None,
-                    }
-                }).collect();
+                    })
+                    .collect();
                 match self.reply {
-                    Reply::Missing => { scores.pop(); }
+                    Reply::Missing => {
+                        scores.pop();
+                    }
                     Reply::Extra => scores.push(scores[0].clone()),
                     Reply::Duplicate => scores[1] = scores[0].clone(),
                     Reply::Foreign => scores[1].doc_id = "private-score-canary".to_owned(),
@@ -522,8 +591,12 @@ mod tests {
                 Ok(scores)
             })
         }
-        fn id(&self) -> &str { "retained-rerank-probe" }
-        fn model_name(&self) -> &str { self.id() }
+        fn id(&self) -> &str {
+            "retained-rerank-probe"
+        }
+        fn model_name(&self) -> &str {
+            self.id()
+        }
         fn is_available(&self) -> bool {
             self.availability_calls.fetch_add(1, Ordering::SeqCst);
             !matches!(self.reply, Reply::Unavailable)
@@ -536,12 +609,23 @@ mod tests {
             let (storage, cohort) = fixture(&cx);
             let tiers = retrieve(&cohort, &cx);
             assert_eq!(tiers[0].hits().len() + tiers[1].hits().len(), 4);
-            storage.connection().execute_sync("DELETE FROM documents;").unwrap();
+            storage
+                .connection()
+                .execute_sync("DELETE FROM documents;")
+                .unwrap();
             drop(storage);
             let probe = Probe::new(Reply::Normal);
-            let results = cohort.rerank_candidates(
-                &cx, &probe, "query", &tiers, 2, PublishedRerankLimits::default(),
-            ).await.unwrap();
+            let results = cohort
+                .rerank_candidates(
+                    &cx,
+                    &probe,
+                    "query",
+                    &tiers,
+                    2,
+                    PublishedRerankLimits::default(),
+                )
+                .await
+                .unwrap();
             drop(tiers); // Result source lifetime is the cohort's, not these lists'.
             assert_eq!(results.len(), 2);
             assert_eq!(results[0].document().catalog().doc_id, "quality-only");
@@ -549,11 +633,14 @@ mod tests {
             assert_eq!(results[0].score().original_rank, 2);
             assert_eq!(results[1].document().catalog().doc_id, "a");
             assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(*probe.inputs.lock().unwrap(), [
-                ("a".to_owned(), "first source".to_owned()),
-                ("shared".to_owned(), "shared α source".to_owned()),
-                ("quality-only".to_owned(), "target source".to_owned()),
-            ]);
+            assert_eq!(
+                *probe.inputs.lock().unwrap(),
+                [
+                    ("a".to_owned(), "first source".to_owned()),
+                    ("shared".to_owned(), "shared α source".to_owned()),
+                    ("quality-only".to_owned(), "target source".to_owned()),
+                ]
+            );
         });
     }
 
@@ -562,12 +649,27 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let (_storage, cohort) = fixture(&cx);
             let tiers = retrieve(&cohort, &cx);
-            for reply in [Reply::Missing, Reply::Extra, Reply::Duplicate, Reply::Foreign,
-                Reply::Rank, Reply::Nan, Reply::InfiniteLogit] {
+            for reply in [
+                Reply::Missing,
+                Reply::Extra,
+                Reply::Duplicate,
+                Reply::Foreign,
+                Reply::Rank,
+                Reply::Nan,
+                Reply::InfiniteLogit,
+            ] {
                 let probe = Probe::new(reply);
-                let error = cohort.rerank_candidates(
-                    &cx, &probe, "query", &tiers, 1, PublishedRerankLimits::default(),
-                ).await.unwrap_err();
+                let error = cohort
+                    .rerank_candidates(
+                        &cx,
+                        &probe,
+                        "query",
+                        &tiers,
+                        1,
+                        PublishedRerankLimits::default(),
+                    )
+                    .await
+                    .unwrap_err();
                 assert!(matches!(error, SearchError::RerankFailed { .. }));
                 assert!(!error.to_string().contains("private-score-canary"));
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
@@ -583,11 +685,29 @@ mod tests {
             let (_storage, cohort) = fixture(&cx);
             let tiers = retrieve(&cohort, &cx);
             let probe = Probe::new(Reply::Ties);
-            let results = cohort.rerank_candidates(
-                &cx, &probe, "query", &tiers, usize::MAX, PublishedRerankLimits::default(),
-            ).await.unwrap();
-            assert_eq!(results.iter().map(|hit| hit.score().original_rank).collect::<Vec<_>>(), [0, 1, 2]);
-            assert!(results.iter().all(|hit| hit.score().score.to_bits() == (-2.0_f32).to_bits()));
+            let results = cohort
+                .rerank_candidates(
+                    &cx,
+                    &probe,
+                    "query",
+                    &tiers,
+                    usize::MAX,
+                    PublishedRerankLimits::default(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                results
+                    .iter()
+                    .map(|hit| hit.score().original_rank)
+                    .collect::<Vec<_>>(),
+                [0, 1, 2]
+            );
+            assert!(
+                results
+                    .iter()
+                    .all(|hit| hit.score().score.to_bits() == (-2.0_f32).to_bits())
+            );
         });
     }
 
@@ -596,23 +716,48 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let (_storage, cohort) = fixture(&cx);
             let tiers = retrieve(&cohort, &cx);
-            let bytes = "query".len() + "a".len() + "first source".len()
-                + "shared".len() + "shared α source".len()
-                + "quality-only".len() + "target source".len();
+            let bytes = "query".len()
+                + "a".len()
+                + "first source".len()
+                + "shared".len()
+                + "shared α source".len()
+                + "quality-only".len()
+                + "target source".len();
             let exact = PublishedRerankLimits {
-                max_candidates: 3, max_input_bytes: bytes, max_query_bytes: 5,
+                max_candidates: 3,
+                max_input_bytes: bytes,
+                max_query_bytes: 5,
             };
             let probe = Probe::new(Reply::Normal);
-            assert_eq!(cohort.rerank_candidates(&cx, &probe, "query", &tiers, 3, exact)
-                .await.unwrap().len(), 3);
+            assert_eq!(
+                cohort
+                    .rerank_candidates(&cx, &probe, "query", &tiers, 3, exact)
+                    .await
+                    .unwrap()
+                    .len(),
+                3
+            );
             for limits in [
-                PublishedRerankLimits { max_candidates: 2, ..exact },
-                PublishedRerankLimits { max_input_bytes: bytes - 1, ..exact },
-                PublishedRerankLimits { max_query_bytes: 4, ..exact },
+                PublishedRerankLimits {
+                    max_candidates: 2,
+                    ..exact
+                },
+                PublishedRerankLimits {
+                    max_input_bytes: bytes - 1,
+                    ..exact
+                },
+                PublishedRerankLimits {
+                    max_query_bytes: 4,
+                    ..exact
+                },
             ] {
                 let refused = Probe::new(Reply::Normal);
-                assert!(matches!(cohort.rerank_candidates(&cx, &refused, "query", &tiers, 1, limits)
-                    .await, Err(SearchError::InvalidConfig { .. })));
+                assert!(matches!(
+                    cohort
+                        .rerank_candidates(&cx, &refused, "query", &tiers, 1, limits)
+                        .await,
+                    Err(SearchError::InvalidConfig { .. })
+                ));
                 assert_eq!(refused.availability_calls.load(Ordering::SeqCst), 0);
                 assert_eq!(refused.calls.load(Ordering::SeqCst), 0);
             }
@@ -627,17 +772,37 @@ mod tests {
             let foreign = retrieve(&clone, &cx);
             let probe = Probe::new(Reply::Normal);
             for limit in [0, 2] {
-                assert!(cohort.rerank_candidates(
-                    &cx, &probe, "query", &foreign, limit, PublishedRerankLimits::default(),
-                ).await.is_err());
+                assert!(
+                    cohort
+                        .rerank_candidates(
+                            &cx,
+                            &probe,
+                            "query",
+                            &foreign,
+                            limit,
+                            PublishedRerankLimits::default(),
+                        )
+                        .await
+                        .is_err()
+                );
             }
             let mut duplicate = retrieve(&cohort, &cx);
             duplicate.pop();
             let mut another = retrieve(&cohort, &cx);
             duplicate.push(another.remove(0));
-            assert!(cohort.rerank_candidates(
-                &cx, &probe, "query", &duplicate, 2, PublishedRerankLimits::default(),
-            ).await.is_err());
+            assert!(
+                cohort
+                    .rerank_candidates(
+                        &cx,
+                        &probe,
+                        "query",
+                        &duplicate,
+                        2,
+                        PublishedRerankLimits::default(),
+                    )
+                    .await
+                    .is_err()
+            );
             assert_eq!(probe.availability_calls.load(Ordering::SeqCst), 0);
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
         });
@@ -650,22 +815,64 @@ mod tests {
             let tiers = retrieve(&cohort, &cx);
             let probe = Probe::new(Reply::Unavailable);
             for (text, limit) in [("query", 0), (" \t ", 2)] {
-                assert!(cohort.rerank_candidates(
-                    &cx, &probe, text, &tiers, limit, PublishedRerankLimits::default(),
-                ).await.unwrap().is_empty());
+                assert!(
+                    cohort
+                        .rerank_candidates(
+                            &cx,
+                            &probe,
+                            text,
+                            &tiers,
+                            limit,
+                            PublishedRerankLimits::default(),
+                        )
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
             }
-            assert!(cohort.rerank_candidates(
-                &cx, &probe, "query", &[], 2, PublishedRerankLimits::default(),
-            ).await.unwrap().is_empty());
+            assert!(
+                cohort
+                    .rerank_candidates(
+                        &cx,
+                        &probe,
+                        "query",
+                        &[],
+                        2,
+                        PublishedRerankLimits::default(),
+                    )
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(probe.availability_calls.load(Ordering::SeqCst), 0);
-            assert!(matches!(cohort.rerank_candidates(
-                &cx, &probe, "query", &tiers, 2, PublishedRerankLimits::default(),
-            ).await, Err(SearchError::RerankerUnavailable { .. })));
+            assert!(matches!(
+                cohort
+                    .rerank_candidates(
+                        &cx,
+                        &probe,
+                        "query",
+                        &tiers,
+                        2,
+                        PublishedRerankLimits::default(),
+                    )
+                    .await,
+                Err(SearchError::RerankerUnavailable { .. })
+            ));
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
             let failing = Probe::new(Reply::Error);
-            assert!(matches!(cohort.rerank_candidates(
-                &cx, &failing, "query", &tiers, 2, PublishedRerankLimits::default(),
-            ).await, Err(SearchError::RerankFailed { .. })));
+            assert!(matches!(
+                cohort
+                    .rerank_candidates(
+                        &cx,
+                        &failing,
+                        "query",
+                        &tiers,
+                        2,
+                        PublishedRerankLimits::default(),
+                    )
+                    .await,
+                Err(SearchError::RerankFailed { .. })
+            ));
             assert_eq!(failing.calls.load(Ordering::SeqCst), 1);
             assert_eq!(tiers[1].hits().len(), 2);
         });
@@ -678,9 +885,19 @@ mod tests {
                 let (_storage, cohort) = fixture(&cx);
                 let tiers = retrieve(&cohort, &cx);
                 let probe = Probe::new(reply);
-                assert!(matches!(cohort.rerank_candidates(
-                    &cx, &probe, "query", &tiers, 2, PublishedRerankLimits::default(),
-                ).await, Err(SearchError::Cancelled { .. })));
+                assert!(matches!(
+                    cohort
+                        .rerank_candidates(
+                            &cx,
+                            &probe,
+                            "query",
+                            &tiers,
+                            2,
+                            PublishedRerankLimits::default(),
+                        )
+                        .await,
+                    Err(SearchError::Cancelled { .. })
+                ));
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
             });
         }
@@ -688,10 +905,22 @@ mod tests {
             let (_storage, cohort) = fixture(&cx);
             let probe = Probe::new(Reply::Normal);
             cx.cancel_with(asupersync::CancelKind::User, Some("before admission"));
-            assert!(matches!(cohort.rerank_candidates(
-                &cx, &probe, "query", &[], 0,
-                PublishedRerankLimits { max_query_bytes: 0, ..PublishedRerankLimits::default() },
-            ).await, Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                cohort
+                    .rerank_candidates(
+                        &cx,
+                        &probe,
+                        "query",
+                        &[],
+                        0,
+                        PublishedRerankLimits {
+                            max_query_bytes: 0,
+                            ..PublishedRerankLimits::default()
+                        },
+                    )
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
         });
     }
@@ -703,7 +932,12 @@ mod tests {
             let tiers = retrieve(&cohort, &cx);
             let probe = Probe::new(Reply::Pending);
             let mut future = Box::pin(cohort.rerank_candidates(
-                &cx, &probe, "query", &tiers, 2, PublishedRerankLimits::default(),
+                &cx,
+                &probe,
+                "query",
+                &tiers,
+                2,
+                PublishedRerankLimits::default(),
             ));
             let mut context = Context::from_waker(Waker::noop());
             assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
@@ -735,14 +969,21 @@ mod tests {
                     ..bounded_options(timeout_ms)
                 };
                 assert!(matches!(
-                    cohort.rerank_candidates_bounded(&cx, &probe, "", &[], options).await,
+                    cohort
+                        .rerank_candidates_bounded(&cx, &probe, "", &[], options)
+                        .await,
                     Err(SearchError::InvalidConfig { .. })
                 ));
             }
             assert_eq!(probe.availability_calls.load(Ordering::SeqCst), 0);
-            cx.cancel_with(asupersync::CancelKind::User, Some("before bounded admission"));
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("before bounded admission"),
+            );
             assert!(matches!(
-                cohort.rerank_candidates_bounded(&cx, &probe, "", &[], bounded_options(0)).await,
+                cohort
+                    .rerank_candidates_bounded(&cx, &probe, "", &[], bounded_options(0))
+                    .await,
                 Err(SearchError::Cancelled { .. })
             ));
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
@@ -756,9 +997,15 @@ mod tests {
             let tiers = retrieve(&cohort, &cx);
             for reply in [Reply::Normal, Reply::Foreign] {
                 let probe = Probe::new(reply);
-                let result = cohort.rerank_candidates_bounded(
-                    &cx, &probe, "query", &tiers, bounded_options(86_400_000),
-                ).await;
+                let result = cohort
+                    .rerank_candidates_bounded(
+                        &cx,
+                        &probe,
+                        "query",
+                        &tiers,
+                        bounded_options(86_400_000),
+                    )
+                    .await;
                 if matches!(reply, Reply::Normal) {
                     let hits = result.unwrap();
                     assert_eq!(hits[0].document().catalog().doc_id, "quality-only");
@@ -780,7 +1027,11 @@ mod tests {
             let tiers = retrieve(&cohort, &cx);
             let probe = Probe::new(Reply::Pending);
             let mut future = Box::pin(cohort.rerank_candidates_bounded(
-                &cx, &probe, "query", &tiers, bounded_options(86_400_000),
+                &cx,
+                &probe,
+                "query",
+                &tiers,
+                bounded_options(86_400_000),
             ));
             let mut context = Context::from_waker(Waker::noop());
             assert!(future.as_mut().poll(&mut context).is_pending());
@@ -801,9 +1052,15 @@ mod tests {
                 let tiers = retrieve(&cohort, &cx);
                 let probe = Probe::new(reply);
                 assert!(matches!(
-                    cohort.rerank_candidates_bounded(
-                        &cx, &probe, "query", &tiers, bounded_options(86_400_000),
-                    ).await,
+                    cohort
+                        .rerank_candidates_bounded(
+                            &cx,
+                            &probe,
+                            "query",
+                            &tiers,
+                            bounded_options(86_400_000),
+                        )
+                        .await,
                     Err(SearchError::Cancelled { .. })
                 ));
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 1);

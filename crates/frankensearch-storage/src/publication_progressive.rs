@@ -147,7 +147,9 @@ impl<'cohort> PublishedSearchStream<'cohort, '_> {
     ) -> SearchResult<Self> {
         checkpoint(cx)?;
         if self.state != (PublishedSearchStreamState::Ready { next_tier: 0 }) {
-            return Err(invalid("deadlines must be configured before the first pull"));
+            return Err(invalid(
+                "deadlines must be configured before the first pull",
+            ));
         }
         if !(1..=MAX_TIER_TIMEOUT_MS).contains(&timeout_ms) {
             return Err(invalid("tier timeout must be between 1 ms and 24 hours"));
@@ -356,7 +358,14 @@ mod tests {
             let body = format!("retained source for {id}");
             let hash = ContentHasher::hash(&body);
             storage
-                .upsert_document(&DocumentRecord::new(id, &body, hash, body.chars().count(), 1, 1))
+                .upsert_document(&DocumentRecord::new(
+                    id,
+                    &body,
+                    hash,
+                    body.chars().count(),
+                    1,
+                    1,
+                ))
                 .unwrap();
             storage.set_document_content(id, &body).unwrap();
             queue.enqueue(id, tier, &hash, 0).unwrap();
@@ -754,7 +763,10 @@ mod tests {
                 if matches!(reply, Reply::Ready) {
                     let hits = outcome.unwrap();
                     assert_eq!(hits.hits()[0].hit().doc_id.as_str(), "quality-only");
-                    assert!(std::ptr::eq(hits.snapshot(), cohort.get("quality").unwrap()));
+                    assert!(std::ptr::eq(
+                        hits.snapshot(),
+                        cohort.get("quality").unwrap()
+                    ));
                     assert_eq!(stream.state(), PublishedSearchStreamState::Complete);
                 } else {
                     assert!(outcome.is_err());
@@ -812,13 +824,9 @@ mod tests {
                 })
                 .await
             };
-            let mut bounded = Box::pin(run_bounded_with_elapsed(
-                &cx,
-                cx.now(),
-                50,
-                work,
-                || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
-            ));
+            let mut bounded = Box::pin(run_bounded_with_elapsed(&cx, cx.now(), 50, work, || {
+                Duration::from_millis(elapsed.load(Ordering::SeqCst))
+            }));
             let mut context = Context::from_waker(Waker::noop());
             assert!(bounded.as_mut().poll(&mut context).is_pending());
             assert_eq!(polls.load(Ordering::SeqCst), 1);

@@ -1241,14 +1241,16 @@ mod tests {
             );
             let hits = old.search_filtered(&cx, &query, 1, Some(&filter)).unwrap();
             assert_eq!(
-                hits.len(), 1,
+                hits.len(),
+                1,
                 "excluded top scorer must not consume the only slot",
             );
             assert_eq!(hits[0].hit().doc_id.as_str(), "b-keep");
             assert_eq!(hits[0].hit().index, 1);
             assert!(std::ptr::eq(hits[0].document(), &old.documents()[1]));
             assert_eq!(
-                storage.metrics_snapshot(), before,
+                storage.metrics_snapshot(),
+                before,
                 "filtering does no SQL work",
             );
 
@@ -1270,7 +1272,9 @@ mod tests {
             drop(queue);
             drop(storage);
             let retained = old.search_filtered(&cx, &query, 1, Some(&filter)).unwrap();
-            let refreshed = fresh.search_filtered(&cx, &query, 1, Some(&filter)).unwrap();
+            let refreshed = fresh
+                .search_filtered(&cx, &query, 1, Some(&filter))
+                .unwrap();
             assert_eq!(retained[0].hit().doc_id.as_str(), "b-keep");
             assert_eq!(retained[0].document().canonical_text(), "old retained");
             assert_eq!(refreshed[0].hit().doc_id.as_str(), "a-blocked");
@@ -1302,7 +1306,12 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (storage, queue) = fixture();
             for id in [
-                "a-old", "b-excluded", "c\0keep", "d-prose", "e-absent", "f-empty",
+                "a-old",
+                "b-excluded",
+                "c\0keep",
+                "d-prose",
+                "e-absent",
+                "f-empty",
             ] {
                 publish(&storage, &queue, id, "body", [-1.0, 0.0]);
             }
@@ -1378,7 +1387,9 @@ mod tests {
                     accept: false,
                 };
                 assert!(
-                    snapshot.search_filtered(&cx, &query, 1, Some(&filter)).is_err(),
+                    snapshot
+                        .search_filtered(&cx, &query, 1, Some(&filter))
+                        .is_err(),
                     "{corruption}",
                 );
                 assert_eq!(
@@ -1441,7 +1452,14 @@ mod tests {
                 };
                 assert!(
                     captured
-                        .search_text_filtered(&cx, &probe, &canonicalizer, "orchard", 1, Some(&filter))
+                        .search_text_filtered(
+                            &cx,
+                            &probe,
+                            &canonicalizer,
+                            "orchard",
+                            1,
+                            Some(&filter)
+                        )
                         .await
                         .is_err()
                 );
@@ -1461,7 +1479,14 @@ mod tests {
                 };
                 assert!(
                     captured
-                        .search_text_filtered(&cx, &probe, &canonicalizer, "orchard", 1, Some(&filter))
+                        .search_text_filtered(
+                            &cx,
+                            &probe,
+                            &canonicalizer,
+                            "orchard",
+                            1,
+                            Some(&filter)
+                        )
                         .await
                         .is_err()
                 );
@@ -1498,11 +1523,17 @@ mod tests {
                         .is_empty()
                 );
                 for k in [0, 1] {
-                    assert!(snapshot.search_filtered(&cx, &wrong, k, Some(&filter)).is_err());
+                    assert!(
+                        snapshot
+                            .search_filtered(&cx, &wrong, k, Some(&filter))
+                            .is_err()
+                    );
                 }
             }
             for (snapshot, text, k) in [
-                (&empty, "query", 1), (&full, "query", 0), (&full, " \t ", 1),
+                (&empty, "query", 1),
+                (&full, "query", 0),
+                (&full, " \t ", 1),
             ] {
                 assert!(
                     snapshot

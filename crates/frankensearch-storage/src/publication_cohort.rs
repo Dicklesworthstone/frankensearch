@@ -158,7 +158,8 @@ impl PublishedSearchCohort {
         cx: &Cx,
         requests: &[PublishedSearchTierQuery<'_>],
     ) -> SearchResult<Vec<PublishedSearchTierHits<'_>>> {
-        let snapshots = self.resolve_tiers(cx, requests.iter().map(|request| request.embedder_id))?;
+        let snapshots =
+            self.resolve_tiers(cx, requests.iter().map(|request| request.embedder_id))?;
         let mut results = Vec::new();
         results
             .try_reserve_exact(snapshots.len())
@@ -192,7 +193,8 @@ impl PublishedSearchCohort {
         text: &str,
         requests: &[PublishedSearchTextQuery<'_>],
     ) -> SearchResult<Vec<PublishedSearchTierHits<'_>>> {
-        let snapshots = self.resolve_tiers(cx, requests.iter().map(|request| request.embedder_id))?;
+        let snapshots =
+            self.resolve_tiers(cx, requests.iter().map(|request| request.embedder_id))?;
         let mut results = Vec::new();
         results
             .try_reserve_exact(snapshots.len())
@@ -232,11 +234,17 @@ impl PublishedSearchCohort {
             .map_err(map_storage_error)?;
         for id in ids {
             checkpoint(cx)?;
-            if snapshots.iter().any(|snapshot| snapshot.embedder_id() == id) {
+            if snapshots
+                .iter()
+                .any(|snapshot| snapshot.embedder_id() == id)
+            {
                 return Err(invalid("queries", "duplicate tier queries are ambiguous"));
             }
             snapshots.push(self.get(id).ok_or_else(|| {
-                invalid("queries", "requested tier is not part of the captured cohort")
+                invalid(
+                    "queries",
+                    "requested tier is not part of the captured cohort",
+                )
             })?);
         }
         checkpoint(cx)?;
@@ -471,10 +479,20 @@ mod tests {
             let (storage, queue) = fixture();
             publish(&storage, &queue, "shared", "fast", "original", [1.0, 0.0]);
             publish(
-                &storage, &queue, "shared", "quality", "original", [-1.0, 0.0],
+                &storage,
+                &queue,
+                "shared",
+                "quality",
+                "original",
+                [-1.0, 0.0],
             );
             publish(
-                &storage, &queue, "quality-only", "quality", "extra", [1.0, 0.0],
+                &storage,
+                &queue,
+                "quality-only",
+                "quality",
+                "extra",
+                [1.0, 0.0],
             );
             let before = storage.metrics_snapshot();
             let cohort = load(&storage, &cx);
@@ -559,9 +577,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (storage, queue) = fixture();
             publish(&storage, &queue, "a", "fast", "fast body", [1.0, 0.0]);
-            publish(
-                &storage, &queue, "z", "quality", "quality body", [0.0, 1.0],
-            );
+            publish(&storage, &queue, "z", "quality", "quality body", [0.0, 1.0]);
             storage.connection().execute_sync(
                 "UPDATE published_embeddings SET vector_le = X'0000' WHERE embedder_id = 'quality';",
             ).unwrap();
@@ -586,9 +602,7 @@ mod tests {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let (storage, queue) = fixture();
                 publish(&storage, &queue, "a", "fast", "fast body", [1.0, 0.0]);
-                publish(
-                    &storage, &queue, "z", "quality", "quality body", [0.0, 1.0],
-                );
+                publish(&storage, &queue, "z", "quality", "quality body", [0.0, 1.0]);
                 if missing_source {
                     storage
                         .connection()
@@ -615,9 +629,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (storage, queue) = fixture();
             publish(&storage, &queue, "doc", "fast", "old source", [1.0, 0.0]);
-            publish(
-                &storage, &queue, "doc", "quality", "old source", [0.0, 1.0],
-            );
+            publish(&storage, &queue, "doc", "quality", "old source", [0.0, 1.0]);
             let old = load(&storage, &cx);
             publish(&storage, &queue, "doc", "fast", "new source", [-1.0, 0.0]);
             let new = load(&storage, &cx);
@@ -688,10 +700,7 @@ mod tests {
                     .iter()
                     .all(PublishedSearchSnapshot::is_empty)
             );
-            assert_eq!(
-                storage.metrics_snapshot().tx_commits,
-                before.tx_commits + 1
-            );
+            assert_eq!(storage.metrics_snapshot().tx_commits, before.tx_commits + 1);
         });
     }
 
@@ -704,11 +713,7 @@ mod tests {
             let valid = requests(&fast, &quality);
             let before = storage.metrics_snapshot();
             cx.cancel_with(asupersync::CancelKind::User, Some("stop coherent capture"));
-            for requests in [
-                vec![],
-                valid.to_vec(),
-                vec![valid[0]; MAX_COHORT_TIERS + 1],
-            ] {
+            for requests in [vec![], valid.to_vec(), vec![valid[0]; MAX_COHORT_TIERS + 1]] {
                 assert!(matches!(
                     storage.load_published_search_cohort(
                         &cx,
@@ -725,8 +730,22 @@ mod tests {
     fn query_fixture(cx: &Cx) -> (Arc<Storage>, PersistentJobQueue, PublishedSearchCohort) {
         let (storage, queue) = fixture();
         publish(&storage, &queue, "shared", "fast", "old body", [1.0, 0.0]);
-        publish(&storage, &queue, "shared", "quality", "old body", [1.0, 0.0]);
-        publish(&storage, &queue, "quality-only", "quality", "extra", [0.0, 1.0]);
+        publish(
+            &storage,
+            &queue,
+            "shared",
+            "quality",
+            "old body",
+            [1.0, 0.0],
+        );
+        publish(
+            &storage,
+            &queue,
+            "quality-only",
+            "quality",
+            "extra",
+            [0.0, 1.0],
+        );
         let cohort = load(&storage, cx);
         (storage, queue, cohort)
     }
@@ -1116,7 +1135,10 @@ mod tests {
                 (&full, "question", 0),
                 (&full, " \t ", 1),
             ] {
-                let requests = [fast.request(&policy, limit), quality.request(&policy, limit)];
+                let requests = [
+                    fast.request(&policy, limit),
+                    quality.request(&policy, limit),
+                ];
                 let results = cohort.search_text(&cx, text, &requests).await.unwrap();
                 assert_eq!(results.len(), 2);
                 assert!(results.iter().all(|result| result.hits().is_empty()));
