@@ -1066,16 +1066,58 @@ struct SearchExecutionResources {
 #[derive(Clone)]
 struct AdmittedEmbedder {
     embedder: Arc<dyn Embedder>,
+    coalescer: Option<frankensearch_embed::CoalescingEmbedder>,
     identity: frankensearch_core::EmbeddingIdentityBundleV1,
 }
 
 impl AdmittedEmbedder {
     /// Capture the identity `embedder` is admitted under. Call only after the
     /// embedder passed its tier's generation checks.
+    ///
+    /// When the provider natively supports bound batch inference
+    /// ([`Embedder::bound_batch_is_native`]), a work-conserving self-driving
+    /// [`frankensearch_embed::CoalescingEmbedder`] is attached so concurrent
+    /// or bursty `embed_admitted` queries micro-batch automatically with zero
+    /// idle timer delay.
     fn admit(embedder: Arc<dyn Embedder>) -> SearchResult<Self> {
         let identity = embedder.identity()?.clone();
         identity.validate()?;
-        Ok(Self { embedder, identity })
+        let coalescer = if embedder.bound_batch_is_native() {
+            let init_cx = Cx::for_request();
+            frankensearch_embed::CoalescingEmbedder::new_auto(
+                &init_cx,
+                Arc::clone(&embedder),
+                identity.clone(),
+                frankensearch_embed::CoalescerConfig {
+                    max_batch_size: 32,
+                    max_wait_ms: 0,
+                    min_batch_size: 1,
+                    use_priority_lanes: true,
+                },
+                frankensearch_embed::CoalescerLimits::default(),
+            )
+            .ok()
+        } else {
+            None
+        };
+        Ok(Self {
+            embedder,
+            coalescer,
+            identity,
+        })
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn without_coalescing(mut self) -> Self {
+        self.coalescer = None;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    fn coalescer(&self) -> Option<&frankensearch_embed::CoalescingEmbedder> {
+        self.coalescer.as_ref()
     }
 
     fn embedder(&self) -> &dyn Embedder {
@@ -1100,7 +1142,11 @@ impl AdmittedEmbedder {
     /// error.
     async fn embed_admitted(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
         self.check_current_identity()?;
-        let response = self.embedder.embed_bound(cx, text).await;
+        let response = if let Some(coalescer) = &self.coalescer {
+            coalescer.embed_bound(cx, text).await
+        } else {
+            self.embedder.embed_bound(cx, text).await
+        };
         cx.checkpoint().map_err(|_| SearchError::Cancelled {
             phase: "admitted_embedding".to_owned(),
             reason: "runtime cancellation requested".to_owned(),
@@ -30008,6 +30054,186 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn admitted_embedder_coalesces_concurrent_queries_and_planted_bypass_does_not() {
+        struct NativeBatchProbe {
+            identity: frankensearch_core::EmbeddingIdentityBundleV1,
+            singleton_calls: AtomicUsize,
+            batch_calls: AtomicUsize,
+        }
+
+        impl Embedder for NativeBatchProbe {
+            fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                #[allow(clippy::cast_precision_loss)]
+                let len = text.len() as f32;
+                Box::pin(async move { Ok(vec![len, 1.0]) })
+            }
+
+            fn embed_bound<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                text: &'a str,
+            ) -> SearchFuture<'a, frankensearch_core::IdentityBoundEmbedding> {
+                self.singleton_calls.fetch_add(1, Ordering::SeqCst);
+                #[allow(clippy::cast_precision_loss)]
+                let len = text.len() as f32;
+                let identity = self.identity.clone();
+                Box::pin(async move {
+                    Ok(frankensearch_core::IdentityBoundEmbedding {
+                        values: vec![len, 1.0],
+                        identity,
+                    })
+                })
+            }
+
+            fn embed_batch_bound<'a>(
+                &'a self,
+                _cx: &'a Cx,
+                texts: &'a [&'a str],
+            ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
+                self.batch_calls.fetch_add(1, Ordering::SeqCst);
+                let identity = self.identity.clone();
+                let outputs = texts
+                    .iter()
+                    .map(|text| {
+                        #[allow(clippy::cast_precision_loss)]
+                        let len = text.len() as f32;
+                        frankensearch_core::IdentityBoundEmbedding {
+                            values: vec![len, 1.0],
+                            identity: identity.clone(),
+                        }
+                    })
+                    .collect();
+                Box::pin(async move { Ok(outputs) })
+            }
+
+            fn bound_batch_is_native(&self) -> bool {
+                true
+            }
+
+            fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+                Ok(&self.identity)
+            }
+
+            fn dimension(&self) -> usize {
+                2
+            }
+
+            fn id(&self) -> &'static str {
+                "native-batch-probe"
+            }
+
+            fn model_name(&self) -> &'static str {
+                "Native Batch Probe"
+            }
+
+            fn is_semantic(&self) -> bool {
+                true
+            }
+
+            fn category(&self) -> ModelCategory {
+                ModelCategory::StaticEmbedder
+            }
+        }
+
+        run_test_with_cx(|cx| async move {
+            let queries = ["a", "bb", "ccc", "dddd", "eeeee", "ffffff"];
+
+            // Positive check: AdmittedEmbedder with native batch support coalesces
+            // 6 same-turn concurrent embed_admitted calls into 1 batch call.
+            let probe = Arc::new(NativeBatchProbe {
+                identity: test_identity("native-batch-probe", 2).clone(),
+                singleton_calls: AtomicUsize::new(0),
+                batch_calls: AtomicUsize::new(0),
+            });
+            let admitted = admitted_shared(&probe);
+            assert!(admitted.coalescer().is_some());
+
+            let mut futures = queries
+                .iter()
+                .map(|q| Box::pin(admitted.embed_admitted(&cx, q)))
+                .collect::<Vec<_>>();
+            let mut results: Vec<Option<SearchResult<Vec<f32>>>> =
+                (0..futures.len()).map(|_| None).collect();
+            std::future::poll_fn(|task_cx| {
+                let mut all_ready = true;
+                for (idx, fut) in futures.iter_mut().enumerate() {
+                    if results[idx].is_none() {
+                        match fut.as_mut().poll(task_cx) {
+                            Poll::Ready(res) => results[idx] = Some(res),
+                            Poll::Pending => all_ready = false,
+                        }
+                    }
+                }
+                if all_ready {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+
+            for (idx, res) in results.into_iter().enumerate() {
+                #[allow(clippy::cast_precision_loss)]
+                let expected = (idx + 1) as f32;
+                assert_eq!(res.unwrap().unwrap(), vec![expected, 1.0]);
+            }
+            assert_eq!(probe.batch_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(probe.singleton_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                admitted
+                    .coalescer()
+                    .unwrap()
+                    .metrics()
+                    .total_texts_batched
+                    .load(Ordering::Relaxed),
+                6
+            );
+
+            // Planted negative: bypassing the coalescer causes 6 individual
+            // singleton calls and 0 batch calls.
+            let uncoalesced_probe = Arc::new(NativeBatchProbe {
+                identity: test_identity("native-batch-probe", 2).clone(),
+                singleton_calls: AtomicUsize::new(0),
+                batch_calls: AtomicUsize::new(0),
+            });
+            let uncoalesced = admitted_shared(&uncoalesced_probe).without_coalescing();
+            assert!(uncoalesced.coalescer().is_none());
+
+            let mut futures = queries
+                .iter()
+                .map(|q| Box::pin(uncoalesced.embed_admitted(&cx, q)))
+                .collect::<Vec<_>>();
+            let mut results: Vec<Option<SearchResult<Vec<f32>>>> =
+                (0..futures.len()).map(|_| None).collect();
+            std::future::poll_fn(|task_cx| {
+                let mut all_ready = true;
+                for (idx, fut) in futures.iter_mut().enumerate() {
+                    if results[idx].is_none() {
+                        match fut.as_mut().poll(task_cx) {
+                            Poll::Ready(res) => results[idx] = Some(res),
+                            Poll::Pending => all_ready = false,
+                        }
+                    }
+                }
+                if all_ready {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+
+            for (idx, res) in results.into_iter().enumerate() {
+                #[allow(clippy::cast_precision_loss)]
+                let expected = (idx + 1) as f32;
+                assert_eq!(res.unwrap().unwrap(), vec![expected, 1.0]);
+            }
+            assert_eq!(uncoalesced_probe.singleton_calls.load(Ordering::SeqCst), 6);
+            assert_eq!(uncoalesced_probe.batch_calls.load(Ordering::SeqCst), 0);
+        });
     }
 
     /// GH #55 through search: a fast tier whose response carries a foreign
