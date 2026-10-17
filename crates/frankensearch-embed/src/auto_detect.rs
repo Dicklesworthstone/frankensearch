@@ -694,6 +694,36 @@ impl EmbedderStack {
         Ok((stack, fast_dispatcher, quality_dispatcher))
     }
 
+    /// Wrap the stack's fast and optional quality embedders in self-driving
+    /// [`CoalescingEmbedder::new_auto`](crate::CoalescingEmbedder::new_auto)
+    /// handles bound to each tier's verified [`EmbeddingIdentityBundleV1`].
+    ///
+    /// Unlike [`Self::into_coalescing`], concurrent callers of `embed_bound`
+    /// automatically elect a leader to dispatch batches with zero idle wait
+    /// when concurrency is 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cx` is cancelled, `config`/`limits` are invalid, or
+    /// either tier's identity bundle cannot be verified for in-memory f32
+    /// coalescing.
+    pub fn with_auto_coalescing(
+        self,
+        cx: &frankensearch_core::Cx,
+        config: crate::batch_coalescer::CoalescerConfig,
+        limits: crate::batch_coalescer::CoalescerLimits,
+    ) -> SearchResult<Self> {
+        let (stack, fast_dispatcher, quality_dispatcher) =
+            self.into_coalescing(cx, config, limits)?;
+        let fast_auto: Arc<dyn Embedder> = Arc::new(fast_dispatcher.into_auto_embedder());
+        let quality_auto = quality_dispatcher.map(|dispatcher| {
+            let arc: Arc<dyn Embedder> = Arc::new(dispatcher.into_auto_embedder());
+            arc
+        });
+        let _ = stack;
+        Ok(Self::from_parts(fast_auto, quality_auto))
+    }
+
     /// Fast embedder reference.
     #[must_use]
     pub fn fast(&self) -> &dyn Embedder {

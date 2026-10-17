@@ -453,3 +453,76 @@ fn frozen_identity_refuses_constructor_mismatch_and_later_provider_drift() {
         assert_eq!(provider.raw.load(Ordering::SeqCst), 0);
     });
 }
+
+#[test]
+fn new_auto_coalesces_same_turn_concurrent_callers_into_single_batch() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let provider = Arc::new(Probe::new(true, Mode::Good));
+        let client = CoalescingEmbedder::new_auto(
+            &cx,
+            Arc::clone(&provider) as Arc<dyn Embedder>,
+            identity(),
+            CoalescerConfig {
+                max_batch_size: 4,
+                max_wait_ms: 0,
+                min_batch_size: 1,
+                use_priority_lanes: true,
+            },
+            CoalescerLimits {
+                max_outstanding_requests: 8,
+                max_outstanding_text_bytes: 128,
+            },
+        )
+        .unwrap();
+
+        let mut f1 = client.embed_bound(&cx, "10");
+        let mut f2 = client.embed_bound(&cx, "20");
+        let mut f3 = client.embed_bound(&cx, "30");
+        let mut s1 = None;
+        let mut s2 = None;
+        let mut s3 = None;
+        std::future::poll_fn(|task_cx| {
+            if s1.is_none()
+                && let Poll::Ready(res) = f1.as_mut().poll(task_cx)
+            {
+                s1 = Some(res);
+            }
+            if s2.is_none()
+                && let Poll::Ready(res) = f2.as_mut().poll(task_cx)
+            {
+                s2 = Some(res);
+            }
+            if s3.is_none()
+                && let Poll::Ready(res) = f3.as_mut().poll(task_cx)
+            {
+                s3 = Some(res);
+            }
+            if s1.is_some() && s2.is_some() && s3.is_some() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+
+        assert_eq!(s1.unwrap().unwrap().values[0], 10.0);
+        assert_eq!(s2.unwrap().unwrap().values[0], 20.0);
+        assert_eq!(s3.unwrap().unwrap().values[0], 30.0);
+        assert_eq!(provider.batches.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.singleton.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            client.metrics().total_texts_batched.load(Ordering::Relaxed),
+            3
+        );
+
+        let batch_out = client.embed_batch_bound(&cx, &["40", "50"]).await.unwrap();
+        assert_eq!(batch_out.len(), 2);
+        assert_eq!(batch_out[0].values[0], 40.0);
+        assert_eq!(batch_out[1].values[0], 50.0);
+        assert_eq!(provider.batches.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client.metrics().total_texts_batched.load(Ordering::Relaxed),
+            5
+        );
+    });
+}

@@ -518,6 +518,26 @@ impl BatchCoalescer {
         Some(batch)
     }
 
+    /// Work-conserving non-blocking batch formation.
+    ///
+    /// Drains up to `max_batch_size` currently queued requests immediately even
+    /// if `max_wait_ms` has not elapsed yet. Used by self-driving /
+    /// leader-follower dispatchers after yielding one executor turn so solo
+    /// queries incur zero timer delay while concurrent same-turn and in-flight
+    /// arrivals still coalesce into batches.
+    pub fn form_available_batch(&self) -> Option<CoalescedBatch> {
+        let mut state = self.lock_state();
+        if state.pending.is_empty() {
+            return None;
+        }
+        let reason = self
+            .batch_ready_reason(&state)
+            .unwrap_or(DispatchReason::InteractiveEarly);
+        let batch = self.form_batch(&mut state, reason);
+        drop(state);
+        Some(batch)
+    }
+
     // ── Shutdown ─────────────────────────────────────────────────────
 
     /// Signal the coalescer to shut down.

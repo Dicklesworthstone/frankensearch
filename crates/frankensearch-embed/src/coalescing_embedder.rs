@@ -34,6 +34,26 @@ use crate::batch_coalescer::{
 pub struct CoalescingEmbedder {
     shared: Arc<Shared>,
     priority: Priority,
+    auto_dispatcher: Option<Arc<asupersync::sync::Mutex<CoalescingDispatcher>>>,
+}
+
+struct YieldOnce(bool);
+
+impl std::future::Future for YieldOnce {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            std::task::Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    }
 }
 
 /// Sole dispatch owner for a [`CoalescingEmbedder`] and its clones.
@@ -90,6 +110,7 @@ impl fmt::Debug for CoalescingEmbedder {
         f.debug_struct("CoalescingEmbedder")
             .field("identity", &self.shared.identity.fingerprint())
             .field("priority", &self.priority)
+            .field("auto_dispatch", &self.auto_dispatcher.is_some())
             .field("usage", &self.usage())
             .finish_non_exhaustive()
     }
@@ -161,9 +182,30 @@ impl CoalescingEmbedder {
             Self {
                 shared: Arc::clone(&shared),
                 priority: Priority::Interactive,
+                auto_dispatcher: None,
             },
             CoalescingDispatcher { shared, provider },
         ))
+    }
+
+    /// Bind an already loaded provider into a self-driving coalescing embedder.
+    ///
+    /// Concurrent callers of [`Embedder::embed_bound`] yield one executor turn
+    /// after admission so same-turn arrivals accumulate in the queue, and then
+    /// use work-conserving leader-follower dispatch (zero idle timer delay for
+    /// solo queries while batching same-turn and in-flight arrivals).
+    ///
+    /// # Errors
+    /// Returns the same validation and identity admission errors as [`Self::new`].
+    pub fn new_auto(
+        cx: &Cx,
+        provider: Arc<dyn Embedder>,
+        expected: EmbeddingIdentityBundleV1,
+        config: CoalescerConfig,
+        limits: CoalescerLimits,
+    ) -> SearchResult<Self> {
+        let (_client, dispatcher) = Self::new(cx, provider, expected, config, limits)?;
+        Ok(dispatcher.into_auto_embedder())
     }
 
     /// Another handle to the same queue/producer with a different priority.
@@ -172,6 +214,7 @@ impl CoalescingEmbedder {
         Self {
             shared: Arc::clone(&self.shared),
             priority,
+            auto_dispatcher: self.auto_dispatcher.clone(),
         }
     }
 
@@ -185,6 +228,12 @@ impl CoalescingEmbedder {
     #[must_use]
     pub fn usage(&self) -> CoalescerUsage {
         self.shared.queue.usage()
+    }
+
+    /// Lock-free batch coalescer telemetry counters.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<crate::batch_coalescer::CoalescerMetrics> {
+        self.shared.queue.metrics()
     }
 
     fn submit(
@@ -220,6 +269,90 @@ impl CoalescingEmbedder {
         // of its reply. It cannot report admission as unperformed after enqueue.
         Ok(receiver)
     }
+
+    async fn embed_bound_auto(
+        &self,
+        cx: &Cx,
+        text: &str,
+        dispatcher_mutex: &Arc<asupersync::sync::Mutex<CoalescingDispatcher>>,
+    ) -> SearchResult<IdentityBoundEmbedding> {
+        let mut receiver = self.submit(cx, text)?;
+        // Yield one poll turn so sibling futures polled in the same executor
+        // turn also enqueue their requests before the leader forms a batch.
+        YieldOnce(false).await;
+        let outcome = loop {
+            enum Step<'a> {
+                Received(Result<SearchResult<IdentityBoundEmbedding>, oneshot::RecvError>),
+                Locked(asupersync::sync::MutexGuard<'a, CoalescingDispatcher>),
+                LockFailed,
+            }
+            let step = {
+                let mut recv_fut = std::pin::pin!(receiver.recv(cx));
+                let mut lock_fut = std::pin::pin!(dispatcher_mutex.lock(cx));
+                std::future::poll_fn(|task_cx| {
+                    if let std::task::Poll::Ready(outcome) = recv_fut.as_mut().poll(task_cx) {
+                        return std::task::Poll::Ready(Step::Received(outcome));
+                    }
+                    match lock_fut.as_mut().poll(task_cx) {
+                        std::task::Poll::Ready(Ok(guard)) => {
+                            std::task::Poll::Ready(Step::Locked(guard))
+                        }
+                        std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Step::LockFailed),
+                        std::task::Poll::Pending => std::task::Poll::Pending,
+                    }
+                })
+                .await
+            };
+            match step {
+                Step::Received(outcome) => break outcome,
+                Step::LockFailed => {
+                    checkpoint(cx)?;
+                    return Err(stopped("coalesced dispatcher lock failed"));
+                }
+                Step::Locked(mut guard) => {
+                    let already_ready = {
+                        let mut recv_fut = std::pin::pin!(receiver.recv(cx));
+                        let noop = std::task::Waker::noop();
+                        let mut probe_cx = std::task::Context::from_waker(noop);
+                        match recv_fut.as_mut().poll(&mut probe_cx) {
+                            std::task::Poll::Ready(outcome) => Some(outcome),
+                            std::task::Poll::Pending => None,
+                        }
+                    };
+                    if let Some(outcome) = already_ready {
+                        drop(guard);
+                        break outcome;
+                    }
+                    let dispatched = guard.dispatch_available(cx).await;
+                    drop(guard);
+                    let ready_after = {
+                        let mut recv_fut = std::pin::pin!(receiver.recv(cx));
+                        let noop = std::task::Waker::noop();
+                        let mut probe_cx = std::task::Context::from_waker(noop);
+                        match recv_fut.as_mut().poll(&mut probe_cx) {
+                            std::task::Poll::Ready(outcome) => Some(outcome),
+                            std::task::Poll::Pending => None,
+                        }
+                    };
+                    if let Some(outcome) = ready_after {
+                        break outcome;
+                    }
+                    checkpoint(cx)?;
+                    if matches!(dispatched, Ok(0)) {
+                        return Err(stopped("coalesced reply was abandoned"));
+                    }
+                }
+            }
+        };
+        checkpoint(cx)?;
+        let output = outcome.map_err(|_| stopped("coalesced reply was abandoned"))??;
+        if output.identity != self.shared.identity {
+            return Err(identity_mismatch());
+        }
+        output.validate()?;
+        checkpoint(cx)?;
+        Ok(output)
+    }
 }
 
 impl Embedder for CoalescingEmbedder {
@@ -232,6 +365,12 @@ impl Embedder for CoalescingEmbedder {
         cx: &'a Cx,
         text: &'a str,
     ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+        if let Some(dispatcher_mutex) = &self.auto_dispatcher {
+            let dispatcher_mutex = Arc::clone(dispatcher_mutex);
+            return Box::pin(
+                async move { self.embed_bound_auto(cx, text, &dispatcher_mutex).await },
+            );
+        }
         Box::pin(async move {
             let mut receiver = self.submit(cx, text)?;
             let outcome = receiver.recv(cx).await;
@@ -256,16 +395,56 @@ impl Embedder for CoalescingEmbedder {
         Box::pin(async move {
             checkpoint(cx)?;
             let mut outputs = Vec::with_capacity(texts.len());
-            for text in texts {
-                outputs.push(self.embed_bound(cx, text).await?);
+            if self.auto_dispatcher.is_some() {
+                let chunk_limit = self
+                    .shared
+                    .queue
+                    .config()
+                    .max_batch_size
+                    .min(self.shared.queue.limits().max_outstanding_requests)
+                    .max(1);
+                for chunk in texts.chunks(chunk_limit) {
+                    checkpoint(cx)?;
+                    let mut futures = chunk
+                        .iter()
+                        .map(|text| self.embed_bound(cx, text))
+                        .collect::<Vec<_>>();
+                    let mut slots: Vec<Option<SearchResult<IdentityBoundEmbedding>>> =
+                        (0..futures.len()).map(|_| None).collect();
+                    std::future::poll_fn(|task_cx| {
+                        let mut all_ready = true;
+                        for (idx, fut) in futures.iter_mut().enumerate() {
+                            if slots[idx].is_none() {
+                                match fut.as_mut().poll(task_cx) {
+                                    std::task::Poll::Ready(res) => slots[idx] = Some(res),
+                                    std::task::Poll::Pending => all_ready = false,
+                                }
+                            }
+                        }
+                        if all_ready {
+                            std::task::Poll::Ready(())
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                    for slot in slots {
+                        outputs.push(slot.ok_or_else(|| stopped("coalesced batch slot missing"))??);
+                    }
+                }
+            } else {
+                for text in texts {
+                    outputs.push(self.embed_bound(cx, text).await?);
+                }
             }
             checkpoint(cx)?;
             Ok(outputs)
         })
     }
 
-    // A single caller's batch remains sequential; independent concurrent callers
-    // are coalesced by the dispatcher. Never bypass our real bound singleton.
+    // A single caller's batch remains sequential in manual mode; in auto mode
+    // chunks are polled concurrently through embed_bound. Never bypass our real
+    // bound singleton.
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
         Ok(&self.shared.identity)
     }
@@ -306,6 +485,22 @@ impl Shared {
         let Some(batch) = self.queue.try_form_batch() else {
             return Ok(None);
         };
+        self.drain_work(&mut state, batch)
+    }
+
+    fn take_available_work(&self) -> SearchResult<Option<Work>> {
+        let mut state = self.lock()?;
+        let Some(batch) = self.queue.form_available_batch() else {
+            return Ok(None);
+        };
+        self.drain_work(&mut state, batch)
+    }
+
+    fn drain_work(
+        &self,
+        state: &mut MutexGuard<'_, State>,
+        batch: CoalescedBatch,
+    ) -> SearchResult<Option<Work>> {
         let count = batch.len();
         if count > state.replies.len() {
             state.closed = true;
@@ -316,7 +511,6 @@ impl Shared {
             ));
         }
         let replies = state.replies.drain(..count).collect();
-        drop(state);
         Ok(Some(Work { batch, replies }))
     }
 
@@ -349,6 +543,18 @@ impl Shared {
 }
 
 impl CoalescingDispatcher {
+    /// Convert this dispatcher into a self-driving [`CoalescingEmbedder`]
+    /// whose concurrent callers automatically elect a leader to dispatch batches.
+    #[must_use]
+    pub fn into_auto_embedder(self) -> CoalescingEmbedder {
+        let shared = Arc::clone(&self.shared);
+        CoalescingEmbedder {
+            shared,
+            priority: Priority::Interactive,
+            auto_dispatcher: Some(Arc::new(asupersync::sync::Mutex::new(self))),
+        }
+    }
+
     /// Execute at most one batch whose existing scheduling conditions are met.
     ///
     /// Returns the number of discharged request slots (including disconnected
@@ -363,6 +569,19 @@ impl CoalescingDispatcher {
     pub async fn dispatch_ready(&mut self, cx: &Cx) -> SearchResult<usize> {
         checkpoint(cx)?;
         let Some(work) = self.shared.take_work()? else {
+            return Ok(0);
+        };
+        self.execute(cx, work).await
+    }
+
+    /// Execute at most one work-conserving batch from all currently queued
+    /// requests without waiting for `max_wait_ms` to elapse.
+    ///
+    /// # Errors
+    /// Returns the same dispatcher and admission errors as [`Self::dispatch_ready`].
+    pub async fn dispatch_available(&mut self, cx: &Cx) -> SearchResult<usize> {
+        checkpoint(cx)?;
+        let Some(work) = self.shared.take_available_work()? else {
             return Ok(0);
         };
         self.execute(cx, work).await
