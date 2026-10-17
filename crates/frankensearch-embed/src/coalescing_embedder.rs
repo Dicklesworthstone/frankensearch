@@ -281,14 +281,17 @@ impl CoalescingEmbedder {
         // turn also enqueue their requests before the leader forms a batch.
         YieldOnce(false).await;
         let outcome = loop {
-            enum Step<'a> {
+            enum Step {
                 Received(Result<SearchResult<IdentityBoundEmbedding>, oneshot::RecvError>),
-                Locked(asupersync::sync::MutexGuard<'a, CoalescingDispatcher>),
+                Locked(asupersync::sync::OwnedMutexGuard<CoalescingDispatcher>),
                 LockFailed,
             }
             let step = {
                 let mut recv_fut = std::pin::pin!(receiver.recv(cx));
-                let mut lock_fut = std::pin::pin!(dispatcher_mutex.lock(cx));
+                let mut lock_fut = std::pin::pin!(asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(dispatcher_mutex),
+                    cx
+                ));
                 std::future::poll_fn(|task_cx| {
                     if let std::task::Poll::Ready(outcome) = recv_fut.as_mut().poll(task_cx) {
                         return std::task::Poll::Ready(Step::Received(outcome));
