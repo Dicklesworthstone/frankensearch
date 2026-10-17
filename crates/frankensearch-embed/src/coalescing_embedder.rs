@@ -22,6 +22,8 @@ use crate::batch_coalescer::{
     BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerLimits, CoalescerUsage, Priority,
 };
 
+mod batch;
+
 /// Cloneable async producer handle bound to one caller-selected model contract.
 ///
 /// Pass this handle wherever an `Embedder` is accepted, while its dispatcher is
@@ -408,32 +410,13 @@ impl Embedder for CoalescingEmbedder {
                     .max(1);
                 for chunk in texts.chunks(chunk_limit) {
                     checkpoint(cx)?;
-                    let mut futures = chunk
+                    let futures = chunk
                         .iter()
                         .map(|text| self.embed_bound(cx, text))
                         .collect::<Vec<_>>();
-                    let mut slots: Vec<Option<SearchResult<IdentityBoundEmbedding>>> =
-                        (0..futures.len()).map(|_| None).collect();
-                    std::future::poll_fn(|task_cx| {
-                        let mut all_ready = true;
-                        for (idx, fut) in futures.iter_mut().enumerate() {
-                            if slots[idx].is_none() {
-                                match fut.as_mut().poll(task_cx) {
-                                    std::task::Poll::Ready(res) => slots[idx] = Some(res),
-                                    std::task::Poll::Pending => all_ready = false,
-                                }
-                            }
-                        }
-                        if all_ready {
-                            std::task::Poll::Ready(())
-                        } else {
-                            std::task::Poll::Pending
-                        }
-                    })
-                    .await;
-                    for slot in slots {
-                        outputs.push(slot.ok_or_else(|| stopped("coalesced batch slot missing"))??);
-                    }
+                    // A known error ends the whole call; do not wait for an
+                    // unrelated pending provider before returning that error.
+                    outputs.extend(batch::collect(cx, futures).await?);
                 }
             } else {
                 for text in texts {
