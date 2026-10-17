@@ -36,6 +36,20 @@ impl Default for PublishedRerankLimits {
     }
 }
 
+/// Explicit output, input and elapsed-time budgets for cross-encoder refinement.
+///
+/// There is no implicit deadline: callers choose it for their provider and
+/// workload. `timeout_ms` must be between 1 ms and 24 hours, inclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishedRerankOptions {
+    /// Maximum results returned after validating the complete provider response.
+    pub limit: usize,
+    /// Admission limits for the whole union, independent of the output limit.
+    pub limits: PublishedRerankLimits,
+    /// Budget beginning when the bounded call is polled, not during retrieval.
+    pub timeout_ms: u64,
+}
+
 /// One cross-encoder result and the exact retained document it scored.
 ///
 /// The score is not a cosine or an RRF score. `original_rank` is the document's
@@ -60,6 +74,41 @@ impl<'cohort> PublishedRerankedHit<'cohort> {
 }
 
 impl PublishedSearchCohort {
+    /// Rerank retained candidates with one deadline for the entire operation.
+    ///
+    /// Covers candidate admission, text copying, provider availability/inference,
+    /// response validation and sorting. It shares the progressive search timer
+    /// and pre/post-poll deadline guard: a parked provider is woken on expiry,
+    /// a late successful poll is rejected, and pending inference is dropped
+    /// before returning. Synchronous code is not preemptible; lateness is
+    /// detected when its poll returns. Actual provider errors are preserved,
+    /// cancellation dominates, and the caller's shared context is not cancelled.
+    ///
+    /// The original tier results are borrowed and remain available for explicit
+    /// fallback. There is no automatic retry or partial successful refinement.
+    /// Invalid budgets fail before all callbacks, even for no-op requests.
+    pub async fn rerank_candidates_bounded<'cohort>(
+        &'cohort self,
+        cx: &Cx,
+        reranker: &dyn Reranker,
+        query: &str,
+        tiers: &[PublishedSearchTierHits<'cohort>],
+        options: PublishedRerankOptions,
+    ) -> SearchResult<Vec<PublishedRerankedHit<'cohort>>> {
+        checkpoint(cx)?;
+        if !(1..=86_400_000).contains(&options.timeout_ms) {
+            return Err(invalid("reranking timeout must be between 1 ms and 24 hours"));
+        }
+        let result = crate::publication_progressive::run_bounded(
+            cx,
+            options.timeout_ms,
+            self.rerank_candidates(cx, reranker, query, tiers, options.limit, options.limits),
+        )
+        .await;
+        checkpoint(cx)?;
+        result
+    }
+
     /// Refine the complete union of independently retrieved tier candidates.
     ///
     /// Every input tier must belong to THIS retained cohort, including empty
@@ -665,5 +714,102 @@ mod tests {
             assert!(!cx.is_cancel_requested());
             assert_eq!(tiers[0].hits().len(), 2);
         });
+    }
+
+    fn bounded_options(timeout_ms: u64) -> PublishedRerankOptions {
+        PublishedRerankOptions {
+            limit: 2,
+            limits: PublishedRerankLimits::default(),
+            timeout_ms,
+        }
+    }
+
+    #[test]
+    fn bounded_rerank_rejects_invalid_budgets_before_callbacks_even_for_noops() {
+        run_test_with_cx(|cx| async move {
+            let (_storage, cohort) = fixture(&cx);
+            let probe = Probe::new(Reply::Normal);
+            for timeout_ms in [0, 86_400_001, u64::MAX] {
+                let options = PublishedRerankOptions {
+                    limit: 0,
+                    ..bounded_options(timeout_ms)
+                };
+                assert!(matches!(
+                    cohort.rerank_candidates_bounded(&cx, &probe, "", &[], options).await,
+                    Err(SearchError::InvalidConfig { .. })
+                ));
+            }
+            assert_eq!(probe.availability_calls.load(Ordering::SeqCst), 0);
+            cx.cancel_with(asupersync::CancelKind::User, Some("before bounded admission"));
+            assert!(matches!(
+                cohort.rerank_candidates_bounded(&cx, &probe, "", &[], bounded_options(0)).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn bounded_rerank_keeps_source_ownership_and_complete_response_validation() {
+        run_test_with_cx(|cx| async move {
+            let (_storage, cohort) = fixture(&cx);
+            let tiers = retrieve(&cohort, &cx);
+            for reply in [Reply::Normal, Reply::Foreign] {
+                let probe = Probe::new(reply);
+                let result = cohort.rerank_candidates_bounded(
+                    &cx, &probe, "query", &tiers, bounded_options(86_400_000),
+                ).await;
+                if matches!(reply, Reply::Normal) {
+                    let hits = result.unwrap();
+                    assert_eq!(hits[0].document().catalog().doc_id, "quality-only");
+                    assert_eq!(hits[0].document().canonical_text(), "target source");
+                } else {
+                    assert!(matches!(result, Err(SearchError::RerankFailed { .. })));
+                }
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                assert!(probe.dropped.load(Ordering::SeqCst));
+            }
+            assert_eq!(tiers[0].hits().len(), 2);
+        });
+    }
+
+    #[test]
+    fn bounded_rerank_abandonment_drops_pending_inference_without_shared_cancel() {
+        run_test_with_cx(|cx| async move {
+            let (_storage, cohort) = fixture(&cx);
+            let tiers = retrieve(&cohort, &cx);
+            let probe = Probe::new(Reply::Pending);
+            let mut future = Box::pin(cohort.rerank_candidates_bounded(
+                &cx, &probe, "query", &tiers, bounded_options(86_400_000),
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(future.as_mut().poll(&mut context).is_pending());
+            assert!(!probe.dropped.load(Ordering::SeqCst));
+            drop(future);
+            assert!(probe.dropped.load(Ordering::SeqCst));
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+            assert!(!cx.is_cancel_requested());
+            assert_eq!(tiers[1].hits().len(), 2);
+        });
+    }
+
+    #[test]
+    fn bounded_rerank_preserves_provider_cancellation_instead_of_timeout_or_success() {
+        for reply in [Reply::Cancel, Reply::ExplicitCancel] {
+            run_test_with_cx(|cx| async move {
+                let (_storage, cohort) = fixture(&cx);
+                let tiers = retrieve(&cohort, &cx);
+                let probe = Probe::new(reply);
+                assert!(matches!(
+                    cohort.rerank_candidates_bounded(
+                        &cx, &probe, "query", &tiers, bounded_options(86_400_000),
+                    ).await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                assert!(probe.dropped.load(Ordering::SeqCst));
+                assert_eq!(tiers[0].hits().len(), 2);
+            });
+        }
     }
 }

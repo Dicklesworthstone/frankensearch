@@ -222,7 +222,7 @@ impl<'cohort> PublishedSearchStream<'cohort, '_> {
 }
 
 #[allow(clippy::future_not_send)] // Caller-owned local futures are supported.
-async fn run_bounded<T>(
+pub(crate) async fn run_bounded<T>(
     cx: &Cx,
     budget_ms: u64,
     work: impl Future<Output = SearchResult<T>>,
