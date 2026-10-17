@@ -18,6 +18,7 @@ use super::{
 
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
+#[path = "query/tuning.rs"]
 mod tuning;
 pub use tuning::FullQuery;
 pub(crate) use tuning::{FullQueryOverride, deserialize_query_override};

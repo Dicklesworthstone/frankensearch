@@ -449,8 +449,14 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
             Message::TunedSearch(request) => {
                 let snapshot = live.snapshot(cx).await?;
                 request_tuning::execute(
-                    snapshot.index(), cx, &request, ordinal, defaults,
-                    output, base_filter, policy,
+                    snapshot.index(),
+                    cx,
+                    &request,
+                    ordinal,
+                    defaults,
+                    output,
+                    base_filter,
+                    policy,
                 )
                 .await?;
             }

@@ -120,7 +120,9 @@ impl FullQuery {
             return Err(bad("graph beams must be null or between 1 and 1000000"));
         }
         if !self.quality_weight.is_finite() || !(0.0..=1.0).contains(&self.quality_weight) {
-            return Err(bad("quality_weight must be finite and between zero and one"));
+            return Err(bad(
+                "quality_weight must be finite and between zero and one",
+            ));
         }
         if !self.rrf_k.is_finite()
             || self.rrf_k < 0.0
@@ -203,7 +205,11 @@ impl Policy {
         }
         for (value, maximum, target) in [
             (requested.fast_ef, base.fast_ef, &mut effective.fast_ef),
-            (requested.quality_ef, base.quality_ef, &mut effective.quality_ef),
+            (
+                requested.quality_ef,
+                base.quality_ef,
+                &mut effective.quality_ef,
+            ),
         ] {
             if let Some(value) = value {
                 if maximum.is_none_or(|maximum| value > maximum) {
@@ -311,7 +317,8 @@ mod tests {
         let original = base.full_query.clone();
         let request: FullQueryOverride = serde_json::from_str(
             r#"{"candidate_multiplier":2,"fast_ef":64,"quality_ef":null,"lexical_weight":2.5}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let effective = base.for_query_override(&cx, &request).unwrap();
         let values = effective.full_query.as_ref().unwrap();
         assert_eq!(values.candidate_multiplier, 2);
@@ -321,8 +328,14 @@ mod tests {
         assert_eq!(values.lexical_weight, 2.5);
         assert_eq!(base.full_query, original);
         assert!(!effective.query_overrides_enabled());
-        assert!(effective.for_query_override(&cx, &FullQueryOverride::default()).is_err());
-        let inherited = base.for_query_override(&cx, &FullQueryOverride::default()).unwrap();
+        assert!(
+            effective
+                .for_query_override(&cx, &FullQueryOverride::default())
+                .is_err()
+        );
+        let inherited = base
+            .for_query_override(&cx, &FullQueryOverride::default())
+            .unwrap();
         let mut expected = original.unwrap();
         expected.request_overrides = false;
         assert_eq!(inherited.full_query, Some(expected));
@@ -333,19 +346,32 @@ mod tests {
         let cx = Cx::for_testing();
         let base = server();
         for text in [
-            r#"{"candidate_multiplier":0}"#, r#"{"candidate_multiplier":7}"#,
-            r#"{"fast_ef":0}"#, r#"{"fast_ef":129}"#,
-            r#"{"quality_ef":257}"#, r#"{"quality_weight":1.1}"#,
-            r#"{"rrf_k":-1}"#, r#"{"lexical_weight":0}"#,
+            r#"{"candidate_multiplier":0}"#,
+            r#"{"candidate_multiplier":7}"#,
+            r#"{"fast_ef":0}"#,
+            r#"{"fast_ef":129}"#,
+            r#"{"quality_ef":257}"#,
+            r#"{"quality_weight":1.1}"#,
+            r#"{"rrf_k":-1}"#,
+            r#"{"lexical_weight":0}"#,
             r#"{"semantic_weight":1e300}"#,
         ] {
             let request: FullQueryOverride = serde_json::from_str(text).unwrap();
             assert!(base.for_query_override(&cx, &request).is_err(), "{text}");
         }
         for request in [
-            FullQueryOverride { quality_weight: Some(f32::NAN), ..Default::default() },
-            FullQueryOverride { rrf_k: Some(f64::INFINITY), ..Default::default() },
-            FullQueryOverride { lexical_weight: Some(f64::NAN), ..Default::default() },
+            FullQueryOverride {
+                quality_weight: Some(f32::NAN),
+                ..Default::default()
+            },
+            FullQueryOverride {
+                rrf_k: Some(f64::INFINITY),
+                ..Default::default()
+            },
+            FullQueryOverride {
+                lexical_weight: Some(f64::NAN),
+                ..Default::default()
+            },
         ] {
             assert!(base.for_query_override(&cx, &request).is_err());
         }
@@ -353,22 +379,37 @@ mod tests {
             full_query: Some(FullQuery::parse(r#"{"request_overrides":true}"#).unwrap()),
             ..Policy::default()
         };
-        assert!(no_beam.for_query_override(&cx, &FullQueryOverride {
-            fast_ef: Some(1), ..Default::default()
-        }).is_err());
+        assert!(
+            no_beam
+                .for_query_override(
+                    &cx,
+                    &FullQueryOverride {
+                        fast_ef: Some(1),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
         for quality_weight in [0.0, 1.0] {
-            assert!(base.for_query_override(&cx, &FullQueryOverride {
-                quality_weight: Some(quality_weight), ..Default::default()
-            }).is_ok());
+            assert!(
+                base.for_query_override(
+                    &cx,
+                    &FullQueryOverride {
+                        quality_weight: Some(quality_weight),
+                        ..Default::default()
+                    }
+                )
+                .is_ok()
+            );
         }
     }
 
     #[test]
     fn overrides_preserve_the_original_timer_and_timeout_ceiling() {
+        use asupersync::time::{TimerDriverHandle, VirtualClock};
         use std::future::Future;
         use std::sync::Arc;
         use std::task::{Context, Poll, Waker};
-        use asupersync::time::{TimerDriverHandle, VirtualClock};
 
         let cx = Cx::for_testing();
         let clock = Arc::new(VirtualClock::new());
@@ -377,13 +418,18 @@ mod tests {
             timer: Some(TimerDriverHandle::with_virtual_clock(Arc::clone(&clock))),
             ..server()
         };
-        let effective = base.for_query_override(&cx, &FullQueryOverride::default()).unwrap();
+        let effective = base
+            .for_query_override(&cx, &FullQueryOverride::default())
+            .unwrap();
         assert_eq!(effective.effective_ms(Some(1000)).unwrap(), Some(10));
         assert_eq!(effective.effective_ms(Some(5)).unwrap(), Some(5));
         let deadline = effective.start(&cx, Some(1000)).unwrap().unwrap();
         clock.advance(10_000_000);
         let mut pending = Box::pin(super::super::within(&cx, Some(&deadline), async { Ok(()) }));
-        let Poll::Ready(Err(error)) = pending.as_mut().poll(&mut Context::from_waker(Waker::noop())) else {
+        let Poll::Ready(Err(error)) = pending
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
             panic!("original clock expiry must be observed");
         };
         assert_eq!(super::super::failure(error.as_ref())["status"], "timed_out");
@@ -394,9 +440,13 @@ mod tests {
     fn missing_permission_is_not_implicit_and_cancellation_keeps_its_type() {
         let cx = Cx::for_testing();
         let request = FullQueryOverride::default();
-        for base in [Policy::default(), Policy {
-            full_query: Some(FullQuery::default()), ..Policy::default()
-        }] {
+        for base in [
+            Policy::default(),
+            Policy {
+                full_query: Some(FullQuery::default()),
+                ..Policy::default()
+            },
+        ] {
             assert!(!base.query_overrides_enabled());
             assert!(base.for_query_override(&cx, &request).is_err());
             cx.set_cancel_requested(true);
