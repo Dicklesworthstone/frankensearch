@@ -1,0 +1,75 @@
+//! Owned top-k results from a direct transactional publication query.
+//!
+//! Unlike a reusable full-corpus snapshot, a direct query keeps only selected
+//! publications. Query execution lives with the shared publication scanner and
+//! exact scorer; these types do not introduce another admission or ranking path.
+
+use frankensearch_core::VectorHit;
+
+use crate::{PublishedEmbedding, PublishedEmbeddingScanStats};
+
+/// A scored winner retaining the exact publication that produced its score.
+///
+/// `hit().index` is its ordinal in the complete binary-ID-ordered scan, NOT an
+/// index into the returned top-k list, a database rowid or a durable identifier.
+/// The publication retains its full producer identity, source hash and attempt.
+#[derive(Clone)]
+pub struct PublishedEmbeddingQueryHit {
+    pub(crate) hit: VectorHit,
+    pub(crate) publication: PublishedEmbedding,
+}
+
+impl PublishedEmbeddingQueryHit {
+    #[must_use]
+    pub const fn hit(&self) -> &VectorHit {
+        &self.hit
+    }
+
+    #[must_use]
+    pub const fn publication(&self) -> &PublishedEmbedding {
+        &self.publication
+    }
+}
+
+impl std::fmt::Debug for PublishedEmbeddingQueryHit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublishedEmbeddingQueryHit")
+            .field("scan_index", &self.hit.index)
+            .field("score", &self.hit.score)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exact best-first results owned independently of the database connection.
+///
+/// Only selected vectors are retained. This is not a reusable corpus snapshot
+/// or evidence of unpublished/pending coverage; each new query reads a new
+/// transaction. The optional scan accounting distinguishes a completed empty
+/// scan from a zero-limit request that performed no database work.
+#[derive(Clone)]
+pub struct PublishedEmbeddingQueryResult {
+    pub(crate) hits: Vec<PublishedEmbeddingQueryHit>,
+    pub(crate) scan_stats: Option<PublishedEmbeddingScanStats>,
+}
+
+impl PublishedEmbeddingQueryResult {
+    #[must_use]
+    pub fn hits(&self) -> &[PublishedEmbeddingQueryHit] {
+        &self.hits
+    }
+
+    /// Complete scan accounting, or `None` for a zero-limit no-op.
+    #[must_use]
+    pub const fn scan_stats(&self) -> Option<PublishedEmbeddingScanStats> {
+        self.scan_stats
+    }
+}
+
+impl std::fmt::Debug for PublishedEmbeddingQueryResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublishedEmbeddingQueryResult")
+            .field("hits", &self.hits.len())
+            .field("scan_stats", &self.scan_stats)
+            .finish_non_exhaustive()
+    }
+}

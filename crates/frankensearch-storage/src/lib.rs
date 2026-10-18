@@ -26,6 +26,7 @@ pub mod metrics;
 pub mod pipeline;
 pub mod publication_cohort;
 pub mod publication_progressive;
+pub mod publication_query;
 pub mod publication_recovery;
 pub mod publication_rerank;
 pub mod publication_search;
@@ -76,6 +77,7 @@ pub use publication_cohort::{
     PublishedSearchTierQuery, PublishedSearchTierRequest,
 };
 pub use publication_progressive::{PublishedSearchStream, PublishedSearchStreamState};
+pub use publication_query::{PublishedEmbeddingQueryHit, PublishedEmbeddingQueryResult};
 pub use publication_recovery::{PublicationRecoveryConfig, PublicationRecoveryPage};
 pub use publication_rerank::{PublishedRerankLimits, PublishedRerankOptions, PublishedRerankedHit};
 pub use publication_search::{
