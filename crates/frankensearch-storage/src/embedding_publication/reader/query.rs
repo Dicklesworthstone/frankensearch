@@ -6,9 +6,58 @@ use super::{
     VectorHit, cosine, map_storage_error, publication_checkpoint, publication_error,
     query_norm, scan_on, validate_read_request,
 };
-use crate::{PublishedEmbeddingQueryHit, PublishedEmbeddingQueryResult};
+use crate::{
+    PublishedEmbeddingQueryHit, PublishedEmbeddingQueryResult, PublishedSearchQueryHit,
+    PublishedSearchQueryResult, PublishedSearchReadLimits,
+};
 
 impl Storage {
+    /// Exact publication search with winning sources captured in its transaction.
+    ///
+    /// Shares `query_published_embeddings` selection, then reads each winner's
+    /// canonical text and metadata through the existing source-hash admission
+    /// on that SAME connection, before the transaction completes. Winners are
+    /// moved into the owned result; no later source lookup or vector clone is
+    /// needed. There is no window between separate ranking/hydration transactions.
+    ///
+    /// `limits.embeddings` applies to the whole vector scan, including losing
+    /// rows. `limits.max_source_bytes` applies ONLY to final winning sources,
+    /// including their stored preview, path and metadata bytes. Missing,
+    /// mismatched or over-budget winning sources fail the whole query, never
+    /// silently drop a winner or replace text with a preview. Losing source
+    /// payloads are neither loaded nor audited; use a full search snapshot
+    /// when every source must be validated. Metadata filters are not run here.
+    ///
+    /// Text is the retained canonical embedding input, not necessarily raw
+    /// source. Results survive database changes/close and are not a live
+    /// authorization or revocation mechanism. No provider, predicate, await,
+    /// filesystem read, new runtime or task enters the transaction. The same
+    /// cooperative cancellation and blocking-lane requirements as the vector
+    /// query apply. Zero limit admits the query without opening a transaction.
+    pub fn query_published_search(
+        &self,
+        cx: &Cx,
+        embedder_id: &str,
+        query: &BoundQueryEmbedding,
+        limit: usize,
+        limits: PublishedSearchReadLimits,
+    ) -> SearchResult<PublishedSearchQueryResult> {
+        let norm = admit_query(cx, embedder_id, query)?;
+        if limit == 0 {
+            return Ok(PublishedSearchQueryResult {
+                hits: Vec::new(),
+                scan_stats: None,
+                source_payload_bytes: 0,
+            });
+        }
+        let result = self.transaction(|conn| {
+            let selected = select_on(conn, cx, embedder_id, query, norm, limit, limits.embeddings)?;
+            hydrate_on(conn, cx, selected, limits.max_source_bytes)
+        });
+        publication_checkpoint(cx)?;
+        result
+    }
+
     /// Score current publications without first retaining the entire corpus.
     ///
     /// One transaction runs the existing checksum/identity/revision-admitted
@@ -55,6 +104,37 @@ impl Storage {
         publication_checkpoint(cx)?;
         result
     }
+}
+
+fn hydrate_on(
+    conn: &AsyncConnection,
+    cx: &Cx,
+    selected: PublishedEmbeddingQueryResult,
+    max_source_bytes: usize,
+) -> SearchResult<PublishedSearchQueryResult> {
+    let mut remaining = max_source_bytes;
+    let mut hits = Vec::new();
+    hits.try_reserve_exact(selected.hits.len())
+        .map_err(map_storage_error)?;
+    for embedding in selected.hits {
+        publication_checkpoint(cx)?;
+        let (document, bytes) = crate::publication_search::read_search_document(
+            conn,
+            cx,
+            embedding.publication(),
+            remaining,
+        )?;
+        remaining = remaining
+            .checked_sub(bytes)
+            .ok_or_else(|| publication_error("winning source exceeded its admitted budget"))?;
+        hits.push(PublishedSearchQueryHit { embedding, document });
+    }
+    publication_checkpoint(cx)?;
+    Ok(PublishedSearchQueryResult {
+        hits,
+        scan_stats: selected.scan_stats,
+        source_payload_bytes: max_source_bytes - remaining,
+    })
 }
 
 fn admit_query(cx: &Cx, embedder_id: &str, query: &BoundQueryEmbedding) -> SearchResult<f64> {
@@ -410,6 +490,239 @@ mod tests {
             cx.set_cancel_requested(true);
             for limit in [0, 1] {
                 assert!(matches!(storage.query_published_embeddings(&cx, "model", &valid, limit, limits), Err(SearchError::Cancelled { .. })));
+            }
+            cx.set_cancel_requested(false);
+            assert_eq!(storage.metrics_snapshot(), before);
+        });
+    }
+
+    #[test]
+    fn winning_sources_match_full_capture_and_survive_database_changes() {
+        run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            publish(&storage, &queue, "a", "old first", "model", [0.0, 1.0]);
+            publish(&storage, &queue, "z", "old last", "model", [1.0, -0.0]);
+            storage
+                .connection()
+                .execute_sync(
+                    "UPDATE documents SET metadata_json = '{\"revision\":\"old\"}', \
+                     source_path = 'missing://never-opened';",
+                )
+                .unwrap();
+            let query = query();
+            let limits = PublishedSearchReadLimits::default();
+            let captured = storage
+                .load_published_search_snapshot(&cx, "model", query.identity(), limits)
+                .unwrap();
+            let before = storage.metrics_snapshot();
+            let result = storage
+                .query_published_search(&cx, "model", &query, 2, limits)
+                .unwrap();
+            assert_eq!(storage.metrics_snapshot().tx_commits, before.tx_commits + 1);
+            assert_eq!(result.scan_stats(), Some(captured.vector_stats()));
+            assert_eq!(result.source_payload_bytes(), captured.source_payload_bytes());
+            assert!(!storage.connection().in_transaction());
+            {
+                let expected = captured.search(&cx, &query, 2).unwrap();
+                for (actual, expected) in result.hits().iter().zip(&expected) {
+                    assert_eq!(actual.hit(), expected.hit());
+                    assert_eq!(actual.publication(), expected.publication());
+                    assert_eq!(
+                        actual.document().canonical_text(),
+                        expected.document().canonical_text()
+                    );
+                    assert_eq!(
+                        actual.document().catalog().metadata,
+                        expected.document().catalog().metadata
+                    );
+                }
+            }
+            drop(captured);
+            publish(&storage, &queue, "z", "replacement", "model", [-1.0, 0.0]);
+            storage
+                .connection()
+                .execute_sync("UPDATE documents SET metadata_json = '{\"revision\":\"new\"}';")
+                .unwrap();
+            drop(queue);
+            drop(storage);
+            assert_eq!(result.hits().len(), 2);
+            assert_eq!(result.hits()[0].hit().doc_id.as_str(), "z");
+            assert_eq!(result.hits()[0].hit().index, 1);
+            assert_eq!(result.hits()[1].hit().index, 0);
+            assert_eq!(result.hits()[0].document().canonical_text(), "old last");
+            assert_eq!(result.hits()[1].document().canonical_text(), "old first");
+            for hit in result.hits() {
+                assert_eq!(
+                    hit.publication().content_hash,
+                    ContentHasher::hash(hit.document().canonical_text())
+                );
+                assert_eq!(
+                    hit.document().catalog().metadata.as_ref(),
+                    Some(&serde_json::json!({"revision": "old"}))
+                );
+                assert_eq!(
+                    hit.document().catalog().source_path.as_deref(),
+                    Some("missing://never-opened")
+                );
+            }
+            let debug = format!("{result:?} {:?}", result.hits()[0]);
+            assert!(!debug.contains("old last"));
+            assert!(!debug.contains("missing://"));
+        });
+    }
+
+    #[test]
+    fn source_budget_counts_winners_in_bytes_without_loading_losing_sources() {
+        run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            publish(&storage, &queue, "a", "苹果\0é", "model", [1.0, 0.0]);
+            let large = "losing unicode字".repeat(4096);
+            publish(&storage, &queue, "b", &large, "model", [-1.0, 0.0]);
+            let query = query();
+            let measured = storage
+                .query_published_search(
+                    &cx,
+                    "model",
+                    &query,
+                    1,
+                    PublishedSearchReadLimits::default(),
+                )
+                .unwrap();
+            let exact = PublishedSearchReadLimits {
+                embeddings: PublishedEmbeddingReadLimits::default(),
+                max_source_bytes: measured.source_payload_bytes(),
+            };
+            assert!(exact.max_source_bytes >= "苹果\0é".len());
+            let result = storage
+                .query_published_search(&cx, "model", &query, 1, exact)
+                .unwrap();
+            assert_eq!(result.source_payload_bytes(), exact.max_source_bytes);
+            assert_eq!(result.hits()[0].document().canonical_text(), "苹果\0é");
+            assert_eq!(result.scan_stats().unwrap().records, 2);
+            // Materializing the corpus would charge b's much larger source.
+            assert!(
+                storage
+                    .load_published_search_snapshot(&cx, "model", query.identity(), exact)
+                    .is_err()
+            );
+            let too_small = PublishedSearchReadLimits {
+                max_source_bytes: exact.max_source_bytes - 1,
+                ..exact
+            };
+            assert!(matches!(
+                storage.query_published_search(&cx, "model", &query, 1, too_small),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "publication_search.max_source_bytes"
+            ));
+            assert!(
+                storage
+                    .query_published_search(&cx, "model", &query, 2, exact)
+                    .is_err()
+            );
+            // A direct query does not claim a full-corpus source integrity audit.
+            // Losing vectors are still admitted, but losing source text is unread.
+            storage
+                .connection()
+                .execute_sync(
+                    "UPDATE document_contents SET canonical_text = 'tampered' WHERE doc_id = 'b';",
+                )
+                .unwrap();
+            let winner = storage
+                .query_published_search(&cx, "model", &query, 1, exact)
+                .unwrap();
+            assert_eq!(winner.hits()[0].document().canonical_text(), "苹果\0é");
+            assert_eq!(winner.scan_stats().unwrap().records, 2);
+            assert!(
+                storage
+                    .query_published_search(
+                        &cx,
+                        "model",
+                        &query,
+                        2,
+                        PublishedSearchReadLimits::default(),
+                    )
+                    .is_err()
+            );
+        });
+    }
+
+    #[test]
+    fn a_later_winning_source_failure_discards_earlier_hydrated_results() {
+        for missing in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let (storage, queue) = fixture();
+                publish(&storage, &queue, "a", "first body", "model", [1.0, 0.0]);
+                publish(&storage, &queue, "b", "second body", "model", [0.0, 1.0]);
+                let sql = if missing {
+                    "DELETE FROM document_contents WHERE doc_id = 'b';"
+                } else {
+                    "UPDATE document_contents SET canonical_text = 'wrong body' WHERE doc_id = 'b';"
+                };
+                storage.connection().execute_sync(sql).unwrap();
+                let query = query();
+                let limits = PublishedSearchReadLimits::default();
+                let vectors = storage
+                    .query_published_embeddings(&cx, "model", &query, 2, limits.embeddings)
+                    .unwrap();
+                assert_eq!(vectors.hits().len(), 2);
+                let before = storage.metrics_snapshot();
+                assert!(
+                    storage
+                        .query_published_search(&cx, "model", &query, 2, limits)
+                        .is_err()
+                );
+                let after = storage.metrics_snapshot();
+                assert_eq!(after.tx_commits, before.tx_commits);
+                assert_eq!(after.tx_rollbacks, before.tx_rollbacks + 1);
+                assert!(!storage.connection().in_transaction());
+                assert_eq!(queue.queue_depth().unwrap().completed, 2);
+            });
+        }
+    }
+
+    #[test]
+    fn hydrated_query_noops_and_cancellation_do_not_read_sources() {
+        run_test_with_cx(|cx| async move {
+            let (storage, queue) = fixture();
+            let query = query();
+            let zero = PublishedSearchReadLimits {
+                embeddings: PublishedEmbeddingReadLimits {
+                    max_records: 0,
+                    max_payload_bytes: 0,
+                },
+                max_source_bytes: 0,
+            };
+            let empty = storage
+                .query_published_search(&cx, "model", &query, 1, zero)
+                .unwrap();
+            assert!(empty.hits().is_empty());
+            assert_eq!(empty.scan_stats().unwrap().records, 0);
+            assert_eq!(empty.source_payload_bytes(), 0);
+            publish(&storage, &queue, "doc", "body", "model", [1.0, 0.0]);
+            storage
+                .connection()
+                .execute_sync("DELETE FROM document_contents WHERE doc_id = 'doc';")
+                .unwrap();
+            let before = storage.metrics_snapshot();
+            let noop = storage
+                .query_published_search(&cx, "model", &query, 0, zero)
+                .unwrap();
+            assert!(noop.hits().is_empty());
+            assert_eq!(noop.scan_stats(), None);
+            assert_eq!(noop.source_payload_bytes(), 0);
+            let invalid = BoundQueryEmbedding::new(vec![0.0, 0.0], identity("model")).unwrap();
+            assert!(
+                storage
+                    .query_published_search(&cx, "model", &invalid, 0, zero)
+                    .is_err()
+            );
+            assert_eq!(storage.metrics_snapshot(), before);
+            cx.set_cancel_requested(true);
+            for limit in [0, 1] {
+                assert!(matches!(
+                    storage.query_published_search(&cx, "model", &query, limit, zero),
+                    Err(SearchError::Cancelled { .. })
+                ));
             }
             cx.set_cancel_requested(false);
             assert_eq!(storage.metrics_snapshot(), before);
