@@ -27,11 +27,14 @@ mod batch;
 /// Cloneable async producer handle bound to one caller-selected model contract.
 ///
 /// Pass this handle wherever an `Embedder` is accepted, while its dispatcher is
-/// driven independently by the caller. Awaiting a submission without driving
-/// the dispatcher cannot perform inference. Dropping one pending client future
-/// disconnects only its reply; it never cancels the shared inference context.
+/// driven independently by the caller. In manual mode, awaiting a submission
+/// without driving the dispatcher cannot perform inference. Dropping a manual
+/// client disconnects only its reply; it never cancels the dispatch owner's Cx.
 /// Queued/in-flight text still consumes admission credit until dispatched or
 /// the dispatcher is dropped. These limits do not bound output/model memory.
+/// Auto mode differs: its elected caller owns the whole in-flight dispatch;
+/// cancelling or dropping that caller can fail other recipients in its batch.
+/// Use a manual dispatcher with a service Cx for independent client cancellation.
 #[derive(Clone)]
 pub struct CoalescingEmbedder {
     shared: Arc<Shared>,
@@ -612,6 +615,9 @@ impl CoalescingDispatcher {
     /// callers), or zero when nothing is ready. All-disconnected batches skip
     /// inference. A partially disconnected batch retains its exact input order.
     /// No caller receives a result before whole-batch identity admission succeeds.
+    /// Cancellation of the dispatch Cx wakes and drops pending inference even
+    /// when the provider never wakes itself. Synchronous provider code cannot
+    /// be preempted, and provider-owned independent work retains its own lifetime.
     ///
     /// # Errors
     /// Returns the original dispatcher error and sends a bounded typed failure
@@ -649,9 +655,38 @@ impl CoalescingDispatcher {
         // exact equality of every actual response with our immutable contract.
         // Reattaching that same contract below translates the validated transport;
         // it does not bind unchecked raw provider output to advertised metadata.
-        let outcome = batch
-            .embed_and_deliver(cx, self.provider.as_ref(), &self.shared.identity)
-            .await;
+        // Register the dispatch owner's cancellation wake independently of
+        // the provider. Before/after checkpoints alone cannot wake a provider
+        // that returns Pending forever without consulting its Cx.
+        let (cancel_sender, mut cancel_receiver) = oneshot::channel::<()>();
+        let outcome = {
+            let mut cancelled = std::pin::pin!(cancel_receiver.recv(cx));
+            let mut inference = std::pin::pin!(batch.embed_and_deliver(
+                cx,
+                self.provider.as_ref(),
+                &self.shared.identity,
+            ));
+            std::future::poll_fn(|task_cx| {
+                if let Err(error) = checkpoint(cx) {
+                    return std::task::Poll::Ready(Err(error));
+                }
+                // The sender stays alive and never sends: only cancellation
+                // can complete this receive while inference is being polled.
+                if cancelled.as_mut().poll(task_cx).is_ready() {
+                    return std::task::Poll::Ready(Err(stopped("coalesced dispatch cancelled")));
+                }
+                let outcome = inference.as_mut().poll(task_cx);
+                match checkpoint(cx) {
+                    Ok(()) => outcome,
+                    Err(error) => std::task::Poll::Ready(Err(error)),
+                }
+            })
+            .await
+        };
+        // Both pinned futures have dropped before public failure delivery.
+        // Close the receiver first, avoiding an unnecessary sender-drop wake.
+        drop(cancel_receiver);
+        drop(cancel_sender);
         let outcome = checkpoint(cx).and(outcome);
         let outputs = outcome.and_then(|()| {
             replies

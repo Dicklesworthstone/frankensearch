@@ -568,7 +568,10 @@ fn abandoned_auto_admission_recovers_request_and_byte_capacity() {
                 assert_eq!(client.usage().outstanding_requests, count);
                 let result = client.embed_bound(&cx, next).await.unwrap();
                 assert_eq!(result.identity, identity());
-                assert_eq!(result.values[0].to_bits(), next.parse::<f32>().unwrap().to_bits());
+                assert_eq!(
+                    result.values[0].to_bits(),
+                    next.parse::<f32>().unwrap().to_bits()
+                );
                 assert_eq!(provider.batches.load(Ordering::SeqCst), round + 1);
                 assert_eq!(provider.raw.load(Ordering::SeqCst), 0);
                 assert_eq!(client.usage(), CoalescerUsage::default());
@@ -591,10 +594,16 @@ fn abandoned_admission_does_not_discard_a_live_prefix_recipient() {
         // Reclaiming a full batch here would also consume the live request.
         assert!(matches!(
             client.embed_bound(&cx, "30").await,
-            Err(SearchError::QueueFull { pending: 2, capacity: 2 })
+            Err(SearchError::QueueFull {
+                pending: 2,
+                capacity: 2
+            })
         ));
         assert_eq!(client.usage().outstanding_requests, 2);
-        assert_eq!(live.await.unwrap().values[0].to_bits(), 20.0_f32.to_bits());
+        assert_eq!(
+            live.await.unwrap().values[0].to_bits(),
+            20.0_f32.to_bits()
+        );
         assert_eq!(provider.batches.load(Ordering::SeqCst), 1);
         assert_eq!(client.usage(), CoalescerUsage::default());
         assert_eq!(
@@ -646,5 +655,111 @@ fn abandoned_front_reclamation_preserves_live_suffix_and_shutdown() {
         let shared = Arc::clone(&client.shared);
         drop(client);
         assert_eq!(shared.queue.usage(), CoalescerUsage::default());
+    });
+}
+
+#[test]
+fn dispatch_cancellation_wakes_an_uncooperative_provider_and_releases_capacity() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for native in [false, true] {
+            for available in [false, true] {
+                let provider = Arc::new(Probe::new(native, Mode::Good));
+                provider.pending.store(true, Ordering::SeqCst);
+                let (client, mut dispatcher) = setup(&cx, Arc::clone(&provider), 2);
+                let recipient_cx = Cx::for_testing();
+                let owner_cx = Cx::for_testing();
+                let mut first = client.embed_bound(&recipient_cx, "10");
+                let mut second = client.embed_bound(&recipient_cx, "20");
+                pending(&mut first);
+                pending(&mut second);
+                let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut dispatch = Box::pin(async {
+                    if available {
+                        dispatcher.dispatch_available(&owner_cx).await
+                    } else {
+                        dispatcher.dispatch_ready(&owner_cx).await
+                    }
+                });
+                assert!(
+                    dispatch
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert_eq!(provider.drops.load(Ordering::SeqCst), 0);
+                assert_eq!(client.usage().outstanding_requests, 2);
+                let before = wake.0.load(Ordering::SeqCst);
+                owner_cx.cancel_with(asupersync::CancelKind::User, Some("stop dispatcher"));
+                assert!(wake.0.load(Ordering::SeqCst) > before);
+                assert!(matches!(
+                    dispatch.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(SearchError::Cancelled { .. }))
+                ));
+                drop(dispatch);
+                assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+                assert_eq!(client.usage(), CoalescerUsage::default());
+                for request in [first, second] {
+                    assert!(matches!(
+                        request.await,
+                        Err(SearchError::Cancelled { .. })
+                    ));
+                }
+                assert!(!recipient_cx.is_cancel_requested());
+                assert!(!cx.is_cancel_requested());
+                // Cancelling this dispatch is not shutdown or a provider retry.
+                // Its released credits can serve a newly submitted batch.
+                provider.pending.store(false, Ordering::SeqCst);
+                let mut next = client.embed_bound(&recipient_cx, "30");
+                pending(&mut next);
+                assert_eq!(dispatcher.dispatch_available(&cx).await.unwrap(), 1);
+                assert_eq!(
+                    next.await.unwrap().values[0].to_bits(),
+                    30.0_f32.to_bits()
+                );
+                assert_eq!(provider.raw.load(Ordering::SeqCst), 0);
+                assert_eq!(client.usage(), CoalescerUsage::default());
+            }
+        }
+    });
+}
+
+#[test]
+fn pending_dispatch_observes_its_owner_not_a_cancelled_manual_recipient() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let provider = Arc::new(Probe::new(true, Mode::Good));
+        provider.pending.store(true, Ordering::SeqCst);
+        let (client, mut dispatcher) = setup(&cx, Arc::clone(&provider), 2);
+        let cancelled_cx = Cx::for_testing();
+        let mut first = client.embed_bound(&cancelled_cx, "10");
+        let mut second = client.embed_bound(&cx, "20");
+        pending(&mut first);
+        pending(&mut second);
+        let mut dispatch = Box::pin(dispatcher.dispatch_available(&cx));
+        assert!(
+            dispatch
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        cancelled_cx.cancel_with(asupersync::CancelKind::User, Some("one recipient stopped"));
+        assert!(matches!(first.await, Err(SearchError::Cancelled { .. })));
+        // The healthy recipient still owns its reply, and the service context
+        // is unchanged. Its provider future must not have been abandoned.
+        assert!(
+            dispatch
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(provider.drops.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.batches.load(Ordering::SeqCst), 1);
+        assert_eq!(client.usage().outstanding_requests, 2);
+        assert!(!cx.is_cancel_requested());
+        drop(dispatch);
+        assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+        assert!(matches!(second.await, Err(SearchError::Cancelled { .. })));
+        assert_eq!(client.usage(), CoalescerUsage::default());
+        assert!(!cx.is_cancel_requested());
     });
 }
