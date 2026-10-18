@@ -180,23 +180,31 @@ impl PublishedEmbeddingSnapshot {
             if !included? {
                 continue;
             }
-            let index = position;
             let score = cosine(cx, query.vector(), &record.embedding.values, query_norm)?;
-            let hit = RankedHit(VectorHit {
-                index,
-                score,
-                doc_id: record.doc_id.clone().into(),
-            });
-            retain_hit(&mut heap, hit, limit)?;
+            // A candidate carries no owned ID. The validated source position
+            // provides the same binary-ID tie order, even through sparse filters.
+            retain_hit(&mut heap, RankedHit { index: position, score }, limit)?;
         }
         publication_checkpoint(cx)?;
         // The greatest heap element is the worst hit. Ascending heap order
         // therefore yields the public best-first order, including tie breaks.
-        let hits = heap
-            .into_sorted_vec()
-            .into_iter()
-            .map(|hit| hit.0)
-            .collect();
+        // Materialize IDs only for final winners, after the entire snapshot
+        // passed admission. Losing rows never allocate a temporary result ID.
+        let ranked = heap.into_sorted_vec();
+        let mut hits = Vec::new();
+        hits.try_reserve_exact(ranked.len()).map_err(map_storage_error)?;
+        for hit in ranked {
+            publication_checkpoint(cx)?;
+            let index = usize::try_from(hit.index).map_err(map_storage_error)?;
+            let record = self.records.get(index).ok_or_else(|| {
+                publication_error("ranked hit is outside its captured snapshot")
+            })?;
+            hits.push(VectorHit {
+                index: hit.index,
+                score: hit.score,
+                doc_id: record.doc_id.clone().into(),
+            });
+        }
         publication_checkpoint(cx)?;
         Ok(hits)
     }
@@ -246,8 +254,14 @@ fn cosine(cx: &Cx, query: &[f32], vector: &[f32], query_norm: f64) -> SearchResu
     Ok(if score == 0.0 { 0.0 } else { score })
 }
 
-#[derive(Debug)]
-struct RankedHit(VectorHit);
+/// Inline selection state. `search_matching` validates strictly increasing,
+/// unique binary document IDs before admitting each row, so source position
+/// is exactly the document-ID tiebreak. These indices are never filter-local.
+#[derive(Debug, Clone, Copy)]
+struct RankedHit {
+    index: u32,
+    score: f32,
+}
 
 impl PartialEq for RankedHit {
     fn eq(&self, other: &Self) -> bool {
@@ -266,11 +280,9 @@ impl PartialOrd for RankedHit {
 impl Ord for RankedHit {
     fn cmp(&self, other: &Self) -> Ordering {
         other
-            .0
             .score
-            .total_cmp(&self.0.score)
-            .then_with(|| self.0.doc_id.cmp(&other.0.doc_id))
-            .then_with(|| self.0.index.cmp(&other.0.index))
+            .total_cmp(&self.score)
+            .then_with(|| self.index.cmp(&other.index))
     }
 }
 
@@ -1502,5 +1514,94 @@ mod tests {
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
             });
         }
+    }
+
+    #[test]
+    fn ranked_heap_entries_are_inline_and_preserve_full_width_position_ties() {
+        fn require_copy<T: Copy>() {}
+        require_copy::<RankedHit>();
+        assert_eq!(std::mem::size_of::<RankedHit>(), 8);
+        assert!(!std::mem::needs_drop::<RankedHit>());
+        let candidates = [
+            (u32::MAX, 1.0),
+            (5, 1.0),
+            (0, -1.0),
+            (2, 0.0),
+            (u32::MAX - 1, 0.0),
+        ];
+        let mut heap = BinaryHeap::new();
+        for (index, score) in candidates {
+            retain_hit(&mut heap, RankedHit { index, score }, 4).unwrap();
+        }
+        assert_eq!(
+            heap.into_sorted_vec()
+                .into_iter()
+                .map(|hit| (hit.index, hit.score.to_bits()))
+                .collect::<Vec<_>>(),
+            [
+                (5, 1.0_f32.to_bits()),
+                (u32::MAX, 1.0_f32.to_bits()),
+                (2, 0.0_f32.to_bits()),
+                (u32::MAX - 1, 0.0_f32.to_bits()),
+            ]
+        );
+    }
+
+    #[test]
+    fn numeric_cutoffs_preserve_long_id_ties_and_sparse_source_positions() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let prefix = "common-prefix/".repeat(128);
+            let mut ids = vec![
+                "a".to_owned(),
+                "a\0tail".to_owned(),
+                format!("{prefix}0"),
+                format!("{prefix}1"),
+                format!("{prefix}é"),
+                "é".to_owned(),
+                "数据".to_owned(),
+                "😀".to_owned(),
+            ];
+            ids.sort_unstable();
+            let mut snapshot = captured(&[]);
+            for (index, id) in ids.iter().enumerate() {
+                let vector = match (index / 2) % 3 {
+                    0 => vec![1.0, 0.0],
+                    1 => vec![0.0, 1.0],
+                    _ => vec![-1.0, 0.0],
+                };
+                snapshot.records.push(captured_record(id, vector));
+            }
+            let before = snapshot.clone();
+            let query =
+                BoundQueryEmbedding::new(vec![1.0, 0.0], semantic_identity("model")).unwrap();
+            let mut reference: Vec<_> = snapshot
+                .records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| VectorHit {
+                    index: u32::try_from(index).unwrap(),
+                    // All fixture vectors are unit axes: cosine is exactly x.
+                    score: record.embedding.values[0],
+                    doc_id: record.doc_id.clone().into(),
+                })
+                .collect();
+            reference.sort_by(VectorHit::cmp_rank);
+            for mask in [0_u16, 0b0101_0101, 0b1010_1010, 0b1101_1011, u16::MAX] {
+                let expected: Vec<_> = reference
+                    .iter()
+                    .filter(|hit| mask & (1 << hit.index) != 0)
+                    .cloned()
+                    .collect();
+                for limit in (0..=ids.len() + 1).chain([usize::MAX]) {
+                    let hits = snapshot
+                        .search_matching(&cx, &query, limit, |index, _| {
+                            Ok(mask & (1 << index) != 0)
+                        })
+                        .unwrap();
+                    assert_eq!(hits, expected[..limit.min(expected.len())], "mask={mask} k={limit}");
+                }
+            }
+            assert_eq!(snapshot, before);
+        });
     }
 }
