@@ -40,6 +40,8 @@ use crate::generation_store::{
 #[path = "retained_reuse/append_input.rs"]
 mod append_input;
 pub(super) use append_input::read_append_documents;
+#[path = "retained_reuse/configuration.rs"]
+mod configuration;
 #[path = "retained_reuse/execution.rs"]
 mod execution;
 
@@ -97,18 +99,7 @@ fn session_id() -> SearchResult<&'static str> {
 }
 
 fn configuration_digest(runtime: &FsfsRuntime) -> SearchResult<String> {
-    // Persist a digest, not the configuration (which can contain private paths
-    // or provider settings). A conservative mismatch simply starts cold.
-    // Whether the command keeps watching afterwards indexes nothing
-    // differently; hashing it made the first `fsfs watch` after `fsfs index`
-    // discard the keyword index and re-embed every file.
-    let mut config = runtime.config().clone();
-    config.indexing.watch_mode = false;
-    let bytes = serde_json::to_vec(&config).map_err(|source| SearchError::SubsystemError {
-        subsystem: "fsfs.complete_generation.reuse_config",
-        source: Box::new(source),
-    })?;
-    Ok(content_sha256_hex(&bytes))
+    configuration::digest(runtime.config())
 }
 
 fn open_regular(path: &Path) -> SearchResult<File> {
@@ -1818,6 +1809,12 @@ mod generation_tests {
             if operation == "config_drift" {
                 runtime.config.indexing.embedding_batch_size = 2;
             }
+            if operation == "query_tuning" {
+                runtime.config.search.quality_weight = 0.25;
+                runtime.config.search.rrf_k = 30.0;
+                runtime.config.search.quality_timeout_ms = 10_000;
+                runtime.config.search.rerank_timeout_ms = 5_000;
+            }
             runtime.cli_input.full_reindex = operation == "force";
             if operation == "daemon" {
                 runtime.cli_input.daemon_socket = Some(parent.join("daemon.sock"));
@@ -2635,6 +2632,12 @@ mod generation_tests {
             runtime.config.search.fast_only = false;
             runtime.config.search.quality_timeout_ms = 5_000;
             "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            if operation == "query_tuning" {
+                runtime.config.search.quality_weight = 0.25;
+                runtime.config.search.rrf_k = 30.0;
+                runtime.config.search.quality_timeout_ms = 10_000;
+                runtime.config.search.rerank_timeout_ms = 5_000;
+            }
             runtime.cli_input.full_reindex = operation == "force";
             let fast = Arc::new(CountingEmbedder::new(
                 "reuse-fast",
@@ -2704,6 +2707,37 @@ mod generation_tests {
                 assert_eq!(phases.last().unwrap().hits.len(), 2);
             }
             report
+        }
+
+        #[test]
+        fn query_policy_tuning_reuses_both_layouts_without_hiding_source_changes() {
+            run_test_with_cx(|cx| async move {
+                for retained in [false, true] {
+                    let parent = tempfile::tempdir().unwrap();
+                    let (_, source, _) = fixture(parent.path(), 2);
+                    let run = |operation: &'static str| {
+                        let cx = &cx;
+                        let parent = parent.path();
+                        async move {
+                            if retained {
+                                run_counted(cx, parent, operation).await
+                            } else {
+                                run_counted_legacy(cx, parent, operation).await
+                            }
+                        }
+                    };
+                    assert_index_calls(&run("index").await, 2, 2);
+                    assert_index_calls(&run("query_tuning").await, 0, 0);
+                    assert_index_calls(&run("index").await, 0, 0);
+                    fs::write(
+                        source.join("doc-0.md"),
+                        "sharedtoken changed after query tuning",
+                    )
+                    .unwrap();
+                    assert_index_calls(&run("query_tuning").await, 1, 1);
+                    assert_index_calls(&run("force").await, 2, 2);
+                }
+            });
         }
 
         #[test]
