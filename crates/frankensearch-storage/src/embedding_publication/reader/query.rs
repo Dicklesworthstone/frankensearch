@@ -295,8 +295,14 @@ mod tests {
         values: [f32; 2],
     ) {
         let hash = ContentHasher::hash(body);
+        // The catalog preview is bounded display metadata, not the complete
+        // embedding input. Keep the latter in document_contents, including
+        // when a source-budget regression deliberately supplies a large body.
+        let preview: String = body.chars().take(400).collect();
         storage
-            .upsert_document(&DocumentRecord::new(id, body, hash, body.chars().count(), 1, 1))
+            .upsert_document(&DocumentRecord::new(
+                id, preview, hash, body.chars().count(), 1, 1,
+            ))
             .unwrap();
         storage.set_document_content(id, body).unwrap();
         queue.enqueue(id, "model", &hash, 0).unwrap();
@@ -578,6 +584,13 @@ mod tests {
             publish(&storage, &queue, "a", "苹果\0é", "model", [1.0, 0.0]);
             let large = "losing unicode字".repeat(4096);
             publish(&storage, &queue, "b", &large, "model", [-1.0, 0.0]);
+            let losing = storage.get_document("b").unwrap().unwrap();
+            assert_eq!(losing.content_preview.chars().count(), 400);
+            assert_eq!(losing.content_length, large.chars().count());
+            assert_eq!(
+                storage.get_document_content("b").unwrap().as_deref(),
+                Some(large.as_str())
+            );
             let query = query();
             let measured = storage
                 .query_published_search(
@@ -588,11 +601,15 @@ mod tests {
                     PublishedSearchReadLimits::default(),
                 )
                 .unwrap();
+            // Independent byte oracle: a's canonical text and its full short
+            // preview are each nine UTF-8 bytes, including the byte after NUL.
+            // No path or metadata is present. Do not derive the budget from
+            // the implementation under test, which could undercount both runs.
             let exact = PublishedSearchReadLimits {
                 embeddings: PublishedEmbeddingReadLimits::default(),
-                max_source_bytes: measured.source_payload_bytes(),
+                max_source_bytes: 2 * "苹果\0é".len(),
             };
-            assert!(exact.max_source_bytes >= "苹果\0é".len());
+            assert_eq!(measured.source_payload_bytes(), exact.max_source_bytes);
             let result = storage
                 .query_published_search(&cx, "model", &query, 1, exact)
                 .unwrap();
