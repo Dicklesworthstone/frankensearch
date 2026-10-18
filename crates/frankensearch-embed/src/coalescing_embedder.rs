@@ -200,6 +200,9 @@ impl CoalescingEmbedder {
     /// by both request count and UTF-8 input bytes. An individually oversized
     /// input is refused before any prefix is submitted. Other callers still
     /// compete for the real queue credits; grouping does not bypass admission.
+    /// Before admitting a new auto-mode request, fully disconnected queued
+    /// batches may be discarded to release their credits. Live or in-flight work
+    /// is never reclaimed this way; actual overload still returns `QueueFull`.
     ///
     /// # Errors
     /// Returns the same validation and identity admission errors as [`Self::new`].
@@ -251,6 +254,13 @@ impl CoalescingEmbedder {
         // Reject an impossible input before copying the borrowed caller text.
         if text.len() > self.shared.queue.limits().max_outstanding_text_bytes {
             return Err(invalid("input", "text exceeds the entire input budget"));
+        }
+        if self.auto_dispatcher.is_some() {
+            // A cancelled burst can leave the queue full before any caller
+            // reaches dispatch. Refusing every subsequent submission would
+            // then prevent the only dispatch drivers from making progress.
+            self.shared.discard_abandoned_front()?;
+            checkpoint(cx)?;
         }
         let (bound, receiver) = oneshot::channel();
         {
@@ -497,6 +507,36 @@ impl Shared {
             return Ok(None);
         };
         self.drain_work(&mut state, batch)
+    }
+
+    /// Bound reclamation by the batches present at entry, and reclaim only
+    /// whole prefixes whose recipients have all disconnected. Keep the FIFO paired
+    /// under its existing lock; never drain a live row or an in-flight batch.
+    /// Channel destruction and credit release happen after both locks leave.
+    fn discard_abandoned_front(&self) -> SearchResult<()> {
+        let width = self.queue.config().max_batch_size;
+        let batches = self.lock()?.replies.len().div_ceil(width);
+        for _ in 0..batches {
+            let abandoned = {
+                let mut state = self.lock()?;
+                if state.closed
+                    || state.replies.is_empty()
+                    || state
+                        .replies
+                        .iter()
+                        .take(width)
+                        .any(|reply| !reply.bound.is_closed())
+                {
+                    return Ok(());
+                }
+                let batch = self.queue.form_available_batch().ok_or_else(|| {
+                    invalid("replies", "queued replies have no matching inputs")
+                })?;
+                self.drain_work(&mut state, batch)?
+            };
+            drop(abandoned);
+        }
+        Ok(())
     }
 
     fn take_available_work(&self) -> SearchResult<Option<Work>> {
