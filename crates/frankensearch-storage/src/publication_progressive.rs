@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::types::Time;
+use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult};
 
 use crate::connection::map_storage_error;
@@ -49,6 +50,7 @@ pub struct PublishedSearchStream<'cohort, 'query> {
     cohort: &'cohort PublishedSearchCohort,
     text: &'query str,
     requests: Vec<PublishedSearchTextQuery<'query>>,
+    filter: Option<&'query dyn SearchFilter>,
     timeout_ms: Vec<Option<u64>>,
     state: PublishedSearchStreamState,
 }
@@ -58,6 +60,7 @@ impl std::fmt::Debug for PublishedSearchStream<'_, '_> {
         // Do not expose query/source payloads or invoke provider callbacks.
         f.debug_struct("PublishedSearchStream")
             .field("tiers", &self.requests.len())
+            .field("filtered", &self.filter.is_some())
             .field("state", &self.state)
             .finish_non_exhaustive()
     }
@@ -81,6 +84,30 @@ impl PublishedSearchCohort {
         cx: &Cx,
         text: &'query str,
         requests: &[PublishedSearchTextQuery<'query>],
+    ) -> SearchResult<PublishedSearchStream<'cohort, 'query>> {
+        self.search_text_stream_filtered(cx, text, requests, None)
+    }
+
+    /// Prepare lazy tier retrieval with one predicate retained for every pull.
+    ///
+    /// The predicate is supplied at construction and cannot be replaced or
+    /// omitted by a later pull. It sees each tier's captured ID and metadata
+    /// before top-k selection, through the same path as buffered filtered
+    /// retrieval. Construction, debug formatting and empty streams invoke no
+    /// predicate callbacks. Results borrow only the cohort, not the predicate.
+    ///
+    /// Each configured tier deadline includes its predicate and scoring work;
+    /// synchronous callbacks are not preemptible. Cancellation or interruption
+    /// remains terminal without retrying unfiltered or starting another tier.
+    /// Metadata is retained, not refreshed. This is not live authorization or
+    /// revocation; missing metadata and interior-mutably changing predicates
+    /// keep the policy documented by `PublishedSearchSnapshot::search_filtered`.
+    pub fn search_text_stream_filtered<'cohort, 'query>(
+        &'cohort self,
+        cx: &Cx,
+        text: &'query str,
+        requests: &[PublishedSearchTextQuery<'query>],
+        filter: Option<&'query dyn SearchFilter>,
     ) -> SearchResult<PublishedSearchStream<'cohort, 'query>> {
         checkpoint(cx)?;
         // The cohort already has at most sixteen unique tiers. A valid subset
@@ -115,6 +142,7 @@ impl PublishedSearchCohort {
             cohort: self,
             text,
             requests: owned,
+            filter,
             timeout_ms,
             state: if requests.is_empty() {
                 PublishedSearchStreamState::Complete
@@ -189,11 +217,12 @@ impl<'cohort> PublishedSearchStream<'cohort, '_> {
         let cohort = self.cohort;
         let text = self.text;
         let request = self.requests[next_tier];
+        let filter = self.filter;
         let timeout_ms = self.timeout_ms[next_tier];
         let work = async move {
             checkpoint(cx)?;
             let result = cohort
-                .search_text(cx, text, std::slice::from_ref(&request))
+                .search_text_filtered(cx, text, std::slice::from_ref(&request), filter)
                 .await;
             checkpoint(cx)?;
             let mut results = result?;
@@ -899,5 +928,290 @@ mod tests {
             .await;
             assert!(matches!(result, Err(SearchError::Cancelled { .. })));
         });
+    }
+
+    fn filtered_fixture(cx: &Cx) -> (Arc<Storage>, PublishedSearchCohort) {
+        let (storage, _) = fixture(cx);
+        storage
+            .connection()
+            .execute_sync(
+                "UPDATE documents SET metadata_json = '{\"visible\":true}' \
+                 WHERE doc_id IN ('shared', 'quality-only');",
+            )
+            .unwrap();
+        let cohort = storage
+            .load_published_search_cohort(
+                cx,
+                &[
+                    PublishedSearchTierRequest {
+                        embedder_id: "fast",
+                        identity: &identity("fast"),
+                    },
+                    PublishedSearchTierRequest {
+                        embedder_id: "quality",
+                        identity: &identity("quality"),
+                    },
+                ],
+                PublishedSearchReadLimits::default(),
+            )
+            .unwrap();
+        (storage, cohort)
+    }
+
+    thread_local! {
+        static FILTER_CANCEL: std::cell::RefCell<Option<Cx>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    struct ClearFilterCancel;
+    impl Drop for ClearFilterCancel {
+        fn drop(&mut self) {
+            FILTER_CANCEL.with(|slot| {
+                let _ = slot.borrow_mut().take();
+            });
+        }
+    }
+
+    struct StreamFilter {
+        calls: AtomicUsize,
+        cancel_at: usize,
+        panic_at: usize,
+    }
+
+    impl Default for StreamFilter {
+        fn default() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+                cancel_at: usize::MAX,
+                panic_at: usize::MAX,
+            }
+        }
+    }
+
+    impl SearchFilter for StreamFilter {
+        fn matches(&self, _: &str, metadata: Option<&serde_json::Value>) -> bool {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.cancel_at {
+                FILTER_CANCEL.with(|slot| {
+                    slot.borrow_mut().take().unwrap().cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel in stream predicate"),
+                    );
+                });
+            }
+            assert_ne!(call, self.panic_at, "intentional predicate unwind");
+            metadata
+                .and_then(|value| value.get("visible"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        }
+
+        fn name(&self) -> &str {
+            panic!("stream construction and debug must not invoke filter callbacks")
+        }
+    }
+
+    #[test]
+    fn filtered_pulls_keep_one_policy_and_old_metadata_across_tiers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, cohort) = filtered_fixture(&cx);
+            let fast = Probe::new("fast", Reply::Ready);
+            let quality = Probe::new("quality", Reply::Ready);
+            let filter = StreamFilter::default();
+            let mut stream = cohort
+                .search_text_stream_filtered(
+                    &cx,
+                    "query",
+                    &[fast.request(1), quality.request(1)],
+                    Some(&filter),
+                )
+                .unwrap()
+                .with_tier_timeout(&cx, "quality", MAX_TIER_TIMEOUT_MS)
+                .unwrap();
+            assert!(format!("{stream:?}").contains("filtered: true"));
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+            drop(stream.next(&cx));
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+            let initial = stream.next(&cx).await.unwrap().unwrap();
+            // Fast's top unfiltered row has no metadata and is excluded. The
+            // next matching row fills its top-1 slot rather than being lost.
+            assert_eq!(initial.hits()[0].hit().doc_id.as_str(), "shared");
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 2);
+            storage
+                .connection()
+                .execute_sync("UPDATE documents SET metadata_json = '{\"visible\":false}';")
+                .unwrap();
+            drop(storage);
+            let quality_hits = stream.next(&cx).await.unwrap().unwrap();
+            assert_eq!(quality_hits.hits()[0].hit().doc_id.as_str(), "quality-only");
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 4);
+            assert_eq!(stream.state(), PublishedSearchStreamState::Complete);
+            assert!(stream.next(&cx).await.is_none());
+            drop(stream);
+            drop(filter);
+            assert_eq!(
+                initial.hits()[0].document().canonical_text(),
+                "retained source for shared"
+            );
+            assert_eq!(
+                quality_hits.hits()[0].document().canonical_text(),
+                "retained source for quality-only"
+            );
+        });
+    }
+
+    #[test]
+    fn filtered_stream_preflight_and_noops_do_not_call_the_predicate() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_storage, cohort) = filtered_fixture(&cx);
+            let mut fast = Probe::new("fast", Reply::Ready);
+            let filter = StreamFilter::default();
+            for requests in [
+                vec![fast.request(1); 2],
+                vec![PublishedSearchTextQuery {
+                    embedder_id: "unknown",
+                    ..fast.request(1)
+                }],
+            ] {
+                assert!(
+                    cohort
+                        .search_text_stream_filtered(&cx, "query", &requests, Some(&filter))
+                        .is_err()
+                );
+            }
+            let mut empty = cohort
+                .search_text_stream_filtered(&cx, "query", &[], Some(&filter))
+                .unwrap();
+            assert!(empty.next(&cx).await.is_none());
+            for (text, limit) in [("", 1), ("query", 0)] {
+                let mut stream = cohort
+                    .search_text_stream_filtered(&cx, text, &[fast.request(limit)], Some(&filter))
+                    .unwrap();
+                assert!(stream.next(&cx).await.unwrap().unwrap().hits().is_empty());
+                assert_eq!(stream.state(), PublishedSearchStreamState::Complete);
+            }
+            fast.identity = identity("foreign");
+            let mut wrong = cohort
+                .search_text_stream_filtered(&cx, "", &[fast.request(0)], Some(&filter))
+                .unwrap();
+            assert!(wrong.next(&cx).await.unwrap().is_err());
+            assert_eq!(
+                wrong.state(),
+                PublishedSearchStreamState::Failed { tier: 0 }
+            );
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+            cx.cancel_with(asupersync::CancelKind::User, Some("cancel before filtered stream"));
+            assert!(matches!(
+                cohort.search_text_stream_filtered(&cx, "", &[], Some(&filter)),
+                Err(SearchError::Cancelled { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn filtered_pending_or_failed_quality_never_retries_without_the_predicate() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_storage, cohort) = filtered_fixture(&cx);
+            for reply in [Reply::Pending, Reply::Foreign, Reply::Error] {
+                let fast = Probe::new("fast", Reply::Ready);
+                let quality = Probe::new("quality", reply);
+                let filter = StreamFilter::default();
+                let mut stream = cohort
+                    .search_text_stream_filtered(
+                        &cx,
+                        "query",
+                        &[fast.request(1), quality.request(1)],
+                        Some(&filter),
+                    )
+                    .unwrap()
+                    .with_tier_timeout(&cx, "quality", MAX_TIER_TIMEOUT_MS)
+                    .unwrap();
+                let initial = stream.next(&cx).await.unwrap().unwrap();
+                if matches!(reply, Reply::Pending) {
+                    let mut pull = Box::pin(stream.next(&cx));
+                    assert!(
+                        pull.as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
+                    drop(pull);
+                    assert_eq!(
+                        stream.state(),
+                        PublishedSearchStreamState::Interrupted { tier: 1 }
+                    );
+                } else {
+                    assert!(stream.next(&cx).await.unwrap().is_err());
+                    assert_eq!(
+                        stream.state(),
+                        PublishedSearchStreamState::Failed { tier: 1 }
+                    );
+                }
+                assert!(stream.next(&cx).await.is_none());
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.drops.load(Ordering::SeqCst), 1);
+                assert_eq!(filter.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(initial.hits()[0].hit().doc_id.as_str(), "shared");
+                assert!(!cx.is_cancel_requested());
+            }
+        });
+    }
+
+    #[test]
+    fn predicate_cancellation_and_unwind_leave_the_initial_tier_intact() {
+        for unwind in [false, true] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let (_storage, cohort) = filtered_fixture(&cx);
+                let fast = Probe::new("fast", Reply::Ready);
+                let quality = Probe::new("quality", Reply::Ready);
+                let filter = StreamFilter {
+                    cancel_at: if unwind { usize::MAX } else { 3 },
+                    panic_at: if unwind { 3 } else { usize::MAX },
+                    ..StreamFilter::default()
+                };
+                let mut stream = cohort
+                    .search_text_stream_filtered(
+                        &cx,
+                        "query",
+                        &[fast.request(1), quality.request(1)],
+                        Some(&filter),
+                    )
+                    .unwrap();
+                let initial = stream.next(&cx).await.unwrap().unwrap();
+                let _clear = ClearFilterCancel;
+                FILTER_CANCEL.with(|slot| *slot.borrow_mut() = Some(cx.clone()));
+                if unwind {
+                    let mut pull = Box::pin(stream.next(&cx));
+                    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        pull.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+                    }));
+                    assert!(panicked.is_err());
+                    drop(pull);
+                    assert_eq!(
+                        stream.state(),
+                        PublishedSearchStreamState::Interrupted { tier: 1 }
+                    );
+                    assert!(!cx.is_cancel_requested());
+                } else {
+                    assert!(matches!(
+                        stream.next(&cx).await,
+                        Some(Err(SearchError::Cancelled { .. }))
+                    ));
+                    assert_eq!(
+                        stream.state(),
+                        PublishedSearchStreamState::Failed { tier: 1 }
+                    );
+                }
+                assert!(stream.next(&cx).await.is_none());
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(filter.calls.load(Ordering::SeqCst), 3);
+                assert_eq!(
+                    initial.hits()[0].document().canonical_text(),
+                    "retained source for shared"
+                );
+            });
+        }
     }
 }
