@@ -138,6 +138,9 @@ impl PublishedSearchCohort {
     /// are caller-owned. Dropping this future drops its inference future; an
     /// internally detached provider must implement its own teardown. Synchronous
     /// callbacks cannot be preempted.
+    /// Pending inference has an independent cancellation wake even without a
+    /// deadline. Cancellation releases the provider future before returning;
+    /// it neither retries refinement nor changes the retained candidates.
     pub async fn rerank_candidates<'cohort>(
         &'cohort self,
         cx: &Cx,
@@ -171,7 +174,14 @@ impl PublishedSearchCohort {
             });
         }
         checkpoint(cx)?;
-        let response = reranker.rerank(cx, query, &documents).await;
+        let response = crate::publication_progressive::run_cancellable(cx, async {
+            // Creating a provider future is an arbitrary synchronous callback.
+            // Do not poll it at all when its factory requested cancellation.
+            let inference = reranker.rerank(cx, query, &documents);
+            checkpoint(cx)?;
+            inference.await
+        })
+        .await;
         checkpoint(cx)?;
         let scores = response?;
         // Validate before assembling ANY output: providers are not trusted to
@@ -1065,6 +1075,184 @@ mod tests {
                 ));
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
                 assert!(probe.dropped.load(Ordering::SeqCst));
+                assert_eq!(tiers[0].hits().len(), 2);
+            });
+        }
+    }
+
+    struct CountWake(AtomicUsize);
+    impl std::task::Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cancelled_pending_reranking_wakes_without_expiry_and_keeps_retained_sources() {
+        for bounded in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let (storage, cohort) = fixture(&cx);
+                let tiers = retrieve(&cohort, &cx);
+                storage
+                    .connection()
+                    .execute_sync("DELETE FROM documents;")
+                    .unwrap();
+                drop(storage);
+                let probe = Probe::new(Reply::Pending);
+                let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(async {
+                    if bounded {
+                        cohort
+                            .rerank_candidates_bounded(
+                                &cx,
+                                &probe,
+                                "query",
+                                &tiers,
+                                bounded_options(86_400_000),
+                            )
+                            .await
+                    } else {
+                        cohort
+                            .rerank_candidates(
+                                &cx,
+                                &probe,
+                                "query",
+                                &tiers,
+                                2,
+                                PublishedRerankLimits::default(),
+                            )
+                            .await
+                    }
+                });
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert_eq!(probe.availability_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                assert!(!probe.dropped.load(Ordering::SeqCst));
+                let before = wake.0.load(Ordering::SeqCst);
+                cx.cancel_with(asupersync::CancelKind::User, Some("stop pending reranking"));
+                // Assert the notification BEFORE another manual poll. Neither
+                // a provider wake nor elapsed time can supply this wakeup.
+                assert!(wake.0.load(Ordering::SeqCst) > before);
+                assert!(matches!(
+                    operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(SearchError::Cancelled { .. }))
+                ));
+                assert!(probe.dropped.load(Ordering::SeqCst));
+                assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+                drop(operation);
+                assert_eq!(tiers[0].hits()[0].document().canonical_text(), "first source");
+
+                // Cancellation belongs to this call, not the immutable cohort.
+                // Explicit new work can use the same retained candidates.
+                let healthy = Cx::for_testing();
+                let next = Probe::new(Reply::Normal);
+                let results = cohort
+                    .rerank_candidates(
+                        &healthy,
+                        &next,
+                        "query",
+                        &tiers,
+                        2,
+                        PublishedRerankLimits::default(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(results[0].document().catalog().doc_id, "quality-only");
+                assert_eq!(results[0].document().canonical_text(), "target source");
+                assert_eq!(next.calls.load(Ordering::SeqCst), 1);
+                assert!(!healthy.is_cancel_requested());
+            });
+        }
+    }
+
+    #[test]
+    fn a_cancelling_reranker_factory_cannot_start_its_returned_future() {
+        struct FactoryCancels {
+            calls: AtomicUsize,
+            polls: AtomicUsize,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl Reranker for FactoryCancels {
+            fn rerank<'a>(
+                &'a self,
+                cx: &'a Cx,
+                _: &'a str,
+                _: &'a [RerankDocument],
+            ) -> SearchFuture<'a, Vec<RerankScore>> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let guard = OnDrop(Arc::clone(&self.dropped));
+                cx.cancel_with(asupersync::CancelKind::User, Some("reranker factory"));
+                Box::pin(async move {
+                    let _guard = guard;
+                    self.polls.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending().await
+                })
+            }
+
+            fn id(&self) -> &str {
+                "cancelling-factory"
+            }
+
+            fn model_name(&self) -> &str {
+                self.id()
+            }
+
+            fn is_available(&self) -> bool {
+                true
+            }
+        }
+
+        for bounded in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let (_storage, cohort) = fixture(&cx);
+                let tiers = retrieve(&cohort, &cx);
+                let provider = FactoryCancels {
+                    calls: AtomicUsize::new(0),
+                    polls: AtomicUsize::new(0),
+                    dropped: Arc::new(AtomicBool::new(false)),
+                };
+                let mut operation = Box::pin(async {
+                    if bounded {
+                        cohort
+                            .rerank_candidates_bounded(
+                                &cx,
+                                &provider,
+                                "query",
+                                &tiers,
+                                bounded_options(86_400_000),
+                            )
+                            .await
+                    } else {
+                        cohort
+                            .rerank_candidates(
+                                &cx,
+                                &provider,
+                                "query",
+                                &tiers,
+                                2,
+                                PublishedRerankLimits::default(),
+                            )
+                            .await
+                    }
+                });
+                assert!(matches!(
+                    operation.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(SearchError::Cancelled { .. }))
+                ));
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(provider.polls.load(Ordering::SeqCst), 0);
+                assert!(provider.dropped.load(Ordering::SeqCst));
                 assert_eq!(tiers[0].hits().len(), 2);
             });
         }
