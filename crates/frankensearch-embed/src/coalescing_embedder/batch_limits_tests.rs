@@ -1,13 +1,12 @@
-use std::future::Future;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use asupersync::test_utils::run_test_with_cx;
 
 use super::super::{
-    CoalescerConfig, CoalescerLimits, CoalescingEmbedder, EmbeddingIdentityBundleV1,
-    Embedder, ModelCategory, SearchError,
+    CoalescerConfig, CoalescerLimits, CoalescingEmbedder, Embedder, EmbeddingIdentityBundleV1,
+    ModelCategory, SearchError,
 };
 use super::*;
 
@@ -71,7 +70,10 @@ impl Embedder for Provider {
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
         Box::pin(async move {
-            assert!(self.native, "a bound-single override must stay on that path");
+            assert!(
+                self.native,
+                "a bound-single override must stay on that path"
+            );
             self.widths.lock().unwrap().push(texts.len());
             Ok(texts.iter().map(|text| self.response(text)).collect())
         })
