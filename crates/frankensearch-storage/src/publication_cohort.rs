@@ -5,6 +5,7 @@
 //! embedding jobs atomic. Missing/pending coverage remains explicit per tier.
 
 use asupersync::Cx;
+use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::types::BoundQueryEmbedding;
 use frankensearch_core::{
     Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError, SearchResult,
@@ -158,6 +159,28 @@ impl PublishedSearchCohort {
         cx: &Cx,
         requests: &[PublishedSearchTierQuery<'_>],
     ) -> SearchResult<Vec<PublishedSearchTierHits<'_>>> {
+        self.search_filtered(cx, requests, None)
+    }
+
+    /// Apply one query predicate to every independently searched captured tier.
+    ///
+    /// Each tier filters BEFORE its own top-k selection, using the exact ID
+    /// and `catalog().metadata` retained with its vectors and source text.
+    /// Excluded high-scoring rows cannot consume a result slot, and quality-only
+    /// matches remain eligible. No live catalog lookup, shared candidate pool,
+    /// hash-hint shortcut, or predicate-result cache is introduced.
+    ///
+    /// Missing metadata is passed as `None`; its admission remains the supplied
+    /// predicate's policy. This is not live authorization or revocation. A
+    /// stateful predicate may change between calls; use a stable predicate when
+    /// both tiers must observe one policy. Names are checked before callbacks,
+    /// zero limits still admit queries, and any failure discards the whole result.
+    pub fn search_filtered(
+        &self,
+        cx: &Cx,
+        requests: &[PublishedSearchTierQuery<'_>],
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<PublishedSearchTierHits<'_>>> {
         let snapshots =
             self.resolve_tiers(cx, requests.iter().map(|request| request.embedder_id))?;
         let mut results = Vec::new();
@@ -166,7 +189,7 @@ impl PublishedSearchCohort {
             .map_err(map_storage_error)?;
         for (snapshot, request) in snapshots.into_iter().zip(requests) {
             checkpoint(cx)?;
-            let hits = snapshot.search(cx, request.query, request.limit)?;
+            let hits = snapshot.search_filtered(cx, request.query, request.limit, filter)?;
             results.push(PublishedSearchTierHits { snapshot, hits });
         }
         checkpoint(cx)?;
@@ -193,6 +216,28 @@ impl PublishedSearchCohort {
         text: &str,
         requests: &[PublishedSearchTextQuery<'_>],
     ) -> SearchResult<Vec<PublishedSearchTierHits<'_>>> {
+        self.search_text_filtered(cx, text, requests, None).await
+    }
+
+    /// Independently embed each requested tier, then filter its complete scan.
+    ///
+    /// Uses the same captured-metadata predicate as [`Self::search_filtered`].
+    /// Each actual bound response still passes the single-tier producer and
+    /// dimension checks before any filter callback. An exclude-all predicate
+    /// is not permission to hide an invalid provider. Empty canonical queries,
+    /// empty tiers and zero limits retain producer admission without inference
+    /// or filter calls. A later failure returns no successful prefix.
+    ///
+    /// Callbacks are synchronous and cooperatively cancellable, not preemptible.
+    /// This buffered API starts no timers; progressive callers may bound each
+    /// tier's full operation, including the predicate, with their stream budget.
+    pub async fn search_text_filtered(
+        &self,
+        cx: &Cx,
+        text: &str,
+        requests: &[PublishedSearchTextQuery<'_>],
+        filter: Option<&dyn SearchFilter>,
+    ) -> SearchResult<Vec<PublishedSearchTierHits<'_>>> {
         let snapshots =
             self.resolve_tiers(cx, requests.iter().map(|request| request.embedder_id))?;
         let mut results = Vec::new();
@@ -202,12 +247,13 @@ impl PublishedSearchCohort {
         for (snapshot, request) in snapshots.into_iter().zip(requests) {
             checkpoint(cx)?;
             let hits = snapshot
-                .search_text(
+                .search_text_filtered(
                     cx,
                     request.embedder,
                     request.canonicalizer,
                     text,
                     request.limit,
+                    filter,
                 )
                 .await?;
             results.push(PublishedSearchTierHits { snapshot, hits });
@@ -1195,6 +1241,315 @@ mod tests {
                 ));
             }
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    fn scope_metadata(storage: &Storage, id: &str, allowed: bool) {
+        use fsqlite_types::value::SqliteValue;
+
+        storage
+            .connection()
+            .execute_with_params_sync(
+                "UPDATE documents SET metadata_json = ?1 WHERE doc_id = ?2;",
+                &[
+                    SqliteValue::Text(serde_json::json!({"allowed": allowed}).to_string().into()),
+                    SqliteValue::Text(id.to_owned().into()),
+                ],
+            )
+            .unwrap();
+    }
+
+    fn scoped_fixture(cx: &Cx) -> (Arc<Storage>, PublishedSearchCohort) {
+        let (storage, queue) = fixture();
+        for (id, tier, values) in [
+            ("a-blocked", "fast", [1.0, 0.0]),
+            ("a-blocked", "quality", [0.0, 1.0]),
+            ("b-fast", "fast", [0.0, 1.0]),
+            ("c-quality\0数据", "quality", [1.0, 0.0]),
+            ("d-shared", "fast", [-1.0, 0.0]),
+            ("d-shared", "quality", [0.0, -1.0]),
+        ] {
+            publish(&storage, &queue, id, tier, &format!("source for {id}"), values);
+        }
+        for id in ["b-fast", "c-quality\0数据", "d-shared"] {
+            scope_metadata(&storage, id, true);
+        }
+        let cohort = load(&storage, cx);
+        (storage, cohort)
+    }
+
+    #[derive(Default)]
+    struct ScopedFilter {
+        calls: AtomicUsize,
+    }
+
+    impl SearchFilter for ScopedFilter {
+        fn matches(&self, _: &str, metadata: Option<&serde_json::Value>) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            metadata
+                .and_then(|value| value.get("allowed"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        }
+
+        fn matches_doc_id_hash(&self, _: u64, _: Option<&serde_json::Value>) -> Option<bool> {
+            panic!("cohort filtering must use the full captured-metadata predicate")
+        }
+
+        fn candidate_hashes(&self) -> Option<&frankensearch_core::filter::DocIdHashSet> {
+            panic!("a hash inventory must not replace captured-metadata admission")
+        }
+
+        fn name(&self) -> &str {
+            panic!("filter diagnostics must not invoke arbitrary callbacks")
+        }
+    }
+
+    #[test]
+    fn filtered_cohort_search_selects_top_k_within_each_tiers_scope() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, cohort) = scoped_fixture(&cx);
+            let fast = BoundQueryEmbedding::new(vec![1.0, 0.0], identity("fast")).unwrap();
+            let quality = BoundQueryEmbedding::new(vec![0.0, 1.0], identity("quality")).unwrap();
+            let filter = ScopedFilter::default();
+            let before = storage.metrics_snapshot();
+            for reverse in [false, true] {
+                let mut requests = [
+                    PublishedSearchTierQuery {
+                        embedder_id: "fast",
+                        query: &fast,
+                        limit: 3,
+                    },
+                    PublishedSearchTierQuery {
+                        embedder_id: "quality",
+                        query: &quality,
+                        limit: 3,
+                    },
+                ];
+                if reverse {
+                    requests.reverse();
+                }
+                let complete = cohort.search(&cx, &requests).unwrap();
+                // The old unfiltered top-1 is excluded in BOTH tiers. Filtering
+                // that truncated prefix would return nothing, not the next match.
+                for tier in &complete {
+                    assert_eq!(tier.hits()[0].hit().doc_id.as_str(), "a-blocked");
+                }
+                for limit in [0, 1, 2, 3, usize::MAX] {
+                    for request in &mut requests {
+                        request.limit = limit;
+                    }
+                    let actual = cohort
+                        .search_filtered(&cx, &requests, Some(&filter))
+                        .unwrap();
+                    for (result, full) in actual.iter().zip(&complete) {
+                        let expected: Vec<_> = full
+                            .hits()
+                            .iter()
+                            .filter(|hit| hit.hit().doc_id.as_str() != "a-blocked")
+                            .take(limit)
+                            .map(|hit| hit.hit())
+                            .collect();
+                        assert_eq!(
+                            result.hits().iter().map(|hit| hit.hit()).collect::<Vec<_>>(),
+                            expected
+                        );
+                        assert!(std::ptr::eq(result.snapshot(), full.snapshot()));
+                    }
+                }
+                let selected = cohort
+                    .search_filtered(&cx, &requests[..1], Some(&filter))
+                    .unwrap();
+                assert_eq!(selected.len(), 1);
+                assert_eq!(selected[0].snapshot().embedder_id(), requests[0].embedder_id);
+                assert_eq!(selected[0].hits().len(), 2);
+            }
+            assert_eq!(storage.metrics_snapshot(), before);
+        });
+    }
+
+    #[test]
+    fn cohort_filters_use_retained_metadata_after_recapture_and_database_drop() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, old) = scoped_fixture(&cx);
+            scope_metadata(&storage, "a-blocked", true);
+            scope_metadata(&storage, "b-fast", false);
+            scope_metadata(&storage, "c-quality\0数据", false);
+            let current = load(&storage, &cx);
+            drop(storage);
+            let fast = QueryProbe::new("fast", QueryReply::Normal);
+            let quality = QueryProbe::new("quality", QueryReply::Normal);
+            let policy = QueryPolicy("query");
+            let filter = ScopedFilter::default();
+            let requests = [fast.request(&policy, 1), quality.request(&policy, 1)];
+            let original = old
+                .search_text_filtered(&cx, "question", &requests, Some(&filter))
+                .await
+                .unwrap();
+            assert_eq!(original[0].hits()[0].hit().doc_id.as_str(), "b-fast");
+            assert_eq!(original[1].hits()[0].hit().doc_id.as_str(), "c-quality\0数据");
+            assert_eq!(
+                original[1].hits()[0].document().canonical_text(),
+                "source for c-quality\0数据"
+            );
+            let latest = current
+                .search_text_filtered(&cx, "question", &requests, Some(&filter))
+                .await
+                .unwrap();
+            for tier in latest {
+                assert_eq!(tier.hits()[0].hit().doc_id.as_str(), "a-blocked");
+            }
+            for provider in [&fast, &quality] {
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+                assert_eq!(provider.raw_calls.load(Ordering::SeqCst), 0);
+            }
+        });
+    }
+
+    #[test]
+    fn filtered_cohort_candidates_reach_reranking_without_excluded_sources() {
+        use frankensearch_core::traits::{RerankDocument, RerankScore, Reranker};
+
+        struct RerankProbe;
+        impl Reranker for RerankProbe {
+            fn rerank<'a>(
+                &'a self,
+                _: &'a Cx,
+                _: &'a str,
+                documents: &'a [RerankDocument],
+            ) -> SearchFuture<'a, Vec<RerankScore>> {
+                Box::pin(async move {
+                    assert_eq!(
+                        documents.iter().map(|doc| doc.doc_id.as_str()).collect::<Vec<_>>(),
+                        ["b-fast", "d-shared", "c-quality\0数据"]
+                    );
+                    Ok(documents
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .map(|(rank, doc)| {
+                            assert_eq!(doc.text, format!("source for {}", doc.doc_id));
+                            RerankScore {
+                                doc_id: doc.doc_id.clone(),
+                                score: 1.0,
+                                original_rank: rank,
+                                raw_logit: None,
+                            }
+                        })
+                        .collect())
+                })
+            }
+            fn id(&self) -> &str {
+                "scope-probe"
+            }
+            fn model_name(&self) -> &str {
+                "scope-probe"
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (storage, cohort) = scoped_fixture(&cx);
+            drop(storage);
+            let fast = QueryProbe::new("fast", QueryReply::Normal);
+            let quality = QueryProbe::new("quality", QueryReply::Normal);
+            let policy = QueryPolicy("query");
+            let tiers = cohort
+                .search_text_filtered(
+                    &cx,
+                    "question",
+                    &[fast.request(&policy, 2), quality.request(&policy, 2)],
+                    Some(&ScopedFilter::default()),
+                )
+                .await
+                .unwrap();
+            let reranked = cohort
+                .rerank_candidates(
+                    &cx,
+                    &RerankProbe,
+                    "question",
+                    &tiers,
+                    3,
+                    crate::publication_rerank::PublishedRerankLimits::default(),
+                )
+                .await
+                .unwrap();
+            drop(tiers);
+            assert_eq!(
+                reranked.iter()
+                    .map(|hit| hit.document().catalog().doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["b-fast", "d-shared", "c-quality\0数据"]
+            );
+        });
+    }
+
+    #[test]
+    fn filtered_cohort_admission_never_uses_the_predicate_to_hide_bad_requests() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_storage, cohort) = scoped_fixture(&cx);
+            let fast = QueryProbe::new("fast", QueryReply::Normal);
+            let quality = QueryProbe::new("quality", QueryReply::Foreign);
+            let policy = QueryPolicy("query");
+            let filter = ScopedFilter::default();
+            let request = fast.request(&policy, 1);
+            for requests in [
+                vec![request, request],
+                vec![PublishedSearchTextQuery {
+                    embedder_id: "unknown",
+                    ..request
+                }],
+            ] {
+                assert!(
+                    cohort.search_text_filtered(&cx, "question", &requests, Some(&filter))
+                        .await.is_err()
+                );
+            }
+            assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+            for (text, limit) in [("question", 0), (" \t ", 1)] {
+                let hits = cohort
+                    .search_text_filtered(
+                        &cx,
+                        text,
+                        &[fast.request(&policy, limit)],
+                        Some(&filter),
+                    )
+                    .await
+                    .unwrap();
+                assert!(hits[0].hits().is_empty());
+                assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
+            }
+            let result = cohort
+                .search_text_filtered(
+                    &cx,
+                    "question",
+                    &[request, quality.request(&policy, 1)],
+                    Some(&filter),
+                )
+                .await;
+            assert!(matches!(result, Err(SearchError::InvalidConfig { field, .. })
+                if field == "publication_search.identity"));
+            // Only fast reached the predicate; a foreign bound quality response
+            // cannot yield a filtered successful prefix or invoke its filter.
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            quality.drift.store(true, Ordering::SeqCst);
+            assert!(
+                cohort.search_text_filtered(
+                    &cx, "", &[quality.request(&policy, 0)], Some(&filter)
+                ).await.is_err()
+            );
+            assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+            cx.cancel_with(asupersync::CancelKind::User, Some("cancel filtered query"));
+            assert!(matches!(
+                cohort.search_filtered(&cx, &[], Some(&filter)),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                cohort.search_text_filtered(&cx, "", &[], Some(&filter)).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(filter.calls.load(Ordering::SeqCst), 3);
         });
     }
 }

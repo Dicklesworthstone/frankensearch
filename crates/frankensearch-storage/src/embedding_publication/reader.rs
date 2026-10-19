@@ -19,6 +19,8 @@ use fsqlite_types::value::SqliteValue;
 
 use crate::Storage;
 
+mod query;
+
 // Read lengths before fetching any identity/vector payload. Keyset pagination
 // does not repeatedly materialize all IDs or use an OFFSET into a growing scan.
 const SCAN_PAGE_SQL: &str = "SELECT v.doc_id, \

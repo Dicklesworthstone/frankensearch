@@ -489,7 +489,19 @@ fn validate_response(
         ));
     }
     response.validate()?;
-    let norm_sq: f32 = response.values.iter().map(|value| value * value).sum();
+    // Widen BEFORE multiplying. Finite f32 coordinates can have squares that
+    // overflow f32 or underflow to zero, although their cosine is well-defined.
+    // The identity bounds dimension to u32, so every finite f32 vector's
+    // squared norm fits f64. Match the exact reader's arithmetic without
+    // normalizing or rewriting any stored coordinate bits.
+    let norm_sq: f64 = response
+        .values
+        .iter()
+        .map(|&value| {
+            let value = f64::from(value);
+            value * value
+        })
+        .sum();
     if norm_sq == 0.0 || !norm_sq.is_finite() {
         return Err(publication_error(
             "embedding must have finite, non-zero squared norm",
@@ -860,7 +872,7 @@ mod tests {
             vec![f32::NAN, 1.0],
             vec![f32::INFINITY, 1.0],
             vec![0.0, -0.0],
-            vec![f32::MAX, 1.0],
+            vec![f32::NEG_INFINITY, 1.0],
         ] {
             let mut invalid = output.clone();
             invalid.values = values;
@@ -1105,6 +1117,88 @@ mod tests {
             rows(&storage, "SELECT * FROM published_embeddings;", 10).len(),
             2
         );
+    }
+
+    #[test]
+    fn norm_admission_does_not_overflow_or_underflow_finite_coordinates() {
+        for values in [
+            vec![f32::MAX, 1.0],
+            vec![f32::MAX, f32::MAX],
+            vec![f32::MIN_POSITIVE, -0.0],
+            vec![f32::from_bits(1), -0.0],
+            vec![3.0, 4.0],
+        ] {
+            let output = response("model", values);
+            let before: Vec<_> = output.values.iter().map(|v| v.to_bits()).collect();
+            validate_response(&output.identity, &output).unwrap();
+            assert_eq!(
+                output.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                before
+            );
+        }
+        // Correcting arithmetic must not admit genuinely undefined cosines.
+        for values in [
+            vec![0.0, -0.0],
+            vec![f32::NAN, 1.0],
+            vec![f32::INFINITY, 1.0],
+            vec![f32::NEG_INFINITY, 1.0],
+        ] {
+            let output = response("model", values);
+            assert!(validate_response(&output.identity, &output).is_err());
+        }
+    }
+
+    #[test]
+    fn extreme_finite_publications_round_trip_and_agree_with_exact_queries() {
+        use frankensearch_core::BoundQueryEmbedding;
+        use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for scale in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+                let (storage, _queue, claim, _) = fixture();
+                let mut output = response("model", vec![scale, -0.0]);
+                // Synthetic semantic admission, not evidence of model quality.
+                output.identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+                output.identity.space.hash_control = None;
+                output.identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+                output.identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+                    role: "weights".to_owned(),
+                    sha256: "b".repeat(64),
+                    size: 1,
+                }];
+                output.identity.producer.space_fingerprint = output.identity.space.fingerprint();
+                output.identity.validate().unwrap();
+                assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
+                let point = storage
+                    .get_published_embedding("doc", "model", &output.identity)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(point.embedding.values[0].to_bits(), scale.to_bits());
+                assert_eq!(point.embedding.values[1].to_bits(), (-0.0_f32).to_bits());
+                let query = BoundQueryEmbedding::new(vec![1.0, 0.0], output.identity.clone())
+                    .unwrap();
+                let limits = crate::PublishedSearchReadLimits::default();
+                let captured = storage
+                    .load_published_embeddings(&cx, "model", &output.identity, limits.embeddings)
+                    .unwrap();
+                let expected = captured.search(&cx, &query, 1).unwrap();
+                assert_eq!(expected.len(), 1);
+                assert_eq!(expected[0].score.to_bits(), 1.0_f32.to_bits());
+                let direct = storage
+                    .query_published_embeddings(&cx, "model", &query, 1, limits.embeddings)
+                    .unwrap();
+                assert_eq!(direct.hits().len(), 1);
+                assert_eq!(direct.hits()[0].hit(), &expected[0]);
+                assert_eq!(direct.hits()[0].publication(), &point);
+                let hydrated = storage
+                    .query_published_search(&cx, "model", &query, 1, limits)
+                    .unwrap();
+                assert_eq!(hydrated.hits().len(), 1);
+                assert_eq!(hydrated.hits()[0].hit(), &expected[0]);
+                assert_eq!(hydrated.hits()[0].publication(), &point);
+                assert_eq!(hydrated.hits()[0].document().canonical_text(), "original body");
+            }
+        });
     }
 
     mod inference {
