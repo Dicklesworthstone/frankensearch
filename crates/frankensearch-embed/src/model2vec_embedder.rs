@@ -60,7 +60,10 @@ const DEFAULT_HF_ID: &str = "minishlab/potion-multilingual-128M";
 
 mod compact_unigram;
 mod registered;
-use compact_unigram::{CompactUnigramTokenizer, is_unigram_tokenizer};
+use compact_unigram::{
+    CompactUnigramTokenizer, UNIGRAM_TRIE_SIDECAR_FILENAME, deserialize_unigram_tokenizer,
+    is_unigram_tokenizer,
+};
 pub use registered::RegisteredModel2Vec;
 
 /// A loaded `Model2Vec` tokenizer. A Unigram vocabulary uses the compact
@@ -76,7 +79,13 @@ impl Model2VecTokenizer {
     fn from_file(path: &Path) -> tokenizers::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         if is_unigram_tokenizer(&content) {
-            Ok(Self::CompactUnigram(serde_json::from_str(&content)?))
+            let sidecar_path = path
+                .parent()
+                .map(|dir| dir.join(UNIGRAM_TRIE_SIDECAR_FILENAME));
+            Ok(Self::CompactUnigram(deserialize_unigram_tokenizer(
+                &content,
+                sidecar_path.as_deref(),
+            )?))
         } else {
             Ok(Self::Library(serde_json::from_str(&content)?))
         }

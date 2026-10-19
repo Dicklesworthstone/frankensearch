@@ -1417,7 +1417,10 @@ fn verify_no_extra_artifacts(
                 )
             })?;
             let relative = relative.to_string_lossy().replace('\\', "/");
-            if relative == ".verified" || expected_paths.contains(relative.as_str()) {
+            if relative == ".verified"
+                || relative == ".tokenizer.unigram-trie.v1"
+                || expected_paths.contains(relative.as_str())
+            {
                 continue;
             }
             if let Ok(role) = artifact_role_for_path(&relative) {
