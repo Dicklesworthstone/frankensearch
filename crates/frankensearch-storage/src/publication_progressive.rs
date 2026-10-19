@@ -9,6 +9,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
+use asupersync::channel::oneshot;
 use asupersync::types::Time;
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{SearchError, SearchResult};
@@ -45,6 +46,8 @@ pub enum PublishedSearchStreamState {
 /// this stream, without cancelling the shared caller `Cx`. A provider that
 /// internally starts independent work retains responsibility for its teardown.
 /// This cannot preempt synchronous provider or exact-scoring work.
+/// Cancellation has its own wake registration, including without a tier timeout;
+/// it does not depend on the provider waking itself or observing its context.
 #[must_use]
 pub struct PublishedSearchStream<'cohort, 'query> {
     cohort: &'cohort PublishedSearchCohort,
@@ -237,7 +240,7 @@ impl<'cohort> PublishedSearchStream<'cohort, '_> {
         };
         let result = match timeout_ms {
             Some(timeout_ms) => run_bounded(cx, timeout_ms, work).await,
-            None => work.await,
+            None => run_cancellable(cx, work).await,
         };
         self.state = if result.is_err() {
             PublishedSearchStreamState::Failed { tier: next_tier }
@@ -250,6 +253,47 @@ impl<'cohort> PublishedSearchStream<'cohort, '_> {
         };
         Some(result)
     }
+}
+
+/// Observe cancellation independently of an uncooperative pending provider.
+/// The private sender stays alive and never sends, so the receive can only
+/// finish through cancellation. Both registration and work are caller-owned;
+/// dropping this future retires the registration and drops work, without
+/// cancelling the context, spawning a task, or waiting for a timer.
+#[allow(clippy::future_not_send)] // Borrowed and non-Send query work is supported.
+pub(crate) async fn run_cancellable<T>(
+    cx: &Cx,
+    work: impl Future<Output = SearchResult<T>>,
+) -> SearchResult<T> {
+    checkpoint(cx)?;
+    let (sender, mut receiver) = oneshot::channel::<()>();
+    let outcome = {
+        let mut cancelled = std::pin::pin!(receiver.recv(cx));
+        let mut work = std::pin::pin!(work);
+        poll_fn(|context| {
+            if let Err(error) = checkpoint(cx) {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(context).is_ready() {
+                return Poll::Ready(Err(SearchError::Cancelled {
+                    phase: "storage.publication_progressive".to_owned(),
+                    reason: "query work cancelled while pending".to_owned(),
+                }));
+            }
+            let outcome = work.as_mut().poll(context);
+            match checkpoint(cx) {
+                Ok(()) => outcome,
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        })
+        .await
+    };
+    // Drop the work and receive futures before checking their destructors'
+    // effects. Receiver-first channel teardown avoids a sender-close wake.
+    drop(receiver);
+    drop(sender);
+    checkpoint(cx)?;
+    outcome
 }
 
 #[allow(clippy::future_not_send)] // Caller-owned local futures are supported.
@@ -309,10 +353,15 @@ async fn run_bounded_with_elapsed<T>(
     });
     // The runtime timer wakes a parked provider even if it never wakes itself.
     // Poll checks above also reject synchronous completion after the deadline.
-    let outcome = asupersync::time::timeout(started, budget, guarded).await;
+    // A timeout wake is not a cancellation wake. Race the same timer/guard
+    // with independent cancellation, even when the deadline is hours away.
+    let outcome = run_cancellable(cx, async {
+        Ok(asupersync::time::timeout(started, budget, guarded).await)
+    })
+    .await;
     drop(work);
     checkpoint(cx)?;
-    outcome.unwrap_or_else(|_| Err(timeout_error(budget_ms, elapsed().max(budget))))
+    outcome?.unwrap_or_else(|_| Err(timeout_error(budget_ms, elapsed().max(budget))))
 }
 
 fn timeout_error(budget_ms: u64, elapsed: Duration) -> SearchError {
@@ -474,6 +523,17 @@ mod tests {
     struct Dropped(Arc<AtomicUsize>);
     impl Drop for Dropped {
         fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct CountWake(AtomicUsize);
+    impl std::task::Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -1213,5 +1273,188 @@ mod tests {
                 );
             });
         }
+    }
+
+    #[test]
+    fn cancellation_wakes_pending_pulls_with_or_without_filter_and_deadline() {
+        for filtered in [false, true] {
+            for bounded in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (_storage, cohort) = filtered_fixture(&cx);
+                    let fast = Probe::new("fast", Reply::Ready);
+                    let quality = Probe::new("quality", Reply::Pending);
+                    let filter = StreamFilter::default();
+                    let mut stream = cohort
+                        .search_text_stream_filtered(
+                            &cx,
+                            "query",
+                            &[fast.request(1), quality.request(1)],
+                            filtered.then_some(&filter as &dyn SearchFilter),
+                        )
+                        .unwrap();
+                    if bounded {
+                        stream = stream
+                            .with_tier_timeout(&cx, "quality", MAX_TIER_TIMEOUT_MS)
+                            .unwrap();
+                    }
+                    let initial = stream.next(&cx).await.unwrap().unwrap();
+                    let initial_id = if filtered { "shared" } else { "fast-only" };
+                    assert_eq!(initial.hits()[0].hit().doc_id, initial_id);
+                    let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+                    let waker = Waker::from(Arc::clone(&wake));
+                    let mut pull = Box::pin(stream.next(&cx));
+                    assert!(
+                        pull.as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                    let before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("stop pending tier"));
+                    // No provider wake, timer advance, sleep or forced repoll
+                    // creates this notification: owner cancellation must do it.
+                    assert!(wake.0.load(Ordering::SeqCst) > before);
+                    assert!(matches!(
+                        pull.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Some(Err(SearchError::Cancelled { .. })))
+                    ));
+                    assert_eq!(quality.drops.load(Ordering::SeqCst), 1);
+                    drop(pull);
+                    assert_eq!(
+                        stream.state(),
+                        PublishedSearchStreamState::Failed { tier: 1 }
+                    );
+                    assert!(stream.next(&cx).await.is_none());
+                    assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+                    assert_eq!(
+                        filter.calls.load(Ordering::SeqCst),
+                        if filtered { 2 } else { 0 }
+                    );
+                    assert_eq!(initial.hits()[0].hit().doc_id, initial_id);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn cancellation_registration_refreshes_without_unregistering_a_sibling() {
+        let cx = Cx::for_testing();
+        let old = Arc::new(CountWake(AtomicUsize::new(0)));
+        let current = Arc::new(CountWake(AtomicUsize::new(0)));
+        let old_waker = Waker::from(Arc::clone(&old));
+        let current_waker = Waker::from(Arc::clone(&current));
+        let mut first = Box::pin(run_cancellable(
+            &cx,
+            std::future::pending::<SearchResult<()>>(),
+        ));
+        let mut sibling = Box::pin(run_cancellable(
+            &cx,
+            std::future::pending::<SearchResult<()>>(),
+        ));
+        for future in [&mut first, &mut sibling] {
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&old_waker))
+                    .is_pending()
+            );
+        }
+        assert!(
+            sibling
+                .as_mut()
+                .poll(&mut Context::from_waker(&current_waker))
+                .is_pending()
+        );
+        drop(first);
+        assert!(!cx.is_cancel_requested());
+        let before = current.0.load(Ordering::SeqCst);
+        cx.cancel_with(asupersync::CancelKind::User, Some("stop remaining work"));
+        assert!(current.0.load(Ordering::SeqCst) > before);
+        assert!(matches!(
+            sibling.as_mut().poll(&mut Context::from_waker(&current_waker)),
+            Poll::Ready(Err(SearchError::Cancelled { .. }))
+        ));
+    }
+
+    #[test]
+    fn cancellation_guard_releases_wakers_on_success_failure_and_abandonment() {
+        for mode in 0..3 {
+            let cx = Cx::for_testing();
+            let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+            let weak = Arc::downgrade(&wake);
+            let waker = Waker::from(wake);
+            let mut operation = Some(Box::pin(run_cancellable(&cx, async move {
+                match mode {
+                    0 => Ok(7),
+                    1 => Err(invalid("original provider failure")),
+                    _ => std::future::pending::<SearchResult<i32>>().await,
+                }
+            })));
+            let result = operation
+                .as_mut()
+                .unwrap()
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker));
+            match mode {
+                0 => assert!(matches!(result, Poll::Ready(Ok(7)))),
+                1 => assert!(matches!(
+                    result,
+                    Poll::Ready(Err(SearchError::InvalidConfig { reason, .. }))
+                        if reason == "original provider failure"
+                )),
+                _ => {
+                    assert!(result.is_pending());
+                    drop(operation.take());
+                }
+            }
+            drop(waker);
+            // Completed outer futures may remain allocated; their private
+            // receive must already have retired its cancellation registration.
+            assert!(weak.upgrade().is_none());
+            assert!(!cx.is_cancel_requested());
+        }
+    }
+
+    #[test]
+    fn cancellation_guard_checks_work_destruction_and_supports_local_values() {
+        use std::cell::Cell;
+        use std::pin::Pin;
+        use std::rc::Rc;
+
+        struct Work<'a> {
+            cx: &'a Cx,
+            drops: Rc<Cell<usize>>,
+        }
+        impl Future for Work<'_> {
+            type Output = SearchResult<Rc<Cell<usize>>>;
+
+            fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+                Poll::Ready(Ok(Rc::clone(&self.drops)))
+            }
+        }
+        impl Drop for Work<'_> {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+                self.cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("work destructor"),
+                );
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let drops = Rc::new(Cell::new(0));
+            let result = run_cancellable(
+                &cx,
+                Work {
+                    cx: &cx,
+                    drops: Rc::clone(&drops),
+                },
+            )
+            .await;
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert_eq!(drops.get(), 1);
+            assert_eq!(Rc::strong_count(&drops), 1);
+        });
     }
 }
