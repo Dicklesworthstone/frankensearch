@@ -13,6 +13,7 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
@@ -300,7 +301,8 @@ impl PieceTrie {
             return Self::build(vocab);
         };
         let vocab_digest = Self::vocab_digest(vocab);
-        if let Ok(bytes) = std::fs::read(path)
+        if let Some(max_bytes) = Self::max_sidecar_bytes(vocab)
+            && let Some(bytes) = Self::read_sidecar(path, max_bytes)
             && let Some(trie) = Self::decode_sidecar(&bytes, &vocab_digest, vocab_len)
         {
             #[cfg(test)]
@@ -311,9 +313,69 @@ impl PieceTrie {
         SIDECAR_BUILDS.with(|builds| builds.set(builds.get() + 1));
         let trie = Self::build(vocab);
         if let Some(encoded) = trie.encode_sidecar(&vocab_digest, vocab_len) {
-            let _ = std::fs::write(path, encoded);
+            let _ = Self::persist_sidecar(path, &encoded);
         }
         trie
+    }
+
+    /// Each vocabulary byte can add at most one node and one edge. A root
+    /// alone occupies 12 payload bytes; every added node/edge occupies 13.
+    /// Derive the read ceiling from authoritative input, not cache headers.
+    fn max_sidecar_bytes(vocab: &[(String, f64)]) -> Option<usize> {
+        vocab.iter().try_fold(
+            TRIE_SIDECAR_HEADER_BYTES.checked_add(12)?,
+            |size, (piece, _)| size.checked_add(piece.len().checked_mul(13)?),
+        )
+    }
+
+    fn read_sidecar(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+        let limit = u64::try_from(max_bytes).ok()?;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return None;
+        }
+        let file = std::fs::File::open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return None;
+        }
+        // Limit the read itself too: a regular file can grow after metadata.
+        let mut bytes = Vec::new();
+        file.take(limit.checked_add(1)?)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= max_bytes).then_some(bytes)
+    }
+
+    /// Publish a complete cache file by replacing its directory entry, never
+    /// by truncating an existing inode (which may be hard-linked or in use).
+    /// Keep ordinary symlinks and special entries untouched. The model
+    /// directory is caller-controlled; this is not a hostile-directory lease.
+    /// A cache write failure never prevents using the freshly built trie.
+    fn persist_sidecar(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tokenizer cache destination is not a regular file",
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut staged = tempfile::Builder::new()
+            .prefix(".unigram-trie-")
+            .tempfile_in(parent)?;
+        staged.write_all(bytes)?;
+        staged.as_file().sync_all()?;
+        staged.persist(path).map_err(|error| error.error)?;
+        // The directory is not synced: this disposable cache can disappear
+        // after a crash. No model artifact or durable publication depends on it.
+        Ok(())
     }
 
     fn child(&self, node: u32, label: u8) -> Option<u32> {
@@ -924,5 +986,115 @@ mod tests {
             first.encode_fast(probe, false).unwrap().get_ids(),
             fourth.encode_fast(probe, false).unwrap().get_ids()
         );
+    }
+
+    #[test]
+    fn sidecar_read_ceiling_comes_from_vocabulary_bytes() {
+        use super::PieceTrie;
+
+        assert_eq!(PieceTrie::max_sidecar_bytes(&[]), Some(100));
+        let sample = vec![("é\0中".to_owned(), -1.0)];
+        // Six UTF-8 bytes, not three Unicode characters.
+        assert_eq!(PieceTrie::max_sidecar_bytes(&sample), Some(178));
+        let digest = PieceTrie::vocab_digest(&sample);
+        let encoded = PieceTrie::build(&sample).encode_sidecar(&digest, 1).unwrap();
+        assert_eq!(encoded.len(), 178);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache");
+        std::fs::write(&path, &encoded).unwrap();
+        assert_eq!(PieceTrie::read_sidecar(&path, 178), Some(encoded));
+        assert!(PieceTrie::read_sidecar(&path, 177).is_none());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(179)
+            .unwrap();
+        assert!(PieceTrie::read_sidecar(&path, 178).is_none());
+    }
+
+    #[test]
+    fn unusable_sidecar_destinations_do_not_prevent_tokenizer_loading() {
+        use super::{PieceTrie, deserialize_unigram_tokenizer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let missing = dir.path().join("missing-parent").join("cache");
+        let json = tokenizer_json("Unigram");
+        let expected: CompactUnigramTokenizer = serde_json::from_str(&json).unwrap();
+        for path in [&directory, &missing] {
+            assert!(PieceTrie::read_sidecar(path, 1024).is_none());
+            assert!(PieceTrie::persist_sidecar(path, b"cache").is_err());
+            let loaded = deserialize_unigram_tokenizer(&json, Some(path)).unwrap();
+            assert_eq!(
+                loaded.encode("ab 日本語", false).unwrap().get_ids(),
+                expected.encode("ab 日本語", false).unwrap().get_ids()
+            );
+        }
+        assert!(directory.is_dir());
+        assert!(!missing.parent().unwrap().exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_publication_preserves_existing_readers_and_hard_link_targets() {
+        use super::PieceTrie;
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.safetensors");
+        let cache = dir.path().join("cache");
+        let original = b"model artifact must not be truncated";
+        std::fs::write(&model, original).unwrap();
+        std::fs::hard_link(&model, &cache).unwrap();
+        let mut retained = std::fs::File::open(&cache).unwrap();
+        let sample = vocab();
+        let trie = PieceTrie::load_or_build(&sample, Some(&cache));
+        assert_eq!(trie, PieceTrie::build(&sample));
+        assert_eq!(std::fs::read(&model).unwrap(), original);
+        let mut old_bytes = Vec::new();
+        retained.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, original);
+        let decoded = PieceTrie::decode_sidecar(
+            &std::fs::read(&cache).unwrap(),
+            &PieceTrie::vocab_digest(&sample),
+            u32::try_from(sample.len()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, trie);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_sidecars_neither_modify_nor_create_their_targets() {
+        use super::PieceTrie;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("model.safetensors");
+        let absent = dir.path().join("absent-model");
+        std::fs::write(&existing, b"authoritative model bytes").unwrap();
+        for (name, target) in [("existing-link", &existing), ("dangling-link", &absent)] {
+            let cache = dir.path().join(name);
+            symlink(target, &cache).unwrap();
+            assert!(PieceTrie::read_sidecar(&cache, 1024).is_none());
+            assert_eq!(
+                PieceTrie::load_or_build(&vocab(), Some(&cache)),
+                PieceTrie::build(&vocab())
+            );
+            assert!(
+                std::fs::symlink_metadata(&cache)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read_link(&cache).unwrap(), *target);
+        }
+        assert_eq!(std::fs::read(&existing).unwrap(), b"authoritative model bytes");
+        assert!(!absent.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     }
 }
