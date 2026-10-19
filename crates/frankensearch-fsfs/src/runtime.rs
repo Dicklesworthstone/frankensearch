@@ -3263,13 +3263,18 @@ impl LiveWindowMembership {
     fn mark_incomplete(&self) -> SearchResult<()> {
         let mut state = self.lock();
         state.1.generation_complete = false;
-        self.runtime.write_index_sentinel(&self.index_root, &state.1)
+        self.runtime
+            .write_index_sentinel(&self.index_root, &state.1)
     }
 
     fn publish(&self) -> SearchResult<()> {
         let (manifests, sentinel) = self.lock().clone();
-        self.runtime
-            .write_window_mutation_membership(&self.index_root, manifests, sentinel, "watch")?;
+        self.runtime.write_window_mutation_membership(
+            &self.index_root,
+            manifests,
+            sentinel,
+            "watch",
+        )?;
         let refreshed = FsfsRuntime::read_index_sentinel(&self.index_root)?.ok_or_else(|| {
             SearchError::IndexCorrupted {
                 path: self.index_root.join(FSFS_SENTINEL_FILE),
@@ -3463,7 +3468,10 @@ fn resolve_watched_paths(target_root: &Path, file_key: &str) -> SearchResult<(Pa
 
 /// Answer an out-of-band `fsfs flush` request against a live keyword writer:
 /// publish its staged rows, then acknowledge with the published freshness.
-async fn acknowledge_lexical_flush_barrier(cx: &Cx, lexical_index: &QuillIndex) -> SearchResult<bool> {
+async fn acknowledge_lexical_flush_barrier(
+    cx: &Cx,
+    lexical_index: &QuillIndex,
+) -> SearchResult<bool> {
     let Some(directory) = lexical_index.directory() else {
         return Ok(false);
     };
@@ -3543,7 +3551,11 @@ impl WatchIngestPipeline for LexicalOnlyWatchIngest {
 }
 
 impl LexicalOnlyWatchIngest {
-    fn new(target_root: PathBuf, lexical_index: QuillIndex, membership: LiveWindowMembership) -> Self {
+    fn new(
+        target_root: PathBuf,
+        lexical_index: QuillIndex,
+        membership: LiveWindowMembership,
+    ) -> Self {
         Self {
             target_root,
             lexical_index,
@@ -6160,6 +6172,7 @@ impl Drop for SearchBlockingPool {
 
 /// Shared runtime entrypoint used by interface adapters.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct FsfsRuntime {
     config: FsfsConfig,
     cli_input: CliInput,
@@ -6202,6 +6215,14 @@ pub struct FsfsRuntime {
     /// sits beneath a hidden directory the walker skips, but a `.gitignore`
     /// whitelist can unhide that directory.
     discovery_excluded_root: Option<PathBuf>,
+    /// Whether zero-I/O code-navigation ranking priors (`code_structure_sidecar`
+    /// path/module signals + `ranking_priors` path proximity) are applied during
+    /// RRF fusion for `Identifier` and `ShortKeyword` queries in `Normal` mode.
+    enable_ranking_priors: bool,
+    /// Whether cross-process completion receipts with a different `executable_sha256`
+    /// may be reused when their `IndexingContractDigestV1` (`indexing_contract_sha256`),
+    /// `configuration_sha256`, and producer identities all match (`bd-ky0j2`).
+    allow_contract_upgrade_reuse: bool,
 }
 
 /// Private CLI entry point used to extract embedded weights in a short-lived process.
@@ -6230,7 +6251,39 @@ impl FsfsRuntime {
             unchanged_sources: None,
             seeded_from_receipt: false,
             discovery_excluded_root: None,
+            enable_ranking_priors: false,
+            allow_contract_upgrade_reuse: false,
         }
+    }
+
+    /// Enable or disable zero-I/O code-navigation ranking priors (`code_structure_sidecar`
+    /// path/module signals and `ranking_priors` path proximity) during RRF fusion for
+    /// `Identifier` and `ShortKeyword` queries in `Normal` retrieval mode.
+    #[must_use]
+    pub const fn with_ranking_priors(mut self, enabled: bool) -> Self {
+        self.enable_ranking_priors = enabled;
+        self
+    }
+
+    /// Whether zero-I/O code-navigation ranking priors are enabled on this runtime.
+    #[must_use]
+    pub const fn ranking_priors_enabled(&self) -> bool {
+        self.enable_ranking_priors
+    }
+
+    /// Enable or disable `IndexingContractDigestV1`-gated warm reuse across `fsfs`
+    /// binary upgrades when `indexing_contract_sha256`, `configuration_sha256`, and
+    /// producer model fingerprints match (`bd-ky0j2`).
+    #[must_use]
+    pub const fn with_contract_upgrade_reuse(mut self, allow: bool) -> Self {
+        self.allow_contract_upgrade_reuse = allow;
+        self
+    }
+
+    /// Whether `IndexingContractDigestV1`-gated warm reuse across binary upgrades is enabled.
+    #[must_use]
+    pub const fn contract_upgrade_reuse_enabled(&self) -> bool {
+        self.allow_contract_upgrade_reuse
     }
 
     /// Name the source files observed unchanged since the generation a seeded
@@ -8980,7 +9033,8 @@ impl FsfsRuntime {
         runtime.prepare_search_reranker(cx).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
-        let cached_payloads = options.hot_cache_enabled
+        let cached_payloads = options
+            .hot_cache_enabled
             .then(|| hot_cache.get(&cache_key))
             .flatten();
         let cached = cached_payloads.is_some();
@@ -9430,7 +9484,10 @@ impl FsfsRuntime {
             match stream.shutdown(Shutdown::Write) {
                 Ok(()) => {}
                 Err(error) if daemon_hangup(&error) || error.kind() == ErrorKind::NotConnected => {
-                    return Err(Self::search_daemon_hung_up(&socket_path, &error.to_string()));
+                    return Err(Self::search_daemon_hung_up(
+                        &socket_path,
+                        &error.to_string(),
+                    ));
                 }
                 Err(error) => return Err(SearchError::Io(error)),
             }
@@ -9442,24 +9499,23 @@ impl FsfsRuntime {
             let mut total_bytes = 0_usize;
             let mut frames = 0_usize;
             loop {
-                let bytes = match Self::read_search_serve_frame(cx, &mut reader, started, budget)
-                    .await
-                {
-                    Ok(Some(bytes)) => bytes,
-                    // A daemon that cannot admit the index exits after binding
-                    // its socket, so the client saw "Connection reset by peer".
-                    // Nothing was delivered yet: report it as unavailable, and
-                    // in-process retrieval names the real cause. A clean close
-                    // stays a protocol failure (missing terminal).
-                    Err(SearchError::Io(error)) if frames == 0 && daemon_hangup(&error) => {
-                        return Err(Self::search_daemon_hung_up(
-                            &socket_path,
-                            &error.to_string(),
-                        ));
-                    }
-                    Ok(None) => break,
-                    Err(error) => return Err(error),
-                };
+                let bytes =
+                    match Self::read_search_serve_frame(cx, &mut reader, started, budget).await {
+                        Ok(Some(bytes)) => bytes,
+                        // A daemon that cannot admit the index exits after binding
+                        // its socket, so the client saw "Connection reset by peer".
+                        // Nothing was delivered yet: report it as unavailable, and
+                        // in-process retrieval names the real cause. A clean close
+                        // stays a protocol failure (missing terminal).
+                        Err(SearchError::Io(error)) if frames == 0 && daemon_hangup(&error) => {
+                            return Err(Self::search_daemon_hung_up(
+                                &socket_path,
+                                &error.to_string(),
+                            ));
+                        }
+                        Ok(None) => break,
+                        Err(error) => return Err(error),
+                    };
                 frames = frames.saturating_add(1);
                 total_bytes = total_bytes.saturating_add(bytes.len());
                 if total_bytes > FSFS_DAEMON_STREAM_MAX_BYTES {
@@ -13033,13 +13089,38 @@ impl FsfsRuntime {
             .len()
             .saturating_add(semantic_candidates.len())
             .max(planning_limit);
-        let fused_initial_head = orchestrator.fuse_rankings_for_vector_lane(
-            &lexical_head_candidates,
-            &semantic_candidates,
-            fusion_budget,
-            0,
-            Self::vector_generation_is_hash_control(resources),
-        );
+        let retrieval_degradation_mode = if matches!(mode, SearchExecutionMode::LexicalOnly)
+            || matches!(
+                plan.mode,
+                crate::query_planning::QueryExecutionMode::LexicalOnly
+                    | crate::query_planning::QueryExecutionMode::Empty
+            ) {
+            crate::query_execution::DegradedRetrievalMode::LexicalOnly
+        } else {
+            crate::query_execution::DegradedRetrievalMode::Normal
+        };
+        let fused_initial_head = if self.enable_ranking_priors {
+            orchestrator.fuse_code_navigation_rankings(
+                plan.intent.intent,
+                retrieval_degradation_mode,
+                self.config.pressure.profile,
+                &normalized_query,
+                Some(resources.index_root.to_string_lossy().as_ref()),
+                &lexical_head_candidates,
+                &semantic_candidates,
+                fusion_budget,
+                0,
+                Self::vector_generation_is_hash_control(resources),
+            )
+        } else {
+            orchestrator.fuse_rankings_for_vector_lane(
+                &lexical_head_candidates,
+                &semantic_candidates,
+                fusion_budget,
+                0,
+                Self::vector_generation_is_hash_control(resources),
+            )
+        };
         let filtered_initial_head =
             Self::apply_search_filter(&fused_initial_head, filter_expr.as_ref());
         let fused_initial =
@@ -13184,12 +13265,27 @@ impl FsfsRuntime {
                         .len()
                         .saturating_add(blended_candidates.len())
                         .max(planning_limit);
-                    let fused_refined_head = orchestrator.fuse_rankings(
-                        &lexical_head_candidates,
-                        &blended_candidates,
-                        refined_budget,
-                        0,
-                    );
+                    let fused_refined_head = if self.enable_ranking_priors {
+                        orchestrator.fuse_code_navigation_rankings(
+                            plan.intent.intent,
+                            retrieval_degradation_mode,
+                            self.config.pressure.profile,
+                            &normalized_query,
+                            Some(resources.index_root.to_string_lossy().as_ref()),
+                            &lexical_head_candidates,
+                            &blended_candidates,
+                            refined_budget,
+                            0,
+                            false,
+                        )
+                    } else {
+                        orchestrator.fuse_rankings(
+                            &lexical_head_candidates,
+                            &blended_candidates,
+                            refined_budget,
+                            0,
+                        )
+                    };
                     let filtered_refined_head =
                         Self::apply_search_filter(&fused_refined_head, filter_expr.as_ref());
                     let fused_refined = Self::merge_with_fallback_tail(
@@ -13880,7 +13976,10 @@ impl FsfsRuntime {
     ) -> SearchResult<Option<LiveWindowMembership>> {
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
         if vector_path.exists() {
-            semantic_windows::load_mapping(index_root, &VectorIndex::open_read_only(&vector_path)?)?;
+            semantic_windows::load_mapping(
+                index_root,
+                &VectorIndex::open_read_only(&vector_path)?,
+            )?;
         }
         let max_per_file = Self::fast_window_policy_at_root(index_root)?;
         if max_per_file == 1 {
@@ -14418,9 +14517,7 @@ impl FsfsRuntime {
 
         if !vector_path.exists() {
             if Self::is_lexical_only_generation(&index_root) {
-                return self
-                    .run_lexical_only_delete_command(cx, &index_root)
-                    .await;
+                return self.run_lexical_only_delete_command(cx, &index_root).await;
             }
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
@@ -16752,12 +16849,14 @@ impl FsfsRuntime {
             LexicalEngineLayout::BlueGreen {
                 lexical_root,
                 pointer,
-            } if pointer.engine() == BlueGreenEngine::Quill && !stale_quill => Ok(LexicalBuildPlan {
-                lexical_root: lexical_root.clone(),
-                engine_dir: pointer.engine_dir(&lexical_root),
-                publish_pointer: None,
-                previous_engine: None,
-            }),
+            } if pointer.engine() == BlueGreenEngine::Quill && !stale_quill => {
+                Ok(LexicalBuildPlan {
+                    lexical_root: lexical_root.clone(),
+                    engine_dir: pointer.engine_dir(&lexical_root),
+                    publish_pointer: None,
+                    previous_engine: None,
+                })
+            }
             LexicalEngineLayout::Missing { lexical_root } => {
                 fs::create_dir_all(&lexical_root)?;
                 let (dir_name, engine_dir) = Self::next_quill_engine_dir(&lexical_root)?;
@@ -17587,7 +17686,8 @@ impl FsfsRuntime {
         // wrote them; a completion receipt binds them to this executable and
         // configuration.
         let checkpoint_from_receipt =
-            if !self.cli_input.full_reindex && retain_legacy_reuse && existing_checkpoint.is_none() {
+            if !self.cli_input.full_reindex && retain_legacy_reuse && existing_checkpoint.is_none()
+            {
                 existing_checkpoint = retained_reuse::legacy_checkpoint(cx, self, &index_root)?;
                 existing_checkpoint.is_some()
             } else {
@@ -17728,7 +17828,10 @@ impl FsfsRuntime {
             // A fast tier left by an earlier semantic build no longer
             // describes this generation's documents.
             publication_lease.fence("one-shot lexical-only vector generation retirement")?;
-            Self::retire_vector_generation(&vector_path, REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY)?;
+            Self::retire_vector_generation(
+                &vector_path,
+                REASON_VECTOR_FAST_TIER_SKIPPED_LEXICAL_ONLY,
+            )?;
             None
         };
         let initial_live_vector_ids = match vector_index.as_ref() {
@@ -17909,8 +18012,7 @@ impl FsfsRuntime {
                 if entry.ingestion_class != ingestion_class_label(candidate.ingestion_class) {
                     continue;
                 }
-                let revision_changed =
-                    entry.revision != revision || manifest.revision != revision;
+                let revision_changed = entry.revision != revision || manifest.revision != revision;
                 let unchanged = !revision_changed
                     && entry.canonical_lines.is_some()
                     && (observed_unchanged(&candidate.file_path)
@@ -18475,7 +18577,11 @@ impl FsfsRuntime {
                     let batch_files = if touched.len() == 1 {
                         sources[first].0.file_key.clone()
                     } else {
-                        format!("{} and {} more files", sources[first].0.file_key, touched.len() - 1)
+                        format!(
+                            "{} and {} more files",
+                            sources[first].0.file_key,
+                            touched.len() - 1
+                        )
                     };
                     let texts = live.iter().map(|(_, text)| *text).collect::<Vec<_>>();
                     let outcome = Self::embed_indexing_batch_with_backoffs(
@@ -19372,8 +19478,10 @@ impl FsfsRuntime {
             BlueGreenEngine::Quill => return Ok(()),
         };
         if crate::generation_store::is_sealed(index_root)? {
-            let source = Self::read_index_sentinel(index_root)?
-                .map_or_else(|| "<source-dir>".to_owned(), |sentinel| sentinel.target_root);
+            let source = Self::read_index_sentinel(index_root)?.map_or_else(
+                || "<source-dir>".to_owned(),
+                |sentinel| sentinel.target_root,
+            );
             return Err(SearchError::InvalidConfig {
                 field: "index.generation".to_owned(),
                 value: index_root.display().to_string(),
@@ -19450,8 +19558,9 @@ impl FsfsRuntime {
             return Err(SearchError::InvalidConfig {
                 field: "cli.index_dir".to_owned(),
                 value: index_root.display().to_string(),
-                reason: "lexical rebuild completed without publishing a current Quill CURRENT pointer"
-                    .to_owned(),
+                reason:
+                    "lexical rebuild completed without publishing a current Quill CURRENT pointer"
+                        .to_owned(),
             });
         };
         let active_bytes = Self::path_bytes(&active_dir)?;
@@ -20935,7 +21044,11 @@ impl FsfsRuntime {
 
     /// `fsfs delete` on a lexical-only generation: remove the matching files'
     /// keyword rows and manifest entries; there is no vector tier (bd-hu41r).
-    async fn run_lexical_only_delete_command(&self, cx: &Cx, index_root: &Path) -> SearchResult<()> {
+    async fn run_lexical_only_delete_command(
+        &self,
+        cx: &Cx,
+        index_root: &Path,
+    ) -> SearchResult<()> {
         let ids = &self.cli_input.delete_ids;
         let publication_lease = crate::lifecycle::PublicationLease::acquire(index_root)?;
         let membership = match (
@@ -20969,7 +21082,12 @@ impl FsfsRuntime {
             let mutations = targets
                 .iter()
                 .map(|doc_id| {
-                    LexicalMutation::delete(doc_id.clone(), 0, IngestionClass::Skip, "delete_command")
+                    LexicalMutation::delete(
+                        doc_id.clone(),
+                        0,
+                        IngestionClass::Skip,
+                        "delete_command",
+                    )
                 })
                 .collect::<Vec<_>>();
             self.apply_one_shot_lexical_mutations(cx, index_root, &mutations)
@@ -22053,7 +22171,9 @@ impl FsfsRuntime {
 
         let index_root = self.resolve_index_root(&target_root)?;
         if Self::is_lexical_only_generation(&index_root) {
-            let ingest = self.build_lexical_only_watch_ingest(cx, &index_root).await?;
+            let ingest = self
+                .build_lexical_only_watch_ingest(cx, &index_root)
+                .await?;
             return Ok(LiveWatchSession {
                 watcher: FsWatcher::new(
                     vec![target_root],
@@ -22111,7 +22231,9 @@ impl FsfsRuntime {
         let rebuild = |what: &str| SearchError::InvalidConfig {
             field: "index.lexical_only_membership".to_owned(),
             value: index_root.display().to_string(),
-            reason: format!("this lexical-only generation has no {what}; rebuild it with `fsfs index`"),
+            reason: format!(
+                "this lexical-only generation has no {what}; rebuild it with `fsfs index`"
+            ),
         };
         let manifests = Self::read_matching_manifest_generation(index_root)?
             .ok_or_else(|| rebuild("matching source manifests"))?;
@@ -22128,7 +22250,11 @@ impl FsfsRuntime {
             index_root = %index_root.display(),
             "lexical-only ingest pipeline initialized for watch mode"
         );
-        Ok(LexicalOnlyWatchIngest::new(target_root, lexical_index, membership))
+        Ok(LexicalOnlyWatchIngest::new(
+            target_root,
+            lexical_index,
+            membership,
+        ))
     }
 
     /// Leave warm reuse evidence behind a cleanly stopped windowed session
@@ -26299,26 +26425,26 @@ fn render_search_dashboard_frame(frame: &mut Frame, state: &SearchDashboardState
             )));
         }
         lines.push(Line::from_spans(hit.snippet.as_deref().map_or_else(
-                || {
-                    vec![Span::styled(
-                        "No snippet available for this match.".to_owned(),
-                        ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
-                    )]
-                },
-                |snippet| {
-                    let budget = usize::from(left[2].width).saturating_sub(8).max(26);
-                    highlight_text_spans(
-                        &crate::adapters::format_emitter::focused_preview(
-                            snippet,
-                            &query_terms,
-                            budget,
-                        ),
+            || {
+                vec![Span::styled(
+                    "No snippet available for this match.".to_owned(),
+                    ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
+                )]
+            },
+            |snippet| {
+                let budget = usize::from(left[2].width).saturating_sub(8).max(26);
+                highlight_text_spans(
+                    &crate::adapters::format_emitter::focused_preview(
+                        snippet,
                         &query_terms,
-                        ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
-                        ui_fg(no_color, PackedRgba::rgb(152, 174, 211)).bold(),
-                    )
-                },
-            )));
+                        budget,
+                    ),
+                    &query_terms,
+                    ui_fg(no_color, PackedRgba::rgb(152, 174, 211)),
+                    ui_fg(no_color, PackedRgba::rgb(152, 174, 211)).bold(),
+                )
+            },
+        )));
         lines
     } else if let Some(error) = state.last_error.as_deref() {
         vec![
@@ -29117,7 +29243,10 @@ fn is_ignorable_index_walk_error(error: &std::io::Error) -> bool {
 /// repository, global and repository excludes, `.ignore` files and hidden
 /// entries are skipped (`standard_filters` re-enables `hidden`). Anything that
 /// decides whether the sources changed must look at this same tree.
-fn index_discovery_walker(target_root: &Path, discovery: &crate::config::DiscoveryConfig) -> WalkBuilder {
+fn index_discovery_walker(
+    target_root: &Path,
+    discovery: &crate::config::DiscoveryConfig,
+) -> WalkBuilder {
     let mut walker = WalkBuilder::new(target_root);
     walker.follow_links(discovery.follow_symlinks);
     walker.git_ignore(true);
@@ -30003,7 +30132,10 @@ mod tests {
             };
             let before = stale(BoundScript::Admitted);
             let admission = admitted_shared(&before);
-            assert_eq!(admission.embed_admitted(&cx, "query").await.unwrap(), vec![1.0, 0.0]);
+            assert_eq!(
+                admission.embed_admitted(&cx, "query").await.unwrap(),
+                vec![1.0, 0.0]
+            );
             before.drift.store(true, Ordering::SeqCst);
             let result = admission.embed_admitted(&cx, "query").await;
             assert!(
@@ -31874,7 +32006,7 @@ mod tests {
                 .to_string()
                 .contains("before attestation")
         );
-// v10 ignores client rerank deadlines; v9 prints credentials in snippets;
+        // v10 ignores client rerank deadlines; v9 prints credentials in snippets;
         // v8 drops `HashMap::new` from the
         // lexical lane; v7 requires every extension clause at once; v6 reads
         // `lang:rust` as an extension; v5 lets excluded documents back through
@@ -32234,9 +32366,7 @@ mod tests {
             format: OutputFormat::Jsonl,
             ..CliInput::default()
         });
-        let unavailable = |error: &SearchError| {
-            matches!(error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket")
-        };
+        let unavailable = |error: &SearchError| matches!(error, SearchError::InvalidConfig { field, .. } if field == "cli.daemon_socket");
         run_on_runtime_task(move |cx| async move {
             let silent = client
                 .search_payloads_via_daemon(&cx, "hangup query", 10)
@@ -33302,7 +33432,9 @@ mod tests {
         let name = "fsfs-query-0123456789abcdef-01234567.sock";
         let fallback = temp.path().join("fallback");
         assert_eq!(
-            super::choose_daemon_socket_path(&short_dir, name, || unreachable!("no fallback needed")),
+            super::choose_daemon_socket_path(&short_dir, name, || unreachable!(
+                "no fallback needed"
+            )),
             short_dir.join(name)
         );
         assert_eq!(
@@ -33331,8 +33463,14 @@ mod tests {
         let fresh = tempfile::tempdir().expect("fresh base");
         let dir = super::private_socket_dir_in(fresh.path()).expect("created private dir");
         assert_eq!(dir, fresh.path().join(format!("fsfs-{uid}")));
-        assert_eq!(fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(super::private_socket_dir_in(fresh.path()), Some(dir.clone()));
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            super::private_socket_dir_in(fresh.path()),
+            Some(dir.clone())
+        );
 
         let shared = tempfile::tempdir().expect("shared base");
         let planted = shared.path().join(format!("fsfs-{uid}"));
@@ -36998,7 +37136,9 @@ mod tests {
         fn fake_daemon(path: PathBuf, deadline: Instant) -> std::thread::JoinHandle<bool> {
             let _ = fs::remove_file(&path);
             let listener = UnixListener::bind(&path).expect("bind fake daemon");
-            listener.set_nonblocking(true).expect("nonblocking listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
             std::thread::spawn(move || {
                 while Instant::now() < deadline {
                     if let Ok((stream, _)) = listener.accept() {
@@ -37038,15 +37178,18 @@ mod tests {
             .default_daemon_socket_path()
             .unwrap();
         let current_name = current.file_name().unwrap().to_str().unwrap();
-        assert!(current_name.starts_with(&format!("{stem}-")), "{current_name}");
+        assert!(
+            current_name.starts_with(&format!("{stem}-")),
+            "{current_name}"
+        );
         assert_ne!(current, legacy);
         assert_ne!(current, older_protocol);
         assert!(!other_index.to_str().unwrap().contains(&stem));
 
         fs::create_dir_all(&socket_dir).expect("daemon dir");
         let deadline = Instant::now() + Duration::from_secs(3);
-        let asked = [&current, &legacy, &older_protocol]
-            .map(|path| fake_daemon(path.clone(), deadline));
+        let asked =
+            [&current, &legacy, &older_protocol].map(|path| fake_daemon(path.clone(), deadline));
         let unrelated = fake_daemon(other_index.clone(), deadline);
 
         runtime.quiesce_query_daemon("test").expect("quiesce");
@@ -39006,7 +39149,10 @@ mod tests {
                 .map(|entry| entry.expect("read lexical entry").file_name())
                 .filter(|name| name.to_string_lossy().ends_with(".fec"))
                 .collect::<Vec<_>>();
-            assert!(sidecars.is_empty(), "keyword sidecars written: {sidecars:?}");
+            assert!(
+                sidecars.is_empty(),
+                "keyword sidecars written: {sidecars:?}"
+            );
             let mut corrupt = fs::read(&segment_path).expect("read segment");
             let corrupt_offset = corrupt.len() / 2;
             corrupt[corrupt_offset] ^= 0x80;
@@ -40290,7 +40436,12 @@ mod tests {
                 .expect("metadata-only upsert replaces the stale row");
 
             assert_eq!(applied, 1);
-            for (query, findable) in [("meta", true), ("json", true), ("stale", false), ("true", false)] {
+            for (query, findable) in [
+                ("meta", true),
+                ("json", true),
+                ("stale", false),
+                ("true", false),
+            ] {
                 let lexical_hits = pipeline
                     .lexical_index
                     .search(&cx, query, 5)
@@ -41428,7 +41579,10 @@ mod tests {
             .expect("semantic index");
             assert!(fast_path.is_file(), "the semantic build has a fast tier");
 
-            for run in ["over the semantic generation", "resuming its own checkpoint"] {
+            for run in [
+                "over the semantic generation",
+                "resuming its own checkpoint",
+            ] {
                 let payload = Box::pin(
                     FsfsRuntime::new(config.clone())
                         .with_lexical_only_indexing()
@@ -41453,7 +41607,11 @@ mod tests {
                     super::REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY,
                 ] {
                     assert!(
-                        payload.generation.reason_codes.iter().any(|seen| seen == code),
+                        payload
+                            .generation
+                            .reason_codes
+                            .iter()
+                            .any(|seen| seen == code),
                         "{run}: missing {code} in {:?}",
                         payload.generation.reason_codes
                     );
@@ -41508,7 +41666,8 @@ mod tests {
                 .expect("lexical search over a lexical-only generation");
             let hits = &payloads.last().expect("one phase").hits;
             assert!(
-                hits.first().is_some_and(|hit| hit.path.ends_with("auth.rs")),
+                hits.first()
+                    .is_some_and(|hit| hit.path.ends_with("auth.rs")),
                 "{hits:?}"
             );
             let deleted = search_runtime
@@ -41570,8 +41729,7 @@ mod tests {
                 fs::write(project.join("bravo.md"), "sharedtoken bravo document\n")
                     .expect("write bravo");
                 // Read and skipped for its content (NUL bytes), not indexed.
-                fs::write(project.join("echo.md"), b"\0\0\0binary echo\0\0\0")
-                    .expect("write echo");
+                fs::write(project.join("echo.md"), b"\0\0\0binary echo\0\0\0").expect("write echo");
                 // Hidden, so never indexed; opened to flush the watch.
                 fs::write(project.join(".sentinel"), "").expect("write sentinel");
                 settle();
@@ -41714,7 +41872,9 @@ mod tests {
                 }
                 if !lexical_only {
                     let index = VectorIndex::open_read_only(
-                        &project.join(".frankensearch").join(super::FSFS_VECTOR_INDEX_FILE),
+                        &project
+                            .join(".frankensearch")
+                            .join(super::FSFS_VECTOR_INDEX_FILE),
                     )
                     .expect("fast tier");
                     let mut sources = index
@@ -41800,7 +41960,10 @@ mod tests {
                 )
                 .await
                 .expect("apply a watch batch");
-            assert_eq!(changed, 2, "the unchanged replay of keep.rs publishes nothing");
+            assert_eq!(
+                changed, 2,
+                "the unchanged replay of keep.rs publishes nothing"
+            );
 
             // The source manifests follow the watch, so `status` counts the new
             // file and `delete` can find it.
@@ -41955,8 +42118,15 @@ mod tests {
             fs::remove_file(sentinel.join("occupied")).unwrap();
             fs::remove_dir(&sentinel).unwrap();
             fs::write(&sentinel, saved).unwrap();
-            assert!(refused.is_err(), "the sentinel write was refused: {refused:?}");
-            assert_eq!(indexed_files(), 1, "the refused publication did not complete");
+            assert!(
+                refused.is_err(),
+                "the sentinel write was refused: {refused:?}"
+            );
+            assert_eq!(
+                indexed_files(),
+                1,
+                "the refused publication did not complete"
+            );
 
             let changed = ingest.apply_batch(&cx, &[]).await.expect("empty batch");
             assert_eq!(changed, 0);
@@ -42386,13 +42556,17 @@ mod tests {
                 .await
                 .expect("auto search");
             assert_ne!(
-                auto.last().and_then(|payload| payload.skip_reason.as_deref()),
+                auto.last()
+                    .and_then(|payload| payload.skip_reason.as_deref()),
                 Some("lexical_only")
             );
-            let lexical = runtime(DegradationOverrideMode::ForceLexicalOnly, CliCommand::Search)
-                .execute_search_payloads_cached_for_cli(&cx, "otters", 10)
-                .await
-                .expect("lexical-only search");
+            let lexical = runtime(
+                DegradationOverrideMode::ForceLexicalOnly,
+                CliCommand::Search,
+            )
+            .execute_search_payloads_cached_for_cli(&cx, "otters", 10)
+            .await
+            .expect("lexical-only search");
             let last = lexical.last().expect("payload");
             assert_eq!(last.skip_reason.as_deref(), Some("lexical_only"));
             assert_eq!(
@@ -42934,18 +43108,29 @@ mod tests {
             resources.vector_index = Some(write(
                 "exclusion-fast.fsvi",
                 "blend-fast-2",
-                &[("a.rs", [1.0, 0.0]), ("b.rs", [0.9, 0.1]), ("c.rs", [0.0, 1.0])],
+                &[
+                    ("a.rs", [1.0, 0.0]),
+                    ("b.rs", [0.9, 0.1]),
+                    ("c.rs", [0.0, 1.0]),
+                ],
             ));
             resources.quality_vector_index = Some(Arc::new(write(
                 "exclusion-quality.fsvi",
                 "blend-quality-2",
-                &[("b.rs", [1.0, 0.0]), ("a.rs", [0.8, 0.2]), ("c.rs", [0.0, 1.0])],
+                &[
+                    ("b.rs", [1.0, 0.0]),
+                    ("a.rs", [0.8, 0.2]),
+                    ("c.rs", [0.0, 1.0]),
+                ],
             )));
             resources.fast_embedder = Some(admitted(ExclusionProbeEmbedder("blend-fast-2")));
-            resources.quality_embedder =
-                Some(admitted(ExclusionProbeEmbedder("blend-quality-2")));
+            resources.quality_embedder = Some(admitted(ExclusionProbeEmbedder("blend-quality-2")));
             let quill = create_test_quill(&cx, &temp.path().join("lexical")).await;
-            for (path, text) in [("a.rs", "alpha"), ("b.rs", "alpha banned"), ("c.rs", "gamma")] {
+            for (path, text) in [
+                ("a.rs", "alpha"),
+                ("b.rs", "alpha banned"),
+                ("c.rs", "gamma"),
+            ] {
                 quill
                     .index_document(&cx, &IndexableDocument::new(path, text))
                     .await
@@ -42990,9 +43175,17 @@ mod tests {
                         .iter()
                         .map(|hit| hit.path.as_str())
                         .collect::<Vec<_>>();
-                    assert!(!paths.contains(&"b.rs"), "{query} {:?}: {paths:?}", phase.phase);
+                    assert!(
+                        !paths.contains(&"b.rs"),
+                        "{query} {:?}: {paths:?}",
+                        phase.phase
+                    );
                 }
-                let initial_a = phases[0].hits.iter().find(|hit| hit.path == "a.rs").unwrap();
+                let initial_a = phases[0]
+                    .hits
+                    .iter()
+                    .find(|hit| hit.path == "a.rs")
+                    .unwrap();
                 assert_eq!(initial_a.semantic_rank, Some(0), "{query}");
             }
             // Without an exclusion b.rs is an ordinary hit.
@@ -43007,7 +43200,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(plain.last().unwrap().hits.iter().any(|hit| hit.path == "b.rs"));
+            assert!(
+                plain
+                    .last()
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .any(|hit| hit.path == "b.rs")
+            );
         });
     }
 
@@ -47299,11 +47499,17 @@ mod tests {
             )
             .await
             .expect("create stale-schema engine");
-            stale.commit(&cx).await.expect("publish stale-schema engine");
+            stale
+                .commit(&cx)
+                .await
+                .expect("publish stale-schema engine");
             drop(stale);
-            let stale_pointer =
-                CurrentPointer::new(BlueGreenEngine::Quill, "quill-stale", super::FSLX_FORMAT_VERSION)
-                    .expect("stale pointer");
+            let stale_pointer = CurrentPointer::new(
+                BlueGreenEngine::Quill,
+                "quill-stale",
+                super::FSLX_FORMAT_VERSION,
+            )
+            .expect("stale pointer");
             publish_current(&lexical_root, &stale_pointer).expect("point CURRENT at stale engine");
             assert!(FsfsRuntime::quill_engine_schema_is_stale(&stale_dir).unwrap());
             let stale_before = snapshot_directory(&stale_dir);
@@ -47335,7 +47541,10 @@ mod tests {
                 .clone();
             assert_eq!(active.engine(), BlueGreenEngine::Quill);
             assert_ne!(active.dir_name(), "quill-stale");
-            assert!(!FsfsRuntime::quill_engine_schema_is_stale(&active.engine_dir(&lexical_root)).unwrap());
+            assert!(
+                !FsfsRuntime::quill_engine_schema_is_stale(&active.engine_dir(&lexical_root))
+                    .unwrap()
+            );
             assert_eq!(
                 snapshot_directory(&stale_dir),
                 stale_before,
@@ -47395,11 +47604,17 @@ mod tests {
             )
             .await
             .expect("create stale-schema engine");
-            stale.commit(&cx).await.expect("publish stale-schema engine");
+            stale
+                .commit(&cx)
+                .await
+                .expect("publish stale-schema engine");
             drop(stale);
-            let stale_pointer =
-                CurrentPointer::new(BlueGreenEngine::Quill, "quill-stale", super::FSLX_FORMAT_VERSION)
-                    .expect("stale pointer");
+            let stale_pointer = CurrentPointer::new(
+                BlueGreenEngine::Quill,
+                "quill-stale",
+                super::FSLX_FORMAT_VERSION,
+            )
+            .expect("stale pointer");
             publish_current(&lexical_root, &stale_pointer).expect("point CURRENT at stale engine");
             // The marker is all `is_sealed` inspects; a real store seals
             // each published generation with it.
@@ -47441,7 +47656,11 @@ mod tests {
                 reason.contains(&format!("run `fsfs index {source}`")),
                 "{reason}"
             );
-            assert_eq!(lexical_entries(), entries_before, "no successor engine is built");
+            assert_eq!(
+                lexical_entries(),
+                entries_before,
+                "no successor engine is built"
+            );
             assert_eq!(snapshot_directory(&stale_dir), stale_before);
             assert_eq!(
                 resolve_current(&lexical_root)
@@ -47484,8 +47703,10 @@ mod tests {
                 .expect("read manifest")
                 .expect("manifest");
             assert!(
-                manifests.iter().any(|entry| entry.file_key == "logs/server.log"
-                    && entry.ingestion_class == "metadata_only"),
+                manifests
+                    .iter()
+                    .any(|entry| entry.file_key == "logs/server.log"
+                        && entry.ingestion_class == "metadata_only"),
                 "{manifests:?}"
             );
 
@@ -47507,7 +47728,10 @@ mod tests {
                 ("badgers", Some("guide.md")),
             ] {
                 let hits = lexical.search_doc_ids(&cx, query, 10).expect("search");
-                let found = hits.iter().map(|hit| hit.document_id.as_str()).collect::<Vec<_>>();
+                let found = hits
+                    .iter()
+                    .map(|hit| hit.document_id.as_str())
+                    .collect::<Vec<_>>();
                 match expected {
                     Some(doc) => assert!(found.contains(&doc), "{query}: {found:?}"),
                     None => assert!(!found.contains(&"logs/server.log"), "{query}: {found:?}"),
@@ -47551,7 +47775,8 @@ mod tests {
             let temp = tempfile::tempdir().expect("tempdir");
             let project = temp.path().join("project");
             fs::create_dir_all(&project).expect("create source root");
-            let long = |word: &str| format!("{word} window text about capybara habitats. ").repeat(400);
+            let long =
+                |word: &str| format!("{word} window text about capybara habitats. ").repeat(400);
             fs::write(project.join("alpha.md"), long("alpha")).expect("write alpha");
             fs::write(project.join("beta.md"), "short beta note\n").expect("write beta");
             let mut config = FsfsConfig::default();
@@ -47614,13 +47839,19 @@ mod tests {
 
             // Shrinking a long file retires its tail windows.
             fs::write(project.join("alpha.md"), "alpha is short now\n").expect("shrink");
-            pipeline.apply_batch(&cx, &[upsert(20)]).await.expect("shrink batch");
+            pipeline
+                .apply_batch(&cx, &[upsert(20)])
+                .await
+                .expect("shrink batch");
             assert_eq!(rows_of("alpha.md"), 1);
             assert_searchable(2);
 
             // Growing it back plans its windows again.
             fs::write(project.join("alpha.md"), long("gamma")).expect("grow");
-            pipeline.apply_batch(&cx, &[upsert(21)]).await.expect("grow batch");
+            pipeline
+                .apply_batch(&cx, &[upsert(21)])
+                .await
+                .expect("grow batch");
             assert_eq!(rows_of("alpha.md"), 4);
             assert_searchable(2);
 
@@ -47707,10 +47938,7 @@ mod tests {
             let (generation, retired) = (published(), retired_rows());
 
             // Startup reconciliation replays every file, changed or not.
-            assert_eq!(
-                pipeline.apply_batch(&cx, &replay).await.expect("replay"),
-                0
-            );
+            assert_eq!(pipeline.apply_batch(&cx, &replay).await.expect("replay"), 0);
             assert_eq!(published(), generation, "no keyword generation per file");
             assert_eq!(retired_rows(), retired, "no window row re-embedded");
             let sentinel = FsfsRuntime::read_index_sentinel(&index_root)
@@ -47726,7 +47954,10 @@ mod tests {
                 .expect("windowed pipeline")
                 .mark_incomplete()
                 .expect("simulate an interrupted batch");
-            pipeline.apply_batch(&cx, &replay[..1]).await.expect("repair replay");
+            pipeline
+                .apply_batch(&cx, &replay[..1])
+                .await
+                .expect("repair replay");
             assert_eq!(retired_rows(), retired + 4, "alpha's four windows replaced");
             assert!(
                 FsfsRuntime::read_index_sentinel(&index_root)
@@ -47909,19 +48140,32 @@ mod tests {
             };
             // Tier merges start after a handful of single-file segments.
             for round in 0..40 {
-                pipeline.apply_batch(&cx, &edit(round)).await.expect("edit batch");
+                pipeline
+                    .apply_batch(&cx, &edit(round))
+                    .await
+                    .expect("edit batch");
                 if retired() > 0 {
                     break;
                 }
             }
             // Inside Quill's reader grace window nothing retired is unlinked.
             assert!(retired() > 0, "the edits must retire merged inputs");
-            pipeline.apply_batch(&cx, &edit(39)).await.expect("edit batch");
+            pipeline
+                .apply_batch(&cx, &edit(39))
+                .await
+                .expect("edit batch");
             assert!(retired() > 0, "the default window keeps fresh retirements");
 
             pipeline.lexical_garbage_grace = Duration::ZERO;
-            pipeline.apply_batch(&cx, &edit(40)).await.expect("edit batch");
-            assert_eq!(retired(), 0, "aged retired files are reclaimed after a batch");
+            pipeline
+                .apply_batch(&cx, &edit(40))
+                .await
+                .expect("edit batch");
+            assert_eq!(
+                retired(),
+                0,
+                "aged retired files are reclaimed after a batch"
+            );
             drop(pipeline);
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 command: CliCommand::Search,
@@ -47933,8 +48177,9 @@ mod tests {
                 .await
                 .expect("open swept index");
             let lexical = resources.lexical_index.as_ref().expect("lexical index");
-            let found = FsfsRuntime::gather_lexical_candidates(&cx, lexical, "revision", 10, None, 10)
-                .expect("lexical candidates");
+            let found =
+                FsfsRuntime::gather_lexical_candidates(&cx, lexical, "revision", 10, None, 10)
+                    .expect("lexical candidates");
             assert_eq!(found.len(), 1);
         });
     }
@@ -47972,7 +48217,13 @@ mod tests {
                 .expect("Quill engine");
             let names = fs::read_dir(&engine)
                 .expect("engine directory")
-                .map(|entry| entry.expect("entry").file_name().to_string_lossy().into_owned())
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
                 .collect::<Vec<_>>();
             let segments = names
                 .iter()
@@ -48082,8 +48333,11 @@ mod tests {
                 "fn build() { let seen = HashMap::new(); std::io::stdout(); }\n",
             )
             .expect("write rust");
-            fs::write(project.join("notes.md"), "Report bugs at https://sqlite.org/forum\n")
-                .expect("write notes");
+            fs::write(
+                project.join("notes.md"),
+                "Report bugs at https://sqlite.org/forum\n",
+            )
+            .expect("write notes");
             let mut config = FsfsConfig::default();
             config.storage.index_dir = ".frankensearch".to_owned();
             FsfsRuntime::new(config.clone())
@@ -48114,11 +48368,12 @@ mod tests {
                 ("title:notes", Some("notes.md")),
                 ("title:HashMap", None),
             ] {
-                let found = FsfsRuntime::gather_lexical_candidates(&cx, lexical, query, 10, None, 10)
-                    .expect("lexical candidates")
-                    .into_iter()
-                    .map(|candidate| candidate.doc_id)
-                    .collect::<Vec<_>>();
+                let found =
+                    FsfsRuntime::gather_lexical_candidates(&cx, lexical, query, 10, None, 10)
+                        .expect("lexical candidates")
+                        .into_iter()
+                        .map(|candidate| candidate.doc_id)
+                        .collect::<Vec<_>>();
                 match expected {
                     Some(doc) => assert!(found.iter().any(|id| id == doc), "{query}: {found:?}"),
                     None => assert!(found.is_empty(), "{query}: {found:?}"),
@@ -49211,10 +49466,19 @@ mod tests {
             false,
             None,
         );
-        assert!(!table.contains('\u{1b}') && !table.contains('\u{7}'), "{table:?}");
-        assert!(table.contains(r"Result: evil\u{1b}]0;pwned\u{7}.rs"), "{table}");
+        assert!(
+            !table.contains('\u{1b}') && !table.contains('\u{7}'),
+            "{table:?}"
+        );
+        assert!(
+            table.contains(r"Result: evil\u{1b}]0;pwned\u{7}.rs"),
+            "{table}"
+        );
         assert!(table.contains(r"Query: quokka\u{1b}[2J"), "{table}");
-        assert!(table.lines().count() > 3, "line structure survives: {table}");
+        assert!(
+            table.lines().count() > 3,
+            "line structure survives: {table}"
+        );
     }
 
     #[test]
@@ -50174,7 +50438,9 @@ mod tests {
         let socket = runtime.default_daemon_socket_path().expect("socket path");
         fs::create_dir_all(socket.parent().expect("daemon dir")).expect("create daemon dir");
         let listener = UnixListener::bind(&socket).expect("bind fake daemon");
-        listener.set_nonblocking(true).expect("nonblocking listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
         // A fake daemon that exits (unlinks its socket) on its first request
         // and returns that request, or nothing once its deadline passes.
         let daemon = std::thread::spawn(move || {

@@ -78,7 +78,12 @@ impl RetentionOutcome {
             Self::Reported(plan) => format!(
                 "retention report: {} older generation(s), {:.1} MB reclaimable",
                 plan.reclaimable.len(),
-                megabytes(plan.reclaimable.iter().map(|generation| generation.bytes).sum())
+                megabytes(
+                    plan.reclaimable
+                        .iter()
+                        .map(|generation| generation.bytes)
+                        .sum()
+                )
             ),
             Self::Off => "predecessors retained".to_owned(),
             Self::Failed { mode, error } => {
@@ -165,8 +170,8 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let Some(root) = self.complete_generation_command_root(initialize_store)? else {
             return match shutdown {
-                Some(shutdown) => self.run_mode_with_shutdown(cx, mode, shutdown).await,
-                None => self.run_mode(cx, mode).await,
+                Some(shutdown) => Box::pin(self.run_mode_with_shutdown(cx, mode, shutdown)).await,
+                None => Box::pin(self.run_mode(cx, mode)).await,
             };
         };
         let dashboard = mode == InterfaceMode::Tui || self.cli_input.command == CliCommand::Tui;
@@ -179,51 +184,57 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
         if dashboard {
-            return self.run_complete_generation_tui(cx, &root).await;
+            return Box::pin(self.run_complete_generation_tui(cx, &root)).await;
         }
         let mut stdout = std::io::stdout();
         match self.cli_input.command {
             CliCommand::Index if !self.cli_input.watch && !self.config.indexing.watch_mode => {
-                self.run_complete_generation_index_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_index_with_writer(cx, &root, &mut stdout))
                     .await
             }
             #[cfg(unix)]
             CliCommand::Watch | CliCommand::Index => graceful_stop(
-                self.run_complete_generation_watch_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_watch_with_writer(cx, &root, &mut stdout))
                     .await,
                 shutdown,
             ),
             CliCommand::Search => {
-                self.run_complete_generation_search_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_search_with_writer(cx, &root, &mut stdout))
                     .await
             }
             CliCommand::Explain => {
-                self.run_complete_generation_explain_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_explain_with_writer(cx, &root, &mut stdout))
                     .await
             }
             CliCommand::Flush => {
                 self.run_complete_generation_flush_with_writer(cx, &root, &mut stdout)
             }
             CliCommand::Delete => {
-                self.run_complete_generation_delete_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_delete_with_writer(cx, &root, &mut stdout))
                     .await
             }
             CliCommand::AppendBatch => {
-                self.run_complete_generation_append_batch_with_writer(cx, &root, &mut stdout)
-                    .await
+                Box::pin(self.run_complete_generation_append_batch_with_writer(
+                    cx,
+                    &root,
+                    &mut stdout,
+                ))
+                .await
             }
             CliCommand::Compact => {
-                self.run_complete_generation_compact_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_compact_with_writer(cx, &root, &mut stdout))
                     .await
             }
             #[cfg(unix)]
-            CliCommand::Serve => {
-                graceful_stop(self.run_complete_generation_serve(cx, &root).await, shutdown)
-            }
+            CliCommand::Serve => graceful_stop(
+                Box::pin(self.run_complete_generation_serve(cx, &root)).await,
+                shutdown,
+            ),
             #[cfg(unix)]
-            CliCommand::Daemon => {
-                graceful_stop(self.run_complete_generation_daemon(cx, &root).await, shutdown)
-            }
+            CliCommand::Daemon => graceful_stop(
+                Box::pin(self.run_complete_generation_daemon(cx, &root)).await,
+                shutdown,
+            ),
             CliCommand::Status | CliCommand::Doctor => {
                 let reader = self.open_complete_generation_diagnostics(cx, &root)?;
                 if self.cli_input.command == CliCommand::Status {
@@ -251,9 +262,10 @@ impl FsfsRuntime {
         // still describe that absent index. Admit the inventory, not search
         // resources: a missing model is diagnostic information, not a reason
         // to load/download a model or refuse inspection of the store.
-        let described = generation
-            .as_ref()
-            .map_or_else(|| root.to_path_buf(), |selected| selected.path().to_path_buf());
+        let described = generation.as_ref().map_or_else(
+            || root.to_path_buf(),
+            |selected| selected.path().to_path_buf(),
+        );
         let mut input = self.cli_input.clone();
         input.index_dir = Some(described);
         input.daemon = false;
@@ -499,7 +511,9 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         let started = Instant::now();
-        let (publication, summary) = self.rebuild_retained_generation_with_summary(cx, root).await?;
+        let (publication, summary) = self
+            .rebuild_retained_generation_with_summary(cx, root)
+            .await?;
         let generation = require_durable_publication(publication)?;
         let retention = self.retire_superseded_generations(cx, root);
         let build = IndexBuildReport {
@@ -791,12 +805,7 @@ impl FsfsRuntime {
                 "Compacted all present vector tiers into an isolated successor"
             )?;
             return self.emit_complete_generation_receipt(
-                root,
-                generation,
-                "compact",
-                retention,
-                None,
-                writer,
+                root, generation, "compact", retention, None, writer,
             );
         }
         payload["generation_changed"] = serde_json::json!(generation.is_some());
@@ -1544,7 +1553,10 @@ mod diagnostic_retention_tests {
                     .open_complete_generation_diagnostics(&cx, root.path())
                     .unwrap();
                 assert_eq!(reader.runtime.cli_input.command, command);
-                assert_eq!(reader.runtime.cli_input.index_dir.as_deref(), Some(old_path.as_path()));
+                assert_eq!(
+                    reader.runtime.cli_input.index_dir.as_deref(),
+                    Some(old_path.as_path())
+                );
                 assert_eq!(runtime.cli_input.index_dir.as_deref(), Some(root.path()));
                 drop(publish_bundle(&store, &cx));
                 let current = publish_bundle(&store, &cx);
@@ -1580,7 +1592,10 @@ mod diagnostic_retention_tests {
                     .open_complete_generation_diagnostics(&cx, root.path())
                     .unwrap();
                 assert!(reader.generation.is_none());
-                assert_eq!(reader.runtime.cli_input.index_dir.as_deref(), Some(root.path()));
+                assert_eq!(
+                    reader.runtime.cli_input.index_dir.as_deref(),
+                    Some(root.path())
+                );
                 assert!(abandoned.is_dir());
                 assert!(!root.path().join("missing-models").exists());
                 assert!(!root.path().join(COMPLETE_GENERATION_POINTER).exists());
@@ -1641,7 +1656,10 @@ mod diagnostic_retention_tests {
                     std::slice::from_ref(&old_id)
                 );
                 assert_eq!(reader.generation.as_ref().unwrap().id(), old_id);
-                Err(complete_cli_error("diagnostic_test", "injected inspection failure"))
+                Err(complete_cli_error(
+                    "diagnostic_test",
+                    "injected inspection failure",
+                ))
             })();
             assert!(matches!(result, Err(SearchError::InvalidConfig { .. })));
             assert_eq!(store.collect_retained(&cx, 0).unwrap().removed, [old_id]);
@@ -1692,7 +1710,10 @@ mod diagnostic_retention_tests {
             assert_eq!(receipt["ok"], true);
             assert_eq!(receipt["data"]["publication"], "durable");
             assert_eq!(receipt["data"]["generation_id"], selected.id());
-            assert_eq!(receipt["data"]["retention"]["partial_collection_possible"], true);
+            assert_eq!(
+                receipt["data"]["retention"]["partial_collection_possible"],
+                true
+            );
             assert!(receipt["data"]["retention"]["error"].is_string());
             runtime.cli_input.format = OutputFormat::Table;
             output.clear();
@@ -1780,7 +1801,10 @@ mod diagnostic_retention_tests {
             assert_eq!(receipt["mode"], mode.as_str());
             assert_eq!(receipt["error"], "injected failure");
             assert_eq!(receipt["partial_collection_possible"], partial);
-            assert_eq!(outcome.summary().contains("no generations removed"), !partial);
+            assert_eq!(
+                outcome.summary().contains("no generations removed"),
+                !partial
+            );
         }
     }
 }
@@ -2123,7 +2147,10 @@ mod tests {
                 .unwrap();
             let text = String::from_utf8(output).unwrap();
             assert!(text.starts_with("Discovered 1 file(s) under "), "{text}");
-            let line = text.lines().find(|line| line.starts_with("Indexed ")).unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("Indexed "))
+                .unwrap();
             let tokens = line.split_whitespace().collect::<Vec<_>>();
             let after = |marker: &str| {
                 tokens
@@ -2140,7 +2167,10 @@ mod tests {
                 .active(&cx)
                 .unwrap()
                 .unwrap();
-            assert!(line.contains(&selected.path().display().to_string()), "{line}");
+            assert!(
+                line.contains(&selected.path().display().to_string()),
+                "{line}"
+            );
         });
     }
 
@@ -2223,7 +2253,10 @@ mod tests {
             .unwrap();
             assert_eq!(lexical["data"]["skip_reason"], "lexical_only", "{lexical}");
             // The lexical-only reader never opened the vector tier.
-            assert!(lexical["data"]["vector_generation_id"].is_null(), "{lexical}");
+            assert!(
+                lexical["data"]["vector_generation_id"].is_null(),
+                "{lexical}"
+            );
             let hits = lexical["data"]["hits"].as_array().unwrap();
             assert_eq!(hits.len(), 1, "{lexical}");
             assert!(
@@ -2296,8 +2329,11 @@ mod tests {
             );
 
             let batch = directory.path().join("append.jsonl");
-            fs::write(&batch, r#"{"id":"notes/kiwi.md","text":"sharedtoken kiwi birds"}"#)
-                .unwrap();
+            fs::write(
+                &batch,
+                r#"{"id":"notes/kiwi.md","text":"sharedtoken kiwi birds"}"#,
+            )
+            .unwrap();
             let mut append = runtime.clone();
             append.cli_input.command = CliCommand::AppendBatch;
             append.cli_input.input_file = Some(batch);
@@ -2333,7 +2369,10 @@ mod tests {
                 .unwrap();
             let compacted: serde_json::Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(compacted["data"]["lexical_only"], true, "{compacted}");
-            assert_eq!(compacted["data"]["generation_changed"], false, "{compacted}");
+            assert_eq!(
+                compacted["data"]["generation_changed"], false,
+                "{compacted}"
+            );
             assert_eq!(
                 store.active(&cx).unwrap().unwrap().id(),
                 active.id(),
@@ -2382,7 +2421,8 @@ mod tests {
                     });
                     let finished = Arc::new(Mutex::new(handle));
                     *daemon_thread.lock().unwrap() = Some(finished.clone());
-                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished())) as DaemonExited)
+                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished()))
+                        as DaemonExited)
                 }))
             };
 
@@ -2409,7 +2449,10 @@ mod tests {
                 .run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new())
                 .await
                 .unwrap();
-            assert!(spawns.lock().unwrap().is_empty(), "--no-daemon starts nothing");
+            assert!(
+                spawns.lock().unwrap().is_empty(),
+                "--no-daemon starts nothing"
+            );
 
             search.cli_input.daemon = true;
             let mut output = Vec::new();
@@ -2424,7 +2467,10 @@ mod tests {
                     .is_some_and(|hits| !hits.is_empty()),
                 "{envelope}"
             );
-            assert_eq!(spawns.lock().unwrap().as_slice(), std::slice::from_ref(&socket));
+            assert_eq!(
+                spawns.lock().unwrap().as_slice(),
+                std::slice::from_ref(&socket)
+            );
             // A slow start lets the first search run in process; the daemon
             // still comes up and serves the store.
             bound(&socket);
@@ -2434,7 +2480,10 @@ mod tests {
                 .await
                 .expect("the started daemon answers a stop request");
             let handle = Arc::try_unwrap(handle).ok().unwrap().into_inner().unwrap();
-            handle.join().unwrap().expect("the daemon exits cleanly on stop");
+            handle
+                .join()
+                .unwrap()
+                .expect("the daemon exits cleanly on stop");
             assert!(!socket.exists());
 
             // A named socket outside the store gets a daemon of its own.
@@ -2466,14 +2515,21 @@ mod tests {
                 serde_json::from_slice::<serde_json::Value>(&output).unwrap()["ok"],
                 true
             );
-            assert_eq!(spawns.lock().unwrap().len(), 2, "an answering daemon is reused");
+            assert_eq!(
+                spawns.lock().unwrap().len(),
+                2,
+                "an answering daemon is reused"
+            );
             let (stopper, handle) = stop_and_join(Some(named.clone()));
             stopper
                 .run_complete_generation_daemon(&cx, &root)
                 .await
                 .expect("the named daemon answers a stop request");
             let handle = Arc::try_unwrap(handle).ok().unwrap().into_inner().unwrap();
-            handle.join().unwrap().expect("the daemon exits cleanly on stop");
+            handle
+                .join()
+                .unwrap()
+                .expect("the daemon exits cleanly on stop");
             assert!(!named.exists());
         });
     }
@@ -2517,7 +2573,8 @@ mod tests {
                     });
                     let finished = Arc::new(Mutex::new(handle));
                     daemons.lock().unwrap().push(finished.clone());
-                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished())) as DaemonExited)
+                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished()))
+                        as DaemonExited)
                 }))
             };
             let bound = |socket: &Path| {
@@ -2532,21 +2589,33 @@ mod tests {
             };
             let join = |daemon: Arc<Mutex<std::thread::JoinHandle<SearchResult<()>>>>| {
                 let handle = Arc::try_unwrap(daemon).ok().unwrap().into_inner().unwrap();
-                handle.join().unwrap().expect("the daemon exits cleanly on stop");
+                handle
+                    .join()
+                    .unwrap()
+                    .expect("the daemon exits cleanly on stop");
             };
 
             let mut search = search_runtime(&runtime);
             search.cli_input.daemon = true;
-            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new()))
-                .await
-                .unwrap();
+            Box::pin(search.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await
+            .unwrap();
             bound(&socket);
             assert_eq!(daemons.lock().unwrap().len(), 1);
 
             let mut edited = search.clone();
             // Not a per-request search knob: the daemon contract holds it exact.
             edited.config.indexing.embedding_batch_size = 32;
-            spawning.lock().unwrap().config.indexing.embedding_batch_size = 32;
+            spawning
+                .lock()
+                .unwrap()
+                .config
+                .indexing
+                .embedding_batch_size = 32;
             let mut named = edited.clone();
             named.cli_input.daemon_socket = Some(socket.clone());
             let refused = Box::pin(named.run_complete_generation_search_with_writer(
@@ -2582,13 +2651,9 @@ mod tests {
             bound(&socket);
             // The replacement serves the edited configuration: a named socket
             // fails closed unless that daemon answers.
-            Box::pin(named.run_complete_generation_search_with_writer(
-                &cx,
-                &root,
-                &mut Vec::new(),
-            ))
-            .await
-            .expect("the replacement serves the edited configuration");
+            Box::pin(named.run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new()))
+                .await
+                .expect("the replacement serves the edited configuration");
 
             let mut stopper = edited.clone();
             stopper.cli_input.daemon_stop = true;
@@ -2614,7 +2679,9 @@ mod tests {
             let (runtime, _, root) = fixture(directory.path());
             publish(&runtime, &cx, &root).await;
             let sockets = tempfile::tempdir().unwrap();
-            let socket = fs::canonicalize(sockets.path()).unwrap().join("policy.sock");
+            let socket = fs::canonicalize(sockets.path())
+                .unwrap()
+                .join("policy.sock");
             let mut daemon_runtime = runtime.clone();
             daemon_runtime.cli_input.command = CliCommand::Daemon;
             daemon_runtime.cli_input.daemon_socket = Some(socket.clone());
@@ -2660,7 +2727,11 @@ mod tests {
                 let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
                 let hit = &envelope["data"]["hits"][0];
                 // Rank 0 in each lane that found it: 1 / (k + 1) per lane.
-                let lanes = if hit["in_both_sources"] == true { 2.0 } else { 1.0 };
+                let lanes = if hit["in_both_sources"] == true {
+                    2.0
+                } else {
+                    1.0
+                };
                 let fused = hit["score"].as_f64().unwrap();
                 assert!(
                     (fused * (rrf_k + 1.0) - lanes).abs() < 1e-9,
@@ -3100,10 +3171,20 @@ mod tests {
         // before the first complete build stays on the legacy route, which
         // reports the missing index instead of an I/O error.
         let search = search_runtime(&runtime);
-        assert!(search.complete_generation_command_root(true).unwrap().is_none());
+        assert!(
+            search
+                .complete_generation_command_root(true)
+                .unwrap()
+                .is_none()
+        );
         let mut status = runtime.clone();
         status.cli_input.command = CliCommand::Status;
-        assert!(status.complete_generation_command_root(true).unwrap().is_none());
+        assert!(
+            status
+                .complete_generation_command_root(true)
+                .unwrap()
+                .is_none()
+        );
         assert!(!root.exists(), "route selection is read-only");
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("generations")).unwrap();
@@ -3217,9 +3298,7 @@ mod tests {
             Some(legacy.clone()),
             "a healthy legacy one-shot rebuild should stage an immutable successor"
         );
-        let disabled = build
-            .clone()
-            .with_complete_generations_for_new_roots(false);
+        let disabled = build.clone().with_complete_generations_for_new_roots(false);
         assert!(
             disabled
                 .complete_generation_command_root(false)
@@ -3252,11 +3331,7 @@ mod tests {
             Some(legacy.clone()),
             "mutators must not write into the predecessor during migration"
         );
-        fs::write(
-            legacy.join(COMPLETE_GENERATION_POINTER),
-            b"corrupt-pointer",
-        )
-        .unwrap();
+        fs::write(legacy.join(COMPLETE_GENERATION_POINTER), b"corrupt-pointer").unwrap();
         assert_eq!(
             search.complete_generation_command_root(false).unwrap(),
             Some(legacy),
@@ -3297,19 +3372,31 @@ mod tests {
             fs::write(source.join(".ignore"), "!.frankensearch/\n").unwrap();
             for build in 0..2 {
                 let receipt = publish(&runtime, &cx, &root).await;
-                assert_eq!(receipt["data"]["discovered_files"], 1, "build {build}: {receipt}");
-                assert_eq!(receipt["data"]["indexed_files"], 1, "build {build}: {receipt}");
+                assert_eq!(
+                    receipt["data"]["discovered_files"], 1,
+                    "build {build}: {receipt}"
+                );
+                assert_eq!(
+                    receipt["data"]["indexed_files"], 1,
+                    "build {build}: {receipt}"
+                );
             }
             let mut output = Vec::new();
-            Box::pin(search_runtime(&runtime).run_complete_generation_search_with_writer(
-                &cx,
-                &root,
-                &mut output,
-            ))
+            Box::pin(
+                search_runtime(&runtime).run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output,
+                ),
+            )
             .await
             .unwrap();
             let search: serde_json::Value = serde_json::from_slice(&output).unwrap();
-            assert_eq!(search["data"]["hits"].as_array().unwrap().len(), 1, "{search}");
+            assert_eq!(
+                search["data"]["hits"].as_array().unwrap().len(),
+                1,
+                "{search}"
+            );
             assert_eq!(search["data"]["hits"][0]["path"], "alpha.md", "{search}");
 
             // A store inside the source but not beneath a hidden directory is
@@ -3642,7 +3729,9 @@ mod tests {
             let (mut runtime, source, root) = fixture(directory.path());
             publish(&runtime, &cx, &root).await;
             runtime.cli_input.command = CliCommand::Status;
-            let reader = runtime.open_complete_generation_diagnostics(&cx, &root).unwrap();
+            let reader = runtime
+                .open_complete_generation_diagnostics(&cx, &root)
+                .unwrap();
             let old = reader.generation.as_ref().unwrap();
             let old_id = old.id().to_owned();
             let old_path = old.path().to_path_buf();
@@ -3702,7 +3791,10 @@ mod tests {
                     .is_some_and(|dimension| dimension > 0),
                 "{data}"
             );
-            assert!(data["quality_generation"].is_null(), "the fixture is fast-only");
+            assert!(
+                data["quality_generation"].is_null(),
+                "the fixture is fast-only"
+            );
             // Publication renames only the selection pointer: the directory a
             // build wrote is the selected generation, a readable index.
             assert_eq!(data["index_root"], data["generation_path"], "{data}");

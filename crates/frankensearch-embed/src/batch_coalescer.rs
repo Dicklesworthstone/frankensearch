@@ -159,27 +159,32 @@ impl CoalescedBatch {
 
     /// Deliver embedding results to the callers who submitted requests.
     ///
-    /// On success, each caller receives its corresponding embedding vector.
-    /// On error, every caller receives a descriptive error.
+    /// Success requires exactly one vector per submitted request, including
+    /// requests whose receivers were dropped. A shorter or longer response
+    /// fails the whole batch before any successful delivery: without IDs, a
+    /// missing or extra row makes positional correspondence untrustworthy.
+    /// Exact-size responses are moved in submission order, without vector copies.
     ///
-    /// Callers whose receivers have been dropped are silently skipped.
+    /// Callers whose receivers have been dropped are silently skipped, not
+    /// removed from the positional mapping. This low-level operation checks
+    /// cardinality, not producer identity or vector contents; use
+    /// [`Self::embed_and_deliver`] for identity-admitted inference.
     pub fn deliver(self, results: SearchResult<Vec<Vec<f32>>>) {
+        let results = match results {
+            Ok(vectors) if vectors.len() != self.requests.len() => {
+                Err(SearchError::EmbeddingFailed {
+                    model: "batch_coalescer".into(),
+                    source: "batch result count mismatch".into(),
+                })
+            }
+            result => result,
+        };
         match results {
             Ok(vectors) => {
-                // Zip results with senders. If lengths don't match (shouldn't
-                // happen), extra callers get an error, extra vectors are dropped.
-                let mut vec_iter = vectors.into_iter();
-                for req in self.requests {
-                    let result = vec_iter.next().map_or_else(
-                        || {
-                            Err(SearchError::EmbeddingFailed {
-                                model: "batch_coalescer".into(),
-                                source: "batch result count mismatch".into(),
-                            })
-                        },
-                        Ok,
-                    );
-                    let _ = req.result_tx.send(result);
+                // The complete response was admitted before any send. Never
+                // guess that a malformed response is a valid positional prefix.
+                for (req, vector) in self.requests.into_iter().zip(vectors) {
+                    let _ = req.result_tx.send(Ok(vector));
                 }
             }
             Err(e) => {
@@ -1183,7 +1188,7 @@ mod tests {
     // ── Result count mismatch ────────────────────────────────────────
 
     #[test]
-    fn result_count_mismatch_sends_error_for_extras() {
+    fn result_count_mismatch_rejects_the_whole_batch() {
         let coalescer = BatchCoalescer::new(CoalescerConfig {
             max_batch_size: 3,
             max_wait_ms: 10_000,
@@ -1196,15 +1201,14 @@ mod tests {
         let rx3 = coalescer.submit("text c".into(), Priority::Background);
 
         let batch = coalescer.try_form_batch().unwrap();
-        // Only deliver 2 results for 3 requests
+        // A missing row could be anywhere, not necessarily the final input.
         batch.deliver(Ok(vec![vec![1.0], vec![2.0]]));
 
-        assert!(rx1.recv().unwrap().is_ok());
-        assert!(rx2.recv().unwrap().is_ok());
-        // Third caller gets an error
-        let r3 = rx3.recv().unwrap();
-        assert!(r3.is_err());
-        assert!(r3.unwrap_err().to_string().contains("mismatch"));
+        for rx in [rx1, rx2, rx3] {
+            let error = rx.try_recv().unwrap().unwrap_err();
+            assert!(error.to_string().contains("mismatch"));
+        }
+        assert_eq!(coalescer.usage(), CoalescerUsage::default());
     }
 
     // ── Dropped receiver is tolerated ────────────────────────────────
@@ -1227,9 +1231,62 @@ mod tests {
         let batch = coalescer.try_form_batch().unwrap();
         // Should not panic even though rx1 is dropped
         batch.deliver(Ok(vec![vec![1.0], vec![2.0]]));
+        // rx2 must retain its original slot, not receive the disconnected row.
+        assert_eq!(rx2.recv().unwrap().unwrap(), vec![2.0]);
+    }
 
-        // rx2 still gets its result
-        assert!(rx2.recv().unwrap().is_ok());
+    #[test]
+    fn malformed_delivery_releases_credits_without_shifting_disconnected_slots() {
+        for returned in [0, 1, 2, 4] {
+            let coalescer = BatchCoalescer::with_limits(
+                CoalescerConfig {
+                    max_batch_size: 3,
+                    max_wait_ms: 10_000,
+                    min_batch_size: 1,
+                    use_priority_lanes: false,
+                },
+                CoalescerLimits {
+                    max_outstanding_requests: 3,
+                    max_outstanding_text_bytes: 64,
+                },
+            )
+            .unwrap();
+            let first = coalescer.submit("a".to_owned(), Priority::Background);
+            let disconnected = coalescer.submit("b".to_owned(), Priority::Background);
+            let last = coalescer.submit("c".to_owned(), Priority::Background);
+            drop(disconnected);
+            assert_eq!(coalescer.usage().outstanding_requests, 3);
+            let batch = coalescer.form_available_batch().unwrap();
+            assert_eq!(batch.len(), 3);
+            batch.deliver(Ok(vec![vec![42.0]; returned]));
+            for rx in [first, last] {
+                let error = rx.try_recv().unwrap().unwrap_err();
+                assert!(error.to_string().contains("mismatch"));
+            }
+            assert_eq!(coalescer.usage(), CoalescerUsage::default());
+
+            // Reuse the full admission budget after rejection, and verify a
+            // valid subsequent batch moves each original vector allocation.
+            let receivers: Vec<_> = ["d", "e", "f"]
+                .into_iter()
+                .map(|text| coalescer.submit(text.to_owned(), Priority::Background))
+                .collect();
+            let batch = coalescer.form_available_batch().unwrap();
+            assert_eq!(batch.len(), 3);
+            let vectors = vec![vec![1.0, -0.0], vec![2.0, -0.0], vec![3.0, -0.0]];
+            let allocations: Vec<_> = vectors.iter().map(Vec::as_ptr).collect();
+            batch.deliver(Ok(vectors));
+            for (index, (rx, allocation)) in receivers.into_iter().zip(allocations).enumerate() {
+                let vector = rx.try_recv().unwrap().unwrap();
+                assert_eq!(vector.as_ptr(), allocation);
+                assert_eq!(
+                    vector[0].to_bits(),
+                    f32::from(u16::try_from(index + 1).unwrap()).to_bits()
+                );
+                assert_eq!(vector[1].to_bits(), (-0.0_f32).to_bits());
+            }
+            assert_eq!(coalescer.usage(), CoalescerUsage::default());
+        }
     }
 
     // ── Empty batch ──────────────────────────────────────────────────
@@ -1577,7 +1634,7 @@ mod tests {
     }
 
     #[test]
-    fn deliver_extra_results_are_dropped() {
+    fn deliver_extra_results_reject_the_whole_batch() {
         let coalescer = BatchCoalescer::new(CoalescerConfig {
             max_batch_size: 2,
             max_wait_ms: 10_000,
@@ -1589,11 +1646,14 @@ mod tests {
         let rx2 = coalescer.submit("text b".into(), Priority::Background);
 
         let batch = coalescer.try_form_batch().unwrap();
-        // Deliver 4 results for 2 requests — extra 2 should be silently dropped
+        // Extra rows make the positional mapping ambiguous too.
         batch.deliver(Ok(vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]]));
 
-        assert_eq!(rx1.recv().unwrap().unwrap(), vec![1.0]);
-        assert_eq!(rx2.recv().unwrap().unwrap(), vec![2.0]);
+        for rx in [rx1, rx2] {
+            let error = rx.try_recv().unwrap().unwrap_err();
+            assert!(error.to_string().contains("mismatch"));
+        }
+        assert_eq!(coalescer.usage(), CoalescerUsage::default());
     }
 
     #[test]
