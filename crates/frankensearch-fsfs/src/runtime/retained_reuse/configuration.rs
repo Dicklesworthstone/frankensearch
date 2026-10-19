@@ -5,11 +5,79 @@
 //! until their effect on indexing has been reviewed. Model identity, source
 //! hashes, executable identity and artifact admission are checked by the owner.
 
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{DefaultCanonicalizer, SearchError, SearchResult};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{FsfsConfig, SearchConfig};
 
 use super::content_sha256_hex;
+
+pub(super) const INDEXING_CONTRACT_VERSION_V1: &str = "fsfs.indexing_contract.v1";
+
+/// Explicit, versioned indexing-pipeline contract (`bd-ky0j2`).
+///
+/// Binds every compile-time and configuration-derived contract that shapes
+/// persisted lexical segments, vector rows, window plans, and catalog records:
+/// - checkpoint schema version (`INDEXING_CHECKPOINT_SCHEMA_VERSION`)
+/// - FSVI binary format version (`frankensearch_index::FSVI_V2_VERSION`)
+/// - Quill lexical engine/segment/manifest format versions and canonicalizer limits
+/// - embedding canonicalizer limits (`DefaultCanonicalizer::default()`)
+/// - fast semantic windowing contract (`WINDOW_CHARS`, `MAX_WINDOWS_PER_FILE`)
+/// - indexing configuration digest (`digest(config)`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct IndexingContractDigestV1 {
+    pub contract_version: String,
+    pub checkpoint_schema_version: u16,
+    pub fsvi_format_version: u16,
+    pub quill_engine_version: u32,
+    pub quill_fslx_format_version: u32,
+    pub quill_manifest_format_version: u32,
+    pub lexical_canonicalizer_max_length: usize,
+    pub lexical_canonicalizer_code_head_lines: usize,
+    pub lexical_canonicalizer_code_tail_lines: usize,
+    pub embedding_canonicalizer_max_length: usize,
+    pub embedding_canonicalizer_code_head_lines: usize,
+    pub embedding_canonicalizer_code_tail_lines: usize,
+    pub fast_window_chars: usize,
+    pub fast_window_max_per_file_cap: usize,
+    pub configuration_sha256: String,
+}
+
+impl IndexingContractDigestV1 {
+    pub(super) fn from_config(config: &FsfsConfig) -> SearchResult<Self> {
+        let embedding_canonicalizer = DefaultCanonicalizer::default();
+        let lexical_canonicalizer = crate::runtime::LEXICAL_CANONICALIZER;
+        Ok(Self {
+            contract_version: INDEXING_CONTRACT_VERSION_V1.to_owned(),
+            checkpoint_schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
+            fsvi_format_version: frankensearch_index::FSVI_V2_VERSION,
+            quill_engine_version: frankensearch_quill::CURRENT_ENGINE_VERSION,
+            quill_fslx_format_version: frankensearch_quill::FSLX_FORMAT_VERSION,
+            quill_manifest_format_version: frankensearch_quill::MANIFEST_FORMAT_VERSION,
+            lexical_canonicalizer_max_length: lexical_canonicalizer.max_length,
+            lexical_canonicalizer_code_head_lines: lexical_canonicalizer.code_head_lines,
+            lexical_canonicalizer_code_tail_lines: lexical_canonicalizer.code_tail_lines,
+            embedding_canonicalizer_max_length: embedding_canonicalizer.max_length,
+            embedding_canonicalizer_code_head_lines: embedding_canonicalizer.code_head_lines,
+            embedding_canonicalizer_code_tail_lines: embedding_canonicalizer.code_tail_lines,
+            fast_window_chars: crate::runtime::semantic_windows::WINDOW_CHARS,
+            fast_window_max_per_file_cap: crate::runtime::semantic_windows::MAX_WINDOWS_PER_FILE,
+            configuration_sha256: digest(config)?,
+        })
+    }
+
+    pub(super) fn sha256_hex(&self) -> SearchResult<String> {
+        let bytes = serde_json::to_vec(self).map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.complete_generation.indexing_contract",
+            source: Box::new(source),
+        })?;
+        Ok(content_sha256_hex(&bytes))
+    }
+}
+
+pub(super) fn contract_digest(config: &FsfsConfig) -> SearchResult<String> {
+    IndexingContractDigestV1::from_config(config)?.sha256_hex()
+}
 
 pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
     let mut config = config.clone();
@@ -51,6 +119,7 @@ mod tests {
     fn query_ranking_and_deadline_changes_reuse_the_same_indexing_contract() {
         let config = FsfsConfig::default();
         let expected = digest(&config).unwrap();
+        let expected_contract = contract_digest(&config).unwrap();
         let changes: &[Change] = &[
             ("quality_weight", |c| c.search.quality_weight = 0.25),
             ("rrf_k", |c| c.search.rrf_k = 30.0),
@@ -66,9 +135,47 @@ mod tests {
             change(&mut tuned);
             assert_ne!(previous_digest(&tuned), previous_digest(&config), "{name}");
             assert_eq!(digest(&tuned).unwrap(), expected, "{name}");
+            assert_eq!(
+                contract_digest(&tuned).unwrap(),
+                expected_contract,
+                "{name}"
+            );
             tuned.indexing.watch_mode = true;
             assert_eq!(digest(&tuned).unwrap(), expected, "watch: {name}");
+            assert_eq!(
+                contract_digest(&tuned).unwrap(),
+                expected_contract,
+                "watch: {name}"
+            );
         }
+    }
+
+    #[test]
+    fn indexing_contract_digest_changes_when_schema_or_window_or_canonicalizer_contract_drifts() {
+        let config = FsfsConfig::default();
+        let baseline = IndexingContractDigestV1::from_config(&config).unwrap();
+        let expected = baseline.sha256_hex().unwrap();
+        assert_eq!(expected.len(), 64);
+
+        let mut changed_version = baseline.clone();
+        changed_version.contract_version = "fsfs.indexing_contract.v2".to_owned();
+        assert_ne!(changed_version.sha256_hex().unwrap(), expected);
+
+        let mut changed_fsvi = baseline.clone();
+        changed_fsvi.fsvi_format_version += 1;
+        assert_ne!(changed_fsvi.sha256_hex().unwrap(), expected);
+
+        let mut changed_quill = baseline.clone();
+        changed_quill.quill_fslx_format_version += 1;
+        assert_ne!(changed_quill.sha256_hex().unwrap(), expected);
+
+        let mut changed_canonicalizer = baseline.clone();
+        changed_canonicalizer.embedding_canonicalizer_max_length += 1;
+        assert_ne!(changed_canonicalizer.sha256_hex().unwrap(), expected);
+
+        let mut changed_window = baseline;
+        changed_window.fast_window_chars += 100;
+        assert_ne!(changed_window.sha256_hex().unwrap(), expected);
     }
 
     #[test]
@@ -110,14 +217,18 @@ mod tests {
             ("model_dir", |c| c.indexing.model_dir.push_str("/changed")),
             ("offline", |c| c.indexing.offline = !c.indexing.offline),
             ("batch_size", |c| c.indexing.embedding_batch_size += 1),
-            ("window_coverage", |c| c.indexing.fast_window_max_per_file = 1),
-            ("reindex_on_change", |c| c.indexing.reindex_on_change = false),
+            ("window_coverage", |c| {
+                c.indexing.fast_window_max_per_file = 1;
+            }),
+            ("reindex_on_change", |c| {
+                c.indexing.reindex_on_change = false;
+            }),
             ("fast_only", |c| c.search.fast_only = true),
         ];
         for (name, change) in changes {
-            let mut changed = config.clone();
-            change(&mut changed);
-            assert_ne!(digest(&changed).unwrap(), expected, "{name}");
+            let mut mutated = config.clone();
+            change(&mut mutated);
+            assert_ne!(digest(&mutated).unwrap(), expected, "{name}");
         }
     }
 
@@ -149,16 +260,22 @@ mod tests {
             ("degradation", |c| {
                 c.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
             }),
-            ("quality_circuit", |c| c.pressure.quality_circuit_open = true),
+            ("quality_circuit", |c| {
+                c.pressure.quality_circuit_open = true;
+            }),
             ("pause", |c| c.pressure.hard_pause_requested = true),
             ("memory_ceiling", |c| c.pressure.memory_ceiling_mb += 1),
-            ("content_privacy", |c| c.privacy.redact_file_contents_in_logs = false),
-            ("path_privacy", |c| c.privacy.redact_paths_in_telemetry = false),
+            ("content_privacy", |c| {
+                c.privacy.redact_file_contents_in_logs = false;
+            }),
+            ("path_privacy", |c| {
+                c.privacy.redact_paths_in_telemetry = false;
+            }),
         ];
         for (name, change) in changes {
-            let mut changed = config.clone();
-            change(&mut changed);
-            assert_ne!(digest(&changed).unwrap(), expected, "{name}");
+            let mut mutated = config.clone();
+            change(&mut mutated);
+            assert_ne!(digest(&mutated).unwrap(), expected, "{name}");
         }
     }
 
@@ -180,9 +297,9 @@ mod tests {
             ("shadow_epsilon", |c| c.search.shadow_score_epsilon = 0.01),
         ];
         for (name, change) in changes {
-            let mut changed = config.clone();
-            change(&mut changed);
-            assert_ne!(digest(&changed).unwrap(), expected, "{name}");
+            let mut mutated = config.clone();
+            change(&mut mutated);
+            assert_ne!(digest(&mutated).unwrap(), expected, "{name}");
         }
     }
 }
