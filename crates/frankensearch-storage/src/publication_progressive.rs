@@ -312,10 +312,7 @@ async fn run_bounded_with_elapsed<T>(
     let outcome = asupersync::time::timeout(started, budget, guarded).await;
     drop(work);
     checkpoint(cx)?;
-    match outcome {
-        Ok(result) => result,
-        Err(_) => Err(timeout_error(budget_ms, elapsed().max(budget))),
-    }
+    outcome.unwrap_or_else(|_| Err(timeout_error(budget_ms, elapsed().max(budget))))
 }
 
 fn timeout_error(budget_ms: u64, elapsed: Duration) -> SearchError {
@@ -1103,7 +1100,10 @@ mod tests {
             );
             assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
             assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
-            cx.cancel_with(asupersync::CancelKind::User, Some("cancel before filtered stream"));
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("cancel before filtered stream"),
+            );
             assert!(matches!(
                 cohort.search_text_stream_filtered(&cx, "", &[], Some(&filter)),
                 Err(SearchError::Cancelled { .. })
