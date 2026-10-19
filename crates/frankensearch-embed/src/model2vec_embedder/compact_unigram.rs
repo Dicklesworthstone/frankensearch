@@ -1056,7 +1056,9 @@ mod tests {
         // Six UTF-8 bytes, not three Unicode characters.
         assert_eq!(PieceTrie::max_sidecar_bytes(&sample), Some(178));
         let digest = PieceTrie::vocab_digest(&sample);
-        let encoded = PieceTrie::build(&sample).encode_sidecar(&digest, 1).unwrap();
+        let encoded = PieceTrie::build(&sample)
+            .encode_sidecar(&digest, 1)
+            .unwrap();
         assert_eq!(encoded.len(), 178);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cache");
@@ -1152,7 +1154,10 @@ mod tests {
             );
             assert_eq!(std::fs::read_link(&cache).unwrap(), *target);
         }
-        assert_eq!(std::fs::read(&existing).unwrap(), b"authoritative model bytes");
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"authoritative model bytes"
+        );
         assert!(!absent.exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
     }

@@ -6,8 +6,8 @@ use std::task::{Context, Poll, Waker};
 use asupersync::test_utils::run_test_with_cx;
 
 use super::super::{
-    CoalescerConfig, CoalescerLimits, CoalescingEmbedder, EmbeddingIdentityBundleV1,
-    Embedder, ModelCategory, SearchError, YieldOnce, identity_mismatch,
+    CoalescerConfig, CoalescerLimits, CoalescingEmbedder, Embedder, EmbeddingIdentityBundleV1,
+    ModelCategory, SearchError, YieldOnce, identity_mismatch,
 };
 use super::*;
 
@@ -98,7 +98,10 @@ fn cancellation_during_cleanup_dominates_the_observed_error() {
             }),
             Box::pin(async { Err(identity_mismatch()) }),
         ];
-        assert!(matches!(collect(&cx, futures).await, Err(SearchError::Cancelled { .. })));
+        assert!(matches!(
+            collect(&cx, futures).await,
+            Err(SearchError::Cancelled { .. })
+        ));
     });
 }
 
@@ -107,11 +110,17 @@ fn cancellation_precedes_empty_or_unstarted_groups() {
     run_test_with_cx(|cx| async move {
         assert!(collect(&cx, Vec::new()).await.unwrap().is_empty());
         cx.set_cancel_requested(true);
-        assert!(matches!(collect(&cx, Vec::new()).await, Err(SearchError::Cancelled { .. })));
+        assert!(matches!(
+            collect(&cx, Vec::new()).await,
+            Err(SearchError::Cancelled { .. })
+        ));
         let futures: Vec<SearchFuture<'_, IdentityBoundEmbedding>> = vec![Box::pin(async {
             panic!("cancelled group must not poll a child")
         })];
-        assert!(matches!(collect(&cx, futures).await, Err(SearchError::Cancelled { .. })));
+        assert!(matches!(
+            collect(&cx, futures).await,
+            Err(SearchError::Cancelled { .. })
+        ));
     });
 }
 
@@ -129,7 +138,12 @@ fn dropping_a_pending_group_releases_every_polled_child() {
             })
             .collect();
         let mut batch = Box::pin(collect(&cx, futures));
-        assert!(batch.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+        assert!(
+            batch
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
         drop(batch);
         assert_eq!(drops.load(Ordering::SeqCst), 3);
         assert!(!cx.is_cancel_requested());
@@ -210,7 +224,12 @@ fn automatic_batch_reports_queue_refusal_without_waiting_for_accepted_siblings()
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
         {
             let mut unrelated = Box::pin(receiver.recv(&cx));
-            assert!(unrelated.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+            assert!(
+                unrelated
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
         }
         assert!(!client.shared.lock().unwrap().closed);
         assert!(!cx.is_cancel_requested());

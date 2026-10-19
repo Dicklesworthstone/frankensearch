@@ -554,9 +554,8 @@ fn abandoned_auto_admission_recovers_request_and_byte_capacity() {
             )
             .unwrap();
             for round in 0..3 {
-                let mut abandoned: Vec<_> = (0..count)
-                    .map(|_| client.embed_bound(&cx, "10"))
-                    .collect();
+                let mut abandoned: Vec<_> =
+                    (0..count).map(|_| client.embed_bound(&cx, "10")).collect();
                 // Stop during the admission yield, before any task owns
                 // dispatch. Previously all later drivers failed at submission.
                 for request in &mut abandoned {
@@ -600,10 +599,7 @@ fn abandoned_admission_does_not_discard_a_live_prefix_recipient() {
             })
         ));
         assert_eq!(client.usage().outstanding_requests, 2);
-        assert_eq!(
-            live.await.unwrap().values[0].to_bits(),
-            20.0_f32.to_bits()
-        );
+        assert_eq!(live.await.unwrap().values[0].to_bits(), 20.0_f32.to_bits());
         assert_eq!(provider.batches.load(Ordering::SeqCst), 1);
         assert_eq!(client.usage(), CoalescerUsage::default());
         assert_eq!(
@@ -700,10 +696,7 @@ fn dispatch_cancellation_wakes_an_uncooperative_provider_and_releases_capacity()
                 assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
                 assert_eq!(client.usage(), CoalescerUsage::default());
                 for request in [first, second] {
-                    assert!(matches!(
-                        request.await,
-                        Err(SearchError::Cancelled { .. })
-                    ));
+                    assert!(matches!(request.await, Err(SearchError::Cancelled { .. })));
                 }
                 assert!(!recipient_cx.is_cancel_requested());
                 assert!(!cx.is_cancel_requested());
@@ -713,10 +706,7 @@ fn dispatch_cancellation_wakes_an_uncooperative_provider_and_releases_capacity()
                 let mut next = client.embed_bound(&recipient_cx, "30");
                 pending(&mut next);
                 assert_eq!(dispatcher.dispatch_available(&cx).await.unwrap(), 1);
-                assert_eq!(
-                    next.await.unwrap().values[0].to_bits(),
-                    30.0_f32.to_bits()
-                );
+                assert_eq!(next.await.unwrap().values[0].to_bits(), 30.0_f32.to_bits());
                 assert_eq!(provider.raw.load(Ordering::SeqCst), 0);
                 assert_eq!(client.usage(), CoalescerUsage::default());
             }

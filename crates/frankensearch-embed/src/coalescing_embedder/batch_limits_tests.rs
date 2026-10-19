@@ -147,7 +147,10 @@ async fn drive_manual_batch(
     client: &dyn Embedder,
     dispatcher: &mut CoalescingDispatcher,
     texts: &[&str],
-) -> (SearchResult<Vec<IdentityBoundEmbedding>>, SearchResult<usize>) {
+) -> (
+    SearchResult<Vec<IdentityBoundEmbedding>>,
+    SearchResult<usize>,
+) {
     let mut request = client.embed_batch_bound(cx, texts);
     let (stop, mut stopped) = oneshot::channel::<()>();
     let mut stop = Some(stop);
@@ -297,10 +300,7 @@ fn manual_service_batches_full_groups_without_changing_provider_contracts() {
     run_test_with_cx(|cx| async move {
         let texts = ["é", "abc", "中", "z", ""];
         for native in [false, true] {
-            for (rows, bytes, expected_widths) in [
-                (2, 128, vec![2, 2, 1]),
-                (4, 5, vec![2, 3]),
-            ] {
+            for (rows, bytes, expected_widths) in [(2, 128, vec![2, 2, 1]), (4, 5, vec![2, 3])] {
                 let provider = Arc::new(Provider::new(native));
                 let (client, mut dispatcher) =
                     manual_clients(&cx, Arc::clone(&provider), rows, bytes);
@@ -335,11 +335,9 @@ fn manual_service_failure_discards_prior_groups_and_never_submits_the_suffix() {
     run_test_with_cx(|cx| async move {
         for native in [false, true] {
             let provider = Arc::new(Provider::new(native));
-            let (client, mut dispatcher) =
-                manual_clients(&cx, Arc::clone(&provider), 2, 128);
+            let (client, mut dispatcher) = manual_clients(&cx, Arc::clone(&provider), 2, 128);
             let texts = ["a", "b", "c", "bad", "not-started"];
-            let (output, service) =
-                drive_manual_batch(&cx, &client, &mut dispatcher, &texts).await;
+            let (output, service) = drive_manual_batch(&cx, &client, &mut dispatcher, &texts).await;
             assert!(matches!(
                 output,
                 Err(SearchError::UnverifiableRemoteSpace { .. })
@@ -401,8 +399,7 @@ fn cancelling_or_dropping_a_manual_batch_keeps_the_service_and_peer_healthy() {
     run_test_with_cx(|cx| async move {
         for cancel in [false, true] {
             let provider = Arc::new(Provider::new(true));
-            let (client, mut dispatcher) =
-                manual_clients(&cx, Arc::clone(&provider), 4, 128);
+            let (client, mut dispatcher) = manual_clients(&cx, Arc::clone(&provider), 4, 128);
             let request_cx = Cx::for_testing();
             let texts = ["a", "b", "c"];
             drop(client.embed_batch_bound(&request_cx, &texts));
@@ -469,10 +466,8 @@ fn trait_erased_stack_tiers_keep_batching_and_independent_service_shutdown() {
         // Same operational label, different full contracts and service owners.
         quality.identity = identity("quality-budget-test");
         let quality = Arc::new(quality);
-        let stack = crate::auto_detect::EmbedderStack::from_parts(
-            fast.clone(),
-            Some(quality.clone()),
-        );
+        let stack =
+            crate::auto_detect::EmbedderStack::from_parts(fast.clone(), Some(quality.clone()));
         let (stack, mut fast_service, quality_service) = stack
             .into_coalescing(
                 &cx,
@@ -493,13 +488,8 @@ fn trait_erased_stack_tiers_keep_batching_and_independent_service_shutdown() {
         assert_eq!(discharged.unwrap(), texts.len());
         assert!(!stack.fast().is_ready());
         assert!(stack.quality().unwrap().is_ready());
-        let (quality_results, discharged) = drive_manual_batch(
-            &cx,
-            stack.quality().unwrap(),
-            &mut quality_service,
-            &texts,
-        )
-        .await;
+        let (quality_results, discharged) =
+            drive_manual_batch(&cx, stack.quality().unwrap(), &mut quality_service, &texts).await;
         let quality_results = quality_results.unwrap();
         assert_eq!(discharged.unwrap(), texts.len());
         assert_eq!(fast_results.len(), texts.len());

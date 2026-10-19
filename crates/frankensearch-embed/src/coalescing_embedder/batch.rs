@@ -30,7 +30,10 @@ pub(super) fn prefix_len(
         count += 1;
     }
     if count == 0 {
-        return Err(invalid("batch", "input cannot fit a nonempty bounded group"));
+        return Err(invalid(
+            "batch",
+            "input cannot fit a nonempty bounded group",
+        ));
     }
     checkpoint(cx)?;
     Ok(count)

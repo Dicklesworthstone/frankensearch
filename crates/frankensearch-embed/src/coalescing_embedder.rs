@@ -562,9 +562,10 @@ impl Shared {
                 {
                     return Ok(());
                 }
-                let batch = self.queue.form_available_batch().ok_or_else(|| {
-                    invalid("replies", "queued replies have no matching inputs")
-                })?;
+                let batch = self
+                    .queue
+                    .form_available_batch()
+                    .ok_or_else(|| invalid("replies", "queued replies have no matching inputs"))?;
                 self.drain_work(&mut state, batch)?
             };
             drop(abandoned);
@@ -620,7 +621,10 @@ impl Shared {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.closed = true;
             self.queue.shutdown();
-            (std::mem::take(&mut state.replies), state.service_wake.take())
+            (
+                std::mem::take(&mut state.replies),
+                state.service_wake.take(),
+            )
         };
         // Channel close can wake arbitrary caller code: no adapter lock is held.
         while let Some(batch) = self.queue.try_form_batch() {
@@ -665,7 +669,10 @@ impl CoalescingDispatcher {
             YieldOnce(false).await;
             let count = self.dispatch_available(cx).await?;
             if count == 0 {
-                return Err(invalid("service", "pending replies made no dispatch progress"));
+                return Err(invalid(
+                    "service",
+                    "pending replies made no dispatch progress",
+                ));
             }
             discharged = discharged.saturating_add(count);
         }
@@ -1002,7 +1009,9 @@ mod service_tests {
                 let _guard = InferenceGuard(&self.drops);
                 let gate = self.gate.lock().unwrap().take();
                 if let Some(mut gate) = gate {
-                    gate.recv(cx).await.map_err(|_| stopped("fixture gate closed"))?;
+                    gate.recv(cx)
+                        .await
+                        .map_err(|_| stopped("fixture gate closed"))?;
                 }
                 if self.fail.load(Ordering::SeqCst) {
                     return Err(invalid("fixture", "service provider failed"));
@@ -1114,7 +1123,10 @@ mod service_tests {
         fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
             self.polls.set(self.polls.get() + 1);
             if let Some(cx) = &self.cancel {
-                cx.cancel_with(asupersync::CancelKind::User, Some("cancel from stop signal"));
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel from stop signal"),
+                );
             }
             if self.ready {
                 Poll::Ready(())
@@ -1197,7 +1209,10 @@ mod service_tests {
             assert_eq!(dispatcher.run(&cx).await.unwrap(), 5);
             assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
             for (request, expected) in live.into_iter().zip([3.0_f32, 4.0, 5.0]) {
-                assert_eq!(request.await.unwrap().values[0].to_bits(), expected.to_bits());
+                assert_eq!(
+                    request.await.unwrap().values[0].to_bits(),
+                    expected.to_bits()
+                );
             }
             assert_eq!(client.usage(), CoalescerUsage::default());
             assert!(!client.is_ready());
@@ -1265,7 +1280,10 @@ mod service_tests {
             pending(request.as_mut(), Waker::noop());
             client.shutdown();
             assert_eq!(dispatcher.run(&cx).await.unwrap(), 1);
-            assert_eq!(request.await.unwrap().values[0].to_bits(), 7.0_f32.to_bits());
+            assert_eq!(
+                request.await.unwrap().values[0].to_bits(),
+                7.0_f32.to_bits()
+            );
             // An already cancelled owner cannot turn closed/empty into success.
             assert!(matches!(
                 dispatcher.run(&owner).await,
@@ -1292,7 +1310,10 @@ mod service_tests {
                     if field == "coalescing_embedder.fixture"
             ));
             for request in [first, second] {
-                assert!(matches!(request.await, Err(SearchError::InvalidConfig { .. })));
+                assert!(matches!(
+                    request.await,
+                    Err(SearchError::InvalidConfig { .. })
+                ));
             }
             pending(suffix.as_mut(), Waker::noop());
             assert_eq!(client.usage().outstanding_requests, 1);
@@ -1393,7 +1414,10 @@ mod service_tests {
             assert_eq!(provider.drops.load(Ordering::SeqCst), 0);
             release.send_blocking(()).unwrap();
             assert_eq!(service.await.unwrap(), 1);
-            assert_eq!(request.await.unwrap().values[0].to_bits(), 1.0_f32.to_bits());
+            assert_eq!(
+                request.await.unwrap().values[0].to_bits(),
+                1.0_f32.to_bits()
+            );
             assert_eq!(drops.get(), 1);
             assert!(!cx.is_cancel_requested());
         });
@@ -1401,7 +1425,14 @@ mod service_tests {
 
     #[test]
     fn service_errors_drop_shutdown_without_silently_closing_admission() {
-        for mode in ["before", "signal", "drop", "pending-signal", "waiting", "provider"] {
+        for mode in [
+            "before",
+            "signal",
+            "drop",
+            "pending-signal",
+            "waiting",
+            "provider",
+        ] {
             run_test_with_cx(|cx| async move {
                 let (provider, client, mut dispatcher) = fixture(&cx);
                 let owner = Cx::for_testing();
