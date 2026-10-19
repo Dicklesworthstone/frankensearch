@@ -636,8 +636,8 @@ impl CoalescingDispatcher {
     ///
     /// Poll this future alongside manual clients returned by
     /// [`CoalescingEmbedder::new`] (or `EmbedderStack::into_coalescing`). Inference
-    /// uses this service's `cx`, never a recipient's context. Cancelling or
-    /// dropping one recipient therefore cannot interrupt its healthy peers.
+    /// uses this service's `cx`; give it a cancellation scope distinct from
+    /// recipient scopes so one recipient cannot interrupt its healthy peers.
     /// No task, runtime, thread or timer is created here. Idle service waits
     /// register with submission/shutdown under the FIFO lock, so a request
     /// arriving before or after registration cannot be missed.
@@ -670,6 +670,58 @@ impl CoalescingDispatcher {
             discharged = discharged.saturating_add(count);
         }
         Ok(discharged)
+    }
+
+    /// Run until an owner-supplied shutdown signal completes, then drain.
+    ///
+    /// This supplies graceful control even when the coalescing clients have
+    /// been erased to `dyn Embedder`, as in `EmbedderStack::into_coalescing`.
+    /// The signal closes admission but does NOT cancel the service context or
+    /// drop in-flight inference. Previously admitted work drains through
+    /// [`Self::run`]; late submissions fail rather than extending shutdown.
+    ///
+    /// The signal is caller-owned, need not be `Send` or `'static`, and is
+    /// dropped as soon as it completes. It is never polled after completion.
+    /// When the service exits first, the unused signal is dropped too. No
+    /// task, timer, runtime or new cancellation scope is created. Synchronous
+    /// signal/provider callbacks cannot be preempted; a stuck provider still
+    /// needs cancellation of the service context, not merely graceful shutdown.
+    ///
+    /// # Errors
+    /// Returns [`Self::run`] errors unchanged. Cancellation takes precedence
+    /// over signal completion, including cancellation requested by the signal.
+    /// Without an observed shutdown signal, an error does not close admission;
+    /// the owner can resume or drop the dispatcher under the existing contract.
+    #[allow(clippy::future_not_send)] // Caller-owned local shutdown futures are supported.
+    pub async fn run_until(
+        &mut self,
+        cx: &Cx,
+        shutdown: impl std::future::Future<Output = ()>,
+    ) -> SearchResult<usize> {
+        checkpoint(cx)?;
+        let shared = Arc::clone(&self.shared);
+        let mut shutdown = Some(Box::pin(shutdown));
+        let mut service = std::pin::pin!(self.run(cx));
+        std::future::poll_fn(|task_cx| {
+            if let Err(error) = checkpoint(cx) {
+                return std::task::Poll::Ready(Err(error));
+            }
+            let requested = shutdown
+                .as_mut()
+                .is_some_and(|signal| signal.as_mut().poll(task_cx).is_ready());
+            if requested {
+                drop(shutdown.take());
+            }
+            // Both polling and dropping a signal can execute arbitrary code.
+            if let Err(error) = checkpoint(cx) {
+                return std::task::Poll::Ready(Err(error));
+            }
+            if requested {
+                shared.close();
+            }
+            service.as_mut().poll(task_cx)
+        })
+        .await
     }
 
     async fn wait_for_work(&mut self, cx: &Cx) -> SearchResult<bool> {
@@ -909,8 +961,10 @@ mod tests;
 
 #[cfg(test)]
 mod service_tests {
+    use std::cell::Cell;
     use std::future::Future;
     use std::pin::Pin;
+    use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Wake, Waker};
 
@@ -986,14 +1040,18 @@ mod service_tests {
         }
     }
 
-    fn fixture(cx: &Cx) -> (Arc<Provider>, CoalescingEmbedder, CoalescingDispatcher) {
-        let provider = Arc::new(Provider {
+    fn provider() -> Arc<Provider> {
+        Arc::new(Provider {
             identity: EmbeddingIdentityBundleV1::explicit_test_model("service-test", 2),
             calls: AtomicUsize::new(0),
             drops: AtomicUsize::new(0),
             fail: AtomicBool::new(false),
             gate: Mutex::new(None),
-        });
+        })
+    }
+
+    fn fixture(cx: &Cx) -> (Arc<Provider>, CoalescingEmbedder, CoalescingDispatcher) {
+        let provider = provider();
         let (client, dispatcher) = CoalescingEmbedder::new(
             cx,
             provider.clone(),
@@ -1041,6 +1099,37 @@ mod service_tests {
 
     fn pending<F: Future + ?Sized>(future: Pin<&mut F>, waker: &Waker) {
         assert!(future.poll(&mut Context::from_waker(waker)).is_pending());
+    }
+
+    // Intentionally !Send: shutdown belongs to the caller, not a spawned task.
+    struct StopSignal {
+        ready: bool,
+        cancel: Option<Cx>,
+        cancel_on_drop: Option<Cx>,
+        polls: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+    }
+    impl Future for StopSignal {
+        type Output = ();
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+            self.polls.set(self.polls.get() + 1);
+            if let Some(cx) = &self.cancel {
+                cx.cancel_with(asupersync::CancelKind::User, Some("cancel from stop signal"));
+            }
+            if self.ready {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+    impl Drop for StopSignal {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+            if let Some(cx) = &self.cancel_on_drop {
+                cx.cancel_with(asupersync::CancelKind::User, Some("stop signal dropped"));
+            }
+        }
     }
 
     #[test]
@@ -1217,6 +1306,154 @@ mod service_tests {
             assert_eq!(client.usage(), CoalescerUsage::default());
             assert!(!cx.is_cancel_requested());
         });
+    }
+
+    #[test]
+    fn stack_service_shutdown_rejects_late_work_but_finishes_inflight_inference() {
+        run_test_with_cx(|cx| async move {
+            let provider = provider();
+            let stack = crate::auto_detect::EmbedderStack::from_parts(provider.clone(), None);
+            let (stack, mut dispatcher, quality) = stack
+                .into_coalescing(
+                    &cx,
+                    CoalescerConfig {
+                        max_batch_size: 2,
+                        ..CoalescerConfig::default()
+                    },
+                    CoalescerLimits::default(),
+                )
+                .unwrap();
+            assert!(quality.is_none());
+            let wake = Arc::new(ServiceWake {
+                shared: Arc::clone(&dispatcher.shared),
+                calls: AtomicUsize::new(0),
+            });
+            let waker = Waker::from(Arc::clone(&wake));
+            let (release, gate) = oneshot::channel();
+            *provider.gate.lock().unwrap() = Some(gate);
+            let (stop, mut stopping) = oneshot::channel();
+            let mut service = Box::pin(dispatcher.run_until(&cx, async {
+                stopping.recv(&cx).await.unwrap();
+            }));
+            pending(service.as_mut(), &waker);
+            // Only the stack's public dyn Embedder is available to this client.
+            let mut request = stack.fast().embed_bound(&cx, "4");
+            pending(request.as_mut(), Waker::noop());
+            pending(service.as_mut(), &waker);
+            pending(service.as_mut(), &waker);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            let before = wake.calls.load(Ordering::SeqCst);
+            stop.send_blocking(()).unwrap();
+            assert!(wake.calls.load(Ordering::SeqCst) > before);
+            pending(service.as_mut(), &waker);
+            assert!(!stack.fast().is_ready());
+            assert!(matches!(
+                stack.fast().embed_bound(&cx, "5").await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(provider.drops.load(Ordering::SeqCst), 0);
+            assert!(!cx.is_cancel_requested());
+            release.send_blocking(()).unwrap();
+            assert_eq!(service.await.unwrap(), 1);
+            let output = request.await.unwrap();
+            assert_eq!(output.identity, provider.identity);
+            assert_eq!(output.values[0].to_bits(), 4.0_f32.to_bits());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(wake.shared.queue.usage(), CoalescerUsage::default());
+        });
+    }
+
+    #[test]
+    fn completed_local_shutdown_is_dropped_once_before_draining_finishes() {
+        run_test_with_cx(|cx| async move {
+            let (provider, client, mut dispatcher) = fixture(&cx);
+            let (release, gate) = oneshot::channel();
+            *provider.gate.lock().unwrap() = Some(gate);
+            let mut request = client.embed_bound(&cx, "1");
+            pending(request.as_mut(), Waker::noop());
+            let polls = Rc::new(Cell::new(0));
+            let drops = Rc::new(Cell::new(0));
+            let signal = StopSignal {
+                ready: true,
+                cancel: None,
+                cancel_on_drop: None,
+                polls: Rc::clone(&polls),
+                drops: Rc::clone(&drops),
+            };
+            let mut service = Box::pin(dispatcher.run_until(&cx, signal));
+            pending(service.as_mut(), Waker::noop());
+            assert_eq!(polls.get(), 1);
+            assert_eq!(drops.get(), 1);
+            assert!(!client.is_ready());
+            for _ in 0..3 {
+                pending(service.as_mut(), Waker::noop());
+            }
+            assert_eq!(polls.get(), 1, "completed signals must not be repolled");
+            assert_eq!(provider.drops.load(Ordering::SeqCst), 0);
+            release.send_blocking(()).unwrap();
+            assert_eq!(service.await.unwrap(), 1);
+            assert_eq!(request.await.unwrap().values[0].to_bits(), 1.0_f32.to_bits());
+            assert_eq!(drops.get(), 1);
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn service_errors_drop_shutdown_without_silently_closing_admission() {
+        for mode in ["before", "signal", "drop", "pending-signal", "waiting", "provider"] {
+            run_test_with_cx(|cx| async move {
+                let (provider, client, mut dispatcher) = fixture(&cx);
+                let owner = Cx::for_testing();
+                let mut request = None;
+                if mode == "provider" {
+                    provider.fail.store(true, Ordering::SeqCst);
+                    let mut submitted = client.embed_bound(&cx, "1");
+                    pending(submitted.as_mut(), Waker::noop());
+                    request = Some(submitted);
+                }
+                if mode == "before" {
+                    owner.cancel_with(asupersync::CancelKind::User, Some("before service"));
+                }
+                let polls = Rc::new(Cell::new(0));
+                let drops = Rc::new(Cell::new(0));
+                let signal = StopSignal {
+                    ready: matches!(mode, "signal" | "drop"),
+                    cancel: matches!(mode, "signal" | "pending-signal").then(|| owner.clone()),
+                    cancel_on_drop: (mode == "drop").then(|| owner.clone()),
+                    polls: Rc::clone(&polls),
+                    drops: Rc::clone(&drops),
+                };
+                let (wake, waker) = wake_for(&client);
+                let mut service = Box::pin(dispatcher.run_until(&owner, signal));
+                if mode == "waiting" {
+                    pending(service.as_mut(), &waker);
+                    let before = wake.calls.load(Ordering::SeqCst);
+                    owner.cancel_with(asupersync::CancelKind::User, Some("idle service"));
+                    assert!(wake.calls.load(Ordering::SeqCst) > before);
+                }
+                let error = service.await.unwrap_err();
+                if mode == "provider" {
+                    assert!(matches!(
+                        error,
+                        SearchError::InvalidConfig { field, .. }
+                            if field == "coalescing_embedder.fixture"
+                    ));
+                    assert!(matches!(
+                        request.unwrap().await,
+                        Err(SearchError::InvalidConfig { .. })
+                    ));
+                } else {
+                    assert!(matches!(error, SearchError::Cancelled { .. }));
+                    assert_eq!(polls.get(), usize::from(mode != "before"));
+                }
+                assert_eq!(drops.get(), 1);
+                assert!(client.is_ready());
+                assert!(client.shared.lock().unwrap().service_wake.is_none());
+                assert_eq!(client.usage(), CoalescerUsage::default());
+                assert!(!cx.is_cancel_requested());
+            });
+        }
     }
 
     #[test]
