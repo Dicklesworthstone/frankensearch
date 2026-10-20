@@ -285,12 +285,12 @@ pub use asupersync::Cx;
 pub use frankensearch_core::error::{SearchError, SearchResult};
 
 // Configuration
-pub use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
+pub use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics, ZeroSignalReason};
 
 // Search result types
 pub use frankensearch_core::types::{
-    FusedHit, IndexableDocument, PhaseMetrics, RankChanges, ScoreSource, ScoredResult, SearchMode,
-    SearchPhase, VectorHit,
+    FusedHit, IndexableDocument, PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource,
+    ScoredResult, SearchMode, SearchPhase, VectorHit,
 };
 
 // Telemetry types
@@ -304,15 +304,23 @@ pub use frankensearch_core::traits::{
     SyncRerankerAdapter,
 };
 pub use frankensearch_core::{
-    AntiRollbackFloorRecordV1, ArtifactGenerationIdentityV1, AttestedDaemonEmbeddingResponseV1,
-    AuthorityFloorV1, AuthorityRefV1, AuthoritySlotV1, DAEMON_ATTESTATION_SCHEMA_V1,
+    ARG_INDEX_DIR, ARG_MODEL_BUNDLE, ARG_SOURCE_DIR, AntiRollbackFloorRecordV1,
+    ArtifactGenerationIdentityV1, AttestedDaemonEmbeddingResponseV1, AuthorityFloorV1,
+    AuthorityRefV1, AuthoritySlotV1, COMPLETE_COVERAGE_PPM, DAEMON_ATTESTATION_SCHEMA_V1,
     DAEMON_CHALLENGE_SCHEMA_V1, DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1,
     DaemonClient, DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError,
     DaemonOperationV1, DaemonRetryConfig, EmbeddingIdentityBundleV1,
     FrozenEmbeddingIdentityBundleV1, GenerationAuthorityErrorV1, GenerationRootSecurityProfileV1,
-    InMemoryAntiRollbackFloorStoreV1, LocalAntiRollbackFloorStoreV1,
-    MIN_DAEMON_ATTESTATION_KEY_BYTES, daemon_embedding_payload_sha256, daemon_endpoint_fingerprint,
-    daemon_executable_fingerprint, daemon_ordered_request_sha256,
+    InMemoryAntiRollbackFloorStoreV1, InteractionPolicy, LocalAntiRollbackFloorStoreV1,
+    MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS, MIN_DAEMON_ATTESTATION_KEY_BYTES,
+    MODEL_ACQUISITION_AUTHORIZATION_SCHEMA_VERSION, ModelAcquisitionAuthorization,
+    ModelAcquisitionAuthorizationSchemaVersion, ModelAcquisitionSource, ModelAcquisitionTarget,
+    ModelDestinationClass, NetworkPolicy, RECOVERY_PLAN_SCHEMA_VERSION, RecoveryAction,
+    RecoveryContractError, RecoveryPlan, RecoveryPlanSchemaVersion, RecoveryPolicy,
+    RecoveryRequest, RequestMode, Retryability, SemanticProvenance, SemanticReadiness,
+    SemanticResponseContract, TrustedRecoveryContext, UntrustedRecoveryPlan,
+    VerifiedSemanticProvenance, daemon_embedding_payload_sha256, daemon_endpoint_fingerprint,
+    daemon_executable_fingerprint, daemon_ordered_request_sha256, plan as plan_recovery,
 };
 
 // Reranker support types
@@ -453,9 +461,10 @@ pub mod prelude {
 
     pub use crate::{
         DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher,
-        GenerationRootSecurityProfileV1, LexicalRead, Reranker, ScoreSource, ScoredResult,
-        SearchError, SearchPhase, SearchResult, SyncTwoTierSearcher, TwoTierConfig, TwoTierMetrics,
-        TwoTierSearcher,
+        GenerationRootSecurityProfileV1, LexicalRead, RecoveryPlan, RecoveryPolicy,
+        RecoveryRequest, Reranker, ScoreSource, ScoredResult, SearchError, SearchPhase,
+        SearchResult, SemanticReadiness, SyncTwoTierSearcher, TrustedRecoveryContext,
+        TwoTierConfig, TwoTierMetrics, TwoTierSearcher, plan_recovery,
     };
 
     #[cfg(feature = "storage")]
@@ -491,6 +500,25 @@ mod tests {
             "read_only_unanchored"
         );
         let _floor_store = InMemoryAntiRollbackFloorStoreV1::new();
+        let readiness = SemanticReadiness::IndexAbsent;
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        let recovery = plan_recovery(TrustedRecoveryContext::new(
+            &readiness,
+            RecoveryRequest {
+                mode: RequestMode::Hybrid,
+                requested_topology: RetrievalTopology::FullProgressive,
+            },
+            &policy,
+            None,
+            1_750_000_000,
+        ))
+        .expect("facade recovery_plan re-export plans IndexAbsent");
+        assert_eq!(recovery.state_code(), "recovery.state.index_absent");
+        assert!(!recovery.semantic_available());
     }
 
     #[test]
