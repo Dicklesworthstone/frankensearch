@@ -2355,10 +2355,24 @@ impl InMemoryVectorIndex {
         if !header_matches {
             return Ok(false);
         }
-        // The header preflight avoids derivation for absent/stale cache entries.
-        // Once it matches, compare every serialized field and whole-file digest
-        // directly from one descriptor with fixed stack buffers. This holds only
-        // the trusted derived sidecar, never a second 512 MiB raw byte image.
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(candidate_layout) =
+                ExactResidualLayout::for_shape(self.record_count(), self.dimension)
+            else {
+                return Ok(false);
+            };
+            if !exact_residual_sidecar_stream_is_self_consistent(path, &candidate_layout)
+                .unwrap_or(false)
+            {
+                return Ok(false);
+            }
+        }
+        // The header and self-covering digest preflight avoid derivation for
+        // absent, stale, or corrupt cache entries. Once both match, compare
+        // every serialized field and whole-file digest directly from one
+        // descriptor with fixed stack buffers. This holds only the trusted
+        // derived sidecar, never a second 512 MiB raw byte image.
         let expected = self.build_exact_residual_sidecar()?;
         #[cfg(target_os = "linux")]
         let exactly_matches =
@@ -4738,13 +4752,24 @@ mod tests {
         // candidate, and corrupt the first payload byte so nothing but the
         // self-covering trailing digest can reject it.
         header_valid_corrupt[EXACT_RESIDUAL_SIDECAR_HEADER_BYTES] ^= 0x01;
-        write_new_owned_file(
-            &cache_dir.join(format!("{cache_prefix}corrupt.fsrs")),
-            &header_valid_corrupt,
-        );
+        let corrupt_path = cache_dir.join(format!("{cache_prefix}corrupt.fsrs"));
+        write_new_owned_file(&corrupt_path, &header_valid_corrupt);
         let entries_before = std::fs::read_dir(&cache_dir)
             .expect("read private corrupt-candidate cache directory")
             .count();
+
+        reset_exact_residual_sidecar_build_count();
+        assert!(
+            !flat
+                .try_open_exact_residual_sidecar(&corrupt_path)
+                .expect("corrupt candidate open returns Ok(false)"),
+            "direct try_open_exact_residual_sidecar must reject a corrupt candidate"
+        );
+        assert_eq!(
+            exact_residual_sidecar_build_count(),
+            0,
+            "try_open_exact_residual_sidecar must reject a corrupt body from its own digest before deriving"
+        );
 
         reset_exact_residual_sidecar_build_count();
         fail_next_exact_residual_publication_acquisition();
