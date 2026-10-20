@@ -50,7 +50,8 @@ Registry census schema:
         "status": "published|unpublished|unknown",
         "checksum": "sha256 or null",
         "source_sha": "40-hex git sha or null",
-        "source_dirty": "boolean or null"
+        "source_dirty": "boolean or null",
+        "max_published_version": "highest non-yanked semver on registry or null (optional)"
       }
     ]
   }
@@ -140,6 +141,64 @@ sha256_file() {
     echo "ERROR: sha256sum or shasum is required" >&2
     return 2
   fi
+}
+
+# Given a candidate semver ($1) and newline-separated published semvers on stdin,
+# prints "<max_published_version>|<is_regression>" where:
+#   - max_published_version is the highest valid semver seen on stdin (or empty)
+#   - is_regression is "true" iff max_published_version > candidate_version under SemVer 2.0.0
+evaluate_published_semver_skew() {
+  local candidate_version="$1"
+  python3 -c '
+import re
+import sys
+
+SEMVER_RE = re.compile(
+    r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?"
+    r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
+)
+
+def semver_key(ver: str):
+    m = SEMVER_RE.match(ver.strip())
+    if not m:
+        return None
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    pre = m.group(4)
+    if pre is None:
+        pre_key = (1, ())
+    else:
+        parts = []
+        for part in pre.split("."):
+            if part.isdigit():
+                parts.append((0, int(part), ""))
+            else:
+                parts.append((1, 0, part))
+        pre_key = (0, tuple(parts))
+    return (major, minor, patch, pre_key)
+
+candidate_raw = sys.argv[1].strip()
+candidate_key = semver_key(candidate_raw)
+
+best_ver = ""
+best_key = None
+for line in sys.stdin:
+    ver = line.strip()
+    if not ver or ver == "null":
+        continue
+    key = semver_key(ver)
+    if key is None:
+        continue
+    if best_key is None or key > best_key:
+        best_key = key
+        best_ver = ver
+
+is_regression = "false"
+if best_key is not None and candidate_key is not None and best_key > candidate_key:
+    is_regression = "true"
+
+print(f"{best_ver}|{is_regression}")
+' "$candidate_version"
 }
 
 run_source_cleanliness_self_test() {
@@ -406,6 +465,49 @@ run_self_test() {
       and .blockers[0].package == "frankensearch-quill"
       and .blockers[0].dependency == "frankensearch-core"
     ' "$isolated_receipt" >/dev/null
+  done
+
+  # Hotfix version-skew / regression checks (bd-dsbym): if crates.io already
+  # serves a higher semver than the workspace candidate (reported either via
+  # max_published_version on the entry or via an additional published census
+  # row), gate must fail closed with PUBLISHED_VERSION_REGRESSION.
+  local regression_census regression_receipt
+  for isolated_case in max-field extra-row; do
+    regression_census="${temp_dir}/census-regression-${isolated_case}.json"
+    regression_receipt="${temp_dir}/receipt-regression-${isolated_case}.json"
+    if [[ "$isolated_case" == "max-field" ]]; then
+      jq '
+        (.entries[] | select(.name == "frankensearch-quill") | .max_published_version) = "0.3.1"
+      ' "$census_path" >"$regression_census"
+    else
+      jq '
+        .entries += [
+          {
+            name: "frankensearch-quill",
+            version: "0.3.2",
+            status: "published",
+            checksum: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            source_sha: "3333333333333333333333333333333333333333",
+            source_dirty: false
+          }
+        ]
+      ' "$census_path" >"$regression_census"
+    fi
+    if bash "$script_path" \
+      --mode gate --scope facade --metadata "$metadata_path" \
+      --registry-census "$regression_census" --release-tag "crates-v0.4.0" \
+      --source-sha "$source_sha" --allow-dirty --output "$regression_receipt"; then
+      echo "ERROR: version-regression (${isolated_case}) self-test unexpectedly passed" >&2
+      return 1
+    fi
+    jq -e '
+      .status == "blocked"
+      and [.blockers[].code] == ["PUBLISHED_VERSION_REGRESSION"]
+      and .blockers[0].package == "frankensearch-quill"
+      and .blockers[0].bead == "bd-dsbym"
+      and ((.packages[] | select(.name == "frankensearch-quill")).action == "blocked_version_regression")
+      and ((.packages[] | select(.name == "frankensearch-quill")).registry.max_published_version != null)
+    ' "$regression_receipt" >/dev/null
   done
 
   jq --arg root "$temp_dir" '
@@ -1383,8 +1485,47 @@ generate_live_census() {
 
   for package_name in "${SEQUENCE[@]}"; do
     package_version="$(jq -r --arg package "$package_name" '.packages[] | select(.name == $package) | .version' "$METADATA_FILE")"
+    crate_api_response="${TEMP_DIR}/${package_name}-crate-api.json"
     api_response="${TEMP_DIR}/${package_name}-${package_version}-api.json"
     archive_path="${TEMP_DIR}/${package_name}-${package_version}.crate"
+    crate_http_status="$(
+      curl \
+        --silent \
+        --show-error \
+        --location \
+        --retry 3 \
+        --retry-all-errors \
+        --retry-delay 2 \
+        --user-agent "$USER_AGENT" \
+        --output "$crate_api_response" \
+        --write-out '%{http_code}' \
+        "https://crates.io/api/v1/crates/${package_name}" || true
+    )"
+    max_published_version=""
+    if [[ "$crate_http_status" == "200" ]]; then
+      local crate_versions_info
+      crate_versions_info="$(
+        jq -r '
+          (.versions // [])[]
+          | select((.yanked // false) == false)
+          | .num // empty
+        ' "$crate_api_response" | evaluate_published_semver_skew "$package_version"
+      )"
+      max_published_version="${crate_versions_info%%|*}"
+      if [[ -z "$max_published_version" ]]; then
+        max_published_version="$(jq -r '.crate.max_version // ""' "$crate_api_response")"
+        [[ "$max_published_version" != "0.0.0" ]] || max_published_version=""
+      fi
+    elif [[ "$crate_http_status" != "404" ]]; then
+      add_blocker \
+        "REGISTRY_CENSUS_QUERY_FAILED" \
+        "$package_name" \
+        "" \
+        "bd-8nqz.6" \
+        "crates.io crate metadata query returned HTTP ${crate_http_status:-unknown} for ${package_name}." \
+        "Retry from a networked worker or inject a complete census receipt."
+    fi
+
     http_status="$(
       curl \
         --silent \
@@ -1403,13 +1544,15 @@ generate_live_census() {
       jq -cn \
         --arg name "$package_name" \
         --arg version "$package_version" \
+        --arg max_published_version "$max_published_version" \
         '{
           name: $name,
           version: $version,
           status: "unpublished",
           checksum: null,
           source_sha: null,
-          source_dirty: null
+          source_dirty: null,
+          max_published_version: (if $max_published_version == "" then null else $max_published_version end)
         }' >>"$entries_file"
       continue
     fi
@@ -1425,13 +1568,15 @@ generate_live_census() {
       jq -cn \
         --arg name "$package_name" \
         --arg version "$package_version" \
+        --arg max_published_version "$max_published_version" \
         '{
           name: $name,
           version: $version,
           status: "unknown",
           checksum: null,
           source_sha: null,
-          source_dirty: null
+          source_dirty: null,
+          max_published_version: (if $max_published_version == "" then null else $max_published_version end)
         }' >>"$entries_file"
       continue
     fi
@@ -1462,13 +1607,15 @@ generate_live_census() {
         --arg name "$package_name" \
         --arg version "$package_version" \
         --arg checksum "$registry_checksum" \
+        --arg max_published_version "$max_published_version" \
         '{
           name: $name,
           version: $version,
           status: "unknown",
           checksum: (if $checksum == "" then null else $checksum end),
           source_sha: null,
-          source_dirty: null
+          source_dirty: null,
+          max_published_version: (if $max_published_version == "" then null else $max_published_version end)
         }' >>"$entries_file"
       continue
     fi
@@ -1511,13 +1658,15 @@ generate_live_census() {
       --arg checksum "$archive_checksum" \
       --arg source_sha "$published_source_sha" \
       --argjson source_dirty "${published_source_dirty:-null}" \
+      --arg max_published_version "$max_published_version" \
       '{
         name: $name,
         version: $version,
         status: "published",
         checksum: $checksum,
         source_sha: (if $source_sha == "" then null else $source_sha end),
-        source_dirty: $source_dirty
+        source_dirty: $source_dirty,
+        max_published_version: (if $max_published_version == "" then null else $max_published_version end)
       }' >>"$entries_file"
   done
 
@@ -1609,6 +1758,7 @@ for position in "${!SEQUENCE[@]}"; do
   registry_checksum=""
   registry_source_sha=""
   registry_source_dirty=""
+  registry_max_published_version=""
   action="unknown"
   if [[ -n "$CENSUS_FILE" ]]; then
     entry_count="$(
@@ -1740,6 +1890,29 @@ for position in "${!SEQUENCE[@]}"; do
             "Use published, unpublished, or unknown."
           ;;
       esac
+
+      skew_eval="$(
+        jq -r --arg name "$package_name" '
+          .entries[]
+          | select(.name == $name)
+          | (.max_published_version // empty),
+            (if .status == "published" then .version else empty end)
+        ' "$CENSUS_FILE" | evaluate_published_semver_skew "$package_version"
+      )"
+      registry_max_published_version="${skew_eval%%|*}"
+      registry_is_regression="${skew_eval##*|}"
+      if [[ "$registry_is_regression" == "true" ]]; then
+        if [[ "$action" == "publish" || "$action" == "skip_exact_archive" ]]; then
+          action="blocked_version_regression"
+        fi
+        add_blocker \
+          "PUBLISHED_VERSION_REGRESSION" \
+          "$package_name" \
+          "" \
+          "bd-dsbym" \
+          "Candidate ${package_name} ${package_version} is behind already-published crates.io version ${registry_max_published_version} (hotfix or out-of-band publication skew)." \
+          "Reconcile the published ${registry_max_published_version} release into main and bump ${package_name} (and every dependent internal requirement) above ${registry_max_published_version}."
+      fi
     fi
   fi
 
@@ -1753,6 +1926,7 @@ for position in "${!SEQUENCE[@]}"; do
     --arg registry_checksum "$registry_checksum" \
     --arg registry_source_sha "$registry_source_sha" \
     --arg registry_source_dirty "$registry_source_dirty" \
+    --arg registry_max_published_version "$registry_max_published_version" \
     --arg action "$action" \
     '{
       position: $position,
@@ -1768,6 +1942,12 @@ for position in "${!SEQUENCE[@]}"; do
           if $registry_source_dirty == ""
           then null
           else ($registry_source_dirty == "true")
+          end
+        ),
+        max_published_version: (
+          if $registry_max_published_version == ""
+          then null
+          else $registry_max_published_version
           end
         )
       },

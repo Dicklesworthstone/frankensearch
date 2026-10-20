@@ -110,6 +110,7 @@ route work without parsing prose.
 | `REGISTRY_CENSUS_*` | Registry identity is missing, malformed, or unverifiable. |
 | `PUBLISHED_VERSION_SOURCE_MISMATCH` | The version is occupied by different source bytes. |
 | `PUBLISHED_VERSION_CONTENT_MISMATCH` | The source SHA matches but the candidate archive does not. |
+| `PUBLISHED_VERSION_REGRESSION` | The candidate version is behind a higher semver already published on crates.io (hotfix or out-of-band publication skew). |
 | `RELEASE_TAG_*` | The crate-bundle tag is absent or maps to the wrong facade version. |
 
 Known campaign prerequisites are attached directly to blocker rows. The
