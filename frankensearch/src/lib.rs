@@ -304,11 +304,15 @@ pub use frankensearch_core::traits::{
     SyncRerankerAdapter,
 };
 pub use frankensearch_core::{
-    AttestedDaemonEmbeddingResponseV1, DAEMON_ATTESTATION_SCHEMA_V1, DAEMON_CHALLENGE_SCHEMA_V1,
-    DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonClient,
-    DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError, DaemonOperationV1,
-    DaemonRetryConfig, MIN_DAEMON_ATTESTATION_KEY_BYTES, daemon_embedding_payload_sha256,
-    daemon_endpoint_fingerprint, daemon_executable_fingerprint, daemon_ordered_request_sha256,
+    AntiRollbackFloorRecordV1, ArtifactGenerationIdentityV1, AttestedDaemonEmbeddingResponseV1,
+    AuthorityFloorV1, AuthorityRefV1, AuthoritySlotV1, DAEMON_ATTESTATION_SCHEMA_V1,
+    DAEMON_CHALLENGE_SCHEMA_V1, DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1,
+    DaemonClient, DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError,
+    DaemonOperationV1, DaemonRetryConfig, EmbeddingIdentityBundleV1,
+    FrozenEmbeddingIdentityBundleV1, GenerationAuthorityErrorV1, GenerationRootSecurityProfileV1,
+    InMemoryAntiRollbackFloorStoreV1, LocalAntiRollbackFloorStoreV1,
+    MIN_DAEMON_ATTESTATION_KEY_BYTES, daemon_embedding_payload_sha256, daemon_endpoint_fingerprint,
+    daemon_executable_fingerprint, daemon_ordered_request_sha256,
 };
 
 // Reranker support types
@@ -345,9 +349,13 @@ pub use frankensearch_embed::model_registry::{EmbedderRegistry, RegisteredEmbedd
 
 // ─── Vector index (always available) ────────────────────────────────────────
 
+pub use frankensearch_index::generation_root::QualifiedGenerationRoot;
+pub use frankensearch_index::generation_root::authority_publisher::{
+    AntiRollbackFloorProviderV1, AuthorityPublisherV1,
+};
 pub use frankensearch_index::{
-    InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex, TwoTierIndexBuilder,
-    TwoTierIndexPaths, VectorIndex, VectorIndexWriter,
+    FsviV2IdentityBinding, InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex,
+    TwoTierIndexBuilder, TwoTierIndexPaths, ValidatedFsviBytes, VectorIndex, VectorIndexWriter,
 };
 
 pub mod native_ann;
@@ -362,8 +370,10 @@ pub use frankensearch_fusion::{
     AssumedDaemonClient, AssumedDaemonEmbeddingBatchV1, DaemonFallbackEmbedder,
     DaemonFallbackReranker, DaemonTrustLevelV1, FederatedConfig, FederatedCoverage,
     FederatedFusion, FederatedHit, FederatedResponse, FederatedSearcher, FederatedShardError,
-    NoopDaemonClient, PinnedDaemonVerifierV1, RrfConfig, SyncLexicalSearch, SyncSearchIterator,
-    SyncTwoTierSearcher, TwoTierSearcher, blend_two_tier, candidate_count, rrf_fuse,
+    GenerationActivationV1, GenerationCandidateV1, GenerationPublicationErrorV1,
+    GenerationPublicationResultV1, GenerationPublisherV1, NoopDaemonClient, PinnedDaemonVerifierV1,
+    RrfConfig, SyncLexicalSearch, SyncSearchIterator, SyncTwoTierSearcher, TwoTierSearcher,
+    blend_two_tier, candidate_count, rrf_fuse,
 };
 
 #[cfg(feature = "graph")]
@@ -442,9 +452,10 @@ pub mod prelude {
     pub use asupersync::Cx;
 
     pub use crate::{
-        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalRead, Reranker,
-        ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult, SyncTwoTierSearcher,
-        TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
+        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher,
+        GenerationRootSecurityProfileV1, LexicalRead, Reranker, ScoreSource, ScoredResult,
+        SearchError, SearchPhase, SearchResult, SyncTwoTierSearcher, TwoTierConfig, TwoTierMetrics,
+        TwoTierSearcher,
     };
 
     #[cfg(feature = "storage")]
@@ -467,6 +478,19 @@ mod tests {
         let _config = TwoTierConfig::default();
         let _metrics = TwoTierMetrics::default();
         let _rrf = RrfConfig::default();
+        assert_eq!(
+            GenerationRootSecurityProfileV1::RequiredExternal.as_str(),
+            "required_external"
+        );
+        assert_eq!(
+            GenerationRootSecurityProfileV1::CooperativeLocal.as_str(),
+            "cooperative_local"
+        );
+        assert_eq!(
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored.as_str(),
+            "read_only_unanchored"
+        );
+        let _floor_store = InMemoryAntiRollbackFloorStoreV1::new();
     }
 
     #[test]

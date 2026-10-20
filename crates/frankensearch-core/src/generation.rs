@@ -558,6 +558,16 @@ pub enum GenerationRootSecurityProfileV1 {
 }
 
 impl GenerationRootSecurityProfileV1 {
+    /// Canonical stable identifier for diagnostics and telemetry receipts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequiredExternal => "required_external",
+            Self::CooperativeLocal => "cooperative_local",
+            Self::ReadOnlyUnanchored => "read_only_unanchored",
+        }
+    }
+
     /// Whether this profile authorizes a caller to mutate a generation root.
     #[must_use]
     pub const fn permits_mutation(self) -> bool {
