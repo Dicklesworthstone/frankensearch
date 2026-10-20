@@ -416,9 +416,16 @@ async fn request_api_response(
     .await
 }
 
-/// This is the actual streaming collector, also exercised with deterministic
-/// bodies in tests. The surrounding attempt owns cancellation wakeup/deadline;
-/// these checkpoints also reject cancellation from an immediately ready poll.
+// Bound both copied payload and callback work. Empty frames/trailers and a
+// fragmented Buf can cost work without making comparable byte progress.
+const API_BODY_BYTES_PER_POLL: usize = 64 * 1024;
+const API_BODY_STEPS_PER_POLL: usize = 32;
+
+/// Collect under the enclosing attempt's original deadline. Even continuously
+/// ready bodies must yield, otherwise an outer timer cannot regain control.
+/// A partially consumed frame remains owned across polls; no data is replayed
+/// or discarded at a cooperative boundary. Individual synchronous Body/Buf
+/// callbacks still cannot be preempted.
 async fn read_api_response_body<B>(
     cx: &Cx,
     provider: &dyn ApiProvider,
@@ -430,39 +437,88 @@ where
     B::Data: Send,
     B::Error: Send,
 {
-    let mut bytes = Vec::new();
-    loop {
-        embed_checkpoint(cx, "api.response_body").map_err(ApiAttemptError::Terminal)?;
-        let frame = poll_fn(|task| Pin::new(&mut body).poll_frame(task)).await;
-        embed_checkpoint(cx, "api.response_body").map_err(ApiAttemptError::Terminal)?;
-        match frame {
-            None => return Ok(bytes),
-            Some(Ok(Frame::Data(mut chunk))) => {
-                while chunk.has_remaining() {
-                    embed_checkpoint(cx, "api.response_body").map_err(ApiAttemptError::Terminal)?;
-                    let part = chunk.chunk();
-                    if part.is_empty() {
-                        break;
+    let outcome = {
+        let mut bytes = Vec::new();
+        let mut pending: Option<B::Data> = None;
+        poll_fn(|task| {
+            let mut copy_left = API_BODY_BYTES_PER_POLL;
+            for _ in 0..API_BODY_STEPS_PER_POLL {
+                if let Err(error) = embed_checkpoint(cx, "api.response_body") {
+                    return Poll::Ready(Err(ApiAttemptError::Terminal(error)));
+                }
+                if copy_left == 0 {
+                    break;
+                }
+                if let Some(chunk) = pending.as_mut() {
+                    let remaining = chunk.remaining();
+                    if remaining == 0 {
+                        // Drop a consumed frame before asking for another one.
+                        // Its destructor may itself request cancellation.
+                        pending = None;
+                        continue;
                     }
-                    if part.len() > max_bytes.saturating_sub(bytes.len()) {
-                        return Err(ApiAttemptError::Terminal(bounded_embedding_failure(
-                            provider,
-                            "remote response exceeded the configured byte budget",
+                    if remaining > max_bytes.saturating_sub(bytes.len()) {
+                        return Poll::Ready(Err(ApiAttemptError::Terminal(
+                            bounded_embedding_failure(
+                                provider,
+                                "remote response exceeded the configured byte budget",
+                            ),
                         )));
                     }
-                    bytes.extend_from_slice(part);
-                    chunk.advance(part.len());
+                    let part = chunk.chunk();
+                    if part.is_empty() || part.len() > remaining {
+                        // A broken buffer is not an empty body. In particular,
+                        // never decode the valid prefix after silently losing
+                        // a nonempty frame whose chunk() made no progress.
+                        return Poll::Ready(Err(ApiAttemptError::Terminal(
+                            bounded_embedding_failure(
+                                provider,
+                                "remote response buffer violated its length contract",
+                            ),
+                        )));
+                    }
+                    let count = part.len().min(copy_left);
+                    bytes.extend_from_slice(&part[..count]);
+                    chunk.advance(count);
+                    copy_left -= count;
+                } else {
+                    let frame = Pin::new(&mut body).poll_frame(task);
+                    if let Err(error) = embed_checkpoint(cx, "api.response_body") {
+                        return Poll::Ready(Err(ApiAttemptError::Terminal(error)));
+                    }
+                    match frame {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(None) => {
+                            return Poll::Ready(Ok(std::mem::take(&mut bytes)));
+                        }
+                        Poll::Ready(Some(Ok(Frame::Data(chunk)))) => pending = Some(chunk),
+                        Poll::Ready(Some(Ok(Frame::Trailers(_)))) => {}
+                        Poll::Ready(Some(Err(_))) => {
+                            return Poll::Ready(Err(ApiAttemptError::Retry(
+                                bounded_embedding_failure(
+                                    provider,
+                                    "remote HTTP response body failed",
+                                ),
+                            )));
+                        }
+                    }
                 }
             }
-            Some(Ok(Frame::Trailers(_))) => {}
-            Some(Err(_)) => {
-                return Err(ApiAttemptError::Retry(bounded_embedding_failure(
-                    provider,
-                    "remote HTTP response body failed",
-                )));
+            if let Err(error) = embed_checkpoint(cx, "api.response_body") {
+                return Poll::Ready(Err(ApiAttemptError::Terminal(error)));
             }
-        }
-    }
+            // The body may be entirely ready and register no wake of its own.
+            // Yield the owning task, not a timer or an independently spawned task.
+            task.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await
+    };
+    // Release partial frames and the connection before reporting completion,
+    // including when their destructors turn an ordinary outcome into cancel.
+    drop(body);
+    embed_checkpoint(cx, "api.response_body").map_err(ApiAttemptError::Terminal)?;
+    outcome
 }
 
 /// The elapsed callback is production's runtime/wall clock, not a new timer.
@@ -763,7 +819,7 @@ impl ApiEmbedder {
     /// Wrap with the default cache capacity (4096 entries).
     #[must_use]
     pub fn cached_default(self) -> CachedEmbedder {
-        CachedEmbedder::new(Arc::new(self), 4096)
+        self.cached(4096)
     }
 
     /// Make a single producer-authenticated API request for a batch, with retry.
@@ -2279,6 +2335,333 @@ mod tests {
     impl Drop for AttemptBody {
         fn drop(&mut self) {
             self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedResponseBuffer {
+        bytes: Arc<Vec<u8>>,
+        offset: usize,
+        max_chunk: usize,
+        copied: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Buf for TrackedResponseBuffer {
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.offset
+        }
+
+        fn chunk(&self) -> &[u8] {
+            let count = self.remaining().min(self.max_chunk);
+            &self.bytes[self.offset..self.offset + count]
+        }
+
+        fn advance(&mut self, count: usize) {
+            assert!(count <= self.remaining());
+            self.offset += count;
+            self.copied.fetch_add(count, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedResponseBody {
+        data: Option<TrackedResponseBuffer>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        copied: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TrackedResponseBody {
+        fn new(bytes: Arc<Vec<u8>>, max_chunk: usize) -> Self {
+            let copied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                data: Some(TrackedResponseBuffer {
+                    bytes,
+                    offset: 0,
+                    max_chunk,
+                    copied: Arc::clone(&copied),
+                }),
+                polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                copied,
+            }
+        }
+    }
+
+    impl Body for TrackedResponseBody {
+        type Data = TrackedResponseBuffer;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(self.data.take().map(|data| Ok(Frame::Data(data))))
+        }
+    }
+
+    #[test]
+    fn always_ready_empty_frames_cannot_starve_the_attempt_deadline_or_cancellation() {
+        use std::task::{Context, Waker};
+
+        struct EmptyFrames {
+            trailers: bool,
+            polls: Arc<std::sync::atomic::AtomicUsize>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Body for EmptyFrames {
+            type Data = &'static [u8];
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                let before = self.polls.fetch_add(1, Ordering::SeqCst);
+                // Fail the old unbounded collector instead of hanging the test.
+                assert!(before < API_BODY_STEPS_PER_POLL, "body drained without yielding");
+                Poll::Ready(Some(Ok(if self.trailers {
+                    Frame::Trailers(Default::default())
+                } else {
+                    Frame::Data(&[])
+                })))
+            }
+        }
+
+        impl Drop for EmptyFrames {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for trailers in [false, true] {
+            for cancel in [false, true] {
+                run_test_with_cx(|cx| async move {
+                    let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+                    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let body = EmptyFrames {
+                        trailers,
+                        polls: Arc::clone(&polls),
+                        dropped: Arc::clone(&dropped),
+                    };
+                    let elapsed = AtomicU64::new(0);
+                    let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                    let waker = Waker::from(Arc::clone(&wake));
+                    let mut operation = Box::pin(run_api_attempt_with_elapsed(
+                        &cx,
+                        &provider,
+                        Duration::from_millis(50),
+                        read_api_response_body(&cx, &provider, body, 1024),
+                        || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+                    ));
+                    assert!(
+                        operation
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                    let polled = polls.load(Ordering::SeqCst);
+                    assert!((1..=API_BODY_STEPS_PER_POLL).contains(&polled));
+                    assert!(
+                        wake.0.load(Ordering::SeqCst) > 0,
+                        "collector must schedule continuation"
+                    );
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    if cancel {
+                        let before = wake.0.load(Ordering::SeqCst);
+                        cx.cancel_with(asupersync::CancelKind::User, Some("empty frame stream"));
+                        assert!(wake.0.load(Ordering::SeqCst) > before);
+                    } else {
+                        elapsed.store(50, Ordering::SeqCst);
+                    }
+                    let result = operation.as_mut().poll(&mut Context::from_waker(&waker));
+                    if cancel {
+                        assert!(matches!(
+                            result,
+                            Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. })))
+                        ));
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Poll::Ready(Err(ApiAttemptError::Retry(_)))
+                        ));
+                    }
+                    assert_eq!(polls.load(Ordering::SeqCst), polled);
+                    assert!(dropped.load(Ordering::SeqCst));
+                    assert_eq!(cx.is_cancel_requested(), cancel);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn ready_frame_turns_preserve_order_and_schedule_their_own_continuations() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+            let mut frames = Vec::new();
+            for _ in 0..65 {
+                frames.push(Ok(Frame::Data(b"\0".as_slice())));
+                frames.push(Ok(Frame::Data("é".as_bytes())));
+                frames.push(Ok(Frame::Data(b"".as_slice())));
+                frames.push(Ok(Frame::Trailers(Default::default())));
+            }
+            let body = AttemptBody::new(frames, false);
+            let polls = Arc::clone(&body.polls);
+            let dropped = Arc::clone(&body.dropped);
+            let expected = "\0é".repeat(65).into_bytes();
+            let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut operation = Box::pin(read_api_response_body(
+                &cx,
+                &provider,
+                body,
+                expected.len(),
+            ));
+            let mut turns = 0;
+            let result = loop {
+                turns += 1;
+                assert!(turns <= 261, "collector stopped making progress");
+                let before = polls.load(Ordering::SeqCst);
+                let wakes_before = wake.0.load(Ordering::SeqCst);
+                let result = operation.as_mut().poll(&mut Context::from_waker(&waker));
+                assert!(polls.load(Ordering::SeqCst) - before <= API_BODY_STEPS_PER_POLL);
+                if let Poll::Ready(result) = result {
+                    break result.unwrap();
+                }
+                assert!(wake.0.load(Ordering::SeqCst) > wakes_before);
+            };
+            assert!(turns > 1);
+            assert_eq!(result, expected);
+            assert_eq!(polls.load(Ordering::SeqCst), 261);
+            assert!(dropped.load(Ordering::SeqCst));
+
+            // Ordinary short responses do not incur an unconditional yield.
+            let short = AttemptBody::new(vec![Ok(Frame::Data(b"ok"))], false);
+            let mut operation = Box::pin(read_api_response_body(&cx, &provider, short, 2));
+            assert!(matches!(
+                operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Ok(bytes)) if bytes == b"ok"
+            ));
+        });
+    }
+
+    #[test]
+    fn large_and_fragmented_single_frames_keep_their_cursor_across_polls() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            for width in [1, 17, usize::MAX] {
+                let length = if width == 1 {
+                    1_043
+                } else {
+                    2 * API_BODY_BYTES_PER_POLL + 17
+                };
+                let input = Arc::new(
+                    (0..length)
+                        .map(|i| u8::try_from(i % 251).unwrap())
+                        .collect(),
+                );
+                let body = TrackedResponseBody::new(Arc::clone(&input), width);
+                let copied = Arc::clone(&body.copied);
+                let polls = Arc::clone(&body.polls);
+                let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(read_api_response_body(&cx, &provider, body, length));
+                let mut turns = 0;
+                let result = loop {
+                    turns += 1;
+                    assert!(turns <= length + 2, "retained frame stopped making progress");
+                    let before = copied.load(Ordering::SeqCst);
+                    let wakes_before = wake.0.load(Ordering::SeqCst);
+                    let result = operation.as_mut().poll(&mut Context::from_waker(&waker));
+                    assert!(copied.load(Ordering::SeqCst) - before <= API_BODY_BYTES_PER_POLL);
+                    if let Poll::Ready(result) = result {
+                        break result.unwrap();
+                    }
+                    assert!(wake.0.load(Ordering::SeqCst) > wakes_before);
+                };
+                assert!(turns > 1);
+                assert_eq!(result.as_slice(), input.as_slice());
+                assert_eq!(copied.load(Ordering::SeqCst), length);
+                assert_eq!(polls.load(Ordering::SeqCst), 2, "one frame followed by EOF");
+                assert_eq!(
+                    Arc::strong_count(&input),
+                    1,
+                    "completed future retained its frame"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn over_budget_frames_fail_before_copying_and_nonprogressing_buffers_are_not_eof() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+            let input = Arc::new(vec![b'x'; API_BODY_BYTES_PER_POLL + 1]);
+            for (width, limit) in [(usize::MAX, input.len() - 1), (0, input.len())] {
+                let body = TrackedResponseBody::new(Arc::clone(&input), width);
+                let copied = Arc::clone(&body.copied);
+                let polls = Arc::clone(&body.polls);
+                let mut operation = Box::pin(read_api_response_body(&cx, &provider, body, limit));
+                assert!(matches!(
+                    operation.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::EmbeddingFailed { .. })))
+                ));
+                assert_eq!(copied.load(Ordering::SeqCst), 0);
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert_eq!(Arc::strong_count(&input), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn cancellation_or_abandonment_releases_a_partially_copied_frame() {
+        use std::task::{Context, Waker};
+
+        for cancel in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+                let input = Arc::new(vec![b'x'; 2 * API_BODY_BYTES_PER_POLL + 1]);
+                let body = TrackedResponseBody::new(Arc::clone(&input), usize::MAX);
+                let copied = Arc::clone(&body.copied);
+                let polls = Arc::clone(&body.polls);
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(run_api_attempt_with_elapsed(
+                    &cx,
+                    &provider,
+                    Duration::from_secs(3_600),
+                    read_api_response_body(&cx, &provider, body, input.len()),
+                    || Duration::ZERO,
+                ));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert_eq!(copied.load(Ordering::SeqCst), API_BODY_BYTES_PER_POLL);
+                assert_eq!(Arc::strong_count(&input), 2);
+                if cancel {
+                    let before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("stop a partial frame"));
+                    assert!(wake.0.load(Ordering::SeqCst) > before);
+                    assert!(matches!(
+                        operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. })))
+                    ));
+                    assert_eq!(Arc::strong_count(&input), 1);
+                }
+                drop(operation);
+                assert_eq!(Arc::strong_count(&input), 1);
+                assert_eq!(copied.load(Ordering::SeqCst), API_BODY_BYTES_PER_POLL);
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert_eq!(cx.is_cancel_requested(), cancel);
+            });
         }
     }
 
