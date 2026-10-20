@@ -4295,6 +4295,9 @@ pub mod generation_reader {
             if name.ends_with(WRITE_AHEAD_LOG_SUFFIX_V1.as_bytes()) {
                 return Err(ClosureViolationV1::WriteAheadLog);
             }
+            if entry.device() != root_device {
+                return Err(ClosureViolationV1::ForeignDevice);
+            }
             if declared.iter().any(|declared| declared.as_bytes() == name) {
                 continue;
             }
@@ -4305,9 +4308,6 @@ pub mod generation_reader {
             }
             if entry.hard_links() != 1 {
                 return Err(ClosureViolationV1::Alias);
-            }
-            if entry.device() != root_device {
-                return Err(ClosureViolationV1::ForeignDevice);
             }
         }
         if !inventory.aliases().is_empty() {
@@ -6379,6 +6379,235 @@ pub mod generation_reader {
                     None
                 )),
                 SnapshotRefusalV1::ClosureViolation(ClosureViolationV1::Alias)
+            );
+        }
+
+        #[test]
+        fn foreign_device_entries_are_refused_whether_declared_or_retained() {
+            use crate::generation_root::GenerationRootEntry;
+            use std::ffi::{OsStr, OsString};
+
+            let (_, root, _) = genesis_root("closure-foreign-device");
+            let snapshot = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            let clean = root.inventory().expect("clean inventory");
+            let root_device = root.witness().device();
+            let manifest_name = activation_manifest_name_v1(snapshot.head().authority.object_id);
+            let receipts = snapshot.manifest().components();
+            let vector_name =
+                component_object_name_v1(GenerationComponentRole::Vector, receipts.vector.sha256);
+            let lexical_name =
+                component_object_name_v1(GenerationComponentRole::Lexical, receipts.lexical.sha256);
+            let ann_name = component_object_name_v1(
+                GenerationComponentRole::Ann,
+                receipts.ann.expect("v1 ann").sha256,
+            );
+            let metadata_name = component_object_name_v1(
+                GenerationComponentRole::Metadata,
+                receipts.metadata.sha256,
+            );
+            let declared = [
+                "LOCK",
+                "AUTHORITY",
+                manifest_name.as_str(),
+                vector_name.as_str(),
+                lexical_name.as_str(),
+                ann_name.as_str(),
+                metadata_name.as_str(),
+            ];
+
+            // Positive control: clean inventory on root_device admits with zero foreign entries.
+            assert!(clean.foreign_device(root_device).is_empty());
+            assert_eq!(check_closure(&clean, root_device, &declared), Ok(()));
+
+            // Planted 1: a declared entry whose device differs from root_device is refused.
+            let mut planted_declared = clean.clone();
+            let declared_target = planted_declared
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name() == OsStr::new(vector_name.as_str()))
+                .expect("declared vector entry");
+            declared_target.device = root_device.wrapping_add(1);
+            assert_eq!(planted_declared.foreign_device(root_device).len(), 1);
+            assert_eq!(
+                planted_declared.foreign_device(root_device)[0].name(),
+                OsStr::new(vector_name.as_str())
+            );
+            assert_eq!(
+                check_closure(&planted_declared, root_device, &declared),
+                Err(ClosureViolationV1::ForeignDevice)
+            );
+
+            // Planted 2: a retained entry whose device differs from root_device is refused.
+            let retained_name = component_object_name_v1(GenerationComponentRole::Ann, [0xfe; 32]);
+            let mut planted_retained = clean;
+            planted_retained.entries.push(GenerationRootEntry {
+                name: OsString::from(&retained_name),
+                kind: GenerationRootEntryKind::RegularFile,
+                device: root_device.wrapping_add(1),
+                inode: 999_999,
+                hard_links: 1,
+                byte_len: 16,
+                mode: 0o100_400,
+            });
+            assert_eq!(planted_retained.foreign_device(root_device).len(), 1);
+            assert_eq!(
+                planted_retained.foreign_device(root_device)[0].name(),
+                OsStr::new(retained_name.as_str())
+            );
+            assert_eq!(
+                check_closure(&planted_retained, root_device, &declared),
+                Err(ClosureViolationV1::ForeignDevice)
+            );
+        }
+
+        #[test]
+        fn wrong_role_and_swapped_fast_and_quality_tiers_are_refused_before_content_use() {
+            // 1. Declared-role swap in ActivationManifest while objects sit under their true roles:
+            //    exact-name lookup refuses before opening or reading content.
+            let root_path = fixture_root("closure-role-swap-manifest");
+            let root = admit(&root_path);
+            let auth_publisher = publisher(&root);
+            write_component_objects(&root_path, 1);
+            let mut swapped_receipts = component_receipts(1);
+            std::mem::swap(&mut swapped_receipts.vector, &mut swapped_receipts.lexical);
+            let swapped_manifest = ActivationManifest::V1(
+                ActivationManifestV1::new(
+                    1,
+                    None,
+                    GenerationAuthorityActionV1::Activate,
+                    ArtifactGenerationIdentityV1::new(1, [0x21; 16]).expect("generation"),
+                    [0x31; 32],
+                    [0x32; 32],
+                    [0x33; 32],
+                    swapped_receipts,
+                )
+                .expect("swapped manifest"),
+            );
+            let (len, sha256) = swapped_manifest.object_receipt();
+            write_manifest_object(
+                &root_path,
+                object_id(1),
+                &swapped_manifest.canonical_bytes(),
+            );
+            let authority =
+                AuthorityRefV1::new(1, object_id(1), len, sha256, None).expect("authority");
+            auth_publisher
+                .publish(
+                    authority,
+                    ExpectedAuthorityPairV1::default(),
+                    None,
+                    object_id(1 ^ 0xa5),
+                )
+                .expect("publish");
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::Closure(GenerationRootErrorKind::ObjectChanged)
+            );
+
+            // 2. Wrong-role content placed under a declared role's content-addressed name:
+            //    admission refuses with HashMismatch before any engine parses the bytes.
+            let root_path = fixture_root("closure-role-swap-bytes");
+            let root = admit(&root_path);
+            let auth_publisher = publisher(&root);
+            let vector_expected_name = component_object_name_v1(
+                GenerationComponentRole::Vector,
+                component_receipt(GenerationComponentRole::Vector, 1).sha256,
+            );
+            write_sealed_object(
+                &root_path,
+                &vector_expected_name,
+                &component_bytes(GenerationComponentRole::Lexical, 1),
+            );
+            publish_with_manifest(
+                &root_path,
+                &auth_publisher,
+                1,
+                None,
+                ExpectedAuthorityPairV1::default(),
+                None,
+            );
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::Closure(GenerationRootErrorKind::HashMismatch)
+            );
+
+            // 3. Swapped fast and quality FSVI v2 vector tiers:
+            //    unswapped control admits cleanly; swapping fast and quality paths or bindings
+            //    is refused before serving any query.
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let tier_dir = fixture_base().join(format!("closure-swapped-fast-quality-v2-{nanos}"));
+            DirBuilder::new()
+                .mode(0o700)
+                .create(&tier_dir)
+                .expect("tier dir");
+            let fast_path = tier_dir.join("fast.fsvi");
+            let quality_path = tier_dir.join("quality.fsvi");
+            let generation =
+                ArtifactGenerationIdentityV1::new(1, [0x4d; 16]).expect("valid generation");
+            let make_binding = |model_id: &str, dim: u32| {
+                let mut bundle =
+                    frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                        model_id, dim,
+                    );
+                "fsvi-v2".clone_into(&mut bundle.storage.format);
+                bundle.storage.quantization =
+                    frankensearch_core::generation::QuantizationFormat::F16;
+                "little-endian".clone_into(&mut bundle.storage.endianness);
+                crate::FsviV2IdentityBinding::new(generation, bundle.freeze().expect("freeze"))
+                    .expect("binding")
+            };
+            let fast_binding = make_binding("potion-fast-128m", 4);
+            let quality_binding = make_binding("minilm-quality-l6", 4);
+            for (path, binding, vec_row) in [
+                (&fast_path, &fast_binding, [1.0_f32, 0.0, 0.0, 0.0]),
+                (&quality_path, &quality_binding, [0.0_f32, 1.0, 0.0, 0.0]),
+            ] {
+                let mut writer =
+                    crate::VectorIndex::create_v2(path, binding.clone()).expect("create v2");
+                writer.write_record("doc-1", &vec_row).expect("write row");
+                writer.finish().expect("finish v2");
+            }
+            let normal_paths =
+                crate::TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+            let admitted = crate::TwoTierIndex::open_admitted_v2_with_paths(
+                &normal_paths,
+                frankensearch_core::TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .expect("unswapped control admits");
+            assert_eq!(admitted.doc_count(), 1);
+
+            let swapped_paths =
+                crate::TwoTierIndexPaths::new(&quality_path).with_quality_index(&fast_path);
+            let swapped_err = crate::TwoTierIndex::open_admitted_v2_with_paths(
+                &swapped_paths,
+                frankensearch_core::TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .expect_err("swapped fast and quality tiers must be refused before content use");
+            assert!(
+                matches!(
+                    swapped_err,
+                    frankensearch_core::SearchError::InvalidConfig { ref field, .. }
+                        if field == "two_tier.fast_v2_admission"
+                ),
+                "unexpected error for swapped tiers: {swapped_err:?}"
             );
         }
 
