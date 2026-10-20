@@ -3831,6 +3831,79 @@ mod tests {
     }
 
     #[test]
+    fn gh43_complete_rebuild_cancelled_after_sealing_or_by_shutdown_preserves_predecessor_and_retries()
+     {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let predecessor = store.active(&cx).unwrap().unwrap();
+            let before_inventory = sealed_inventory(predecessor.path());
+            let mut old_reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+
+            fs::write(source.join("beta.md"), "sharedtoken beta new document").unwrap();
+            let error = runtime
+                .rebuild_retained_generation_with_precommit(&cx, &root, |cx| {
+                    cx.set_cancel_requested(true);
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
+            assert_eq!(sealed_inventory(predecessor.path()), before_inventory);
+
+            let shutdown = ShutdownCoordinator::new();
+            shutdown.request_shutdown(crate::ShutdownReason::Signal(2));
+            let error = runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, Some(&shutdown), false)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
+
+            let mut fresh_before_retry = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let hits_before_retry = fresh_before_retry
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            assert_eq!(hits_before_retry.len(), 1);
+            assert!(hits_before_retry[0].path.ends_with("alpha.md"));
+
+            runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await
+                .unwrap();
+            let successor = store.active(&cx).unwrap().unwrap();
+            assert_ne!(successor.id(), predecessor.id());
+
+            let mut fresh_after_retry = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let hits_after_retry = fresh_after_retry
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            assert_eq!(hits_after_retry.len(), 2);
+            let old_hits = old_reader
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            assert_eq!(old_hits.len(), 1);
+        });
+    }
+
+    #[test]
     fn complete_cli_stream_uses_the_existing_protocol_without_changing_the_bundle() {
         run_test_with_cx(|cx| async move {
             let directory = tempfile::tempdir().unwrap();
