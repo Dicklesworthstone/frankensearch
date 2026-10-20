@@ -20,6 +20,8 @@ enum Fault {
     Cancel,
     TypedCancel,
     Pending,
+    PendingAfterFirst,
+    CancelFactory,
 }
 
 struct Backend {
@@ -62,10 +64,11 @@ impl Backend {
     }
 
     async fn respond(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<IdentityBoundEmbedding>> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(texts.iter().map(|text| (*text).to_owned()).collect());
+        let call_count = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(texts.iter().map(|text| (*text).to_owned()).collect());
+            calls.len()
+        };
         match self.fault {
             Fault::Dispatch => {
                 self.native.fetch_xor(true, Ordering::SeqCst);
@@ -78,7 +81,9 @@ impl Backend {
                     reason: "original cancellation".to_owned(),
                 });
             }
-            Fault::Pending => {
+            Fault::Pending | Fault::PendingAfterFirst
+                if matches!(self.fault, Fault::Pending) || call_count > 1 =>
+            {
                 struct Guard<'a>(&'a AtomicUsize);
                 impl Drop for Guard<'_> {
                     fn drop(&mut self) {
@@ -137,6 +142,26 @@ impl Embedder for Backend {
         cx: &'a Cx,
         texts: &'a [&'a str],
     ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+        if matches!(self.fault, Fault::CancelFactory) {
+            struct Unpolled<'a>(&'a AtomicUsize);
+            impl Future for Unpolled<'_> {
+                type Output = SearchResult<Vec<IdentityBoundEmbedding>>;
+
+                fn poll(
+                    self: std::pin::Pin<&mut Self>,
+                    _: &mut std::task::Context<'_>,
+                ) -> Poll<Self::Output> {
+                    panic!("cancelled provider factory's future was polled");
+                }
+            }
+            impl Drop for Unpolled<'_> {
+                fn drop(&mut self) {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            cx.cancel_with(asupersync::CancelKind::User, Some("provider factory"));
+            return Box::pin(Unpolled(&self.dropped));
+        }
         Box::pin(async move {
             assert!(
                 self.native.load(Ordering::SeqCst),
@@ -443,5 +468,265 @@ fn empty_inference_groups_never_invoke_a_model() {
             assert!(backend.widths().is_empty());
             assert_eq!(bytes, 0);
         }
+    });
+}
+
+#[derive(Default)]
+struct InferenceWake(AtomicUsize);
+
+impl std::task::Wake for InferenceWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn cancellation_wakes_a_stalled_group_and_preserves_completed_group_accounting() {
+    use std::task::{Context, Waker};
+
+    for native in [false, true] {
+        run_test_with_cx(|cx| async move {
+            let backend = Arc::new(Backend::new(native, Fault::PendingAfterFirst));
+            let owner = producer(&backend);
+            let mut batch = InferenceBatch::new(&owner);
+            let mut bytes = 0;
+            batch
+                .push(&cx, "prior".to_owned(), "previous group", &mut bytes)
+                .await
+                .unwrap();
+            batch.flush(&cx, &mut bytes).await.unwrap();
+            let prior = batch.output.clone();
+            assert_eq!(bytes, 12);
+            for id in ["a", "b"] {
+                batch
+                    .push(&cx, id.to_owned(), id, &mut bytes)
+                    .await
+                    .unwrap();
+            }
+            let first = Arc::new(InferenceWake::default());
+            let latest = Arc::new(InferenceWake::default());
+            let first_waker = Waker::from(Arc::clone(&first));
+            let latest_waker = Waker::from(Arc::clone(&latest));
+            let mut operation = Box::pin(batch.flush(&cx, &mut bytes));
+            assert!(
+                operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&first_waker))
+                    .is_pending()
+            );
+            assert!(
+                operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&latest_waker))
+                    .is_pending()
+            );
+            assert_eq!(backend.dropped.load(Ordering::SeqCst), 0);
+            let before_first = first.0.load(Ordering::SeqCst);
+            let before_latest = latest.0.load(Ordering::SeqCst);
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("cancel stalled retained update"),
+            );
+            // The provider is std::future::pending(): no provider completion,
+            // runtime timer, or forced poll can account for this notification.
+            assert!(latest.0.load(Ordering::SeqCst) > before_latest);
+            assert_eq!(first.0.load(Ordering::SeqCst), before_first);
+            assert!(matches!(
+                operation.as_mut().poll(&mut Context::from_waker(&latest_waker)),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            // Cleanup cannot depend on dropping an already-completed future.
+            assert_eq!(backend.dropped.load(Ordering::SeqCst), 1);
+            drop(operation);
+            assert_eq!(batch.output, prior);
+            assert_eq!(batch.ids, ["a", "b"]);
+            assert_eq!(batch.texts, ["a", "b"]);
+            assert_eq!(bytes, 12);
+            assert_eq!(backend.widths(), [1, if native { 2 } else { 1 }]);
+            assert_eq!(backend.raw_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+}
+
+#[test]
+fn cancelling_a_later_singleton_discards_the_groups_successful_prefix() {
+    use std::task::{Context, Waker};
+
+    run_test_with_cx(|cx| async move {
+        let backend = Arc::new(Backend::new(false, Fault::PendingAfterFirst));
+        let owner = producer(&backend);
+        let mut batch = InferenceBatch::new(&owner);
+        let mut bytes = 0;
+        for id in ["first", "second", "never-started"] {
+            batch
+                .push(&cx, id.to_owned(), id, &mut bytes)
+                .await
+                .unwrap();
+        }
+        let wake = Arc::new(InferenceWake::default());
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut operation = Box::pin(batch.flush(&cx, &mut bytes));
+        assert!(
+            operation
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        assert_eq!(backend.widths(), [1, 1]);
+        let before = wake.0.load(Ordering::SeqCst);
+        cx.cancel_with(asupersync::CancelKind::User, Some("cancel second singleton"));
+        assert!(wake.0.load(Ordering::SeqCst) > before);
+        assert!(matches!(
+            operation.as_mut().poll(&mut Context::from_waker(&waker)),
+            Poll::Ready(Err(SearchError::Cancelled { .. }))
+        ));
+        assert_eq!(backend.dropped.load(Ordering::SeqCst), 1);
+        drop(operation);
+        assert!(batch.output.is_empty());
+        assert_eq!(batch.ids, ["first", "second", "never-started"]);
+        assert_eq!(bytes, 0);
+        assert_eq!(backend.widths(), [1, 1]);
+        assert_eq!(backend.raw_calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn abandoned_inference_registration_does_not_remove_a_siblings_cancellation_wake() {
+    use std::task::{Context, Waker};
+
+    run_test_with_cx(|cx| async move {
+        let abandoned = Arc::new(InferenceWake::default());
+        let sibling = Arc::new(InferenceWake::default());
+        let abandoned_waker = Waker::from(Arc::clone(&abandoned));
+        let sibling_waker = Waker::from(Arc::clone(&sibling));
+        let mut first = Box::pin(cancellable_inference(
+            &cx,
+            std::future::pending::<SearchResult<()>>(),
+        ));
+        let mut second = Box::pin(cancellable_inference(
+            &cx,
+            std::future::pending::<SearchResult<()>>(),
+        ));
+        assert!(
+            first
+                .as_mut()
+                .poll(&mut Context::from_waker(&abandoned_waker))
+                .is_pending()
+        );
+        assert!(
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&sibling_waker))
+                .is_pending()
+        );
+        drop(first);
+        assert!(!cx.is_cancel_requested());
+        let abandoned_before = abandoned.0.load(Ordering::SeqCst);
+        let sibling_before = sibling.0.load(Ordering::SeqCst);
+        cx.cancel_with(
+            asupersync::CancelKind::User,
+            Some("only the live group should wake"),
+        );
+        assert_eq!(abandoned.0.load(Ordering::SeqCst), abandoned_before);
+        assert!(sibling.0.load(Ordering::SeqCst) > sibling_before);
+        assert!(matches!(
+            second.as_mut().poll(&mut Context::from_waker(&sibling_waker)),
+            Poll::Ready(Err(SearchError::Cancelled { .. }))
+        ));
+    });
+}
+
+#[test]
+fn completed_inference_releases_registration_and_preserves_provider_errors() {
+    use std::task::{Context, Waker};
+
+    for fails in [false, true] {
+        run_test_with_cx(|cx| async move {
+            let result = if fails {
+                Err(SearchError::Cancelled {
+                    phase: "provider.own-scope".to_owned(),
+                    reason: "keep the original reason".to_owned(),
+                })
+            } else {
+                Ok(42)
+            };
+            let wake = Arc::new(InferenceWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut operation = Box::pin(cancellable_inference(&cx, std::future::ready(result)));
+            match operation.as_mut().poll(&mut Context::from_waker(&waker)) {
+                Poll::Ready(Ok(value)) => {
+                    assert!(!fails);
+                    assert_eq!(value, 42);
+                }
+                Poll::Ready(Err(SearchError::Cancelled { phase, reason })) => {
+                    assert!(fails);
+                    assert_eq!(phase, "provider.own-scope");
+                    assert_eq!(reason, "keep the original reason");
+                }
+                other => panic!("unexpected inference outcome: {other:?}"),
+            }
+            assert!(!cx.is_cancel_requested());
+            let before = wake.0.load(Ordering::SeqCst);
+            cx.cancel_with(asupersync::CancelKind::User, Some("after group completion"));
+            assert_eq!(wake.0.load(Ordering::SeqCst), before);
+            // Keep `operation` alive through cancellation to detect registrations
+            // retained in a completed future rather than released on completion.
+            drop(operation);
+        });
+    }
+}
+
+#[test]
+fn cancelling_provider_factory_drops_the_unpolled_future_and_stages_nothing() {
+    run_test_with_cx(|cx| async move {
+        let backend = Arc::new(Backend::new(true, Fault::CancelFactory));
+        let owner = producer(&backend);
+        let mut batch = InferenceBatch::new(&owner);
+        let mut bytes = 0;
+        batch
+            .push(&cx, "a".to_owned(), "one", &mut bytes)
+            .await
+            .unwrap();
+        assert!(matches!(
+            batch.flush(&cx, &mut bytes).await,
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert_eq!(backend.dropped.load(Ordering::SeqCst), 1);
+        assert!(backend.widths().is_empty());
+        assert_eq!(backend.raw_calls.load(Ordering::SeqCst), 0);
+        assert!(batch.output.is_empty());
+        assert_eq!(batch.ids, ["a"]);
+        assert_eq!(bytes, 0);
+    });
+}
+
+#[test]
+fn cancellation_from_inference_destruction_wins_before_any_result_is_returned() {
+    use std::task::Context;
+
+    struct CancelOnDrop(Cx);
+    impl Future for CancelOnDrop {
+        type Output = SearchResult<()>;
+
+        fn poll(self: std::pin::Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Ready(Ok(()))
+        }
+    }
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0
+                .cancel_with(asupersync::CancelKind::User, Some("provider destructor"));
+        }
+    }
+
+    run_test_with_cx(|cx| async move {
+        assert!(matches!(
+            cancellable_inference(&cx, CancelOnDrop(cx.clone())).await,
+            Err(SearchError::Cancelled { .. })
+        ));
     });
 }

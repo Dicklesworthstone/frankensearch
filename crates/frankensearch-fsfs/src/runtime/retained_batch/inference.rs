@@ -1,6 +1,10 @@
 //! Bounded inference groups for mixed retained updates. Inputs borrow the owned
 //! prepared bodies; only a completed, fully validated group enters staged output.
 
+use std::future::{Future, poll_fn};
+use std::task::Poll;
+
+use asupersync::channel::oneshot;
 use frankensearch_core::IdentityBoundEmbedding;
 
 use super::{
@@ -12,6 +16,49 @@ const MAX_ROWS: usize = 64;
 const MAX_TEXT_BYTES: usize = 512 * 1024;
 
 type VectorRows = Vec<(String, Vec<f32>)>;
+
+/// A provider may remain pending without observing its Cx or registering a
+/// cancellation wake. Keep one independent registration for the entire group,
+/// including a singleton-only producer's sequence of calls. The current task
+/// owns both futures: cancellation drops inference before returning, and an
+/// abandoned group cannot leave a helper task or a cancellation waiter behind.
+/// Synchronous provider callbacks and already-running kernels are not preempted.
+async fn cancellable_inference<T>(
+    cx: &Cx,
+    work: impl Future<Output = SearchResult<T>>,
+) -> SearchResult<T> {
+    retained_search_checkpoint(cx)?;
+    let (sender, mut receiver) = oneshot::channel::<()>();
+    let outcome = {
+        let mut cancelled = std::pin::pin!(receiver.recv(cx));
+        let mut work = std::pin::pin!(work);
+        poll_fn(|task| {
+            if let Err(error) = retained_search_checkpoint(cx) {
+                return Poll::Ready(Err(error));
+            }
+            // No value is ever sent and the sender stays alive. A completed
+            // receive therefore means cancellation, not successful inference.
+            if cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(SearchError::Cancelled {
+                    phase: "fsfs.retained_batch.inference".to_owned(),
+                    reason: "retained update inference cancelled".to_owned(),
+                }));
+            }
+            let outcome = work.as_mut().poll(task);
+            match retained_search_checkpoint(cx) {
+                Ok(()) => outcome,
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        })
+        .await
+    };
+    // Inference and its registration have been dropped even if this future is
+    // retained after Ready. Observe cancellation requested by their destructors.
+    drop(receiver);
+    drop(sender);
+    retained_search_checkpoint(cx)?;
+    outcome
+}
 
 pub(super) struct InferenceBatch<'a> {
     producer: &'a Producer,
@@ -109,40 +156,44 @@ impl<'a> InferenceBatch<'a> {
             .and_then(|bytes| vector_bytes.checked_add(bytes))
             .filter(|bytes| *bytes <= MAX_VECTOR_BYTES)
             .ok_or_else(|| invalid("retained batch vector payload exceeds 128 MiB"))?;
-        let values = if self.native {
-            let outcome = self
-                .producer
-                .embedder
-                .embed_batch_bound(cx, &self.texts)
-                .await;
-            retained_search_checkpoint(cx)?;
-            let outcome = match outcome {
-                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
-                outcome => outcome,
-            };
-            // Drift during ordinary failure must not become a retryable error.
-            self.check(cx)?;
-            let response = outcome?;
-            if response.len() != self.ids.len() {
-                return Err(invalid("one bound batch output is required per input row"));
-            }
-            for row in &response {
+        let values = cancellable_inference(cx, async {
+            let values = if self.native {
+                let inference = self.producer.embedder.embed_batch_bound(cx, &self.texts);
+                // Constructing a provider future can itself request cancellation.
+                // Do not poll the returned future once that is already known.
                 retained_search_checkpoint(cx)?;
-                self.admit_response(row)?;
-            }
-            response
-                .into_iter()
-                .map(|row| row.values)
-                .collect::<Vec<_>>()
-        } else {
-            let mut response = Vec::with_capacity(self.ids.len());
-            for text in &self.texts {
+                let outcome = inference.await;
+                retained_search_checkpoint(cx)?;
+                let outcome = match outcome {
+                    Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                    outcome => outcome,
+                };
+                // Drift during ordinary failure must not become a retryable error.
                 self.check(cx)?;
-                response.push(self.producer.infer(cx, text).await?);
-                self.check(cx)?;
-            }
-            response
-        };
+                let response = outcome?;
+                if response.len() != self.ids.len() {
+                    return Err(invalid("one bound batch output is required per input row"));
+                }
+                for row in &response {
+                    retained_search_checkpoint(cx)?;
+                    self.admit_response(row)?;
+                }
+                response
+                    .into_iter()
+                    .map(|row| row.values)
+                    .collect::<Vec<_>>()
+            } else {
+                let mut response = Vec::with_capacity(self.ids.len());
+                for text in &self.texts {
+                    self.check(cx)?;
+                    response.push(self.producer.infer(cx, text).await?);
+                    self.check(cx)?;
+                }
+                response
+            };
+            Ok(values)
+        })
+        .await?;
         self.check(cx)?;
         let mut charged = *vector_bytes;
         for vector in &values {
