@@ -8,10 +8,12 @@ use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::bytes::Buf;
+use asupersync::channel::oneshot;
 use asupersync::http::body::{Body, Frame};
 use asupersync::http::h1::{ClientError, HttpClient, HttpClientConfig, Method, RedirectPolicy};
 use sha2::{Digest, Sha256};
@@ -233,9 +235,15 @@ struct RateLimiter {
     requests_per_minute: u32,
 }
 
+// One permit costs a minute of nanoseconds; each elapsed nanosecond earns
+// `requests_per_minute` credits. Integer arithmetic retains partial credit and
+// rounds the next attempt UP without floating-point boundary spin. Even the
+// largest u32 rate and its initially full bucket fit comfortably in u128.
+const RATE_LIMIT_PERMIT_CREDITS: u128 = 60_000_000_000;
+
 #[derive(Debug)]
 struct RateLimiterState {
-    available_permits: f64,
+    available_credits: u128,
     last_refill: Instant,
 }
 
@@ -243,39 +251,118 @@ impl RateLimiter {
     fn new(requests_per_minute: u32) -> Self {
         Self {
             state: Mutex::new(RateLimiterState {
-                available_permits: f64::from(requests_per_minute),
+                available_credits: u128::from(requests_per_minute) * RATE_LIMIT_PERMIT_CREDITS,
                 last_refill: Instant::now(),
             }),
             requests_per_minute,
         }
     }
 
-    /// Returns the duration to wait before making a request, or `None` if
-    /// a token is available immediately.
+    /// Consume exactly one available permit, or suggest when to retry.
+    /// A delay is NOT a permit or reservation: every awakened caller must
+    /// compete again. Failed probes never consume partially refilled credit.
     fn acquire(&self) -> Option<Duration> {
+        self.acquire_at(Instant::now())
+    }
+
+    fn acquire_at(&self, now: Instant) -> Option<Duration> {
         if self.requests_per_minute == 0 {
             return None;
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-        let requests_per_minute = f64::from(self.requests_per_minute);
-        let refill = elapsed * (requests_per_minute / 60.0);
-        state.available_permits = (state.available_permits + refill).min(requests_per_minute);
+        // A caller can sample time, then lose the mutex to a newer caller.
+        // Never move the shared clock backwards and count an interval twice.
+        let now = now.max(state.last_refill);
+        let rate = u128::from(self.requests_per_minute);
+        let refill = now
+            .duration_since(state.last_refill)
+            .as_nanos()
+            .saturating_mul(rate);
+        state.available_credits = state
+            .available_credits
+            .saturating_add(refill)
+            .min(rate * RATE_LIMIT_PERMIT_CREDITS);
         state.last_refill = now;
 
-        if state.available_permits >= 1.0 {
-            state.available_permits -= 1.0;
-            drop(state);
+        let wait = if state.available_credits >= RATE_LIMIT_PERMIT_CREDITS {
+            state.available_credits -= RATE_LIMIT_PERMIT_CREDITS;
             None
         } else {
-            let deficit = 1.0 - state.available_permits;
-            state.available_permits = 0.0; // consume all partial permits
-            drop(state);
-            let wait_secs = deficit / (requests_per_minute / 60.0);
-            Some(Duration::from_secs_f64(wait_secs))
-        }
+            let deficit = RATE_LIMIT_PERMIT_CREDITS - state.available_credits;
+            // A positive deficit and nonzero rate require 1 ns through 60 s.
+            // The conservative fallback cannot grant an early permit.
+            let nanos = u64::try_from(deficit.div_ceil(rate)).unwrap_or(60_000_000_000);
+            Some(Duration::from_nanos(nanos))
+        };
+        drop(state);
+        wait
     }
+
+    /// No waiter owns future credit, so abandoning a wait creates no debt.
+    /// Admission is work-conserving, not FIFO: only the caller consuming a
+    /// permit may proceed, even when many timers become ready together.
+    async fn wait_for_permit(&self, cx: &Cx) -> SearchResult<()> {
+        wait_for_api_permit(cx, || self.acquire(), |delay| wait_api_delay(cx, delay)).await
+    }
+}
+
+/// Production uses the shared bucket and cancel-aware runtime delay. Separate
+/// callbacks let deterministic tests schedule a competing permit acquisition
+/// between a completed delay and the required admission recheck.
+async fn wait_for_api_permit<F>(
+    cx: &Cx,
+    mut acquire: impl FnMut() -> Option<Duration>,
+    mut pause: impl FnMut(Duration) -> F,
+) -> SearchResult<()>
+where
+    F: std::future::Future<Output = SearchResult<()>>,
+{
+    loop {
+        embed_checkpoint(cx, "api.rate_limit")?;
+        let wait = acquire();
+        embed_checkpoint(cx, "api.rate_limit")?;
+        let Some(wait) = wait else {
+            return Ok(());
+        };
+        pause(wait).await?;
+    }
+}
+
+/// Rate-limit and retry sleeps must wake on cancellation, not just expiry.
+/// The private sender stays alive without sending; the receive registers the
+/// caller's cancellation waker independently of the runtime timer. Both futures
+/// are owned here and released before returning. No task or context is created.
+async fn wait_api_delay(cx: &Cx, duration: Duration) -> SearchResult<()> {
+    embed_checkpoint(cx, "api.delay")?;
+    if duration.is_zero() {
+        return Ok(());
+    }
+    let (sender, mut receiver) = oneshot::channel::<()>();
+    let outcome = {
+        let mut cancelled = std::pin::pin!(receiver.recv(cx));
+        let mut timer = std::pin::pin!(asupersync::time::sleep(cx.now(), duration));
+        poll_fn(|context| {
+            if let Err(error) = embed_checkpoint(cx, "api.delay") {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(context).is_ready() {
+                return Poll::Ready(Err(SearchError::Cancelled {
+                    phase: "api.delay".to_owned(),
+                    reason: "remote API wait cancelled".to_owned(),
+                }));
+            }
+            let outcome = timer.as_mut().poll(context);
+            match embed_checkpoint(cx, "api.delay") {
+                Ok(()) => outcome.map(Ok),
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        })
+        .await
+    };
+    drop(receiver);
+    drop(sender);
+    embed_checkpoint(cx, "api.delay")?;
+    outcome
 }
 
 // ─── ApiEmbedder ────────────────────────────────────────────────────────────
@@ -557,12 +644,10 @@ impl ApiEmbedder {
                     backoff_ms = backoff.as_millis(),
                     "retrying API request"
                 );
-                asupersync::time::sleep(cx.now(), backoff).await;
+                wait_api_delay(cx, backoff).await?;
             }
 
-            if let Some(wait) = self.rate_limiter.acquire() {
-                asupersync::time::sleep(cx.now(), wait).await;
-            }
+            self.rate_limiter.wait_for_permit(cx).await?;
 
             let response = self
                 .client
@@ -896,12 +981,10 @@ impl AssumedRemoteApi {
                     trust = "assumed-remote",
                     "retrying transient API request"
                 );
-                asupersync::time::sleep(cx.now(), backoff).await;
+                wait_api_delay(cx, backoff).await?;
             }
 
-            if let Some(wait) = self.rate_limiter.acquire() {
-                asupersync::time::sleep(cx.now(), wait).await;
-            }
+            self.rate_limiter.wait_for_permit(cx).await?;
 
             let response = self
                 .client
@@ -1776,6 +1859,306 @@ mod tests {
         assert!(rl.acquire().is_none());
         // Third should require waiting.
         assert!(rl.acquire().is_some());
+    }
+
+    #[test]
+    fn rate_limiter_denied_probes_preserve_fractional_credit() {
+        let limiter = RateLimiter::new(60);
+        let start = limiter.state.lock().unwrap().last_refill;
+        for _ in 0..60 {
+            assert!(limiter.acquire_at(start).is_none());
+        }
+        for _ in 0..128 {
+            assert_eq!(
+                limiter.acquire_at(start + Duration::from_millis(250)),
+                Some(Duration::from_millis(750))
+            );
+        }
+        assert_eq!(
+            limiter.acquire_at(start + Duration::from_millis(500)),
+            Some(Duration::from_millis(500))
+        );
+        assert!(limiter.acquire_at(start + Duration::from_secs(1)).is_none());
+        assert_eq!(
+            limiter.acquire_at(start + Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn rate_limiter_same_instant_contenders_share_one_refilled_permit() {
+        let limiter = RateLimiter::new(3);
+        let start = limiter.state.lock().unwrap().last_refill;
+        for _ in 0..3 {
+            assert!(limiter.acquire_at(start).is_none());
+        }
+        for tick in 1..=4 {
+            let now = start + Duration::from_secs(tick * 20);
+            // The mutex serializes the actual contenders in precisely this way.
+            let admitted = (0..128)
+                .filter(|_| limiter.acquire_at(now).is_none())
+                .count();
+            assert_eq!(admitted, 1);
+        }
+        // Idle time can refill the configured burst, not accumulate unbounded debt.
+        let later = start + Duration::from_secs(3_600);
+        for _ in 0..3 {
+            assert!(limiter.acquire_at(later).is_none());
+        }
+        assert_eq!(limiter.acquire_at(later), Some(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn rate_limiter_stale_clock_samples_cannot_duplicate_refill() {
+        let limiter = RateLimiter::new(60);
+        let start = limiter.state.lock().unwrap().last_refill;
+        for _ in 0..60 {
+            assert!(limiter.acquire_at(start).is_none());
+        }
+        let newer = start + Duration::from_millis(750);
+        assert_eq!(limiter.acquire_at(newer), Some(Duration::from_millis(250)));
+        // A thread sampled this instant before another thread won the lock.
+        let older = start + Duration::from_millis(250);
+        assert_eq!(limiter.acquire_at(older), Some(Duration::from_millis(250)));
+        assert_eq!(limiter.state.lock().unwrap().last_refill, newer);
+        let due = start + Duration::from_secs(1);
+        assert!(limiter.acquire_at(due).is_none());
+        assert_eq!(limiter.acquire_at(due), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn rate_limiter_rounds_waits_up_at_nanosecond_and_maximum_rate_boundaries() {
+        for rate in [1, 2, 3, 7, 60, 997, u32::MAX] {
+            let limiter = RateLimiter::new(rate);
+            let start = {
+                let mut state = limiter.state.lock().unwrap();
+                state.available_credits = 0;
+                state.last_refill
+            };
+            let nanos = 60_000_000_000_u64.div_ceil(u64::from(rate));
+            let delay = Duration::from_nanos(nanos);
+            assert_eq!(limiter.acquire_at(start), Some(delay));
+            assert_eq!(
+                limiter.acquire_at(start + delay - Duration::from_nanos(1)),
+                Some(Duration::from_nanos(1))
+            );
+            assert!(limiter.acquire_at(start + delay).is_none());
+            assert!(limiter.acquire_at(start + delay).is_some());
+        }
+    }
+
+    #[test]
+    fn rate_wait_rechecks_after_another_caller_consumes_the_refill() {
+        run_test_with_cx(|cx| async move {
+            let limiter = RateLimiter::new(1);
+            let start = limiter.state.lock().unwrap().last_refill;
+            assert!(limiter.acquire_at(start).is_none());
+            let clock = Mutex::new(start);
+            let mut pauses = 0;
+            wait_for_api_permit(
+                &cx,
+                || limiter.acquire_at(*clock.lock().unwrap()),
+                |delay| {
+                    pauses += 1;
+                    assert!(pauses <= 2, "admission must make bounded test progress");
+                    assert_eq!(delay, Duration::from_secs(60));
+                    let now = {
+                        let mut clock = clock.lock().unwrap();
+                        *clock += delay;
+                        *clock
+                    };
+                    if pauses == 1 {
+                        // Another awakened request wins the sole permit first.
+                        assert!(limiter.acquire_at(now).is_none());
+                    }
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(pauses, 2, "one completed delay does not authorize a request");
+            assert_eq!(
+                limiter.acquire_at(*clock.lock().unwrap()),
+                Some(Duration::from_secs(60))
+            );
+        });
+    }
+
+    struct AdmissionWake(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for AdmissionWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cancelled_rate_admission_never_consumes_an_available_permit() {
+        for rate in [0, 1] {
+            run_test_with_cx(|cx| async move {
+                let limiter = RateLimiter::new(rate);
+                let before = limiter.state.lock().unwrap().available_credits;
+                cx.cancel_with(asupersync::CancelKind::User, Some("cancel before admission"));
+                assert!(matches!(
+                    limiter.wait_for_permit(&cx).await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert_eq!(limiter.state.lock().unwrap().available_credits, before);
+            });
+        }
+    }
+
+    #[test]
+    fn pending_rate_waits_cancel_or_drop_without_leaving_reserved_debt() {
+        use std::task::{Context, Waker};
+
+        for cancel in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let limiter = RateLimiter::new(1);
+                // Freeze wall-clock refill for this manually polled test. The
+                // injected future instant also exercises stale-sample clamping.
+                let start = Instant::now() + Duration::from_secs(3_600);
+                assert!(limiter.acquire_at(start).is_none());
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(limiter.wait_for_permit(&cx));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                if cancel {
+                    let before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("stop rate waiter"));
+                    assert!(wake.0.load(Ordering::SeqCst) > before);
+                    assert!(matches!(
+                        operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(SearchError::Cancelled { .. }))
+                    ));
+                }
+                drop(operation);
+                assert_eq!(limiter.state.lock().unwrap().available_credits, 0);
+                assert!(limiter.acquire_at(start + Duration::from_secs(60)).is_none());
+                if !cancel {
+                    let before = wake.0.load(Ordering::SeqCst);
+                    assert!(!cx.is_cancel_requested());
+                    cx.cancel_with(asupersync::CancelKind::User, Some("after waiter drop"));
+                    assert_eq!(wake.0.load(Ordering::SeqCst), before);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn retry_delay_cancels_before_expiry_and_zero_delay_still_checks_cancellation() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            wait_api_delay(&cx, Duration::ZERO).await.unwrap();
+            let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut delay = Box::pin(wait_api_delay(&cx, Duration::from_secs(3_600)));
+            assert!(
+                delay
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let before = wake.0.load(Ordering::SeqCst);
+            cx.cancel_with(asupersync::CancelKind::User, Some("stop retry backoff"));
+            // No wall-clock sleep, timer advancement, or forced poll supplies this wake.
+            assert!(wake.0.load(Ordering::SeqCst) > before);
+            assert!(matches!(
+                delay.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            assert!(matches!(
+                wait_api_delay(&cx, Duration::ZERO).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn verified_and_transient_attempts_wait_for_admission_before_connecting() {
+        use std::task::{Context, Waker};
+
+        for verified in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let provider = TestGatewayProvider {
+                    endpoint: format!("http://{}/embeddings", listener.local_addr().unwrap()),
+                    dimension: 4,
+                };
+                let config = ApiEmbedderConfig {
+                    requests_per_minute: 1,
+                    max_retries: 0,
+                    ..ApiEmbedderConfig::default()
+                };
+                let authenticated = ApiEmbedder::new_verified(
+                    Box::new(provider.clone()),
+                    config.clone(),
+                    Some(remote_test_identity(4)),
+                    test_attester(),
+                )
+                .unwrap();
+                let transient = AssumedRemoteApi::new(
+                    Box::new(provider),
+                    config,
+                    Some(remote_test_identity(4)),
+                )
+                .unwrap();
+                let limiter = if verified {
+                    &authenticated.rate_limiter
+                } else {
+                    &transient.rate_limiter
+                };
+                let start = Instant::now() + Duration::from_secs(3_600);
+                assert!(limiter.acquire_at(start).is_none());
+                let texts = ["quota-test"];
+                let mut operation = Box::pin(async {
+                    if verified {
+                        authenticated.request_batch(&cx, &texts).await
+                    } else {
+                        transient.request_batch_unattested(&cx, &texts).await
+                    }
+                });
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+                let before = wake.0.load(Ordering::SeqCst);
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel queued API attempt"),
+                );
+                assert!(wake.0.load(Ordering::SeqCst) > before);
+                assert!(matches!(
+                    operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(SearchError::Cancelled { .. }))
+                ));
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+                drop(operation);
+                assert_eq!(limiter.state.lock().unwrap().available_credits, 0);
+            });
+        }
     }
 
     #[test]
