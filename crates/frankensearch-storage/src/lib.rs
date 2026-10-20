@@ -78,8 +78,8 @@ pub use publication_cohort::{
 };
 pub use publication_progressive::{PublishedSearchStream, PublishedSearchStreamState};
 pub use publication_query::{
-    PublishedEmbeddingQueryHit, PublishedEmbeddingQueryResult, PublishedSearchQueryHit,
-    PublishedSearchQueryResult,
+    PublishedEmbeddingQueryHit, PublishedEmbeddingQueryResult, PublishedQueryOptions,
+    PublishedSearchQueryHit, PublishedSearchQueryResult,
 };
 pub use publication_recovery::{PublicationRecoveryConfig, PublicationRecoveryPage};
 pub use publication_rerank::{PublishedRerankLimits, PublishedRerankOptions, PublishedRerankedHit};

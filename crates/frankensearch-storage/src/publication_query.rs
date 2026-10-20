@@ -1,12 +1,66 @@
-//! Owned top-k results from a direct transactional publication query.
+//! Selection options and owned results for direct transactional publication queries.
 //!
 //! Unlike a reusable full-corpus snapshot, a direct query keeps only selected
 //! publications. Query execution lives with the shared publication scanner and
 //! exact scorer; these types do not introduce another admission or ranking path.
 
+use std::collections::BTreeSet;
+
 use frankensearch_core::VectorHit;
 
 use crate::{PublishedEmbedding, PublishedEmbeddingScanStats, PublishedSearchDocument};
+
+/// Exact result scope shared by vector-only and source-hydrated direct queries.
+///
+/// Membership is checked before top-k selection, not against an already
+/// truncated result. IDs are compared in full, without hashing, normalization,
+/// prefix matching or SQL interpolation. Unknown IDs simply do not match.
+/// The set is borrowed and cannot change during the call or a transaction retry;
+/// no user predicate executes while the database transaction is held.
+///
+/// This scopes results, not integrity admission: even an empty allow-set with
+/// a positive limit scans and validates every current publication in the tier.
+/// Read limits and scan statistics include excluded publications. Only final
+/// winning sources are hydrated. A zero limit still admits the query but does
+/// no database work. The caller-owned set's memory is outside the read budgets.
+///
+/// A set derived from earlier metadata is not re-authorized in the transaction.
+/// This is not a live authorization or revocation mechanism. Use a captured
+/// search snapshot for predicates over source-coherent metadata.
+#[derive(Clone, Copy)]
+pub struct PublishedQueryOptions<'a> {
+    /// Maximum number of matching results, in best-first order.
+    pub limit: usize,
+    /// `None` admits all IDs; `Some(empty)` admits no result IDs.
+    pub allowed_doc_ids: Option<&'a BTreeSet<String>>,
+}
+
+impl<'a> PublishedQueryOptions<'a> {
+    /// Search the whole publication tier, retaining at most `limit` results.
+    #[must_use]
+    pub const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            allowed_doc_ids: None,
+        }
+    }
+
+    /// Restrict candidates to these exact IDs without copying the set.
+    #[must_use]
+    pub const fn with_doc_ids(mut self, ids: &'a BTreeSet<String>) -> Self {
+        self.allowed_doc_ids = Some(ids);
+        self
+    }
+}
+
+impl std::fmt::Debug for PublishedQueryOptions<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublishedQueryOptions")
+            .field("limit", &self.limit)
+            .field("allowed_doc_id_count", &self.allowed_doc_ids.map(BTreeSet::len))
+            .finish()
+    }
+}
 
 /// A scored winner retaining the exact publication that produced its score.
 ///
