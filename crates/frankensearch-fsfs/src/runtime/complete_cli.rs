@@ -428,8 +428,15 @@ impl FsfsRuntime {
         let one_shot_index = self.cli_input.command == CliCommand::Index
             && !self.cli_input.watch
             && !self.config.indexing.watch_mode;
+        let watch_start = self.cli_input.command == CliCommand::Watch
+            || (self.cli_input.command == CliCommand::Index
+                && (self.cli_input.watch || self.config.indexing.watch_mode));
+        // On the default complete-generation policy, a completed legacy root
+        // is converted before a watcher takes ownership. The generation build
+        // later acquires this same root's publication lease, so a competing
+        // legacy writer refuses promotion instead of racing the seed copy.
         let legacy_complete = legacy
-            && one_shot_index
+            && (one_shot_index || watch_start)
             && Self::read_index_sentinel(&root)
                 .ok()
                 .flatten()
@@ -3280,15 +3287,26 @@ mod tests {
                     .is_none(),
                 "{marker} alone does not prove a completed legacy predecessor"
             );
+            let mut watch = build.clone();
+            watch.cli_input.command = CliCommand::Watch;
+            watch.config.indexing.watch_mode = true;
+            assert!(
+                watch
+                    .complete_generation_command_root(false)
+                    .unwrap()
+                    .is_none(),
+                "{marker} alone must not be auto-promoted by watch"
+            );
             assert_eq!(
                 build.complete_generation_command_root(true).unwrap(),
                 Some(legacy)
             );
         }
 
-        // A completed legacy predecessor migrates on the default one-shot
-        // route. Once staging exists, every command stays on complete-store
-        // authority; an absent pointer is not evidence for a legacy fallback.
+        // A completed legacy predecessor migrates on the default one-shot or
+        // watch-start route. Once staging exists, every command stays on
+        // complete-store authority; an absent pointer is not evidence for a
+        // legacy fallback.
         let legacy = directory.path().join("legacy-complete");
         fs::create_dir(&legacy).unwrap();
         let sentinel = IndexSentinel {
@@ -3314,6 +3332,22 @@ mod tests {
             Some(legacy.clone()),
             "a healthy legacy one-shot rebuild should stage an immutable successor"
         );
+        let mut watch = build.clone();
+        watch.cli_input.command = CliCommand::Watch;
+        watch.config.indexing.watch_mode = true;
+        assert_eq!(
+            watch.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "Linux-default watch should promote a completed legacy root"
+        );
+        let mut index_watch = build.clone();
+        index_watch.cli_input.watch = true;
+        index_watch.config.indexing.watch_mode = true;
+        assert_eq!(
+            index_watch.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "index --watch should promote a completed legacy root"
+        );
         let disabled = build.clone().with_complete_generations_for_new_roots(false);
         assert!(
             disabled
@@ -3321,6 +3355,15 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "an explicit false policy must retain the legacy layout"
+        );
+        let mut disabled_watch = watch.with_complete_generations_for_new_roots(false);
+        disabled_watch.config.indexing.watch_mode = true;
+        assert!(
+            disabled_watch
+                .complete_generation_command_root(false)
+                .unwrap()
+                .is_none(),
+            "an explicit false policy must retain the legacy watcher"
         );
         fs::create_dir(legacy.join("generations")).unwrap();
         let search = search_runtime(&build);
