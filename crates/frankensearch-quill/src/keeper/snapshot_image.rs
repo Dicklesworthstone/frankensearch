@@ -26,8 +26,10 @@ use super::{
 use crate::schema::SchemaDescriptor;
 use crate::segment::SegmentReader;
 
-/// Exact snapshot-image domain and version. The remaining bytes are a
-/// `manifest` frame followed by each MANIFEST segment ID and `segment` frame.
+/// Exact snapshot-image domain and version.
+///
+/// The remaining bytes are a `manifest` frame followed by each MANIFEST
+/// segment ID and `segment` frame.
 /// Frame tags have a little-endian u16 length and payloads a little-endian
 /// u64 length. Segment IDs are little-endian u64. There are no trailing bytes.
 pub const EXACT_LEXICAL_SNAPSHOT_IMAGE_DOMAIN: &[u8] =
@@ -397,7 +399,7 @@ impl KeeperSnapshot {
         )?;
         // Retain the complete original allocation even for an empty image,
         // whose MANIFEST is its only component and has no segment-held Arc.
-        snapshot.retained_manifest = Some((Arc::clone(&bytes), manifest_range));
+        snapshot.retained_manifest = Some((bytes, manifest_range));
         if snapshot
             .exact_lexical_component_receipt_with_checkpoint(source_checkpoint, || checkpoint(cx))?
             != *expected

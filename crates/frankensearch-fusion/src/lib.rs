@@ -77,7 +77,7 @@ pub use federated::{
 pub use feedback::{FeedbackCollector, FeedbackConfig, FeedbackSignal, SignalWeights};
 pub use generation_publication::{
     GenerationActivationV1, GenerationCandidateV1, GenerationPublicationErrorV1,
-    GenerationPublicationResultV1, GenerationPublisherV1,
+    GenerationPublicationResultV1, GenerationPublisherV1, GenerationReconciliationResultV1,
 };
 #[cfg(feature = "graph")]
 pub use graph_rank::GraphRanker;

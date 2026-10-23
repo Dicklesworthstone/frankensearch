@@ -39,7 +39,7 @@ use frankensearch_core::generation::{
 };
 use frankensearch_index::generation_root::authority_publisher::{
     AUTHORITY_PUBLISHER_LOCK_BYTES_V1, AntiRollbackFloorProviderV1, AttemptPermitV1,
-    AuthorityPublisherV1, ExpectedAuthorityPairV1, PublicationOutcomeV1,
+    AuthorityPublisherV1, ExpectedAuthorityPairV1, PublicationOutcomeV1, ReconcileOutcomeV1,
 };
 use frankensearch_index::generation_root::generation_reader::{
     GenerationSnapshotCellV1, OpenedGenerationSnapshotV1, SnapshotOpenOutcomeV1, SnapshotRefusalV1,
@@ -53,8 +53,11 @@ use frankensearch_index::generation_root::{
     QualifiedGenerationRoot,
 };
 
-/// A refusal before entering the authority publisher. No authority bytes were
-/// issued by this call. Publication uncertainty is an OUTCOME, not this error.
+/// A publication refusal or reconciliation infrastructure failure.
+///
+/// Errors from `publish` precede authority mutation. Errors from
+/// `reconcile_pending` retain the exact pending permit: a floor or completion
+/// write may already have occurred and must be reconciled again.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GenerationPublicationErrorV1 {
     /// A manifest, authority, frame, or predecessor was invalid.
@@ -77,12 +80,12 @@ pub enum GenerationPublicationErrorV1 {
     StaleExpectedAuthority,
     /// A prior attempt must be reconciled, never automatically retried.
     PendingReconciliation,
-    /// A stop request was observed before invoking the authority publisher.
+    /// A stop request was observed before invoking the authority operation.
     Cancelled {
         /// Stable operation boundary.
         phase: &'static str,
     },
-    /// A candidate object or retained root failed descriptor-owned admission.
+    /// Candidate admission or a retained-root operation failed.
     Root(GenerationRootError),
     /// A sealed root contained an undeclared object, alias, WAL, or foreign file.
     InvalidRootClosure,
@@ -90,7 +93,7 @@ pub enum GenerationPublicationErrorV1 {
 
 impl fmt::Display for GenerationPublicationErrorV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "generation publication refused: {self:?}")
+        write!(formatter, "generation operation failed: {self:?}")
     }
 }
 
@@ -440,6 +443,16 @@ pub struct GenerationPublicationResultV1 {
     pub activation: Option<GenerationActivationV1>,
 }
 
+/// Exact reconciliation knowledge, independent of fresh-reader activation.
+#[derive(Debug)]
+pub struct GenerationReconciliationResultV1 {
+    /// Unmodified verdict of the underlying authority publisher.
+    pub reconciliation: ReconcileOutcomeV1,
+    /// Present only when the candidate is proven committed, including when a
+    /// newer head has already superseded it. A failed activation keeps old readers.
+    pub activation: Option<GenerationActivationV1>,
+}
+
 /// Serial publisher plus a retained, immutable serving snapshot.
 ///
 /// The `&mut self` write API prevents same-instance concurrent publication.
@@ -454,6 +467,7 @@ pub struct GenerationPublisherV1<'root> {
     profile: GenerationRootSecurityProfileV1,
     snapshots: GenerationSnapshotCellV1,
     pending: Option<AttemptPermitV1>,
+    pending_requires_floor: bool,
 }
 
 impl<'root> GenerationPublisherV1<'root> {
@@ -475,6 +489,7 @@ impl<'root> GenerationPublisherV1<'root> {
             profile,
             snapshots: GenerationSnapshotCellV1::new(),
             pending: None,
+            pending_requires_floor: false,
         })
     }
 
@@ -484,11 +499,69 @@ impl<'root> GenerationPublisherV1<'root> {
         self.snapshots.load()
     }
 
-    /// Exact unresolved attempt; callers may retain it for fresh-process recovery
-    /// through the authority publisher. This session refuses another publication.
+    /// Exact unresolved attempt. This session refuses another publication until
+    /// [`Self::reconcile_pending`] proves the outcome. Callers may also retain
+    /// the permit for fresh-process recovery through the authority publisher.
     #[must_use]
     pub const fn pending_attempt(&self) -> Option<AttemptPermitV1> {
         self.pending
+    }
+
+    /// Reconcile this session's exact pending attempt without republishing it.
+    ///
+    /// Returns `Ok(None)` when no attempt is pending. Proven committed or
+    /// not-committed outcomes release the session's publication fence; unknown,
+    /// fork, and repair verdicts retain it. A known commit is returned separately
+    /// from opening the current head, so cancelled or refused activation cannot
+    /// turn a successful commit into a request to retry publication.
+    ///
+    /// The previous snapshot remains installed until a fresh complete snapshot
+    /// passes admission. Cancellation is checked before reconciliation starts;
+    /// once started, its exact verdict is preserved even if cancellation arrives.
+    ///
+    /// # Errors
+    ///
+    /// Reports pre-operation cancellation, an unauthorized profile, a missing
+    /// required floor provider, or root infrastructure failure. Every error
+    /// retains the pending permit, including errors after a floor/completion
+    /// write; callers must reconcile again before attempting publication.
+    pub fn reconcile_pending(
+        &mut self,
+        cx: &Cx,
+        floor: Option<&dyn AntiRollbackFloorProviderV1>,
+    ) -> Result<Option<GenerationReconciliationResultV1>, GenerationPublicationErrorV1> {
+        let Some(permit) = self.pending else {
+            return Ok(None);
+        };
+        self.profile.require_mutation_authorized()?;
+        if (self.profile == GenerationRootSecurityProfileV1::RequiredExternal
+            || self.pending_requires_floor)
+            && floor.is_none()
+        {
+            return Err(GenerationAuthorityErrorV1::ExternalFloorRequired.into());
+        }
+        checkpoint(cx, "generation.reconcile")?;
+        let reconciliation = self.publisher.reconcile(&permit, floor)?;
+        let activation = match reconciliation {
+            ReconcileOutcomeV1::Committed { .. }
+            | ReconcileOutcomeV1::CommittedThenSuperseded { .. } => {
+                self.pending = None;
+                self.pending_requires_floor = false;
+                Some(self.activate(cx, floor))
+            }
+            ReconcileOutcomeV1::NotCommitted => {
+                self.pending = None;
+                self.pending_requires_floor = false;
+                None
+            }
+            ReconcileOutcomeV1::StillUnknown(_)
+            | ReconcileOutcomeV1::Fork { .. }
+            | ReconcileOutcomeV1::RepairRequired(_) => None,
+        };
+        Ok(Some(GenerationReconciliationResultV1 {
+            reconciliation,
+            activation,
+        }))
     }
 
     /// Refresh serving state without mutating authority or discarding old readers.
@@ -564,6 +637,7 @@ impl<'root> GenerationPublisherV1<'root> {
             PublicationOutcomeV1::NotCommitted(_) => None,
             PublicationOutcomeV1::CommitOutcomeUnknown(permit) => {
                 self.pending = Some(*permit);
+                self.pending_requires_floor = floor.is_some();
                 None
             }
         };
@@ -826,13 +900,18 @@ mod tests {
     mod disk {
         use super::*;
         use asupersync::test_utils::run_test_with_cx;
+        use frankensearch_core::generation::{
+            AntiRollbackFloorRecordV1, AuthorityFloorV1, InMemoryAntiRollbackFloorStoreV1,
+        };
+        use frankensearch_index::generation_root::authority_publisher::AttemptStageV1;
         use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
         use frankensearch_index::generation_root::{
             GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout,
         };
+        use std::cell::Cell;
         use std::fs::{self, DirBuilder, OpenOptions};
         use std::io::Write as _;
-        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
         use std::path::{Path, PathBuf};
         use std::sync::OnceLock;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -842,6 +921,85 @@ mod tests {
         const WRITER_ID: [u8; 16] = [0x72; 16];
         static BASE: OnceLock<PathBuf> = OnceLock::new();
         static NEXT: AtomicU64 = AtomicU64::new(0);
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum FloorFault {
+            Healthy,
+            BeforeAdvance,
+            AfterAdvance,
+            LoadUnavailable,
+        }
+
+        struct RecoverableFloor {
+            inner: InMemoryAntiRollbackFloorStoreV1,
+            fault: Cell<FloorFault>,
+        }
+
+        impl RecoverableFloor {
+            fn new() -> Self {
+                Self {
+                    inner: InMemoryAntiRollbackFloorStoreV1::new(),
+                    fault: Cell::new(FloorFault::Healthy),
+                }
+            }
+        }
+
+        impl AntiRollbackFloorProviderV1 for RecoverableFloor {
+            fn load(
+                &self,
+                root_id: [u8; 16],
+            ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+                if self.fault.get() == FloorFault::LoadUnavailable {
+                    return Err(GenerationAuthorityErrorV1::FloorStoreUnavailable);
+                }
+                self.inner.load(root_id)
+            }
+
+            fn compare_and_advance(
+                &self,
+                expected: Option<AntiRollbackFloorRecordV1>,
+                next: AuthorityFloorV1,
+                idempotency_key: [u8; 16],
+            ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+                if self.fault.get() == FloorFault::BeforeAdvance {
+                    return Err(GenerationAuthorityErrorV1::FloorStoreUnavailable);
+                }
+                let receipt = self
+                    .inner
+                    .compare_and_advance(expected, next, idempotency_key)?;
+                if self.fault.get() == FloorFault::AfterAdvance {
+                    return Err(GenerationAuthorityErrorV1::FloorStoreUnavailable);
+                }
+                Ok(receipt)
+            }
+        }
+
+        struct CancelAfterAdvance<'a> {
+            floor: &'a RecoverableFloor,
+            cx: &'a Cx,
+        }
+
+        impl AntiRollbackFloorProviderV1 for CancelAfterAdvance<'_> {
+            fn load(
+                &self,
+                root_id: [u8; 16],
+            ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+                self.floor.load(root_id)
+            }
+
+            fn compare_and_advance(
+                &self,
+                expected: Option<AntiRollbackFloorRecordV1>,
+                next: AuthorityFloorV1,
+                idempotency_key: [u8; 16],
+            ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+                let receipt = self
+                    .floor
+                    .compare_and_advance(expected, next, idempotency_key)?;
+                self.cx.set_cancel_requested(true);
+                Ok(receipt)
+            }
+        }
 
         // Match the root substrate's tests: qualified private local storage,
         // no /tmp symlink shortcut, no deletion, no unsupported-filesystem skip.
@@ -948,6 +1106,520 @@ mod tests {
                     candidate.owned_image_bytes(),
                 )
                 .expect("publication")
+        }
+
+        fn publish_with_floor(
+            publisher: &mut GenerationPublisherV1<'_>,
+            cx: &Cx,
+            candidate: &GenerationCandidateV1,
+            expected: ExpectedAuthorityPairV1,
+            floor: &dyn AntiRollbackFloorProviderV1,
+        ) -> GenerationPublicationResultV1 {
+            publisher
+                .publish(
+                    cx,
+                    candidate,
+                    expected,
+                    Some(floor),
+                    candidate.authority().object_id,
+                    candidate.owned_image_bytes(),
+                )
+                .expect("publication")
+        }
+
+        #[test]
+        fn pending_floor_timeout_reconciles_in_same_session_and_allows_next_publication() {
+            run_test_with_cx(|cx| async move {
+                for fault in [FloorFault::BeforeAdvance, FloorFault::AfterAdvance] {
+                    let path = root_path();
+                    let first = candidate(1, None);
+                    stage(&path, &first, 1, None);
+                    let root = admit(&path);
+                    let floor = RecoverableFloor::new();
+                    let mut publisher = session(&root);
+                    let _ = publish_with_floor(
+                        &mut publisher,
+                        &cx,
+                        &first,
+                        ExpectedAuthorityPairV1::default(),
+                        &floor,
+                    );
+                    let old = publisher.snapshot().expect("first serving generation");
+                    let second = candidate(2, Some(first.authority()));
+                    stage(&path, &second, 2, None);
+                    floor.fault.set(fault);
+                    let outcome = publish_with_floor(
+                        &mut publisher,
+                        &cx,
+                        &second,
+                        old.authority_pair(),
+                        &floor,
+                    );
+                    let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome.publication
+                    else {
+                        panic!("floor timeout must preserve an unknown outcome");
+                    };
+                    assert!(outcome.activation.is_none());
+                    assert_eq!(publisher.pending_attempt(), Some(permit));
+                    assert!(Arc::ptr_eq(
+                        &old,
+                        &publisher.snapshot().expect("old reader")
+                    ));
+                    assert!(matches!(
+                        publisher.refresh(&cx, Some(&floor)),
+                        Err(GenerationPublicationErrorV1::PendingReconciliation)
+                    ));
+                    assert!(matches!(
+                        publisher.publish(
+                            &cx,
+                            &second,
+                            old.authority_pair(),
+                            Some(&floor),
+                            [0x79; 16],
+                            second.owned_image_bytes(),
+                        ),
+                        Err(GenerationPublicationErrorV1::PendingReconciliation)
+                    ));
+                    let authority = fs::read(path.join("AUTHORITY")).expect("authority");
+                    let lock = fs::read(path.join("LOCK")).expect("lock");
+                    assert!(matches!(
+                        publisher.reconcile_pending(&cx, None),
+                        Err(GenerationPublicationErrorV1::Authority(
+                            GenerationAuthorityErrorV1::ExternalFloorRequired
+                        ))
+                    ));
+                    floor.fault.set(FloorFault::LoadUnavailable);
+                    let unresolved = publisher
+                        .reconcile_pending(&cx, Some(&floor))
+                        .expect("reconcile unavailable floor")
+                        .expect("pending attempt");
+                    assert_eq!(
+                        unresolved.reconciliation,
+                        ReconcileOutcomeV1::StillUnknown(permit)
+                    );
+                    assert!(unresolved.activation.is_none());
+                    assert_eq!(publisher.pending_attempt(), Some(permit));
+                    assert!(Arc::ptr_eq(
+                        &old,
+                        &publisher.snapshot().expect("old reader")
+                    ));
+                    assert_eq!(
+                        fs::read(path.join("AUTHORITY")).expect("authority"),
+                        authority
+                    );
+                    assert_eq!(fs::read(path.join("LOCK")).expect("lock"), lock);
+
+                    floor.fault.set(FloorFault::Healthy);
+                    let resolved = publisher
+                        .reconcile_pending(&cx, Some(&floor))
+                        .expect("reconcile recovered floor")
+                        .expect("pending attempt");
+                    assert!(matches!(
+                        resolved.reconciliation,
+                        ReconcileOutcomeV1::Committed { slot, .. }
+                            if slot.authority == second.authority()
+                    ));
+                    assert!(matches!(
+                        resolved.activation,
+                        Some(GenerationActivationV1::Installed(ref snapshot))
+                            if snapshot.head().authority == second.authority()
+                    ));
+                    assert_eq!(publisher.pending_attempt(), None);
+                    assert!(
+                        publisher
+                            .reconcile_pending(&cx, None)
+                            .expect("no pending")
+                            .is_none()
+                    );
+                    assert_eq!(
+                        floor
+                            .inner
+                            .load(ROOT_ID)
+                            .expect("floor")
+                            .expect("record")
+                            .cas_version,
+                        2
+                    );
+                    assert_eq!(
+                        old.closure()
+                            .bytes(GenerationComponentRole::Lexical)
+                            .expect("old lexical")
+                            .as_ref(),
+                        bytes(GenerationComponentRole::Lexical, 1)
+                    );
+
+                    let third = candidate(3, Some(second.authority()));
+                    stage(&path, &third, 3, None);
+                    let expected = publisher
+                        .snapshot()
+                        .expect("second reader")
+                        .authority_pair();
+                    let next = publish_with_floor(&mut publisher, &cx, &third, expected, &floor);
+                    assert!(matches!(
+                        next.publication,
+                        PublicationOutcomeV1::Committed { .. }
+                    ));
+                    assert_eq!(
+                        publisher.snapshot().expect("third reader").head().authority,
+                        third.authority()
+                    );
+                }
+            });
+        }
+
+        #[test]
+        fn reconciliation_cancellation_preserves_pending_or_known_commit_and_old_reader() {
+            run_test_with_cx(|cx| async move {
+                let path = root_path();
+                let first = candidate(1, None);
+                stage(&path, &first, 1, None);
+                let root = admit(&path);
+                let floor = RecoverableFloor::new();
+                let mut publisher = session(&root);
+                let _ = publish_with_floor(
+                    &mut publisher,
+                    &cx,
+                    &first,
+                    ExpectedAuthorityPairV1::default(),
+                    &floor,
+                );
+                let old = publisher.snapshot().expect("first reader");
+                let second = candidate(2, Some(first.authority()));
+                stage(&path, &second, 2, None);
+                floor.fault.set(FloorFault::BeforeAdvance);
+                let _ =
+                    publish_with_floor(&mut publisher, &cx, &second, old.authority_pair(), &floor);
+                let pending = publisher.pending_attempt().expect("pending floor request");
+                let authority = fs::read(path.join("AUTHORITY")).expect("authority");
+                let lock = fs::read(path.join("LOCK")).expect("lock");
+                cx.set_cancel_requested(true);
+                let cancelled = publisher.reconcile_pending(&cx, Some(&floor));
+                cx.set_cancel_requested(false);
+                assert!(matches!(
+                    cancelled,
+                    Err(GenerationPublicationErrorV1::Cancelled {
+                        phase: "generation.reconcile"
+                    })
+                ));
+                assert_eq!(publisher.pending_attempt(), Some(pending));
+                assert_eq!(
+                    fs::read(path.join("AUTHORITY")).expect("authority"),
+                    authority
+                );
+                assert_eq!(fs::read(path.join("LOCK")).expect("lock"), lock);
+
+                floor.fault.set(FloorFault::Healthy);
+                let cancelling = CancelAfterAdvance {
+                    floor: &floor,
+                    cx: &cx,
+                };
+                let committed = publisher
+                    .reconcile_pending(&cx, Some(&cancelling))
+                    .expect("reconciliation")
+                    .expect("pending");
+                cx.set_cancel_requested(false);
+                assert!(matches!(
+                    committed.reconciliation,
+                    ReconcileOutcomeV1::Committed { .. }
+                ));
+                assert!(matches!(
+                    committed.activation,
+                    Some(GenerationActivationV1::DeferredByCancellation)
+                ));
+                assert_eq!(publisher.pending_attempt(), None);
+                assert!(Arc::ptr_eq(
+                    &old,
+                    &publisher.snapshot().expect("retained reader")
+                ));
+                assert!(matches!(
+                    publisher
+                        .refresh(&cx, Some(&floor))
+                        .expect("later activation"),
+                    SnapshotOpenOutcomeV1::Opened(_)
+                ));
+                assert_eq!(
+                    publisher
+                        .snapshot()
+                        .expect("second reader")
+                        .head()
+                        .authority,
+                    second.authority()
+                );
+                assert_eq!(old.head().authority, first.authority());
+            });
+        }
+
+        #[test]
+        fn reconciled_commit_survives_refused_activation_until_explicit_refresh() {
+            run_test_with_cx(|cx| async move {
+                let path = root_path();
+                let first = candidate(1, None);
+                stage(&path, &first, 1, None);
+                let root = admit(&path);
+                let floor = RecoverableFloor::new();
+                let mut publisher = session(&root);
+                let _ = publish_with_floor(
+                    &mut publisher,
+                    &cx,
+                    &first,
+                    ExpectedAuthorityPairV1::default(),
+                    &floor,
+                );
+                let old = publisher.snapshot().expect("first reader");
+                let second = candidate(2, Some(first.authority()));
+                stage(&path, &second, 2, None);
+                floor.fault.set(FloorFault::BeforeAdvance);
+                let _ =
+                    publish_with_floor(&mut publisher, &cx, &second, old.authority_pair(), &floor);
+                floor.fault.set(FloorFault::Healthy);
+                let lexical = path.join(component_object_name_v1(
+                    GenerationComponentRole::Lexical,
+                    second.manifest().components().lexical.sha256,
+                ));
+                fs::set_permissions(&lexical, fs::Permissions::from_mode(0o600))
+                    .expect("make committed closure inadmissible");
+                let committed = publisher
+                    .reconcile_pending(&cx, Some(&floor))
+                    .expect("reconciliation")
+                    .expect("pending");
+                assert!(
+                    matches!(committed.reconciliation, ReconcileOutcomeV1::Committed { slot, .. } if slot.authority == second.authority())
+                );
+                assert!(matches!(
+                    committed.activation,
+                    Some(GenerationActivationV1::Refused(_))
+                ));
+                assert_eq!(publisher.pending_attempt(), None);
+                assert!(Arc::ptr_eq(
+                    &old,
+                    &publisher.snapshot().expect("old reader")
+                ));
+                fs::set_permissions(&lexical, fs::Permissions::from_mode(0o400))
+                    .expect("restore immutable mode");
+                assert!(matches!(
+                    publisher
+                        .refresh(&cx, Some(&floor))
+                        .expect("fresh admission"),
+                    SnapshotOpenOutcomeV1::Opened(_)
+                ));
+                assert_eq!(
+                    publisher
+                        .snapshot()
+                        .expect("second reader")
+                        .head()
+                        .authority,
+                    second.authority()
+                );
+                assert_eq!(old.head().authority, first.authority());
+            });
+        }
+
+        #[test]
+        fn proven_aborted_attempt_releases_session_and_persisted_publication_fences() {
+            run_test_with_cx(|cx| async move {
+                let path = root_path();
+                let first = candidate(1, None);
+                stage(&path, &first, 1, None);
+                let root = admit(&path);
+                let floor = RecoverableFloor::new();
+                let mut publisher = session(&root);
+                let _ = publish_with_floor(
+                    &mut publisher,
+                    &cx,
+                    &first,
+                    ExpectedAuthorityPairV1::default(),
+                    &floor,
+                );
+                let old = publisher.snapshot().expect("first reader");
+                let second = candidate(2, Some(first.authority()));
+                stage(&path, &second, 2, None);
+                let authority = fs::read(path.join("AUTHORITY")).expect("authority");
+                let old_lock = fs::read(path.join("LOCK")).expect("lock");
+                // The substrate's crash-point tests exercise the actual write
+                // interruption. Materialize that same durable InFlight state
+                // here to prove both the session and preparation fences reopen.
+                let permit = AttemptPermitV1 {
+                    root_id: ROOT_ID,
+                    writer_id: WRITER_ID,
+                    attempt_id: [0x7a; 16],
+                    target_slot: 0,
+                    candidate: second.authority(),
+                    expected: old.authority_pair(),
+                    stage: AttemptStageV1::SlotWrite,
+                    idempotency_key: second.authority().object_id,
+                };
+                let attempt = GenerationLockFrameV1::new(
+                    GenerationLockFrameKindV1::Attempt,
+                    ROOT_ID,
+                    WRITER_ID,
+                    permit.attempt_id,
+                    second.authority().sequence,
+                    second.authority().fingerprint(),
+                )
+                .expect("attempt")
+                .encode()
+                .expect("attempt bytes");
+                let lock_file = OpenOptions::new()
+                    .write(true)
+                    .open(path.join("LOCK"))
+                    .expect("lock writer");
+                std::os::unix::fs::FileExt::write_all_at(
+                    &lock_file,
+                    &attempt,
+                    GENERATION_LOCK_FRAME_BYTES_V1 as u64,
+                )
+                .expect("persist attempt");
+                lock_file.sync_all().expect("attempt durable");
+                publisher.pending = Some(permit);
+                publisher.pending_requires_floor = true;
+                let reconciled = publisher
+                    .reconcile_pending(&cx, Some(&floor))
+                    .expect("reconcile")
+                    .expect("pending");
+                assert_eq!(reconciled.reconciliation, ReconcileOutcomeV1::NotCommitted);
+                assert!(reconciled.activation.is_none());
+                assert_eq!(publisher.pending_attempt(), None);
+                assert!(Arc::ptr_eq(
+                    &old,
+                    &publisher.snapshot().expect("retained reader")
+                ));
+                assert_eq!(
+                    fs::read(path.join("AUTHORITY")).expect("authority"),
+                    authority
+                );
+                let lock = fs::read(path.join("LOCK")).expect("reconciled lock");
+                assert_eq!(
+                    &lock[..GENERATION_LOCK_FRAME_BYTES_V1],
+                    &old_lock[..GENERATION_LOCK_FRAME_BYTES_V1]
+                );
+                assert!(
+                    lock[GENERATION_LOCK_FRAME_BYTES_V1..]
+                        .iter()
+                        .all(|byte| *byte == 0)
+                );
+                let retry =
+                    publish_with_floor(&mut publisher, &cx, &second, old.authority_pair(), &floor);
+                assert!(matches!(
+                    retry.publication,
+                    PublicationOutcomeV1::Committed { .. }
+                ));
+                assert_eq!(
+                    publisher
+                        .snapshot()
+                        .expect("second reader")
+                        .head()
+                        .authority,
+                    second.authority()
+                );
+            });
+        }
+
+        #[test]
+        fn inconclusive_reconciliation_keeps_exact_permit_and_reader_until_recovery() {
+            run_test_with_cx(|cx| async move {
+                let path = root_path();
+                let first = candidate(1, None);
+                stage(&path, &first, 1, None);
+                let root = admit(&path);
+                let floor = RecoverableFloor::new();
+                let mut publisher = session(&root);
+                let _ = publish_with_floor(
+                    &mut publisher,
+                    &cx,
+                    &first,
+                    ExpectedAuthorityPairV1::default(),
+                    &floor,
+                );
+                let old = publisher.snapshot().expect("first reader");
+                let second = candidate(2, Some(first.authority()));
+                stage(&path, &second, 2, None);
+                floor.fault.set(FloorFault::BeforeAdvance);
+                let _ =
+                    publish_with_floor(&mut publisher, &cx, &second, old.authority_pair(), &floor);
+                let permit = publisher.pending_attempt().expect("pending");
+                let authority = fs::read(path.join("AUTHORITY")).expect("authority");
+                let lock = fs::read(path.join("LOCK")).expect("lock");
+                let authority_file = OpenOptions::new()
+                    .write(true)
+                    .open(path.join("AUTHORITY"))
+                    .expect("authority writer");
+                let mut fork = second.authority();
+                fork.object_id = [0x7b; 16];
+                let fork_slot = AuthoritySlotV1::new(0, ROOT_ID, fork)
+                    .expect("fork slot")
+                    .encode()
+                    .expect("fork bytes");
+                std::os::unix::fs::FileExt::write_all_at(&authority_file, &fork_slot, 0)
+                    .expect("persist fork");
+                authority_file.sync_all().expect("fork durable");
+                let forked = publisher
+                    .reconcile_pending(&cx, Some(&floor))
+                    .expect("fork verdict")
+                    .expect("pending");
+                assert!(matches!(
+                    forked.reconciliation,
+                    ReconcileOutcomeV1::Fork { .. }
+                ));
+                assert!(forked.activation.is_none());
+                assert_eq!(publisher.pending_attempt(), Some(permit));
+                assert!(Arc::ptr_eq(
+                    &old,
+                    &publisher.snapshot().expect("retained reader")
+                ));
+                let mut torn = authority.clone();
+                torn[100] ^= 1;
+                std::os::unix::fs::FileExt::write_all_at(&authority_file, &torn, 0)
+                    .expect("persist torn slot");
+                authority_file.sync_all().expect("torn slot durable");
+                let repair = publisher
+                    .reconcile_pending(&cx, Some(&floor))
+                    .expect("repair verdict")
+                    .expect("pending");
+                assert!(matches!(
+                    repair.reconciliation,
+                    ReconcileOutcomeV1::RepairRequired(_)
+                ));
+                assert!(repair.activation.is_none());
+                assert_eq!(publisher.pending_attempt(), Some(permit));
+                assert_eq!(fs::read(path.join("LOCK")).expect("lock"), lock);
+                std::os::unix::fs::FileExt::write_all_at(&authority_file, &authority, 0)
+                    .expect("restore exact committed bytes");
+                authority_file
+                    .sync_all()
+                    .expect("restored authority durable");
+                fs::set_permissions(path.join("LOCK"), fs::Permissions::from_mode(0o644))
+                    .expect("invalidate anchor permissions");
+                let unavailable = publisher.reconcile_pending(&cx, Some(&floor));
+                fs::set_permissions(path.join("LOCK"), fs::Permissions::from_mode(0o600))
+                    .expect("restore anchor permissions");
+                assert!(matches!(
+                    unavailable,
+                    Err(GenerationPublicationErrorV1::Root(_))
+                ));
+                assert_eq!(publisher.pending_attempt(), Some(permit));
+                assert!(Arc::ptr_eq(
+                    &old,
+                    &publisher.snapshot().expect("retained reader")
+                ));
+                floor.fault.set(FloorFault::Healthy);
+                let recovered = publisher
+                    .reconcile_pending(&cx, Some(&floor))
+                    .expect("recovery")
+                    .expect("pending");
+                assert!(matches!(
+                    recovered.reconciliation,
+                    ReconcileOutcomeV1::Committed { .. }
+                ));
+                assert_eq!(publisher.pending_attempt(), None);
+                assert_eq!(
+                    publisher
+                        .snapshot()
+                        .expect("second reader")
+                        .head()
+                        .authority,
+                    second.authority()
+                );
+            });
         }
 
         #[test]

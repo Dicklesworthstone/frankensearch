@@ -379,9 +379,9 @@ pub use frankensearch_fusion::{
     DaemonFallbackReranker, DaemonTrustLevelV1, FederatedConfig, FederatedCoverage,
     FederatedFusion, FederatedHit, FederatedResponse, FederatedSearcher, FederatedShardError,
     GenerationActivationV1, GenerationCandidateV1, GenerationPublicationErrorV1,
-    GenerationPublicationResultV1, GenerationPublisherV1, NoopDaemonClient, PinnedDaemonVerifierV1,
-    RrfConfig, SyncLexicalSearch, SyncSearchIterator, SyncTwoTierSearcher, TwoTierSearcher,
-    blend_two_tier, candidate_count, rrf_fuse,
+    GenerationPublicationResultV1, GenerationPublisherV1, GenerationReconciliationResultV1,
+    NoopDaemonClient, PinnedDaemonVerifierV1, RrfConfig, SyncLexicalSearch, SyncSearchIterator,
+    SyncTwoTierSearcher, TwoTierSearcher, blend_two_tier, candidate_count, rrf_fuse,
 };
 
 #[cfg(feature = "graph")]
