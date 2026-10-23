@@ -52,6 +52,9 @@ mod live;
 #[path = "native_cli/lexical.rs"]
 mod lexical;
 
+#[path = "native_cli/generation.rs"]
+mod generation;
+
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
 mod tests;
@@ -70,6 +73,8 @@ const MAX_DOCUMENTS: usize = 100_000;
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
+  authority-index / authority-search: fixed AUTHORITY exact generations\n\
+         (use authority-index --help for the complete command contract)\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N] [--shard-size N]\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
@@ -578,6 +583,7 @@ fn new_path(path: &Path) -> Result<PathBuf> {
             "native.sharded.json",
             "native.sharded-hybrid.json",
             "FSFS-BUNDLE.json",
+            "AUTHORITY",
         ] {
             match fs::symlink_metadata(ancestor.join(marker)) {
                 Ok(_) => {
@@ -922,6 +928,12 @@ fn run() -> Result<()> {
                 .map_err(|_| bad("command arguments must be UTF-8"))
         })
         .collect::<Result<Vec<_>>>()?;
+    if args
+        .first()
+        .is_some_and(|command| generation::is_command(command))
+    {
+        return generation::run(args);
+    }
     let Some(options) = Options::parse(args)? else {
         io::stdout().lock().write_all(HELP.as_bytes())?;
         return Ok(());
@@ -945,7 +957,8 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let mut payload = query::failure(error.as_ref());
+            let mut payload = generation::publication_failure(error.as_ref())
+                .unwrap_or_else(|| query::failure(error.as_ref()));
             payload["schema"] = serde_json::json!(SCHEMA);
             payload["ok"] = serde_json::json!(false);
             payload["event"] = serde_json::json!("error");

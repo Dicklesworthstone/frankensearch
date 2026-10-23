@@ -160,6 +160,35 @@ pub fn load(
     })
 }
 
+/// Load exactly the tier selected by a fixed-authority generation. A quality
+/// generation does not initialize or require an unrelated fast provider.
+pub fn load_single(
+    cx: &Cx,
+    root: Option<&Path>,
+    tier: frankensearch_core::generation::EmbedderTierTag,
+    options: &QualityOptions,
+    pool: Option<BlockingPoolHandle>,
+) -> Result<Arc<dyn Embedder>> {
+    use frankensearch_core::generation::EmbedderTierTag;
+
+    checkpoint(cx)?;
+    let required_quality = tier == EmbedderTierTag::Quality;
+    let backend = options.preflight(required_quality, pool.is_some())?;
+    let policy = DetectOptions {
+        offline: Some(true),
+    };
+    let loaded = backend.map_or_else(
+        || {
+            EmbedderStack::auto_detect_fast_semantic_with_options(root, &policy)
+                .map(|stack| stack.fast_arc())
+                .map_err(Into::into)
+        },
+        |backend| load_quality(backend, root, options, policy, pool),
+    );
+    checkpoint(cx)?;
+    loaded
+}
+
 fn load_quality(
     backend: QualityBackend,
     root: Option<&Path>,

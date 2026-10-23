@@ -49,7 +49,7 @@ pub struct NativeGenerationSnapshot {
     readers: CompositeReaders,
 }
 
-struct CompositeReaders {
+pub(super) struct CompositeReaders {
     vector: NativeAnnIndex,
     lexical: QuillSnapshotIndex,
     metadata: GenerationManifest,
@@ -189,7 +189,7 @@ impl CompositeReaders {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn admit_components(
+pub(super) fn admit_components(
     cx: &Cx,
     activation: &ActivationManifest,
     expected_vector: &FsviV2IdentityBinding,
