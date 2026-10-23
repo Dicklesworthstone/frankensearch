@@ -30,6 +30,8 @@ use crate::{Cx, Embedder, SearchError, SearchResult, VectorHit};
 pub mod builder;
 
 mod fallback;
+#[cfg(feature = "quill")]
+mod generation;
 mod hybrid;
 #[cfg(feature = "quill")]
 mod quill;
@@ -38,6 +40,8 @@ mod shards;
 #[cfg(test)]
 mod scoring_tests;
 
+#[cfg(feature = "quill")]
+pub use generation::NativeGenerationSnapshot;
 #[cfg(feature = "quill")]
 pub use quill::NativeQuillSnapshot;
 
