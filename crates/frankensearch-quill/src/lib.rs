@@ -59,8 +59,9 @@ pub use index::{
 pub use index::{
     QUILL_LEXICAL_BACKEND, QuillClauseKind, QuillDocumentWitness, QuillHit, QuillIndex,
     QuillIndexError, QuillScoreExplanation, QuillSearchIndex, QuillSearchResult,
-    QuillSearchSnapshot, QuillSnippetHit, QuillTermScore, RootBoundQuillSearchIndex,
-    SchemaDocument, SnapshotError, SnapshotPublisher, indexable_document_content_hash,
+    QuillSearchSnapshot, QuillSnapshotIndex, QuillSnippetHit, QuillTermScore,
+    RootBoundQuillSearchIndex, SchemaDocument, SnapshotError, SnapshotPublisher,
+    indexable_document_content_hash,
 };
 #[cfg(feature = "profile-internals")]
 #[doc(hidden)]
@@ -73,7 +74,8 @@ pub use keeper::UnrepairableSegmentPolicy;
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
     CompactionError, CompactionPolicy, CompactionReport, ConcatMergeError, CurrentPointer,
-    CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES, ExactLexicalSnapshotDescriptor,
+    CurrentPointerError, DEFAULT_GARBAGE_GRACE, EMPTY_TOMBSTONES,
+    EXACT_LEXICAL_SNAPSHOT_IMAGE_DOMAIN, ExactLexicalSnapshotDescriptor, ExactLexicalSnapshotImage,
     GarbageCollectionOptions, GarbageCollectionReport, KeeperError, KeeperSnapshot, KeeperWriter,
     LexicalLayout, LoadedManifest, MANIFEST_FORMAT_VERSION, MANIFEST_FORMAT_VERSION_V1,
     MANIFEST_MAGIC, Manifest, ManifestCodecError, ManifestFieldStats, ManifestSegment,

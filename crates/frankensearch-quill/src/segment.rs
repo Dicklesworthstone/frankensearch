@@ -857,6 +857,37 @@ pub struct SegmentReader<B: AsRef<[u8]>> {
     file_xxh3: u64,
 }
 
+/// One validated range of a retained immutable lexical snapshot image.
+/// Each segment shares the image allocation instead of copying its payload.
+pub(crate) struct RetainedSegmentBytes {
+    image: Arc<[u8]>,
+    range: std::ops::Range<usize>,
+}
+
+impl AsRef<[u8]> for RetainedSegmentBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.image[self.range.clone()]
+    }
+}
+
+impl SegmentReader<RetainedSegmentBytes> {
+    pub(crate) fn from_retained_range(
+        image: Arc<[u8]>,
+        range: std::ops::Range<usize>,
+        schema: SchemaDescriptor,
+    ) -> Result<Self, QuillError> {
+        if image.get(range.clone()).is_none() {
+            return Err(invalid_segment("retained segment range exceeds its image"));
+        }
+        Self::parse_source(
+            RetainedSegmentBytes { image, range },
+            PathBuf::from(MEMORY_PATH),
+            schema,
+            SegmentLimits::default(),
+        )
+    }
+}
+
 impl SegmentReader<Vec<u8>> {
     /// Parse an owned in-memory segment with default resource ceilings.
     ///

@@ -623,6 +623,42 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 - Divergence Register: `docs/contracts/quill-divergence-register.md` (bead e0.4).
 - Vendored fieldnorm + BM25 constants: `crates/frankensearch-lexical/src/quill_contract.rs` (final home `frankensearch_quill::contract`, moves with e1.0).
 
+### 9.1 Composite-generation lexical image v2
+
+The composite generation authority stages one immutable lexical object outside
+the ordinary Quill index-directory layout. `KeeperSnapshot::export_exact_image`
+emits the following hand-written, bounded encoding; ordinary FSLX segments and
+MANIFEST bytes retain their existing formats unchanged.
+
+| Field | Encoding |
+|---|---|
+| Domain/version | Exact ASCII `frankensearch.quill.exact-lexical-snapshot.v2` |
+| Selected MANIFEST | Frame with tag `manifest`, carrying the complete selected MANIFEST bytes |
+| Referenced segments | In MANIFEST order, `segment_id: u64 LE`, then frame with tag `segment`, carrying the complete FSLX file bytes |
+
+A frame is `tag_len: u16 LE`, exact tag bytes, `payload_len: u64 LE`, and exact
+payload bytes. There is no padding or trailing data. The composite receipt's
+`byte_len` and SHA-256 cover **every raw image byte**, including the domain and
+all frame headers; SHA-256 is the enclosing generation authority's artifact
+identity, while the embedded Quill checksums remain as specified above.
+
+Admission requires the caller's independently selected schema, source
+checkpoint, exact component receipt and explicit byte budget. It checks raw
+length/SHA-256, bounded frames, MANIFEST schema and references, each FSLX's
+section and full-prefix checksums, IDMAP/tombstone validity, and the canonical
+ordered live-document digest and count. Source checkpoints are supplied by the
+enclosing authority rather than inferred from lexical bytes. Incomplete bulk,
+quarantined or recovered-predecessor sources cannot be exported as complete
+images. Every admitted segment retains a range of the original immutable byte
+allocation; no pathname reopen, writer lease or selection pointer is involved.
+`QuillSnapshotIndex` binds the ordinary query and metadata-hydration engine to
+that admitted snapshot.
+
+The prior v1 receipt domain described an unpersisted stream whose hash included
+frame headers but whose length omitted them. It is not an admissible physical
+image. Rebuild a v2 image and its receipt from a validated source snapshot; no
+segment or MANIFEST migration is required.
+
 ## 10. Section → implementing bead checklist
 
 | Section/artifact | Bead |
@@ -674,6 +710,7 @@ GC runs **only under the writer LOCK** (readers never GC — bead `bd-quill-duel
 | 1.0.17 | 2026-07-18 | Writer admission and generation publication are pinned: persistent no-follow `LOCK` inode, exact LE+CRC record, nonblocking exclusive flock, ESRCH-only residual takeover independent of mtime, exact-record truncate-on-release without unlink, retained O_EXCL `gen-N.claim`, writer-only recovery/repair/GC, and touchless reader open | — (pre-freeze protocol hardening) | wire/corruption matrix, real SIGSTOP owner, two-process dead-owner race, inode-replacement ABA, reader directory-identity, interrupted-claim recovery, and durable staged-repair fixtures (writer-lock bead) |
 | 1.0.18 | 2026-07-18 | MANIFEST v2: generation-level `last_publish_unix_s: i64` after `flags` (visibility freshness witness; 0 = unknown; publisher stamps zero fields; never monotonicity-validated). Readers accept v1 images as timestamp-unknown; writers emit v2 only (bead `bd-quill-duel-visibility-contract-9rk3`) | v1 images read with timestamp 0 (unknown) | v1/v2 wire goldens, v1-image read compatibility, publisher stamping + caller-override, successor stamp propagation (keeper inline) |
 | 1.0.19 | 2026-07-18 | STATS denominator contract hardened: every `field_stats` row's `doc_count` MUST equal the manifest's aggregate at-seal document count (Σ segment `doc_count`); validation now rejects deviations in either direction instead of accepting `doc_count <= aggregate`. Tombstones never relax the rule. No format change (bd-quill-e3-keeper-ndtk.10) | manifests with per-field counts deviating from the aggregate are corruption; valid v1/v2 images are unaffected | both-direction rejection, exact round-trip, tombstone-invariance, stale-transition fixtures (keeper inline) |
+| lexical-image.v2 | 2026-10-23 | Complete retained lexical object with strict framed MANIFEST/FSLX bytes, raw generation receipt, bounded admission, canonical live-ID coherence and production query facade (§9.1; bd-cdny8/bd-xomn.3) | Regenerate the former unpersisted v1 receipt as a physical v2 image; ordinary FSLX/MANIFEST formats are unchanged | `keeper::snapshot_image::tests`: real-query/tombstone/hydration parity, retained source relocation, rebound-inner-corruption rejection, identity drift, resource bounds and cancellation |
 
 The v1 golden decodes to 921 bytes and is the exact output pinned by
 `segment::tests::pinned_wire_oracle_and_roundtrip_preserve_header_table_and_payloads`.
