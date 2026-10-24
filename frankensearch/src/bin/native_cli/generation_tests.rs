@@ -109,6 +109,35 @@ fn search_options_do_not_grant_publication_or_change_the_selected_tier() {
     assert!(parse(&["authority-search", "--receipt", "r", "--query", "   "]).is_err());
 }
 
+#[test]
+fn recovery_requires_only_the_saved_attempt_and_rejects_model_or_publish_options() {
+    let base = ["authority-recover", "--receipt", "trusted.json"];
+    assert_eq!(parse(&base).unwrap().unwrap().command, Command::Recover);
+    assert!(is_command("authority-recover"));
+    assert!(parse(&["authority-recover"]).is_err());
+    assert!(parse(&["authority-recover", "--help"]).unwrap().is_none());
+    for extra in [
+        vec!["--root", "different-root"],
+        vec!["--cooperative-local"],
+        vec!["--tier", "quality"],
+        vec!["--input", "documents.jsonl"],
+        vec!["--model-dir", "unavailable"],
+        vec!["--quality-backend", "onnx"],
+        vec!["--quality-model-dir", "unavailable"],
+        vec!["--query", "retry"],
+        vec!["--limit", "10"],
+        vec!["--receipt", "different.json"],
+        vec!["--max-image-bytes", "0"],
+    ] {
+        let mut arguments = base.to_vec();
+        arguments.extend(extra);
+        assert!(parse(&arguments).is_err(), "{arguments:?}");
+    }
+    let mut arguments = base.to_vec();
+    arguments.extend(["--max-image-bytes", "4096"]);
+    assert_eq!(parse(&arguments).unwrap().unwrap().max_image_bytes, 4096);
+}
+
 fn identity() -> FrozenEmbeddingIdentityBundleV1 {
     let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("authority-cli-test", 2);
     // Synthetic semantic-shaped test provider; no production inference or
@@ -130,6 +159,10 @@ fn identity() -> FrozenEmbeddingIdentityBundleV1 {
 
 fn receipt() -> Receipt {
     let authority = AuthorityRefV1::new(1, [0x52; 16], 256, [0x53; 32], None).unwrap();
+    let permit = AttemptPermitV1::new(
+        [0x51; 16], [0x61; 16], [0x62; 16], authority,
+        ExpectedAuthorityPairV1::default(), [0x63; 16],
+    ).unwrap();
     Receipt {
         schema: RECEIPT_SCHEMA.to_owned(),
         root: PathBuf::from("/private/generation"),
@@ -141,6 +174,7 @@ fn receipt() -> Receipt {
         tier: EmbedderTierTag::Fast,
         documents: 2,
         image_bytes: 4096,
+        attempt: Some(SavedAttempt::from_permit(&permit, false)),
     }
 }
 
@@ -170,6 +204,68 @@ fn receipt_preserves_independent_binding_and_rejects_downgrades_and_tampering() 
     changed = original;
     changed.root = PathBuf::from("relative/root");
     assert!(changed.validate().is_err());
+}
+
+#[test]
+fn saved_attempt_round_trip_preserves_both_slots_and_the_original_identities() {
+    let mut selected = receipt();
+    let first = selected.authority().unwrap();
+    let second = AuthorityRefV1::new(
+        2, [0x71; 16], 256, [0x72; 32], Some(first.fingerprint()),
+    ).unwrap();
+    let third = AuthorityRefV1::new(
+        3, [0x73; 16], 256, [0x74; 32], Some(second.fingerprint()),
+    ).unwrap();
+    let permit = AttemptPermitV1::new(
+        selected.root_id, [0x81; 16], [0x82; 16], third,
+        ExpectedAuthorityPairV1 {
+            first: Some(AuthoritySlotV1::new(0, selected.root_id, second).unwrap()),
+            second: Some(AuthoritySlotV1::new(1, selected.root_id, first).unwrap()),
+        },
+        [0x83; 16],
+    ).unwrap();
+    selected.authority = third.canonical_bytes().to_vec();
+    selected.attempt = Some(SavedAttempt::from_permit(&permit, false));
+    let encoded = serde_json::to_vec(&selected).unwrap();
+    let restored: Receipt = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(restored.recovery_attempt().unwrap(), permit);
+    assert_eq!(restored.recovery_attempt().unwrap().stage, AttemptStageV1::AttemptFrame);
+    let mut changed = restored.clone();
+    changed.attempt.as_mut().unwrap().requires_floor = true;
+    assert!(changed.validate().is_err());
+    changed = restored.clone();
+    changed.attempt.as_mut().unwrap().writer_id = [0; 16];
+    assert!(changed.validate().is_err());
+    changed = restored.clone();
+    changed.attempt.as_mut().unwrap().attempt_id = [0; 16];
+    assert!(changed.validate().is_err());
+    changed = restored.clone();
+    changed.attempt.as_mut().unwrap().idempotency_key = [0; 16];
+    assert!(changed.validate().is_err());
+    changed = restored.clone();
+    changed.attempt.as_mut().unwrap().expected_first = None;
+    assert!(changed.validate().is_err(), "the complete predecessor pair is required");
+    changed = restored;
+    changed.attempt.as_mut().unwrap().expected_second = Some(vec![0; 128]);
+    assert!(changed.validate().is_err());
+}
+
+#[test]
+fn selection_only_receipts_remain_readable_but_cannot_authorize_recovery() {
+    let mut selected = receipt();
+    selected.schema = SELECTION_ONLY_RECEIPT_SCHEMA.to_owned();
+    assert!(selected.validate().is_err(), "a v2 attempt cannot be relabelled v1");
+    selected.attempt = None;
+    selected.validate().unwrap();
+    let encoded = serde_json::to_vec(&selected).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert!(value.get("attempt").is_none());
+    let restored: Receipt = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(restored.binding().unwrap(), selected.binding().unwrap());
+    assert_eq!(restored.authority().unwrap(), selected.authority().unwrap());
+    assert!(restored.recovery_attempt().is_err());
+    selected.schema = RECEIPT_SCHEMA.to_owned();
+    assert!(selected.validate().is_err(), "v2 requires its prepared attempt");
 }
 
 #[test]
@@ -231,6 +327,72 @@ fn root_receipt_and_work_destinations_are_disjoint() {
     ] {
         assert!(separate_destinations(&paths).is_err());
     }
+}
+
+#[test]
+fn recovery_reports_every_verdict_without_turning_uncertainty_into_an_abort() {
+    use frankensearch_core::generation::GenerationAuthorityErrorV1;
+
+    let selected = receipt();
+    let permit = selected.recovery_attempt().unwrap();
+    let slot = AuthoritySlotV1::new(1, selected.root_id, permit.candidate).unwrap();
+    let other = AuthorityRefV1::new(1, [0x91; 16], 256, [0x92; 32], None).unwrap();
+    let fork = AuthoritySlotV1::new(1, selected.root_id, other).unwrap();
+    let successor = AuthorityRefV1::new(
+        2, [0x93; 16], 256, [0x94; 32], Some(permit.candidate.fingerprint()),
+    ).unwrap();
+    let head = AuthoritySlotV1::new(0, selected.root_id, successor).unwrap();
+    for (outcome, verdict, publication, serving, resolved) in [
+        (ReconcileOutcomeV1::Committed { slot, floor: None }, "committed", "committed", "not_activated", true),
+        (ReconcileOutcomeV1::NotCommitted, "not_committed", "not_committed", "not_activated", true),
+        (ReconcileOutcomeV1::StillUnknown(permit), "still_unknown", "unknown", "not_activated", false),
+        (ReconcileOutcomeV1::Fork { observed: fork }, "fork", "unknown", "not_activated", false),
+        (ReconcileOutcomeV1::RepairRequired(GenerationAuthorityErrorV1::UnresolvedAttempt), "repair_required", "unknown", "not_activated", false),
+        (ReconcileOutcomeV1::CommittedThenSuperseded { head }, "committed_then_superseded", "committed", "superseded", true),
+    ] {
+        let report = reconciliation_report(&selected, &permit, &outcome);
+        assert_eq!(report["reconciliation"], verdict);
+        assert_eq!(report["publication"], publication);
+        assert_eq!(report["serving"], serving);
+        assert_eq!(report["ok"], resolved);
+        assert_eq!(report["attempt"], attempt_report(&permit));
+        let mut output = Vec::new();
+        let result = emit_recovery(&mut output, report.clone());
+        if resolved {
+            result.unwrap();
+            let emitted: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(emitted, report);
+        } else {
+            let error = result.unwrap_err();
+            assert!(output.is_empty());
+            assert_eq!(publication_failure(error.as_ref()).unwrap(), report);
+        }
+    }
+}
+
+#[test]
+fn recovery_output_failure_preserves_the_exact_reconciliation_and_commit_knowledge() {
+    struct Closed;
+    impl Write for Closed {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output"))
+        }
+        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    let selected = receipt();
+    let permit = selected.recovery_attempt().unwrap();
+    let slot = AuthoritySlotV1::new(1, selected.root_id, permit.candidate).unwrap();
+    let mut report = reconciliation_report(
+        &selected, &permit, &ReconcileOutcomeV1::Committed { slot, floor: None },
+    );
+    report["serving"] = serde_json::json!("activated");
+    let error = emit_recovery(&mut Closed, report).unwrap_err();
+    let failure = publication_failure(error.as_ref()).unwrap();
+    assert_eq!(failure["publication"], "committed");
+    assert_eq!(failure["reconciliation"], "committed");
+    assert_eq!(failure["serving"], "activated");
+    assert_eq!(failure["reason"], "result_delivery_failed");
+    assert_eq!(failure["attempt"], attempt_report(&permit));
 }
 
 #[test]
@@ -335,6 +497,28 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
     ));
     fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
     asupersync::test_utils::run_test_with_cx(|cx| async move {
+        // A durable receipt can precede every attempt write. Recovery must prove
+        // non-commit without requiring model files or staged component images.
+        let unissued_path = parent.join("unissued-root");
+        drop(create_root(&unissued_path).expect("qualified Linux root is required"));
+        let mut unissued = receipt();
+        unissued.root = unissued_path.clone();
+        let unissued_receipt = parent.join("unissued.json");
+        save_receipt(&unissued, &unissued_receipt).unwrap();
+        let unissued_options = Options::parse([
+            "authority-recover".to_owned(),
+            "--receipt".to_owned(),
+            unissued_receipt.to_str().unwrap().to_owned(),
+        ]).unwrap().unwrap();
+        let mut output = Vec::new();
+        recover(&cx, &unissued_options, &mut output).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["publication"], "not_committed");
+        assert_eq!(report["reconciliation"], "not_committed");
+        assert_eq!(report["serving"], "not_activated");
+        assert_eq!(fs::read(unissued_path.join("AUTHORITY")).unwrap(), vec![0; 8192]);
+        assert_eq!(fs::read(unissued_path.join("LOCK")).unwrap(), vec![0; 8192]);
+
         for (name, tier) in [
             ("fast", EmbedderTierTag::Fast),
             ("quality", EmbedderTierTag::Quality),
@@ -381,9 +565,60 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
                     [0x71; 32],
                 )
                 .unwrap();
+            drop(published);
             drop(built);
             drop(root);
             let selected = Receipt::read(&receipt_path).unwrap();
+            let recorded = selected.recovery_attempt().unwrap();
+            // Reproduce the on-disk cut after the slot barrier but before the
+            // owner frame. Only the pre-publication receipt is used to recover.
+            let mut lock = OpenOptions::new().write(true).open(root_path.join("LOCK")).unwrap();
+            lock.write_all(&[0; 4096]).unwrap();
+            lock.sync_all().unwrap();
+            drop(lock);
+            assert!(selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+            let authority_before_recovery = fs::read(root_path.join("AUTHORITY")).unwrap();
+            let lock_before_recovery = fs::read(root_path.join("LOCK")).unwrap();
+            let mut altered = selected.clone();
+            altered.attempt.as_mut().unwrap().writer_id[0] ^= 1;
+            let altered_path = parent.join(format!("{name}-altered.json"));
+            save_receipt(&altered, &altered_path).unwrap();
+            let mut recovery = Options::parse([
+                "authority-recover".to_owned(), "--receipt".to_owned(),
+                altered_path.to_str().unwrap().to_owned(),
+            ]).unwrap().unwrap();
+            let error = recover(&cx, &recovery, &mut Vec::new()).unwrap_err();
+            let refused = publication_failure(error.as_ref()).unwrap();
+            assert_eq!(refused["publication"], "unknown");
+            assert_eq!(refused["reconciliation"], "repair_required");
+            assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority_before_recovery);
+            assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_before_recovery);
+
+            recovery.receipt = receipt_path.clone();
+            let calls_before_recovery = provider.calls.load(Ordering::Relaxed);
+            let mut recovered_output = Vec::new();
+            recover(&cx, &recovery, &mut recovered_output).unwrap();
+            let recovered: serde_json::Value = serde_json::from_slice(&recovered_output).unwrap();
+            assert_eq!(recovered["publication"], "committed");
+            assert_eq!(recovered["reconciliation"], "committed");
+            assert_eq!(recovered["serving"], "activated");
+            assert_eq!(recovered["attempt"], attempt_report(&recorded));
+            assert_eq!(provider.calls.load(Ordering::Relaxed), calls_before_recovery);
+            assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority_before_recovery);
+            let owner = admit_root(&root_path).unwrap()
+                .authority_publisher(selected.root_id, [0xa1; 16], PROFILE).unwrap()
+                .owner_frame().unwrap().unwrap();
+            assert_eq!(owner.writer_id, recorded.writer_id);
+            assert_eq!(owner.attempt_id, recorded.attempt_id);
+            recovery.max_image_bytes = 1;
+            let error = recover(&cx, &recovery, &mut Vec::new()).unwrap_err();
+            let bounded = publication_failure(error.as_ref()).unwrap();
+            assert_eq!(bounded["publication"], "committed");
+            assert_eq!(bounded["reconciliation"], "committed");
+            assert_eq!(bounded["serving"], "not_activated");
+            assert_eq!(bounded["reason"], "snapshot_activation_deferred_or_refused");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), calls_before_recovery);
+            recovery.max_image_bytes = DEFAULT_IMAGE_BYTES;
             assert!(selected.open(&cx, 1).is_err());
             let before = provider.calls.load(Ordering::Relaxed);
             let snapshot = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
@@ -436,6 +671,14 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
                 PublicationOutcomeV1::Committed { .. }
             ));
             assert!(selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+            let before_superseded = provider.calls.load(Ordering::Relaxed);
+            let mut superseded_output = Vec::new();
+            recover(&cx, &recovery, &mut superseded_output).unwrap();
+            let superseded: serde_json::Value = serde_json::from_slice(&superseded_output).unwrap();
+            assert_eq!(superseded["publication"], "committed");
+            assert_eq!(superseded["reconciliation"], "committed_then_superseded");
+            assert_eq!(superseded["serving"], "superseded");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before_superseded);
             assert!(
                 !snapshot
                     .search_text(&cx, provider.as_ref(), "retry", 1)

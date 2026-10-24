@@ -120,10 +120,16 @@ images, not model memory, query scratch space, page cache, or other retained
 readers. Indexing inference batches default to 64 documents on this route and
 can be selected with `--batch-size`.
 
-The receipt uses schema `frankensearch.native.authority-selection.v1` and is
-written durably before publication. Its existence identifies the proposed exact
-authority; it does not by itself acknowledge a commit. The publication result
-keeps commit knowledge separate from serving activation:
+New receipts use schema `frankensearch.native.authority-selection.v2` and are
+written durably before publication. In addition to the selected authority and
+producer, each receipt preserves the original writer, exact attempt identity,
+complete expected slot pair, floor requirement, and floor idempotency key. The
+publisher uses that exact prepared attempt. A process crash before any success
+or error output therefore leaves the inputs needed for reconciliation.
+
+Receipt existence identifies a proposed authority; it does not acknowledge a
+commit. The publication result keeps commit knowledge separate from serving
+activation:
 
 | Publication result | Meaning |
 |---|---|
@@ -132,14 +138,48 @@ keeps commit knowledge separate from serving activation:
 | `committed` | The authority switch succeeded. A later activation or output error does not undo that commit. |
 
 Successful indexing reports `publication: "committed"` and
-`serving: "activated"`. Unknown outcomes require reconciliation before further
-mutation, using the existing authority-publisher recovery API and the returned
-attempt. The library's `GenerationPublisherV1::reconcile_pending` also supports
-recovery within a live publication session while retaining its old reader.
-The two authority commands currently provide initial publication and exact
-selected search. The existing `update`, `rebuild`, and `serve` commands continue
-to use their own selected-snapshot receipts. Work files and staged candidates
-remain available after success or failure.
+`serving: "activated"`. After an interrupted or uncertain publication, run:
+
+```sh
+./target/release/frankensearch-native authority-recover \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --max-image-bytes 268435456
+```
+
+Recovery reconciles only the exact saved attempt. It does not republish the
+candidate or load embedding models. The exclusive publisher also refuses to
+overwrite an unresolved persisted attempt, including from a different process.
+Recovery reports one of the following verdicts:
+
+| Reconciliation | Publication knowledge and serving behavior |
+|---|---|
+| `committed` | Commit is confirmed; the command separately attempts bounded admission of the exact selected generation. |
+| `not_committed` | The complete prior authority pair proves an abort. Only a matching abandoned attempt frame may be cleared. |
+| `still_unknown` | The outcome remains unresolved; the attempt must be retained and reconciled again. |
+| `fork` | A conflicting authority prevents a commit/abort decision; the command fails without replacing it. |
+| `repair_required` | Inconsistent or damaged authority evidence prevents reconciliation; the command fails without guessing. |
+| `committed_then_superseded` | Commit is confirmed but a newer authority is selected. The old receipt is reported as superseded, without activating another generation through it. |
+
+Unresolved, fork, and repair outcomes return a failing exit status. A known
+commit remains `publication: "committed"` when bounded reader admission is
+refused, cancellation defers activation, or output delivery fails. Those cases
+also return a failing exit status. Repeating recovery is safe; it does not create
+another publication. The receipt and staged objects remain available.
+
+Selection-only v1 receipts still support `authority-search`; they cannot
+authorize `authority-recover` because they do not contain an exact prepared
+attempt. Recovery never invents missing fields or drops a saved floor
+requirement.
+
+Library callers can use `GenerationPublisherV1::prepare_attempt`, durably save
+its permit and security/floor requirements, and then call `publish_prepared`.
+A fresh serving session can restore that permit with `restore_pending_attempt`
+and reuse `reconcile_pending` while retaining its existing reader.
+
+The authority commands provide initial publication, exact selected search, and
+publication recovery. The existing `update`, `rebuild`, and `serve` commands
+continue to use their own selected-snapshot receipts. Work files and staged
+candidates remain available after success or failure.
 
 ## Native quality without the ONNX feature bundle
 

@@ -21,13 +21,13 @@ use frankensearch::native_ann::builder::{
 };
 use frankensearch::{Cx, GenerationActivationV1, GenerationPublisherV1, SearchError};
 use frankensearch_core::generation::{
-    ArtifactGenerationIdentityV1, AuthorityRefV1, CommitRange, EmbedderTierTag,
+    ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1, CommitRange, EmbedderTierTag,
     FrozenEmbeddingIdentityBundleV1, GenerationAuthorityActionV1, GenerationRootSecurityProfileV1,
 };
 use frankensearch_index::FsviV2IdentityBinding;
 use frankensearch_index::generation_root::authority_publisher::{
     AUTHORITY_PUBLISHER_LOCK_BYTES_V1, AttemptPermitV1, ExpectedAuthorityPairV1,
-    PublicationOutcomeV1, WriterIdentityV1,
+    PublicationOutcomeV1, ReconcileOutcomeV1, WriterIdentityV1,
 };
 use frankensearch_index::generation_root::generation_reader::{
     SnapshotOpenOutcomeV1, component_object_name_v1,
@@ -44,7 +44,8 @@ use super::{
     new_generation, new_path, positive as number, read_documents, validate_query, value,
 };
 
-const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
+const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
+const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 const PROFILE: GenerationRootSecurityProfileV1 = GenerationRootSecurityProfileV1::CooperativeLocal;
 const HELP: &str = "Fixed AUTHORITY exact search (one explicit semantic tier)\n\n\
@@ -56,6 +57,7 @@ const HELP: &str = "Fixed AUTHORITY exact search (one explicit semantic tier)\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--max-image-bytes N]\n\n\
+  authority-recover --receipt JSON [--max-image-bytes N]\n\n\
 This explicit route builds one exact FSVI v2 tier plus a retained Quill image.\n\
 Quality-only generations load and query their quality model directly. Models\n\
 are local-only; unavailable or mismatched models fail without substitution.\n\
@@ -66,6 +68,9 @@ contract. Unsupported filesystems fail before indexing. Cooperative-local is\n\
 explicit: this command does not provide an external anti-rollback service.\n\
 The receipt is durably written before publication and selects exactly one\n\
 authority; its existence alone is not proof that publication committed.\n\
+It also preserves the complete original attempt for recovery after a crash.\n\
+authority-recover reconciles that attempt without republishing or loading models.\n\
+Recovery reports commit knowledge separately from bounded reader admission.\n\
 Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
 by authority-index. Search refuses a head different from the receipt.\n\
@@ -76,6 +81,7 @@ Work files remain available after completion or failure. Stdout is JSON.\n";
 enum Command {
     Index,
     Search,
+    Recover,
 }
 
 struct Options {
@@ -97,7 +103,7 @@ struct Options {
 }
 
 pub fn is_command(command: &str) -> bool {
-    matches!(command, "authority-index" | "authority-search")
+    matches!(command, "authority-index" | "authority-search" | "authority-recover")
 }
 
 impl Options {
@@ -106,6 +112,7 @@ impl Options {
         let command = match args.next().as_deref() {
             Some("authority-index") => Command::Index,
             Some("authority-search") => Command::Search,
+            Some("authority-recover") => Command::Recover,
             _ => return Err(bad("unknown authority command")),
         };
         let mut options = Self {
@@ -135,12 +142,14 @@ impl Options {
             }
             match flag.as_str() {
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
-                "--model-dir" => options.models = Some(PathBuf::from(value(&mut args)?)),
-                "--quality-backend" => {
+                "--model-dir" if command != Command::Recover => {
+                    options.models = Some(PathBuf::from(value(&mut args)?));
+                }
+                "--quality-backend" if command != Command::Recover => {
                     options.quality.backend =
                         Some(models::QualityBackend::parse(&value(&mut args)?)?);
                 }
-                "--quality-model-dir" => {
+                "--quality-model-dir" if command != Command::Recover => {
                     options.quality.directory = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--max-image-bytes" => {
@@ -205,6 +214,7 @@ impl Options {
                     .as_deref()
                     .ok_or_else(|| bad("authority-search requires --query"))?,
             )?,
+            Command::Recover => {}
         }
         Ok(Some(options))
     }
@@ -234,6 +244,53 @@ fn source_sequence(text: &str) -> Result<u64> {
         .map_err(|_| bad("source sequence must be an unsigned 64-bit integer"))
 }
 
+/// Inputs recorded before publication, never an assertion about its outcome.
+/// Root and candidate are pinned by the enclosing selection receipt. The
+/// original physical slot pair is preserved in full for aborted-attempt proof.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SavedAttempt {
+    writer_id: [u8; 16],
+    attempt_id: [u8; 16],
+    expected_first: Option<Vec<u8>>,
+    expected_second: Option<Vec<u8>>,
+    idempotency_key: [u8; 16],
+    requires_floor: bool,
+}
+
+impl SavedAttempt {
+    fn from_permit(permit: &AttemptPermitV1, requires_floor: bool) -> Self {
+        Self {
+            writer_id: permit.writer_id,
+            attempt_id: permit.attempt_id,
+            expected_first: permit.expected.first.map(|slot| slot.authority.canonical_bytes().to_vec()),
+            expected_second: permit.expected.second.map(|slot| slot.authority.canonical_bytes().to_vec()),
+            idempotency_key: permit.idempotency_key,
+            requires_floor,
+        }
+    }
+
+    fn restore(&self, root_id: [u8; 16], candidate: AuthorityRefV1) -> Result<AttemptPermitV1> {
+        let decode = |bytes: &Option<Vec<u8>>, index| -> Result<Option<AuthoritySlotV1>> {
+            bytes.as_ref().map(|bytes| {
+                let authority = AuthorityRefV1::from_canonical_bytes(bytes)?;
+                AuthoritySlotV1::new(index, root_id, authority).map_err(Into::into)
+            }).transpose()
+        };
+        AttemptPermitV1::new(
+            root_id,
+            self.writer_id,
+            self.attempt_id,
+            candidate,
+            ExpectedAuthorityPairV1 {
+                first: decode(&self.expected_first, 0)?,
+                second: decode(&self.expected_second, 1)?,
+            },
+            self.idempotency_key,
+        ).map_err(Into::into)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Receipt {
@@ -247,6 +304,8 @@ struct Receipt {
     tier: EmbedderTierTag,
     documents: u64,
     image_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt: Option<SavedAttempt>,
 }
 
 impl Receipt {
@@ -270,8 +329,7 @@ impl Receipt {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.schema != RECEIPT_SCHEMA
-            || !self.root.is_absolute()
+        if !self.root.is_absolute()
             || self.root_id == [0; 16]
             || self.profile != PROFILE.as_str()
             || self.documents == 0
@@ -281,11 +339,30 @@ impl Receipt {
             return Err(bad("invalid authority receipt contract"));
         }
         let authority = self.authority()?;
+        match (self.schema.as_str(), self.attempt.as_ref()) {
+            (RECEIPT_SCHEMA, Some(attempt)) => {
+                // This CLI never supplies an external floor. A saved attempt
+                // requiring one cannot be downgraded during a process restart.
+                if attempt.requires_floor {
+                    return Err(bad("the recorded attempt requires an unavailable anti-rollback floor"));
+                }
+                attempt.restore(self.root_id, authority)?;
+            }
+            (SELECTION_ONLY_RECEIPT_SCHEMA, None) => {}
+            _ => return Err(bad("authority receipt schema and prepared attempt disagree")),
+        }
         if self.image_bytes < authority.manifest_len {
             return Err(bad("authority receipt image length is inconsistent"));
         }
         self.binding()?;
         Ok(())
+    }
+
+    fn recovery_attempt(&self) -> Result<AttemptPermitV1> {
+        self.validate()?;
+        self.attempt.as_ref()
+            .ok_or_else(|| bad("this selection-only receipt has no durable publication attempt"))?
+            .restore(self.root_id, self.authority()?)
     }
 
     fn authority(&self) -> Result<AuthorityRefV1> {
@@ -447,6 +524,17 @@ pub fn publication_failure(error: &(dyn Error + 'static)) -> Option<serde_json::
         .map(|error| error.0.clone())
 }
 
+fn attempt_report(permit: &AttemptPermitV1) -> serde_json::Value {
+    serde_json::json!({
+        "root_id": permit.root_id, "writer_id": permit.writer_id,
+        "attempt_id": permit.attempt_id, "target_slot": permit.target_slot,
+        "candidate": permit.candidate.canonical_bytes().as_slice(),
+        "expected_first": permit.expected.first.map(|slot| slot.authority.canonical_bytes().to_vec()),
+        "expected_second": permit.expected.second.map(|slot| slot.authority.canonical_bytes().to_vec()),
+        "stage": format!("{:?}", permit.stage), "idempotency_key": permit.idempotency_key,
+    })
+}
+
 fn publication_error(
     receipt: &Receipt,
     publication: &str,
@@ -460,14 +548,7 @@ fn publication_error(
         "root": receipt.root, "root_id": receipt.root_id, "authority": receipt.authority,
     });
     if let Some(permit) = attempt {
-        payload["attempt"] = serde_json::json!({
-            "root_id": permit.root_id, "writer_id": permit.writer_id,
-            "attempt_id": permit.attempt_id, "target_slot": permit.target_slot,
-            "candidate": permit.candidate.canonical_bytes().as_slice(),
-            "expected_first": permit.expected.first.map(|slot| slot.authority.canonical_bytes().to_vec()),
-            "expected_second": permit.expected.second.map(|slot| slot.authority.canonical_bytes().to_vec()),
-            "stage": format!("{:?}", permit.stage), "idempotency_key": permit.idempotency_key,
-        });
+        payload["attempt"] = attempt_report(permit);
     }
     Box::new(PublicationFailure(payload))
 }
@@ -498,6 +579,13 @@ fn stage_and_publish(
         return Err(bad("complete generation exceeds the encoded-image budget"));
     }
     built.validate_candidate(cx, &candidate)?;
+    let mut publisher = GenerationPublisherV1::new(root, root_id, writer.writer_id, PROFILE)?;
+    let attempt = publisher.prepare_attempt(
+        &candidate,
+        ExpectedAuthorityPairV1::default(),
+        new_generation(1)?.nonce,
+        new_generation(1)?.nonce,
+    )?;
     let receipt = Receipt {
         schema: RECEIPT_SCHEMA.to_owned(),
         root: root_path.to_path_buf(),
@@ -509,6 +597,7 @@ fn stage_and_publish(
         tier: built.metadata().vector_artifacts[0].embedder_tier,
         documents: built.metadata().total_documents,
         image_bytes: candidate.owned_image_bytes(),
+        attempt: Some(SavedAttempt::from_permit(&attempt, false)),
     };
     // Freeze the recovery/selection inputs before any authority mutation.
     // Encoding is also preflighted before writing any candidate object.
@@ -533,14 +622,12 @@ fn stage_and_publish(
     )?;
     root.revalidate()?;
     save_receipt(&receipt, receipt_path)?;
-    let mut publisher = GenerationPublisherV1::new(root, root_id, writer.writer_id, PROFILE)?;
     let result = publisher
-        .publish(
+        .publish_prepared(
             cx,
             &candidate,
-            ExpectedAuthorityPairV1::default(),
+            &attempt,
             None,
-            new_generation(1)?.nonce,
             u64::try_from(max_image_bytes)?,
         )
         .map_err(|error| {
@@ -700,6 +787,83 @@ async fn search(
     )
 }
 
+fn reconciliation_report(
+    receipt: &Receipt,
+    permit: &AttemptPermitV1,
+    outcome: &ReconcileOutcomeV1,
+) -> serde_json::Value {
+    let (publication, reconciliation, serving, resolved) = match outcome {
+        ReconcileOutcomeV1::Committed { .. } => ("committed", "committed", "not_activated", true),
+        ReconcileOutcomeV1::NotCommitted => ("not_committed", "not_committed", "not_activated", true),
+        ReconcileOutcomeV1::StillUnknown(_) => ("unknown", "still_unknown", "not_activated", false),
+        ReconcileOutcomeV1::Fork { .. } => ("unknown", "fork", "not_activated", false),
+        ReconcileOutcomeV1::RepairRequired(_) => ("unknown", "repair_required", "not_activated", false),
+        ReconcileOutcomeV1::CommittedThenSuperseded { .. } => {
+            ("committed", "committed_then_superseded", "superseded", true)
+        }
+    };
+    let mut report = serde_json::json!({
+        "schema": SCHEMA, "ok": resolved, "event": "recovered",
+        "publication": publication, "reconciliation": reconciliation, "serving": serving,
+        "root": receipt.root, "root_id": receipt.root_id,
+        "authority": receipt.authority, "attempt": attempt_report(permit),
+    });
+    match outcome {
+        ReconcileOutcomeV1::Fork { observed } => {
+            report["observed_authority"] = serde_json::json!(observed.authority.canonical_bytes().as_slice());
+        }
+        ReconcileOutcomeV1::RepairRequired(error) => {
+            report["reason"] = serde_json::json!(error.to_string());
+        }
+        ReconcileOutcomeV1::CommittedThenSuperseded { head } => {
+            report["current_authority"] = serde_json::json!(head.authority.canonical_bytes().as_slice());
+        }
+        ReconcileOutcomeV1::StillUnknown(current) => {
+            report["attempt"] = attempt_report(current);
+        }
+        ReconcileOutcomeV1::Committed { .. } | ReconcileOutcomeV1::NotCommitted => {}
+    }
+    report
+}
+
+fn emit_recovery(output: &mut impl Write, mut report: serde_json::Value) -> Result<()> {
+    if report["ok"] != true {
+        return Err(Box::new(PublicationFailure(report)));
+    }
+    emit(output, &report).map_err(|_| {
+        report["ok"] = serde_json::json!(false);
+        report["reason"] = serde_json::json!("result_delivery_failed");
+        Box::new(PublicationFailure(report)) as Box<dyn Error + Send + Sync>
+    })
+}
+
+fn recover(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
+    let receipt = Receipt::read(&options.receipt)?;
+    let permit = receipt.recovery_attempt()?;
+    checkpoint(cx)?;
+    let root = admit_root(&receipt.root)?;
+    let writer = WriterIdentityV1::for_current_process()?;
+    let publisher = root.authority_publisher(receipt.root_id, writer.writer_id, PROFILE)?;
+    checkpoint(cx)?;
+    // Reconcile the original exact attempt. Never publish, infer a new attempt,
+    // or load models here. Reader admission is separate and remains bounded.
+    let outcome = publisher.reconcile(&permit, None).map_err(|error| {
+        publication_error(&receipt, "unknown", "not_activated", &error.to_string(), Some(&permit))
+    })?;
+    let mut report = reconciliation_report(&receipt, &permit, &outcome);
+    if matches!(outcome, ReconcileOutcomeV1::Committed { .. }) {
+        match receipt.open(cx, options.max_image_bytes) {
+            Ok(_snapshot) => report["serving"] = serde_json::json!("activated"),
+            Err(error) => {
+                report["ok"] = serde_json::json!(false);
+                report["reason"] = serde_json::json!("snapshot_activation_deferred_or_refused");
+                report["detail"] = serde_json::json!(error.to_string());
+            }
+        }
+    }
+    emit_recovery(output, report)
+}
+
 pub fn run(args: Vec<String>) -> Result<()> {
     let Some(options) = Options::parse(args)? else {
         io::stdout().lock().write_all(HELP.as_bytes())?;
@@ -720,6 +884,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         match options.command {
             Command::Index => Box::pin(index(&cx, &options, &mut output, pool)).await,
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,
+            Command::Recover => recover(&cx, &options, &mut output),
         }
     })
 }
