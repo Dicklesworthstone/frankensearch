@@ -1756,6 +1756,9 @@ pub mod authority_publisher {
         },
         /// A non-empty slot failed authentication; publication needs repair first.
         UnreadableSlot(GenerationAuthorityErrorV1),
+        /// Persisted owner/attempt evidence is unauthenticated, unresolved, or
+        /// inconsistent with the selected authority. No frame was overwritten.
+        LockRefused(GenerationAuthorityErrorV1),
         /// The candidate does not extend the resolved head by exactly one sequence.
         InvalidCandidate(GenerationAuthorityErrorV1),
         /// The floor head could not be proven or already exceeds the pair.
@@ -1796,6 +1799,46 @@ pub mod authority_publisher {
         pub stage: AttemptStageV1,
         /// Idempotency key used for the floor request.
         pub idempotency_key: [u8; 16],
+    }
+
+    impl AttemptPermitV1 {
+        /// Prepare an exact attempt without I/O. Persist it before publication
+        /// to retain the inputs needed for fresh-process reconciliation.
+        ///
+        /// # Errors
+        ///
+        /// Rejects reserved identities, invalid pairs, and non-successor candidates.
+        pub fn new(
+            root_id: [u8; 16],
+            writer_id: [u8; 16],
+            attempt_id: [u8; 16],
+            candidate: AuthorityRefV1,
+            expected: ExpectedAuthorityPairV1,
+            idempotency_key: [u8; 16],
+        ) -> Result<Self, GenerationAuthorityErrorV1> {
+            let permit = Self {
+                root_id,
+                writer_id,
+                attempt_id,
+                target_slot: u8::try_from(candidate.sequence & 1).unwrap_or(1),
+                candidate,
+                expected,
+                stage: AttemptStageV1::AttemptFrame,
+                idempotency_key,
+            };
+            permit.validate()?;
+            Ok(permit)
+        }
+
+        /// Validate structural attempt facts without I/O. Reconciliation accepts
+        /// every diagnostic stage; publication requires `AttemptFrame`.
+        ///
+        /// # Errors
+        ///
+        /// Rejects invalid identities, slots, target parity, or predecessor binding.
+        pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+            validate_reconciliation_permit(self, self.root_id).map(|_| ())
+        }
     }
 
     /// Result of one publication.
@@ -1930,8 +1973,11 @@ pub mod authority_publisher {
             return Ok((None, None));
         };
         let record = provider.load(root_id)?;
+        if record.is_some_and(|record| record.root_id != root_id) {
+            return Err(GenerationAuthorityErrorV1::RootMismatch);
+        }
         let floor = record
-            .map(|record| AuthorityFloorV1::new(root_id, record.authority))
+            .map(|record| AuthorityFloorV1::new(record.root_id, record.authority))
             .transpose()?;
         Ok((record, floor))
     }
@@ -2165,11 +2211,75 @@ pub mod authority_publisher {
         })
     }
 
+    fn publication_owner(
+        lock_bytes: &[u8],
+        root_id: [u8; 16],
+        pair: ExpectedAuthorityPairV1,
+    ) -> Result<Option<GenerationLockFrameV1>, GenerationAuthorityErrorV1> {
+        if u64::try_from(lock_bytes.len()).ok() != Some(AUTHORITY_PUBLISHER_LOCK_BYTES_V1) {
+            return Err(GenerationAuthorityErrorV1::InvalidSlotLength);
+        }
+        let owner = reconciliation_frame(
+            lock_bytes,
+            OWNER_FRAME_OFFSET,
+            root_id,
+            GenerationLockFrameKindV1::Owner,
+        )?;
+        let attempt = reconciliation_frame(
+            lock_bytes,
+            ATTEMPT_FRAME_OFFSET,
+            root_id,
+            GenerationLockFrameKindV1::Attempt,
+        )?;
+        if let Some(attempt) = attempt
+            && !frame_completes_attempt(owner, attempt)
+        {
+            return Err(GenerationAuthorityErrorV1::UnresolvedAttempt);
+        }
+        let head = resolve_authority_slots_with_profile_v1(
+            pair.first,
+            pair.second,
+            owner,
+            None,
+            GenerationRootSecurityProfileV1::CooperativeLocal,
+            None,
+        )?;
+        if let (Some(owner), Some(head)) = (owner, head)
+            && owner.fence != head.authority.sequence
+        {
+            return Err(GenerationAuthorityErrorV1::LockAuthorityMismatch);
+        }
+        Ok(owner)
+    }
+
     impl AuthorityPublisherV1<'_> {
         /// Root this publisher writes.
         #[must_use]
         pub const fn root_id(&self) -> [u8; 16] {
             self.root_id
+        }
+
+        /// Bind an exact attempt without I/O. Persist it before
+        /// [`Self::publish_prepared`] to survive loss of that call's response.
+        ///
+        /// # Errors
+        ///
+        /// Rejects invalid identities, pairs, and non-successor candidates.
+        pub fn prepare_attempt(
+            &self,
+            candidate: AuthorityRefV1,
+            expected: ExpectedAuthorityPairV1,
+            attempt_id: [u8; 16],
+            idempotency_key: [u8; 16],
+        ) -> Result<AttemptPermitV1, GenerationAuthorityErrorV1> {
+            AttemptPermitV1::new(
+                self.root_id,
+                self.writer_id,
+                attempt_id,
+                candidate,
+                expected,
+                idempotency_key,
+            )
         }
 
         fn lock_layout_matches(&self) -> Result<(), NotCommittedV1> {
@@ -2213,6 +2323,65 @@ pub mod authority_publisher {
                 ));
             }
 
+            let permit = match self.prepare_attempt(
+                candidate,
+                expected,
+                random_identity()?,
+                idempotency_key,
+            ) {
+                Ok(permit) => permit,
+                Err(error) => {
+                    return Ok(PublicationOutcomeV1::NotCommitted(
+                        NotCommittedV1::InvalidCandidate(error),
+                    ));
+                }
+            };
+            self.publish_prepared(&permit, floor)
+        }
+
+        /// Publish the prepared attempt through the same protocol as [`Self::publish`].
+        ///
+        /// Preserve its exact identity for fresh-process reconciliation. An
+        /// unresolved persisted attempt must be reconciled before another publish.
+        ///
+        /// # Errors
+        ///
+        /// Pre-write infrastructure errors return [`GenerationRootError`]. Invalid
+        /// permits or LOCK state return `NotCommitted`; failures after an attempt
+        /// write return `CommitOutcomeUnknown` with the original attempt identity.
+        pub fn publish_prepared(
+            &self,
+            prepared: &AttemptPermitV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
+        ) -> GenerationRootResult<PublicationOutcomeV1> {
+            if self.profile.require_mutation_authorized().is_err() {
+                return Ok(PublicationOutcomeV1::NotCommitted(
+                    NotCommittedV1::ReadOnlyProfile,
+                ));
+            }
+            if let Err(refusal) = self.lock_layout_matches() {
+                return Ok(PublicationOutcomeV1::NotCommitted(refusal));
+            }
+            if let Err(error) = validate_reconciliation_permit(prepared, self.root_id) {
+                return Ok(PublicationOutcomeV1::NotCommitted(
+                    NotCommittedV1::InvalidCandidate(error),
+                ));
+            }
+            if prepared.writer_id != self.writer_id
+                || prepared.stage != AttemptStageV1::AttemptFrame
+            {
+                return Ok(PublicationOutcomeV1::NotCommitted(
+                    NotCommittedV1::InvalidCandidate(GenerationAuthorityErrorV1::InvalidField {
+                        field: "authority_publisher.prepared_attempt",
+                    }),
+                ));
+            }
+            let mut permit = *prepared;
+            let candidate = permit.candidate;
+            let expected = permit.expected;
+            let attempt_id = permit.attempt_id;
+            let idempotency_key = permit.idempotency_key;
+
             let mut guard = match self.root.try_exclusive_anchor_guard() {
                 Ok(guard) => guard,
                 Err(error) if error.kind() == GenerationRootErrorKind::LockContended => {
@@ -2254,6 +2423,18 @@ pub mod authority_publisher {
                 ));
             }
 
+            // The shared candidate preflight cannot authorize a later writer.
+            // Authenticate and fence both persisted frames under THIS exclusive
+            // lock before replacing any attempt evidence.
+            let owner = match publication_owner(&guard.lock_image.bytes, self.root_id, observed) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    return Ok(PublicationOutcomeV1::NotCommitted(
+                        NotCommittedV1::LockRefused(error),
+                    ));
+                }
+            };
+
             // Fence: floor head and profile resolution.
             let (floor_record, floor_ref) = match floor_head(floor, self.root_id) {
                 Ok(head) => head,
@@ -2266,7 +2447,7 @@ pub mod authority_publisher {
             let head = match resolve_authority_slots_with_profile_v1(
                 expected.first,
                 expected.second,
-                None,
+                owner,
                 None,
                 self.profile,
                 floor_ref,
@@ -2301,17 +2482,6 @@ pub mod authority_publisher {
                 }
             };
 
-            let attempt_id = random_identity()?;
-            let mut permit = AttemptPermitV1 {
-                root_id: self.root_id,
-                writer_id: self.writer_id,
-                attempt_id,
-                target_slot,
-                candidate,
-                expected,
-                stage: AttemptStageV1::AttemptFrame,
-                idempotency_key,
-            };
             let fingerprint = candidate.fingerprint();
             let attempt_frame = match GenerationLockFrameV1::new(
                 GenerationLockFrameKindV1::Attempt,
@@ -2396,8 +2566,15 @@ pub mod authority_publisher {
                         return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
                     };
                     match provider.compare_and_advance(floor_record, next, idempotency_key) {
-                        Ok(receipt) => Some(receipt),
-                        Err(_) => return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit)),
+                        Ok(receipt)
+                            if receipt.root_id == self.root_id
+                                && receipt.authority == candidate =>
+                        {
+                            Some(receipt)
+                        }
+                        Ok(_) | Err(_) => {
+                            return Ok(PublicationOutcomeV1::CommitOutcomeUnknown(permit));
+                        }
                     }
                 }
             };
@@ -2716,6 +2893,214 @@ pub mod authority_publisher {
         }
     }
 
+    #[cfg(test)]
+    mod prepared_attempt_tests {
+        use super::*;
+
+        const ROOT: [u8; 16] = [1; 16];
+        const WRITER: [u8; 16] = [2; 16];
+
+        fn genesis() -> AuthorityRefV1 {
+            AuthorityRefV1::new(1, [3; 16], 4096, [4; 32], None).expect("genesis")
+        }
+
+        fn prepared() -> AttemptPermitV1 {
+            AttemptPermitV1::new(
+                ROOT,
+                WRITER,
+                [5; 16],
+                genesis(),
+                ExpectedAuthorityPairV1::default(),
+                [6; 16],
+            )
+            .expect("pure preparation")
+        }
+
+        fn lock_image(
+            owner: Option<GenerationLockFrameV1>,
+            attempt: Option<GenerationLockFrameV1>,
+        ) -> Vec<u8> {
+            let mut bytes = vec![0; 2 * GENERATION_LOCK_FRAME_BYTES_V1];
+            for (index, frame) in [owner, attempt].into_iter().enumerate() {
+                if let Some(frame) = frame {
+                    let start = index * GENERATION_LOCK_FRAME_BYTES_V1;
+                    bytes[start..start + GENERATION_LOCK_FRAME_BYTES_V1]
+                        .copy_from_slice(&frame.encode().expect("authenticated frame"));
+                }
+            }
+            bytes
+        }
+
+        #[test]
+        fn prepared_attempt_binds_exact_predecessor_pair_and_survives_diagnostic_stages() {
+            let original = prepared();
+            assert_eq!(original.stage, AttemptStageV1::AttemptFrame);
+            assert_eq!(original.target_slot, 1);
+            assert_eq!(original.validate(), Ok(()));
+            for stage in [
+                AttemptStageV1::AttemptFrame,
+                AttemptStageV1::SlotWrite,
+                AttemptStageV1::SlotReread,
+                AttemptStageV1::FloorAdvance,
+                AttemptStageV1::OwnerFrame,
+            ] {
+                assert_eq!(AttemptPermitV1 { stage, ..original }.validate(), Ok(()));
+            }
+            let first = AuthoritySlotV1::new(1, ROOT, genesis()).expect("first slot");
+            let next = AuthorityRefV1::new(
+                2,
+                [7; 16],
+                4097,
+                [8; 32],
+                Some(genesis().fingerprint()),
+            )
+            .expect("successor");
+            let expected = ExpectedAuthorityPairV1 {
+                first: None,
+                second: Some(first),
+            };
+            let successor =
+                AttemptPermitV1::new(ROOT, WRITER, [9; 16], next, expected, [10; 16])
+                    .expect("prepared successor");
+            assert_eq!(successor.target_slot, 0);
+            assert_eq!(successor.expected, expected);
+            assert_eq!(successor.candidate.predecessor, Some(genesis().fingerprint()));
+        }
+
+        #[test]
+        fn prepared_attempt_rejects_reserved_and_inconsistent_facts_without_io() {
+            let original = prepared();
+            let foreign_slot = AuthoritySlotV1::new(1, [99; 16], genesis()).expect("foreign slot");
+            let first = AuthoritySlotV1::new(1, ROOT, genesis()).expect("first slot");
+            for invalid in [
+                AttemptPermitV1 {
+                    root_id: [0; 16],
+                    ..original
+                },
+                AttemptPermitV1 {
+                    writer_id: [0; 16],
+                    ..original
+                },
+                AttemptPermitV1 {
+                    attempt_id: [0; 16],
+                    ..original
+                },
+                AttemptPermitV1 {
+                    idempotency_key: [0; 16],
+                    ..original
+                },
+                AttemptPermitV1 {
+                    target_slot: 0,
+                    ..original
+                },
+                AttemptPermitV1 {
+                    expected: ExpectedAuthorityPairV1 {
+                        first: None,
+                        second: Some(foreign_slot),
+                    },
+                    ..original
+                },
+                AttemptPermitV1 {
+                    expected: ExpectedAuthorityPairV1 {
+                        first: Some(first),
+                        second: None,
+                    },
+                    ..original
+                },
+                AttemptPermitV1 {
+                    expected: ExpectedAuthorityPairV1 {
+                        first: None,
+                        second: Some(first),
+                    },
+                    ..original
+                },
+                AttemptPermitV1 {
+                    candidate: AuthorityRefV1 {
+                        sequence: 2,
+                        ..genesis()
+                    },
+                    ..original
+                },
+            ] {
+                assert!(invalid.validate().is_err(), "accepted {invalid:?}");
+            }
+        }
+
+        #[test]
+        fn publication_lock_fence_requires_complete_authenticated_evidence_for_the_actual_head() {
+            let permit = prepared();
+            let attempt = validate_reconciliation_permit(&permit, ROOT).expect("attempt");
+            let owner = GenerationLockFrameV1 {
+                kind: GenerationLockFrameKindV1::Owner,
+                ..attempt
+            };
+            let pair = ExpectedAuthorityPairV1 {
+                first: None,
+                second: Some(AuthoritySlotV1::new(1, ROOT, genesis()).expect("head")),
+            };
+            assert_eq!(
+                publication_owner(
+                    &lock_image(None, None),
+                    ROOT,
+                    ExpectedAuthorityPairV1::default(),
+                ),
+                Ok(None),
+            );
+            assert_eq!(
+                publication_owner(&lock_image(Some(owner), None), ROOT, pair),
+                Ok(Some(owner)),
+            );
+            assert_eq!(
+                publication_owner(&lock_image(Some(owner), Some(attempt)), ROOT, pair),
+                Ok(Some(owner)),
+            );
+            for (bad_owner, bad_attempt) in [
+                (None, Some(attempt)),
+                (
+                    Some(owner),
+                    Some(GenerationLockFrameV1 {
+                        writer_id: [99; 16],
+                        ..attempt
+                    }),
+                ),
+                (
+                    Some(GenerationLockFrameV1 { fence: 2, ..owner }),
+                    Some(GenerationLockFrameV1 { fence: 2, ..attempt }),
+                ),
+                (
+                    Some(GenerationLockFrameV1 {
+                        root_id: [99; 16],
+                        ..owner
+                    }),
+                    Some(attempt),
+                ),
+                (
+                    Some(owner),
+                    Some(GenerationLockFrameV1 {
+                        root_id: [99; 16],
+                        ..attempt
+                    }),
+                ),
+                (Some(attempt), None),
+            ] {
+                let bytes = lock_image(bad_owner, bad_attempt);
+                assert!(publication_owner(&bytes, ROOT, pair).is_err());
+            }
+            assert!(
+                publication_owner(
+                    &lock_image(Some(owner), Some(attempt)),
+                    ROOT,
+                    ExpectedAuthorityPairV1::default(),
+                )
+                .is_err(),
+            );
+            let mut torn = lock_image(Some(owner), Some(attempt));
+            torn[100] ^= 1;
+            assert!(publication_owner(&torn, ROOT, pair).is_err());
+            assert!(publication_owner(&torn[..torn.len() - 1], ROOT, pair).is_err());
+        }
+    }
+
     #[cfg(all(test, target_os = "linux"))]
     mod tests {
         use super::*;
@@ -2844,6 +3229,234 @@ pub mod authority_publisher {
                 }
                 self.inner
                     .compare_and_advance(expected, next, idempotency_key)
+            }
+        }
+
+        struct MisboundAcknowledgementFloor {
+            inner: InMemoryAntiRollbackFloorStoreV1,
+            wrong_root: bool,
+        }
+
+        struct ForeignLoadedFloor(AntiRollbackFloorRecordV1);
+
+        impl AntiRollbackFloorProviderV1 for ForeignLoadedFloor {
+            fn load(
+                &self,
+                _root_id: [u8; 16],
+            ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+                Ok(Some(self.0))
+            }
+
+            fn compare_and_advance(
+                &self,
+                _expected: Option<AntiRollbackFloorRecordV1>,
+                _next: AuthorityFloorV1,
+                _idempotency_key: [u8; 16],
+            ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+                panic!("a foreign-root loaded floor must be refused before a CAS request");
+            }
+        }
+
+        impl AntiRollbackFloorProviderV1 for MisboundAcknowledgementFloor {
+            fn load(
+                &self,
+                root_id: [u8; 16],
+            ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+                self.inner.load(root_id)
+            }
+
+            fn compare_and_advance(
+                &self,
+                expected: Option<AntiRollbackFloorRecordV1>,
+                next: AuthorityFloorV1,
+                idempotency_key: [u8; 16],
+            ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+                let actual = self
+                    .inner
+                    .compare_and_advance(expected, next, idempotency_key)?;
+                let mut authority = actual.authority;
+                let root_id = if self.wrong_root {
+                    [0x99; 16]
+                } else {
+                    authority.manifest_sha256[0] ^= 1;
+                    actual.root_id
+                };
+                // Return a structurally valid, digest-bound receipt for the
+                // wrong request while the real floor has already advanced.
+                InMemoryAntiRollbackFloorStoreV1::new().compare_and_advance(
+                    None,
+                    AuthorityFloorV1::new(root_id, authority)?,
+                    idempotency_key,
+                )
+            }
+        }
+
+        #[test]
+        fn prepared_publication_refuses_foreign_or_started_permits_without_mutation() {
+            let root_path = fixture_root("prepared-refusal");
+            let root = admit(&root_path);
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher");
+            let permit = publisher
+                .prepare_attempt(
+                    authority(1, None),
+                    ExpectedAuthorityPairV1::default(),
+                    [0x76; 16],
+                    [0x41; 16],
+                )
+                .expect("prepared");
+            let authority_before = authority_bytes(&root_path);
+            let lock_before = fs::read(root_path.join("LOCK")).expect("lock");
+            for invalid in [
+                AttemptPermitV1 {
+                    writer_id: WRITER_B,
+                    ..permit
+                },
+                AttemptPermitV1 {
+                    root_id: [0x99; 16],
+                    ..permit
+                },
+                AttemptPermitV1 {
+                    stage: AttemptStageV1::SlotWrite,
+                    ..permit
+                },
+                AttemptPermitV1 {
+                    target_slot: 0,
+                    ..permit
+                },
+            ] {
+                assert!(matches!(
+                    publisher
+                        .publish_prepared(&invalid, None)
+                        .expect("typed refusal"),
+                    PublicationOutcomeV1::NotCommitted(NotCommittedV1::InvalidCandidate(_))
+                ));
+                assert_eq!(authority_bytes(&root_path), authority_before);
+                assert_eq!(fs::read(root_path.join("LOCK")).expect("lock"), lock_before);
+            }
+            let committed = publisher
+                .publish_prepared(&permit, None)
+                .expect("original prepared identity publishes");
+            assert!(matches!(committed, PublicationOutcomeV1::Committed { .. }));
+            let owner = publisher.owner_frame().expect("owner").expect("completed");
+            assert_eq!(owner.writer_id, permit.writer_id);
+            assert_eq!(owner.attempt_id, permit.attempt_id);
+        }
+
+        #[test]
+        fn foreign_loaded_floor_is_refused_before_any_attempt_or_authority_write() {
+            let root_path = fixture_root("foreign-loaded-floor");
+            let root = admit(&root_path);
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher");
+            let candidate = authority(1, None);
+            let floor = ForeignLoadedFloor(
+                InMemoryAntiRollbackFloorStoreV1::new()
+                    .compare_and_advance(
+                        None,
+                        AuthorityFloorV1::new([0x99; 16], candidate).expect("foreign floor"),
+                        [0x51; 16],
+                    )
+                    .expect("valid receipt for a different root"),
+            );
+            assert_eq!(
+                floor_head(Some(&floor), ROOT_ID),
+                Err(GenerationAuthorityErrorV1::RootMismatch),
+            );
+            let prepared = publisher
+                .prepare_attempt(
+                    candidate,
+                    ExpectedAuthorityPairV1::default(),
+                    [0x76; 16],
+                    [0x41; 16],
+                )
+                .expect("prepared");
+            let authority_before = authority_bytes(&root_path);
+            let lock_before = fs::read(root_path.join("LOCK")).expect("lock");
+            assert_eq!(
+                publisher
+                    .publish_prepared(&prepared, Some(&floor))
+                    .expect("foreign root refusal"),
+                PublicationOutcomeV1::NotCommitted(NotCommittedV1::FloorRefused(
+                    GenerationAuthorityErrorV1::RootMismatch,
+                )),
+            );
+            assert_eq!(authority_bytes(&root_path), authority_before);
+            assert_eq!(fs::read(root_path.join("LOCK")).expect("lock"), lock_before);
+        }
+
+        #[test]
+        fn wrong_floor_acknowledgement_stays_unknown_until_exact_reconciliation() {
+            for wrong_root in [false, true] {
+                let root_path = fixture_root(&format!("misbound-floor-{wrong_root}"));
+                let root = admit(&root_path);
+                let publisher = root
+                    .authority_publisher(
+                        ROOT_ID,
+                        WRITER_A,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                    )
+                    .expect("publisher");
+                let floor = MisboundAcknowledgementFloor {
+                    inner: InMemoryAntiRollbackFloorStoreV1::new(),
+                    wrong_root,
+                };
+                let prepared = publisher
+                    .prepare_attempt(
+                        authority(1, None),
+                        ExpectedAuthorityPairV1::default(),
+                        [0x76; 16],
+                        [0x41; 16],
+                    )
+                    .expect("prepared");
+                let outcome = publisher
+                    .publish_prepared(&prepared, Some(&floor))
+                    .expect("publication call");
+                assert_eq!(
+                    outcome,
+                    PublicationOutcomeV1::CommitOutcomeUnknown(AttemptPermitV1 {
+                        stage: AttemptStageV1::FloorAdvance,
+                        ..prepared
+                    }),
+                );
+                assert!(publisher.owner_frame().expect("owner read").is_none());
+                assert_eq!(
+                    floor
+                        .inner
+                        .load(ROOT_ID)
+                        .expect("actual floor")
+                        .map(|record| record.authority),
+                    Some(prepared.candidate),
+                );
+                let authority_before = authority_bytes(&root_path);
+                let recovered_root = admit(&root_path);
+                let recovered = recovered_root
+                    .authority_publisher(
+                        ROOT_ID,
+                        WRITER_B,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                    )
+                    .expect("fresh publisher");
+                assert!(matches!(
+                    recovered
+                        .reconcile(&prepared, Some(&floor))
+                        .expect("exact recovery"),
+                    ReconcileOutcomeV1::Committed { .. },
+                ));
+                assert_eq!(authority_bytes(&root_path), authority_before);
+                let owner = recovered.owner_frame().expect("owner").expect("completed");
+                assert_eq!(owner.writer_id, prepared.writer_id);
+                assert_eq!(owner.attempt_id, prepared.attempt_id);
             }
         }
 
@@ -3312,7 +3925,7 @@ pub mod authority_publisher {
         }
 
         #[test]
-        fn every_publish_crash_point_reconciles_to_its_exact_verdict() {
+        fn every_predeclared_publish_crash_point_reconciles_from_the_saved_permit() {
             use platform::TestBoundary as B;
             // (crash point, stage the permit must report, verdict a fresh
             // reconcile must reach, whether the floor is expected to hold the
@@ -3356,6 +3969,17 @@ pub mod authority_publisher {
                     .expect("publisher binds");
                 let genesis = authority(1, None);
                 let before = authority_bytes(&root_path);
+                let before_lock = fs::read(root_path.join("LOCK")).expect("initial lock");
+                let prepared = publisher
+                    .prepare_attempt(
+                        genesis,
+                        ExpectedAuthorityPairV1::default(),
+                        [0x76; 16],
+                        [0x41; 16],
+                    )
+                    .expect("exact attempt prepared before any write");
+                assert_eq!(authority_bytes(&root_path), before);
+                assert_eq!(fs::read(root_path.join("LOCK")).expect("lock"), before_lock);
 
                 let outcome = {
                     let _hook = platform::install_test_hook(move |boundary| {
@@ -3369,18 +3993,14 @@ pub mod authority_publisher {
                         }
                     });
                     publisher
-                        .publish(
-                            genesis,
-                            ExpectedAuthorityPairV1::default(),
-                            Some(&floor),
-                            [0x41; 16],
-                        )
+                        .publish_prepared(&prepared, Some(&floor))
                         .expect("publication runs")
                 };
                 let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome else {
                     panic!("crash at {crash_at:?} must be unknown, got {outcome:?}");
                 };
                 assert_eq!(permit.stage, stage, "crash at {crash_at:?}");
+                assert_eq!(permit, AttemptPermitV1 { stage, ..prepared });
 
                 // Local slot state is exactly what the crash point implies.
                 let after = authority_bytes(&root_path);
@@ -3408,9 +4028,40 @@ pub mod authority_publisher {
                     "crash at {crash_at:?}"
                 );
 
-                // A fresh reconcile (hook gone) reaches the exact verdict.
-                let verdict = publisher
-                    .reconcile(&permit, Some(&floor))
+                let recovered_root = admit(&root_path);
+                let recovered = recovered_root
+                    .authority_publisher(
+                        ROOT_ID,
+                        WRITER_B,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                    )
+                    .expect("fresh publisher incarnation");
+                if crash_at != B::BeforePublishAttemptFrame {
+                    let lock_before = fs::read(root_path.join("LOCK")).expect("pending lock");
+                    let floor_before = floor.load(ROOT_ID).expect("pending floor");
+                    let observed = decode_pair(&after, ROOT_ID).expect("observed pair");
+                    let competing = if slot_written {
+                        authority(2, Some(genesis.fingerprint()))
+                    } else {
+                        genesis
+                    };
+                    assert_eq!(
+                        recovered
+                            .publish(competing, observed, Some(&floor), [0x72; 16])
+                            .expect("fresh publisher refuses persisted uncertainty"),
+                        PublicationOutcomeV1::NotCommitted(NotCommittedV1::LockRefused(
+                            GenerationAuthorityErrorV1::UnresolvedAttempt,
+                        )),
+                    );
+                    assert_eq!(authority_bytes(&root_path), after);
+                    assert_eq!(fs::read(root_path.join("LOCK")).expect("lock"), lock_before);
+                    assert_eq!(floor.load(ROOT_ID).expect("floor"), floor_before);
+                }
+
+                // Recover with the pre-call saved permit, not the diagnostic
+                // response that a terminated process could never deliver.
+                let verdict = recovered
+                    .reconcile(&prepared, Some(&floor))
                     .expect("reconcile runs");
                 if slot_written {
                     let ReconcileOutcomeV1::Committed {
@@ -3432,6 +4083,9 @@ pub mod authority_publisher {
                         Some(1),
                         "reconcile completed the owner frame for {crash_at:?}"
                     );
+                    let owner = recovered.owner_frame().expect("owner").expect("completed");
+                    assert_eq!(owner.writer_id, prepared.writer_id);
+                    assert_eq!(owner.attempt_id, prepared.attempt_id);
                     // The next publication extends the reconciled head normally.
                     let next = publisher
                         .publish(
