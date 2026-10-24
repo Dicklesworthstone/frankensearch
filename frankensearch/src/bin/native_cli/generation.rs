@@ -19,10 +19,11 @@ use frankensearch::native_ann::NativeGenerationSnapshot;
 use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
 };
-use frankensearch::{Cx, GenerationActivationV1, GenerationPublisherV1, SearchError};
+use frankensearch::{Cx, Embedder, GenerationActivationV1, GenerationPublisherV1, SearchError};
 use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1, CommitRange, EmbedderTierTag,
     FrozenEmbeddingIdentityBundleV1, GenerationAuthorityActionV1, GenerationRootSecurityProfileV1,
+    QuantizationFormat,
 };
 use frankensearch_index::FsviV2IdentityBinding;
 use frankensearch_index::generation_root::authority_publisher::{
@@ -30,7 +31,7 @@ use frankensearch_index::generation_root::authority_publisher::{
     PublicationOutcomeV1, ReconcileOutcomeV1, WriterIdentityV1,
 };
 use frankensearch_index::generation_root::generation_reader::{
-    SnapshotOpenOutcomeV1, component_object_name_v1,
+    SnapshotOpenOutcomeV1, activation_manifest_path_v1, component_object_path_v1,
 };
 use frankensearch_index::generation_root::{
     GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout, QualifiedGenerationRoot,
@@ -54,6 +55,10 @@ const HELP: &str = "Fixed AUTHORITY exact search (one explicit semantic tier)\n\
       [--input JSONL] [--model-dir DIR] [--batch-size N]\n\
       [--quality-backend onnx|native-int8|native-f32|native-multilingual]\n\
       [--quality-model-dir DIR] [--max-image-bytes N]\n\n\
+  authority-rebuild --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
+      --source-low N --source-high N [--input JSONL] [--batch-size N]\n\
+      [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
+      [--migrate-model] [--max-image-bytes N]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--max-image-bytes N]\n\n\
@@ -63,6 +68,11 @@ Quality-only generations load and query their quality model directly. Models\n\
 are local-only; unavailable or mismatched models fail without substitution.\n\
 Source-low/high identify the inclusive source checkpoint supplied by the caller.\n\
 Roots, work directories and receipts must be new, separate locations.\n\
+Rebuild retains the selected root, tier and security profile, replaces the whole\n\
+source cohort, and requires a new work directory and receipt outside the root.\n\
+Source boundaries cannot regress. A different producer requires --migrate-model.\n\
+Concurrent publication refuses the captured old selection; retry explicitly\n\
+from the winning receipt. Rebuild never edits the old generation's images.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
 contract. Unsupported filesystems fail before indexing. Cooperative-local is\n\
 explicit: this command does not provide an external anti-rollback service.\n\
@@ -80,6 +90,7 @@ Work files remain available after completion or failure. Stdout is JSON.\n";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Index,
+    Rebuild,
     Search,
     Recover,
 }
@@ -89,6 +100,7 @@ struct Options {
     root: Option<PathBuf>,
     work: Option<PathBuf>,
     receipt: PathBuf,
+    from_receipt: Option<PathBuf>,
     input: Option<PathBuf>,
     models: Option<PathBuf>,
     quality: models::QualityOptions,
@@ -100,10 +112,14 @@ struct Options {
     batch_size: usize,
     max_image_bytes: usize,
     cooperative_local: bool,
+    migrate_model: bool,
 }
 
 pub fn is_command(command: &str) -> bool {
-    matches!(command, "authority-index" | "authority-search" | "authority-recover")
+    matches!(
+        command,
+        "authority-index" | "authority-rebuild" | "authority-search" | "authority-recover"
+    )
 }
 
 impl Options {
@@ -111,6 +127,7 @@ impl Options {
         let mut args = args.into_iter();
         let command = match args.next().as_deref() {
             Some("authority-index") => Command::Index,
+            Some("authority-rebuild") => Command::Rebuild,
             Some("authority-search") => Command::Search,
             Some("authority-recover") => Command::Recover,
             _ => return Err(bad("unknown authority command")),
@@ -120,6 +137,7 @@ impl Options {
             root: None,
             work: None,
             receipt: PathBuf::new(),
+            from_receipt: None,
             input: None,
             models: None,
             quality: models::QualityOptions::default(),
@@ -131,6 +149,7 @@ impl Options {
             batch_size: 64,
             max_image_bytes: DEFAULT_IMAGE_BYTES,
             cooperative_local: false,
+            migrate_model: false,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -142,6 +161,10 @@ impl Options {
             }
             match flag.as_str() {
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
+                "--from-receipt" if command == Command::Rebuild => {
+                    options.from_receipt = Some(PathBuf::from(value(&mut args)?));
+                }
+                "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
                 "--model-dir" if command != Command::Recover => {
                     options.models = Some(PathBuf::from(value(&mut args)?));
                 }
@@ -158,10 +181,10 @@ impl Options {
                 "--root" if command == Command::Index => {
                     options.root = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--work-dir" if command == Command::Index => {
+                "--work-dir" if matches!(command, Command::Index | Command::Rebuild) => {
                     options.work = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--input" if command == Command::Index => {
+                "--input" if matches!(command, Command::Index | Command::Rebuild) => {
                     options.input = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--tier" if command == Command::Index => {
@@ -171,13 +194,13 @@ impl Options {
                         _ => return Err(bad("authority tier must be fast or quality")),
                     });
                 }
-                "--source-low" if command == Command::Index => {
+                "--source-low" if matches!(command, Command::Index | Command::Rebuild) => {
                     options.source_low = Some(source_sequence(&value(&mut args)?)?);
                 }
-                "--source-high" if command == Command::Index => {
+                "--source-high" if matches!(command, Command::Index | Command::Rebuild) => {
                     options.source_high = Some(source_sequence(&value(&mut args)?)?);
                 }
-                "--batch-size" if command == Command::Index => {
+                "--batch-size" if matches!(command, Command::Index | Command::Rebuild) => {
                     options.batch_size = number(&value(&mut args)?, MAX_DOCUMENTS)?;
                 }
                 "--cooperative-local" if command == Command::Index => {
@@ -214,6 +237,14 @@ impl Options {
                     .as_deref()
                     .ok_or_else(|| bad("authority-search requires --query"))?,
             )?,
+            Command::Rebuild => {
+                if options.from_receipt.is_none() || options.work.is_none() {
+                    return Err(bad(
+                        "authority-rebuild requires --from-receipt and --work-dir",
+                    ));
+                }
+                options.source_cut()?;
+            }
             Command::Recover => {}
         }
         Ok(Some(options))
@@ -222,10 +253,10 @@ impl Options {
     fn source_cut(&self) -> Result<CommitRange> {
         let low = self
             .source_low
-            .ok_or_else(|| bad("authority-index requires --source-low"))?;
+            .ok_or_else(|| bad("authority builds require --source-low"))?;
         let high = self
             .source_high
-            .ok_or_else(|| bad("authority-index requires --source-high"))?;
+            .ok_or_else(|| bad("authority builds require --source-high"))?;
         if high
             .checked_sub(low)
             .and_then(|span| span.checked_add(1))
@@ -263,8 +294,14 @@ impl SavedAttempt {
         Self {
             writer_id: permit.writer_id,
             attempt_id: permit.attempt_id,
-            expected_first: permit.expected.first.map(|slot| slot.authority.canonical_bytes().to_vec()),
-            expected_second: permit.expected.second.map(|slot| slot.authority.canonical_bytes().to_vec()),
+            expected_first: permit
+                .expected
+                .first
+                .map(|slot| slot.authority.canonical_bytes().to_vec()),
+            expected_second: permit
+                .expected
+                .second
+                .map(|slot| slot.authority.canonical_bytes().to_vec()),
             idempotency_key: permit.idempotency_key,
             requires_floor,
         }
@@ -272,10 +309,13 @@ impl SavedAttempt {
 
     fn restore(&self, root_id: [u8; 16], candidate: AuthorityRefV1) -> Result<AttemptPermitV1> {
         let decode = |bytes: &Option<Vec<u8>>, index| -> Result<Option<AuthoritySlotV1>> {
-            bytes.as_ref().map(|bytes| {
-                let authority = AuthorityRefV1::from_canonical_bytes(bytes)?;
-                AuthoritySlotV1::new(index, root_id, authority).map_err(Into::into)
-            }).transpose()
+            bytes
+                .as_ref()
+                .map(|bytes| {
+                    let authority = AuthorityRefV1::from_canonical_bytes(bytes)?;
+                    AuthoritySlotV1::new(index, root_id, authority).map_err(Into::into)
+                })
+                .transpose()
         };
         AttemptPermitV1::new(
             root_id,
@@ -287,7 +327,8 @@ impl SavedAttempt {
                 second: decode(&self.expected_second, 1)?,
             },
             self.idempotency_key,
-        ).map_err(Into::into)
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -344,12 +385,18 @@ impl Receipt {
                 // This CLI never supplies an external floor. A saved attempt
                 // requiring one cannot be downgraded during a process restart.
                 if attempt.requires_floor {
-                    return Err(bad("the recorded attempt requires an unavailable anti-rollback floor"));
+                    return Err(bad(
+                        "the recorded attempt requires an unavailable anti-rollback floor",
+                    ));
                 }
                 attempt.restore(self.root_id, authority)?;
             }
             (SELECTION_ONLY_RECEIPT_SCHEMA, None) => {}
-            _ => return Err(bad("authority receipt schema and prepared attempt disagree")),
+            _ => {
+                return Err(bad(
+                    "authority receipt schema and prepared attempt disagree",
+                ));
+            }
         }
         if self.image_bytes < authority.manifest_len {
             return Err(bad("authority receipt image length is inconsistent"));
@@ -360,7 +407,8 @@ impl Receipt {
 
     fn recovery_attempt(&self) -> Result<AttemptPermitV1> {
         self.validate()?;
-        self.attempt.as_ref()
+        self.attempt
+            .as_ref()
             .ok_or_else(|| bad("this selection-only receipt has no durable publication attempt"))?
             .restore(self.root_id, self.authority()?)
     }
@@ -376,8 +424,22 @@ impl Receipt {
     fn open(&self, cx: &Cx, max_image_bytes: usize) -> Result<NativeGenerationSnapshot> {
         self.validate()?;
         checkpoint(cx)?;
-        let budget = u64::try_from(max_image_bytes)?.min(self.image_bytes);
         let root = admit_root(&self.root)?;
+        self.open_on_root(cx, &root, max_image_bytes)
+    }
+
+    // Rebuild uses the same qualified capability for selection and publication.
+    // Reopening the root path between those steps could admit a different root
+    // inode containing a copied authority pair.
+    fn open_on_root(
+        &self,
+        cx: &Cx,
+        root: &QualifiedGenerationRoot,
+        max_image_bytes: usize,
+    ) -> Result<NativeGenerationSnapshot> {
+        self.validate()?;
+        checkpoint(cx)?;
+        let budget = u64::try_from(max_image_bytes)?.min(self.image_bytes);
         let opened =
             root.open_generation_snapshot_with_budget(self.root_id, PROFILE, None, budget)?;
         checkpoint(cx)?;
@@ -471,6 +533,7 @@ fn create_root(path: &Path) -> Result<QualifiedGenerationRoot> {
     admit_root(path)
 }
 
+#[cfg(test)]
 fn write_immutable(cx: &Cx, path: &Path, bytes: &[u8]) -> Result<()> {
     checkpoint(cx)?;
     let mut file = create_file(path, 0o400)?;
@@ -559,9 +622,39 @@ fn stage_and_publish(
     root_path: &Path,
     receipt_path: &Path,
     built: &NativeBuiltExactGeneration,
+    predecessor: Option<&NativeGenerationSnapshot>,
     max_image_bytes: usize,
 ) -> Result<Receipt> {
-    let root_id = new_generation(1)?.nonce;
+    let (root_id, expected, previous) = match predecessor {
+        Some(snapshot) => {
+            validate_successor_source(
+                &snapshot.metadata().commit_range,
+                &built.metadata().commit_range,
+            )?;
+            if built.binding().generation().sequence
+                <= snapshot
+                    .retained_snapshot()
+                    .manifest()
+                    .generation()
+                    .sequence
+                || built.metadata().vector_artifacts[0].embedder_tier != snapshot.tier()
+            {
+                return Err(bad(
+                    "a rebuild must advance the artifact generation and preserve its tier",
+                ));
+            }
+            (
+                snapshot.retained_snapshot().root_id(),
+                snapshot.retained_snapshot().authority_pair(),
+                Some(snapshot.authority()),
+            )
+        }
+        None => (
+            new_generation(1)?.nonce,
+            ExpectedAuthorityPairV1::default(),
+            None,
+        ),
+    };
     let writer = WriterIdentityV1::for_current_process()?;
     let object_id = new_generation(1)?.nonce;
     let mut hasher = Sha256::new();
@@ -571,7 +664,7 @@ fn stage_and_publish(
     hasher.update(object_id);
     let candidate = built.candidate(
         object_id,
-        None,
+        previous,
         GenerationAuthorityActionV1::Activate,
         hasher.finalize().into(),
     )?;
@@ -582,7 +675,7 @@ fn stage_and_publish(
     let mut publisher = GenerationPublisherV1::new(root, root_id, writer.writer_id, PROFILE)?;
     let attempt = publisher.prepare_attempt(
         &candidate,
-        ExpectedAuthorityPairV1::default(),
+        expected,
         new_generation(1)?.nonce,
         new_generation(1)?.nonce,
     )?;
@@ -604,20 +697,15 @@ fn stage_and_publish(
     receipt.validate()?;
     encode(&receipt, MAX_RECEIPT_BYTES)?;
     for (role, component) in candidate.manifest().components().iter() {
-        root.revalidate()?;
+        checkpoint(cx)?;
         let bytes = built
             .component_bytes(role)
             .ok_or_else(|| bad("the exact builder omitted a declared component"))?;
-        write_immutable(
-            cx,
-            &root_path.join(component_object_name_v1(role, component.sha256)),
-            &bytes,
-        )?;
+        root.stage_immutable_file(&component_object_path_v1(role, component.sha256)?, &bytes)?;
     }
-    root.revalidate()?;
-    write_immutable(
-        cx,
-        &root_path.join(candidate.manifest_name()),
+    checkpoint(cx)?;
+    root.stage_immutable_file(
+        &activation_manifest_path_v1(candidate.authority().object_id)?,
         candidate.manifest_bytes(),
     )?;
     root.revalidate()?;
@@ -722,6 +810,7 @@ async fn index(
         &root_path,
         &receipt_path,
         &built,
+        None,
         options.max_image_bytes,
     )?;
     emit_indexed(output, &receipt, &receipt_path)
@@ -739,6 +828,134 @@ fn emit_indexed(output: &mut impl Write, receipt: &Receipt, receipt_path: &Path)
     .map_err(|_| {
         publication_error(
             receipt,
+            "committed",
+            "activated",
+            "result_delivery_failed",
+            None,
+        )
+    })
+}
+
+fn validate_successor_source(previous: &CommitRange, source: &CommitRange) -> Result<()> {
+    if source.low < previous.low || source.high < previous.high {
+        return Err(bad(
+            "a rebuild cannot move either source checkpoint boundary backward; rollback requires a distinct activation",
+        ));
+    }
+    Ok(())
+}
+
+fn rebuild_identity(
+    selected: &Receipt,
+    model: &dyn Embedder,
+    migrate_model: bool,
+) -> Result<FrozenEmbeddingIdentityBundleV1> {
+    let mut identity = model.identity()?.clone();
+    identity.validate()?;
+    if usize::try_from(identity.space.dimension)? != model.dimension() {
+        return Err(bad(
+            "the rebuild provider dimension disagrees with its complete identity",
+        ));
+    }
+    // Match the builder's explicit F32 persistence encoding. Only storage
+    // encoding changes here; the space, producer, and input contracts remain
+    // exactly those independently supplied by the loaded provider.
+    "fsvi-v2".clone_into(&mut identity.storage.format);
+    identity.storage.quantization = QuantizationFormat::F32;
+    "little-endian".clone_into(&mut identity.storage.endianness);
+    let frozen = identity.freeze()?;
+    if !migrate_model && frozen != selected.identity {
+        return Err(bad(
+            "the rebuild producer differs from the selected generation; an intentional full-cohort migration requires --migrate-model",
+        ));
+    }
+    Ok(frozen)
+}
+
+async fn rebuild(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    pool: Option<BlockingPoolHandle>,
+) -> Result<()> {
+    let selected = Receipt::read(
+        options
+            .from_receipt
+            .as_deref()
+            .ok_or_else(|| bad("missing predecessor receipt"))?,
+    )?;
+    options
+        .quality
+        .validate_usage(selected.tier == EmbedderTierTag::Quality)?;
+    let work_path = new_path(
+        options
+            .work
+            .as_deref()
+            .ok_or_else(|| bad("missing work directory"))?,
+    )?;
+    let receipt_path = new_path(&options.receipt)?;
+    separate_destinations(&[&selected.root, &work_path, &receipt_path])?;
+    let root = admit_root(&selected.root)?;
+    // Select once, before input or model work, and keep that reader alive until
+    // publication finishes. A competitor can win while we build; its head is
+    // never substituted into this captured expected pair.
+    let snapshot = selected.open_on_root(cx, &root, options.max_image_bytes)?;
+    snapshot.authority().next_sequence()?;
+    let source = options.source_cut()?;
+    validate_successor_source(&snapshot.metadata().commit_range, &source)?;
+    let sequence = selected
+        .generation
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| bad("the artifact generation sequence is exhausted"))?;
+    let documents = match &options.input {
+        Some(path) => read_documents(&mut BufReader::new(File::open(path)?))?,
+        None => read_documents(&mut io::stdin().lock())?,
+    };
+    if documents.is_empty() {
+        return Err(bad(
+            "the exact generation metadata contract requires a nonempty source cohort",
+        ));
+    }
+    let model = models::load_single(
+        cx,
+        options.models.as_deref(),
+        selected.tier,
+        &options.quality,
+        pool,
+    )?;
+    let expected_identity = rebuild_identity(&selected, model.as_ref(), options.migrate_model)?;
+    let built = NativeIndexBuilder::new(&work_path, new_generation(sequence)?, model)?
+        .with_batch_size(options.batch_size)?
+        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
+        .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+        .add_documents(documents)
+        .build_exact_generation(cx, selected.tier, source, options.max_image_bytes)
+        .await?;
+    if built.binding().frozen_identity() != &expected_identity {
+        return Err(bad("the provider changed after rebuild identity admission"));
+    }
+    let receipt = stage_and_publish(
+        cx,
+        &root,
+        &selected.root,
+        &receipt_path,
+        &built,
+        Some(&snapshot),
+        options.max_image_bytes,
+    )?;
+    emit(
+        output,
+        &serde_json::json!({
+            "schema": SCHEMA, "ok": true, "event": "rebuilt", "publication": "committed",
+            "serving": "activated", "retrieval": "exact", "receipt": receipt_path,
+            "replaces": selected.authority, "model_migrated": receipt.identity != selected.identity,
+            "selection": receipt,
+        }),
+    )
+    .map_err(|_| {
+        publication_error(
+            &receipt,
             "committed",
             "activated",
             "result_delivery_failed",
@@ -794,10 +1011,14 @@ fn reconciliation_report(
 ) -> serde_json::Value {
     let (publication, reconciliation, serving, resolved) = match outcome {
         ReconcileOutcomeV1::Committed { .. } => ("committed", "committed", "not_activated", true),
-        ReconcileOutcomeV1::NotCommitted => ("not_committed", "not_committed", "not_activated", true),
+        ReconcileOutcomeV1::NotCommitted => {
+            ("not_committed", "not_committed", "not_activated", true)
+        }
         ReconcileOutcomeV1::StillUnknown(_) => ("unknown", "still_unknown", "not_activated", false),
         ReconcileOutcomeV1::Fork { .. } => ("unknown", "fork", "not_activated", false),
-        ReconcileOutcomeV1::RepairRequired(_) => ("unknown", "repair_required", "not_activated", false),
+        ReconcileOutcomeV1::RepairRequired(_) => {
+            ("unknown", "repair_required", "not_activated", false)
+        }
         ReconcileOutcomeV1::CommittedThenSuperseded { .. } => {
             ("committed", "committed_then_superseded", "superseded", true)
         }
@@ -810,13 +1031,15 @@ fn reconciliation_report(
     });
     match outcome {
         ReconcileOutcomeV1::Fork { observed } => {
-            report["observed_authority"] = serde_json::json!(observed.authority.canonical_bytes().as_slice());
+            report["observed_authority"] =
+                serde_json::json!(observed.authority.canonical_bytes().as_slice());
         }
         ReconcileOutcomeV1::RepairRequired(error) => {
             report["reason"] = serde_json::json!(error.to_string());
         }
         ReconcileOutcomeV1::CommittedThenSuperseded { head } => {
-            report["current_authority"] = serde_json::json!(head.authority.canonical_bytes().as_slice());
+            report["current_authority"] =
+                serde_json::json!(head.authority.canonical_bytes().as_slice());
         }
         ReconcileOutcomeV1::StillUnknown(current) => {
             report["attempt"] = attempt_report(current);
@@ -848,7 +1071,13 @@ fn recover(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     // Reconcile the original exact attempt. Never publish, infer a new attempt,
     // or load models here. Reader admission is separate and remains bounded.
     let outcome = publisher.reconcile(&permit, None).map_err(|error| {
-        publication_error(&receipt, "unknown", "not_activated", &error.to_string(), Some(&permit))
+        publication_error(
+            &receipt,
+            "unknown",
+            "not_activated",
+            &error.to_string(),
+            Some(&permit),
+        )
     })?;
     let mut report = reconciliation_report(&receipt, &permit, &outcome);
     if matches!(outcome, ReconcileOutcomeV1::Committed { .. }) {
@@ -883,6 +1112,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         let mut output = io::stdout().lock();
         match options.command {
             Command::Index => Box::pin(index(&cx, &options, &mut output, pool)).await,
+            Command::Rebuild => Box::pin(rebuild(&cx, &options, &mut output, pool)).await,
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,
             Command::Recover => recover(&cx, &options, &mut output),
         }

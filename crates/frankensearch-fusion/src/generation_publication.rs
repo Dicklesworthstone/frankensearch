@@ -564,8 +564,8 @@ impl<'root> GenerationPublisherV1<'root> {
             return Err(GenerationPublicationErrorV1::PendingReconciliation);
         }
         self.pending = Some(permit);
-        self.pending_requires_floor |= requires_floor
-            || self.profile == GenerationRootSecurityProfileV1::RequiredExternal;
+        self.pending_requires_floor |=
+            requires_floor || self.profile == GenerationRootSecurityProfileV1::RequiredExternal;
         Ok(())
     }
 
@@ -580,6 +580,8 @@ impl<'root> GenerationPublisherV1<'root> {
     /// The previous snapshot remains installed until a fresh complete snapshot
     /// passes admission. Cancellation is checked before reconciliation starts;
     /// once started, its exact verdict is preserved even if cancellation arrives.
+    /// This entry point has no aggregate image cap; use
+    /// [`Self::reconcile_pending_with_budget`] for bounded reader admission.
     ///
     /// # Errors
     ///
@@ -591,6 +593,28 @@ impl<'root> GenerationPublisherV1<'root> {
         &mut self,
         cx: &Cx,
         floor: Option<&dyn AntiRollbackFloorProviderV1>,
+    ) -> Result<Option<GenerationReconciliationResultV1>, GenerationPublicationErrorV1> {
+        self.reconcile_pending_with_budget(cx, floor, u64::MAX)
+    }
+
+    /// Reconcile an exact pending attempt and bound any subsequent activation.
+    ///
+    /// The budget covers the complete encoded manifest/component images of the
+    /// head actually opened, including a concurrent successor. It does not cap
+    /// readers already retained by this session or process RSS. A budget refusal
+    /// preserves the old reader and the exact committed reconciliation verdict;
+    /// it does not turn a known commit into an unresolved or retryable attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same pre-operation and reconciliation infrastructure errors
+    /// as [`Self::reconcile_pending`]. Reader admission failures are returned in
+    /// the result's activation field, separately from commit knowledge.
+    pub fn reconcile_pending_with_budget(
+        &mut self,
+        cx: &Cx,
+        floor: Option<&dyn AntiRollbackFloorProviderV1>,
+        max_owned_image_bytes: u64,
     ) -> Result<Option<GenerationReconciliationResultV1>, GenerationPublicationErrorV1> {
         let Some(permit) = self.pending else {
             return Ok(None);
@@ -609,7 +633,7 @@ impl<'root> GenerationPublisherV1<'root> {
             | ReconcileOutcomeV1::CommittedThenSuperseded { .. } => {
                 self.pending = None;
                 self.pending_requires_floor = false;
-                Some(self.activate(cx, floor))
+                Some(self.activate(cx, floor, max_owned_image_bytes))
             }
             ReconcileOutcomeV1::NotCommitted => {
                 self.pending = None;
@@ -627,6 +651,7 @@ impl<'root> GenerationPublisherV1<'root> {
     }
 
     /// Refresh serving state without mutating authority or discarding old readers.
+    /// Use [`Self::refresh_with_budget`] to bound fresh encoded-image admission.
     ///
     /// # Errors
     ///
@@ -636,20 +661,45 @@ impl<'root> GenerationPublisherV1<'root> {
         cx: &Cx,
         floor: Option<&dyn AntiRollbackFloorProviderV1>,
     ) -> Result<SnapshotOpenOutcomeV1, GenerationPublicationErrorV1> {
+        self.refresh_with_budget(cx, floor, u64::MAX)
+    }
+
+    /// Refresh serving state within an aggregate encoded-image budget.
+    ///
+    /// The budget is enforced before component reads and on every concurrent
+    /// authority retry. Refusal leaves the previously admitted reader installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same cancellation, pending-attempt and infrastructure errors
+    /// as [`Self::refresh`]. Image-budget refusals remain typed open outcomes.
+    pub fn refresh_with_budget(
+        &mut self,
+        cx: &Cx,
+        floor: Option<&dyn AntiRollbackFloorProviderV1>,
+        max_owned_image_bytes: u64,
+    ) -> Result<SnapshotOpenOutcomeV1, GenerationPublicationErrorV1> {
         if self.pending.is_some() {
             return Err(GenerationPublicationErrorV1::PendingReconciliation);
         }
         checkpoint(cx, "generation.refresh")?;
         self.snapshots
-            .refresh(self.root, self.root_id, self.profile, floor)
+            .refresh_with_budget(
+                self.root,
+                self.root_id,
+                self.profile,
+                floor,
+                max_owned_image_bytes,
+            )
             .map_err(Into::into)
     }
 
     /// Admit and durably verify a pre-staged complete generation, switch its
     /// authority once, then open the actual published head for serving.
     ///
-    /// `max_owned_image_bytes` bounds the sum of the declared preflight images, not
-    /// RSS, page cache, or snapshots retained by existing queries. The caller
+    /// `max_owned_image_bytes` bounds both the sum of declared preflight images
+    /// and each fresh post-commit activation, including a concurrent successor.
+    /// It does not bound RSS, page cache, or already-retained snapshots. The caller
     /// must stage objects through its trusted writer before calling this method.
     /// No artifact is created, overwritten, deleted, or renamed here.
     ///
@@ -694,7 +744,7 @@ impl<'root> GenerationPublisherV1<'root> {
                 .publish(candidate.authority, expected, floor, idempotency_key)?;
         // Do not retain a second complete copy beside the serving snapshot.
         drop(prepared);
-        Ok(self.record_publication(cx, publication, floor))
+        Ok(self.record_publication(cx, publication, floor, max_owned_image_bytes))
     }
 
     /// Publish using the exact permit recorded before any authority mutation.
@@ -742,7 +792,7 @@ impl<'root> GenerationPublisherV1<'root> {
         checkpoint(cx, "generation.publish")?;
         let publication = self.publisher.publish_prepared(permit, floor)?;
         drop(prepared);
-        Ok(self.record_publication(cx, publication, floor))
+        Ok(self.record_publication(cx, publication, floor, max_owned_image_bytes))
     }
 
     fn record_publication(
@@ -750,9 +800,12 @@ impl<'root> GenerationPublisherV1<'root> {
         cx: &Cx,
         publication: PublicationOutcomeV1,
         floor: Option<&dyn AntiRollbackFloorProviderV1>,
+        max_owned_image_bytes: u64,
     ) -> GenerationPublicationResultV1 {
         let activation = match &publication {
-            PublicationOutcomeV1::Committed { .. } => Some(self.activate(cx, floor)),
+            PublicationOutcomeV1::Committed { .. } => {
+                Some(self.activate(cx, floor, max_owned_image_bytes))
+            }
             PublicationOutcomeV1::NotCommitted(_) => None,
             PublicationOutcomeV1::CommitOutcomeUnknown(permit) => {
                 self.pending = Some(*permit);
@@ -770,14 +823,18 @@ impl<'root> GenerationPublisherV1<'root> {
         &self,
         cx: &Cx,
         floor: Option<&dyn AntiRollbackFloorProviderV1>,
+        max_owned_image_bytes: u64,
     ) -> GenerationActivationV1 {
         if checkpoint(cx, "generation.activate").is_err() {
             return GenerationActivationV1::DeferredByCancellation;
         }
-        match self
-            .snapshots
-            .refresh(self.root, self.root_id, self.profile, floor)
-        {
+        match self.snapshots.refresh_with_budget(
+            self.root,
+            self.root_id,
+            self.profile,
+            floor,
+            max_owned_image_bytes,
+        ) {
             Ok(SnapshotOpenOutcomeV1::Opened(snapshot)) => {
                 GenerationActivationV1::Installed(snapshot)
             }
@@ -1278,7 +1335,13 @@ mod tests {
                     Err(GenerationPublicationErrorV1::AdmissionBudget { .. })
                 ));
                 assert!(matches!(
-                    publisher.publish_prepared(&cx, &first, &permit, None, first.owned_image_bytes()),
+                    publisher.publish_prepared(
+                        &cx,
+                        &first,
+                        &permit,
+                        None,
+                        first.owned_image_bytes()
+                    ),
                     Err(GenerationPublicationErrorV1::Root(_))
                 ));
                 stage(&path, &first, 1, None);
@@ -2137,6 +2200,143 @@ mod tests {
                     panic!("fresh admission refused"); // ubs:ignore — cfg(test) assertion: a refused fresh open must fail the publication test.
                 };
                 assert_eq!(reopened.head().authority, second.authority());
+            });
+        }
+
+        #[test]
+        fn larger_concurrent_successor_cannot_bypass_publication_or_recovery_image_budget() {
+            run_test_with_cx(|cx| async move {
+                let path = root_path();
+                let first = candidate_with_ann(1, None, false);
+                stage(&path, &first, 1, None);
+                let root = admit(&path);
+                let mut publisher = session(&root);
+                let _ = publish(
+                    &mut publisher,
+                    &cx,
+                    &first,
+                    ExpectedAuthorityPairV1::default(),
+                );
+                let old = publisher.snapshot().expect("old reader");
+                let second = candidate_with_ann(2, Some(first.authority()), false);
+                stage(&path, &second, 2, None);
+                let limit = second.owned_image_bytes();
+                let permit = publisher
+                    .prepare_attempt(&second, old.authority_pair(), [0xb1; 16], [0xb2; 16])
+                    .expect("durable-attempt inputs");
+
+                // Execute the real preflight and authority protocol, then
+                // schedule another writer at the production boundary between
+                // the first writer's unlock and its serving activation.
+                let admitted = prepare(&cx, &root, ROOT_ID, &second, permit.expected, limit)
+                    .expect("complete preflight within original budget");
+                let publication = publisher
+                    .publisher
+                    .publish_prepared(&permit, None)
+                    .expect("authority protocol");
+                drop(admitted);
+                assert!(
+                    matches!(publication, PublicationOutcomeV1::Committed { slot, .. }
+                    if slot.authority == second.authority())
+                );
+                let SnapshotOpenOutcomeV1::Opened(second_opened) = root
+                    .open_generation_snapshot_with_budget(
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                        limit,
+                    )
+                    .expect("second authority")
+                else {
+                    panic!("second generation must open");
+                };
+                let third = candidate_with_ann(3, Some(second.authority()), true);
+                assert!(third.owned_image_bytes() > limit);
+                stage(&path, &third, 3, None);
+                let mut concurrent = GenerationPublisherV1::new(
+                    &root,
+                    ROOT_ID,
+                    [0xb3; 16],
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("concurrent publisher");
+                let _ = publish(&mut concurrent, &cx, &third, second_opened.authority_pair());
+                let authority_after_successor =
+                    fs::read(path.join("AUTHORITY")).expect("authority");
+                let lock_after_successor = fs::read(path.join("LOCK")).expect("lock");
+
+                let completed = publisher.record_publication(&cx, publication, None, limit);
+                assert!(
+                    matches!(completed.publication, PublicationOutcomeV1::Committed { slot, .. }
+                    if slot.authority == second.authority())
+                );
+                assert!(matches!(completed.activation,
+                    Some(GenerationActivationV1::Refused(SnapshotRefusalV1::ImageBudget {
+                        required, limit: observed_limit,
+                    })) if required == third.owned_image_bytes() && observed_limit == limit
+                ));
+                assert!(Arc::ptr_eq(
+                    &old,
+                    &publisher.snapshot().expect("old reader retained")
+                ));
+                assert!(publisher.pending_attempt().is_none());
+
+                // Restarting from the original saved attempt preserves the
+                // superseded commit verdict, even when current-head admission
+                // cannot fit in the original caller's budget.
+                publisher
+                    .restore_pending_attempt(permit, false)
+                    .expect("restore original attempt");
+                let recovered = publisher
+                    .reconcile_pending_with_budget(&cx, None, limit)
+                    .expect("reconciliation")
+                    .expect("saved attempt");
+                assert!(matches!(recovered.reconciliation,
+                    ReconcileOutcomeV1::CommittedThenSuperseded { head }
+                        if head.authority == third.authority()
+                ));
+                assert!(matches!(
+                    recovered.activation,
+                    Some(GenerationActivationV1::Refused(
+                        SnapshotRefusalV1::ImageBudget { .. }
+                    ))
+                ));
+                assert!(publisher.pending_attempt().is_none());
+                assert!(Arc::ptr_eq(
+                    &old,
+                    &publisher.snapshot().expect("old reader retained")
+                ));
+                assert!(matches!(
+                    publisher
+                        .refresh_with_budget(&cx, None, limit)
+                        .expect("bounded refresh"),
+                    SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::ImageBudget { .. })
+                ));
+                assert_eq!(
+                    fs::read(path.join("AUTHORITY")).expect("authority"),
+                    authority_after_successor
+                );
+                assert_eq!(
+                    fs::read(path.join("LOCK")).expect("lock"),
+                    lock_after_successor
+                );
+                assert!(matches!(
+                    publisher
+                        .refresh_with_budget(&cx, None, third.owned_image_bytes())
+                        .expect("expanded budget"),
+                    SnapshotOpenOutcomeV1::Opened(_)
+                ));
+                assert_eq!(
+                    publisher.snapshot().expect("third reader").head().authority,
+                    third.authority()
+                );
+                assert_eq!(old.head().authority, first.authority());
+                for (role, _) in component_receipts(first.manifest()) {
+                    assert_eq!(
+                        old.closure().bytes(role).expect("old component").as_ref(),
+                        bytes(role, 1)
+                    );
+                }
             });
         }
 

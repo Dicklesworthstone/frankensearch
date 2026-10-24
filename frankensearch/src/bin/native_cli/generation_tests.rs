@@ -3,7 +3,45 @@ use frankensearch_core::generation::{
     EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1,
     QuantizationFormat,
 };
+use frankensearch_core::{ModelCategory, SearchFuture, SearchResult};
 use frankensearch_index::generation_root::authority_publisher::AttemptStageV1;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct Provider {
+    identity: EmbeddingIdentityBundleV1,
+    calls: AtomicUsize,
+}
+
+impl Embedder for Provider {
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+    fn embed<'a>(&'a self, _: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            Ok(if text.contains("retry") {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            })
+        })
+    }
+    fn dimension(&self) -> usize {
+        2
+    }
+    fn id(&self) -> &str {
+        "authority-cli-test"
+    }
+    fn model_name(&self) -> &str {
+        self.id()
+    }
+    fn is_semantic(&self) -> bool {
+        true
+    }
+    fn category(&self) -> ModelCategory {
+        ModelCategory::TransformerEmbedder
+    }
+}
 
 fn parse(args: &[&str]) -> Result<Option<Options>> {
     Options::parse(args.iter().map(|argument| (*argument).to_owned()))
@@ -26,6 +64,121 @@ fn index_arguments() -> Vec<&'static str> {
         "5",
         "--cooperative-local",
     ]
+}
+
+fn rebuild_arguments() -> Vec<&'static str> {
+    vec![
+        "authority-rebuild",
+        "--from-receipt",
+        "selected.json",
+        "--work-dir",
+        "new-work",
+        "--receipt",
+        "new.json",
+        "--source-low",
+        "1",
+        "--source-high",
+        "9",
+    ]
+}
+
+#[test]
+fn rebuild_parser_selects_an_existing_receipt_without_overriding_its_root_or_tier() {
+    let options = parse(&rebuild_arguments()).unwrap().unwrap();
+    assert_eq!(options.command, Command::Rebuild);
+    assert_eq!(
+        options.from_receipt.as_deref(),
+        Some(Path::new("selected.json"))
+    );
+    assert!(options.root.is_none());
+    assert!(options.tier.is_none());
+    assert!(!options.migrate_model);
+    assert!(is_command("authority-rebuild"));
+    assert!(parse(&["authority-rebuild", "--help"]).unwrap().is_none());
+    for extra in [
+        vec!["--root", "replacement-root"],
+        vec!["--tier", "quality"],
+        vec!["--cooperative-local"],
+        vec!["--query", "retry"],
+        vec!["--limit", "1"],
+        vec!["--from-receipt", "different.json"],
+    ] {
+        let mut arguments = rebuild_arguments();
+        arguments.extend(extra);
+        assert!(parse(&arguments).is_err(), "{arguments:?}");
+    }
+    for required in [
+        "--from-receipt",
+        "--work-dir",
+        "--receipt",
+        "--source-low",
+        "--source-high",
+    ] {
+        let mut arguments = rebuild_arguments();
+        let position = arguments
+            .iter()
+            .position(|argument| *argument == required)
+            .unwrap();
+        arguments.drain(position..position + 2);
+        assert!(parse(&arguments).is_err(), "{required}");
+    }
+    let mut migration = rebuild_arguments();
+    migration.extend([
+        "--migrate-model",
+        "--quality-backend",
+        "native-int8",
+        "--quality-model-dir",
+        "model",
+    ]);
+    assert!(parse(&migration).unwrap().unwrap().migrate_model);
+    for command in ["authority-search", "authority-recover"] {
+        assert!(parse(&[command, "--receipt", "r", "--from-receipt", "old"]).is_err());
+        assert!(parse(&[command, "--receipt", "r", "--migrate-model"]).is_err());
+    }
+}
+
+#[test]
+fn rebuild_source_boundaries_are_monotone_and_allow_an_unchanged_cut() {
+    let previous = CommitRange { low: 2, high: 7 };
+    for source in [
+        CommitRange { low: 2, high: 7 },
+        CommitRange { low: 2, high: 8 },
+        CommitRange { low: 3, high: 9 },
+    ] {
+        validate_successor_source(&previous, &source).unwrap();
+    }
+    for source in [
+        CommitRange { low: 1, high: 9 },
+        CommitRange { low: 2, high: 6 },
+        CommitRange { low: 1, high: 6 },
+    ] {
+        assert!(validate_successor_source(&previous, &source).is_err());
+    }
+}
+
+#[test]
+fn rebuild_requires_explicit_producer_migration_before_any_inference() {
+    let selected = receipt();
+    let mut provider = Provider {
+        identity: identity().identity,
+        calls: AtomicUsize::new(0),
+    };
+    assert_eq!(
+        rebuild_identity(&selected, &provider, false).unwrap(),
+        selected.identity
+    );
+    provider.identity.producer.implementation_revision =
+        "changed-same-dimension-producer".to_owned();
+    provider.identity.validate().unwrap();
+    assert!(rebuild_identity(&selected, &provider, false).is_err());
+    let migrated = rebuild_identity(&selected, &provider, true).unwrap();
+    assert_ne!(migrated, selected.identity);
+    assert_eq!(migrated.identity.producer, provider.identity.producer);
+    assert_eq!(migrated.identity.space, provider.identity.space);
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+    provider.identity.space.dimension = 3;
+    assert!(rebuild_identity(&selected, &provider, true).is_err());
+    assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -160,9 +313,14 @@ fn identity() -> FrozenEmbeddingIdentityBundleV1 {
 fn receipt() -> Receipt {
     let authority = AuthorityRefV1::new(1, [0x52; 16], 256, [0x53; 32], None).unwrap();
     let permit = AttemptPermitV1::new(
-        [0x51; 16], [0x61; 16], [0x62; 16], authority,
-        ExpectedAuthorityPairV1::default(), [0x63; 16],
-    ).unwrap();
+        [0x51; 16],
+        [0x61; 16],
+        [0x62; 16],
+        authority,
+        ExpectedAuthorityPairV1::default(),
+        [0x63; 16],
+    )
+    .unwrap();
     Receipt {
         schema: RECEIPT_SCHEMA.to_owned(),
         root: PathBuf::from("/private/generation"),
@@ -210,26 +368,31 @@ fn receipt_preserves_independent_binding_and_rejects_downgrades_and_tampering() 
 fn saved_attempt_round_trip_preserves_both_slots_and_the_original_identities() {
     let mut selected = receipt();
     let first = selected.authority().unwrap();
-    let second = AuthorityRefV1::new(
-        2, [0x71; 16], 256, [0x72; 32], Some(first.fingerprint()),
-    ).unwrap();
-    let third = AuthorityRefV1::new(
-        3, [0x73; 16], 256, [0x74; 32], Some(second.fingerprint()),
-    ).unwrap();
+    let second =
+        AuthorityRefV1::new(2, [0x71; 16], 256, [0x72; 32], Some(first.fingerprint())).unwrap();
+    let third =
+        AuthorityRefV1::new(3, [0x73; 16], 256, [0x74; 32], Some(second.fingerprint())).unwrap();
     let permit = AttemptPermitV1::new(
-        selected.root_id, [0x81; 16], [0x82; 16], third,
+        selected.root_id,
+        [0x81; 16],
+        [0x82; 16],
+        third,
         ExpectedAuthorityPairV1 {
             first: Some(AuthoritySlotV1::new(0, selected.root_id, second).unwrap()),
             second: Some(AuthoritySlotV1::new(1, selected.root_id, first).unwrap()),
         },
         [0x83; 16],
-    ).unwrap();
+    )
+    .unwrap();
     selected.authority = third.canonical_bytes().to_vec();
     selected.attempt = Some(SavedAttempt::from_permit(&permit, false));
     let encoded = serde_json::to_vec(&selected).unwrap();
     let restored: Receipt = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(restored.recovery_attempt().unwrap(), permit);
-    assert_eq!(restored.recovery_attempt().unwrap().stage, AttemptStageV1::AttemptFrame);
+    assert_eq!(
+        restored.recovery_attempt().unwrap().stage,
+        AttemptStageV1::AttemptFrame
+    );
     let mut changed = restored.clone();
     changed.attempt.as_mut().unwrap().requires_floor = true;
     assert!(changed.validate().is_err());
@@ -244,7 +407,10 @@ fn saved_attempt_round_trip_preserves_both_slots_and_the_original_identities() {
     assert!(changed.validate().is_err());
     changed = restored.clone();
     changed.attempt.as_mut().unwrap().expected_first = None;
-    assert!(changed.validate().is_err(), "the complete predecessor pair is required");
+    assert!(
+        changed.validate().is_err(),
+        "the complete predecessor pair is required"
+    );
     changed = restored;
     changed.attempt.as_mut().unwrap().expected_second = Some(vec![0; 128]);
     assert!(changed.validate().is_err());
@@ -254,7 +420,10 @@ fn saved_attempt_round_trip_preserves_both_slots_and_the_original_identities() {
 fn selection_only_receipts_remain_readable_but_cannot_authorize_recovery() {
     let mut selected = receipt();
     selected.schema = SELECTION_ONLY_RECEIPT_SCHEMA.to_owned();
-    assert!(selected.validate().is_err(), "a v2 attempt cannot be relabelled v1");
+    assert!(
+        selected.validate().is_err(),
+        "a v2 attempt cannot be relabelled v1"
+    );
     selected.attempt = None;
     selected.validate().unwrap();
     let encoded = serde_json::to_vec(&selected).unwrap();
@@ -265,7 +434,10 @@ fn selection_only_receipts_remain_readable_but_cannot_authorize_recovery() {
     assert_eq!(restored.authority().unwrap(), selected.authority().unwrap());
     assert!(restored.recovery_attempt().is_err());
     selected.schema = RECEIPT_SCHEMA.to_owned();
-    assert!(selected.validate().is_err(), "v2 requires its prepared attempt");
+    assert!(
+        selected.validate().is_err(),
+        "v2 requires its prepared attempt"
+    );
 }
 
 #[test]
@@ -339,16 +511,57 @@ fn recovery_reports_every_verdict_without_turning_uncertainty_into_an_abort() {
     let other = AuthorityRefV1::new(1, [0x91; 16], 256, [0x92; 32], None).unwrap();
     let fork = AuthoritySlotV1::new(1, selected.root_id, other).unwrap();
     let successor = AuthorityRefV1::new(
-        2, [0x93; 16], 256, [0x94; 32], Some(permit.candidate.fingerprint()),
-    ).unwrap();
+        2,
+        [0x93; 16],
+        256,
+        [0x94; 32],
+        Some(permit.candidate.fingerprint()),
+    )
+    .unwrap();
     let head = AuthoritySlotV1::new(0, selected.root_id, successor).unwrap();
     for (outcome, verdict, publication, serving, resolved) in [
-        (ReconcileOutcomeV1::Committed { slot, floor: None }, "committed", "committed", "not_activated", true),
-        (ReconcileOutcomeV1::NotCommitted, "not_committed", "not_committed", "not_activated", true),
-        (ReconcileOutcomeV1::StillUnknown(permit), "still_unknown", "unknown", "not_activated", false),
-        (ReconcileOutcomeV1::Fork { observed: fork }, "fork", "unknown", "not_activated", false),
-        (ReconcileOutcomeV1::RepairRequired(GenerationAuthorityErrorV1::UnresolvedAttempt), "repair_required", "unknown", "not_activated", false),
-        (ReconcileOutcomeV1::CommittedThenSuperseded { head }, "committed_then_superseded", "committed", "superseded", true),
+        (
+            ReconcileOutcomeV1::Committed { slot, floor: None },
+            "committed",
+            "committed",
+            "not_activated",
+            true,
+        ),
+        (
+            ReconcileOutcomeV1::NotCommitted,
+            "not_committed",
+            "not_committed",
+            "not_activated",
+            true,
+        ),
+        (
+            ReconcileOutcomeV1::StillUnknown(permit),
+            "still_unknown",
+            "unknown",
+            "not_activated",
+            false,
+        ),
+        (
+            ReconcileOutcomeV1::Fork { observed: fork },
+            "fork",
+            "unknown",
+            "not_activated",
+            false,
+        ),
+        (
+            ReconcileOutcomeV1::RepairRequired(GenerationAuthorityErrorV1::UnresolvedAttempt),
+            "repair_required",
+            "unknown",
+            "not_activated",
+            false,
+        ),
+        (
+            ReconcileOutcomeV1::CommittedThenSuperseded { head },
+            "committed_then_superseded",
+            "committed",
+            "superseded",
+            true,
+        ),
     ] {
         let report = reconciliation_report(&selected, &permit, &outcome);
         assert_eq!(report["reconciliation"], verdict);
@@ -377,13 +590,17 @@ fn recovery_output_failure_preserves_the_exact_reconciliation_and_commit_knowled
         fn write(&mut self, _: &[u8]) -> io::Result<usize> {
             Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed output"))
         }
-        fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
     let selected = receipt();
     let permit = selected.recovery_attempt().unwrap();
     let slot = AuthoritySlotV1::new(1, selected.root_id, permit.candidate).unwrap();
     let mut report = reconciliation_report(
-        &selected, &permit, &ReconcileOutcomeV1::Committed { slot, floor: None },
+        &selected,
+        &permit,
+        &ReconcileOutcomeV1::Committed { slot, floor: None },
     );
     report["serving"] = serde_json::json!("activated");
     let error = emit_recovery(&mut Closed, report).unwrap_err();
@@ -444,46 +661,9 @@ fn failed_result_delivery_preserves_known_commit_and_activation() {
 #[cfg(target_os = "linux")]
 #[test]
 fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() {
-    use frankensearch::{Embedder, IndexableDocument};
-    use frankensearch_core::{ModelCategory, SearchFuture, SearchResult};
+    use frankensearch::IndexableDocument;
     use std::os::unix::fs::DirBuilderExt as _;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    struct Provider {
-        identity: EmbeddingIdentityBundleV1,
-        calls: AtomicUsize,
-    }
-    impl Embedder for Provider {
-        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
-            Ok(&self.identity)
-        }
-        fn embed<'a>(&'a self, _: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Box::pin(async move {
-                Ok(if text.contains("retry") {
-                    vec![1.0, 0.0]
-                } else {
-                    vec![0.0, 1.0]
-                })
-            })
-        }
-        fn dimension(&self) -> usize {
-            2
-        }
-        fn id(&self) -> &str {
-            "authority-cli-test"
-        }
-        fn model_name(&self) -> &str {
-            self.id()
-        }
-        fn is_semantic(&self) -> bool {
-            true
-        }
-        fn category(&self) -> ModelCategory {
-            ModelCategory::TransformerEmbedder
-        }
-    }
 
     // Same real-host discipline as generation_root's tests. Qualification
     // failures remain failures: no overlay/tmpfs bypass or automatic skip.
@@ -509,14 +689,19 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             "authority-recover".to_owned(),
             "--receipt".to_owned(),
             unissued_receipt.to_str().unwrap().to_owned(),
-        ]).unwrap().unwrap();
+        ])
+        .unwrap()
+        .unwrap();
         let mut output = Vec::new();
         recover(&cx, &unissued_options, &mut output).unwrap();
         let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(report["publication"], "not_committed");
         assert_eq!(report["reconciliation"], "not_committed");
         assert_eq!(report["serving"], "not_activated");
-        assert_eq!(fs::read(unissued_path.join("AUTHORITY")).unwrap(), vec![0; 8192]);
+        assert_eq!(
+            fs::read(unissued_path.join("AUTHORITY")).unwrap(),
+            vec![0; 8192]
+        );
         assert_eq!(fs::read(unissued_path.join("LOCK")).unwrap(), vec![0; 8192]);
 
         for (name, tier) in [
@@ -554,6 +739,7 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
                 &root_path,
                 &receipt_path,
                 &built,
+                None,
                 DEFAULT_IMAGE_BYTES,
             )
             .unwrap();
@@ -572,7 +758,10 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             let recorded = selected.recovery_attempt().unwrap();
             // Reproduce the on-disk cut after the slot barrier but before the
             // owner frame. Only the pre-publication receipt is used to recover.
-            let mut lock = OpenOptions::new().write(true).open(root_path.join("LOCK")).unwrap();
+            let mut lock = OpenOptions::new()
+                .write(true)
+                .open(root_path.join("LOCK"))
+                .unwrap();
             lock.write_all(&[0; 4096]).unwrap();
             lock.sync_all().unwrap();
             drop(lock);
@@ -584,15 +773,24 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             let altered_path = parent.join(format!("{name}-altered.json"));
             save_receipt(&altered, &altered_path).unwrap();
             let mut recovery = Options::parse([
-                "authority-recover".to_owned(), "--receipt".to_owned(),
+                "authority-recover".to_owned(),
+                "--receipt".to_owned(),
                 altered_path.to_str().unwrap().to_owned(),
-            ]).unwrap().unwrap();
+            ])
+            .unwrap()
+            .unwrap();
             let error = recover(&cx, &recovery, &mut Vec::new()).unwrap_err();
             let refused = publication_failure(error.as_ref()).unwrap();
             assert_eq!(refused["publication"], "unknown");
             assert_eq!(refused["reconciliation"], "repair_required");
-            assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority_before_recovery);
-            assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_before_recovery);
+            assert_eq!(
+                fs::read(root_path.join("AUTHORITY")).unwrap(),
+                authority_before_recovery
+            );
+            assert_eq!(
+                fs::read(root_path.join("LOCK")).unwrap(),
+                lock_before_recovery
+            );
 
             recovery.receipt = receipt_path.clone();
             let calls_before_recovery = provider.calls.load(Ordering::Relaxed);
@@ -603,11 +801,21 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             assert_eq!(recovered["reconciliation"], "committed");
             assert_eq!(recovered["serving"], "activated");
             assert_eq!(recovered["attempt"], attempt_report(&recorded));
-            assert_eq!(provider.calls.load(Ordering::Relaxed), calls_before_recovery);
-            assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority_before_recovery);
-            let owner = admit_root(&root_path).unwrap()
-                .authority_publisher(selected.root_id, [0xa1; 16], PROFILE).unwrap()
-                .owner_frame().unwrap().unwrap();
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                calls_before_recovery
+            );
+            assert_eq!(
+                fs::read(root_path.join("AUTHORITY")).unwrap(),
+                authority_before_recovery
+            );
+            let owner = admit_root(&root_path)
+                .unwrap()
+                .authority_publisher(selected.root_id, [0xa1; 16], PROFILE)
+                .unwrap()
+                .owner_frame()
+                .unwrap()
+                .unwrap();
             assert_eq!(owner.writer_id, recorded.writer_id);
             assert_eq!(owner.attempt_id, recorded.attempt_id);
             recovery.max_image_bytes = 1;
@@ -617,7 +825,10 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             assert_eq!(bounded["reconciliation"], "committed");
             assert_eq!(bounded["serving"], "not_activated");
             assert_eq!(bounded["reason"], "snapshot_activation_deferred_or_refused");
-            assert_eq!(provider.calls.load(Ordering::Relaxed), calls_before_recovery);
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                calls_before_recovery
+            );
             recovery.max_image_bytes = DEFAULT_IMAGE_BYTES;
             assert!(selected.open(&cx, 1).is_err());
             let before = provider.calls.load(Ordering::Relaxed);
@@ -685,6 +896,267 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
                     .await
                     .unwrap()
                     .is_empty()
+            );
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publisher() {
+    use frankensearch::IndexableDocument;
+    use frankensearch_core::generation::GenerationComponentRole;
+    use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+        ".frankensearch-authority-rebuild-tests-{}-{stamp}",
+        std::process::id(),
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for (name, tier) in [
+            ("fast", EmbedderTierTag::Fast),
+            ("quality", EmbedderTierTag::Quality),
+        ] {
+            let root_path = parent.join(format!("{name}-root"));
+            let root = create_root(&root_path).expect("qualified Linux root is required");
+            let provider = Arc::new(Provider {
+                identity: identity().identity,
+                calls: AtomicUsize::new(0),
+            });
+            let model: Arc<dyn Embedder> = provider.clone();
+            let original_documents = || {
+                [
+                    IndexableDocument::new("zeta", "retry network requests")
+                        .with_metadata("version", "old"),
+                    IndexableDocument::new("alpha", "garden flowers"),
+                ]
+            };
+            let first = NativeIndexBuilder::new(
+                parent.join(format!("{name}-first-work")),
+                new_generation(1).unwrap(),
+                model.clone(),
+            )
+            .unwrap()
+            .add_documents(original_documents())
+            .build_exact_generation(
+                &cx,
+                tier,
+                CommitRange { low: 2, high: 7 },
+                DEFAULT_IMAGE_BYTES,
+            )
+            .await
+            .unwrap();
+            let first_path = parent.join(format!("{name}-first.json"));
+            let selected = stage_and_publish(
+                &cx,
+                &root,
+                &root_path,
+                &first_path,
+                &first,
+                None,
+                DEFAULT_IMAGE_BYTES,
+            )
+            .unwrap();
+            let retained = selected
+                .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                .unwrap();
+            let lexical_receipt = retained.retained_snapshot().manifest().components().lexical;
+            let lexical_path = root_path.join(
+                frankensearch_index::generation_root::generation_reader::component_object_name_v1(
+                    GenerationComponentRole::Lexical,
+                    lexical_receipt.sha256,
+                ),
+            );
+            let original_inode = fs::metadata(&lexical_path).unwrap().ino();
+            let original_lexical = fs::read(&lexical_path).unwrap();
+            let first_receipt_bytes = fs::read(&first_path).unwrap();
+
+            // An unchanged full cohort shares its exact lexical object. A
+            // create_new-only pathname writer would fail this valid successor.
+            let unchanged = NativeIndexBuilder::new(
+                parent.join(format!("{name}-unchanged-work")),
+                new_generation(2).unwrap(),
+                model.clone(),
+            )
+            .unwrap()
+            .add_documents(original_documents())
+            .build_exact_generation(
+                &cx,
+                tier,
+                CommitRange { low: 2, high: 7 },
+                DEFAULT_IMAGE_BYTES,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                first.component_bytes(GenerationComponentRole::Lexical),
+                unchanged.component_bytes(GenerationComponentRole::Lexical)
+            );
+            let second_path = parent.join(format!("{name}-second.json"));
+            let second = stage_and_publish(
+                &cx,
+                &root,
+                &root_path,
+                &second_path,
+                &unchanged,
+                Some(&retained),
+                DEFAULT_IMAGE_BYTES,
+            )
+            .unwrap();
+            assert_eq!(second.root_id, selected.root_id);
+            assert_eq!(second.authority().unwrap().sequence, 2);
+            assert_eq!(fs::metadata(&lexical_path).unwrap().ino(), original_inode);
+            assert_eq!(fs::read(&lexical_path).unwrap(), original_lexical);
+            let second_snapshot = second
+                .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                .unwrap();
+            assert_eq!(
+                second.recovery_attempt().unwrap().expected,
+                retained.retained_snapshot().authority_pair()
+            );
+
+            let winner = NativeIndexBuilder::new(
+                parent.join(format!("{name}-winner-work")),
+                new_generation(3).unwrap(),
+                model.clone(),
+            )
+            .unwrap()
+            .add_documents([
+                IndexableDocument::new("zeta", "retry requests safely")
+                    .with_metadata("version", "new"),
+                IndexableDocument::new("beta", "fresh garden vegetables"),
+            ])
+            .build_exact_generation(
+                &cx,
+                tier,
+                CommitRange { low: 2, high: 8 },
+                DEFAULT_IMAGE_BYTES,
+            )
+            .await
+            .unwrap();
+            let loser = NativeIndexBuilder::new(
+                parent.join(format!("{name}-loser-work")),
+                new_generation(3).unwrap(),
+                model,
+            )
+            .unwrap()
+            .add_documents([IndexableDocument::new("loser", "retry obsolete requests")])
+            .build_exact_generation(
+                &cx,
+                tier,
+                CommitRange { low: 2, high: 9 },
+                DEFAULT_IMAGE_BYTES,
+            )
+            .await
+            .unwrap();
+            let winner_path = parent.join(format!("{name}-winner.json"));
+            let committed = stage_and_publish(
+                &cx,
+                &root,
+                &root_path,
+                &winner_path,
+                &winner,
+                Some(&second_snapshot),
+                DEFAULT_IMAGE_BYTES,
+            )
+            .unwrap();
+            let authority_after_winner = fs::read(root_path.join("AUTHORITY")).unwrap();
+            let lock_after_winner = fs::read(root_path.join("LOCK")).unwrap();
+            let loser_path = parent.join(format!("{name}-loser.json"));
+            let error = stage_and_publish(
+                &cx,
+                &root,
+                &root_path,
+                &loser_path,
+                &loser,
+                Some(&second_snapshot),
+                DEFAULT_IMAGE_BYTES,
+            )
+            .unwrap_err();
+            assert_eq!(
+                publication_failure(error.as_ref()).unwrap()["publication"],
+                "not_committed"
+            );
+            assert_eq!(
+                fs::read(root_path.join("AUTHORITY")).unwrap(),
+                authority_after_winner
+            );
+            assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_after_winner);
+            assert_eq!(fs::read(&first_path).unwrap(), first_receipt_bytes);
+            assert_eq!(fs::read(&lexical_path).unwrap(), original_lexical);
+            let lost = Receipt::read(&loser_path).unwrap();
+            assert_eq!(
+                lost.recovery_attempt().unwrap().expected,
+                second_snapshot.retained_snapshot().authority_pair()
+            );
+            assert_ne!(lost.authority().unwrap(), committed.authority().unwrap());
+            assert!(selected.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+            assert!(second.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+
+            let active = committed.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let current_results = active
+                .search_text(&cx, provider.as_ref(), "retry garden", 10)
+                .await
+                .unwrap();
+            let current_ids: BTreeSet<_> = current_results
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect();
+            assert_eq!(current_ids, BTreeSet::from(["beta", "zeta"]));
+            let old_results = retained
+                .search_text(&cx, provider.as_ref(), "retry garden", 10)
+                .await
+                .unwrap();
+            let old_ids: BTreeSet<_> = old_results.iter().map(|hit| hit.doc_id.as_str()).collect();
+            assert_eq!(old_ids, BTreeSet::from(["alpha", "zeta"]));
+            assert_eq!(
+                active.metadata().commit_range,
+                CommitRange { low: 2, high: 8 }
+            );
+            assert_eq!(
+                retained.metadata().commit_range,
+                CommitRange { low: 2, high: 7 }
+            );
+            let calls = provider.calls.load(Ordering::Relaxed);
+            let recovery = Options::parse([
+                "authority-recover".to_owned(),
+                "--receipt".to_owned(),
+                winner_path.to_str().unwrap().to_owned(),
+            ])
+            .unwrap()
+            .unwrap();
+            let mut output = Vec::new();
+            recover(&cx, &recovery, &mut output).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["publication"], "committed");
+            assert_eq!(report["serving"], "activated");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+
+            // A stale receipt is refused before even trying the deliberately
+            // missing input or models, and cannot create new work/receipt files.
+            let mut options = parse(&rebuild_arguments()).unwrap().unwrap();
+            options.from_receipt = Some(first_path);
+            let refused_work = parent.join(format!("{name}-stale-work"));
+            let refused_receipt = parent.join(format!("{name}-stale.json"));
+            options.work = Some(refused_work.clone());
+            options.receipt = refused_receipt.clone();
+            options.input = Some(parent.join("missing-input.jsonl"));
+            options.models = Some(parent.join("missing-models"));
+            let error = rebuild(&cx, &options, &mut Vec::new(), None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("head differs"));
+            assert!(!refused_work.exists());
+            assert!(!refused_receipt.exists());
+            assert_eq!(
+                fs::read(root_path.join("AUTHORITY")).unwrap(),
+                authority_after_winner
             );
         }
     });

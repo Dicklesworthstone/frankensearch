@@ -63,8 +63,9 @@ documents differs from the number of source changes.
 These commands require the qualified Linux root provider and supported local
 ext4/btrfs storage. Put the root under a trusted private parent. The command
 qualifies the new root before reading documents or loading models; an unsupported
-filesystem or insecure ancestor fails at that boundary. The root, work directory,
-and receipt must be new, separate destinations outside existing sealed indexes.
+filesystem or insecure ancestor fails at that boundary. For `authority-index`,
+the root, work directory, and receipt must be new, separate destinations outside
+existing sealed indexes.
 The examples use three siblings under one private parent:
 
 ```sh
@@ -88,6 +89,62 @@ receipt's security profile, generation, authority, producer identity, or tier.
 A changed current authority is a refusal, even when its components are otherwise
 valid. Already opened readers retain their original component bytes.
 
+### Rebuild an existing authority generation
+
+`authority-rebuild` replaces the complete source cohort in the existing root.
+It reads the selected generation from `--from-receipt`, retains that admitted
+reader, and captures its exact authority pair before reading input or loading a
+model. Supply the complete replacement JSONL corpus: omitted documents disappear
+from the new generation, while readers already holding the old generation keep
+its original documents and metadata.
+
+```sh
+./target/release/frankensearch-native authority-rebuild \
+  --from-receipt "$HOME/frankensearch-authority/g1.json" \
+  --work-dir "$HOME/frankensearch-authority/g2-work" \
+  --receipt "$HOME/frankensearch-authority/g2.json" \
+  --source-low 1 --source-high 57 \
+  --input ./replacement-documents.jsonl \
+  --model-dir /absolute/path/to/installed/models
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g2.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --query 'retry network requests' --limit 10
+```
+
+The selected receipt fixes the root, tier, and cooperative-local security
+profile. The work directory and output receipt must be new, separate paths
+outside the root. Both source boundaries must be at least their previous values;
+an unchanged source cut is allowed. Empty corpora remain unsupported by this
+route's metadata contract. Rebuild advances both the artifact generation and
+authority sequence, refusing exhausted counters before inference.
+
+The loaded provider must match the selected generation's complete identity
+before embedding begins. To intentionally rebuild with another producer, add
+`--migrate-model` and select its local model using the usual model options. This
+re-embeds the whole cohort and records the new producer; it does not relabel or
+reuse the old vectors. The tier stays fixed, including direct quality-only
+inference. Provider identity must remain stable throughout the build.
+
+Staging creates absent objects relative to the retained root descriptor. An
+existing content-addressed image is reused only after qualified admission
+verifies its security metadata, length, hash, and exact bytes. A partial,
+corrupt, or linked collision is refused and left intact. Existing objects and
+the old receipt are never overwritten. The new receipt durably records the
+exact successor attempt before publication, and `authority-recover` accepts it
+after an interrupted build publication.
+
+Publication compares the original authority pair under the exclusive lock. If
+another publisher has advanced the root, this rebuild reports `not_committed`
+without changing that winner's authority or owner evidence. It does not refresh
+its expectation and overwrite the winner. Rebuild explicitly from the winning
+receipt to try a new replacement. Successful output has `event: "rebuilt"`,
+`publication: "committed"`, `serving: "activated"`, the replaced authority, and
+whether the model identity changed. A later output failure still reports the
+known commit.
+
+### Quality models, budgets, and publication recovery
+
 For quality-only native inference, build with `hybrid-native` as described below
 and select the exact local native model:
 
@@ -110,7 +167,7 @@ have the same artifact verification and explicit-selection rules as the other
 native commands. All loading is offline. A missing or different producer fails;
 the selected generation is never relabelled to match an available model.
 
-The encoded-image budget defaults to 256 MiB. Set `--max-image-bytes N` on either
+The encoded-image budget defaults to 256 MiB. Set `--max-image-bytes N` on any
 authority command to choose a different positive byte limit. It covers the
 activation manifest and every declared component image. Search checks the
 manifest's own length before reading it, then checks the combined declared
@@ -119,6 +176,12 @@ exceed the image size recorded by the trusted receipt. This bounds encoded
 images, not model memory, query scratch space, page cache, or other retained
 readers. Indexing inference batches default to 64 documents on this route and
 can be selected with `--batch-size`.
+
+The publication budget also applies when activating a reader after the commit.
+If another publisher selects a larger generation in that interval, admission
+refuses it before component reads and keeps the prior installed reader. The
+original publication remains a known commit; a reader-admission refusal does
+not authorize another publication attempt.
 
 New receipts use schema `frankensearch.native.authority-selection.v2` and are
 written durably before publication. In addition to the selected authority and
@@ -174,10 +237,14 @@ requirement.
 Library callers can use `GenerationPublisherV1::prepare_attempt`, durably save
 its permit and security/floor requirements, and then call `publish_prepared`.
 A fresh serving session can restore that permit with `restore_pending_attempt`
-and reuse `reconcile_pending` while retaining its existing reader.
+and call `reconcile_pending_with_budget` while retaining its existing reader.
+`GenerationPublisherV1::refresh_with_budget` provides the same encoded-image
+limit for explicit refreshes. The existing `reconcile_pending` and `refresh`
+methods remain available without an aggregate image cap.
 
-The authority commands provide initial publication, exact selected search, and
-publication recovery. The existing `update`, `rebuild`, and `serve` commands
+The authority commands provide initial publication, full-cohort successor
+rebuilds, exact selected search, and publication recovery. The existing
+`update`, `rebuild`, and `serve` commands
 continue to use their own selected-snapshot receipts. Work files and staged
 candidates remain available after success or failure.
 
