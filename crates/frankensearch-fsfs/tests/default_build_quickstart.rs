@@ -16,9 +16,9 @@ mod loader_only {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use frankensearch_embed::model_manifest::ModelManifest;
     #[cfg(feature = "semantic-loaders")]
     use frankensearch_embed::model_manifest::is_verification_cached;
+    use frankensearch_embed::model_manifest::{ModelManifest, ModelTier};
     use frankensearch_index::VectorIndex;
     use serde_json::Value;
 
@@ -2653,6 +2653,155 @@ mod loader_only {
                 assert_eq!(outcome.stdout.lines().count(), 1);
             }
         }
+    }
+
+    #[test]
+    fn fresh_setup_defaults_select_only_production_ready_manifests() {
+        let temp = tempfile::tempdir().expect("create fresh setup fixture");
+        let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("models"));
+        let defaults = ModelManifest::builtin_catalog();
+        defaults.validate().expect("validate default model catalog");
+        assert!(!defaults.models.is_empty());
+        for manifest in &defaults.models {
+            assert!(
+                manifest.is_production_ready(),
+                "fresh setup must not require an unqualified model: {}",
+                manifest.id
+            );
+            assert!(manifest.files.iter().all(|file| file.size > 0));
+            assert!(manifest.download_size_bytes > 0, "{}", manifest.id);
+            assert_eq!(
+                manifest.download_size_bytes,
+                manifest.files.iter().map(|file| file.size).sum::<u64>(),
+                "{} download budget must describe its verified artifacts",
+                manifest.id
+            );
+        }
+        assert!(
+            defaults
+                .models
+                .iter()
+                .all(|model| model.id != "flashrank-nano")
+        );
+        let reranker = defaults
+            .models
+            .iter()
+            .find(|model| model.id == "ms-marco-minilm-l-6-v2")
+            .expect("fresh setup retains the verified native reranker");
+        assert_eq!(reranker.tier, Some(ModelTier::Reranker));
+        assert!(
+            reranker
+                .files
+                .iter()
+                .any(|file| file.name.ends_with(".safetensors")),
+            "the default reranker must provide weights for the native loader"
+        );
+
+        let mut registered = defaults.models;
+        registered.extend(ModelManifest::opt_in_catalog().models);
+        for key in ["indexing.fast_model", "indexing.quality_model"] {
+            let outcome = fsfs.run(
+                temp.path(),
+                key,
+                ["config", "get", key, "--format", "json"],
+                FAILURE_TIMEOUT,
+            );
+            let envelope = parse_success_envelope("fresh setup default configuration", &outcome);
+            assert_eq!(envelope["data"]["source"], "defaults", "{envelope}");
+            let selected = envelope["data"]["value"]
+                .as_str()
+                .expect("configured model name");
+            let manifest = registered
+                .iter()
+                .find(|model| model.id.eq_ignore_ascii_case(selected))
+                .unwrap_or_else(|| panic!("{key}={selected} must have a registered manifest"));
+            assert!(
+                manifest.is_production_ready(),
+                "{key}={selected} must be provisionable on a fresh machine"
+            );
+            assert!(manifest.total_size_bytes() > 0, "{key}={selected}");
+        }
+        assert_eq!(fs::read_dir(&fsfs.model_root).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fresh_setup_lists_unqualified_flashrank_but_rejects_explicit_download() {
+        let temp = tempfile::tempdir().expect("create unqualified model fixture");
+        let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("models"));
+        let manifest = ModelManifest::flashrank_nano();
+        assert_eq!(manifest.repo, "prithivida/flashrank");
+        assert_eq!(manifest.license, "CC-BY-SA-4.0");
+        assert_eq!(manifest.total_size_bytes(), 3_421_983);
+        assert_eq!(
+            manifest.download_size_bytes,
+            manifest.files.iter().map(|file| file.size).sum::<u64>()
+        );
+        assert!(!manifest.is_production_ready());
+        assert!(
+            ModelManifest::opt_in_catalog()
+                .models
+                .iter()
+                .any(|model| model.id == manifest.id)
+        );
+
+        for (label, args) in [
+            (
+                "list-unqualified-models",
+                vec!["download-models", "--list", "--format", "json"],
+            ),
+            (
+                "verify-unqualified-model",
+                vec![
+                    "download-models",
+                    "flashrank-nano",
+                    "--verify",
+                    "--format",
+                    "json",
+                ],
+            ),
+        ] {
+            let outcome = fsfs.run(temp.path(), label, args, FAILURE_TIMEOUT);
+            let envelope = parse_success_envelope(label, &outcome);
+            let flashrank = envelope["data"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["id"] == manifest.id)
+                .expect("FlashRank remains discoverable with an unavailable reason");
+            assert_eq!(flashrank["state"], "unavailable", "{flashrank}");
+            assert!(flashrank["verified"].is_null(), "{flashrank}");
+            assert!(
+                flashrank["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("production-ready")),
+                "{flashrank}"
+            );
+        }
+
+        for name in ["flashrank-nano", "flashrank"] {
+            let outcome = fsfs.run(
+                temp.path(),
+                name,
+                ["download-models", name, "--format", "json"],
+                FAILURE_TIMEOUT,
+            );
+            assert!(!outcome.timed_out, "{outcome:?}");
+            assert_eq!(outcome.status.code(), Some(2), "{outcome:?}");
+            let envelope: Value = serde_json::from_str(&outcome.stdout).unwrap();
+            assert_eq!(envelope["ok"], false, "{envelope}");
+            assert_eq!(envelope["error"]["code"], "invalid_config");
+            assert!(
+                envelope["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("production-ready")),
+                "{envelope}"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&fsfs.model_root).unwrap().count(),
+            0,
+            "rejecting an unqualified model must not leave staged artifacts or a verification receipt"
+        );
     }
 
     #[test]

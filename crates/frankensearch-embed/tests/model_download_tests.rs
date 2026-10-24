@@ -6,7 +6,7 @@
 
 use frankensearch_embed::{
     ConsentSource, DownloadConsent, ModelFile, ModelLifecycle, ModelManifest, ModelState,
-    ModelTier, resolve_download_consent,
+    ModelTier, PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, resolve_download_consent,
 };
 
 // ---------------------------------------------------------------------------
@@ -32,6 +32,146 @@ fn test_manifest() -> ModelManifest {
         description: Some("A test".to_owned()),
         download_size_bytes: 1024,
     }
+}
+
+fn verified_fixture_manifest() -> ModelManifest {
+    let mut manifest = test_manifest();
+    manifest.revision = "a".repeat(40);
+    manifest.files[0].sha256 =
+        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_owned();
+    manifest.files[0].size = 11;
+    manifest.download_size_bytes = 11;
+    manifest
+}
+
+// ---------------------------------------------------------------------------
+// Acquisition integrity: consent never bypasses manifest or artifact admission
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "download")]
+#[test]
+fn granted_consent_does_not_download_unqualified_manifests() {
+    use asupersync::test_utils::run_test_with_cx;
+    use frankensearch_core::SearchError;
+    use frankensearch_embed::{DownloadConfig, ModelDownloader};
+    use std::io::ErrorKind;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut mutable_revision = ModelManifest::minilm_v2();
+    mutable_revision.revision = "main".to_owned();
+    let mut placeholder_checksum = ModelManifest::minilm_v2();
+    placeholder_checksum.files[0].sha256 = PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned();
+    let mut malformed_checksum = ModelManifest::minilm_v2();
+    malformed_checksum.files[0].sha256 = "invalid-sha256".to_owned();
+
+    for mut manifest in [
+        ModelManifest::flashrank_nano(),
+        mutable_revision,
+        placeholder_checksum,
+        malformed_checksum,
+    ] {
+        // An observing local listener makes accidental network access detectable
+        // without contacting a model host or relying on DNS/network failures.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        for file in &mut manifest.files {
+            file.url = Some(format!("https://{address}/{}", file.name));
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("uncreated-cache").join("model");
+        let mut lifecycle = ModelLifecycle::new(
+            manifest.clone(),
+            DownloadConsent::granted(ConsentSource::Interactive),
+        );
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            ..DownloadConfig::default()
+        });
+
+        run_test_with_cx(|cx| async move {
+            let progress_calls = AtomicUsize::new(0);
+            let error = downloader
+                .download_model(&cx, &manifest, &destination, &mut lifecycle, |_| {
+                    progress_calls.fetch_add(1, Ordering::Relaxed);
+                })
+                .await
+                .expect_err("consent must not admit an unqualified manifest");
+            assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            assert!(matches!(
+                lifecycle.state(),
+                ModelState::VerificationFailed { .. }
+            ));
+            assert_eq!(progress_calls.load(Ordering::Relaxed), 0);
+            assert!(!destination.exists());
+            assert!(!destination.parent().unwrap().exists());
+            assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            let network_error = listener
+                .accept()
+                .expect_err("rejected manifests must not open a connection");
+            assert_eq!(network_error.kind(), ErrorKind::WouldBlock);
+        });
+    }
+}
+
+#[test]
+fn invalid_staged_artifacts_never_replace_an_existing_installation() {
+    let verified = verified_fixture_manifest();
+    let mut unpinned = verified.clone();
+    unpinned.revision = "main".to_owned();
+    let mut unverified = verified.clone();
+    unverified.files[0].sha256 = PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned();
+
+    for (manifest, content) in [
+        (verified.clone(), b"jello world".as_slice()),
+        (verified, b"hello".as_slice()),
+        (unpinned, b"hello world".as_slice()),
+        (unverified, b"hello world".as_slice()),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let staged = temp.path().join("staged");
+        let installed = temp.path().join("installed");
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::create_dir(&installed).unwrap();
+        std::fs::write(staged.join("model.bin"), content).unwrap();
+        std::fs::write(installed.join("model.bin"), b"previous installation").unwrap();
+
+        manifest
+            .promote_verified_installation(&staged, &installed)
+            .expect_err("corrupt, truncated, unpinned, or unverified assets must be rejected");
+
+        assert_eq!(
+            std::fs::read(installed.join("model.bin")).unwrap(),
+            b"previous installation"
+        );
+        assert_eq!(std::fs::read(staged.join("model.bin")).unwrap(), content);
+        assert_eq!(std::fs::read_dir(&staged).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2);
+    }
+}
+
+#[test]
+fn verified_staged_artifacts_can_be_installed() {
+    let manifest = verified_fixture_manifest();
+    let temp = tempfile::tempdir().unwrap();
+    let staged = temp.path().join("staged");
+    let installed = temp.path().join("installed");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("model.bin"), b"hello world").unwrap();
+
+    assert!(
+        manifest
+            .promote_verified_installation(&staged, &installed)
+            .expect("valid pinned artifacts pass the same installation path")
+            .is_none()
+    );
+    manifest.verify_dir(&installed).unwrap();
+    assert!(!staged.exists());
+    assert_eq!(
+        std::fs::read(installed.join("model.bin")).unwrap(),
+        b"hello world"
+    );
 }
 
 // ---------------------------------------------------------------------------

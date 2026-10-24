@@ -1859,36 +1859,38 @@ impl ModelManifest {
         }
     }
 
-    /// Built-in manifest for flashrank-nano (cross-encoder reranker).
+    /// Unavailable catalog entry for the `FlashRank` `TinyBERT` archive.
+    ///
+    /// Upstream distributes a ZIP, not the flat ONNX bundle previously described
+    /// here. Its pinned LFS metadata supplies the archive size and the model card
+    /// declares CC-BY-SA-4.0 (the Python library's Apache-2.0 license does not apply
+    /// to these weights). Keep the checksum unverified until archive extraction
+    /// and a compatible inference backend are qualified; metadata alone must not
+    /// make this model downloadable. The verified MS MARCO reranker is the default.
     #[must_use]
     pub fn flashrank_nano() -> Self {
-        const REVISION: &str = PLACEHOLDER_PINNED_REVISION;
-        const REPO: &str = "prithivida/flashrank-nano";
+        const REVISION: &str = "858a1ac046a05663a35367eac852d7f76feeefdd";
+        const REPO: &str = "prithivida/flashrank";
         Self {
             id: "flashrank-nano".to_owned(),
             version: "v1".to_owned(),
             display_name: Some("FlashRank Nano (Reranker)".to_owned()),
-            description: Some("FlashRank compact ONNX cross-encoder reranker model".to_owned()),
+            description: Some(
+                "Unavailable: FlashRank TinyBERT ZIP extraction and inference are not qualified; use ms-marco-minilm-l-6-v2"
+                    .to_owned(),
+            ),
             repo: REPO.to_owned(),
             revision: REVISION.to_owned(),
-            files: vec![
-                ModelFile {
-                    name: "onnx/model.onnx".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
-                    url: None,
-                },
-                ModelFile {
-                    name: "tokenizer.json".to_owned(),
-                    sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
-                    size: 0,
-                    url: None,
-                },
-            ],
-            license: "Apache-2.0".to_owned(),
+            files: vec![ModelFile {
+                name: "ms-marco-TinyBERT-L-2-v2.zip".to_owned(),
+                sha256: PLACEHOLDER_VERIFY_AFTER_DOWNLOAD.to_owned(),
+                size: 3_421_983,
+                url: None,
+            }],
+            license: "CC-BY-SA-4.0".to_owned(),
             dimension: None,
             tier: Some(ModelTier::Reranker),
-            download_size_bytes: 0,
+            download_size_bytes: 3_421_983,
         }
     }
 
@@ -2209,10 +2211,11 @@ impl ModelManifest {
         candidates
     }
 
-    /// Return the compiled-in catalog of all built-in model manifests.
+    /// Return the compiled-in catalog for default model acquisition.
     ///
-    /// This is the single source of truth for what models frankensearch needs.
-    /// The binary always knows what models it requires without network access.
+    /// Every entry must be production-ready, with pinned revisions, verified
+    /// checksums and known artifact sizes. Explicit-only and unavailable entries
+    /// belong in [`Self::opt_in_catalog`].
     #[must_use]
     pub fn builtin_catalog() -> ModelManifestCatalog {
         ModelManifestCatalog {
@@ -2224,13 +2227,13 @@ impl ModelManifest {
                 Self::snowflake_arctic_s(),
                 Self::nomic_embed(),
                 Self::jina_reranker_turbo(),
-                Self::flashrank_nano(),
             ],
         }
     }
 
-    /// Models that are discoverable and downloadable only after an explicit
-    /// model selection. They are excluded from default bulk acquisition.
+    /// Models that are discoverable only after listing or explicit selection.
+    /// They are excluded from default bulk acquisition. An explicit selection
+    /// does not bypass production-readiness checks for unavailable entries.
     #[must_use]
     pub fn opt_in_catalog() -> ModelManifestCatalog {
         ModelManifestCatalog {
@@ -2240,6 +2243,7 @@ impl ModelManifest {
                 Self::minilm_v2_native(),
                 Self::potion_base_8m(),
                 Self::potion_base_32m(),
+                Self::flashrank_nano(),
             ],
         }
     }
@@ -6482,6 +6486,7 @@ mod tests {
                 ModelManifest::minilm_v2_native(),
                 ModelManifest::potion_base_8m(),
                 ModelManifest::potion_base_32m(),
+                ModelManifest::flashrank_nano(),
             ]
         );
         opt_in.validate().unwrap();
@@ -6499,10 +6504,10 @@ mod tests {
     }
 
     #[test]
-    fn builtin_catalog_contains_all_models() {
+    fn builtin_catalog_contains_only_production_ready_defaults() {
         let catalog = ModelManifest::builtin_catalog();
         assert_eq!(catalog.schema_version, MANIFEST_SCHEMA_VERSION);
-        assert_eq!(catalog.models.len(), 7);
+        assert_eq!(catalog.models.len(), 6);
 
         let ids: Vec<&str> = catalog.models.iter().map(|m| m.id.as_str()).collect();
         assert!(ids.contains(&"potion-multilingual-128m"));
@@ -6511,9 +6516,15 @@ mod tests {
         assert!(ids.contains(&"snowflake-arctic-embed-s"));
         assert!(ids.contains(&"nomic-embed-text-v1.5"));
         assert!(ids.contains(&"jina-reranker-v1-turbo-en"));
-        assert!(ids.contains(&"flashrank-nano"));
+        assert!(!ids.contains(&"flashrank-nano"));
 
         catalog.validate().unwrap();
+        assert!(
+            catalog
+                .models
+                .iter()
+                .all(ModelManifest::is_production_ready)
+        );
     }
 
     #[test]
@@ -6540,18 +6551,8 @@ mod tests {
         for manifest in manifests {
             assert!(!manifest.version.is_empty());
             assert!(manifest.description.is_some());
-            // Some built-in manifests intentionally use placeholder metadata
-            // (sha256=PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, size=0) so that file
-            // sizes are confirmed at runtime during the first download rather
-            // than baked into source code. For those, we only assert the
-            // size-sum invariant, not a non-zero total.
-            let all_placeholder = manifest
-                .files
-                .iter()
-                .all(|file| file.sha256 == PLACEHOLDER_VERIFY_AFTER_DOWNLOAD);
-            if !all_placeholder {
-                assert!(manifest.download_size_bytes > 0);
-            }
+            assert!(manifest.download_size_bytes > 0);
+            assert!(manifest.files.iter().all(|file| file.size > 0));
             let summed_size: u64 = manifest.files.iter().map(|file| file.size).sum();
             assert_eq!(manifest.download_size_bytes, summed_size);
         }

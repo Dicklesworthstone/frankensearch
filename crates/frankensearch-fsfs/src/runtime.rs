@@ -13740,6 +13740,38 @@ impl FsfsRuntime {
         })
     }
 
+    /// Select missing, qualified models before showing a download consent prompt.
+    /// The command resolver also honors native-only builds' configured models.
+    fn missing_interactive_model_downloads(
+        &self,
+        model_root: &Path,
+    ) -> SearchResult<Vec<(ModelManifest, PathBuf)>> {
+        let mut missing = Vec::new();
+        for manifest in self.resolve_download_manifests()? {
+            manifest.validate()?;
+            let install_dir = Self::manifest_install_dir_name(&manifest);
+            let destination = model_root.join(&install_dir);
+            // Listing an unavailable model or selecting one explicitly must
+            // never turn it into an offer that fails only after consent.
+            if Self::non_production_manifest_entry(
+                &manifest,
+                &install_dir,
+                &destination,
+                "download",
+                self.cli_input.model_name.is_some(),
+            )?
+            .is_some()
+            {
+                continue;
+            }
+            let (_, verified, _) = Self::inspect_manifest_installation(&manifest, &destination);
+            if verified != Some(true) {
+                missing.push((manifest, destination));
+            }
+        }
+        Ok(missing)
+    }
+
     /// Offer one interactive consent prompt for missing registered semantic
     /// models before an indexing run resolves its embedder.
     ///
@@ -13765,15 +13797,7 @@ impl FsfsRuntime {
             return Ok(());
         }
         let model_root = self.resolve_download_model_root()?;
-        let mut missing = Vec::new();
-        for manifest in ModelManifest::builtin_catalog().models {
-            let install_dir = Self::manifest_install_dir_name(&manifest);
-            let destination = model_root.join(&install_dir);
-            let (_, verified, _) = Self::inspect_manifest_installation(&manifest, &destination);
-            if verified != Some(true) {
-                missing.push((manifest, destination));
-            }
-        }
+        let missing = self.missing_interactive_model_downloads(&model_root)?;
 
         let decision = interactive_model_provisioning_decision(
             offline,
@@ -16617,10 +16641,16 @@ impl FsfsRuntime {
         } else {
             "checksums missing"
         };
-        format!(
+        let mut message = format!(
             "{NON_PRODUCTION_MANIFEST_REASON} ({revision_state}, {checksum_state}) for '{}'",
             manifest.id
-        )
+        );
+        if manifest.id == "flashrank-nano" {
+            message.push_str(
+                "; the upstream TinyBERT ZIP requires qualified extraction and inference support; use `fsfs download-models ms-marco-minilm-l-6-v2`",
+            );
+        }
+        message
     }
 
     fn manifest_install_dir_name(manifest: &ModelManifest) -> String {
@@ -29558,6 +29588,78 @@ mod tests {
         let interactive_terminal = std::io::IsTerminal::is_terminal(&std::io::stdout())
             && std::io::IsTerminal::is_terminal(&std::io::stdin());
         assert!(!interactive_terminal || std::env::var_os("FSFS_ALLOW_TTY_TEST").is_some());
+    }
+
+    #[test]
+    fn interactive_model_provisioning_defaults_are_qualified_before_consent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_root = temp.path().join("fresh-model-cache");
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let selected = runtime
+            .resolve_download_manifests()
+            .expect("default download selection");
+        let missing = runtime
+            .missing_interactive_model_downloads(&model_root)
+            .expect("first-run download selection");
+
+        assert!(!missing.is_empty());
+        assert_eq!(
+            missing
+                .iter()
+                .map(|(manifest, _)| manifest)
+                .collect::<Vec<_>>(),
+            selected.iter().collect::<Vec<_>>()
+        );
+        for (manifest, destination) in missing {
+            manifest.validate().expect("valid manifest before consent");
+            assert!(manifest.is_production_ready(), "{}", manifest.id);
+            assert!(manifest.total_size_bytes() > 0, "{}", manifest.id);
+            assert!(manifest.files.iter().all(|file| file.size > 0));
+            assert_ne!(manifest.id, "flashrank-nano");
+            assert_eq!(
+                destination,
+                model_root.join(FsfsRuntime::manifest_install_dir_name(&manifest))
+            );
+        }
+        assert!(!model_root.exists(), "selection must not install anything");
+    }
+
+    #[test]
+    fn interactive_model_provisioning_filters_unqualified_catalog_entries() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Include opt-in entries to prove that readiness is checked before
+        // consent even if an unavailable model reaches the selection again.
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            download_list: true,
+            ..CliInput::default()
+        });
+        let missing = runtime
+            .missing_interactive_model_downloads(temp.path())
+            .expect("unqualified candidates are excluded");
+        assert_eq!(
+            missing.len(),
+            runtime.resolve_download_manifests().unwrap().len() - 1
+        );
+        assert!(
+            missing
+                .iter()
+                .all(|(manifest, _)| manifest.is_production_ready())
+        );
+        assert!(
+            missing
+                .iter()
+                .all(|(manifest, _)| manifest.id != "flashrank-nano")
+        );
+
+        let explicit = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            model_name: Some("flashrank-nano".to_owned()),
+            ..CliInput::default()
+        });
+        assert!(matches!(
+            explicit.missing_interactive_model_downloads(temp.path()),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "cli.download.model"
+        ));
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
     }
     #[cfg(unix)]
     use std::io::ErrorKind;
@@ -46908,7 +47010,7 @@ mod tests {
                 .await
                 .expect("list payload");
             assert_eq!(payload.operation, "list");
-            // 7 default + 4 opt-in (multilingual, native MiniLM, potion-base 8M/32M).
+            // 6 qualified defaults + 5 opt-in entries (including unavailable FlashRank).
             assert_eq!(payload.models.len(), 11);
             for opt_in in ["potion-base-8m", "potion-base-32m"] {
                 let entry = payload

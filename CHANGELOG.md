@@ -1,5 +1,33 @@
 # Changelog
 
+### Unreleased — Qualified first-run model downloads (#67, 2026-10-23)
+
+- Fresh interactive setup and bulk downloads exclude the unqualified
+  `flashrank-nano` entry. The default catalog retains the pinned, verified
+  `ms-marco-minilm-l-6-v2` bundle used by the native reranker. First-run setup
+  now shares the download command's model resolver (including native-only
+  configuration) and checks manifest validity and production readiness before
+  offering consent. Download verification and atomic promotion remain enforced.
+- FlashRank remains visible as unavailable in `download-models --list`;
+  explicit requests still fail closed and name the supported MS MARCO alternative.
+  Its metadata now identifies the actual `prithivida/flashrank` repository,
+  `ms-marco-TinyBERT-L-2-v2.zip`, the `CC-BY-SA-4.0` model license, and a
+  3,421,983-byte archive instead of an Apache-2.0, zero-byte flat ONNX bundle.
+- Upstream metadata was checked at revision
+  `858a1ac046a05663a35367eac852d7f76feeefdd`: the
+  [model card](https://huggingface.co/prithivida/flashrank/blob/858a1ac046a05663a35367eac852d7f76feeefdd/README.md)
+  declares the license, and the
+  [LFS pointer](https://huggingface.co/prithivida/flashrank/raw/858a1ac046a05663a35367eac852d7f76feeefdd/ms-marco-TinyBERT-L-2-v2.zip)
+  records SHA-256
+  `752eddf1c5ece3c5e6115e9ab52eb3b16436bbf9b3a091cbb62b5b8eadc47105`.
+  This is upstream archive metadata, not qualification of extracted model
+  files. The manifest checksum remains unverified: secure archive extraction
+  and compatible two-layer ONNX inference must be qualified before acquisition
+  can be enabled. The current native reranker consumes six-layer safetensors.
+- Regressions cover default catalog readiness, first-run pre-consent selection,
+  CLI refusal of unavailable models, and rejection of unpinned, unverified,
+  corrupted, or truncated artifacts.
+
 ### Unreleased — Quill bounds term streams before merge (2026-10-12)
 
 - Native concat admission also respects the existing POSTINGS, POSITIONS and

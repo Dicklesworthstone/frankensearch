@@ -22,6 +22,89 @@ fn empty_catalog_is_valid() {
 }
 
 #[test]
+fn default_acquisition_catalog_contains_only_production_ready_manifests() {
+    let catalog = ModelManifest::builtin_catalog();
+    catalog.validate().expect("default catalog is valid");
+    assert!(!catalog.models.is_empty(), "fresh setup must select models");
+
+    for manifest in &catalog.models {
+        assert!(
+            manifest.is_production_ready(),
+            "default setup must be able to acquire {}",
+            manifest.id
+        );
+        manifest
+            .validate_checksum_policy_for(true)
+            .expect("default downloads obey release checksum policy");
+        assert!(
+            manifest.files.iter().all(|file| file.size > 0),
+            "{} must report known, nonzero artifact sizes before consent",
+            manifest.id
+        );
+        assert_eq!(
+            manifest.download_size_bytes,
+            manifest.files.iter().map(|file| file.size).sum::<u64>(),
+            "{} must report the complete download size",
+            manifest.id
+        );
+        for file in &manifest.files {
+            assert!(
+                manifest
+                    .download_url(file)
+                    .contains(&format!("/resolve/{}/", manifest.revision)),
+                "{}:{} must download from its immutable revision",
+                manifest.id,
+                file.name
+            );
+        }
+    }
+
+    for tier in [ModelTier::Fast, ModelTier::Quality, ModelTier::Reranker] {
+        assert!(
+            catalog.models.iter().any(|model| model.tier == Some(tier)),
+            "fresh setup must retain the {tier:?} tier"
+        );
+    }
+    let native_reranker = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "ms-marco-minilm-l-6-v2")
+        .expect("default setup retains the supported native reranker");
+    assert!(
+        native_reranker
+            .files
+            .iter()
+            .any(|file| file.name == "model.safetensors")
+    );
+    assert!(
+        catalog
+            .models
+            .iter()
+            .all(|model| model.id != "flashrank-nano")
+    );
+}
+
+#[test]
+fn flashrank_upstream_metadata_does_not_qualify_it_for_default_setup() {
+    let catalog = ModelManifest::opt_in_catalog();
+    let flashrank = catalog
+        .models
+        .iter()
+        .find(|model| model.id == "flashrank-nano")
+        .expect("explicit FlashRank selection retains an unavailable descriptor");
+    flashrank.validate().expect("descriptor metadata is valid");
+    assert_eq!(flashrank.repo, "prithivida/flashrank");
+    assert_eq!(flashrank.license, "CC-BY-SA-4.0");
+    assert_eq!(flashrank.files.len(), 1);
+    assert_eq!(flashrank.files[0].name, "ms-marco-TinyBERT-L-2-v2.zip");
+    assert_eq!(flashrank.files[0].size, 3_421_983);
+    assert_eq!(flashrank.total_size_bytes(), 3_421_983);
+    assert!(!flashrank.has_verified_checksums());
+    assert!(!flashrank.is_production_ready());
+    assert!(flashrank.validate_checksum_policy_for(true).is_err());
+}
+
+#[test]
 fn catalog_json_roundtrip_preserves_all_fields() {
     let catalog = ModelManifestCatalog {
         schema_version: MANIFEST_SCHEMA_VERSION,

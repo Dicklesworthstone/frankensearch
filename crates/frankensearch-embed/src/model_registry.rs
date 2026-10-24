@@ -181,11 +181,11 @@ const REGISTERED_RERANKERS: [RegisteredReranker; 5] = [
     RegisteredReranker {
         name: "flashrank-nano",
         id: "flashrank-nano",
-        description: "FlashRank compact ONNX reranker",
+        description: "FlashRank TinyBERT archive (download/inference not qualified)",
         requires_model_files: true,
         release_date: "2024-06-01",
-        huggingface_id: "prithivida/flashrank-nano",
-        size_bytes: 4_000_000,
+        huggingface_id: "prithivida/flashrank",
+        size_bytes: 3_421_983,
         is_baseline: false,
     },
     RegisteredReranker {
