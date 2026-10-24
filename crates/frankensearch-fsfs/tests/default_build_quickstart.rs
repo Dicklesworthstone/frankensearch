@@ -175,6 +175,7 @@ mod loader_only {
                 .env_remove("FRANKENSEARCH_INDEX_DIR")
                 .env_remove("FSFS_STORAGE_INDEX_DIR")
                 .env_remove("FRANKENSEARCH_STORAGE_INDEX_DIR")
+                .env_remove("FSFS_DISABLE_QUERY_CACHE")
                 .env_remove("HF_HOME")
                 .env_remove("HUGGINGFACE_HUB_CACHE");
             command
@@ -613,6 +614,127 @@ mod loader_only {
         .expect("write typography document");
     }
 
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    fn verify_real_fast_model_cache_isolation(fsfs: &IsolatedFsfs, root: &Path, index: &Path) {
+        let query = "producer policy controls retained network retries";
+        let selected = root.join("cached-fast-model.toml");
+        fs::write(
+            &selected,
+            "[indexing]\nfast_model = \"potion-multilingual-128M\"\n",
+        )
+        .unwrap();
+        let search = |label: &str, config: &Path| {
+            fsfs.run_with_env(
+                root,
+                label,
+                [
+                    "search",
+                    query,
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--no-daemon",
+                    "--fast-only",
+                    "--limit",
+                    "3",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &[("FRANKENSEARCH_LOG", "info")],
+            )
+        };
+        let cold = search("fast-model-cache-cold", &selected);
+        let original = parse_success_envelope("real fast-model cache seed", &cold);
+        assert!(cold.stderr.contains("Model2Vec model loaded"), "{cold:?}");
+        assert!(
+            original["data"]["hits"]
+                .as_array()
+                .is_some_and(|hits| !hits.is_empty())
+        );
+        let matching_records = || {
+            fs::read_dir(index.join("query_cache"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter_map(|path| {
+                    let bytes = fs::read(&path).ok()?;
+                    let record: Value = serde_json::from_slice(&bytes).ok()?;
+                    (record["key"]["query"] == query).then_some((path, bytes, record))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut records = matching_records();
+        assert_eq!(records.len(), 1, "the real query must persist one answer");
+        let (cache_path, cache_bytes, record) = records.pop().unwrap();
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v18");
+        assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
+
+        let warm = search("fast-model-cache-warm", &selected);
+        let replayed = parse_success_envelope("real fast-model cache replay", &warm);
+        assert_eq!(replayed["data"], original["data"]);
+        assert!(
+            !warm.stderr.contains("Model2Vec model loaded"),
+            "the positive control must actually reuse the persisted answer: {warm:?}"
+        );
+
+        for (label, model) in [
+            ("8m", "potion-base-8m"),
+            ("32m", "potion-base-32m"),
+            ("unknown", "missing-fast-model"),
+            ("malformed", "potion/multilingual/128m"),
+        ] {
+            let config = root.join(format!("cached-fast-model-{label}.toml"));
+            fs::write(&config, format!("[indexing]\nfast_model = \"{model}\"\n")).unwrap();
+            let refused = search(&format!("fast-model-cache-refuse-{label}"), &config);
+            assert!(!refused.timed_out, "{refused:?}");
+            assert!(
+                !refused.status.success(),
+                "changing the producer must not replay the old answer: {refused:?}"
+            );
+            let error: Value = serde_json::from_str(&refused.stdout).unwrap();
+            assert_eq!(error["ok"], false, "{error}");
+            assert!(error["data"].is_null(), "{error}");
+            assert!(
+                error["error"]["code"]
+                    .as_str()
+                    .is_some_and(|code| !code.is_empty()),
+                "producer mismatch must remain a typed failure: {error}"
+            );
+            if matches!(label, "unknown" | "malformed") {
+                assert_eq!(error["error"]["code"], "invalid_config", "{error}");
+                assert!(
+                    refused.combined_output().contains("indexing.fast_model"),
+                    "{refused:?}"
+                );
+            }
+            assert_eq!(fs::read(&cache_path).unwrap(), cache_bytes);
+            assert_eq!(matching_records().len(), 1);
+        }
+
+        // Case and surrounding whitespace identify the same registered producer.
+        // Their canonical cache key should retain the valid existing answer.
+        let alias = root.join("cached-fast-model-alias.toml");
+        fs::write(
+            &alias,
+            "[indexing]\nfast_model = \"  POTION-MULTILINGUAL-128M  \"\n",
+        )
+        .unwrap();
+        for (label, config) in [("alias", &alias), ("restored", &selected)] {
+            let outcome = search(&format!("fast-model-cache-{label}"), config);
+            let envelope = parse_success_envelope("retained fast-model answer", &outcome);
+            assert_eq!(envelope["data"], original["data"]);
+            assert!(
+                !outcome.stderr.contains("Model2Vec model loaded"),
+                "{outcome:?}"
+            );
+        }
+        assert_eq!(fs::read(cache_path).unwrap(), cache_bytes);
+        eprintln!(
+            "[default-build-e2e] stage=fast-model-answer-cache real_potion=true warm_replay=true changed_producer_refused=true malformed_selection_refused=true canonical_alias_reused=true original_preserved=true"
+        );
+    }
+
     fn write_legacy_same_id_receipt_over_corrupt_potion_cache(model_root: &Path) {
         let manifest = ModelManifest::potion_128m();
         let model_dir = model_root.join("potion-multilingual-128M");
@@ -802,6 +924,10 @@ mod loader_only {
             assert_eq!(frames.len(), 4, "{frames:?}");
             assert_eq!(frames[0]["event"], "attested");
             assert_eq!(
+                frames[0]["policy"]["fast_model"],
+                "potion-multilingual-128m"
+            );
+            assert_eq!(
                 frames[0]["cached"], false,
                 "distinct queries must execute against the same model owner"
             );
@@ -866,6 +992,68 @@ mod loader_only {
                     "{stream:?}"
                 );
                 assert!(!stream.stderr.contains("falling back"));
+            }
+            if number == 0 {
+                for (label, model) in [
+                    ("8m", "potion-base-8m"),
+                    ("32m", "potion-base-32m"),
+                    ("malformed", "potion/multilingual/128m"),
+                ] {
+                    let changed_config = root.join(format!("daemon-fast-{label}.toml"));
+                    fs::write(
+                        &changed_config,
+                        format!(
+                            "[indexing]\nfast_model = \"{model}\"\n[search]\nquality_timeout_ms = 5000\n"
+                        ),
+                    )
+                    .unwrap();
+                    let refused = fsfs.run(
+                        root,
+                        &format!("daemon-fast-producer-refuse-{label}"),
+                        [
+                            "search",
+                            query,
+                            "--daemon",
+                            "--daemon-socket",
+                            owner.socket.to_str().unwrap(),
+                            "--config",
+                            changed_config.to_str().unwrap(),
+                            "--index-dir",
+                            index.to_str().unwrap(),
+                            "--limit",
+                            "3",
+                            "--stream",
+                            "--format",
+                            "jsonl",
+                        ],
+                        QUICKSTART_TIMEOUT,
+                    );
+                    assert!(!refused.timed_out, "{refused:?}");
+                    assert!(
+                        !refused.status.success(),
+                        "a warmed daemon must not serve another selected producer: {refused:?}"
+                    );
+                    assert!(
+                        !refused
+                            .stderr
+                            .contains("falling back to in-process retrieval"),
+                        "{refused:?}"
+                    );
+                    let expected = if label == "malformed" {
+                        "indexing.fast_model"
+                    } else {
+                        "did not acknowledge the requested search policy"
+                    };
+                    assert!(refused.combined_output().contains(expected), "{refused:?}");
+                    for line in refused.stdout.lines() {
+                        let frame: Value = serde_json::from_str(line).unwrap();
+                        assert_ne!(frame["event"], "result", "{frame}");
+                        assert_ne!(
+                            frame["payload"]["reason_code"], "query.stream.initial_ready",
+                            "policy refusal must precede any answer: {frame}"
+                        );
+                    }
+                }
             }
             assert!(owner.child.try_wait().unwrap().is_none());
         }
@@ -1107,11 +1295,13 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v13");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v14");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
                     let mut contracts = sha2::Sha256::new();
                     for manifest in [
                         ModelArtifactManifestV1::potion_128m_native().unwrap(),
+                        ModelArtifactManifestV1::potion_base_8m_native().unwrap(),
+                        ModelArtifactManifestV1::potion_base_32m_native().unwrap(),
                         ModelArtifactManifestV1::minilm_fastembed().unwrap(),
                         ModelArtifactManifestV1::snowflake_fastembed().unwrap(),
                         ModelArtifactManifestV1::nomic_fastembed().unwrap(),
@@ -1129,6 +1319,7 @@ mod loader_only {
                         "the actual serving binary acknowledges its registered producers"
                     );
                     assert_eq!(response["policy"]["quality_weight_bits"], weight.to_bits());
+                    assert_eq!(response["policy"]["fast_model"], "potion-multilingual-128m");
                     assert_eq!(response["policy"]["quality_model"], "allminilml6v2");
                     assert_eq!(response["policy"]["quality_timeout_ms"], 5000);
                     assert_eq!(
@@ -4587,6 +4778,7 @@ mod loader_only {
                 &[("FSFS_COMPLETE_GENERATIONS", "0")],
             );
             parse_success_envelope("legacy index for the progressive daemon", &legacy);
+            verify_real_fast_model_cache_isolation(&fsfs, temp.path(), &legacy_index);
             verify_real_progressive_daemon(&fsfs, temp.path(), &legacy_index);
         }
 

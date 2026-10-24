@@ -612,7 +612,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v15: extension filter clauses widen each other (`ext:rs ext:md`).
 // v16: `HashMap::new`, `std::io` and URLs reach the lexical lane.
 // v17: snippets mask credential tokens and private-key material.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v17";
+// v18: cached answers bind the selected fast model and every registered producer.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v18";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -625,8 +626,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v11 / stream v9: colons that name no field reach the lexical lane.
 // v12 / stream v10: snippets mask credential tokens and private-key material.
 // v13 / stream v11: apply and attest the client's rerank deadline.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v13";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v11";
+// v14 / stream v12: attest the selected fast model before any cached phase.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v14";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v12";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -1079,13 +1081,19 @@ impl AdmittedEmbedder {
     /// [`frankensearch_embed::CoalescingEmbedder`] is attached so concurrent
     /// or bursty `embed_admitted` queries micro-batch automatically with zero
     /// idle timer delay.
-    fn admit(embedder: Arc<dyn Embedder>) -> SearchResult<Self> {
+    fn admit(cx: &Cx, embedder: Arc<dyn Embedder>) -> SearchResult<Self> {
+        let checkpoint = || {
+            cx.checkpoint().map_err(|_| SearchError::Cancelled {
+                phase: "embedding_admission".to_owned(),
+                reason: "runtime cancellation requested".to_owned(),
+            })
+        };
+        checkpoint()?;
         let identity = embedder.identity()?.clone();
         identity.validate()?;
         let coalescer = if embedder.bound_batch_is_native() {
-            let init_cx = Cx::for_request();
-            frankensearch_embed::CoalescingEmbedder::new_auto(
-                &init_cx,
+            match frankensearch_embed::CoalescingEmbedder::new_auto(
+                cx,
                 Arc::clone(&embedder),
                 identity.clone(),
                 frankensearch_embed::CoalescerConfig {
@@ -1095,11 +1103,15 @@ impl AdmittedEmbedder {
                     use_priority_lanes: true,
                 },
                 frankensearch_embed::CoalescerLimits::default(),
-            )
-            .ok()
+            ) {
+                Ok(coalescer) => Some(coalescer),
+                Err(error @ SearchError::Cancelled { .. }) => return Err(error),
+                Err(_) => None,
+            }
         } else {
             None
         };
+        checkpoint()?;
         Ok(Self {
             embedder,
             coalescer,
@@ -1359,6 +1371,8 @@ struct SearchCacheKey {
     /// Bind persisted answers to the registered local producers without
     /// loading the quality model before Initial. Old keys fail deserialization.
     embedding_contracts: String,
+    /// Canonical registered fast-model id, checked before looking up an answer.
+    fast_model: String,
     quality_model: String,
     query: String,
     requested_limit: usize,
@@ -1427,6 +1441,7 @@ struct SearchServeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SearchServePolicy {
     embedding_contracts: String,
+    fast_model: String,
     quality_model: String,
     quality_weight_bits: u32,
     quality_timeout_ms: u64,
@@ -9861,20 +9876,25 @@ impl FsfsRuntime {
 
     #[cfg(unix)]
     fn resolve_daemon_socket_path(&self) -> SearchResult<PathBuf> {
+        // Explicit sockets must reject invalid selections just as default
+        // socket routing does, before contacting a retained warm daemon.
+        self.selected_fast_model_id()?;
         if let Some(path) = self.cli_input.daemon_socket.as_deref() {
             return absolutize_path(path);
         }
         self.default_daemon_socket_path()
     }
 
-    /// `fsfs-query-<index>-<variant>.sock`: one daemon per index, quality model
-    /// and serve protocol. The protocol is part of the name so an upgraded
-    /// client whose results changed spawns its own daemon instead of being
-    /// refused by a warm older one until that one idles out.
+    /// `fsfs-query-<index>-<variant>.sock`: one daemon per index, fast/quality
+    /// model selection and serve protocol. The protocol is part of the name so
+    /// an upgraded client whose results changed spawns its own daemon instead
+    /// of being refused by a warm older one until that one idles out.
     #[cfg(unix)]
     fn default_daemon_socket_path(&self) -> SearchResult<PathBuf> {
+        let fast_model = self.selected_fast_model_id()?;
         let (socket_dir, index_stem) = self.default_daemon_socket_stem()?;
         let variant = Self::daemon_socket_variant(
+            &fast_model,
             &self.config.indexing.quality_model,
             self.config.pressure.degradation_override,
             FSFS_SEARCH_SERVE_SCHEMA_VERSION,
@@ -9887,16 +9907,19 @@ impl FsfsRuntime {
         ))
     }
 
-    /// Socket name suffix that separates daemons by quality model and serve
-    /// protocol.
+    /// Socket name suffix that separates daemons by checked fast-model id,
+    /// quality model and serve protocol.
     #[cfg(unix)]
     fn daemon_socket_variant(
+        fast_model: &str,
         quality_model: &str,
         degradation_override: crate::config::DegradationOverrideMode,
         serve_version: &str,
         stream_version: &str,
     ) -> String {
         let mut hasher = Sha256::new();
+        hasher.update(fast_model.as_bytes());
+        hasher.update([0]);
         hasher.update(normalize_model_key(quality_model).as_bytes());
         hasher.update([0]);
         // A daemon applies its own degradation override to every request, so
@@ -11612,6 +11635,29 @@ impl FsfsRuntime {
         (candidates, details)
     }
 
+    /// Resolve the same registered id the fast loader uses before accepting a
+    /// warm answer or daemon. Punctuation-stripping normalization is not model
+    /// selection: it could make an invalid name share a valid model's cache.
+    #[cfg_attr(not(feature = "semantic-support"), allow(clippy::unnecessary_wraps))]
+    fn selected_fast_model_id(&self) -> SearchResult<String> {
+        #[cfg(feature = "semantic-support")]
+        {
+            let selected = select_fast_model(&self.config.indexing.fast_model)?;
+            Ok(selected.download_manifest().id.clone())
+        }
+        #[cfg(not(feature = "semantic-support"))]
+        {
+            // Lite builds do not execute a fast semantic loader. Preserve its
+            // configured name without conflating punctuation-distinct values.
+            let name = self.config.indexing.fast_model.trim();
+            Ok(if name.is_empty() {
+                ModelManifest::potion_128m().id
+            } else {
+                name.to_ascii_lowercase()
+            })
+        }
+    }
+
     fn registered_embedding_contracts() -> SearchResult<String> {
         use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
 
@@ -11621,6 +11667,8 @@ impl FsfsRuntime {
         let mut contracts = Sha256::new();
         for manifest in [
             ModelArtifactManifestV1::potion_128m_native()?,
+            ModelArtifactManifestV1::potion_base_8m_native()?,
+            ModelArtifactManifestV1::potion_base_32m_native()?,
             ModelArtifactManifestV1::minilm_fastembed()?,
             ModelArtifactManifestV1::snowflake_fastembed()?,
             ModelArtifactManifestV1::nomic_fastembed()?,
@@ -11640,6 +11688,7 @@ impl FsfsRuntime {
     ) -> SearchResult<SearchCacheKey> {
         Ok(SearchCacheKey {
             embedding_contracts: Self::registered_embedding_contracts()?,
+            fast_model: self.selected_fast_model_id()?,
             quality_model: normalize_model_key(&self.config.indexing.quality_model),
             query: Self::normalize_search_query(query),
             requested_limit,
@@ -11666,6 +11715,9 @@ impl FsfsRuntime {
     fn search_cache_key_hash(key: &SearchCacheKey) -> String {
         let mut hasher = Sha256::new();
         hasher.update(key.embedding_contracts.as_bytes());
+        hasher.update([0]);
+        hasher.update(key.fast_model.as_bytes());
+        hasher.update([0]);
         hasher.update(key.quality_model.as_bytes());
         hasher.update([0]);
         hasher.update(key.query.as_bytes());
@@ -11691,6 +11743,7 @@ impl FsfsRuntime {
     fn search_serve_policy(&self) -> SearchResult<SearchServePolicy> {
         Ok(SearchServePolicy {
             embedding_contracts: Self::registered_embedding_contracts()?,
+            fast_model: self.selected_fast_model_id()?,
             quality_model: normalize_model_key(&self.config.indexing.quality_model),
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
@@ -12949,7 +13002,7 @@ impl FsfsRuntime {
             && resources.fast_embedder.is_none()
             && !resources.fast_embedder_attempted
         {
-            self.maybe_prepare_fast_embedder(resources)?;
+            self.maybe_prepare_fast_embedder(cx, resources)?;
         }
         if semantic_readiness_required
             && resources.vector_index.is_some()
@@ -17661,11 +17714,11 @@ impl FsfsRuntime {
         // identity, so capture it once and hold each batch to it.
         let fast_admission = embedder
             .as_ref()
-            .map(|embedder| AdmittedEmbedder::admit(Arc::clone(embedder)))
+            .map(|embedder| AdmittedEmbedder::admit(cx, Arc::clone(embedder)))
             .transpose()?;
         let quality_admission = quality_embedder
             .as_ref()
-            .map(|embedder| AdmittedEmbedder::admit(Arc::clone(embedder)))
+            .map(|embedder| AdmittedEmbedder::admit(cx, Arc::clone(embedder)))
             .transpose()?;
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
 
@@ -21689,6 +21742,7 @@ impl FsfsRuntime {
 
     fn maybe_prepare_fast_embedder(
         &self,
+        cx: &Cx,
         resources: &mut SearchExecutionResources,
     ) -> SearchResult<()> {
         if resources.fast_embedder.is_some() || resources.fast_embedder_attempted {
@@ -21727,7 +21781,7 @@ impl FsfsRuntime {
                     dimension = embedder.dimension(),
                     "{message}"
                 );
-                resources.fast_embedder = Some(AdmittedEmbedder::admit(embedder)?);
+                resources.fast_embedder = Some(AdmittedEmbedder::admit(cx, embedder)?);
                 Ok(())
             }
             Err(error) => {
@@ -22021,7 +22075,7 @@ impl FsfsRuntime {
                 if let Some(index) = resources.quality_vector_index.as_ref() {
                     Self::admit_quality_generation_for_embedder(index, embedder.as_ref())?;
                 }
-                resources.quality_embedder = Some(AdmittedEmbedder::admit(embedder)?);
+                resources.quality_embedder = Some(AdmittedEmbedder::admit(cx, embedder)?);
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -22144,7 +22198,10 @@ impl FsfsRuntime {
                 WATCH_OPEN_BUDGET,
             )?;
             Self::admit_quality_generation_for_embedder(&quality_index, quality_embedder.as_ref())?;
-            Some((quality_index, AdmittedEmbedder::admit(quality_embedder)?))
+            Some((
+                quality_index,
+                AdmittedEmbedder::admit(cx, quality_embedder)?,
+            ))
         } else {
             None
         };
@@ -22162,7 +22219,7 @@ impl FsfsRuntime {
             target_root,
             lexical_index,
             vector_index,
-            AdmittedEmbedder::admit(embedder)?,
+            AdmittedEmbedder::admit(cx, embedder)?,
         )
         .with_storage_db_path(storage_db_path);
         if let Some((quality_index, quality_embedder)) = quality_tier {
@@ -29523,7 +29580,7 @@ fn emit_model_free_build_hint() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
     use std::future::{Future, poll_fn};
 
@@ -29770,10 +29827,10 @@ mod tests {
         FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
         FsfsFlushAck, FsfsFlushRequest, FsfsIndexStatus, FsfsModelStatus, FsfsRuntime,
         FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, IndexingBatchEmbeddingOutcome,
-        InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheRecord, SearchDashboardState,
-        SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
-        SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
-        VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
+        InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheKey, SearchCacheRecord,
+        SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources,
+        SearchServeRequest, SemanticGateDecisionInput, SemanticRecallDecisionInput,
+        VectorIndexWriteAction, VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
         degradation_controller_config_for_profile, detect_context_preview_format,
         is_likely_html_fragment, normalize_html_fragment_for_markdown,
         payload_has_admitted_semantic_hits, payload_has_hash_control_hits, read_durable_json,
@@ -29955,6 +30012,114 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fast_model_selection_binds_warm_cache_and_daemon_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut keys = HashSet::new();
+        #[cfg(unix)]
+        let mut socket_paths = HashSet::new();
+        for (id, aliases) in [
+            (
+                "potion-multilingual-128m",
+                vec![
+                    "potion-multilingual-128M",
+                    " POTION-MULTILINGUAL-128m ",
+                    "",
+                    "  ",
+                ],
+            ),
+            ("potion-base-8m", vec!["potion-base-8M", " POTION-BASE-8m "]),
+            (
+                "potion-base-32m",
+                vec!["potion-base-32M", " POTION-BASE-32m "],
+            ),
+        ] {
+            let mut config = FsfsConfig::default();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.indexing.fast_model = id.to_owned();
+            let runtime = FsfsRuntime::new(config);
+            let key = runtime
+                .search_cache_key("query", 10, SearchExecutionMode::Full)
+                .unwrap();
+            assert_eq!(key.fast_model, id);
+            assert!(keys.insert(FsfsRuntime::search_cache_key_hash(&key)));
+            let policy = runtime.search_serve_policy().unwrap();
+            assert_eq!(policy.fast_model, id);
+            #[cfg(unix)]
+            let socket_path = runtime.default_daemon_socket_path().unwrap();
+            #[cfg(unix)]
+            assert!(socket_paths.insert(socket_path.clone()));
+
+            for alias in aliases {
+                let mut alias_runtime = runtime.clone();
+                alias_runtime.config.indexing.fast_model = alias.to_owned();
+                assert_eq!(
+                    alias_runtime
+                        .search_cache_key("query", 10, SearchExecutionMode::Full)
+                        .unwrap(),
+                    key,
+                    "an actual loader alias must reuse only its own cache: {alias:?}"
+                );
+                assert_eq!(alias_runtime.search_serve_policy().unwrap(), policy);
+                #[cfg(unix)]
+                assert_eq!(
+                    alias_runtime.default_daemon_socket_path().unwrap(),
+                    socket_path
+                );
+            }
+
+            let mut unbound = serde_json::to_value(&key).unwrap();
+            unbound.as_object_mut().unwrap().remove("fast_model");
+            assert!(
+                serde_json::from_value::<SearchCacheKey>(unbound).is_err(),
+                "a cached answer must retain the selected fast model"
+            );
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn invalid_fast_model_is_rejected_before_warm_cache_or_daemon_routing() {
+        for name in [
+            "potion",
+            "hash",
+            "potionbase8m",
+            "potion-base-8m!",
+            "potion_base_8m",
+            "potion-base-2M",
+        ] {
+            let mut config = FsfsConfig::default();
+            config.indexing.fast_model = name.to_owned();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                daemon_socket: Some(PathBuf::from("explicit-warm-daemon.sock")),
+                ..CliInput::default()
+            });
+            for error in [
+                runtime
+                    .search_cache_key("query", 10, SearchExecutionMode::Full)
+                    .unwrap_err(),
+                runtime.search_serve_policy().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, value, .. }
+                        if field == "indexing.fast_model" && value == name),
+                    "invalid selection must not acquire a normalized cache identity: {name:?}"
+                );
+            }
+            #[cfg(unix)]
+            for error in [
+                runtime.default_daemon_socket_path().unwrap_err(),
+                runtime.resolve_daemon_socket_path().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, value, .. }
+                        if field == "indexing.fast_model" && value == name),
+                    "invalid selection must not contact a retained daemon: {name:?}"
+                );
+            }
+        }
+    }
+
     /// One stable synthetic identity per `(id, dimension)`, for fixtures that
     /// only need admission to see a valid identity of their own.
     fn test_identity(
@@ -29985,13 +30150,17 @@ mod tests {
 
     /// Admit a test embedder the way search admission does.
     fn admitted(embedder: impl Embedder + 'static) -> super::AdmittedEmbedder {
-        super::AdmittedEmbedder::admit(Arc::new(embedder)).expect("test embedder has an identity")
+        super::AdmittedEmbedder::admit(&Cx::for_request(), Arc::new(embedder))
+            .expect("test embedder has an identity")
     }
 
     /// Admit a shared test embedder while the test keeps its handle.
     fn admitted_shared<E: Embedder + 'static>(embedder: &Arc<E>) -> super::AdmittedEmbedder {
-        super::AdmittedEmbedder::admit(Arc::clone(embedder) as Arc<dyn Embedder>)
-            .expect("test embedder has an identity")
+        super::AdmittedEmbedder::admit(
+            &Cx::for_request(),
+            Arc::clone(embedder) as Arc<dyn Embedder>,
+        )
+        .expect("test embedder has an identity")
     }
 
     /// Query vectors are explicit basis vectors; this is a ranking fixture,
@@ -30219,7 +30388,8 @@ mod tests {
             drifting.drifted = Some(test_identity("drifted-model-2", 2).clone());
             let drifting = Arc::new(drifting);
             let admission =
-                super::AdmittedEmbedder::admit(Arc::clone(&drifting) as Arc<dyn Embedder>).unwrap();
+                super::AdmittedEmbedder::admit(&cx, Arc::clone(&drifting) as Arc<dyn Embedder>)
+                    .unwrap();
             admission.check_current_identity().unwrap();
             drifting.drift.store(true, Ordering::SeqCst);
             assert!(admission.check_current_identity().is_err());
@@ -30289,6 +30459,89 @@ mod tests {
                 assert!(
                     matches!(result, Err(SearchError::Cancelled { .. })),
                     "{result:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn embedder_admission_preserves_caller_cancellation_without_fallback() {
+        struct AdmissionProbe {
+            cx: Cx,
+            native_batch: bool,
+            cancel_on_identity_call: usize,
+            identity_calls: AtomicUsize,
+        }
+
+        impl Embedder for AdmissionProbe {
+            fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                panic!("admission must not start inference")
+            }
+
+            fn identity(
+                &self,
+            ) -> super::SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+                let call = self.identity_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if call == self.cancel_on_identity_call {
+                    self.cx.set_cancel_requested(true);
+                }
+                Ok(test_identity("admission-probe", 2))
+            }
+
+            fn bound_batch_is_native(&self) -> bool {
+                self.native_batch
+            }
+
+            fn dimension(&self) -> usize {
+                2
+            }
+
+            fn id(&self) -> &'static str {
+                "admission-probe"
+            }
+
+            fn model_name(&self) -> &'static str {
+                "Admission Probe"
+            }
+
+            fn is_semantic(&self) -> bool {
+                true
+            }
+
+            fn category(&self) -> ModelCategory {
+                ModelCategory::StaticEmbedder
+            }
+        }
+
+        // Reject both kinds of provider before work when already cancelled,
+        // and cancellation during direct or coalesced admission as well.
+        for (native_batch, cancel_on_identity_call) in
+            [(false, 0), (true, 0), (false, 1), (true, 2)]
+        {
+            run_test_with_cx(|cx| async move {
+                let probe = Arc::new(AdmissionProbe {
+                    cx: cx.clone(),
+                    native_batch,
+                    cancel_on_identity_call,
+                    identity_calls: AtomicUsize::new(0),
+                });
+                cx.set_cancel_requested(cancel_on_identity_call == 0);
+                let result =
+                    super::AdmittedEmbedder::admit(&cx, Arc::clone(&probe) as Arc<dyn Embedder>);
+                cx.set_cancel_requested(false);
+                let expected_phase = if native_batch && cancel_on_identity_call == 2 {
+                    "coalescing_embedder"
+                } else {
+                    "embedding_admission"
+                };
+                assert!(matches!(
+                    result,
+                    Err(SearchError::Cancelled { phase, .. }) if phase == expected_phase
+                ));
+                assert_eq!(
+                    probe.identity_calls.load(Ordering::SeqCst),
+                    cancel_on_identity_call,
+                    "admission continued after cancellation"
                 );
             });
         }
@@ -31360,6 +31613,11 @@ mod tests {
             serde_json::from_value::<super::SearchServeResponse>(unbound).is_err(),
             "an omitted deadline cannot acknowledge a current request"
         );
+        response.schema_version = "fsfs.search.serve.v13".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that does not bind fast-model selection cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v12".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -31415,6 +31673,39 @@ mod tests {
         assert!(
             serde_json::from_str::<super::SearchServeResponse>(legacy).is_err(),
             "old daemon success cannot deserialize as an acknowledged policy"
+        );
+    }
+
+    #[test]
+    fn daemon_attestation_requires_the_selected_fast_model() {
+        let runtime = FsfsRuntime::new(FsfsConfig::default());
+        let mut response = super::SearchServeResponse {
+            schema_version: super::FSFS_SEARCH_SERVE_SCHEMA_VERSION.to_owned(),
+            policy: Some(runtime.search_serve_policy().unwrap()),
+            ok: true,
+            query: "query".to_owned(),
+            mode: "full".to_owned(),
+            cached: true,
+            payloads: Vec::new(),
+            error: None,
+        };
+        runtime.validate_search_serve_policy(&response).unwrap();
+        for selected in ["potion-base-8m", "potion-base-32m"] {
+            response.policy.as_mut().unwrap().fast_model = selected.to_owned();
+            assert!(
+                runtime.validate_search_serve_policy(&response).is_err(),
+                "a warm daemon for {selected} must not acknowledge the default fast model"
+            );
+        }
+        response.policy = Some(runtime.search_serve_policy().unwrap());
+        let mut unbound = serde_json::to_value(&response).unwrap();
+        unbound["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fast_model");
+        assert!(
+            serde_json::from_value::<super::SearchServeResponse>(unbound).is_err(),
+            "a missing fast-model field cannot acknowledge any selected producer"
         );
     }
 
@@ -37192,6 +37483,7 @@ mod tests {
         };
         use crate::config::DegradationOverrideMode::{Auto, ForceLexicalOnly};
         let current = FsfsRuntime::daemon_socket_variant(
+            "potion-multilingual-128m",
             "all-MiniLM-L6-v2",
             Auto,
             FSFS_SEARCH_SERVE_SCHEMA_VERSION,
@@ -37225,7 +37517,13 @@ mod tests {
             ),
         ] {
             assert_ne!(
-                FsfsRuntime::daemon_socket_variant(model, degradation, serve, stream),
+                FsfsRuntime::daemon_socket_variant(
+                    "potion-multilingual-128m",
+                    model,
+                    degradation,
+                    serve,
+                    stream
+                ),
                 current,
                 "{model} {degradation:?} {serve} {stream}"
             );
@@ -52276,6 +52574,8 @@ mod tests {
                 "fsfs.search.cache.v15",
                 // Printed credentials in snippets.
                 "fsfs.search.cache.v16",
+                // Replayed another configured fast model's answers.
+                "fsfs.search.cache.v17",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
@@ -52425,6 +52725,98 @@ mod tests {
                 "the cache writer must preserve the execution pin instead of recomputing \
                  and relabeling stale payloads as the currently visible generation"
             );
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn persistent_cache_never_replays_another_selected_fast_model() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let index_root = temp.path().join("index");
+            fs::create_dir(&index_root).unwrap();
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(index_root.clone()),
+                ..CliInput::default()
+            });
+            let query = "cached producer witness";
+            let key = runtime
+                .search_cache_key(query, 10, SearchExecutionMode::Full)
+                .unwrap();
+            let fingerprint = runtime.search_index_fingerprint().unwrap();
+            let payloads = vec![SearchPayload::new(
+                query,
+                SearchOutputPhase::Initial,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "src/original-model.rs".to_owned(),
+                    line: None,
+                    score: 0.9,
+                    snippet: None,
+                    lexical_rank: Some(0),
+                    semantic_rank: Some(0),
+                    hash_rank: None,
+                    in_both_sources: true,
+                }],
+            )];
+            runtime
+                .write_search_payload_cache(&key, &payloads, &fingerprint)
+                .unwrap();
+            let cache_path = runtime.search_cache_path(&key).unwrap();
+            let original_bytes = fs::read(&cache_path).unwrap();
+            assert_eq!(
+                runtime
+                    .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                    .await
+                    .unwrap(),
+                payloads,
+                "the regression must begin with a real persisted cache hit"
+            );
+
+            for name in ["potion-base-8M", "potion-base-32M"] {
+                let mut changed = runtime.clone();
+                changed.config.indexing.fast_model = name.to_owned();
+                let changed_key = changed
+                    .search_cache_key(query, 10, SearchExecutionMode::Full)
+                    .unwrap();
+                assert!(
+                    changed
+                        .try_load_search_payload_cache(&changed_key, &fingerprint)
+                        .unwrap()
+                        .is_none(),
+                    "{name} must reach its own model/generation admission, not reuse the old answer"
+                );
+            }
+            for name in [
+                "potionmultilingual128m",
+                "potion-multilingual-128m!",
+                "unknown",
+            ] {
+                let mut invalid = runtime.clone();
+                invalid.config.indexing.fast_model = name.to_owned();
+                let error = invalid
+                    .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                    .await
+                    .expect_err("invalid model selection must not be hidden by a warm cache");
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field, value, .. }
+                        if field == "indexing.fast_model" && value == name
+                ));
+            }
+
+            let mut alias = runtime.clone();
+            alias.config.indexing.fast_model = " POTION-MULTILINGUAL-128m ".to_owned();
+            assert_eq!(
+                alias
+                    .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                    .await
+                    .unwrap(),
+                payloads,
+                "an actual loader alias preserves its verified selection's cache namespace"
+            );
+            assert_eq!(fs::read(cache_path).unwrap(), original_bytes);
         });
     }
 

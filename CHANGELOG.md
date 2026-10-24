@@ -1,5 +1,24 @@
 # Changelog
 
+### Unreleased — Bind warm search to the selected fast model (2026-10-24)
+
+- Persisted search answers, daemon socket selection, and daemon policy
+  attestations now include the canonical configured fast model. Switching
+  between Potion 128M, 8M, and 32M cannot replay a previous producer's cached
+  answer before model/index compatibility checks. Unknown or malformed fast
+  model selections are rejected before a warm cache or daemon can answer.
+- The registered producer fingerprint includes the frozen Potion 8M and 32M
+  contracts. Cache and serve protocol versions advance; retained responses
+  without the required fast-model identity cannot satisfy the new policy.
+- Embedder admission now uses the caller's cancellation context, including
+  retained-generation recovery. This removes a test-only context constructor
+  from the production build and prevents cancellation from falling back to
+  uncancelled direct inference admission.
+- Regressions cover cache and socket separation, canonical aliases, missing
+  or mismatched daemon attestations, and persisted-cache refusal. The existing
+  real-model CLI qualification also covers changing fast models after warming
+  both direct cached search and a progressive daemon.
+
 ### Unreleased — Qualified first-run model downloads (#67, 2026-10-23)
 
 - Fresh interactive setup and bulk downloads exclude the unqualified

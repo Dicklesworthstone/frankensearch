@@ -374,9 +374,10 @@ impl FsfsRuntime {
         if let Some(index) = resources.vector_index.as_ref() {
             let embedder = runtime.resolve_fast_embedder()?;
             Self::admit_vector_generation_for_embedder(index, embedder.as_ref())?;
-            resources.fast_embedder = Some(AdmittedEmbedder::admit(recovery_query::bind(
-                embedder,
-            )?)?);
+            resources.fast_embedder = Some(AdmittedEmbedder::admit(
+                cx,
+                recovery_query::bind(embedder)?,
+            )?);
             resources.fast_embedder_attempted = true;
         }
         let quality_path = generation.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE);
@@ -397,9 +398,10 @@ impl FsfsRuntime {
                 .maybe_prepare_quality_embedder(cx, &mut resources)
                 .await?;
             if let Some(admitted) = resources.quality_embedder.take() {
-                resources.quality_embedder = Some(AdmittedEmbedder::admit(recovery_query::bind(
-                    admitted.embedder,
-                )?)?);
+                resources.quality_embedder = Some(AdmittedEmbedder::admit(
+                    cx,
+                    recovery_query::bind(admitted.embedder)?,
+                )?);
             }
         }
         let reader = RetainedSearchReader {
