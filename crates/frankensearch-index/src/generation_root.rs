@@ -131,6 +131,8 @@ pub enum GenerationRootStage {
     OpenRegularFile,
     /// Read one regular file into a bounded owned image.
     ReadRegularFile,
+    /// Create and fill one absent immutable object without replacing any name.
+    StageImmutableFile,
     /// Re-open and fence a relative file route.
     RevalidateRegularFile,
     /// Execute the platform's file durability barrier.
@@ -170,6 +172,7 @@ impl GenerationRootStage {
             Self::OpenRelativeDirectory => "open_relative_directory",
             Self::OpenRegularFile => "open_regular_file",
             Self::ReadRegularFile => "read_regular_file",
+            Self::StageImmutableFile => "stage_immutable_file",
             Self::RevalidateRegularFile => "revalidate_regular_file",
             Self::SyncRegularFile => "sync_regular_file",
             Self::SyncDirectory => "sync_directory",
@@ -1300,6 +1303,62 @@ impl QualifiedGenerationRoot {
         expectation: GenerationFileExpectation,
     ) -> GenerationRootResult<QualifiedGenerationFile> {
         self.directory.admit_file(path, expectation)
+    }
+
+    /// Durably stage one immutable activation or content-addressed component.
+    ///
+    /// Linux creates the object exclusively relative to the retained root
+    /// descriptor. Only canonical, top-level retained-object names are accepted;
+    /// component names must bind the SHA-256 of `bytes`. Existing names are never
+    /// opened for writing, truncated, renamed, or removed. An existing object is
+    /// reused only after the same descriptor-relative security, exact-length,
+    /// and content admission required of a fresh reader, followed by an exact
+    /// byte comparison. Thus unchanged components can be shared by successors.
+    ///
+    /// The new writable descriptor is closed before immutable admission. Both
+    /// new and reused objects receive the required file and directory durability
+    /// barriers, with root and named-anchor fences before and after staging.
+    /// A failure may leave an unselected partial object; retry never repairs or
+    /// overwrites it. This method does not modify LOCK or AUTHORITY or select a
+    /// generation. The caller still publishes through the authority protocol.
+    ///
+    /// This is synchronous filesystem work bounded by the supplied image and
+    /// [`GENERATION_ROOT_MAX_FILE_BYTES`]. Async callers provide their own bounded
+    /// blocking lane and cancellation checkpoints between component operations.
+    /// Apple Silicon requires a provider-owned staging route and returns
+    /// [`GenerationRootErrorKind::PreopenedDescriptorRequired`] without I/O;
+    /// unsupported targets return a zero-I/O platform refusal.
+    ///
+    /// # Errors
+    ///
+    /// Refuses noncanonical names, mismatched component addresses, invalid or
+    /// changed existing objects, resource limits, root/anchor drift, and write
+    /// or durability failures. Existing bytes and names remain untouched.
+    pub fn stage_immutable_file(
+        &self,
+        path: &ConfinedGenerationPath,
+        bytes: &[u8],
+    ) -> GenerationRootResult<QualifiedGenerationFile> {
+        #[cfg(target_os = "linux")]
+        self.revalidate()?;
+        let admission = platform::stage_immutable_file(&self.directory.inner, &path.inner, bytes)?;
+        let file = QualifiedGenerationFile {
+            handle: admission.handle,
+            bytes: admission.bytes,
+            witness: admission.witness,
+            sha256: admission.sha256,
+        };
+        if file.as_bytes() != bytes {
+            return Err(GenerationRootError::new(
+                GenerationRootErrorKind::HashMismatch,
+                GenerationRootStage::StageImmutableFile,
+            ));
+        }
+        self.revalidate()?;
+        file.sync_durable()?;
+        self.sync_directory_durable()?;
+        self.revalidate()?;
+        Ok(file)
     }
 
     /// Admit one exact Apple Silicon immutable artifact from a provider-owned
@@ -2947,24 +3006,21 @@ pub mod authority_publisher {
                 assert_eq!(AttemptPermitV1 { stage, ..original }.validate(), Ok(()));
             }
             let first = AuthoritySlotV1::new(1, ROOT, genesis()).expect("first slot");
-            let next = AuthorityRefV1::new(
-                2,
-                [7; 16],
-                4097,
-                [8; 32],
-                Some(genesis().fingerprint()),
-            )
-            .expect("successor");
+            let next =
+                AuthorityRefV1::new(2, [7; 16], 4097, [8; 32], Some(genesis().fingerprint()))
+                    .expect("successor");
             let expected = ExpectedAuthorityPairV1 {
                 first: None,
                 second: Some(first),
             };
-            let successor =
-                AttemptPermitV1::new(ROOT, WRITER, [9; 16], next, expected, [10; 16])
-                    .expect("prepared successor");
+            let successor = AttemptPermitV1::new(ROOT, WRITER, [9; 16], next, expected, [10; 16])
+                .expect("prepared successor");
             assert_eq!(successor.target_slot, 0);
             assert_eq!(successor.expected, expected);
-            assert_eq!(successor.candidate.predecessor, Some(genesis().fingerprint()));
+            assert_eq!(
+                successor.candidate.predecessor,
+                Some(genesis().fingerprint())
+            );
         }
 
         #[test]
@@ -3065,7 +3121,10 @@ pub mod authority_publisher {
                 ),
                 (
                     Some(GenerationLockFrameV1 { fence: 2, ..owner }),
-                    Some(GenerationLockFrameV1 { fence: 2, ..attempt }),
+                    Some(GenerationLockFrameV1 {
+                        fence: 2,
+                        ..attempt
+                    }),
                 ),
                 (
                     Some(GenerationLockFrameV1 {
@@ -6101,7 +6160,36 @@ pub mod generation_reader {
             profile: GenerationRootSecurityProfileV1,
             floor: Option<&dyn AntiRollbackFloorProviderV1>,
         ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
-            let outcome = root.open_generation_snapshot(root_id, profile, floor)?;
+            self.refresh_with_budget(root, root_id, profile, floor, u64::MAX)
+        }
+
+        /// Refresh while bounding the complete encoded image admitted from disk.
+        ///
+        /// The limit includes the activation manifest and every declared
+        /// component. It is checked by fresh snapshot admission before component
+        /// reads, including when another publisher selected a larger successor.
+        /// Budget refusal leaves the current cell and all retained readers
+        /// unchanged. Successful opens retain [`Self::refresh`]'s monotone,
+        /// exact-authority compare-and-swap installation semantics. The limit
+        /// bounds encoded images, not total process memory or existing readers.
+        ///
+        /// # Errors
+        ///
+        /// Same as [`QualifiedGenerationRoot::open_generation_snapshot_with_budget`].
+        pub fn refresh_with_budget(
+            &self,
+            root: &QualifiedGenerationRoot,
+            root_id: [u8; 16],
+            profile: GenerationRootSecurityProfileV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
+            max_owned_image_bytes: u64,
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            let outcome = root.open_generation_snapshot_with_budget(
+                root_id,
+                profile,
+                floor,
+                max_owned_image_bytes,
+            )?;
             let SnapshotOpenOutcomeV1::Opened(fresh) = &outcome else {
                 return Ok(outcome);
             };
@@ -7962,6 +8050,81 @@ pub mod generation_reader {
         }
 
         #[test]
+        fn bounded_cell_refresh_keeps_old_reader_until_the_successor_fits() {
+            let (root_path, root, genesis_slot) = genesis_root("cell-bounded-successor");
+            let cell = GenerationSnapshotCellV1::new();
+            let old = opened(
+                cell.refresh(
+                    &root,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                )
+                .expect("genesis refresh"),
+            );
+            let old_bytes = old
+                .closure()
+                .bytes(GenerationComponentRole::Vector)
+                .expect("retained old vector");
+            let (successor, manifest, _) = publish_with_manifest(
+                &root_path,
+                &publisher(&root),
+                2,
+                Some(genesis_slot.authority),
+                old.authority_pair(),
+                None,
+            );
+            let required = manifest
+                .components()
+                .iter()
+                .fold(successor.manifest_len, |total, (_, component)| {
+                    total + component.byte_len
+                });
+            assert_eq!(
+                refused(
+                    cell.refresh_with_budget(
+                        &root,
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                        required - 1,
+                    )
+                    .expect("bounded refresh")
+                ),
+                SnapshotRefusalV1::ImageBudget {
+                    required,
+                    limit: required - 1
+                },
+            );
+            assert!(Arc::ptr_eq(
+                &cell.load().expect("old still installed"),
+                &old
+            ));
+            assert_eq!(old.head(), genesis_slot);
+            assert_eq!(
+                &*old_bytes,
+                &component_bytes(GenerationComponentRole::Vector, 1)
+            );
+            let fresh = opened(
+                cell.refresh_with_budget(
+                    &root,
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                    required,
+                )
+                .expect("successor fits exactly"),
+            );
+            assert_eq!(fresh.head().authority, successor);
+            assert!(Arc::ptr_eq(&cell.load().expect("new installed"), &fresh));
+            assert_eq!(
+                &*old_bytes,
+                &component_bytes(GenerationComponentRole::Vector, 1)
+            );
+            assert_eq!(old.head(), genesis_slot);
+        }
+
+        #[test]
         fn cell_refuses_a_regressed_head_from_a_stale_root() {
             // Root A advances to sequence 2; root B (same root id, e.g. a
             // replica restored from an older copy) only has genesis.
@@ -8880,6 +9043,14 @@ mod platform {
         AfterRootDescriptorDuplicate,
         #[cfg(target_os = "linux")]
         AfterQualifiedFileOpen,
+        #[cfg(target_os = "linux")]
+        BeforeImmutableCreate,
+        #[cfg(target_os = "linux")]
+        AfterImmutableCreate,
+        #[cfg(target_os = "linux")]
+        DuringImmutableWrite {
+            written: usize,
+        },
         BeforeRead {
             offset: u64,
         },
@@ -9368,6 +9539,226 @@ mod platform {
             root.state.creator_process_id,
             GenerationRootStage::RevalidateRootRoute,
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn immutable_staging_expectation(
+        name: &OsStr,
+        bytes: &[u8],
+    ) -> GenerationRootResult<GenerationFileExpectation> {
+        use super::generation_reader::{component_object_name_v1, is_retained_object_name_v1};
+        use frankensearch_core::generation::GenerationComponentRole;
+
+        const STAGE: GenerationRootStage = GenerationRootStage::StageImmutableFile;
+        let name_bytes = name.as_encoded_bytes();
+        if !is_retained_object_name_v1(name_bytes) {
+            return Err(GenerationRootError::new(
+                GenerationRootErrorKind::InvalidRoute,
+                STAGE,
+            ));
+        }
+        let byte_len = usize_as_u64(bytes.len());
+        // Enforce the file ceiling before spending work hashing the image.
+        GenerationFileExpectation::immutable(byte_len, [0; 32])?;
+        let sha256: [u8; 32] = Sha256::digest(bytes).into();
+        let expectation = GenerationFileExpectation::immutable(byte_len, sha256)?;
+        if !name_bytes.ends_with(b".activation")
+            && ![
+                GenerationComponentRole::Vector,
+                GenerationComponentRole::Lexical,
+                GenerationComponentRole::Ann,
+                GenerationComponentRole::Metadata,
+            ]
+            .into_iter()
+            .any(|role| name_bytes == component_object_name_v1(role, sha256).as_bytes())
+        {
+            return Err(GenerationRootError::new(
+                GenerationRootErrorKind::HashMismatch,
+                STAGE,
+            ));
+        }
+        Ok(expectation)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn stage_immutable_file(
+        root: &RootHandle,
+        path: &RelativePath,
+        bytes: &[u8],
+    ) -> GenerationRootResult<FileAdmission> {
+        use rustix::fs::{ResolveFlags, openat2};
+
+        const STAGE: GenerationRootStage = GenerationRootStage::StageImmutableFile;
+        let [name] = path.components.as_ref() else {
+            return Err(GenerationRootError::new(
+                GenerationRootErrorKind::InvalidRoute,
+                STAGE,
+            ));
+        };
+        let expectation = immutable_staging_expectation(name, bytes)?;
+        #[cfg(test)]
+        test_boundary(TestBoundary::BeforeImmutableCreate)?;
+        revalidate_root(root)?;
+        // O_CREAT|O_EXCL never follows or opens a pre-existing final object,
+        // including devices and dangling symlinks. No pathname route or proc
+        // bridge acquires a writable descriptor to an existing artifact.
+        let created = match openat2(
+            &root.state.descriptor,
+            name,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::RUSR,
+            ResolveFlags::BENEATH
+                | ResolveFlags::NO_SYMLINKS
+                | ResolveFlags::NO_MAGICLINKS
+                | ResolveFlags::NO_XDEV,
+        ) {
+            Ok(descriptor) => Some(descriptor),
+            Err(error) if error == Errno::EXIST => None,
+            Err(error) => return Err(linux_open_error(STAGE, error)),
+        };
+        let created_witness = if let Some(descriptor) = created {
+            let empty = GenerationFileExpectation::immutable(0, Sha256::digest([]).into())?;
+            let before = object_witness(
+                &descriptor,
+                root.state.witness.filesystem,
+                root.state.witness.mount_identity,
+                STAGE,
+            )?;
+            validate_private_regular_file(&descriptor, before, empty, STAGE)?;
+            if before.mount_identity != root.state.witness.mount_identity {
+                return Err(GenerationRootError::new(
+                    GenerationRootErrorKind::CrossDevice,
+                    STAGE,
+                ));
+            }
+            #[cfg(test)]
+            test_boundary(TestBoundary::AfterImmutableCreate)?;
+            let named = open_relative_probe(root, path, empty, STAGE)?;
+            if !before.mutation_stable_eq(named.witness) {
+                return Err(GenerationRootError::new(
+                    GenerationRootErrorKind::ObjectChanged,
+                    STAGE,
+                ));
+            }
+            revalidate_root(root)?;
+            let mut written = 0_usize;
+            while written < bytes.len() {
+                validate_process_identity(root.state.creator_process_id, STAGE)?;
+                let end = bytes.len().min(written.saturating_add(1024 * 1024));
+                let count = match rustix::io::pwrite(
+                    &descriptor,
+                    &bytes[written..end],
+                    usize_as_u64(written),
+                ) {
+                    Ok(count) => count,
+                    Err(error) if error == Errno::INTR => continue,
+                    Err(error) => return Err(os_error(STAGE, error)),
+                };
+                if count == 0 {
+                    return Err(GenerationRootError::new(GenerationRootErrorKind::Io, STAGE));
+                }
+                written += count;
+                #[cfg(test)]
+                test_boundary(TestBoundary::DuringImmutableWrite { written })?;
+            }
+            let after = object_witness(
+                &descriptor,
+                root.state.witness.filesystem,
+                root.state.witness.mount_identity,
+                STAGE,
+            )?;
+            validate_private_regular_file(&descriptor, after, expectation, STAGE)?;
+            if !before.same_file_security_identity(after) {
+                return Err(GenerationRootError::new(
+                    GenerationRootErrorKind::ObjectChanged,
+                    STAGE,
+                ));
+            }
+            // Close the sole writable descriptor before admitting immutable
+            // owned bytes. The returned reader retains only a read descriptor.
+            drop(descriptor);
+            Some(after)
+        } else {
+            None
+        };
+        let admission = admit_file(root, path, expectation)?;
+        if created_witness.is_some_and(|created| !created.mutation_stable_eq(admission.witness)) {
+            return Err(GenerationRootError::new(
+                GenerationRootErrorKind::ObjectChanged,
+                STAGE,
+            ));
+        }
+        Ok(admission)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod immutable_staging_contract_tests {
+        use super::*;
+        use crate::generation_root::generation_reader::{
+            activation_manifest_name_v1, component_object_name_v1,
+        };
+        use frankensearch_core::generation::GenerationComponentRole;
+
+        #[test]
+        fn immutable_staging_accepts_only_bound_component_or_activation_names() {
+            let bytes = b"one exact immutable image";
+            let sha256: [u8; 32] = Sha256::digest(bytes).into();
+            for role in [
+                GenerationComponentRole::Vector,
+                GenerationComponentRole::Lexical,
+                GenerationComponentRole::Ann,
+                GenerationComponentRole::Metadata,
+            ] {
+                let name = component_object_name_v1(role, sha256);
+                let expected = immutable_staging_expectation(OsStr::new(&name), bytes)
+                    .expect("the exact digest names its component");
+                assert_eq!(expected.byte_len(), bytes.len() as u64);
+                assert_eq!(expected.sha256(), Some(sha256));
+                assert_eq!(
+                    immutable_staging_expectation(OsStr::new(&name), b"different bytes")
+                        .expect_err("a different payload cannot create a mislabeled object")
+                        .kind(),
+                    GenerationRootErrorKind::HashMismatch,
+                );
+            }
+            let name = activation_manifest_name_v1([7; 16]);
+            immutable_staging_expectation(OsStr::new(&name), bytes)
+                .expect("activation object IDs are independent of payload digests");
+        }
+
+        #[test]
+        fn immutable_staging_rejects_anchors_aliases_nested_names_and_wal() {
+            let component = component_object_name_v1(GenerationComponentRole::Vector, [1; 32]);
+            for name in [
+                "LOCK".to_owned(),
+                "AUTHORITY".to_owned(),
+                "CURRENT".to_owned(),
+                "unknown".to_owned(),
+                format!("{component}.wal"),
+                format!("nested/{component}"),
+                format!("../{component}"),
+                component.to_uppercase(),
+                format!("{}.activation", "f".repeat(31)),
+                format!("{}.vector", "g".repeat(64)),
+            ] {
+                let error = immutable_staging_expectation(OsStr::new(&name), b"payload")
+                    .expect_err("only exact retained immutable names are writable");
+                assert_eq!(error.kind(), GenerationRootErrorKind::InvalidRoute);
+                assert_eq!(error.stage(), GenerationRootStage::StageImmutableFile);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn stage_immutable_file(
+        _root: &RootHandle,
+        _path: &RelativePath,
+        _bytes: &[u8],
+    ) -> GenerationRootResult<FileAdmission> {
+        Err(GenerationRootError::new(
+            GenerationRootErrorKind::PreopenedDescriptorRequired,
+            GenerationRootStage::StageImmutableFile,
+        ))
     }
 
     #[cfg(target_os = "linux")]
@@ -13580,6 +13971,14 @@ mod platform {
         unsupported()
     }
 
+    pub(super) fn stage_immutable_file(
+        _root: &RootHandle,
+        _path: &RelativePath,
+        _bytes: &[u8],
+    ) -> GenerationRootResult<FileAdmission> {
+        unsupported()
+    }
+
     pub(super) fn sync_root_directory(_root: &RootHandle) -> GenerationRootResult<()> {
         unsupported()
     }
@@ -13933,6 +14332,12 @@ mod tests {
         ) -> GenerationRootResult<
             GenerationRootReadGuard<'root>,
         > = NamedGenerationRoot::read_guard;
+        let _stage_surface: fn(
+            &NamedGenerationRoot,
+            &ConfinedGenerationPath,
+            &[u8],
+        ) -> GenerationRootResult<super::QualifiedGenerationFile> =
+            NamedGenerationRoot::stage_immutable_file;
     }
 
     #[cfg(target_os = "linux")]
@@ -18938,6 +19343,229 @@ if not close_only_contended or not explicit_unlock_released:
             guard
                 .release()
                 .expect("the unchanged shared guard should release");
+        }
+
+        #[test]
+        fn immutable_staging_reuses_exact_objects_without_replacing_inodes_or_anchors() {
+            use crate::generation_root::generation_reader::{
+                activation_manifest_path_v1, component_object_path_v1,
+            };
+            use frankensearch_core::generation::GenerationComponentRole;
+
+            let (root_path, authority_path, layout) =
+                named_root_fixture("immutable-stage-reuse", b"lock-v1!", 0x11);
+            let root = NamedGenerationRoot::admit(&root_path, layout).expect("qualified root");
+            let anchors = root.anchor_witnesses();
+            let before_authority = fs::read(&authority_path).expect("authority bytes");
+            let payload = b"exact content shared by successive generations";
+            let component =
+                component_object_path_v1(GenerationComponentRole::Lexical, digest(payload))
+                    .expect("confined address");
+            let first = root
+                .stage_immutable_file(&component, payload)
+                .expect("new immutable object");
+            let second = root
+                .stage_immutable_file(&component, payload)
+                .expect("reuse admitted bytes");
+            assert_eq!(first.as_bytes(), payload);
+            assert_eq!(second.as_bytes(), payload);
+            assert!(first.witness().mutation_stable_eq(second.witness()));
+            assert_eq!(first.witness().mode() & 0o777, 0o400);
+            assert_eq!(first.witness().hard_links(), 1);
+            let manifest = activation_manifest_path_v1([0x41; 16]).expect("manifest address");
+            let staged = root
+                .stage_immutable_file(&manifest, b"one manifest")
+                .expect("manifest");
+            let reused = root
+                .stage_immutable_file(&manifest, b"one manifest")
+                .expect("exact retry");
+            assert!(staged.witness().mutation_stable_eq(reused.witness()));
+            assert_eq!(
+                root.stage_immutable_file(&manifest, b"two manifest")
+                    .expect_err("same name and length do not permit different content")
+                    .kind(),
+                GenerationRootErrorKind::HashMismatch,
+            );
+            assert_eq!(staged.as_bytes(), b"one manifest");
+            assert_eq!(root.anchor_witnesses(), anchors);
+            assert_eq!(
+                fs::read(authority_path).expect("authority retained"),
+                before_authority
+            );
+            assert_eq!(
+                fs::read(root_path.join("LOCK")).expect("lock retained"),
+                b"lock-v1!"
+            );
+            root.revalidate().expect("root and named anchors unchanged");
+        }
+
+        #[test]
+        fn immutable_staging_refuses_existing_corruption_links_and_reserved_names() {
+            use crate::generation_root::generation_reader::component_object_name_v1;
+            use frankensearch_core::generation::GenerationComponentRole;
+
+            let (root_path, authority_path, layout) =
+                named_root_fixture("immutable-stage-conflict", b"lock-v1!", 0x22);
+            let root = NamedGenerationRoot::admit(&root_path, layout).expect("qualified root");
+            let authority_before = fs::read(&authority_path).expect("authority bytes");
+            for reserved in ["LOCK", "AUTHORITY", "CURRENT", "foreign"] {
+                assert_eq!(
+                    root.stage_immutable_file(&confined(reserved), b"replacement")
+                        .expect_err("staging cannot address anchors or undeclared names")
+                        .kind(),
+                    GenerationRootErrorKind::InvalidRoute,
+                );
+            }
+            let payload = b"candidate";
+            let name = component_object_name_v1(GenerationComponentRole::Vector, digest(payload));
+            let path = private_file(&root_path, &name, b"incorrect");
+            let inode = fs::symlink_metadata(&path)
+                .expect("collision metadata")
+                .ino();
+            assert_eq!(
+                root.stage_immutable_file(&confined(&name), payload)
+                    .expect_err("same-length corruption is not overwritten")
+                    .kind(),
+                GenerationRootErrorKind::HashMismatch,
+            );
+            assert_eq!(
+                fs::read(&path).expect("corrupt bytes retained"),
+                b"incorrect"
+            );
+            assert_eq!(
+                fs::symlink_metadata(&path).expect("same inode").ino(),
+                inode
+            );
+
+            let victim = private_file(&root_path, "retained-victim", b"victim");
+            let symbolic_name =
+                component_object_name_v1(GenerationComponentRole::Metadata, digest(b"victim"));
+            symlink(&victim, root_path.join(&symbolic_name)).expect("hostile symlink");
+            assert!(
+                root.stage_immutable_file(&confined(&symbolic_name), b"victim")
+                    .is_err()
+            );
+            assert!(
+                fs::symlink_metadata(root_path.join(symbolic_name))
+                    .expect("link retained")
+                    .is_symlink()
+            );
+            let linked_name =
+                component_object_name_v1(GenerationComponentRole::Ann, digest(b"victim"));
+            fs::hard_link(&victim, root_path.join(&linked_name)).expect("hostile hard link");
+            assert_eq!(
+                root.stage_immutable_file(&confined(&linked_name), b"victim")
+                    .expect_err("hard-linked bytes cannot be adopted")
+                    .kind(),
+                GenerationRootErrorKind::HardLinked,
+            );
+            assert_eq!(fs::read(victim).expect("victim retained"), b"victim");
+            assert_eq!(
+                fs::read(authority_path).expect("authority retained"),
+                authority_before
+            );
+            assert_eq!(
+                fs::read(root_path.join("LOCK")).expect("lock retained"),
+                b"lock-v1!"
+            );
+        }
+
+        #[test]
+        fn immutable_staging_write_failure_preserves_partial_object_and_refuses_retry() {
+            use crate::generation_root::generation_reader::component_object_name_v1;
+            use frankensearch_core::generation::GenerationComponentRole;
+
+            let (root_path, authority_path, layout) =
+                named_root_fixture("immutable-stage-partial", b"lock-v1!", 0x33);
+            let root = NamedGenerationRoot::admit(&root_path, layout).expect("qualified root");
+            let authority_before = fs::read(&authority_path).expect("authority bytes");
+            let payload = vec![0x51; 2 * 1024 * 1024 + 7];
+            let name = component_object_name_v1(GenerationComponentRole::Vector, digest(&payload));
+            let hook = install_test_hook(|boundary| {
+                if matches!(boundary, TestBoundary::DuringImmutableWrite { .. }) {
+                    return Err(GenerationRootError::new(
+                        GenerationRootErrorKind::Io,
+                        GenerationRootStage::StageImmutableFile,
+                    )
+                    .with_raw_os_error(libc::ENOSPC));
+                }
+                Ok(())
+            });
+            let error = root
+                .stage_immutable_file(&confined(&name), &payload)
+                .expect_err("injected failure follows a genuine bounded partial write");
+            assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+            drop(hook);
+            let partial = fs::read(root_path.join(&name)).expect("partial object retained");
+            assert!(!partial.is_empty() && partial.len() < payload.len());
+            assert_eq!(partial, payload[..partial.len()]);
+            let inode = fs::symlink_metadata(root_path.join(&name))
+                .expect("partial metadata")
+                .ino();
+            assert_eq!(
+                root.stage_immutable_file(&confined(&name), &payload)
+                    .expect_err("retry must not fill or replace a partial immutable object")
+                    .kind(),
+                GenerationRootErrorKind::SizeMismatch,
+            );
+            assert_eq!(
+                fs::read(root_path.join(&name)).expect("partial remains exact"),
+                partial
+            );
+            assert_eq!(
+                fs::symlink_metadata(root_path.join(name))
+                    .expect("same partial inode")
+                    .ino(),
+                inode
+            );
+            assert_eq!(
+                fs::read(authority_path).expect("authority retained"),
+                authority_before
+            );
+            assert_eq!(
+                fs::read(root_path.join("LOCK")).expect("lock retained"),
+                b"lock-v1!"
+            );
+        }
+
+        #[test]
+        fn immutable_staging_fences_root_replacement_before_exclusive_creation() {
+            use crate::generation_root::generation_reader::component_object_name_v1;
+            use frankensearch_core::generation::GenerationComponentRole;
+
+            let (root_path, _, layout) =
+                named_root_fixture("immutable-stage-route", b"lock-v1!", 0x44);
+            let root = NamedGenerationRoot::admit(&root_path, layout).expect("qualified root");
+            let retained = root_path.with_extension("retained");
+            let hook_root = root_path.clone();
+            let hook_retained = retained.clone();
+            let hook = install_test_hook(move |boundary| {
+                if boundary == TestBoundary::BeforeImmutableCreate {
+                    fs::rename(&hook_root, &hook_retained).expect("retain original root");
+                    DirBuilder::new()
+                        .mode(0o700)
+                        .create(&hook_root)
+                        .expect("replacement root");
+                    control_file(&hook_root, "LOCK", b"lock-v1!");
+                    control_file(&hook_root, "AUTHORITY", &authority_image(0x44));
+                }
+                Ok(())
+            });
+            let name =
+                component_object_name_v1(GenerationComponentRole::Vector, digest(b"payload"));
+            assert_eq!(
+                root.stage_immutable_file(&confined(&name), b"payload")
+                    .expect_err("a replaced route cannot receive a staged object")
+                    .kind(),
+                GenerationRootErrorKind::ObjectChanged,
+            );
+            drop(hook);
+            assert!(!root_path.join(&name).exists());
+            assert!(!retained.join(&name).exists());
+            assert_eq!(
+                fs::read(retained.join("LOCK")).expect("old anchors retained"),
+                b"lock-v1!"
+            );
         }
 
         #[test]
