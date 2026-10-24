@@ -54,6 +54,95 @@ pub enum ModelTier {
     Reranker,
 }
 
+/// Explicit quality-model choices with registered download and producer contracts.
+///
+/// Selection is available without compiling an inference backend so consumers
+/// can reject an unsupported request before offering a download. A selection
+/// never establishes that artifacts are installed or that an index is compatible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RegisteredQualityModel {
+    /// English `MiniLM` through the registered ONNX execution contract.
+    MiniLmOnnx,
+    /// Snowflake Arctic Embed S through the registered ONNX execution contract.
+    SnowflakeOnnx,
+    /// Nomic Embed Text v1.5 through the registered ONNX execution contract.
+    NomicOnnx,
+    /// English `MiniLM` through the registered native F32 execution contract.
+    MiniLmNative,
+    /// Multilingual `MiniLM` through its registered native execution contract.
+    MultilingualNative,
+}
+
+impl RegisteredQualityModel {
+    /// Resolve a complete model id or a documented registry alias.
+    ///
+    /// Matching ignores case and surrounding whitespace, but never uses fuzzy
+    /// matching or strips punctuation. Empty and unknown selections return
+    /// `None`; the consumer decides whether an empty quality tier is disabled.
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "minilm" | "minilm-384" | "all-minilm-l6-v2" => Some(Self::MiniLmOnnx),
+            "snowflake-arctic-s" | "snowflake-arctic-s-384" | "snowflake-arctic-embed-s" => {
+                Some(Self::SnowflakeOnnx)
+            }
+            "nomic-embed" | "nomic-embed-768" | "nomic-embed-text-v1.5" => Some(Self::NomicOnnx),
+            "all-minilm-l6-v2-native" => Some(Self::MiniLmNative),
+            "multilingual-minilm"
+            | "paraphrase-multilingual-minilm-l12-v2"
+            | "paraphrase-multilingual-minilm-l12-v2-384" => Some(Self::MultilingualNative),
+            _ => None,
+        }
+    }
+
+    /// Canonical acquisition id, including the separate native installation.
+    #[must_use]
+    pub const fn manifest_id(self) -> &'static str {
+        match self {
+            Self::MiniLmOnnx => "all-minilm-l6-v2",
+            Self::SnowflakeOnnx => "snowflake-arctic-embed-s",
+            Self::NomicOnnx => "nomic-embed-text-v1.5",
+            Self::MiniLmNative => "all-minilm-l6-v2-native",
+            Self::MultilingualNative => "paraphrase-multilingual-minilm-l12-v2",
+        }
+    }
+
+    /// Whether this selection requires the native inference backend.
+    #[must_use]
+    pub const fn is_native(self) -> bool {
+        matches!(self, Self::MiniLmNative | Self::MultilingualNative)
+    }
+
+    /// The exact pinned artifact bundle required by this selection.
+    #[must_use]
+    pub fn download_manifest(self) -> ModelManifest {
+        match self {
+            Self::MiniLmOnnx => ModelManifest::minilm_v2(),
+            Self::SnowflakeOnnx => ModelManifest::snowflake_arctic_s(),
+            Self::NomicOnnx => ModelManifest::nomic_embed(),
+            Self::MiniLmNative => ModelManifest::minilm_v2_native(),
+            Self::MultilingualNative => ModelManifest::multilingual_minilm_l12_v2(),
+        }
+    }
+
+    /// The frozen producer contract required for admission and cache identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registered artifact or execution metadata is invalid.
+    pub fn artifact_manifest(self) -> SearchResult<ModelArtifactManifestV1> {
+        match self {
+            Self::MiniLmOnnx => ModelArtifactManifestV1::minilm_fastembed(),
+            Self::SnowflakeOnnx => ModelArtifactManifestV1::snowflake_fastembed(),
+            Self::NomicOnnx => ModelArtifactManifestV1::nomic_fastembed(),
+            Self::MiniLmNative => ModelArtifactManifestV1::minilm_native_frankentorch_f32(),
+            Self::MultilingualNative => {
+                ModelArtifactManifestV1::multilingual_minilm_native_frankentorch()
+            }
+        }
+    }
+}
+
 /// Schema for the frozen artifact-plus-execution manifest.
 pub const MODEL_ARTIFACT_MANIFEST_SCHEMA_V1: u16 = 1;
 
@@ -3789,6 +3878,87 @@ mod tests {
         VerifiedGoldenConformanceManifestV1,
     };
     use std::io::Write;
+
+    #[test]
+    fn registered_quality_selection_preserves_exact_model_and_backend() {
+        use RegisteredQualityModel as Quality;
+
+        for (name, expected) in [
+            ("all-MiniLM-L6-v2", Quality::MiniLmOnnx),
+            (" minilm-384 ", Quality::MiniLmOnnx),
+            ("SNOWFLAKE-ARCTIC-S", Quality::SnowflakeOnnx),
+            ("snowflake-arctic-embed-s", Quality::SnowflakeOnnx),
+            ("nomic-embed", Quality::NomicOnnx),
+            ("NOMIC-EMBED-TEXT-V1.5", Quality::NomicOnnx),
+            ("all-MiniLM-L6-v2-native", Quality::MiniLmNative),
+            ("multilingual-minilm", Quality::MultilingualNative),
+            (
+                "paraphrase-multilingual-MiniLM-L12-v2",
+                Quality::MultilingualNative,
+            ),
+        ] {
+            assert_eq!(RegisteredQualityModel::from_name(name), Some(expected));
+            assert_eq!(
+                RegisteredQualityModel::from_name(expected.manifest_id()),
+                Some(expected)
+            );
+        }
+
+        for invalid in [
+            "",
+            "   ",
+            "unknown-model",
+            "mini",
+            "all-minilm-l6-v2!",
+            "all_minilm_l6_v2",
+            "nomic-embed-text-v15",
+            "potion-base-8m",
+            "flashrank-nano",
+            "ms-marco-minilm-l-6-v2",
+        ] {
+            assert_eq!(
+                RegisteredQualityModel::from_name(invalid),
+                None,
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn registered_quality_selections_bind_qualified_artifacts_and_distinct_producers() {
+        use RegisteredQualityModel as Quality;
+
+        let mut fingerprints = std::collections::BTreeSet::new();
+        for (selection, dimension, native) in [
+            (Quality::MiniLmOnnx, 384, false),
+            (Quality::SnowflakeOnnx, 384, false),
+            (Quality::NomicOnnx, 768, false),
+            (Quality::MiniLmNative, 384, true),
+            (Quality::MultilingualNative, 384, true),
+        ] {
+            let download = selection.download_manifest();
+            assert_eq!(download.id, selection.manifest_id());
+            assert_eq!(download.tier, Some(ModelTier::Quality));
+            assert_eq!(download.dimension, Some(dimension));
+            assert_eq!(selection.is_native(), native);
+            assert!(download.is_production_ready());
+            let artifact = selection.artifact_manifest().unwrap();
+            assert_eq!(artifact.dimension, dimension);
+            assert_eq!(artifact.upstream_revision, download.revision);
+            assert_eq!(artifact.artifacts.len(), download.files.len());
+            for file in &download.files {
+                let frozen_file = artifact
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.relative_path == file.name)
+                    .expect("downloaded file belongs to the selected producer");
+                assert_eq!(frozen_file.sha256, file.sha256);
+                assert_eq!(frozen_file.size, file.size);
+            }
+            assert!(fingerprints.insert(artifact.freeze().unwrap().fingerprint));
+        }
+        assert_eq!(fingerprints.len(), 5);
+    }
 
     fn write_temp_file(path: &Path, bytes: &[u8]) {
         let mut file = File::create(path).unwrap();

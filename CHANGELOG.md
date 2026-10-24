@@ -1,5 +1,29 @@
 # Changelog
 
+### Unreleased — Honor configured models and offline acquisition (2026-10-24)
+
+- First-run consent now selects the configured fast producer and enabled
+  quality producer, including Potion 8M/32M and the registered ONNX/native
+  quality alternatives. It adds the supported MS MARCO reranker only when
+  requested. Unsupported backends fail before consent, and disabled quality
+  tiers require no quality download. The full build's bare download command
+  retains its bulk catalog behavior.
+- Quality selection, acquisition, and loading share an exact model registry.
+  Unknown active selections fail early; missing or corrupt Nomic/Snowflake
+  artifacts cannot silently select a cached MiniLM. Quality identities also
+  bind persisted answers and daemon policies, with new protocol versions.
+- `download-models --offline` reuses verified installations and supports local
+  listing and verification. Acquisition and forced replacement fail before
+  staging or network access, preserving existing artifacts and integrity errors.
+- Explicit remote-provider settings cannot bypass registered local selection
+  through cached answers or native/opt-in loaders. Typed errors preserve offline
+  policy without exposing environment values; ordinary API keys do not select a
+  provider.
+- Regressions cover configured first-run manifests, disabled quality,
+  exact producer identities, offline acquisition refusal, and cache/daemon
+  policy separation. The real-model CLI qualification includes MiniLM controls
+  alongside missing/corrupt Nomic and verified offline cache reuse.
+
 ### Unreleased — Bind warm search to the selected fast model (2026-10-24)
 
 - Persisted search answers, daemon socket selection, and daemon policy

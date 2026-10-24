@@ -1076,9 +1076,15 @@ mod generation_tests {
                     // Such readers admit their lexical resources for inspection;
                     // the request itself must report the configured search refusal.
                     let mut session = refused.open_live_retained_search(&cx, &root).await.unwrap();
+                    // Construct the wire request independently of the client's
+                    // pre-transport guard so this still exercises server refusal.
+                    let mut forwarded = make_request(&runtime, &root, "sharedtoken", 10).unwrap();
+                    forwarded.search.configuration =
+                        super::super::configuration_contract(refused.config()).unwrap();
+                    forwarded.search.explain = explain;
                     let request = StreamRequest {
                         fsfs_complete_cli_stream: VERSION,
-                        request: make_request(&refused, &root, "sharedtoken", 10).unwrap(),
+                        request: forwarded,
                     };
                     let (mut client, mut peer) = UnixStream::pair().unwrap();
                     peer.set_nonblocking(true).unwrap();

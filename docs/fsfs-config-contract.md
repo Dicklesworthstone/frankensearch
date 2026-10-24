@@ -60,6 +60,8 @@ Path expansion rule:
 - `fast_model: string`
 - `quality_model: string`
 - `model_dir: string`
+- `offline: bool` (default `false`; `--offline` forbids model acquisition,
+  including a forced refresh. `--online` explicitly permits acquisition.)
 - `embedding_batch_size: int` (`1..4096`, default `64`; bounds document batches in
   one-shot indexing and the watch vector pipeline. Smaller batches reduce working
   memory and the time between batch checkpoints; they do not reduce model size.)
@@ -70,6 +72,61 @@ Model upgrades must pass the stored producer-revision check, even if the
 embedding space and output vectors are unchanged. The Model2Vec adapter bump
 from `frankensearch-embed` 0.2.6 to 0.2.7 changes that revision; rebuild with
 `fsfs index` before searching or watching an index produced by 0.2.6.
+
+### Registered model selection and first-run acquisition
+
+Semantic execution uses the configured registered producer. Model names accept
+case differences, surrounding whitespace, and documented aliases; punctuation
+changes and unknown names are errors. Changing a model also changes the search
+cache and daemon policy, so a warm answer from the previous producer cannot
+satisfy the new selection.
+
+The quality tier supports these distinct selections when their inference
+backend is compiled into the binary:
+
+| Canonical `quality_model` | Backend | Short aliases |
+|---|---|---|
+| `all-minilm-l6-v2` | ONNX | `minilm`, `minilm-384` |
+| `snowflake-arctic-embed-s` | ONNX | `snowflake-arctic-s`, `snowflake-arctic-s-384` |
+| `nomic-embed-text-v1.5` | ONNX | `nomic-embed`, `nomic-embed-768` |
+| `all-minilm-l6-v2-native` | Native F32 | None |
+| `paraphrase-multilingual-minilm-l12-v2` | Native | `multilingual-minilm`, `paraphrase-multilingual-minilm-l12-v2-384` |
+
+An empty `quality_model` or `search.fast_only = true` disables quality inference.
+If a supported selected quality model is missing or fails artifact verification,
+indexing can produce the existing fast-only result with an explicit
+`vector.quality_tier.skipped.model_unavailable` reason. A different cached
+quality model is never substituted. An unknown active quality selection is
+rejected before semantic indexing starts.
+
+Append, watch, and recovery operations must still admit the producer of every
+stored vector tier. A fast-only query policy does not waive those checks or
+allow an existing quality tier to diverge from its generation.
+
+Interactive first-run acquisition requests the configured fast model and the
+enabled quality model. It includes the supported MS MARCO reranker when
+reranking is enabled. Every requested manifest must pass production-readiness
+checks before the consent prompt. The full loader build's bare
+`fsfs download-models` command continues to acquire the bulk catalog; provide
+model IDs to acquire specific selections.
+
+Offline mode permits reuse of verified installed models and the
+`download-models --list` and `download-models --verify` inspection commands.
+A missing or corrupt model that needs acquisition, or `--force`, is refused
+before staging or network access. Verification still reports its original
+missing-file or integrity error. To acquire a selected model explicitly:
+
+```bash
+fsfs download-models nomic-embed-text-v1.5 --online
+fsfs download-models nomic-embed-text-v1.5 --offline --verify
+```
+
+The fsfs semantic path uses registered local producers. Explicit
+`FRANKENSEARCH_API_PROVIDER`, `FRANKENSEARCH_API_MODEL`,
+`FRANKENSEARCH_API_DIMENSION`, or `FRANKENSEARCH_API_IDENTITY_JSON` selection
+is refused rather than silently replaced with a local model. Generic API-key
+environment variables alone do not select a provider. Lexical-only commands
+and model diagnostics remain available.
 
 ## `[search]`
 

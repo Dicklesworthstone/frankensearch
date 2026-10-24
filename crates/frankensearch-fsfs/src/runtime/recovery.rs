@@ -578,7 +578,7 @@ mod retained_recovery_tests {
         fs::write(source.join("alpha.md"), "sharedtoken original alpha document").unwrap();
         let mut config = FsfsConfig::default();
         "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
-        "recovery-quality".clone_into(&mut config.indexing.quality_model);
+        "all-minilm-l6-v2".clone_into(&mut config.indexing.quality_model);
         config.indexing.offline = true;
         config.search.fast_only = false;
         config.search.rerank = false;

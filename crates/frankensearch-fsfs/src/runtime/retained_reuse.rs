@@ -1858,7 +1858,7 @@ mod generation_tests {
             runtime.config.indexing.fast_window_max_per_file = max_windows;
             runtime.config.search.fast_only = false;
             runtime.config.search.quality_timeout_ms = 5_000;
-            "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
             (runtime, source, root)
         }
 
@@ -2718,7 +2718,7 @@ mod generation_tests {
             let (mut runtime, source, root) = fixture(parent, 0);
             runtime.config.search.fast_only = false;
             runtime.config.search.quality_timeout_ms = 5_000;
-            "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
             if operation == "query_tuning" {
                 runtime.config.search.quality_weight = 0.25;
                 runtime.config.search.rrf_k = 30.0;

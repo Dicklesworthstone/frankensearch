@@ -28,7 +28,8 @@ use fastembed::{
 use tracing::instrument;
 
 use crate::model_manifest::{
-    FASTEMBED_OUTPUT_NORMALIZATION_V1, ModelArtifactManifestV1, ModelManifest, fastembed_max_length,
+    FASTEMBED_OUTPUT_NORMALIZATION_V1, ModelArtifactManifestV1, ModelManifest,
+    RegisteredQualityModel, fastembed_max_length,
 };
 use crate::model_registry::{ensure_model_storage_layout, model_directory_variants};
 use frankensearch_core::error::{SearchError, SearchResult};
@@ -86,21 +87,23 @@ impl OnnxEmbedderConfig {
     /// logical model IDs for `MiniLM`, Snowflake, and Nomic.
     #[must_use]
     pub fn for_name(embedder_name: &str) -> Option<Self> {
-        match embedder_name {
-            "minilm" | DEFAULT_MODEL_NAME | "all-minilm-l6-v2" => Some(Self::default()),
-            "snowflake-arctic-s" | "snowflake-arctic-embed-s" => Some(Self {
+        match RegisteredQualityModel::from_name(embedder_name)? {
+            RegisteredQualityModel::MiniLmOnnx => Some(Self::default()),
+            RegisteredQualityModel::SnowflakeOnnx => Some(Self {
                 embedder_id: "snowflake-arctic-s-384".to_string(),
                 model_id: "snowflake-arctic-embed-s".to_string(),
                 dimension: 384,
                 pooling: Pooling::Mean,
             }),
-            "nomic-embed" | "nomic-embed-text-v1.5" => Some(Self {
+            RegisteredQualityModel::NomicOnnx => Some(Self {
                 embedder_id: "nomic-embed-768".to_string(),
                 model_id: "nomic-embed-text-v1.5".to_string(),
                 dimension: 768,
                 pooling: Pooling::Mean,
             }),
-            _ => None,
+            RegisteredQualityModel::MiniLmNative | RegisteredQualityModel::MultilingualNative => {
+                None
+            }
         }
     }
 }

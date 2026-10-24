@@ -49,7 +49,8 @@ use frankensearch_embed::bundled_default_models::default_semantic_models_are_mat
 use frankensearch_embed::ensure_default_semantic_models;
 use frankensearch_embed::{
     ConsentSource, DownloadConsent, ModelDownloader, ModelLifecycle, ModelManifest,
-    ModelTier as ManifestModelTier, verify_dir_and_record, verify_dir_cached,
+    ModelTier as ManifestModelTier, RegisteredQualityModel, verify_dir_and_record,
+    verify_dir_cached,
 };
 #[cfg(not(test))]
 use frankensearch_embed::{DetectOptions, EmbedderStack};
@@ -613,7 +614,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v16: `HashMap::new`, `std::io` and URLs reach the lexical lane.
 // v17: snippets mask credential tokens and private-key material.
 // v18: cached answers bind the selected fast model and every registered producer.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v18";
+// v19: checked canonical quality selection; disabled tiers have no producer.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v19";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -627,8 +629,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v12 / stream v10: snippets mask credential tokens and private-key material.
 // v13 / stream v11: apply and attest the client's rerank deadline.
 // v14 / stream v12: attest the selected fast model before any cached phase.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v14";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v12";
+// v15 / stream v13: attest the checked, actually selected quality producer.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v15";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v13";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -6024,13 +6027,10 @@ enum NativeQualityModel {
 
 impl NativeQualityModel {
     fn from_name(name: &str) -> Option<Self> {
-        let normalized = normalize_model_key(name);
-        if normalized == normalize_model_key(FSFS_NATIVE_QUALITY_MODEL_ID) {
-            Some(Self::EnglishF32)
-        } else if normalized == normalize_model_key(FSFS_MULTILINGUAL_QUALITY_MODEL_ID) {
-            Some(Self::Multilingual)
-        } else {
-            None
+        match RegisteredQualityModel::from_name(name) {
+            Some(RegisteredQualityModel::MiniLmNative) => Some(Self::EnglishF32),
+            Some(RegisteredQualityModel::MultilingualNative) => Some(Self::Multilingual),
+            _ => None,
         }
     }
 
@@ -6084,6 +6084,40 @@ fn select_fast_model(name: &str) -> SearchResult<frankensearch_embed::Registered
                 RegisteredModel2Vec::BUILTIN_IDS.join(", ")
             ),
         })
+    })
+}
+
+/// A blank quality tier is disabled. Every enabled choice names one registered
+/// producer; fuzzy download-command matching must never choose its vector space.
+fn select_quality_model(name: &str) -> SearchResult<Option<RegisteredQualityModel>> {
+    if name.trim().is_empty() {
+        return Ok(None);
+    }
+    RegisteredQualityModel::from_name(name)
+        .map(Some)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "indexing.quality_model".to_owned(),
+            value: name.to_owned(),
+            reason: "not a registered quality model; select all-minilm-l6-v2, snowflake-arctic-embed-s, nomic-embed-text-v1.5, all-minilm-l6-v2-native, or paraphrase-multilingual-minilm-l12-v2 (see fsfs download-models --list); a blank value disables the quality tier".to_owned(),
+        })
+}
+
+/// fsfs selects registered local producers. Explicit remote configuration must
+/// never be silently ignored or substitute another producer, including on a
+/// warm answer. Only presence is needed; errors never disclose environment data.
+fn registered_local_model_policy(offline: bool, explicit_remote_intent: bool) -> SearchResult<()> {
+    if !explicit_remote_intent {
+        return Ok(());
+    }
+    if offline {
+        return Err(SearchError::EmbedderUnavailable {
+            model: "remote-tier".to_owned(),
+            reason: "--offline forbids the explicitly configured remote embedding provider; unset FRANKENSEARCH_API_PROVIDER, FRANKENSEARCH_API_MODEL, FRANKENSEARCH_API_DIMENSION, and FRANKENSEARCH_API_IDENTITY_JSON to use registered local models".to_owned(),
+        });
+    }
+    Err(SearchError::UnverifiableRemoteSpace {
+        producer: "environment".to_owned(),
+        reason: "fsfs selects registered local embedding models and cannot substitute an explicitly configured remote provider; unset FRANKENSEARCH_API_PROVIDER, FRANKENSEARCH_API_MODEL, FRANKENSEARCH_API_DIMENSION, and FRANKENSEARCH_API_IDENTITY_JSON to use the selected local producers".to_owned(),
     })
 }
 
@@ -9027,6 +9061,8 @@ impl FsfsRuntime {
             self.config.pressure.degradation_override,
             parse_search_execution_mode(request.mode.as_deref())?,
         )?;
+        let mut runtime = self.with_search_serve_request_policy(&request)?;
+        runtime.validate_semantic_model_selection(mode)?;
         // The generation fingerprint covers the active Quill MANIFEST's file
         // identity, and every durable publication renames a new MANIFEST into
         // place, so a newer publication rebinds all resources here. A per-request
@@ -9044,7 +9080,6 @@ impl FsfsRuntime {
                 .limit
                 .unwrap_or(self.config.search.default_limit)
         });
-        let mut runtime = self.with_search_serve_request_policy(&request)?;
         runtime.prepare_search_reranker(cx).await?;
         let cache_key = runtime.search_cache_key(&request.query, requested_limit, mode)?;
 
@@ -9054,7 +9089,7 @@ impl FsfsRuntime {
             .flatten();
         let cached = cached_payloads.is_some();
         Self::validate_bound_search_resources(resources, mode)?;
-        let policy = runtime.search_serve_policy()?;
+        let policy = runtime.search_serve_policy_for_mode(mode)?;
         if let Some(sink) = frame_sink.as_mut() {
             sink(SearchServeFrame::Attested {
                 schema_version: FSFS_SEARCH_SERVE_STREAM_VERSION.to_owned(),
@@ -9429,6 +9464,7 @@ impl FsfsRuntime {
                 self.config.pressure.degradation_override,
                 SearchExecutionMode::Full,
             )?;
+            self.validate_semantic_model_selection(mode)?;
             let socket_path = self.resolve_daemon_socket_path()?;
             ensure_daemon_socket_path_fits(&socket_path)?;
             let mut stream = if let Ok(stream) = UnixStream::connect(&socket_path) {
@@ -9659,7 +9695,10 @@ impl FsfsRuntime {
                     return Err(Self::search_daemon_error("duplicate daemon attestation"));
                 }
                 if schema_version != FSFS_SEARCH_SERVE_STREAM_VERSION
-                    || *policy != self.search_serve_policy()?
+                    || *policy
+                        != self.search_serve_policy_for_mode(parse_search_execution_mode(
+                            request.mode.as_deref(),
+                        )?)?
                     || query != request.query
                     || Some(mode.as_str()) != request.mode.as_deref()
                     || Some(limit) != request.limit
@@ -9878,7 +9917,11 @@ impl FsfsRuntime {
     fn resolve_daemon_socket_path(&self) -> SearchResult<PathBuf> {
         // Explicit sockets must reject invalid selections just as default
         // socket routing does, before contacting a retained warm daemon.
-        self.selected_fast_model_id()?;
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )?;
+        self.selected_model_ids_for_mode(mode)?;
         if let Some(path) = self.cli_input.daemon_socket.as_deref() {
             return absolutize_path(path);
         }
@@ -9891,11 +9934,15 @@ impl FsfsRuntime {
     /// of being refused by a warm older one until that one idles out.
     #[cfg(unix)]
     fn default_daemon_socket_path(&self) -> SearchResult<PathBuf> {
-        let fast_model = self.selected_fast_model_id()?;
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )?;
+        let (fast_model, quality_model) = self.selected_model_ids_for_mode(mode)?;
         let (socket_dir, index_stem) = self.default_daemon_socket_stem()?;
         let variant = Self::daemon_socket_variant(
             &fast_model,
-            &self.config.indexing.quality_model,
+            &quality_model,
             self.config.pressure.degradation_override,
             FSFS_SEARCH_SERVE_SCHEMA_VERSION,
             FSFS_SEARCH_SERVE_STREAM_VERSION,
@@ -9907,8 +9954,8 @@ impl FsfsRuntime {
         ))
     }
 
-    /// Socket name suffix that separates daemons by checked fast-model id,
-    /// quality model and serve protocol.
+    /// Socket name suffix that separates daemons by checked model ids and
+    /// serve protocol.
     #[cfg(unix)]
     fn daemon_socket_variant(
         fast_model: &str,
@@ -9920,7 +9967,7 @@ impl FsfsRuntime {
         let mut hasher = Sha256::new();
         hasher.update(fast_model.as_bytes());
         hasher.update([0]);
-        hasher.update(normalize_model_key(quality_model).as_bytes());
+        hasher.update(quality_model.as_bytes());
         hasher.update([0]);
         // A daemon applies its own degradation override to every request, so
         // clients with a different override must not share it.
@@ -11178,6 +11225,7 @@ impl FsfsRuntime {
             self.config.pressure.degradation_override,
             SearchExecutionMode::Full,
         )?;
+        self.validate_semantic_model_selection(mode)?;
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         if !cache_enabled {
             return self
@@ -11658,6 +11706,51 @@ impl FsfsRuntime {
         }
     }
 
+    fn selected_quality_model_id(&self) -> SearchResult<String> {
+        if self.config.search.fast_only {
+            return Ok(String::new());
+        }
+        Ok(select_quality_model(&self.config.indexing.quality_model)?
+            .map_or_else(String::new, |model| model.manifest_id().to_owned()))
+    }
+
+    /// A lexical answer has no embedding producer. Ignore unrelated model
+    /// configuration only when the effective execution mode is lexical-only.
+    fn selected_model_ids_for_mode(
+        &self,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<(String, String)> {
+        if matches!(build_search_mode(mode), SearchExecutionMode::LexicalOnly) {
+            return Ok((String::new(), String::new()));
+        }
+        Ok((
+            self.selected_fast_model_id()?,
+            self.selected_quality_model_id()?,
+        ))
+    }
+
+    fn validate_registered_local_model_intent(&self) -> SearchResult<()> {
+        let explicit_remote_intent = [
+            "FRANKENSEARCH_API_PROVIDER",
+            "FRANKENSEARCH_API_MODEL",
+            "FRANKENSEARCH_API_DIMENSION",
+            "FRANKENSEARCH_API_IDENTITY_JSON",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+        registered_local_model_policy(self.config.indexing.offline, explicit_remote_intent)
+    }
+
+    fn validate_semantic_model_selection(&self, mode: SearchExecutionMode) -> SearchResult<()> {
+        if matches!(build_search_mode(mode), SearchExecutionMode::LexicalOnly) {
+            return Ok(());
+        }
+        self.validate_registered_local_model_intent()?;
+        self.selected_fast_model_id()?;
+        self.selected_quality_model_id()?;
+        Ok(())
+    }
+
     fn registered_embedding_contracts() -> SearchResult<String> {
         use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
 
@@ -11686,10 +11779,12 @@ impl FsfsRuntime {
         requested_limit: usize,
         mode: SearchExecutionMode,
     ) -> SearchResult<SearchCacheKey> {
+        self.validate_semantic_model_selection(mode)?;
+        let (fast_model, quality_model) = self.selected_model_ids_for_mode(mode)?;
         Ok(SearchCacheKey {
             embedding_contracts: Self::registered_embedding_contracts()?,
-            fast_model: self.selected_fast_model_id()?,
-            quality_model: normalize_model_key(&self.config.indexing.quality_model),
+            fast_model,
+            quality_model,
             query: Self::normalize_search_query(query),
             requested_limit,
             mode: mode.label().to_owned(),
@@ -11740,11 +11835,24 @@ impl FsfsRuntime {
         Ok(index_root.join(FSFS_SEARCH_CACHE_DIR_NAME).join(file_name))
     }
 
+    #[cfg(test)]
     fn search_serve_policy(&self) -> SearchResult<SearchServePolicy> {
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )?;
+        self.search_serve_policy_for_mode(mode)
+    }
+
+    fn search_serve_policy_for_mode(
+        &self,
+        mode: SearchExecutionMode,
+    ) -> SearchResult<SearchServePolicy> {
+        let (fast_model, quality_model) = self.selected_model_ids_for_mode(mode)?;
         Ok(SearchServePolicy {
             embedding_contracts: Self::registered_embedding_contracts()?,
-            fast_model: self.selected_fast_model_id()?,
-            quality_model: normalize_model_key(&self.config.indexing.quality_model),
+            fast_model,
+            quality_model,
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
             rerank_timeout_ms: self.config.search.rerank_timeout_ms,
@@ -12636,6 +12744,7 @@ impl FsfsRuntime {
         flags: SearchExecutionFlags,
         mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        self.validate_semantic_model_selection(mode)?;
         self.rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
         let lexical_stats = resources
@@ -13678,8 +13787,6 @@ impl FsfsRuntime {
         } else {
             "download"
         };
-        fs::create_dir_all(&model_root)?;
-
         let mut results = Vec::with_capacity(manifests.len());
         let show_progress = self.cli_input.format == OutputFormat::Table && !self.cli_input.quiet;
 
@@ -13751,6 +13858,17 @@ impl FsfsRuntime {
                             Some("already present and verified".to_owned()),
                         )
                     } else {
+                        if self.config.indexing.offline {
+                            return Err(SearchError::InvalidConfig {
+                                field: "indexing.offline".to_owned(),
+                                value: "true".to_owned(),
+                                reason: format!(
+                                    "--offline forbids downloading or replacing {}; reuse an already verified cache without --force, or rerun `fsfs download-models {} --online`",
+                                    manifest.id, manifest.id,
+                                ),
+                            });
+                        }
+                        fs::create_dir_all(&model_root)?;
                         let mut lifecycle = ModelLifecycle::new(
                             manifest.clone(),
                             DownloadConsent::granted(ConsentSource::Programmatic),
@@ -13793,25 +13911,82 @@ impl FsfsRuntime {
         })
     }
 
+    /// Check build support before offering acquisition of a selected producer.
+    #[cfg(feature = "semantic-support")]
+    fn ensure_quality_backend(model: RegisteredQualityModel) -> SearchResult<()> {
+        if model.is_native() && !cfg!(feature = "rerank") {
+            return Err(SearchError::EmbedderUnavailable {
+                model: model.manifest_id().to_owned(),
+                reason: "this fsfs build has no native backend; rebuild with the rerank feature (enabled by default)".to_owned(),
+            });
+        }
+        if !model.is_native() && !cfg!(feature = "semantic-loaders") {
+            return Err(SearchError::EmbedderUnavailable {
+                model: model.manifest_id().to_owned(),
+                reason: "this fsfs build has no ONNX quality loader; select all-minilm-l6-v2-native or paraphrase-multilingual-minilm-l12-v2 in a native-enabled build, or rebuild with semantic-loaders".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// First-run consent covers the models this configuration can actually use.
+    /// The bare download command retains its separate bulk catalog semantics.
+    fn configured_model_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
+        self.validate_registered_local_model_intent()?;
+        let quality = if self.config.search.fast_only {
+            None
+        } else {
+            select_quality_model(&self.config.indexing.quality_model)?
+        };
+        #[cfg(not(feature = "semantic-support"))]
+        {
+            let _ = quality;
+            Err(SearchError::EmbedderUnavailable {
+                model: self.config.indexing.fast_model.clone(),
+                reason: "this fsfs build has no semantic fast-model loader; use a build with semantic-loaders or semantic-native before provisioning semantic models".to_owned(),
+            })
+        }
+        #[cfg(feature = "semantic-support")]
+        {
+            let fast = select_fast_model(&self.config.indexing.fast_model)?;
+            let mut selected = vec![fast.download_manifest().clone()];
+            if !self.config.search.fast_only
+                && let Some(quality) = quality
+            {
+                Self::ensure_quality_backend(quality)?;
+                selected.push(quality.download_manifest());
+            }
+            if self.config.search.rerank {
+                if !cfg!(feature = "rerank") {
+                    return Err(SearchError::EmbedderUnavailable {
+                        model: FSFS_RERANKER_MODEL_ID.to_owned(),
+                        reason: "search.rerank requires the rerank feature; this build cannot load the selected cross-encoder".to_owned(),
+                    });
+                }
+                selected.push(ModelManifest::ms_marco_reranker());
+            }
+            Ok(selected)
+        }
+    }
+
     /// Select missing, qualified models before showing a download consent prompt.
-    /// The command resolver also honors native-only builds' configured models.
     fn missing_interactive_model_downloads(
         &self,
         model_root: &Path,
     ) -> SearchResult<Vec<(ModelManifest, PathBuf)>> {
         let mut missing = Vec::new();
-        for manifest in self.resolve_download_manifests()? {
+        for manifest in self.configured_model_manifests()? {
             manifest.validate()?;
             let install_dir = Self::manifest_install_dir_name(&manifest);
             let destination = model_root.join(&install_dir);
-            // Listing an unavailable model or selecting one explicitly must
-            // never turn it into an offer that fails only after consent.
+            // A configured model must pass integrity qualification before the
+            // user is asked to authorize its acquisition.
             if Self::non_production_manifest_entry(
                 &manifest,
                 &install_dir,
                 &destination,
                 "download",
-                self.cli_input.model_name.is_some(),
+                true,
             )?
             .is_some()
             {
@@ -16569,28 +16744,18 @@ impl FsfsRuntime {
     fn resolve_download_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
         #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders")))]
         if !self.cli_input.download_list && self.cli_input.model_name.is_none() {
-            let mut selected = Vec::new();
-            for (tier, name) in [
-                ("fast", self.config.indexing.fast_model.as_str()),
-                ("quality", self.config.indexing.quality_model.as_str()),
-            ] {
-                if tier == "quality" && (self.config.search.fast_only || name.trim().is_empty()) {
-                    continue;
-                }
-                if tier == "quality" && NativeQualityModel::from_name(name).is_none() {
-                    return Err(SearchError::EmbedderUnavailable {
-                        model: name.to_owned(),
-                        reason: "this native-only fsfs build cannot load ONNX quality models; select all-MiniLM-L6-v2-native or paraphrase-multilingual-MiniLM-L12-v2 before provisioning".to_owned(),
-                    });
-                }
-                selected.push(Self::registered_manifest_for_model(tier, name).ok_or_else(
-                    || SearchError::InvalidConfig {
-                        field: format!("indexing.{tier}_model"),
-                        value: name.to_owned(),
-                        reason:
-                            "select a registered model from fsfs download-models --list".to_owned(),
-                    },
-                )?);
+            let fast = select_fast_model(&self.config.indexing.fast_model)?;
+            let mut selected = vec![fast.download_manifest().clone()];
+            let quality = if self.config.search.fast_only {
+                None
+            } else {
+                select_quality_model(&self.config.indexing.quality_model)?
+            };
+            if !self.config.search.fast_only
+                && let Some(quality) = quality
+            {
+                Self::ensure_quality_backend(quality)?;
+                selected.push(quality.download_manifest());
             }
             return Ok(selected);
         }
@@ -17430,9 +17595,12 @@ impl FsfsRuntime {
     }
 
     fn registered_manifest_for_model(tier: &str, model_name: &str) -> Option<ModelManifest> {
+        if tier == "quality" {
+            return RegisteredQualityModel::from_name(model_name)
+                .map(RegisteredQualityModel::download_manifest);
+        }
         let expected_tier = match tier {
             "fast" => ManifestModelTier::Fast,
-            "quality" => ManifestModelTier::Quality,
             "reranker" => ManifestModelTier::Reranker,
             _ => return None,
         };
@@ -17508,6 +17676,9 @@ impl FsfsRuntime {
     where
         F: FnMut(&IndexingProgressSnapshot) -> SearchResult<()>,
     {
+        if !self.lexical_only_indexing {
+            self.validate_semantic_model_selection(SearchExecutionMode::Full)?;
+        }
         let batch_size = self.effective_embedding_batch_size();
         let mut control = IndexRunControl::new(&self.config);
         control.checkpoint(cx, "index.start", true)?;
@@ -20275,6 +20446,7 @@ impl FsfsRuntime {
 
     #[cfg_attr(test, allow(clippy::unnecessary_wraps, clippy::unused_self))]
     fn resolve_fast_embedder(&self) -> SearchResult<Arc<dyn Embedder>> {
+        self.validate_registered_local_model_intent()?;
         #[cfg(feature = "embedded-models")]
         self.prepare_bundled_semantic_models_for_execution()?;
 
@@ -20372,9 +20544,13 @@ impl FsfsRuntime {
         )
     )]
     fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
-        if let Some(native_model) =
-            NativeQualityModel::from_name(&self.config.indexing.quality_model)
-        {
+        if !self.config.indexing.quality_model.trim().is_empty() {
+            self.validate_registered_local_model_intent()?;
+        }
+        let Some(selected) = select_quality_model(&self.config.indexing.quality_model)? else {
+            return Ok(None);
+        };
+        if let Some(native_model) = NativeQualityModel::from_name(selected.manifest_id()) {
             #[cfg(feature = "rerank")]
             {
                 let pool = self.native_blocking_pool.clone().ok_or_else(|| {
@@ -20411,35 +20587,51 @@ impl FsfsRuntime {
         }
 
         #[cfg(feature = "embedded-models")]
-        self.prepare_bundled_semantic_models_for_execution()?;
+        if selected == RegisteredQualityModel::MiniLmOnnx {
+            self.prepare_bundled_semantic_models_for_execution()?;
+        }
 
         #[cfg(test)]
         {
             Ok(test_quality_embedder_override())
         }
 
-        #[cfg(not(test))]
+        #[cfg(all(not(test), feature = "semantic-loaders"))]
         {
-            #[cfg(all(feature = "semantic-native", not(feature = "semantic-loaders")))]
-            if !self.config.indexing.quality_model.trim().is_empty() {
+            let inspection = Self::inspect_registered_model_cache(
+                "quality",
+                selected.manifest_id(),
+                Path::new(&self.config.indexing.model_dir),
+            )?;
+            if inspection.state == ModelCacheVerificationState::Missing {
                 return Err(SearchError::EmbedderUnavailable {
-                    model: self.config.indexing.quality_model.clone(),
-                    reason: "this native-only fsfs build cannot load ONNX quality models; select all-MiniLM-L6-v2-native or paraphrase-multilingual-MiniLM-L12-v2, then run fsfs download-models and rebuild the index with that producer".to_owned(),
+                    model: selected.manifest_id().to_owned(),
+                    reason: format!(
+                        "indexing.quality_model selects {} but it is not installed at {}; run `fsfs download-models {}` and rebuild the quality tier with that producer",
+                        selected.manifest_id(),
+                        inspection.path.display(),
+                        selected.manifest_id(),
+                    ),
                 });
             }
-            let configured_root = PathBuf::from(&self.config.indexing.model_dir);
-            let options = DetectOptions {
-                offline: Some(self.config.indexing.offline),
-            };
+            // The loader verifies this producer's pinned bundle and frozen
+            // execution contract. A missing or corrupt selection never falls
+            // through to an installed MiniLM or a different vector space.
             let quality =
-                EmbedderStack::auto_detect_quality_with_options(Some(&configured_root), &options);
-
-            #[cfg(not(feature = "semantic-support"))]
-            let quality = quality.inspect_err(|_| {
-                emit_model_free_build_hint();
-            });
-
-            quality
+                FastEmbedEmbedder::load_with_name(&inspection.path, selected.manifest_id())?;
+            Self::ensure_semantic_embedder_admissible(&quality, false)?;
+            info!(
+                quality_embedder = quality.id(),
+                "fsfs selected verified ONNX quality model"
+            );
+            Ok(Some(Arc::new(quality)))
+        }
+        #[cfg(all(not(test), not(feature = "semantic-loaders")))]
+        {
+            Err(SearchError::EmbedderUnavailable {
+                model: selected.manifest_id().to_owned(),
+                reason: "this fsfs build has no ONNX quality loader; select all-minilm-l6-v2-native or paraphrase-multilingual-minilm-l12-v2 in a native-enabled build, or rebuild with semantic-loaders".to_owned(),
+            })
         }
     }
 
@@ -21442,6 +21634,7 @@ impl FsfsRuntime {
         admission_mode: SearchExecutionMode,
         resource_mode: SearchExecutionMode,
     ) -> SearchResult<SearchExecutionResources> {
+        self.validate_semantic_model_selection(admission_mode)?;
         self.rebuild_legacy_lexical_index_if_needed(cx, index_root)
             .await?;
         Self::validate_search_generation_at_root(index_root, admission_mode)?;
@@ -22021,6 +22214,9 @@ impl FsfsRuntime {
         cx: &Cx,
         resources: &mut SearchExecutionResources,
     ) -> SearchResult<()> {
+        if self.config.indexing.quality_model.trim().is_empty() {
+            return Ok(());
+        }
         if resources.quality_embedder.is_some() || resources.quality_embedder_attempted {
             return Ok(());
         }
@@ -29647,19 +29843,20 @@ mod tests {
         assert!(!interactive_terminal || std::env::var_os("FSFS_ALLOW_TTY_TEST").is_some());
     }
 
+    #[cfg(any(feature = "semantic-loaders", feature = "semantic-native"))]
     #[test]
     fn interactive_model_provisioning_defaults_are_qualified_before_consent() {
         let temp = tempfile::tempdir().expect("tempdir");
         let model_root = temp.path().join("fresh-model-cache");
         let runtime = FsfsRuntime::new(FsfsConfig::default());
         let selected = runtime
-            .resolve_download_manifests()
-            .expect("default download selection");
+            .configured_model_manifests()
+            .expect("configured default selection");
         let missing = runtime
             .missing_interactive_model_downloads(&model_root)
             .expect("first-run download selection");
 
-        assert!(!missing.is_empty());
+        assert_eq!(missing.len(), 2, "only the enabled fast and quality tiers");
         assert_eq!(
             missing
                 .iter()
@@ -29681,21 +29878,29 @@ mod tests {
         assert!(!model_root.exists(), "selection must not install anything");
     }
 
+    #[cfg(feature = "semantic-loaders")]
     #[test]
-    fn interactive_model_provisioning_filters_unqualified_catalog_entries() {
+    fn interactive_model_provisioning_uses_selected_models_instead_of_bulk_catalog() {
         let temp = tempfile::tempdir().expect("tempdir");
-        // Include opt-in entries to prove that readiness is checked before
-        // consent even if an unavailable model reaches the selection again.
-        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+        let mut config = FsfsConfig::default();
+        config.indexing.fast_model = "potion-base-8M".to_owned();
+        config.indexing.quality_model = "NOMIC-EMBED".to_owned();
+        // Download-command flags cannot replace the runtime's configured
+        // producers or add an unrelated, unqualified model to first-run consent.
+        let runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
             download_list: true,
+            model_name: Some("flashrank-nano".to_owned()),
             ..CliInput::default()
         });
         let missing = runtime
             .missing_interactive_model_downloads(temp.path())
-            .expect("unqualified candidates are excluded");
+            .expect("selected registered producers are qualified");
         assert_eq!(
-            missing.len(),
-            runtime.resolve_download_manifests().unwrap().len() - 1
+            missing
+                .iter()
+                .map(|(model, _)| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["potion-base-8m", "nomic-embed-text-v1.5"],
         );
         assert!(
             missing
@@ -29708,15 +29913,120 @@ mod tests {
                 .all(|(manifest, _)| manifest.id != "flashrank-nano")
         );
 
-        let explicit = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
-            model_name: Some("flashrank-nano".to_owned()),
-            ..CliInput::default()
-        });
+        config.indexing.quality_model = "flashrank-nano".to_owned();
+        let explicit = FsfsRuntime::new(config);
         assert!(matches!(
             explicit.missing_interactive_model_downloads(temp.path()),
-            Err(SearchError::InvalidConfig { field, .. }) if field == "cli.download.model"
+            Err(SearchError::InvalidConfig { field, .. }) if field == "indexing.quality_model"
         ));
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn configured_provisioning_admits_only_enabled_supported_backends() {
+        use frankensearch_embed::RegisteredQualityModel as Quality;
+
+        let temp = tempfile::tempdir().unwrap();
+        for quality in [
+            Quality::MiniLmOnnx,
+            Quality::SnowflakeOnnx,
+            Quality::NomicOnnx,
+            Quality::MiniLmNative,
+            Quality::MultilingualNative,
+        ] {
+            let mut config = FsfsConfig::default();
+            config.indexing.fast_model = "potion-base-32M".to_owned();
+            config.indexing.quality_model = quality.manifest_id().to_owned();
+            let runtime = FsfsRuntime::new(config.clone());
+            let selected = runtime.missing_interactive_model_downloads(temp.path());
+            let supported = if quality.is_native() {
+                cfg!(feature = "rerank")
+            } else {
+                cfg!(feature = "semantic-loaders")
+            };
+            if supported {
+                let selected = selected.unwrap();
+                assert_eq!(selected.len(), 2);
+                assert_eq!(selected[0].0.id, "potion-base-32m");
+                assert_eq!(selected[1].0, quality.download_manifest());
+                assert!(
+                    selected
+                        .iter()
+                        .all(|(manifest, _)| manifest.is_production_ready())
+                );
+            } else {
+                assert!(matches!(
+                    selected,
+                    Err(SearchError::EmbedderUnavailable { model, .. })
+                        if model == quality.manifest_id()
+                ));
+            }
+            config.search.fast_only = true;
+            assert_eq!(
+                FsfsRuntime::new(config)
+                    .configured_model_manifests()
+                    .unwrap(),
+                vec![ModelManifest::potion_base_32m()],
+                "fast-only never acquires even a configured unsupported quality model",
+            );
+        }
+        let mut config = FsfsConfig::default();
+        config.indexing.fast_model = "  ".to_owned();
+        config.indexing.quality_model = "  ".to_owned();
+        assert_eq!(
+            FsfsRuntime::new(config.clone())
+                .configured_model_manifests()
+                .unwrap(),
+            vec![ModelManifest::potion_128m()],
+        );
+        config.search.rerank = true;
+        let selected = FsfsRuntime::new(config).configured_model_manifests();
+        #[cfg(feature = "rerank")]
+        assert_eq!(
+            selected.unwrap(),
+            vec![
+                ModelManifest::potion_128m(),
+                ModelManifest::ms_marco_reranker()
+            ]
+        );
+        #[cfg(not(feature = "rerank"))]
+        assert!(
+            matches!(selected, Err(SearchError::EmbedderUnavailable { model, .. }) if model == super::FSFS_RERANKER_MODEL_ID)
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(not(feature = "semantic-support"))]
+    #[test]
+    fn model_free_build_refuses_first_run_acquisition_before_consent() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            FsfsRuntime::new(FsfsConfig::default())
+                .missing_interactive_model_downloads(temp.path()),
+            Err(SearchError::EmbedderUnavailable { .. }),
+        ));
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn registered_local_policy_rejects_explicit_remote_intent_without_reading_credentials() {
+        for offline in [false, true] {
+            super::registered_local_model_policy(offline, false).unwrap();
+            let error = super::registered_local_model_policy(offline, true).unwrap_err();
+            if offline {
+                assert!(
+                    matches!(&error, SearchError::EmbedderUnavailable { model, .. } if model == "remote-tier")
+                );
+                assert!(error.to_string().contains("--offline"));
+            } else {
+                assert!(
+                    matches!(&error, SearchError::UnverifiableRemoteSpace { producer, .. } if producer == "environment")
+                );
+            }
+            assert!(error.to_string().contains("FRANKENSEARCH_API_PROVIDER"));
+            assert!(error.to_string().contains("registered local"));
+        }
     }
     #[cfg(unix)]
     use std::io::ErrorKind;
@@ -30012,6 +30322,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn fast_model_selection_binds_warm_cache_and_daemon_policy() {
         let temp = tempfile::tempdir().unwrap();
@@ -30118,6 +30429,279 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn quality_model_selection_binds_cache_daemon_and_registered_aliases() {
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                "all-minilm-l6-v2",
+                &["MiniLM", "minilm-384", " ALL-MINILM-L6-V2 "],
+            ),
+            (
+                "snowflake-arctic-embed-s",
+                &["snowflake-arctic-s", "SNOWFLAKE-ARCTIC-S-384"],
+            ),
+            (
+                "nomic-embed-text-v1.5",
+                &["nomic-embed", " NOMIC-EMBED-768 "],
+            ),
+            ("all-minilm-l6-v2-native", &[" ALL-MINILM-L6-V2-NATIVE "]),
+            (
+                "paraphrase-multilingual-minilm-l12-v2",
+                &[
+                    "multilingual-minilm",
+                    "paraphrase-multilingual-minilm-l12-v2-384",
+                ],
+            ),
+        ];
+        let mut cache_hashes = HashSet::new();
+        #[cfg(unix)]
+        let mut socket_paths = HashSet::new();
+        for (canonical, aliases) in cases {
+            let mut config = FsfsConfig::default();
+            config.indexing.quality_model = canonical.to_owned();
+            let runtime = FsfsRuntime::new(config);
+            let key = runtime
+                .search_cache_key("query", 10, SearchExecutionMode::Full)
+                .unwrap();
+            assert_eq!(key.quality_model, canonical);
+            assert!(cache_hashes.insert(FsfsRuntime::search_cache_key_hash(&key)));
+            let policy = runtime.search_serve_policy().unwrap();
+            assert_eq!(policy.quality_model, canonical);
+            #[cfg(unix)]
+            let socket_path = runtime.default_daemon_socket_path().unwrap();
+            #[cfg(unix)]
+            assert!(socket_paths.insert(socket_path.clone()));
+            for alias in aliases {
+                let mut aliased = runtime.clone();
+                aliased.config.indexing.quality_model = (*alias).to_owned();
+                assert_eq!(
+                    aliased
+                        .search_cache_key("query", 10, SearchExecutionMode::Full)
+                        .unwrap(),
+                    key
+                );
+                assert_eq!(aliased.search_serve_policy().unwrap(), policy);
+                #[cfg(unix)]
+                assert_eq!(aliased.default_daemon_socket_path().unwrap(), socket_path);
+            }
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn invalid_enabled_quality_is_rejected_before_cache_routing_and_loading() {
+        for name in [
+            "allminilml6v2",
+            "all-minilm-l6-v2!",
+            "nomic_embed_text_v1.5",
+            "nomic-embed-text-v15",
+            "all-minilm-l6-v2-native!",
+            "unknown-quality",
+        ] {
+            let mut config = FsfsConfig::default();
+            config.indexing.quality_model = name.to_owned();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                daemon_socket: Some(PathBuf::from("explicit-warm-daemon.sock")),
+                ..CliInput::default()
+            });
+            for error in [
+                runtime
+                    .search_cache_key("query", 10, SearchExecutionMode::Full)
+                    .unwrap_err(),
+                runtime.search_serve_policy().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, value, .. }
+                    if field == "indexing.quality_model" && value == name)
+                );
+            }
+            let Err(error) = runtime.resolve_quality_embedder() else {
+                panic!("an unknown selection must not reach a default or injected provider");
+            };
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, value, .. }
+                if field == "indexing.quality_model" && value == name)
+            );
+            #[cfg(unix)]
+            for error in [
+                runtime.default_daemon_socket_path().unwrap_err(),
+                runtime.resolve_daemon_socket_path().unwrap_err(),
+            ] {
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, value, .. }
+                    if field == "indexing.quality_model" && value == name)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_quality_does_not_resolve_but_reenable_checks_the_selection() {
+        let mut config = FsfsConfig::default();
+        config.search.fast_only = true;
+        config.indexing.quality_model = "unknown-disabled-quality".to_owned();
+        let runtime = FsfsRuntime::new(config);
+        let key = runtime
+            .search_cache_key("query", 10, SearchExecutionMode::Full)
+            .unwrap();
+        assert!(key.quality_model.is_empty());
+        assert!(
+            runtime
+                .search_serve_policy()
+                .unwrap()
+                .quality_model
+                .is_empty()
+        );
+        let (quality, reason) = runtime.resolve_indexing_quality_embedder();
+        assert!(quality.is_none());
+        assert_eq!(reason, super::REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);
+        // Explicit admission still validates every stored tier for recovery,
+        // append and watch, even when ordinary queries are fast-only.
+        assert!(matches!(runtime.resolve_quality_embedder(),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "indexing.quality_model"));
+        #[cfg(feature = "semantic-support")]
+        assert_eq!(
+            runtime.configured_model_manifests().unwrap(),
+            vec![ModelManifest::potion_128m()]
+        );
+
+        let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+            "query": "query", "fast_only": false,
+        }))
+        .unwrap();
+        let enabled = runtime.with_search_serve_request_policy(&request).unwrap();
+        #[cfg(feature = "semantic-support")]
+        assert!(matches!(
+            enabled.search_cache_key("query", 10, SearchExecutionMode::Full),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "indexing.quality_model"
+        ));
+        #[cfg(not(feature = "semantic-support"))]
+        assert!(
+            enabled
+                .search_cache_key("query", 10, SearchExecutionMode::Full)
+                .unwrap()
+                .quality_model
+                .is_empty()
+        );
+        let mut blank = enabled;
+        blank.config.indexing.quality_model = " \t ".to_owned();
+        assert!(blank.resolve_quality_embedder().unwrap().is_none());
+        assert!(
+            blank
+                .search_serve_policy()
+                .unwrap()
+                .quality_model
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lexical_only_cache_and_daemon_ignore_unused_model_configuration() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let index_root = temp.path().join("index");
+            fs::create_dir(&index_root).unwrap();
+            let explicit_socket = temp.path().join("explicit.sock");
+            let mut config = FsfsConfig::default();
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            config.indexing.fast_model = "potion-base-8m!".to_owned();
+            config.indexing.quality_model = "all-minilm-l6-v2!".to_owned();
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(index_root),
+                daemon_socket: Some(explicit_socket.clone()),
+                ..CliInput::default()
+            });
+            let query = "lexical cache witness";
+            let key = runtime
+                .search_cache_key(query, 10, SearchExecutionMode::LexicalOnly)
+                .unwrap();
+            assert!(key.fast_model.is_empty());
+            assert!(key.quality_model.is_empty());
+            let policy = runtime.search_serve_policy().unwrap();
+            assert!(policy.fast_model.is_empty());
+            assert!(policy.quality_model.is_empty());
+            #[cfg(unix)]
+            let socket = runtime.default_daemon_socket_path().unwrap();
+            #[cfg(unix)]
+            assert_eq!(
+                runtime.resolve_daemon_socket_path().unwrap(),
+                explicit_socket
+            );
+            let mut known = runtime.clone();
+            known.config.indexing.fast_model = "potion-multilingual-128m".to_owned();
+            known.config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
+            assert_eq!(
+                known
+                    .search_cache_key(query, 10, SearchExecutionMode::LexicalOnly)
+                    .unwrap(),
+                key
+            );
+            assert_eq!(known.search_serve_policy().unwrap(), policy);
+            #[cfg(unix)]
+            assert_eq!(known.default_daemon_socket_path().unwrap(), socket);
+
+            let fingerprint = runtime.search_index_fingerprint().unwrap();
+            let payloads = vec![SearchPayload::new(
+                query,
+                SearchOutputPhase::Initial,
+                1,
+                vec![SearchHitPayload {
+                    rank: 1,
+                    path: "lexical-witness.md".to_owned(),
+                    line: None,
+                    score: 1.0,
+                    snippet: None,
+                    lexical_rank: Some(0),
+                    semantic_rank: None,
+                    hash_rank: None,
+                    in_both_sources: false,
+                }],
+            )];
+            runtime
+                .write_search_payload_cache(&key, &payloads, &fingerprint)
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                    .await
+                    .unwrap(),
+                payloads,
+                "an actual lexical cache hit must not parse disabled model names",
+            );
+
+            let mut active = runtime;
+            active.config.pressure.degradation_override = DegradationOverrideMode::ForceFull;
+            let mode = super::degraded_search_mode(
+                active.config.pressure.degradation_override,
+                SearchExecutionMode::Full,
+            )
+            .unwrap();
+            #[cfg(feature = "semantic-support")]
+            {
+                assert_eq!(mode, SearchExecutionMode::Full);
+                assert!(matches!(active.search_cache_key(query, 10, mode),
+                    Err(SearchError::InvalidConfig { field, .. }) if field == "indexing.fast_model"));
+                assert!(active.search_serve_policy().is_err());
+                #[cfg(unix)]
+                assert!(active.resolve_daemon_socket_path().is_err());
+                active.config.indexing.fast_model = "potion-multilingual-128m".to_owned();
+                assert!(matches!(active.search_cache_key(query, 10, mode),
+                    Err(SearchError::InvalidConfig { field, .. }) if field == "indexing.quality_model"));
+                assert!(active.search_serve_policy().is_err());
+            }
+            #[cfg(not(feature = "semantic-support"))]
+            {
+                assert_eq!(mode, SearchExecutionMode::LexicalOnly);
+                let key = active.search_cache_key(query, 10, mode).unwrap();
+                assert!(key.fast_model.is_empty() && key.quality_model.is_empty());
+                assert!(active.search_serve_policy().unwrap().fast_model.is_empty());
+                #[cfg(unix)]
+                active.resolve_daemon_socket_path().unwrap();
+            }
+        });
     }
 
     /// One stable synthetic identity per `(id, dimension)`, for fixtures that
@@ -31613,6 +32197,11 @@ mod tests {
             serde_json::from_value::<super::SearchServeResponse>(unbound).is_err(),
             "an omitted deadline cannot acknowledge a current request"
         );
+        response.schema_version = "fsfs.search.serve.v14".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that does not check its quality selection cannot attest"
+        );
         response.schema_version = "fsfs.search.serve.v13".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -31873,7 +32462,7 @@ mod tests {
             resources.quality_embedder = None;
             resources.quality_embedder_attempted = false;
             let mut config = FsfsConfig::default();
-            config.indexing.quality_model = embedder.id().to_owned();
+            config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
             let runtime = FsfsRuntime::new(config);
             super::set_test_quality_embedder(None);
             runtime
@@ -36593,7 +37182,7 @@ mod tests {
             // No registered cache is reachable from here, so the planted
             // negative below finds no cross-encoder at all.
             config.indexing.model_dir = temp.path().join("no-models").display().to_string();
-            config.indexing.quality_model = SemanticQualityStub.id().to_owned();
+            config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
 
             super::set_test_fast_embedder(Some(Arc::new(SemanticFastEmbedder)));
             super::set_test_quality_embedder(Some(Arc::new(SemanticQualityStub)));
@@ -36758,7 +37347,7 @@ mod tests {
             // Positive: a semantic fast double (the planner refuses to refine
             // over hash-control ranks) plus a distinct semantic quality double
             // resolve -> both tiers built in two different spaces.
-            config.indexing.quality_model = SemanticQualityStub.id().to_owned();
+            config.indexing.quality_model = "all-minilm-l6-v2".to_owned();
             super::set_test_fast_embedder(Some(Arc::new(SemanticFastEmbedder)));
             super::set_test_quality_embedder(Some(Arc::new(SemanticQualityStub)));
             let index_runtime = FsfsRuntime::new(config.clone()).with_cli_input(CliInput {
@@ -47382,7 +47971,7 @@ mod tests {
             .search_cache_key("castaway", 10, SearchExecutionMode::Full)
             .unwrap();
         let mut cache_keys = vec![FsfsRuntime::search_cache_key_hash(&default_key)];
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "semantic-support"))]
         let mut socket_paths = vec![onnx.default_daemon_socket_path().unwrap()];
         for (name, manifest) in [
             ("all-MiniLM-L6-v2-native", ModelManifest::minilm_v2_native()),
@@ -47410,9 +47999,15 @@ mod tests {
                 .search_cache_key("castaway", 10, SearchExecutionMode::Full)
                 .unwrap();
             let hash = FsfsRuntime::search_cache_key_hash(&key);
+            #[cfg(feature = "semantic-support")]
             assert!(!cache_keys.contains(&hash), "distinct producer: {name}");
+            #[cfg(not(feature = "semantic-support"))]
+            assert!(
+                cache_keys.contains(&hash),
+                "model-free queries have no producer: {name}"
+            );
             cache_keys.push(hash);
-            #[cfg(unix)]
+            #[cfg(all(unix, feature = "semantic-support"))]
             {
                 let socket_path = native.default_daemon_socket_path().unwrap();
                 assert!(
@@ -52576,6 +53171,8 @@ mod tests {
                 "fsfs.search.cache.v16",
                 // Replayed another configured fast model's answers.
                 "fsfs.search.cache.v17",
+                // Accepted malformed quality selections through normalization.
+                "fsfs.search.cache.v18",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();
@@ -52730,7 +53327,7 @@ mod tests {
 
     #[cfg(feature = "semantic-support")]
     #[test]
-    fn persistent_cache_never_replays_another_selected_fast_model() {
+    fn persistent_cache_never_replays_another_selected_embedding_model() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
             let index_root = temp.path().join("index");
@@ -52815,6 +53412,43 @@ mod tests {
                     .unwrap(),
                 payloads,
                 "an actual loader alias preserves its verified selection's cache namespace"
+            );
+            for name in ["nomic-embed-text-v1.5", "snowflake-arctic-embed-s", ""] {
+                let mut changed = runtime.clone();
+                changed.config.indexing.quality_model = name.to_owned();
+                let changed_key = changed
+                    .search_cache_key(query, 10, SearchExecutionMode::Full)
+                    .unwrap();
+                assert!(
+                    changed
+                        .try_load_search_payload_cache(&changed_key, &fingerprint)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            for name in [
+                "allminilml6v2",
+                "all-minilm-l6-v2!",
+                "all-minilm-l6-v2-native!",
+                "unknown-quality",
+            ] {
+                let mut invalid = runtime.clone();
+                invalid.config.indexing.quality_model = name.to_owned();
+                assert!(matches!(
+                    invalid.execute_search_payloads_cached_for_cli(&cx, query, 10).await,
+                    Err(SearchError::InvalidConfig { field, value, .. })
+                        if field == "indexing.quality_model" && value == name
+                ));
+            }
+            let mut quality_alias = runtime.clone();
+            quality_alias.config.indexing.quality_model =
+                format!(" {} ", key.quality_model.to_ascii_uppercase());
+            assert_eq!(
+                quality_alias
+                    .execute_search_payloads_cached_for_cli(&cx, query, 10)
+                    .await
+                    .unwrap(),
+                payloads,
             );
             assert_eq!(fs::read(cache_path).unwrap(), original_bytes);
         });

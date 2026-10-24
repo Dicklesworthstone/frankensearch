@@ -176,6 +176,10 @@ mod loader_only {
                 .env_remove("FSFS_STORAGE_INDEX_DIR")
                 .env_remove("FRANKENSEARCH_STORAGE_INDEX_DIR")
                 .env_remove("FSFS_DISABLE_QUERY_CACHE")
+                .env_remove("FRANKENSEARCH_API_PROVIDER")
+                .env_remove("FRANKENSEARCH_API_MODEL")
+                .env_remove("FRANKENSEARCH_API_DIMENSION")
+                .env_remove("FRANKENSEARCH_API_IDENTITY_JSON")
                 .env_remove("HF_HOME")
                 .env_remove("HUGGINGFACE_HUB_CACHE");
             command
@@ -667,7 +671,7 @@ mod loader_only {
         let mut records = matching_records();
         assert_eq!(records.len(), 1, "the real query must persist one answer");
         let (cache_path, cache_bytes, record) = records.pop().unwrap();
-        assert_eq!(record["schema_version"], "fsfs.search.cache.v18");
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v19");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
 
         let warm = search("fast-model-cache-warm", &selected);
@@ -732,6 +736,172 @@ mod loader_only {
         assert_eq!(fs::read(cache_path).unwrap(), cache_bytes);
         eprintln!(
             "[default-build-e2e] stage=fast-model-answer-cache real_potion=true warm_replay=true changed_producer_refused=true malformed_selection_refused=true canonical_alias_reused=true original_preserved=true"
+        );
+    }
+
+    #[cfg(feature = "semantic-loaders")]
+    fn verify_selected_quality_never_falls_back_to_cached_minilm(
+        root: &Path,
+        source_models: &Path,
+    ) {
+        let root = root.join("selected-quality");
+        let models = root.join("models");
+        let corpus = root.join("corpus");
+        fs::create_dir_all(&corpus).unwrap();
+        fs::write(corpus.join("retry.md"), RETRY_DOCUMENT).unwrap();
+        // Keep the missing/corrupt selected-model cases independent of any
+        // additional models the release qualification cache happens to hold.
+        for (manifest, directory) in [
+            (ModelManifest::potion_128m(), "potion-multilingual-128M"),
+            (ModelManifest::minilm_v2(), "all-MiniLM-L6-v2"),
+        ] {
+            for artifact in &manifest.files {
+                let source = source_models.join(directory).join(&artifact.name);
+                let target = models.join(directory).join(&artifact.name);
+                fs::create_dir_all(target.parent().unwrap()).unwrap();
+                if fs::hard_link(&source, &target).is_err() {
+                    fs::copy(source, target).unwrap();
+                }
+            }
+            fs::copy(
+                source_models.join(directory).join(".verified"),
+                models.join(directory).join(".verified"),
+            )
+            .unwrap();
+        }
+        let fsfs = IsolatedFsfs::new(&root, models.clone());
+        for (label, selected, reason) in [
+            ("control", "all-MiniLM-L6-v2", "vector.quality_tier.built"),
+            (
+                "missing",
+                "nomic-embed-text-v1.5",
+                "vector.quality_tier.skipped.model_unavailable",
+            ),
+            (
+                "corrupt",
+                "nomic-embed-text-v1.5",
+                "vector.quality_tier.skipped.model_unavailable",
+            ),
+            ("disabled", "", "vector.quality_tier.skipped.fast_only"),
+        ] {
+            if label == "corrupt" {
+                for artifact in &ModelManifest::nomic_embed().files {
+                    let path = models.join("nomic-embed-text-v1.5").join(&artifact.name);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, b"unverified selected quality artifact").unwrap();
+                }
+            }
+            let config = root.join(format!("{label}.toml"));
+            fs::write(
+                &config,
+                format!(
+                    "[indexing]\nquality_model = \"{selected}\"\n[search]\nfast_only = false\n"
+                ),
+            )
+            .unwrap();
+            let index = root.join(format!("index-{label}"));
+            let outcome = fsfs.run(
+                &root,
+                &format!("quality-selection-{label}"),
+                [
+                    "index",
+                    corpus.to_str().unwrap(),
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--offline",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let envelope = parse_success_envelope("exact quality selection", &outcome);
+            assert_eq!(envelope["data"]["generation_complete"], true);
+            assert_eq!(envelope["data"]["indexed_files"], 1);
+            assert!(
+                envelope["data"]["reason_codes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value == reason),
+                "{envelope}"
+            );
+            let generation = active_generation_root(&index);
+            assert!(generation.join("vector/index.fsvi").is_file());
+            if label == "control" {
+                let quality = VectorIndex::open_read_only(generation.join("vector/quality.fsvi"))
+                    .expect("the real MiniLM control must build a quality generation");
+                assert_eq!(quality.record_count(), 1);
+                assert!(
+                    quality
+                        .embedder_id()
+                        .to_ascii_lowercase()
+                        .contains("minilm")
+                );
+                continue;
+            }
+            assert!(envelope["data"]["quality_generation"].is_null());
+            assert!(
+                !generation.join("vector/quality.fsvi").exists(),
+                "a cached MiniLM must never replace an unavailable or disabled selection"
+            );
+            if matches!(label, "missing" | "corrupt") {
+                assert!(
+                    outcome.stderr.contains("quality-tier model unavailable"),
+                    "{outcome:?}"
+                );
+                let status = fsfs.run(
+                    &root,
+                    &format!("quality-selection-status-{label}"),
+                    [
+                        "status",
+                        "--config",
+                        config.to_str().unwrap(),
+                        "--index-dir",
+                        index.to_str().unwrap(),
+                        "--format",
+                        "json",
+                    ],
+                    QUICKSTART_TIMEOUT,
+                );
+                let inspected = parse_success_envelope("selected quality cache status", &status);
+                let quality = model_status(&inspected, "quality");
+                assert_eq!(quality["name"], "nomic-embed-text-v1.5");
+                assert_eq!(quality["cached"], false);
+                assert_eq!(
+                    quality["verification_state"],
+                    if label == "missing" {
+                        "missing"
+                    } else {
+                        "mismatch"
+                    }
+                );
+            }
+            let searched = fsfs.run(
+                &root,
+                &format!("quality-selection-search-{label}"),
+                [
+                    "search",
+                    SEMANTIC_PARAPHRASES[0],
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--offline",
+                    "--no-daemon",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let answer =
+                parse_success_envelope("selected quality unavailable, real fast search", &searched);
+            assert_eq!(answer["data"]["phase"], "initial", "{answer}");
+            assert!(!answer["data"]["hits"].as_array().unwrap().is_empty());
+        }
+        eprintln!(
+            "[default-build-e2e] stage=quality-selection real_minilm_control=true missing_selected_skips_quality=true corrupt_selected_skips_quality=true empty_selection_disables_quality=true real_fast_search=true"
         );
     }
 
@@ -927,6 +1097,7 @@ mod loader_only {
                 frames[0]["policy"]["fast_model"],
                 "potion-multilingual-128m"
             );
+            assert_eq!(frames[0]["policy"]["quality_model"], "all-minilm-l6-v2");
             assert_eq!(
                 frames[0]["cached"], false,
                 "distinct queries must execute against the same model owner"
@@ -994,16 +1165,28 @@ mod loader_only {
                 assert!(!stream.stderr.contains("falling back"));
             }
             if number == 0 {
-                for (label, model) in [
-                    ("8m", "potion-base-8m"),
-                    ("32m", "potion-base-32m"),
-                    ("malformed", "potion/multilingual/128m"),
+                for (label, field, model, invalid) in [
+                    ("8m", "fast_model", "potion-base-8m", false),
+                    ("32m", "fast_model", "potion-base-32m", false),
+                    ("malformed", "fast_model", "potion/multilingual/128m", true),
+                    (
+                        "nomic-quality",
+                        "quality_model",
+                        "nomic-embed-text-v1.5",
+                        false,
+                    ),
+                    (
+                        "malformed-quality",
+                        "quality_model",
+                        "all/minilm/l6/v2",
+                        true,
+                    ),
                 ] {
                     let changed_config = root.join(format!("daemon-fast-{label}.toml"));
                     fs::write(
                         &changed_config,
                         format!(
-                            "[indexing]\nfast_model = \"{model}\"\n[search]\nquality_timeout_ms = 5000\n"
+                            "[indexing]\n{field} = \"{model}\"\n[search]\nquality_timeout_ms = 5000\n"
                         ),
                     )
                     .unwrap();
@@ -1039,12 +1222,12 @@ mod loader_only {
                             .contains("falling back to in-process retrieval"),
                         "{refused:?}"
                     );
-                    let expected = if label == "malformed" {
-                        "indexing.fast_model"
+                    let expected = if invalid {
+                        format!("indexing.{field}")
                     } else {
-                        "did not acknowledge the requested search policy"
+                        "requested search policy".to_owned()
                     };
-                    assert!(refused.combined_output().contains(expected), "{refused:?}");
+                    assert!(refused.combined_output().contains(&expected), "{refused:?}");
                     for line in refused.stdout.lines() {
                         let frame: Value = serde_json::from_str(line).unwrap();
                         assert_ne!(frame["event"], "result", "{frame}");
@@ -1295,7 +1478,7 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v14");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v15");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
                     let mut contracts = sha2::Sha256::new();
                     for manifest in [
@@ -1320,7 +1503,7 @@ mod loader_only {
                     );
                     assert_eq!(response["policy"]["quality_weight_bits"], weight.to_bits());
                     assert_eq!(response["policy"]["fast_model"], "potion-multilingual-128m");
-                    assert_eq!(response["policy"]["quality_model"], "allminilml6v2");
+                    assert_eq!(response["policy"]["quality_model"], "all-minilm-l6-v2");
                     assert_eq!(response["policy"]["quality_timeout_ms"], 5000);
                     assert_eq!(
                         response["cached"], true,
@@ -2077,7 +2260,10 @@ mod loader_only {
             let mut raw = String::new();
             socket.read_to_string(&mut raw).unwrap();
             let response: Value = serde_json::from_str(&raw).unwrap();
-            assert_eq!(response["policy"]["quality_model"], "allminilml6v2native");
+            assert_eq!(
+                response["policy"]["quality_model"],
+                "all-minilm-l6-v2-native"
+            );
             assert_eq!(
                 validate_native_cold_result(
                     response["payloads"].as_array().unwrap().last().unwrap()
@@ -2598,7 +2784,7 @@ mod loader_only {
             );
             assert_eq!(
                 response["policy"]["quality_model"],
-                "paraphrasemultilingualminilml12v2"
+                "paraphrase-multilingual-minilm-l12-v2"
             );
             let refined = response["payloads"].as_array().unwrap().last().unwrap();
             assert_eq!(refined["phase"], "refined", "{response}");
@@ -2993,6 +3179,187 @@ mod loader_only {
             0,
             "rejecting an unqualified model must not leave staged artifacts or a verification receipt"
         );
+    }
+
+    #[test]
+    fn offline_downloads_refuse_acquisition_without_mutating_missing_or_corrupt_caches() {
+        let temp = tempfile::tempdir().expect("create offline acquisition fixture");
+        let directory_entries = |path: &Path| {
+            let mut entries = fs::read_dir(path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            entries.sort_unstable();
+            entries
+        };
+        for corrupt in [false, true] {
+            let case = if corrupt { "corrupt" } else { "missing" };
+            let root = temp.path().join(case);
+            let fsfs = IsolatedFsfs::new(&root, root.join("models"));
+            let installed = fsfs.model_root.join("potion-base-8M");
+            let corrupt_files: [(&str, &[u8]); 3] = [
+                ("tokenizer.json", b"unverified tokenizer bytes"),
+                ("model.safetensors", b"unverified model bytes"),
+                (".verified", br#"{"schema_version":0,"verified":true}"#),
+            ];
+            if corrupt {
+                fs::create_dir_all(&installed).unwrap();
+                for (name, bytes) in corrupt_files {
+                    fs::write(installed.join(name), bytes).unwrap();
+                }
+            }
+            let root_before = directory_entries(&fsfs.model_root);
+            let installed_before = corrupt.then(|| directory_entries(&installed));
+            let assert_unchanged = || {
+                assert_eq!(
+                    directory_entries(&fsfs.model_root),
+                    root_before,
+                    "offline acquisition must not create a staging directory"
+                );
+                if let Some(before) = &installed_before {
+                    assert_eq!(&directory_entries(&installed), before);
+                    for (name, bytes) in corrupt_files {
+                        assert_eq!(fs::read(installed.join(name)).unwrap(), bytes);
+                    }
+                }
+            };
+
+            for force in [false, true] {
+                let mut args = vec![
+                    "download-models",
+                    "potion-base-8m",
+                    "--offline",
+                    "--format",
+                    "json",
+                ];
+                if force {
+                    args.push("--force");
+                }
+                let outcome = fsfs.run(
+                    &root,
+                    &format!("offline-{case}-force-{force}"),
+                    args,
+                    FAILURE_TIMEOUT,
+                );
+                assert!(
+                    !outcome.timed_out,
+                    "offline refusal must be prompt: {outcome:?}"
+                );
+                assert_eq!(outcome.status.code(), Some(2), "{outcome:?}");
+                let envelope: Value = serde_json::from_str(&outcome.stdout).unwrap();
+                assert_eq!(envelope["ok"], false, "{envelope}");
+                assert_eq!(envelope["error"]["code"], "invalid_config");
+                assert_eq!(envelope["error"]["field"], "indexing.offline");
+                let message = envelope["error"]["message"].as_str().unwrap();
+                assert!(message.contains("--offline"), "{message}");
+                assert!(message.contains("potion-base-8m"), "{message}");
+                assert!(envelope["data"].is_null());
+                assert_unchanged();
+            }
+
+            let listed = fsfs.run(
+                &root,
+                &format!("offline-{case}-list"),
+                [
+                    "download-models",
+                    "potion-base-8m",
+                    "--offline",
+                    "--list",
+                    "--format",
+                    "json",
+                ],
+                FAILURE_TIMEOUT,
+            );
+            let envelope = parse_success_envelope("offline model inspection", &listed);
+            assert_eq!(envelope["data"]["operation"], "list");
+            assert_eq!(envelope["data"]["models"].as_array().unwrap().len(), 1);
+            assert_eq!(envelope["data"]["models"][0]["state"], case);
+            assert_unchanged();
+
+            let verified = fsfs.run(
+                &root,
+                &format!("offline-{case}-verify"),
+                [
+                    "download-models",
+                    "potion-base-8m",
+                    "--offline",
+                    "--verify",
+                    "--format",
+                    "json",
+                ],
+                FAILURE_TIMEOUT,
+            );
+            assert!(!verified.timed_out, "{verified:?}");
+            assert!(!verified.status.success(), "{verified:?}");
+            let envelope: Value = serde_json::from_str(&verified.stdout).unwrap();
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(
+                envelope["error"]["code"],
+                if corrupt {
+                    "hash_mismatch"
+                } else {
+                    "model_not_found"
+                },
+                "offline verification must preserve the artifact error: {envelope}"
+            );
+            assert_unchanged();
+        }
+    }
+
+    #[test]
+    fn indexing_rejects_unknown_quality_selection_before_loading_or_publishing() {
+        let temp = tempfile::tempdir().expect("create quality selection fixture");
+        let corpus = temp.path().join("corpus");
+        fs::create_dir_all(&corpus).unwrap();
+        fs::write(corpus.join("retry.md"), RETRY_DOCUMENT).unwrap();
+        let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("models"));
+        for (label, model) in [
+            ("unknown", "missing-quality-model"),
+            ("malformed", "all/minilm/l6/v2"),
+        ] {
+            let config = temp.path().join(format!("quality-{label}.toml"));
+            fs::write(
+                &config,
+                format!(
+                    "[indexing]\nfast_model = \"potion-base-8m\"\nquality_model = \"{model}\"\n"
+                ),
+            )
+            .unwrap();
+            let index = temp.path().join(format!("index-{label}"));
+            let outcome = fsfs.run(
+                temp.path(),
+                &format!("index-quality-{label}"),
+                [
+                    "index",
+                    corpus.to_str().unwrap(),
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--offline",
+                    "--format",
+                    "json",
+                ],
+                FAILURE_TIMEOUT,
+            );
+            assert!(!outcome.timed_out, "{outcome:?}");
+            assert_eq!(outcome.status.code(), Some(2), "{outcome:?}");
+            let envelope: Value = serde_json::from_str(&outcome.stdout).unwrap();
+            assert_eq!(envelope["ok"], false);
+            assert_eq!(envelope["error"]["code"], "invalid_config");
+            assert_eq!(envelope["error"]["field"], "indexing.quality_model");
+            assert!(
+                envelope["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(model)
+            );
+            assert!(!index.join("index_sentinel.json").exists());
+            assert!(!index.join("vector/index.fsvi").exists());
+            assert!(!index.join("CURRENT").exists());
+            assert!(!index.join("FSFS-CURRENT").exists());
+            assert_eq!(fs::read_dir(&fsfs.model_root).unwrap().count(), 0);
+        }
     }
 
     #[test]
@@ -4118,7 +4485,14 @@ mod loader_only {
             let verify_outcome = fsfs.run(
                 temp.path(),
                 label,
-                ["download-models", model_id, "--verify", "--format", "json"],
+                [
+                    "download-models",
+                    model_id,
+                    "--offline",
+                    "--verify",
+                    "--format",
+                    "json",
+                ],
                 QUICKSTART_TIMEOUT,
             );
             let verify_envelope =
@@ -4147,10 +4521,64 @@ mod loader_only {
                 is_verification_cached(&manifest, &model_root.join(install_dir)),
                 "explicit CLI verification must refresh a current full-SHA receipt for {model_id}"
             );
+            let receipt_before = fs::read(&receipt_path).unwrap();
+            let model_directories = || {
+                fs::read_dir(&model_root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+            let directories_before = model_directories();
+            let cached_outcome = fsfs.run(
+                temp.path(),
+                &format!("offline-cached-{model_id}"),
+                ["download-models", model_id, "--offline", "--format", "json"],
+                QUICKSTART_TIMEOUT,
+            );
+            let cached = parse_success_envelope("offline verified cache reuse", &cached_outcome);
+            assert_eq!(cached["data"]["operation"], "download");
+            assert_eq!(cached["data"]["models"].as_array().unwrap().len(), 1);
+            assert_eq!(cached["data"]["models"][0]["id"], model_id);
+            assert_eq!(cached["data"]["models"][0]["state"], "cached");
+            assert_eq!(cached["data"]["models"][0]["verified"], true);
+
+            let forced_outcome = fsfs.run(
+                temp.path(),
+                &format!("offline-force-cached-{model_id}"),
+                [
+                    "download-models",
+                    model_id,
+                    "--offline",
+                    "--force",
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            assert!(!forced_outcome.timed_out, "{forced_outcome:?}");
+            assert_eq!(forced_outcome.status.code(), Some(2), "{forced_outcome:?}");
+            let forced: Value = serde_json::from_str(&forced_outcome.stdout).unwrap();
+            assert_eq!(forced["ok"], false);
+            assert_eq!(forced["error"]["code"], "invalid_config");
+            assert_eq!(forced["error"]["field"], "indexing.offline");
+            assert!(
+                forced["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(model_id)
+            );
+            assert_eq!(fs::read(&receipt_path).unwrap(), receipt_before);
+            assert_eq!(model_directories(), directories_before);
+            assert!(is_verification_cached(
+                &manifest,
+                &model_root.join(install_dir)
+            ));
             eprintln!(
-                "[default-build-e2e] stage=cli-model-verify event=verified model={model_id} exit=0 ok=true receipt_refreshed=true"
+                "[default-build-e2e] stage=cli-model-verify event=verified model={model_id} exit=0 ok=true receipt_refreshed=true offline_cached_reuse=true offline_force_refused=true cache_preserved=true"
             );
         }
+
+        verify_selected_quality_never_falls_back_to_cached_minilm(temp.path(), &model_root);
 
         // Exercise the FastEmbed caller itself with a real cached ONNX model,
         // then make that same receipt stale without changing size or mtime.

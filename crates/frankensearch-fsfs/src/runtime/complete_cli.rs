@@ -12,9 +12,9 @@ use frankensearch_core::{SearchError, SearchResult};
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
-    SearchDashboardState, SearchExecutionFlags, canonical_store_root, iso_timestamp_now,
-    pressure_timestamp_ms, retained_search_checkpoint, store_overlaps_source,
-    validate_retained_catalog_path,
+    SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, canonical_store_root,
+    degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms, retained_search_checkpoint,
+    store_overlaps_source, validate_retained_catalog_path,
 };
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
@@ -890,6 +890,11 @@ impl FsfsRuntime {
         root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            SearchExecutionMode::Full,
+        )?;
+        self.validate_semantic_model_selection(mode)?;
         let query = self
             .cli_input
             .query
@@ -2003,7 +2008,7 @@ mod tests {
             let (mut runtime, source, root) = fixture(directory.path());
             runtime.config.search.fast_only = false;
             runtime.config.search.quality_timeout_ms = 5_000;
-            "dashboard-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
             fs::write(
                 source.join("alpha.md"),
                 "sharedtoken original document body",
@@ -3593,7 +3598,7 @@ mod tests {
             let (mut runtime, _, root) = fixture(directory.path());
             runtime.config.search.fast_only = false;
             runtime.config.search.quality_timeout_ms = 5_000;
-            "dashboard-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
             publish(&runtime, &cx, &root).await;
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             let selected = store.active(&cx).unwrap().unwrap();

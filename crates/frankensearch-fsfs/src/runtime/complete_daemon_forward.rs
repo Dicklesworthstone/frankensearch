@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::super::{
     FSFS_DAEMON_RESPONSE_MAX_BYTES, LiveRetainedSearchReader, SearchCacheKey, SearchExecutionMode,
-    SearchServeOptions, SearchServeRequest,
+    SearchServeOptions, SearchServeRequest, degraded_search_mode,
 };
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FsfsRuntime, PeerOutcome, SearchExecutionFlags,
@@ -47,7 +47,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 11: snippets mask credential tokens and private-key material.
 // 12: the search policy travels with each request (`SearchPolicy`).
 // 13: shared buffered/progressive cache and configured search delivery budgets.
-const VERSION: u32 = 13;
+// 14: checked registered model selection; no implicit quality-producer substitution.
+const VERSION: u32 = 14;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -262,6 +263,11 @@ fn make_request(
     query: &str,
     limit: usize,
 ) -> SearchResult<ForwardedSearch> {
+    let mode = degraded_search_mode(
+        runtime.config.pressure.degradation_override,
+        SearchExecutionMode::Full,
+    )?;
+    runtime.validate_semantic_model_selection(mode)?;
     if runtime
         .cli_input
         .overrides
@@ -735,6 +741,70 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn unknown_quality_is_refused_before_forwarding_or_starting_a_daemon() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let absent_root = parent.path().join("absent-store");
+            let socket = parent.path().join("never-start.sock");
+            let mut config = FsfsConfig::default();
+            config.indexing.quality_model = "all-minilm-l6-v2!".to_owned();
+            let runtime = FsfsRuntime::new(config).with_cli_input(crate::CliInput {
+                command: CliCommand::Search,
+                query: Some("query".to_owned()),
+                daemon: true,
+                daemon_socket: Some(socket.clone()),
+                ..crate::CliInput::default()
+            });
+            let refused = |error: SearchError| {
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == "indexing.quality_model"));
+            };
+            refused(make_request(&runtime, &absent_root, "query", 10).unwrap_err());
+            refused(
+                runtime
+                    .query_complete_generation_daemon(&cx, &absent_root, "query", 10)
+                    .await
+                    .unwrap_err(),
+            );
+            for stream in [false, true] {
+                let mut requested = runtime.clone();
+                requested.cli_input.stream = stream;
+                requested.cli_input.format = if stream {
+                    OutputFormat::Jsonl
+                } else {
+                    OutputFormat::Json
+                };
+                let mut output = Vec::new();
+                if stream {
+                    refused(
+                        requested
+                            .stream_complete_generation_daemon(
+                                &cx, &absent_root, "query", 10, &mut output,
+                            )
+                            .await
+                            .unwrap_err(),
+                    );
+                }
+                refused(
+                    Box::pin(requested.run_complete_generation_search_with_writer(
+                        &cx, &absent_root, &mut output,
+                    ))
+                    .await
+                    .unwrap_err(),
+                );
+                assert!(output.is_empty());
+                assert!(!absent_root.exists());
+                assert!(!socket.exists());
+            }
+            let mut lexical = runtime;
+            lexical.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            make_request(&lexical, parent.path(), "query", 10).unwrap();
+        });
+    }
+
     #[test]
     fn forwarded_request_rejects_duplicate_unknown_and_unsupported_fields() {
         let root = tempfile::tempdir().unwrap();
@@ -756,7 +826,7 @@ mod tests {
         // gives long windowed sources the whole quality weight, 6 lets
         // excluded documents back through the vector lanes and 7 reads
         // `lang:rust` as a file extension.
-        for unsupported in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, VERSION + 1] {
+        for unsupported in (1..VERSION).chain([VERSION + 1]) {
             value["fsfs_complete_cli"] = serde_json::json!(unsupported);
             assert!(decode_request(&serde_json::to_vec(&value).unwrap()).is_err());
         }

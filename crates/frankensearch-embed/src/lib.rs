@@ -89,9 +89,9 @@ pub use model_manifest::{
     MANIFEST_SCHEMA_VERSION, MODEL_ARTIFACT_MANIFEST_SCHEMA_V1, ModelArtifactFileV1,
     ModelArtifactManifestV1, ModelArtifactRoleV1, ModelExecutionContractV1, ModelFile,
     ModelLifecycle, ModelManifest, ModelManifestCatalog, ModelState, ModelTier,
-    PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, VerificationMarker, VerifiedModelArtifactsV1,
-    is_verification_cached, resolve_download_consent, verify_dir_and_record, verify_dir_cached,
-    verify_file_sha256,
+    PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, RegisteredQualityModel, VerificationMarker,
+    VerifiedModelArtifactsV1, is_verification_cached, resolve_download_consent,
+    verify_dir_and_record, verify_dir_cached, verify_file_sha256,
 };
 pub use model_registry::{
     BAKEOFF_CUTOFF_DATE, EmbedderRegistry, RegisteredEmbedder, RegisteredReranker,
