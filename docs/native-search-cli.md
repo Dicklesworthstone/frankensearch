@@ -242,6 +242,31 @@ and call `reconcile_pending_with_budget` while retaining its existing reader.
 limit for explicit refreshes. The existing `reconcile_pending` and `refresh`
 methods remain available without an aggregate image cap.
 
+### Library rollback from a retained generation
+
+An application that retains a `NativeGenerationSnapshot` can propose a rollback
+with `target.rollback_candidate(cx, &current, object_id, writer_fence)`. The
+target and independently admitted current snapshot must belong to the same
+logical root and the same physical root, `LOCK`, and `AUTHORITY` inodes. Their
+security profiles must agree and allow mutation. A pending uncertain successor,
+an exhausted authority sequence, or a target that is not older than the current
+authority is refused.
+
+The candidate is a new `Rollback` activation at `current.sequence + 1`. It keeps
+the target's original artifact identity, producer, source checkpoint, document
+set, and validated component receipts. Proposal construction performs no model
+inference or filesystem operation. Stage only its fresh activation manifest
+using `QualifiedGenerationRoot::stage_immutable_file`, prepare an attempt against
+`current.retained_snapshot().authority_pair()`, save that permit durably, and
+publish it through `GenerationPublisherV1::publish_prepared`. The normal publisher
+re-admits the retained objects and applies the configured anti-rollback floor.
+Use the target's original vector binding when admitting the resulting reader.
+
+An intervening publication causes the stale rollback attempt to lose its exact
+comparison. Existing readers keep their original bytes throughout successful
+rollback or failure. This is a retained-snapshot library API; it does not add
+historical discovery through paths or a rollback CLI command.
+
 The authority commands provide initial publication, full-cohort successor
 rebuilds, exact selected search, and publication recovery. The existing
 `update`, `rebuild`, and `serve` commands

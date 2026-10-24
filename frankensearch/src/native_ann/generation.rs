@@ -8,17 +8,21 @@ use std::sync::Arc;
 
 use frankensearch_core::generation::{
     ActivationManifest, AuthorityRefV1, CanonicalDocsetV1, EmbedderTierTag,
-    ExactComponentReceiptV1, ExactGenerationComponentsV1, GenerationComponentRole,
-    GenerationManifest, InvariantKind, SourceCheckpointV1, validate_manifest,
+    ExactComponentReceiptV1, ExactGenerationComponentsV1, GenerationAuthorityActionV1,
+    GenerationComponentRole, GenerationManifest, InvariantKind, SourceCheckpointV1,
+    validate_manifest,
 };
 use frankensearch_index::exact_component_adapters::vector_component_receipt;
-use frankensearch_index::generation_root::generation_reader::OpenedGenerationSnapshotV1;
+use frankensearch_index::generation_root::GenerationRootObjectWitness;
+use frankensearch_index::generation_root::generation_reader::{
+    OpenedGenerationSnapshotV1, SnapshotHealthV1,
+};
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{KeeperSnapshot, QuillConfig, QuillSnapshotIndex, SchemaDescriptor};
 use sha2::Digest as _;
 
 use super::{NativeAnnIndex, NativeRetrievalMode, checkpoint, invalid, lower_hex};
-use crate::{Cx, Embedder, ScoredResult, SearchResult};
+use crate::{Cx, Embedder, GenerationCandidateV1, ScoredResult, SearchResult};
 
 #[cfg(test)]
 mod tests;
@@ -54,6 +58,7 @@ pub(super) struct CompositeReaders {
     lexical: QuillSnapshotIndex,
     metadata: GenerationManifest,
     tier: EmbedderTierTag,
+    components: ExactGenerationComponentsV1,
 }
 
 impl NativeGenerationSnapshot {
@@ -140,6 +145,84 @@ impl NativeGenerationSnapshot {
         &self.readers.metadata
     }
 
+    /// Propose this retained generation as a rollback of `current`.
+    ///
+    /// Both handles must have been independently admitted from the same logical
+    /// root, physical root and persistent control anchors under the same
+    /// mutation-authorized security profile. `self` must be older than
+    /// `current`; an uncertain pending local successor cannot authorize a
+    /// rollback. The caller supplies a fresh manifest object id and writer
+    /// fence, just as for a newly built candidate.
+    ///
+    /// The proposal advances the authority sequence beyond `current` while
+    /// retaining this handle's exact artifact generation, producer identity,
+    /// source checkpoint, document set and component receipts. It never copies
+    /// an old authority number over the current one, loads a model, reads a
+    /// pathname or changes either reader. Only the new activation manifest
+    /// needs staging: the original immutable component objects stay retained.
+    ///
+    /// Publish through [`crate::GenerationPublisherV1`] with the exact pair from
+    /// `current.retained_snapshot().authority_pair()`. That publisher re-admits
+    /// the physical objects, checks the expected pair under its exclusive lock,
+    /// and applies the configured external floor. This pure proposal does not
+    /// reserve the head or prove publication; persist its prepared attempt and
+    /// reconcile any unknown outcome through the normal publication protocol.
+    ///
+    /// # Errors
+    ///
+    /// Refuses cancellation, a foreign or replaced root/anchor, a security
+    /// profile change, read-only or pending authority, a target that is not
+    /// older than `current`, sequence exhaustion, or invalid candidate ids.
+    pub fn rollback_candidate(
+        &self,
+        cx: &Cx,
+        current: &Self,
+        object_id: [u8; 16],
+        writer_fence_sha256: [u8; 32],
+    ) -> SearchResult<GenerationCandidateV1> {
+        checkpoint(cx, "native_ann.generation.rollback")?;
+        let target = self.retained_snapshot();
+        let expected = current.retained_snapshot();
+        if target.root_id() != expected.root_id()
+            || !same_root_security_identity(target.root_witness(), expected.root_witness())
+            || !same_anchor_security_identity(
+                target.anchor_witnesses().lock(),
+                expected.anchor_witnesses().lock(),
+            )
+            || !same_anchor_security_identity(
+                target.anchor_witnesses().authority(),
+                expected.anchor_witnesses().authority(),
+            )
+        {
+            return Err(refused("rollback", "different-root-or-anchors"));
+        }
+        if target.profile() != expected.profile() || !expected.profile().permits_mutation() {
+            return Err(refused("rollback", "security-profile"));
+        }
+        if matches!(
+            expected.health(),
+            SnapshotHealthV1::PendingLocalSuccessor { .. }
+        ) {
+            return Err(refused("rollback", "pending-reconciliation"));
+        }
+        if self.authority().sequence >= current.authority().sequence {
+            return Err(refused("rollback", "target-not-older"));
+        }
+        current
+            .authority()
+            .next_sequence()
+            .map_err(|_| refused("rollback", "sequence-exhausted"))?;
+        GenerationCandidateV1::new(
+            object_id,
+            Some(current.authority()),
+            GenerationAuthorityActionV1::Rollback,
+            target.manifest().generation(),
+            writer_fence_sha256,
+            &self.readers.components,
+        )
+        .map_err(|_| refused("rollback", "invalid-candidate"))
+    }
+
     /// Search and hydrate against the selected vector and Quill images.
     ///
     /// The configured producer is checked before inference and its bound output
@@ -159,6 +242,31 @@ impl NativeGenerationSnapshot {
     ) -> SearchResult<Vec<ScoredResult>> {
         self.readers.search_text(cx, embedder, text, k).await
     }
+}
+
+// Directory contents and control bytes legitimately change on publication.
+// Compare only the descriptor-derived security identities, never derived
+// witness equality (which also includes timestamps and directory length).
+fn same_root_security_identity(
+    first: GenerationRootObjectWitness,
+    second: GenerationRootObjectWitness,
+) -> bool {
+    first.device() == second.device()
+        && first.inode() == second.inode()
+        && first.mode() == second.mode()
+        && first.uid() == second.uid()
+        && first.gid() == second.gid()
+        && first.mount_identity() == second.mount_identity()
+        && first.filesystem() == second.filesystem()
+}
+
+fn same_anchor_security_identity(
+    first: GenerationRootObjectWitness,
+    second: GenerationRootObjectWitness,
+) -> bool {
+    same_root_security_identity(first, second)
+        && first.hard_links() == second.hard_links()
+        && first.byte_len() == second.byte_len()
 }
 
 impl CompositeReaders {
@@ -306,8 +414,9 @@ pub(super) fn admit_components(
     );
     checkpoint(cx, "native_ann.generation.lexical_complete")?;
     let lexical = lexical_result.map_err(|_| refused("lexical", "admission-failed"))?;
-    ExactGenerationComponentsV1::admit(vector_receipt, lexical_receipt, None, metadata_receipt)
-        .map_err(|_| refused("components", "incoherent-generation"))?;
+    let components =
+        ExactGenerationComponentsV1::admit(vector_receipt, lexical_receipt, None, metadata_receipt)
+            .map_err(|_| refused("components", "incoherent-generation"))?;
     checkpoint(cx, "native_ann.generation.readers")?;
     let vector = NativeAnnIndex::exact(cx, owner)?;
     let lexical_result = QuillSnapshotIndex::new(cx, lexical, config);
@@ -319,6 +428,7 @@ pub(super) fn admit_components(
         lexical,
         metadata,
         tier,
+        components,
     })
 }
 
