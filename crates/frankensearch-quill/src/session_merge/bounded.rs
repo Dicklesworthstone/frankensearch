@@ -486,7 +486,10 @@ mod tests {
     fn real_manifest_layout_budget_still_applies_with_unlimited_inputs() {
         run_test_with_cx(|cx| async move {
             let bytes = u64::from(u32::MAX) / 3 + 1;
-            let sources: Vec<_> = (0..8).map(|id| segment(id, 1, bytes)).collect();
+            // Contiguous sources: no holes, so the u32 file-length budget is
+            // the only bound (two fit, three do not). `segment` spaces ids
+            // 65,536 apart, and that many holes alone exceed the layout.
+            let sources: Vec<_> = (0..8).map(|id| layout_segment(id, id, 1, bytes)).collect();
             let policy = SessionMergePolicy {
                 max_input_docs: u64::MAX,
                 max_input_bytes: u64::MAX,
@@ -790,27 +793,29 @@ mod publication_tests {
             .await
             .expect("create bounded-session fixture");
         for batch in 0..3 {
-            for row in 0..2 {
-                // The newest source replaces a row in the oldest source. A
-                // newly merged container must not mask the live replacement.
-                let id = if batch == 2 && row == 1 {
-                    "bounded-0-0".to_owned()
-                } else {
-                    format!("bounded-{batch}-{row}")
-                };
-                let text = if row == 0 {
-                    "shared amber rust"
-                } else {
-                    "shared cobalt python"
-                };
-                LexicalWrite::index_document(
-                    &index,
-                    cx,
-                    &IndexableDocument::new(id.as_str(), text),
-                )
+            // The newest source replaces a row in the oldest source. A newly
+            // merged container must not mask the live replacement. Each source
+            // is one ingest batch: a separate call that replaces a published
+            // document first publishes the pending rows (the engine-neutral
+            // LexicalWrite contract), which would split the source in two.
+            let rows: Vec<_> = (0..2)
+                .map(|row| {
+                    let id = if batch == 2 && row == 1 {
+                        "bounded-0-0".to_owned()
+                    } else {
+                        format!("bounded-{batch}-{row}")
+                    };
+                    let text = if row == 0 {
+                        "shared amber rust"
+                    } else {
+                        "shared cobalt python"
+                    };
+                    IndexableDocument::new(id.as_str(), text)
+                })
+                .collect();
+            LexicalWrite::index_documents(&index, cx, &rows)
                 .await
-                .expect("stage fixture row");
-            }
+                .expect("stage fixture rows");
             LexicalWrite::commit(&index, cx)
                 .await
                 .expect("seal a two-row source");

@@ -43,21 +43,28 @@ fn budget() -> SessionMergeBudget {
 async fn fixture(cx: &Cx, directory: &Path) -> QuillIndex {
     let index = QuillIndex::create(cx, directory, config()).await.unwrap();
     for batch in 0..6 {
-        for row in 0..2 {
-            let id = if batch == 5 && row == 1 {
-                "maintenance-0-0".to_owned()
-            } else {
-                format!("maintenance-{batch}-{row}")
-            };
-            let text = if row == 0 {
-                "shared amber rust"
-            } else {
-                "shared cobalt python"
-            };
-            LexicalWrite::index_document(&index, cx, &IndexableDocument::new(id.as_str(), text))
-                .await
-                .unwrap();
-        }
+        // One ingest batch per source: a separate call that replaces a
+        // published document first publishes the pending rows (the
+        // engine-neutral LexicalWrite contract), which would split the
+        // replacing source in two.
+        let rows: Vec<_> = (0..2)
+            .map(|row| {
+                let id = if batch == 5 && row == 1 {
+                    "maintenance-0-0".to_owned()
+                } else {
+                    format!("maintenance-{batch}-{row}")
+                };
+                let text = if row == 0 {
+                    "shared amber rust"
+                } else {
+                    "shared cobalt python"
+                };
+                IndexableDocument::new(id.as_str(), text)
+            })
+            .collect();
+        LexicalWrite::index_documents(&index, cx, &rows)
+            .await
+            .unwrap();
         LexicalWrite::commit(&index, cx).await.unwrap();
     }
     assert_eq!(index.snapshot().unwrap().segments().len(), 6);
@@ -300,8 +307,8 @@ fn failed_second_publication_keeps_first_receipt_and_resumes_after_reconciliatio
         let blocked = directory
             .path()
             .join(format!(".tmp-manifest-{}", initial.generation + 2));
-        let blocker = b"preserve the conflicting second proposal";
-        std::fs::write(&blocked, blocker).unwrap();
+        let conflicting_proposal = b"preserve the conflicting second proposal";
+        std::fs::write(&blocked, conflicting_proposal).unwrap();
         let failure = index
             .merge_sessions(&cx, policy(), budget(), 0xc300, 0)
             .await
@@ -342,7 +349,7 @@ fn failed_second_publication_keeps_first_receipt_and_resumes_after_reconciliatio
         assert!(authority.segments.iter().any(|s| s.segment_id == 0xc300));
         assert!(!authority.segments.iter().any(|s| s.segment_id == 0xc301));
         assert!(!output_path(directory.path(), 0xc302).exists());
-        assert_eq!(std::fs::read(&blocked).unwrap(), blocker);
+        assert_eq!(std::fs::read(&blocked).unwrap(), conflicting_proposal);
         assert_eq!(stored(&held), expected_stored);
         assert_reopened(&cx, directory.path(), &expected_queries, &expected_stored).await;
 
