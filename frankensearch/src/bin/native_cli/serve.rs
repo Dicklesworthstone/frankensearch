@@ -26,6 +26,9 @@ mod model_migration;
 #[path = "request_tuning.rs"]
 mod request_tuning;
 
+#[path = "source.rs"]
+pub mod source;
+
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Read one bounded nonblank record using the same policy for hybrid and
@@ -103,11 +106,23 @@ impl Controls {
     }
 }
 
+impl SessionControls {
+    /// Apply the startup query-cache policy to models loaded by later migrations.
+    /// Existing warm caches are never transferred across a model replacement.
+    pub(super) fn with_query_cache(mut self, cache: crate::query_cache::Config) -> Self {
+        if let Some(authority) = self.migration.take() {
+            self.migration = Some(authority.with_query_cache(cache));
+        }
+        self
+    }
+}
+
 // Unknown control fields cannot fall through into an unrestricted search.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Message {
     Search(Request),
+    Fetch(source::Request),
     TunedSearch(request_tuning::Request),
     Control(activation::Request),
     Update(warm_update::Request),
@@ -220,9 +235,13 @@ async fn phases<W: Write>(
     }
     frames.send(started).map_err(Failure::Delivery)?;
     if mode != Mode::Full {
-        let payload = query::within(cx, deadline, scoped.search(cx, &request.query, mode, limit))
-            .await
-            .map_err(Failure::Query)?;
+        let payload = Box::pin(query::within(
+            cx,
+            deadline,
+            scoped.search_with_pool(cx, &request.query, mode, limit, policy.query_pool()),
+        ))
+        .await
+        .map_err(Failure::Query)?;
         frames.send(payload).map_err(Failure::Delivery)?;
         frames.partial = true;
         return Ok(false);
@@ -234,9 +253,9 @@ async fn phases<W: Write>(
     while !stream.is_finished() {
         // One deadline, not a renewed timeout per phase. Do not time output:
         // delivery may already be visible and must never be reported undone.
-        let phase = query::within(cx, deadline, async {
+        let phase = Box::pin(query::within(cx, deadline, async {
             stream.next_phase().await.map_err(Into::into)
-        })
+        }))
         .await
         .map_err(Failure::Query)?;
         let Some(phase) = phase else {
@@ -322,12 +341,12 @@ pub async fn stream_one<'i, W: Write>(
     let mut frames = Frames::new(output, ordinal, request.id.as_deref(), index.generation());
     let mode = request.mode.unwrap_or(defaults.0);
     let limit = request.limit.unwrap_or(defaults.1);
-    let result = async {
+    let result = Box::pin(async {
         request.validate().map_err(Failure::Query)?;
         let deadline = policy
             .start(cx, request.timeout_ms)
             .map_err(Failure::Query)?;
-        phases(
+        Box::pin(phases(
             index,
             cx,
             request,
@@ -337,9 +356,9 @@ pub async fn stream_one<'i, W: Write>(
             [base_filter, request.filter.as_ref()],
             deadline.as_ref(),
             policy,
-        )
+        ))
         .await
-    }
+    })
     .await;
     match result {
         Ok(degraded) => {
@@ -391,13 +410,17 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
         "activation_enabled": controls.controls.activation,
         "updates_enabled": controls.controls.updates,
         "model_migration_enabled": controls.migration.is_some(),
-        "model_migration_supported": matches!(&initial, live::Snapshot::Single(_)),
+        "model_migration_supported": true,
         "update_max_mutations": warm_update::MAX_MUTATIONS,
         "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),
         "query_tuning_enabled": policy.query_overrides_enabled(),
         "full_mode_reranker": policy.rerank.as_ref().map(|r| r.model.id()),
         "rerank_window": policy.rerank.as_ref().map(|r| r.window),
+        "source_fetch_supported": true,
+        "source_fetch_max_documents": source::MAX_DOCUMENTS,
+        "source_fetch_max_content_bytes": source::MAX_CONTENT_BYTES,
+        "source_fetch_max_response_bytes": source::MAX_RESPONSE_BYTES,
     });
     index.annotate(&mut ready);
     policy.annotate_full_query(Mode::Full, &mut ready);
@@ -430,11 +453,31 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
             }
         };
         match message {
+            Message::Fetch(request) => {
+                // Pin once for generation admission, every document window and
+                // delivery. IDs resolve through source membership, not FSVI rows.
+                let snapshot = live.snapshot(cx).await?;
+                let index = snapshot.index();
+                source::execute(
+                    cx,
+                    snapshot.generation(),
+                    &request,
+                    ordinal,
+                    base_filter,
+                    policy,
+                    |id| match index {
+                        cohort::Index::Single(index) => index.vectors().document(id),
+                        cohort::Index::Sharded(index) => index.vectors().document(id),
+                    },
+                    output,
+                )
+                .await?;
+            }
             Message::Search(request) => {
                 // Pin once, through Initial, quality, hydration and terminal
                 // delivery. Never resolve the serving selection between phases.
                 let snapshot = live.snapshot(cx).await?;
-                let _complete = stream_one(
+                let _complete = Box::pin(stream_one(
                     snapshot.index(),
                     cx,
                     &request,
@@ -443,12 +486,12 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                     output,
                     base_filter,
                     policy,
-                )
+                ))
                 .await?;
             }
             Message::TunedSearch(request) => {
                 let snapshot = live.snapshot(cx).await?;
-                request_tuning::execute(
+                Box::pin(request_tuning::execute(
                     snapshot.index(),
                     cx,
                     &request,
@@ -457,7 +500,7 @@ pub async fn run_with_controls<'l, R: BufRead, W: Write>(
                     output,
                     base_filter,
                     policy,
-                )
+                ))
                 .await?;
             }
             Message::Control(request) => {

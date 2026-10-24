@@ -56,11 +56,14 @@ use crate::quiver::{
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{
-    EncodedSegment, PendingSegmentFile, PlannedSection, SectionEntry, SectionKind,
-    SegmentAssembler, SegmentHeader, SegmentHeaderInput, SegmentReader,
+    EncodedSegment, PendingSegmentFile, PlannedSection, RetainedSegmentBytes, SectionEntry,
+    SectionKind, SegmentAssembler, SegmentHeader, SegmentHeaderInput, SegmentReader,
 };
 
 mod receipt_admission;
+mod snapshot_image;
+
+pub use snapshot_image::{EXACT_LEXICAL_SNAPSHOT_IMAGE_DOMAIN, ExactLexicalSnapshotImage};
 
 pub use crate::stats::{SegmentStats, SegmentStatsProvider};
 
@@ -770,6 +773,9 @@ fn manifest_live_doc_count(manifest: &Manifest) -> u64 {
 /// Keeper I/O, recovery, locking, and publication failures.
 #[derive(Debug, Error)]
 pub enum KeeperError {
+    /// An exact lexical snapshot image operation was cancelled.
+    #[error("Quill exact lexical snapshot image operation cancelled")]
+    SnapshotImageCancelled,
     /// An immutable lexical snapshot could not produce or re-open its exact receipt.
     #[error("Quill exact lexical snapshot receipt rejected: {detail}")]
     ExactSnapshotReceipt {
@@ -1259,6 +1265,10 @@ impl From<KeeperError> for SearchError {
             KeeperError::InvalidClaimArtifact { path, detail } => {
                 Self::IndexCorrupted { path, detail }
             }
+            KeeperError::SnapshotImageCancelled => Self::Cancelled {
+                phase: "keeper.snapshot_image".to_owned(),
+                reason: "exact lexical snapshot image operation cancelled".to_owned(),
+            },
             KeeperError::WriterAdmissionCancelled => Self::Cancelled {
                 phase: "keeper.writer_admission".to_owned(),
                 reason: "writer admission cancelled".to_owned(),
@@ -2410,6 +2420,7 @@ impl TombstoneIndex {
 enum RecoveredSegmentBacking {
     Mapped(SegmentReader<ReadOnlyMappedFile>),
     Owned(SegmentReader<EncodedSegment>),
+    Retained(SegmentReader<RetainedSegmentBytes>),
 }
 
 impl RecoveredSegmentBacking {
@@ -2417,6 +2428,7 @@ impl RecoveredSegmentBacking {
         match self {
             Self::Mapped(reader) => reader.header(),
             Self::Owned(reader) => reader.header(),
+            Self::Retained(reader) => reader.header(),
         }
     }
 
@@ -2424,6 +2436,7 @@ impl RecoveredSegmentBacking {
         match self {
             Self::Mapped(reader) => reader.section(kind),
             Self::Owned(reader) => reader.section(kind),
+            Self::Retained(reader) => reader.section(kind),
         }
     }
 
@@ -2431,6 +2444,7 @@ impl RecoveredSegmentBacking {
         match self {
             Self::Mapped(reader) => reader.section_entries(),
             Self::Owned(reader) => reader.section_entries(),
+            Self::Retained(reader) => reader.section_entries(),
         }
     }
 
@@ -2438,6 +2452,7 @@ impl RecoveredSegmentBacking {
         match self {
             Self::Mapped(reader) => reader.verify(),
             Self::Owned(reader) => reader.verify(),
+            Self::Retained(reader) => reader.verify(),
         }
     }
 
@@ -2445,6 +2460,7 @@ impl RecoveredSegmentBacking {
         match self {
             Self::Mapped(reader) => reader.source_bytes(),
             Self::Owned(reader) => reader.source_bytes(),
+            Self::Retained(reader) => reader.source_bytes(),
         }
     }
 
@@ -2456,6 +2472,7 @@ impl RecoveredSegmentBacking {
         match self {
             Self::Mapped(reader) => reader.file_xxh3(),
             Self::Owned(reader) => reader.file_xxh3(),
+            Self::Retained(reader) => reader.file_xxh3(),
         }
     }
 
@@ -3681,6 +3698,9 @@ pub struct KeeperSnapshot {
     tombstone_count: u64,
     live_doc_count: u64,
     quarantined_segments: Vec<QuarantinedSegment>,
+    /// Exact selected MANIFEST from a retained snapshot image. This is never
+    /// recovered by pathname; immutable segment ranges retain the same image.
+    retained_manifest: Option<(Arc<[u8]>, Range<usize>)>,
 }
 
 /// Re-openable authority for one immutable Quill lexical snapshot receipt.
@@ -3773,6 +3793,7 @@ impl KeeperSnapshot {
             tombstone_count,
             live_doc_count,
             quarantined_segments,
+            retained_manifest: None,
         })
     }
 
@@ -3794,9 +3815,9 @@ impl KeeperSnapshot {
 
     /// Emit the exact Quill lexical component receipt for this immutable snapshot.
     ///
-    /// The byte receipt is a domain-separated SHA-256 over the selected
-    /// MANIFEST generation and every retained immutable FSLX image in manifest
-    /// order. The document-set digest independently materializes every live
+    /// The byte receipt is the raw SHA-256 and complete length of the v2
+    /// image produced by [`Self::export_exact_image`], including its domain
+    /// and frame headers. The document-set digest independently materializes every live
     /// IDMAP identity in physical generation order, so a tombstone, a hole, a
     /// duplicate, or a reordered row cannot be hidden by the component hash.
     ///
@@ -3808,6 +3829,16 @@ impl KeeperSnapshot {
         &self,
         source_checkpoint: SourceCheckpointV1,
     ) -> Result<ExactComponentReceiptV1, KeeperError> {
+        self.exact_lexical_component_receipt_with_checkpoint(source_checkpoint, || Ok(()))
+    }
+
+    fn exact_lexical_component_receipt_with_checkpoint(
+        &self,
+        source_checkpoint: SourceCheckpointV1,
+        mut checkpoint: impl FnMut() -> Result<(), KeeperError>,
+    ) -> Result<ExactComponentReceiptV1, KeeperError> {
+        checkpoint()?;
+        self.validate_exact_image_source()?;
         let source_checkpoint = source_checkpoint.to_bytes();
         // Retained despite the newtype (bd-z4zr3): a derived checkpoint cannot
         // be all-zero for any commit range, so this is now unreachable through
@@ -3821,30 +3852,39 @@ impl KeeperSnapshot {
 
         let manifest = exact_snapshot_manifest_bytes(self)?;
         let mut hasher = Sha256::new();
-        hasher.update(b"frankensearch.quill.exact-lexical-snapshot.v1");
-        hash_exact_snapshot_frame(&mut hasher, b"manifest", &manifest)?;
-        let mut byte_len =
-            u64::try_from(manifest.len()).map_err(|_| KeeperError::ExactSnapshotReceipt {
+        hasher.update(EXACT_LEXICAL_SNAPSHOT_IMAGE_DOMAIN);
+        hash_exact_snapshot_frame(&mut hasher, b"manifest", &manifest, &mut checkpoint)?;
+        let mut byte_len = u64::try_from(manifest.len())
+            .map_err(|_| KeeperError::ExactSnapshotReceipt {
                 detail: "MANIFEST length does not fit the component receipt".to_owned(),
+            })?
+            .checked_add(EXACT_LEXICAL_SNAPSHOT_IMAGE_DOMAIN.len() as u64 + 2 + 8 + 8)
+            .ok_or_else(|| KeeperError::ExactSnapshotReceipt {
+                detail: "lexical image framing length overflowed".to_owned(),
             })?;
         let mut document_ids = Vec::new();
 
         for segment in &self.segments {
+            checkpoint()?;
             let manifest = segment.manifest();
             hasher.update(manifest.segment_id.to_le_bytes());
             let bytes = segment.reader.source_bytes();
-            hash_exact_snapshot_frame(&mut hasher, b"segment", bytes)?;
+            hash_exact_snapshot_frame(&mut hasher, b"segment", bytes, &mut checkpoint)?;
             byte_len = byte_len
                 .checked_add(u64::try_from(bytes.len()).map_err(|_| {
                     KeeperError::ExactSnapshotReceipt {
                         detail: "segment length does not fit the component receipt".to_owned(),
                     }
                 })?)
+                .and_then(|length| length.checked_add(8 + 2 + 7 + 8))
                 .ok_or_else(|| KeeperError::ExactSnapshotReceipt {
                     detail: "lexical component byte length overflowed".to_owned(),
                 })?;
 
             for global_docid in manifest.docid_lo..manifest.docid_hi {
+                if global_docid % 1024 == 0 {
+                    checkpoint()?;
+                }
                 let global_docid =
                     u32::try_from(global_docid).map_err(|_| KeeperError::ExactSnapshotReceipt {
                         detail: "manifest named a non-u32 Quill document id".to_owned(),
@@ -3861,6 +3901,7 @@ impl KeeperSnapshot {
                     detail: format!("canonical lexical document set was rejected: {error}"),
                 }
             })?;
+        checkpoint()?;
         if u64::try_from(docset.len()).map_err(|_| KeeperError::ExactSnapshotReceipt {
             detail: "lexical live document count does not fit the component receipt".to_owned(),
         })? != self.live_doc_count
@@ -17321,6 +17362,7 @@ fn hash_exact_snapshot_frame(
     hasher: &mut Sha256,
     role: &[u8],
     bytes: &[u8],
+    checkpoint: &mut impl FnMut() -> Result<(), KeeperError>,
 ) -> Result<(), KeeperError> {
     let role_len = u16::try_from(role.len()).map_err(|_| KeeperError::ExactSnapshotReceipt {
         detail: "exact lexical snapshot frame role exceeded u16".to_owned(),
@@ -17331,11 +17373,25 @@ fn hash_exact_snapshot_frame(
     hasher.update(role_len.to_le_bytes());
     hasher.update(role);
     hasher.update(byte_len.to_le_bytes());
-    hasher.update(bytes);
+    for chunk in bytes.chunks(1 << 20) {
+        checkpoint()?;
+        hasher.update(chunk);
+    }
     Ok(())
 }
 
 fn exact_snapshot_manifest_bytes(snapshot: &KeeperSnapshot) -> Result<Vec<u8>, KeeperError> {
+    if let Some((image, range)) = &snapshot.retained_manifest {
+        return copy_bytes(&image[range.clone()], "retained lexical MANIFEST")
+            .map_err(|source| KeeperError::InvalidManifest { source });
+    }
+    if snapshot.directory.is_none() && snapshot.loaded.source == ManifestSource::InMemory {
+        return snapshot
+            .loaded
+            .manifest
+            .to_bytes()
+            .map_err(|source| KeeperError::InvalidManifest { source });
+    }
     let directory =
         snapshot
             .directory

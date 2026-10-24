@@ -133,8 +133,8 @@ impl NativeAnnIndex {
         if target == 0 {
             return Ok(Vec::new());
         }
-        // Keep only k winners, not an all-corpus hit vector. Decode at most one
-        // row at a time, and clone a document ID only when it enters the heap.
+        // Keep only k winners, not an all-corpus hit vector. Score retained
+        // bytes, and clone a document ID only when it enters the heap.
         let mut heap: BinaryHeap<RankedHit> = BinaryHeap::new();
         for physical in 0..self.owner.record_count() {
             checkpoint(cx, "native_ann.exact_row")?;
@@ -143,10 +143,7 @@ impl NativeAnnIndex {
                 continue;
             }
             checkpoint(cx, "native_ann.exact_score")?;
-            let values = self.owner.vector_at_f32(physical)?;
-            // Use exactly the ANN facade's retained-owner rescoring kernel,
-            // including its f16-to-f32 promotion, rather than rounded distance.
-            let score = frankensearch_index::dot_product_f32_f32(&values, query.vector())?;
+            let score = self.score_retained_row(physical, query.vector())?;
             if !score.is_finite() {
                 return Err(invalid(
                     "score",

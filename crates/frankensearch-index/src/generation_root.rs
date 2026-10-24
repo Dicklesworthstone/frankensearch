@@ -1651,7 +1651,8 @@ pub mod authority_publisher {
         GENERATION_AUTHORITY_SLOT_BYTES_V1, GENERATION_LOCK_FRAME_BYTES_V1,
         GenerationAuthorityErrorV1, GenerationLockFrameKindV1, GenerationLockFrameV1,
         GenerationRootSecurityProfileV1, InMemoryAntiRollbackFloorStoreV1,
-        LocalAntiRollbackFloorStoreV1, resolve_authority_slots_with_profile_v1,
+        LocalAntiRollbackFloorStoreV1, resolve_authority_slots_at_floor_v1,
+        resolve_authority_slots_with_profile_v1,
     };
 
     /// Exact LOCK anchor length this publisher requires: owner frame + attempt frame.
@@ -2084,6 +2085,86 @@ pub mod authority_publisher {
         Ok(())
     }
 
+    fn validate_reconciliation_permit(
+        permit: &AttemptPermitV1,
+        root_id: [u8; 16],
+    ) -> Result<GenerationLockFrameV1, GenerationAuthorityErrorV1> {
+        if permit.root_id != root_id {
+            return Err(GenerationAuthorityErrorV1::RootMismatch);
+        }
+        if u64::from(permit.target_slot) != (permit.candidate.sequence & 1) {
+            return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
+        }
+        if permit.idempotency_key == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.idempotency_key",
+            });
+        }
+        for (index, slot) in [(0, permit.expected.first), (1, permit.expected.second)] {
+            if let Some(slot) = slot {
+                if slot.root_id != root_id {
+                    return Err(GenerationAuthorityErrorV1::RootMismatch);
+                }
+                if slot.slot_index != index {
+                    return Err(GenerationAuthorityErrorV1::SlotIndexMismatch);
+                }
+            }
+        }
+        let expected_head = resolve_authority_slots_with_profile_v1(
+            permit.expected.first,
+            permit.expected.second,
+            None,
+            None,
+            GenerationRootSecurityProfileV1::CooperativeLocal,
+            None,
+        )?;
+        candidate_extends(permit.candidate, expected_head)?;
+        GenerationLockFrameV1::new(
+            GenerationLockFrameKindV1::Attempt,
+            root_id,
+            permit.writer_id,
+            permit.attempt_id,
+            permit.candidate.sequence,
+            permit.candidate.fingerprint(),
+        )
+    }
+
+    fn reconciliation_frame(
+        lock_bytes: &[u8],
+        offset: u64,
+        root_id: [u8; 16],
+        kind: GenerationLockFrameKindV1,
+    ) -> Result<Option<GenerationLockFrameV1>, GenerationAuthorityErrorV1> {
+        let start =
+            usize::try_from(offset).map_err(|_| GenerationAuthorityErrorV1::InvalidSlotLength)?;
+        let bytes = lock_bytes
+            .get(start..start + GENERATION_LOCK_FRAME_BYTES_V1)
+            .ok_or(GenerationAuthorityErrorV1::InvalidSlotLength)?;
+        if bytes.iter().all(|byte| *byte == 0) {
+            return Ok(None);
+        }
+        let frame = GenerationLockFrameV1::from_authenticated_bytes(bytes, root_id)?;
+        if frame.kind != kind {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.frame.kind",
+            });
+        }
+        Ok(Some(frame))
+    }
+
+    fn frame_completes_attempt(
+        owner: Option<GenerationLockFrameV1>,
+        attempt: GenerationLockFrameV1,
+    ) -> bool {
+        owner.is_some_and(|owner| {
+            owner.root_id == attempt.root_id
+                && owner.writer_id == attempt.writer_id
+                && owner.attempt_id == attempt.attempt_id
+                && owner.fence == attempt.fence
+                && owner.authority_fingerprint == attempt.authority_fingerprint
+        })
+    }
+
     impl AuthorityPublisherV1<'_> {
         /// Root this publisher writes.
         #[must_use]
@@ -2358,20 +2439,41 @@ pub mod authority_publisher {
 
         /// Resolve an unknown attempt from the exact current slot, floor, and frame state.
         ///
+        /// A proven aborted attempt clears only its matching attempt frame after
+        /// fencing the complete old slot pair and owner. A committed attempt
+        /// completes under the original writer/attempt identity, including when
+        /// another process performs recovery. Neither path rewrites AUTHORITY.
+        ///
         /// # Errors
         ///
-        /// Infrastructure failures surface as [`GenerationRootError`]; every
-        /// authority-level state is a typed [`ReconcileOutcomeV1`].
+        /// Infrastructure failures surface as [`GenerationRootError`]; a floor
+        /// or completion-frame write may already have occurred, so the caller
+        /// must retain the permit and reconcile again. Every authority-level
+        /// state is a typed [`ReconcileOutcomeV1`].
         pub fn reconcile(
             &self,
             permit: &AttemptPermitV1,
             floor: Option<&dyn AntiRollbackFloorProviderV1>,
         ) -> GenerationRootResult<ReconcileOutcomeV1> {
-            if permit.root_id != self.root_id {
+            let candidate_authority = permit.candidate;
+            if let Err(error) = self.profile.require_mutation_authorized() {
+                return Ok(ReconcileOutcomeV1::RepairRequired(error));
+            }
+            if self.profile == GenerationRootSecurityProfileV1::RequiredExternal && floor.is_none()
+            {
                 return Ok(ReconcileOutcomeV1::RepairRequired(
-                    GenerationAuthorityErrorV1::RootMismatch,
+                    GenerationAuthorityErrorV1::ExternalFloorRequired,
                 ));
             }
+            if self.lock_layout_matches().is_err() {
+                return Ok(ReconcileOutcomeV1::RepairRequired(
+                    GenerationAuthorityErrorV1::InvalidSlotLength,
+                ));
+            }
+            let expected_attempt = match validate_reconciliation_permit(permit, self.root_id) {
+                Ok(attempt) => attempt,
+                Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
+            };
             let mut guard = match self.root.try_exclusive_anchor_guard() {
                 Ok(guard) => guard,
                 // Same fence as in `publish`: the permit stays valid; retry.
@@ -2387,111 +2489,208 @@ pub mod authority_publisher {
                 }
                 Err(error) => return Err(error),
             };
-            let observed_target = match decode_slot(
-                &guard.authority_image.bytes,
-                permit.target_slot,
-                self.root_id,
-            ) {
-                Ok(slot) => slot,
+            let observed = match decode_pair(&guard.authority_image.bytes, self.root_id) {
+                Ok(pair) => pair,
                 Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
             };
-            let expected_target = if permit.target_slot == 0 {
-                permit.expected.first
+            let observed_target = if permit.target_slot == 0 {
+                observed.first
             } else {
-                permit.expected.second
+                observed.second
             };
-
-            let outcome = match observed_target {
-                None => ReconcileOutcomeV1::NotCommitted,
-                Some(slot) if Some(slot) == expected_target => ReconcileOutcomeV1::NotCommitted,
-                Some(slot) if slot.authority == permit.candidate => {
-                    // Locally committed. Prove or advance the floor, then make
-                    // sure the owner frame records completion.
-                    let floor_receipt = match floor {
-                        None => None,
-                        Some(provider) => match provider.load(self.root_id) {
-                            Err(_) => {
-                                return Ok(ReconcileOutcomeV1::StillUnknown(*permit));
-                            }
-                            Ok(Some(record))
-                                if record.authority.sequence > permit.candidate.sequence =>
-                            {
-                                // Floor is past us: only a newer local head explains it.
-                                let pair =
-                                    match decode_pair(&guard.authority_image.bytes, self.root_id) {
-                                        Ok(pair) => pair,
-                                        Err(error) => {
-                                            return Ok(ReconcileOutcomeV1::RepairRequired(error));
-                                        }
-                                    };
-                                return Ok(
-                                    match resolve_authority_slots_with_profile_v1(
-                                        pair.first,
-                                        pair.second,
-                                        None,
-                                        None,
-                                        GenerationRootSecurityProfileV1::CooperativeLocal,
-                                        None,
-                                    ) {
-                                        Ok(Some(head))
-                                            if head.authority.sequence
-                                                > permit.candidate.sequence =>
-                                        {
-                                            ReconcileOutcomeV1::CommittedThenSuperseded { head }
-                                        }
-                                        _ => ReconcileOutcomeV1::StillUnknown(*permit),
-                                    },
-                                );
-                            }
-                            Ok(Some(record)) if record.authority == permit.candidate => {
-                                Some(record)
-                            }
-                            Ok(current) => {
-                                let next =
-                                    match AuthorityFloorV1::new(self.root_id, permit.candidate) {
-                                        Ok(next) => next,
-                                        Err(error) => {
-                                            return Ok(ReconcileOutcomeV1::RepairRequired(error));
-                                        }
-                                    };
-                                match provider.compare_and_advance(
-                                    current,
-                                    next,
-                                    permit.idempotency_key,
-                                ) {
-                                    Ok(receipt) => Some(receipt),
-                                    Err(_) => {
-                                        return Ok(ReconcileOutcomeV1::StillUnknown(*permit));
-                                    }
-                                }
-                            }
-                        },
-                    };
-                    let owner_frame = GenerationLockFrameV1::new(
-                        GenerationLockFrameKindV1::Owner,
-                        self.root_id,
-                        self.writer_id,
-                        permit.attempt_id,
-                        permit.candidate.sequence,
-                        permit.candidate.fingerprint(),
-                    )
-                    .and_then(GenerationLockFrameV1::encode);
-                    match owner_frame {
-                        Ok(frame) => {
-                            platform::write_lock_range(
-                                &mut guard.flock,
-                                OWNER_FRAME_OFFSET,
-                                &frame,
-                            )?;
-                        }
-                        Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
-                    }
-                    ReconcileOutcomeV1::Committed {
-                        slot,
-                        floor: floor_receipt,
-                    }
+            if observed != permit.expected
+                && !observed_target.is_some_and(|slot| slot.authority == permit.candidate)
+            {
+                let expected_target = if permit.target_slot == 0 {
+                    permit.expected.first
+                } else {
+                    permit.expected.second
+                };
+                if observed_target == expected_target {
+                    return Ok(ReconcileOutcomeV1::RepairRequired(
+                        GenerationAuthorityErrorV1::LockAuthorityMismatch,
+                    ));
                 }
-                Some(observed) => ReconcileOutcomeV1::Fork { observed },
+                return Ok(observed_target.map_or(
+                    ReconcileOutcomeV1::RepairRequired(
+                        GenerationAuthorityErrorV1::LockAuthorityMismatch,
+                    ),
+                    |observed| ReconcileOutcomeV1::Fork { observed },
+                ));
+            }
+            let head = match resolve_authority_slots_with_profile_v1(
+                observed.first,
+                observed.second,
+                None,
+                None,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ) {
+                Ok(head) => head,
+                Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
+            };
+            let lock_image = platform::read_lock_image(&guard.flock)?;
+            let owner = match reconciliation_frame(
+                &lock_image,
+                OWNER_FRAME_OFFSET,
+                self.root_id,
+                GenerationLockFrameKindV1::Owner,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
+            };
+            let attempt = match reconciliation_frame(
+                &lock_image,
+                ATTEMPT_FRAME_OFFSET,
+                self.root_id,
+                GenerationLockFrameKindV1::Attempt,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
+            };
+            let current_floor = match floor {
+                Some(provider) => match provider.load(self.root_id) {
+                    Ok(record) => record,
+                    Err(_) => return Ok(ReconcileOutcomeV1::StillUnknown(*permit)),
+                },
+                None => None,
+            };
+            if current_floor.is_some_and(|record| record.root_id != self.root_id) {
+                return Ok(ReconcileOutcomeV1::RepairRequired(
+                    GenerationAuthorityErrorV1::RootMismatch,
+                ));
+            }
+
+            let outcome = if observed == permit.expected {
+                // Reading only the target slot cannot prove abortion: its peer,
+                // the floor, and the previous owner's authority must also agree.
+                if let Err(error) = resolve_authority_slots_with_profile_v1(
+                    observed.first,
+                    observed.second,
+                    owner,
+                    None,
+                    self.profile,
+                    current_floor.map(|record| AuthorityFloorV1 {
+                        root_id: record.root_id,
+                        authority: record.authority,
+                    }),
+                ) {
+                    return Ok(ReconcileOutcomeV1::RepairRequired(error));
+                }
+                if let Some(record) = current_floor
+                    && let Err(error) = resolve_authority_slots_at_floor_v1(
+                        observed.first,
+                        observed.second,
+                        AuthorityFloorV1 {
+                            root_id: record.root_id,
+                            authority: record.authority,
+                        },
+                    )
+                {
+                    return Ok(ReconcileOutcomeV1::RepairRequired(error));
+                }
+                match attempt {
+                    Some(attempt) if attempt == expected_attempt => {
+                        // Clear a proven non-commit in place. Keep the previous
+                        // owner, exact authority bytes, inode and length intact.
+                        platform::write_lock_range(
+                            &mut guard.flock,
+                            ATTEMPT_FRAME_OFFSET,
+                            &[0; GENERATION_LOCK_FRAME_BYTES_V1],
+                        )?;
+                    }
+                    Some(attempt) if !frame_completes_attempt(owner, attempt) => {
+                        return Ok(ReconcileOutcomeV1::RepairRequired(
+                            GenerationAuthorityErrorV1::UnresolvedAttempt,
+                        ));
+                    }
+                    // The crash may precede the attempt write, or a previous
+                    // reconciliation may already have durably cleared it.
+                    Some(_) | None => {}
+                }
+                ReconcileOutcomeV1::NotCommitted
+            } else if let Some(head) = head
+                && head.authority.sequence > permit.candidate.sequence
+            {
+                // The consecutive authenticated pair proves the candidate's
+                // successor. Never overwrite that successor's owner frame.
+                if let Some(record) = current_floor {
+                    if record.authority != candidate_authority && record.authority != head.authority
+                    {
+                        return Ok(ReconcileOutcomeV1::StillUnknown(*permit));
+                    }
+                } else if floor.is_some() {
+                    return Ok(ReconcileOutcomeV1::StillUnknown(*permit));
+                }
+                ReconcileOutcomeV1::CommittedThenSuperseded { head }
+            } else {
+                let Some(slot) = observed_target else {
+                    return Ok(ReconcileOutcomeV1::RepairRequired(
+                        GenerationAuthorityErrorV1::LockAuthorityMismatch,
+                    ));
+                };
+                let mut committed_pair = permit.expected;
+                if permit.target_slot == 0 {
+                    committed_pair.first = Some(slot);
+                } else {
+                    committed_pair.second = Some(slot);
+                }
+                if observed != committed_pair || attempt != Some(expected_attempt) {
+                    return Ok(ReconcileOutcomeV1::RepairRequired(
+                        GenerationAuthorityErrorV1::LockAuthorityMismatch,
+                    ));
+                }
+                if !frame_completes_attempt(owner, expected_attempt)
+                    && let Err(error) = resolve_authority_slots_with_profile_v1(
+                        permit.expected.first,
+                        permit.expected.second,
+                        owner,
+                        None,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                    )
+                {
+                    return Ok(ReconcileOutcomeV1::RepairRequired(error));
+                }
+                let floor_receipt = match (floor, current_floor) {
+                    (None, _) => None,
+                    (Some(_), Some(record)) if record.authority == permit.candidate => Some(record),
+                    (Some(_), Some(record))
+                        if record.authority.sequence >= permit.candidate.sequence =>
+                    {
+                        return Ok(ReconcileOutcomeV1::StillUnknown(*permit));
+                    }
+                    (Some(provider), current) => {
+                        let next = match AuthorityFloorV1::new(self.root_id, permit.candidate) {
+                            Ok(next) => next,
+                            Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
+                        };
+                        match provider.compare_and_advance(current, next, permit.idempotency_key) {
+                            Ok(receipt)
+                                if receipt.root_id == self.root_id
+                                    && receipt.authority == candidate_authority =>
+                            {
+                                Some(receipt)
+                            }
+                            Ok(_) | Err(_) => return Ok(ReconcileOutcomeV1::StillUnknown(*permit)),
+                        }
+                    }
+                };
+                if !frame_completes_attempt(owner, expected_attempt) {
+                    let owner_frame = GenerationLockFrameV1 {
+                        kind: GenerationLockFrameKindV1::Owner,
+                        ..expected_attempt
+                    };
+                    let frame = match owner_frame.encode() {
+                        Ok(frame) => frame,
+                        Err(error) => return Ok(ReconcileOutcomeV1::RepairRequired(error)),
+                    };
+                    platform::write_lock_range(&mut guard.flock, OWNER_FRAME_OFFSET, &frame)?;
+                }
+                ReconcileOutcomeV1::Committed {
+                    slot,
+                    floor: floor_receipt,
+                }
             };
             let _ = guard.release();
             Ok(outcome)
@@ -3002,7 +3201,15 @@ pub mod authority_publisher {
             floor
                 .refuse
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            let reconciled = publisher
+            let recovered_root = admit(&root_path);
+            let recovered = recovered_root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_B,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("different process incarnation recovers the exact attempt");
+            let reconciled = recovered
                 .reconcile(&permit, Some(&floor))
                 .expect("reconcile runs");
             let ReconcileOutcomeV1::Committed {
@@ -3021,6 +3228,12 @@ pub mod authority_publisher {
                     .map(|f| f.fence),
                 Some(1)
             );
+            let owner = recovered
+                .owner_frame()
+                .expect("recovered owner")
+                .expect("completed");
+            assert_eq!(owner.writer_id, permit.writer_id);
+            assert_eq!(owner.attempt_id, permit.attempt_id);
             // Reconciling again is idempotent.
             assert!(matches!(
                 publisher
@@ -3242,6 +3455,11 @@ pub mod authority_publisher {
                         "crash at {crash_at:?}"
                     );
                     assert_eq!(floor.load(ROOT_ID), Ok(None));
+                    let lock = fs::read(root_path.join("LOCK")).expect("reconciled lock");
+                    assert!(
+                        lock.iter().all(|byte| *byte == 0),
+                        "aborted genesis leaves no unresolved frame"
+                    );
                     // Nothing was published: a fresh genesis publication succeeds.
                     let retry = publisher
                         .publish(
@@ -3257,6 +3475,240 @@ pub mod authority_publisher {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn reconcile_refuses_altered_permits_and_security_downgrades_without_mutation() {
+            let root_path = fixture_root("reconcile-permit-fence");
+            let root = admit(&root_path);
+            let floor = RefusingFloor {
+                inner: InMemoryAntiRollbackFloorStoreV1::new(),
+                refuse: std::sync::atomic::AtomicBool::new(true),
+            };
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher");
+            let genesis = authority(1, None);
+            let outcome = publisher
+                .publish(
+                    genesis,
+                    ExpectedAuthorityPairV1::default(),
+                    Some(&floor),
+                    [0x41; 16],
+                )
+                .expect("publication");
+            let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome else {
+                panic!("floor failure must retain a permit");
+            };
+            let authority_before = authority_bytes(&root_path);
+            let lock_before = fs::read(root_path.join("LOCK")).expect("lock");
+            let altered = [
+                AttemptPermitV1 {
+                    root_id: [0x19; 16],
+                    ..permit
+                },
+                AttemptPermitV1 {
+                    writer_id: WRITER_B,
+                    ..permit
+                },
+                AttemptPermitV1 {
+                    attempt_id: [0x19; 16],
+                    ..permit
+                },
+                AttemptPermitV1 {
+                    target_slot: 0,
+                    ..permit
+                },
+                AttemptPermitV1 {
+                    idempotency_key: [0; 16],
+                    ..permit
+                },
+                AttemptPermitV1 {
+                    expected: ExpectedAuthorityPairV1 {
+                        first: None,
+                        second: Some(AuthoritySlotV1::new(1, ROOT_ID, genesis).expect("slot")),
+                    },
+                    ..permit
+                },
+            ];
+            for altered in altered {
+                assert!(matches!(
+                    publisher
+                        .reconcile(&altered, Some(&floor))
+                        .expect("refusal"),
+                    ReconcileOutcomeV1::RepairRequired(_)
+                ));
+                assert_eq!(authority_bytes(&root_path), authority_before);
+                assert_eq!(fs::read(root_path.join("LOCK")).expect("lock"), lock_before);
+                assert_eq!(floor.inner.load(ROOT_ID), Ok(None));
+            }
+            let inspection = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_B,
+                    GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+                )
+                .expect("inspection publisher");
+            assert_eq!(
+                inspection
+                    .reconcile(&permit, Some(&floor))
+                    .expect("read-only refusal"),
+                ReconcileOutcomeV1::RepairRequired(GenerationAuthorityErrorV1::ReadOnlyProfile)
+            );
+            let anchored = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_B,
+                    GenerationRootSecurityProfileV1::RequiredExternal,
+                )
+                .expect("anchored publisher");
+            assert_eq!(
+                anchored
+                    .reconcile(&permit, None)
+                    .expect("missing floor refusal"),
+                ReconcileOutcomeV1::RepairRequired(
+                    GenerationAuthorityErrorV1::ExternalFloorRequired
+                )
+            );
+            assert_eq!(authority_bytes(&root_path), authority_before);
+            assert_eq!(fs::read(root_path.join("LOCK")).expect("lock"), lock_before);
+
+            floor
+                .refuse
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                anchored
+                    .reconcile(&permit, Some(&floor))
+                    .expect("exact recovery"),
+                ReconcileOutcomeV1::Committed { .. }
+            ));
+            assert_eq!(
+                anchored
+                    .owner_frame()
+                    .expect("owner")
+                    .expect("completed")
+                    .writer_id,
+                WRITER_A
+            );
+        }
+
+        #[test]
+        fn aborted_reconciliation_fences_the_whole_pair_and_preserves_previous_owner() {
+            let root_path = fixture_root("aborted-attempt-fence");
+            let root = admit(&root_path);
+            let publisher = root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_A,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("publisher");
+            let genesis = authority(1, None);
+            let PublicationOutcomeV1::Committed { slot, .. } = publisher
+                .publish(
+                    genesis,
+                    ExpectedAuthorityPairV1::default(),
+                    None,
+                    [0x41; 16],
+                )
+                .expect("genesis")
+            else {
+                panic!("genesis must commit");
+            };
+            let expected = ExpectedAuthorityPairV1 {
+                first: None,
+                second: Some(slot),
+            };
+            let successor = authority(2, Some(genesis.fingerprint()));
+            let authority_before = authority_bytes(&root_path);
+            let owner_before = fs::read(root_path.join("LOCK")).expect("old lock")
+                [..GENERATION_LOCK_FRAME_BYTES_V1]
+                .to_vec();
+            let outcome = {
+                let _hook = platform::install_test_hook(|boundary| {
+                    if boundary == platform::TestBoundary::BeforePublishSlotWrite {
+                        Err(GenerationRootError::new(
+                            GenerationRootErrorKind::Io,
+                            GenerationRootStage::SyncRegularFile,
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                publisher
+                    .publish(successor, expected, None, [0x42; 16])
+                    .expect("interrupted successor")
+            };
+            let PublicationOutcomeV1::CommitOutcomeUnknown(permit) = outcome else {
+                panic!("interrupted slot write must be unknown");
+            };
+            let pending_lock = fs::read(root_path.join("LOCK")).expect("pending lock");
+            let peer_fork =
+                AuthorityRefV1::new(1, [0x88; 16], 5_000, [0x89; 32], None).expect("peer fork");
+            let peer_bytes = AuthoritySlotV1::new(1, ROOT_ID, peer_fork)
+                .expect("peer slot")
+                .encode()
+                .expect("peer bytes");
+            let authority_file = OpenOptions::new()
+                .write(true)
+                .open(root_path.join("AUTHORITY"))
+                .expect("authority writer");
+            std::os::unix::fs::FileExt::write_all_at(&authority_file, &peer_bytes, slot_offset(1))
+                .expect("mutate peer only");
+            authority_file.sync_all().expect("durable peer mutation");
+            assert!(matches!(
+                publisher
+                    .reconcile(&permit, None)
+                    .expect("changed peer refusal"),
+                ReconcileOutcomeV1::RepairRequired(_)
+            ));
+            assert_eq!(
+                fs::read(root_path.join("LOCK")).expect("lock"),
+                pending_lock
+            );
+
+            std::os::unix::fs::FileExt::write_all_at(&authority_file, &authority_before, 0)
+                .expect("restore exact old pair");
+            authority_file.sync_all().expect("old pair durable");
+            let fresh_root = admit(&root_path);
+            let recovered = fresh_root
+                .authority_publisher(
+                    ROOT_ID,
+                    WRITER_B,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                )
+                .expect("recovery writer");
+            assert_eq!(
+                recovered.reconcile(&permit, None).expect("proven abortion"),
+                ReconcileOutcomeV1::NotCommitted
+            );
+            let completed_lock = fs::read(root_path.join("LOCK")).expect("completed lock");
+            assert_eq!(
+                &completed_lock[..GENERATION_LOCK_FRAME_BYTES_V1],
+                owner_before
+            );
+            assert!(
+                completed_lock[GENERATION_LOCK_FRAME_BYTES_V1..]
+                    .iter()
+                    .all(|byte| *byte == 0)
+            );
+            assert_eq!(authority_bytes(&root_path), authority_before);
+            assert_eq!(
+                recovered
+                    .reconcile(&permit, None)
+                    .expect("idempotent abortion"),
+                ReconcileOutcomeV1::NotCommitted
+            );
+            assert!(matches!(
+                recovered
+                    .publish(successor, expected, None, [0x43; 16])
+                    .expect("next publication"),
+                PublicationOutcomeV1::Committed { .. }
+            ));
         }
 
         #[test]
@@ -4295,6 +4747,9 @@ pub mod generation_reader {
             if name.ends_with(WRITE_AHEAD_LOG_SUFFIX_V1.as_bytes()) {
                 return Err(ClosureViolationV1::WriteAheadLog);
             }
+            if entry.device() != root_device {
+                return Err(ClosureViolationV1::ForeignDevice);
+            }
             if declared.iter().any(|declared| declared.as_bytes() == name) {
                 continue;
             }
@@ -4305,9 +4760,6 @@ pub mod generation_reader {
             }
             if entry.hard_links() != 1 {
                 return Err(ClosureViolationV1::Alias);
-            }
-            if entry.device() != root_device {
-                return Err(ClosureViolationV1::ForeignDevice);
             }
         }
         if !inventory.aliases().is_empty() {
@@ -4372,6 +4824,14 @@ pub mod generation_reader {
         /// The manifest object opened, but it is not the exact object the
         /// resolved authority addresses.
         Manifest(GenerationAuthorityErrorV1),
+        /// The selected manifest and component images exceed the caller's
+        /// admission budget. Checked before reading component objects.
+        ImageBudget {
+            /// Declared total, or `u64::MAX` if addition overflowed.
+            required: u64,
+            /// Caller-selected maximum encoded image bytes.
+            limit: u64,
+        },
         /// The manifest or a component object could not be admitted exactly
         /// (missing, wrong length or digest, wrong owner/mode/link identity…).
         Closure(GenerationRootErrorKind),
@@ -4670,6 +5130,23 @@ pub mod generation_reader {
             .map_err(|error| SnapshotRefusalV1::Closure(error.kind())))
     }
 
+    fn check_image_budget(
+        manifest_bytes: u64,
+        component_lengths: impl IntoIterator<Item = u64>,
+        limit: u64,
+    ) -> Result<(), SnapshotRefusalV1> {
+        let total = component_lengths
+            .into_iter()
+            .try_fold(manifest_bytes, u64::checked_add);
+        match total {
+            Some(required) if required <= limit => Ok(()),
+            required => Err(SnapshotRefusalV1::ImageBudget {
+                required: required.unwrap_or(u64::MAX),
+                limit,
+            }),
+        }
+    }
+
     impl QualifiedGenerationRoot {
         fn resolution_round(
             &self,
@@ -4733,6 +5210,31 @@ pub mod generation_reader {
             profile: GenerationRootSecurityProfileV1,
             floor: Option<&dyn AntiRollbackFloorProviderV1>,
         ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            self.open_generation_snapshot_with_budget(root_id, profile, floor, u64::MAX)
+        }
+
+        /// Open a complete snapshot within an explicit encoded-image budget.
+        ///
+        /// The manifest length is checked before its image is opened. After
+        /// authenticating that manifest, the combined lengths of its declared
+        /// components and manifest are checked before any component is opened.
+        /// Every retry after a concurrent authority switch repeats these checks
+        /// for the newly selected generation. Absent ANN consumes no budget.
+        /// This bounds retained encoded images, not engine parsing, process RSS,
+        /// filesystem cache, or readers the caller already retains.
+        ///
+        /// # Errors
+        ///
+        /// Returns the same infrastructure errors and typed refusals as
+        /// [`Self::open_generation_snapshot`], with
+        /// [`SnapshotRefusalV1::ImageBudget`] for a budget refusal.
+        pub fn open_generation_snapshot_with_budget(
+            &self,
+            root_id: [u8; 16],
+            profile: GenerationRootSecurityProfileV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
+            max_owned_image_bytes: u64,
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
             if root_id == [0; 16] {
                 return Ok(SnapshotOpenOutcomeV1::Refused(
                     SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::InvalidField {
@@ -4750,6 +5252,11 @@ pub mod generation_reader {
                 // Open the immutable closure outside the lock: exact length
                 // and digest from the authority, descriptor-relative route.
                 let authority = first.head.authority;
+                if let Err(refusal) =
+                    check_image_budget(authority.manifest_len, [], max_owned_image_bytes)
+                {
+                    return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
+                }
                 let path = activation_manifest_path_v1(authority.object_id)?;
                 let expectation = GenerationFileExpectation::immutable(
                     authority.manifest_len,
@@ -4780,6 +5287,13 @@ pub mod generation_reader {
                 // Every declared component object, exact length and digest
                 // from the manifest receipts, descriptor-relative.
                 let receipts = manifest.components();
+                if let Err(refusal) = check_image_budget(
+                    authority.manifest_len,
+                    receipts.iter().map(|(_, receipt)| receipt.byte_len),
+                    max_owned_image_bytes,
+                ) {
+                    return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
+                }
                 let mut vector = None;
                 let mut lexical = None;
                 let mut ann = None;
@@ -5023,6 +5537,97 @@ pub mod generation_reader {
         static FIXTURE_BASE: OnceLock<PathBuf> = OnceLock::new();
         const ROOT_ID: [u8; 16] = [0x7c; 16];
         const WRITER: [u8; 16] = [0xc3; 16];
+
+        #[test]
+        fn image_budget_counts_every_declared_image_without_overflow() {
+            assert_eq!(check_image_budget(7, [11, 13, 17], 48), Ok(()));
+            assert_eq!(
+                check_image_budget(7, [11, 13, 17], 47),
+                Err(SnapshotRefusalV1::ImageBudget {
+                    required: 48,
+                    limit: 47,
+                })
+            );
+            assert_eq!(
+                check_image_budget(7, [11, 13, 17, 19], 48),
+                Err(SnapshotRefusalV1::ImageBudget {
+                    required: 67,
+                    limit: 48,
+                })
+            );
+            assert_eq!(check_image_budget(0, [], 0), Ok(()));
+            assert_eq!(
+                check_image_budget(7, [], 6),
+                Err(SnapshotRefusalV1::ImageBudget {
+                    required: 7,
+                    limit: 6,
+                })
+            );
+            assert_eq!(
+                check_image_budget(1, [u64::MAX], u64::MAX),
+                Err(SnapshotRefusalV1::ImageBudget {
+                    required: u64::MAX,
+                    limit: u64::MAX,
+                })
+            );
+        }
+
+        #[test]
+        fn image_budget_refuses_before_opening_missing_component_objects() {
+            let path = fixture_root("image-budget-before-component-io");
+            let root = admit(&path);
+            let selected = manifest_v2(1, None, false);
+            let (manifest_len, manifest_sha256) = selected.object_receipt();
+            let authority =
+                AuthorityRefV1::new(1, object_id(1), manifest_len, manifest_sha256, None)
+                    .expect("valid authority");
+            write_manifest_object(&path, object_id(1), &selected.canonical_bytes());
+            assert!(matches!(
+                publisher(&root)
+                    .publish(
+                        authority,
+                        ExpectedAuthorityPairV1::default(),
+                        None,
+                        [0x79; 16],
+                    )
+                    .expect("low-level publication"),
+                PublicationOutcomeV1::Committed { .. }
+            ));
+            let required = selected
+                .components()
+                .iter()
+                .fold(manifest_len, |total, (_, receipt)| total + receipt.byte_len);
+            let open_with_budget = |budget| {
+                root.open_generation_snapshot_with_budget(
+                    ROOT_ID,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                    budget,
+                )
+                .expect("bounded open")
+            };
+            assert_eq!(
+                refused(open_with_budget(manifest_len - 1)),
+                SnapshotRefusalV1::ImageBudget {
+                    required: manifest_len,
+                    limit: manifest_len - 1
+                },
+            );
+            assert_eq!(
+                refused(open_with_budget(required - 1)),
+                SnapshotRefusalV1::ImageBudget {
+                    required,
+                    limit: required - 1
+                },
+            );
+            assert!(
+                matches!(
+                    refused(open_with_budget(required)),
+                    SnapshotRefusalV1::Closure(_),
+                ),
+                "a sufficient budget reaches the deliberately missing components"
+            );
+        }
 
         // Same discipline as the publisher fixtures: a privately owned
         // ancestor under $HOME, and nothing is ever deleted.
@@ -6379,6 +6984,235 @@ pub mod generation_reader {
                     None
                 )),
                 SnapshotRefusalV1::ClosureViolation(ClosureViolationV1::Alias)
+            );
+        }
+
+        #[test]
+        fn foreign_device_entries_are_refused_whether_declared_or_retained() {
+            use crate::generation_root::GenerationRootEntry;
+            use std::ffi::{OsStr, OsString};
+
+            let (_, root, _) = genesis_root("closure-foreign-device");
+            let snapshot = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            let clean = root.inventory().expect("clean inventory");
+            let root_device = root.witness().device();
+            let manifest_name = activation_manifest_name_v1(snapshot.head().authority.object_id);
+            let receipts = snapshot.manifest().components();
+            let vector_name =
+                component_object_name_v1(GenerationComponentRole::Vector, receipts.vector.sha256);
+            let lexical_name =
+                component_object_name_v1(GenerationComponentRole::Lexical, receipts.lexical.sha256);
+            let ann_name = component_object_name_v1(
+                GenerationComponentRole::Ann,
+                receipts.ann.expect("v1 ann").sha256,
+            );
+            let metadata_name = component_object_name_v1(
+                GenerationComponentRole::Metadata,
+                receipts.metadata.sha256,
+            );
+            let declared = [
+                "LOCK",
+                "AUTHORITY",
+                manifest_name.as_str(),
+                vector_name.as_str(),
+                lexical_name.as_str(),
+                ann_name.as_str(),
+                metadata_name.as_str(),
+            ];
+
+            // Positive control: clean inventory on root_device admits with zero foreign entries.
+            assert!(clean.foreign_device(root_device).is_empty());
+            assert_eq!(check_closure(&clean, root_device, &declared), Ok(()));
+
+            // Planted 1: a declared entry whose device differs from root_device is refused.
+            let mut planted_declared = clean.clone();
+            let declared_target = planted_declared
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name() == OsStr::new(vector_name.as_str()))
+                .expect("declared vector entry");
+            declared_target.device = root_device.wrapping_add(1);
+            assert_eq!(planted_declared.foreign_device(root_device).len(), 1);
+            assert_eq!(
+                planted_declared.foreign_device(root_device)[0].name(),
+                OsStr::new(vector_name.as_str())
+            );
+            assert_eq!(
+                check_closure(&planted_declared, root_device, &declared),
+                Err(ClosureViolationV1::ForeignDevice)
+            );
+
+            // Planted 2: a retained entry whose device differs from root_device is refused.
+            let retained_name = component_object_name_v1(GenerationComponentRole::Ann, [0xfe; 32]);
+            let mut planted_retained = clean;
+            planted_retained.entries.push(GenerationRootEntry {
+                name: OsString::from(&retained_name),
+                kind: GenerationRootEntryKind::RegularFile,
+                device: root_device.wrapping_add(1),
+                inode: 999_999,
+                hard_links: 1,
+                byte_len: 16,
+                mode: 0o100_400,
+            });
+            assert_eq!(planted_retained.foreign_device(root_device).len(), 1);
+            assert_eq!(
+                planted_retained.foreign_device(root_device)[0].name(),
+                OsStr::new(retained_name.as_str())
+            );
+            assert_eq!(
+                check_closure(&planted_retained, root_device, &declared),
+                Err(ClosureViolationV1::ForeignDevice)
+            );
+        }
+
+        #[test]
+        fn wrong_role_and_swapped_fast_and_quality_tiers_are_refused_before_content_use() {
+            // 1. Declared-role swap in ActivationManifest while objects sit under their true roles:
+            //    exact-name lookup refuses before opening or reading content.
+            let root_path = fixture_root("closure-role-swap-manifest");
+            let root = admit(&root_path);
+            let auth_publisher = publisher(&root);
+            write_component_objects(&root_path, 1);
+            let mut swapped_receipts = component_receipts(1);
+            std::mem::swap(&mut swapped_receipts.vector, &mut swapped_receipts.lexical);
+            let swapped_manifest = ActivationManifest::V1(
+                ActivationManifestV1::new(
+                    1,
+                    None,
+                    GenerationAuthorityActionV1::Activate,
+                    ArtifactGenerationIdentityV1::new(1, [0x21; 16]).expect("generation"),
+                    [0x31; 32],
+                    [0x32; 32],
+                    [0x33; 32],
+                    swapped_receipts,
+                )
+                .expect("swapped manifest"),
+            );
+            let (len, sha256) = swapped_manifest.object_receipt();
+            write_manifest_object(
+                &root_path,
+                object_id(1),
+                &swapped_manifest.canonical_bytes(),
+            );
+            let authority =
+                AuthorityRefV1::new(1, object_id(1), len, sha256, None).expect("authority");
+            auth_publisher
+                .publish(
+                    authority,
+                    ExpectedAuthorityPairV1::default(),
+                    None,
+                    object_id(1 ^ 0xa5),
+                )
+                .expect("publish");
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::Closure(GenerationRootErrorKind::ObjectChanged)
+            );
+
+            // 2. Wrong-role content placed under a declared role's content-addressed name:
+            //    admission refuses with HashMismatch before any engine parses the bytes.
+            let root_path = fixture_root("closure-role-swap-bytes");
+            let root = admit(&root_path);
+            let auth_publisher = publisher(&root);
+            let vector_expected_name = component_object_name_v1(
+                GenerationComponentRole::Vector,
+                component_receipt(GenerationComponentRole::Vector, 1).sha256,
+            );
+            write_sealed_object(
+                &root_path,
+                &vector_expected_name,
+                &component_bytes(GenerationComponentRole::Lexical, 1),
+            );
+            publish_with_manifest(
+                &root_path,
+                &auth_publisher,
+                1,
+                None,
+                ExpectedAuthorityPairV1::default(),
+                None,
+            );
+            assert_eq!(
+                refused(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                )),
+                SnapshotRefusalV1::Closure(GenerationRootErrorKind::HashMismatch)
+            );
+
+            // 3. Swapped fast and quality FSVI v2 vector tiers:
+            //    unswapped control admits cleanly; swapping fast and quality paths or bindings
+            //    is refused before serving any query.
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let tier_dir = fixture_base().join(format!("closure-swapped-fast-quality-v2-{nanos}"));
+            DirBuilder::new()
+                .mode(0o700)
+                .create(&tier_dir)
+                .expect("tier dir");
+            let fast_path = tier_dir.join("fast.fsvi");
+            let quality_path = tier_dir.join("quality.fsvi");
+            let generation =
+                ArtifactGenerationIdentityV1::new(1, [0x4d; 16]).expect("valid generation");
+            let make_binding = |model_id: &str, dim: u32| {
+                let mut bundle =
+                    frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                        model_id, dim,
+                    );
+                "fsvi-v2".clone_into(&mut bundle.storage.format);
+                bundle.storage.quantization =
+                    frankensearch_core::generation::QuantizationFormat::F16;
+                "little-endian".clone_into(&mut bundle.storage.endianness);
+                crate::FsviV2IdentityBinding::new(generation, bundle.freeze().expect("freeze"))
+                    .expect("binding")
+            };
+            let fast_binding = make_binding("potion-fast-128m", 4);
+            let quality_binding = make_binding("minilm-quality-l6", 4);
+            for (path, binding, vec_row) in [
+                (&fast_path, &fast_binding, [1.0_f32, 0.0, 0.0, 0.0]),
+                (&quality_path, &quality_binding, [0.0_f32, 1.0, 0.0, 0.0]),
+            ] {
+                let mut writer =
+                    crate::VectorIndex::create_v2(path, binding.clone()).expect("create v2");
+                writer.write_record("doc-1", &vec_row).expect("write row");
+                writer.finish().expect("finish v2");
+            }
+            let normal_paths =
+                crate::TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+            let admitted = crate::TwoTierIndex::open_admitted_v2_with_paths(
+                &normal_paths,
+                frankensearch_core::TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .expect("unswapped control admits");
+            assert_eq!(admitted.doc_count(), 1);
+
+            let swapped_paths =
+                crate::TwoTierIndexPaths::new(&quality_path).with_quality_index(&fast_path);
+            let swapped_err = crate::TwoTierIndex::open_admitted_v2_with_paths(
+                &swapped_paths,
+                frankensearch_core::TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .expect_err("swapped fast and quality tiers must be refused before content use");
+            assert!(
+                matches!(
+                    swapped_err,
+                    frankensearch_core::SearchError::InvalidConfig { ref field, .. }
+                        if field == "two_tier.fast_v2_admission"
+                ),
+                "unexpected error for swapped tiers: {swapped_err:?}"
             );
         }
 

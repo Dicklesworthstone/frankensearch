@@ -135,6 +135,8 @@ struct Receipt {
     session: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executable_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indexing_contract_sha256: Option<String>,
     configuration_sha256: String,
     checkpoint: IndexingCheckpoint,
 }

@@ -15,7 +15,9 @@ use crate::Storage;
 use crate::connection::map_storage_error;
 use crate::content_hash::{ContentHasher, record_content_hash};
 use crate::document::{DocumentRecord, EmbeddingStatus, upsert_document};
-use crate::document_content::{read_document_content, upsert_document_content, verify_document_text};
+use crate::document_content::{
+    read_document_content, upsert_document_content, verify_document_text,
+};
 use crate::job_queue::{
     ClaimOutcome, EnqueueOutcome, EnqueueRequest, PersistentJobQueue, enqueue_inner,
 };
@@ -1423,7 +1425,11 @@ mod tests {
                 )
                 .unwrap()
                 .iter()
-                .map(|row| (0..6).map(|column| row.get(column).unwrap().clone()).collect())
+                .map(|row| {
+                    (0..6)
+                        .map(|column| row.get(column).unwrap().clone())
+                        .collect()
+                })
                 .collect()
         }
 
@@ -1433,7 +1439,9 @@ mod tests {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let sink = Arc::new(InMemoryVectorSink::default());
                     let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
-                    runner.ingest(IngestRequest::new("revision", "old body")).unwrap();
+                    runner
+                        .ingest(IngestRequest::new("revision", "old body"))
+                        .unwrap();
                     replace_catalog(&runner, "revision", "current body");
 
                     let result = runner
@@ -1459,8 +1467,15 @@ mod tests {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let sink = Arc::new(InMemoryVectorSink::default());
                     let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
-                    runner.ingest(IngestRequest::new("inflight", "old body")).unwrap();
-                    let old = runner.queue.claim_batch("old-worker", 1).unwrap().pop().unwrap();
+                    runner
+                        .ingest(IngestRequest::new("inflight", "old body"))
+                        .unwrap();
+                    let old = runner
+                        .queue
+                        .claim_batch("old-worker", 1)
+                        .unwrap()
+                        .pop()
+                        .unwrap();
                     replace_catalog(&runner, "inflight", "current body");
 
                     let result = runner
@@ -1471,10 +1486,19 @@ mod tests {
                     let depth = runner.queue.queue_depth().unwrap();
                     assert_eq!(depth.pending, 1);
                     assert_eq!(depth.processing, 1);
-                    assert!(runner.queue.claim_batch("new-worker", 1).unwrap().is_empty());
+                    assert!(
+                        runner
+                            .queue
+                            .claim_batch("new-worker", 1)
+                            .unwrap()
+                            .is_empty()
+                    );
 
                     assert_eq!(
-                        runner.queue.complete(&old, &old.content_hash.unwrap()).unwrap(),
+                        runner
+                            .queue
+                            .complete(&old, &old.content_hash.unwrap())
+                            .unwrap(),
                         ClaimOutcome::Superseded
                     );
                     let processed = runner.process_batch(&cx, "new-worker").await.unwrap();
@@ -1482,7 +1506,10 @@ mod tests {
                     assert_eq!(probe.inputs.lock().unwrap().as_slice(), ["current body"]);
                     assert_eq!(sink.entries().len(), 1);
                     assert_eq!(
-                        runner.queue.complete(&old, &old.content_hash.unwrap()).unwrap(),
+                        runner
+                            .queue
+                            .complete(&old, &old.content_hash.unwrap())
+                            .unwrap(),
                         ClaimOutcome::LostClaim
                     );
                 });
@@ -1494,14 +1521,18 @@ mod tests {
             for quality in [false, true] {
                 let sink = Arc::new(InMemoryVectorSink::default());
                 let (runner, probe) = make_claim_probe_runner(quality, false, sink);
-                runner.ingest(IngestRequest::new("mixed", "old body")).unwrap();
+                runner
+                    .ingest(IngestRequest::new("mixed", "old body"))
+                    .unwrap();
                 assert_eq!(runner.queue.claim_batch("old-worker", 1).unwrap().len(), 1);
                 replace_catalog(&runner, "mixed", "current body");
                 let hash = ContentHasher::hash("current body");
                 assert!(runner.queue.enqueue("mixed", probe.id, &hash, 0).unwrap());
                 let before = jobs(&runner);
 
-                let result = runner.ingest(IngestRequest::new("mixed", "current body")).unwrap();
+                let result = runner
+                    .ingest(IngestRequest::new("mixed", "current body"))
+                    .unwrap();
                 assert!(!result.fast_job_enqueued);
                 assert!(!result.quality_job_enqueued);
                 assert_eq!(jobs(&runner), before, "neither attempt may be replaced");
@@ -1514,14 +1545,18 @@ mod tests {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let sink = Arc::new(InMemoryVectorSink::default());
                     let (runner, probe) = make_claim_probe_runner(quality, false, sink.clone());
-                    runner.ingest(IngestRequest::new("legacy", "legacy body")).unwrap();
+                    runner
+                        .ingest(IngestRequest::new("legacy", "legacy body"))
+                        .unwrap();
                     runner
                         .storage
                         .connection()
                         .execute_sync("UPDATE embedding_jobs SET content_hash = NULL;")
                         .unwrap();
                     let before = jobs(&runner);
-                    let result = runner.ingest(IngestRequest::new("legacy", "legacy body")).unwrap();
+                    let result = runner
+                        .ingest(IngestRequest::new("legacy", "legacy body"))
+                        .unwrap();
                     assert!(!result.fast_job_enqueued);
                     assert!(!result.quality_job_enqueued);
                     assert_eq!(jobs(&runner), before);
@@ -1538,22 +1573,33 @@ mod tests {
             for skipped in [false, true] {
                 let sink = Arc::new(InMemoryVectorSink::default());
                 let (runner, probe) = make_claim_probe_runner(false, false, sink);
-                runner.ingest(IngestRequest::new("finished", "old body")).unwrap();
+                runner
+                    .ingest(IngestRequest::new("finished", "old body"))
+                    .unwrap();
                 replace_catalog(&runner, "finished", "current body");
                 if skipped {
-                    runner.storage.mark_skipped("finished", probe.id, "deliberate skip").unwrap();
+                    runner
+                        .storage
+                        .mark_skipped("finished", probe.id, "deliberate skip")
+                        .unwrap();
                 } else {
                     runner.storage.mark_embedded("finished", probe.id).unwrap();
                 }
                 let before = jobs(&runner);
-                let result = runner.ingest(IngestRequest::new("finished", "current body")).unwrap();
+                let result = runner
+                    .ingest(IngestRequest::new("finished", "current body"))
+                    .unwrap();
                 assert_eq!(result.action, IngestAction::Unchanged);
                 assert!(!result.fast_job_enqueued);
                 assert_eq!(jobs(&runner), before);
                 assert_catalog_status(
                     &runner,
                     probe.id,
-                    if skipped { EmbeddingStatus::Skipped } else { EmbeddingStatus::Embedded },
+                    if skipped {
+                        EmbeddingStatus::Skipped
+                    } else {
+                        EmbeddingStatus::Embedded
+                    },
                 );
             }
         }
@@ -1586,9 +1632,14 @@ mod tests {
                     let raw = long_input();
                     let expected = runner.canonicalizer.canonicalize(&raw);
                     assert!(content_char_len(&expected) > MAX_CONTENT_PREVIEW_CHARS);
-                    runner.ingest(IngestRequest::new("full-input", raw)).unwrap();
+                    runner
+                        .ingest(IngestRequest::new("full-input", raw))
+                        .unwrap();
                     let doc = runner.storage.get_document("full-input").unwrap().unwrap();
-                    assert_eq!(content_char_len(&doc.content_preview), MAX_CONTENT_PREVIEW_CHARS);
+                    assert_eq!(
+                        content_char_len(&doc.content_preview),
+                        MAX_CONTENT_PREVIEW_CHARS
+                    );
                     assert_eq!(
                         read_document_content(runner.storage.connection(), &doc).unwrap(),
                         Some(expected.clone())
@@ -1676,7 +1727,12 @@ mod tests {
                 read_document_content(runner.storage.connection(), &edited).unwrap(),
                 None
             );
-            assert!(runner.storage.set_document_content("revision", &expected).is_err());
+            assert!(
+                runner
+                    .storage
+                    .set_document_content("revision", &expected)
+                    .is_err()
+            );
             assert_eq!(
                 read_document_content(runner.storage.connection(), &edited).unwrap(),
                 None
@@ -1704,7 +1760,14 @@ mod tests {
                     assert_eq!(result.jobs_completed, 0);
                     assert!(probe.inputs.lock().unwrap().is_empty());
                     assert!(sink.entries().is_empty());
-                    assert_eq!(runner.storage.count_by_status("fast-tier").unwrap().embedded, 0);
+                    assert_eq!(
+                        runner
+                            .storage
+                            .count_by_status("fast-tier")
+                            .unwrap()
+                            .embedded,
+                        0
+                    );
                 });
             }
         }
@@ -1715,8 +1778,14 @@ mod tests {
             let (runner, _) = make_claim_probe_runner(false, false, sink);
             let raw = long_input();
             let expected = runner.canonicalizer.canonicalize(&raw);
-            runner.ingest(IngestRequest::new("atomic-input", raw)).unwrap();
-            let before = runner.storage.get_document("atomic-input").unwrap().unwrap();
+            runner
+                .ingest(IngestRequest::new("atomic-input", raw))
+                .unwrap();
+            let before = runner
+                .storage
+                .get_document("atomic-input")
+                .unwrap()
+                .unwrap();
             // Dedup reads do not use max_retries. This fails only the enqueue
             // INSERT, after document and retained-input writes have occurred.
             runner.storage.connection().execute_sync(
@@ -1730,7 +1799,10 @@ mod tests {
             runner.storage.connection().execute_sync(
                 "ALTER TABLE embedding_jobs RENAME COLUMN unavailable_max_retries TO max_retries;",
             ).unwrap();
-            assert_eq!(runner.storage.get_document("atomic-input").unwrap(), Some(before.clone()));
+            assert_eq!(
+                runner.storage.get_document("atomic-input").unwrap(),
+                Some(before.clone())
+            );
             assert_eq!(
                 read_document_content(runner.storage.connection(), &before).unwrap(),
                 Some(expected)
@@ -1754,10 +1826,13 @@ mod tests {
                     fail_next: AtomicBool::new(false),
                 });
                 let open_runner = || {
-                    let storage = Arc::new(Storage::open(crate::connection::StorageConfig {
-                        db_path: db_path.clone(),
-                        ..crate::connection::StorageConfig::default()
-                    }).unwrap());
+                    let storage = Arc::new(
+                        Storage::open(crate::connection::StorageConfig {
+                            db_path: db_path.clone(),
+                            ..crate::connection::StorageConfig::default()
+                        })
+                        .unwrap(),
+                    );
                     let queue = Arc::new(PersistentJobQueue::new(
                         storage.clone(),
                         JobQueueConfig::default(),
@@ -1773,7 +1848,9 @@ mod tests {
                 let expected = DefaultCanonicalizer::default().canonicalize(&long_input());
                 {
                     let runner = open_runner();
-                    runner.ingest(IngestRequest::new("reopen", long_input())).unwrap();
+                    runner
+                        .ingest(IngestRequest::new("reopen", long_input()))
+                        .unwrap();
                 }
                 let runner = open_runner();
                 let result = runner.process_batch(&cx, "after-restart").await.unwrap();
@@ -1790,7 +1867,9 @@ mod tests {
                     let sink = Arc::new(InMemoryVectorSink::default());
                     let (runner, probe) = make_claim_probe_runner(false, false, sink.clone());
                     let expected = runner.canonicalizer.canonicalize(&raw);
-                    runner.ingest(IngestRequest::new("legacy-preview", raw)).unwrap();
+                    runner
+                        .ingest(IngestRequest::new("legacy-preview", raw))
+                        .unwrap();
                     forget_retained_input(&runner, "legacy-preview");
                     let result = runner.process_batch(&cx, "worker").await.unwrap();
                     if content_char_len(&expected) <= MAX_CONTENT_PREVIEW_CHARS {
@@ -1849,12 +1928,8 @@ mod tests {
                 let sink = Arc::new(InMemoryVectorSink::default());
                 let (runner, probe) = make_claim_probe_runner(false, false, sink.clone());
                 let mut request = IngestRequest::new("unreadable", long_input());
-                request.source_path = Some(
-                    dir.path()
-                        .join("absent.txt")
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+                request.source_path =
+                    Some(dir.path().join("absent.txt").to_string_lossy().into_owned());
                 runner.ingest(request).unwrap();
                 forget_retained_input(&runner, "unreadable");
                 for attempt in 0..=runner.queue.config().max_retries {
@@ -1877,7 +1952,9 @@ mod tests {
         fn canonical_content_rejects_a_forged_payload_before_any_write() {
             let sink = Arc::new(InMemoryVectorSink::default());
             let (runner, _) = make_claim_probe_runner(false, false, sink);
-            runner.ingest(IngestRequest::new("payload", "original payload")).unwrap();
+            runner
+                .ingest(IngestRequest::new("payload", "original payload"))
+                .unwrap();
             let doc = runner.storage.get_document("payload").unwrap().unwrap();
             let before = read_document_content(runner.storage.connection(), &doc).unwrap();
             assert!(

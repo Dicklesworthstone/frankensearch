@@ -25,23 +25,41 @@ fsfs watch .
 
 `watch` listens for file changes and incrementally updates index state.
 
-## 3) Stop the watcher before searching from another process
+## 3) Searching from another terminal while `watch` runs
 
-The current watcher holds an exclusive vector writer lock for its lifetime.
-An independent `fsfs search` or query daemon can fail with `fsvi.map_lock` while
-it runs. This was reproduced with the full Linux v1.8.0 binary: the watcher
-remained alive and a separate `search --no-daemon` exited 2.
-
-Press `Ctrl+C` in the watch terminal and wait for it to exit, then query:
+On Linux, a new index created in `.frankensearch` (or outside the source tree)
+uses the **complete-generation store** by default (`FSFS-CURRENT` + immutable
+`generations/<id>/` bundles). On a complete-generation store, `fsfs watch`
+publishes atomic delta generations without holding a serving-index writer lock
+between publications, so another terminal—and the background query daemon—can
+search concurrently while `watch` is running:
 
 ```bash
-fsfs search "ownership model in background workers" --no-daemon --limit 10
+fsfs search "ownership model in background workers" --limit 10
 ```
 
-Concurrent searches that see durably published changes without stopping watch
-remain required functionality under `bd-z2nfa`. Incremental ingestion alone does
-not prove cross-process visibility. Until that work passes its concurrent-reader
-probe, stop and restart the watcher when using this separate-terminal workflow.
+### Legacy index roots and non-Linux hosts (`bd-z2nfa`)
+
+An index that uses the **legacy mutable layout**—an older index created before
+complete generations were the default, an index on macOS created without
+`FSFS_COMPLETE_GENERATIONS=1`, an index built with `FSFS_COMPLETE_GENERATIONS=0`,
+or an index placed inside a non-hidden directory of the source tree—still holds
+an exclusive vector writer lock (`fsvi.map_lock`) for the lifetime of the
+watcher (`bd-z2nfa`).
+
+To convert an existing legacy index root into a complete-generation store (or to
+create one on macOS), run one build or watch pass with
+`FSFS_COMPLETE_GENERATIONS=1`:
+
+```bash
+FSFS_COMPLETE_GENERATIONS=1 fsfs index .
+```
+
+When the legacy index has a compatible completion receipt, conversion reuses
+unchanged embeddings and hard-links unchanged keyword segments in seconds. If
+you intentionally keep a legacy root (`FSFS_COMPLETE_GENERATIONS=0`), press
+`Ctrl+C` in the watch terminal and wait for it to exit before running
+`fsfs search` from another process.
 
 ## 4) Monorepo hygiene tips
 

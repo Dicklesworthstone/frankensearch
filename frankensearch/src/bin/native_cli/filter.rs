@@ -2,6 +2,7 @@
 //! Membership is evaluated before retrieval and fusion, never on a displayed
 //! top-k page. An owner-supplied server scope cannot be widened by a request.
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch::native_ann::NativeProgressiveSearch;
 use frankensearch::native_ann::builder::scope::NativeScopedHybridIndex;
 use std::collections::{BTreeMap, BTreeSet};
@@ -146,6 +147,21 @@ impl<'a> Query<'a> {
         )
     }
 
+    pub(super) fn progressive_on_pool<'q>(
+        &'q self,
+        cx: &'q Cx,
+        query: &'q str,
+        limit: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
+        match (&self.scope, pool) {
+            (Some(scope), Some(pool)) => scope.progressive_with_pool(cx, query, limit, pool),
+            (None, Some(pool)) => self.index.progressive_with_pool(cx, query, limit, pool),
+            _ => self.progressive(cx, query, limit),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) async fn search(
         &self,
         cx: &Cx,
@@ -153,15 +169,52 @@ impl<'a> Query<'a> {
         mode: Mode,
         limit: usize,
     ) -> Result<serde_json::Value> {
+        self.search_with_pool(cx, query, mode, limit, None).await
+    }
+
+    pub(super) async fn search_with_pool(
+        &self,
+        cx: &Cx,
+        query: &str,
+        mode: Mode,
+        limit: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> Result<serde_json::Value> {
         validate_query(query)?;
         let full = mode == Mode::Full && self.index.vectors().quality().is_some();
-        let results = match (&self.scope, mode, full) {
-            (Some(scope), Mode::Quality, _) => scope.search_quality(cx, query, limit).await?,
-            (Some(scope), _, true) => scope.search_refined(cx, query, limit).await?,
-            (Some(scope), _, false) => scope.search(cx, query, limit).await?,
-            (None, Mode::Quality, _) => self.index.search_quality(cx, query, limit).await?,
-            (None, _, true) => self.index.search_refined(cx, query, limit).await?,
-            (None, _, false) => self.index.search(cx, query, limit).await?,
+        let results = match (&self.scope, pool, mode, full) {
+            (Some(scope), Some(pool), Mode::Quality, _) => {
+                scope
+                    .search_quality_with_pool(cx, query, limit, pool)
+                    .await?
+            }
+            (Some(scope), Some(pool), _, true) => {
+                scope
+                    .search_refined_with_pool(cx, query, limit, pool)
+                    .await?
+            }
+            (Some(scope), Some(pool), _, false) => {
+                scope.search_with_pool(cx, query, limit, pool).await?
+            }
+            (Some(scope), None, Mode::Quality, _) => scope.search_quality(cx, query, limit).await?,
+            (Some(scope), None, _, true) => scope.search_refined(cx, query, limit).await?,
+            (Some(scope), None, _, false) => scope.search(cx, query, limit).await?,
+            (None, Some(pool), Mode::Quality, _) => {
+                self.index
+                    .search_quality_with_pool(cx, query, limit, pool)
+                    .await?
+            }
+            (None, Some(pool), _, true) => {
+                self.index
+                    .search_refined_with_pool(cx, query, limit, pool)
+                    .await?
+            }
+            (None, Some(pool), _, false) => {
+                self.index.search_with_pool(cx, query, limit, pool).await?
+            }
+            (None, None, Mode::Quality, _) => self.index.search_quality(cx, query, limit).await?,
+            (None, None, _, true) => self.index.search_refined(cx, query, limit).await?,
+            (None, None, _, false) => self.index.search(cx, query, limit).await?,
         };
         let phase = if mode == Mode::Quality {
             "quality"
@@ -194,6 +247,26 @@ impl<'a> Query<'a> {
             },
             |scope| scope.progressive_with_reranker(cx, text, limit, reranker, window),
         )
+    }
+
+    pub(super) fn progressive_with_reranker_on_pool<'q>(
+        &'q self,
+        cx: &'q Cx,
+        text: &'q str,
+        limit: usize,
+        reranker: &'q dyn frankensearch::Reranker,
+        window: usize,
+        pool: Option<BlockingPoolHandle>,
+    ) -> frankensearch::SearchResult<NativeProgressiveSearch<'q>> {
+        match (&self.scope, pool) {
+            (Some(scope), Some(pool)) => {
+                scope.progressive_with_reranker_on_pool(cx, text, limit, reranker, window, pool)
+            }
+            (None, Some(pool)) => self
+                .index
+                .progressive_with_reranker_on_pool(cx, text, limit, reranker, window, pool),
+            _ => self.progressive_with_reranker(cx, text, limit, reranker, window),
+        }
     }
 }
 

@@ -5199,6 +5199,154 @@ pub struct QuillSearchIndex {
     directory: PathBuf,
 }
 
+/// A query-capable reader for one admitted immutable lexical image.
+///
+/// Construct the snapshot with [`KeeperSnapshot::from_exact_image`] under the
+/// caller's composite generation authority. Every query and hydration context
+/// retains that exact image; this facade has no pathname, writer, refresh, or
+/// generation-discovery operation. It uses the ordinary Quill parser, scorer,
+/// collector and stored-field readers.
+#[derive(Clone)]
+pub struct QuillSnapshotIndex {
+    reader: QuillReader,
+}
+
+impl QuillSnapshotIndex {
+    /// Bind the production query engine to an admitted retained-byte snapshot.
+    ///
+    /// # Errors
+    /// Rejects cancellation, invalid configuration, snapshots not admitted by
+    /// [`KeeperSnapshot::from_exact_image`], or incompatible schema/parser state.
+    pub fn new(
+        cx: &Cx,
+        snapshot: KeeperSnapshot,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        validate_config(&config)?;
+        validate_non_durable_quarantine(&config)?;
+        check_cancel(cx, "retained lexical image reader")?;
+        if !snapshot.is_retained_image() {
+            return Err(KeeperError::ExactSnapshotReceipt {
+                detail: "immutable image readers require an admitted retained-byte snapshot"
+                    .to_owned(),
+            }
+            .into());
+        }
+        let schema = snapshot.schema();
+        let generation = snapshot.loaded_manifest().manifest.generation;
+        let publication_read_state = PublicationReadState::new(generation)?;
+        let published_snapshot = Arc::new(SnapshotPublisher::new(Arc::new(snapshot), Vec::new())?);
+        let parser = match DefaultQueryParser::new(schema) {
+            Ok(parser) => Some(parser),
+            Err(
+                QueryParserConfigError::MissingDefaultField { .. }
+                | QueryParserConfigError::InvalidDefaultField { .. },
+            ) => None,
+            Err(error) => return Err(error.into()),
+        };
+        check_cancel(cx, "retained lexical image reader")?;
+        Ok(Self {
+            reader: QuillReader {
+                config,
+                schema,
+                parser,
+                published_snapshot,
+                publication_read_state,
+                #[cfg(test)]
+                publication_read_pause: Arc::default(),
+                #[cfg(feature = "conformance-internals")]
+                conformance_controller: Arc::default(),
+            },
+        })
+    }
+
+    /// The exact immutable Keeper snapshot retained by every query.
+    ///
+    /// # Errors
+    /// Returns a typed publication-state error if the internal reader cannot
+    /// prove the pinned snapshot readable.
+    pub fn snapshot(&self) -> Result<Arc<KeeperSnapshot>, QuillIndexError> {
+        Ok(self
+            .reader
+            .checked_published_snapshot()?
+            .keeper_snapshot_arc())
+    }
+
+    /// Number of live documents in this immutable image.
+    ///
+    /// # Errors
+    /// Returns a typed publication-state error for an unreadable snapshot.
+    pub fn doc_count(&self) -> Result<u64, QuillIndexError> {
+        Ok(self.reader.checked_published_snapshot()?.live_doc_count())
+    }
+
+    /// Search with canonical stored metadata from this image.
+    ///
+    /// # Errors
+    /// Returns typed cancellation, parsing, scoring, metadata or allocation errors.
+    pub fn search_results(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredResult>, QuillIndexError> {
+        self.reader.scored_results(cx, query, limit, true)
+    }
+
+    /// Execute a ranked page with an optional exact match count.
+    ///
+    /// # Errors
+    /// Returns typed cancellation, parsing, lowering, scoring or collection errors.
+    pub fn search_paginated(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        self.reader
+            .search_paginated(cx, query, limit, offset, exact_count)
+    }
+
+    /// Execute a query tree supplied by the selected schema's own parser.
+    ///
+    /// # Errors
+    /// Returns typed cancellation, lowering, scoring or collection errors.
+    pub fn search_preparsed_paginated(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        let published = self.reader.checked_published_snapshot()?;
+        self.reader.search_preparsed_uncached_on(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            published.as_ref(),
+        )
+    }
+
+    /// Read one schema-stored column for a live document in this image.
+    ///
+    /// # Errors
+    /// Returns typed snapshot or stored-section validation failures.
+    pub fn stored_field_value(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+    ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        self.reader
+            .checked_published_snapshot()?
+            .stored_field_value(field_ord, global_docid)
+    }
+}
+
 /// Read-only Quill handle bound to a lexical root rather than one engine
 /// directory.
 ///
@@ -13540,6 +13688,51 @@ impl LexicalRead for QuillSearchIndex {
         usize::try_from(count).map_err(|_| SearchError::SubsystemError {
             subsystem: "quill",
             source: "published Quill document count does not fit usize".into(),
+        })
+    }
+}
+
+impl LexicalRead for QuillSnapshotIndex {
+    fn query_text<'q>(&self, query: &'q str) -> Cow<'q, str> {
+        crate::query::escape_unknown_field_colons(query, self.reader.schema)
+    }
+
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move {
+            self.reader
+                .scored_results(cx, query, limit, true)
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn search_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, LexicalCandidateBatch> {
+        quill_search_candidates(&self.reader, cx, query, limit)
+    }
+
+    fn hydrate_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        context: Option<&'a LexicalHydrationContext>,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        quill_hydrate_candidates(cx, context, results)
+    }
+
+    fn doc_count(&self) -> SearchResult<usize> {
+        let count = Self::doc_count(self).map_err(SearchError::from)?;
+        usize::try_from(count).map_err(|_| SearchError::SubsystemError {
+            subsystem: "quill",
+            source: "retained Quill document count does not fit usize".into(),
         })
     }
 }

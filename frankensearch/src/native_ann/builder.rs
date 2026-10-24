@@ -50,6 +50,11 @@ mod hybrid;
 #[cfg(feature = "quill")]
 pub use hybrid::{NativeBuiltHybridIndex, NativeHybridReopenLimits};
 
+#[cfg(feature = "quill")]
+mod generation;
+#[cfg(feature = "quill")]
+pub use generation::NativeBuiltExactGeneration;
+
 /// Live whole-cohort serving and stale-safe installation of native hybrid updates.
 #[cfg(feature = "quill")]
 pub mod live;

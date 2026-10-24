@@ -11,6 +11,7 @@ enum Operation {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_field_names)]
 pub(super) struct Request {
     #[serde(rename = "op")]
     _operation: Operation,
@@ -57,7 +58,7 @@ pub(super) async fn execute<W: Write>(
     };
     // One retained cohort, intersected scopes, unchanged deadline ceiling and
     // reranker. A delivery error remains fatal; reported query failures do not.
-    super::stream_one(
+    Box::pin(super::stream_one(
         index,
         cx,
         &message.request,
@@ -66,7 +67,7 @@ pub(super) async fn execute<W: Write>(
         output,
         base_filter,
         &effective,
-    )
+    ))
     .await?;
     Ok(())
 }
@@ -538,6 +539,10 @@ mod tests {
                     assert_eq!(page("small", "initial")["candidates"]["fast"], 1);
                     assert_eq!(page("small", "reranked")["evaluated"], 1);
                     assert_eq!(page("small", "reranked")["rerank_window"], 1);
+                    assert_eq!(
+                        page("small", "reranked")["results"][0]["metadata"]["original_id"],
+                        "keyword"
+                    );
                     assert_eq!(page("skip", "initial")["candidates"]["fast"], 1);
                     assert!(page("skip", "refined").get("reranker").is_none());
                     assert!(
@@ -554,6 +559,10 @@ mod tests {
                     assert_eq!(
                         page("ordinary", "reranked")["results"][0]["metadata"]["original_id"],
                         "vector"
+                    );
+                    assert_eq!(
+                        page("ordinary", "reranked")["results"][0]["rerank_score"],
+                        1.0
                     );
                     let calls = scorer.inputs.lock().unwrap();
                     assert_eq!(calls.len(), 2);

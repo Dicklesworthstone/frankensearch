@@ -376,6 +376,7 @@ fn keyword_deadline_counts_started_delivery_and_later_queries_can_reuse_the_read
             maximum_ms: Some(10),
             timer: Some(TimerDriverHandle::with_virtual_clock(clock.clone())),
             rerank: None,
+            ..query::Policy::default()
         };
         let options = options(&f.receipt, &["--stream"]);
         let mut output = ExpireOnStart {
@@ -734,6 +735,7 @@ fn keyword_server_deadlines_cannot_be_widened_and_expired_queries_do_not_poison_
             maximum_ms: Some(10),
             timer: Some(TimerDriverHandle::with_virtual_clock(clock.clone())),
             rerank: None,
+            ..query::Policy::default()
         };
         let mut output = ExpireSelected {
             bytes: Vec::new(),

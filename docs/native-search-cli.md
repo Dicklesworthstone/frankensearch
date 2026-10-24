@@ -45,6 +45,102 @@ long documents into deliberate source units for the selected models.
 The input limits are 16 MiB per encoded line, 256 MiB for the complete stream,
 and 100,000 documents. These bound input, not model scratch space or total RSS.
 
+## Fixed-authority generations with retained search
+
+`authority-index` builds and publishes a complete generation through the fixed
+`LOCK` and `AUTHORITY` protocol. Its immutable components are one FSVI v2 vector
+tier, a sealed Quill image, and the generation metadata. `authority-search`
+reopens the exact authority named by the saved receipt and searches the retained
+vector and lexical images together, including deferred result metadata.
+
+Choose either `--tier fast` or `--tier quality`. Both use exact vector retrieval.
+A quality generation loads its quality producer directly; it does not require
+a fast model. The source checkpoint is explicit: `--source-low` and
+`--source-high` are the inclusive source sequence boundaries that produced this
+input cohort. Use the actual source boundaries even when the number of input
+documents differs from the number of source changes.
+
+These commands require the qualified Linux root provider and supported local
+ext4/btrfs storage. Put the root under a trusted private parent. The command
+qualifies the new root before reading documents or loading models; an unsupported
+filesystem or insecure ancestor fails at that boundary. The root, work directory,
+and receipt must be new, separate destinations outside existing sealed indexes.
+The examples use three siblings under one private parent:
+
+```sh
+mkdir -m 700 "$HOME/frankensearch-authority"
+./target/release/frankensearch-native authority-index \
+  --root "$HOME/frankensearch-authority/g1" \
+  --work-dir "$HOME/frankensearch-authority/g1-work" \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --tier fast --source-low 1 --source-high 42 --cooperative-local \
+  --input ./documents.jsonl --model-dir /absolute/path/to/installed/models
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --query 'retry network requests' --limit 10
+```
+
+`--cooperative-local` is required when publishing. It declares that the caller
+owns the local root and that this command supplies no external anti-rollback
+service. This choice is persisted in the receipt. Search cannot change the
+receipt's security profile, generation, authority, producer identity, or tier.
+A changed current authority is a refusal, even when its components are otherwise
+valid. Already opened readers retain their original component bytes.
+
+For quality-only native inference, build with `hybrid-native` as described below
+and select the exact local native model:
+
+```sh
+./target/release/frankensearch-native authority-index \
+  --root "$HOME/frankensearch-authority/q1" \
+  --work-dir "$HOME/frankensearch-authority/q1-work" \
+  --receipt "$HOME/frankensearch-authority/q1.json" \
+  --tier quality --source-low 1 --source-high 42 --cooperative-local \
+  --input ./documents.jsonl \
+  --quality-backend native-int8 --quality-model-dir /absolute/path/to/native-minilm
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/q1.json" \
+  --quality-backend native-int8 --quality-model-dir /absolute/path/to/native-minilm \
+  --query 'retry network requests' --limit 10
+```
+
+The `onnx`, `native-int8`, `native-f32`, and `native-multilingual` quality choices
+have the same artifact verification and explicit-selection rules as the other
+native commands. All loading is offline. A missing or different producer fails;
+the selected generation is never relabelled to match an available model.
+
+The encoded-image budget defaults to 256 MiB. Set `--max-image-bytes N` on either
+authority command to choose a different positive byte limit. It covers the
+activation manifest and every declared component image. Search checks the
+manifest's own length before reading it, then checks the combined declared
+lengths before reading component objects. The effective search limit also cannot
+exceed the image size recorded by the trusted receipt. This bounds encoded
+images, not model memory, query scratch space, page cache, or other retained
+readers. Indexing inference batches default to 64 documents on this route and
+can be selected with `--batch-size`.
+
+The receipt uses schema `frankensearch.native.authority-selection.v1` and is
+written durably before publication. Its existence identifies the proposed exact
+authority; it does not by itself acknowledge a commit. The publication result
+keeps commit knowledge separate from serving activation:
+
+| Publication result | Meaning |
+|---|---|
+| `not_committed` | The publication call refused before authority mutation. |
+| `unknown` | An authority write may have occurred; the error includes the exact bounded attempt for reconciliation. |
+| `committed` | The authority switch succeeded. A later activation or output error does not undo that commit. |
+
+Successful indexing reports `publication: "committed"` and
+`serving: "activated"`. Unknown outcomes require reconciliation before further
+mutation, using the existing authority-publisher recovery API and the returned
+attempt. The library's `GenerationPublisherV1::reconcile_pending` also supports
+recovery within a live publication session while retaining its old reader.
+The two authority commands currently provide initial publication and exact
+selected search. The existing `update`, `rebuild`, and `serve` commands continue
+to use their own selected-snapshot receipts. Work files and staged candidates
+remain available after success or failure.
+
 ## Native quality without the ONNX feature bundle
 
 The executable is also available with Quill, Model2Vec, and the existing native

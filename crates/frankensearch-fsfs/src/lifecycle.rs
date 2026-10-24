@@ -1519,6 +1519,26 @@ impl PressureStateMachine {
         };
         self.smoothed = Some(smoothed);
 
+        // Memory spikes are qualitatively different from noisy CPU/load/IO
+        // samples: continuing heavy work while an EWMA catches up can allocate
+        // for many more sampling intervals. A raw emergency breach therefore
+        // escalates immediately. Recovery still uses the smoothed signal and
+        // the ordinary anti-flap gate below.
+        if sample.memory_pct >= self.thresholds.emergency_memory_pct {
+            self.pending_state = None;
+            self.pending_count = 0;
+            let changed = self.state != PressureState::Emergency;
+            self.state = PressureState::Emergency;
+            return PressureStateUpdate {
+                state: self.state,
+                target_state: PressureState::Emergency,
+                transition_reason_code: changed
+                    .then_some(FsfsReasonCode::DEGRADE_MEMORY_CEILING_HIT),
+                smoothed,
+                consecutive_observations: usize::from(changed),
+            };
+        }
+
         let (target_state, target_reason_code) = self.evaluate_target(smoothed);
         if target_state == self.state {
             self.pending_state = None;
@@ -3336,6 +3356,49 @@ mod tests {
             u3.transition_reason_code,
             Some(FsfsReasonCode::DEGRADE_CPU_CEILING_HIT)
         );
+    }
+
+    #[test]
+    fn pressure_machine_escalates_raw_memory_emergency_without_ewma_or_antiflap_delay() {
+        let config = PressureConfig {
+            anti_flap_readings: 5,
+            ewma_alpha_per_mille: 100,
+            ..PressureConfig::default()
+        };
+        let mut machine = PressureStateMachine::from_config(&config);
+
+        let baseline = PressureSignals {
+            cpu_pct: 0.0,
+            memory_pct: 10.0,
+            io_bytes_per_sec: 0.0,
+            load_avg_1m: 0.0,
+        };
+        assert_eq!(machine.observe(baseline).state, PressureState::Normal);
+
+        let emergency = machine.thresholds().emergency_memory_pct + 1.0;
+        let update = machine.observe(PressureSignals {
+            memory_pct: emergency,
+            ..baseline
+        });
+
+        assert_eq!(update.state, PressureState::Emergency);
+        assert_eq!(update.target_state, PressureState::Emergency);
+        assert_eq!(
+            update.transition_reason_code,
+            Some(FsfsReasonCode::DEGRADE_MEMORY_CEILING_HIT)
+        );
+        assert!(
+            update.smoothed.memory_pct < machine.thresholds().constrained_memory_pct,
+            "the raw breach must escalate even while EWMA is still below the first threshold"
+        );
+        assert_eq!(update.consecutive_observations, 1);
+
+        let repeated = machine.observe(PressureSignals {
+            memory_pct: emergency,
+            ..baseline
+        });
+        assert_eq!(repeated.state, PressureState::Emergency);
+        assert_eq!(repeated.transition_reason_code, None);
     }
 
     #[test]

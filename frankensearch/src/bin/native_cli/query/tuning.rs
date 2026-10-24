@@ -30,6 +30,7 @@ pub struct FullQuery {
     request_overrides: bool,
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -54,7 +55,7 @@ pub struct FullQueryOverride {
 
 /// Require an object without first decoding through Value (which would erase
 /// duplicate keys). Derived field decoding still rejects duplicates/unknowns.
-pub(crate) fn deserialize_query_override<'de, D>(
+pub fn deserialize_query_override<'de, D>(
     deserializer: D,
 ) -> std::result::Result<FullQueryOverride, D::Error>
 where
@@ -271,14 +272,15 @@ impl Policy {
         limit: usize,
     ) -> Result<cohort::Progressive<'a>> {
         let query = match &self.rerank {
-            Some(rerank) => scoped.progressive_with_reranker(
+            Some(rerank) => scoped.progressive_with_reranker_on_pool(
                 cx,
                 text,
                 limit,
                 rerank.model.as_ref(),
                 rerank.window,
+                self.query_pool(),
             )?,
-            None => scoped.progressive(cx, text, limit)?,
+            None => scoped.progressive_on_pool(cx, text, limit, self.query_pool())?,
         };
         match &self.full_query {
             Some(policy) => policy.apply(query),

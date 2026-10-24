@@ -540,11 +540,11 @@ fn tuned_scoped_retrieval_and_reranking_keep_only_eligible_rows() {
             .unwrap();
         let mut phases = 0;
         while let Some(phase) = query.next_phase().await.unwrap() {
-            let results = match phase {
-                NativeShardedSearchPhase::Initial { results, .. }
-                | NativeShardedSearchPhase::Refined { results, .. }
-                | NativeShardedSearchPhase::Reranked { results, .. } => results,
-                _ => panic!("eligible query succeeds"),
+            let (NativeShardedSearchPhase::Initial { results, .. }
+            | NativeShardedSearchPhase::Refined { results, .. }
+            | NativeShardedSearchPhase::Reranked { results, .. }) = phase
+            else {
+                panic!("eligible query succeeds");
             };
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].result.doc_id, "a-late");

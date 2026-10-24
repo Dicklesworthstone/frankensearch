@@ -125,17 +125,23 @@ impl Storage {
     ) -> SearchResult<PublicationRecoveryPage> {
         checkpoint(cx)?;
         validate_request(embedder_id, expected_identity, config)?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_err(map_storage_error)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(map_storage_error)?;
         let now_ms = i64::try_from(now.as_millis()).map_err(map_storage_error)?;
         self.immediate_transaction(|conn| {
             checkpoint(cx)?;
-            let rows = conn.query_with_params_sync(
-                PAGE_SQL,
-                &[
-                    after.map_or(SqliteValue::Null, text),
-                    SqliteValue::Integer(i64::try_from(config.page_size + 1).map_err(map_storage_error)?),
-                ],
-            ).map_err(map_storage_error)?;
+            let rows = conn
+                .query_with_params_sync(
+                    PAGE_SQL,
+                    &[
+                        after.map_or(SqliteValue::Null, text),
+                        SqliteValue::Integer(
+                            i64::try_from(config.page_size + 1).map_err(map_storage_error)?,
+                        ),
+                    ],
+                )
+                .map_err(map_storage_error)?;
             let mut page = PublicationRecoveryPage::default();
             let mut pending = pending_count(conn)?;
             let mut previous = after;
@@ -148,7 +154,9 @@ impl Storage {
                 previous = Some(doc_id);
                 page.examined_documents += 1;
                 let params = [text(doc_id), text(embedder_id)];
-                let statuses = conn.query_with_params_sync(STATUS_SQL, &params).map_err(map_storage_error)?;
+                let statuses = conn
+                    .query_with_params_sync(STATUS_SQL, &params)
+                    .map_err(map_storage_error)?;
                 let status = statuses.first().map(|row| row_text(row, 0)).transpose()?;
                 match status {
                     Some("failed" | "skipped") => {
@@ -158,15 +166,26 @@ impl Storage {
                     None | Some("pending" | "embedded") => {}
                     _ => return Err(invalid("catalog", "unknown embedding status")),
                 }
-                let document = get_document_inner(conn, doc_id)?
-                    .ok_or_else(|| invalid("catalog", "document disappeared inside recovery transaction"))?;
+                let document = get_document_inner(conn, doc_id)?.ok_or_else(|| {
+                    invalid(
+                        "catalog",
+                        "document disappeared inside recovery transaction",
+                    )
+                })?;
                 if status == Some("embedded")
-                    && publication_matches(conn, &params, &document.content_hash, expected_identity)?
+                    && publication_matches(
+                        conn,
+                        &params,
+                        &document.content_hash,
+                        expected_identity,
+                    )?
                 {
                     page.already_published += 1;
                     continue;
                 }
-                let active = conn.query_with_params_sync(ACTIVE_SQL, &params).map_err(map_storage_error)?;
+                let active = conn
+                    .query_with_params_sync(ACTIVE_SQL, &params)
+                    .map_err(map_storage_error)?;
                 let mut covered = false;
                 let mut replaces_pending = false;
                 for attempt in &active {
@@ -185,7 +204,8 @@ impl Storage {
                     continue;
                 }
                 checkpoint(cx)?;
-                let projected = pending.checked_add(usize::from(!replaces_pending))
+                let projected = pending
+                    .checked_add(usize::from(!replaces_pending))
                     .ok_or_else(|| invalid("capacity", "pending count overflow"))?;
                 if projected > config.max_pending_jobs {
                     return Err(SearchError::QueueFull {
@@ -193,14 +213,20 @@ impl Storage {
                         capacity: config.max_pending_jobs,
                     });
                 }
-                let request = EnqueueRequest::new(doc_id, embedder_id, document.content_hash, config.priority);
+                let request = EnqueueRequest::new(
+                    doc_id,
+                    embedder_id,
+                    document.content_hash,
+                    config.priority,
+                );
                 match enqueue_inner(conn, &request, now_ms, config.max_retries)? {
                     EnqueueOutcome::Inserted | EnqueueOutcome::Replaced => {}
                     // The immediate transaction excludes a new claimant between
                     // the active-work check and enqueue. Do not mask a violation.
                     _ => return Err(invalid("enqueue", "unexpected recovery enqueue outcome")),
                 }
-                conn.execute_with_params_sync(MARK_PENDING_SQL, &params).map_err(map_storage_error)?;
+                conn.execute_with_params_sync(MARK_PENDING_SQL, &params)
+                    .map_err(map_storage_error)?;
                 pending = projected;
                 page.enqueued_jobs += 1;
                 checkpoint(cx)?;
@@ -220,7 +246,10 @@ fn validate_request(
     config: PublicationRecoveryConfig,
 ) -> SearchResult<()> {
     if embedder_id.trim().is_empty() || frankensearch_core::is_hash_generation_id(embedder_id) {
-        return Err(invalid("embedder_id", "requires a nonempty, persisted embedder ID"));
+        return Err(invalid(
+            "embedder_id",
+            "requires a nonempty, persisted embedder ID",
+        ));
     }
     if !(1..=256).contains(&config.page_size) {
         return Err(invalid("page_size", "must be in 1..=256"));
@@ -228,9 +257,15 @@ fn validate_request(
     identity.validate()?;
     if identity.storage.quantization != QuantizationFormat::F32
         || !identity.storage.format.starts_with("in-memory-")
-        || !matches!(identity.storage.endianness.as_str(), "native-f32-values" | "native-test-only")
+        || !matches!(
+            identity.storage.endianness.as_str(),
+            "native-f32-values" | "native-test-only"
+        )
     {
-        return Err(invalid("identity", "requires the producer's in-memory f32 identity"));
+        return Err(invalid(
+            "identity",
+            "requires the producer's in-memory f32 identity",
+        ));
     }
     Ok(())
 }
@@ -241,8 +276,12 @@ fn publication_matches(
     hash: &[u8; 32],
     expected: &EmbeddingIdentityBundleV1,
 ) -> SearchResult<bool> {
-    let rows = conn.query_with_params_sync(PUBLICATION_SQL, params).map_err(map_storage_error)?;
-    let Some(row) = rows.first() else { return Ok(false); };
+    let rows = conn
+        .query_with_params_sync(PUBLICATION_SQL, params)
+        .map_err(map_storage_error)?;
+    let Some(row) = rows.first() else {
+        return Ok(false);
+    };
     let stored_hash = optional_hash(row, 0)?
         .ok_or_else(|| invalid("publication", "missing publication revision"))?;
     if &stored_hash != hash {
@@ -255,16 +294,23 @@ fn publication_matches(
 }
 
 fn pending_count(conn: &AsyncConnection) -> SearchResult<usize> {
-    let rows = conn.query_sync(PENDING_COUNT_SQL).map_err(map_storage_error)?;
-    let row = rows.first().ok_or_else(|| invalid("capacity", "missing pending count"))?;
+    let rows = conn
+        .query_sync(PENDING_COUNT_SQL)
+        .map_err(map_storage_error)?;
+    let row = rows
+        .first()
+        .ok_or_else(|| invalid("capacity", "missing pending count"))?;
     usize::try_from(row_i64(row, 0, "pending count")?).map_err(map_storage_error)
 }
 
 fn optional_hash(row: &Row, index: usize) -> SearchResult<Option<[u8; 32]>> {
     match row.get(index) {
         Some(SqliteValue::Null) => Ok(None),
-        Some(SqliteValue::Blob(bytes)) => bytes.as_ref().try_into()
-            .map(Some).map_err(|_| invalid("revision", "expected a 32-byte content hash")),
+        Some(SqliteValue::Blob(bytes)) => bytes
+            .as_ref()
+            .try_into()
+            .map(Some)
+            .map_err(|_| invalid("revision", "expected a 32-byte content hash")),
         _ => Err(invalid("revision", "invalid content hash type")),
     }
 }
@@ -276,7 +322,9 @@ fn row_text(row: &Row, index: usize) -> SearchResult<&str> {
     }
 }
 
-fn text(value: &str) -> SqliteValue { SqliteValue::Text(value.to_owned().into()) }
+fn text(value: &str) -> SqliteValue {
+    SqliteValue::Text(value.to_owned().into())
+}
 
 fn checkpoint(cx: &Cx) -> SearchResult<()> {
     cx.checkpoint().map_err(|error| SearchError::Cancelled {
@@ -297,8 +345,8 @@ fn invalid(field: &str, reason: &str) -> SearchError {
 mod tests {
     #![allow(clippy::arc_with_non_send_sync, clippy::too_many_lines)]
 
-    use std::sync::{Arc, Mutex, OnceLock};
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
     use frankensearch_core::{
@@ -339,23 +387,42 @@ mod tests {
         assert!(queue.enqueue(id, MODEL, &hash, 0).unwrap());
         let claim = queue.claim_batch("publisher", 1).unwrap().pop().unwrap();
         assert_eq!(claim.doc_id, id);
-        let value = IdentityBoundEmbedding { values: vec![1.0, -0.0], identity: identity(producer) };
+        let value = IdentityBoundEmbedding {
+            values: vec![1.0, -0.0],
+            identity: identity(producer),
+        };
         assert_eq!(
-            storage.publish_claimed_embedding(&claim, &hash, &value.identity, &value).unwrap(),
+            storage
+                .publish_claimed_embedding(&claim, &hash, &value.identity, &value)
+                .unwrap(),
             ClaimOutcome::Applied(())
         );
     }
 
     fn recover(storage: &Storage, cx: &Cx) -> PublicationRecoveryPage {
-        storage.reconcile_published_embeddings(
-            cx, MODEL, &identity(MODEL), None, PublicationRecoveryConfig::default(),
-        ).unwrap()
+        storage
+            .reconcile_published_embeddings(
+                cx,
+                MODEL,
+                &identity(MODEL),
+                None,
+                PublicationRecoveryConfig::default(),
+            )
+            .unwrap()
     }
 
     fn rows(storage: &Storage, sql: &str, width: usize) -> Vec<Vec<SqliteValue>> {
-        storage.connection().query_sync(sql).unwrap().iter().map(|row| {
-            (0..width).map(|column| row.get(column).unwrap().clone()).collect()
-        }).collect()
+        storage
+            .connection()
+            .query_sync(sql)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (0..width)
+                    .map(|column| row.get(column).unwrap().clone())
+                    .collect()
+            })
+            .collect()
     }
 
     #[test]
@@ -368,20 +435,43 @@ mod tests {
             seed(&storage, "external", "retained external body", true);
             storage.mark_embedded("external", MODEL).unwrap();
             seed(&storage, "unqueued", "retained catalog only", true);
-            let before_current = storage.get_published_embedding("current", MODEL, &identity(MODEL)).unwrap();
+            let before_current = storage
+                .get_published_embedding("current", MODEL, &identity(MODEL))
+                .unwrap();
             let page = recover(&storage, &cx);
             assert_eq!(page.examined_documents, 4);
             assert_eq!(page.enqueued_jobs, 3);
             assert_eq!(page.already_published, 1);
             assert!(page.missing_input.is_empty());
             assert_eq!(queue.queue_depth().unwrap().pending, 3);
-            assert_eq!(storage.get_published_embedding("current", MODEL, &identity(MODEL)).unwrap(), before_current);
-            assert!(storage.get_published_embedding("old-revision", MODEL, &identity(MODEL)).unwrap().is_none());
-            let before = rows(&storage, "SELECT * FROM embedding_jobs ORDER BY job_id;", 14);
+            assert_eq!(
+                storage
+                    .get_published_embedding("current", MODEL, &identity(MODEL))
+                    .unwrap(),
+                before_current
+            );
+            assert!(
+                storage
+                    .get_published_embedding("old-revision", MODEL, &identity(MODEL))
+                    .unwrap()
+                    .is_none()
+            );
+            let before = rows(
+                &storage,
+                "SELECT * FROM embedding_jobs ORDER BY job_id;",
+                14,
+            );
             let again = recover(&storage, &cx);
             assert_eq!(again.enqueued_jobs, 0);
             assert_eq!(again.already_active, 3);
-            assert_eq!(rows(&storage, "SELECT * FROM embedding_jobs ORDER BY job_id;", 14), before);
+            assert_eq!(
+                rows(
+                    &storage,
+                    "SELECT * FROM embedding_jobs ORDER BY job_id;",
+                    14
+                ),
+                before
+            );
         });
     }
 
@@ -393,13 +483,32 @@ mod tests {
             let before = rows(&storage, "SELECT * FROM published_embeddings;", 10);
             let page = recover(&storage, &cx);
             assert_eq!(page.enqueued_jobs, 1);
-            assert_eq!(rows(&storage, "SELECT * FROM published_embeddings;", 10), before);
-            assert!(storage.get_published_embedding("upgrade", MODEL, &identity("old-producer")).unwrap().is_none());
+            assert_eq!(
+                rows(&storage, "SELECT * FROM published_embeddings;", 10),
+                before
+            );
+            assert!(
+                storage
+                    .get_published_embedding("upgrade", MODEL, &identity("old-producer"))
+                    .unwrap()
+                    .is_none()
+            );
             let claim = queue.claim_batch("new-producer", 1).unwrap().pop().unwrap();
-            let response = IdentityBoundEmbedding { values: vec![0.0, 1.0], identity: identity(MODEL) };
-            assert_eq!(storage.publish_claimed_embedding(
-                &claim, &claim.content_hash.unwrap(), &response.identity, &response,
-            ).unwrap(), ClaimOutcome::Applied(()));
+            let response = IdentityBoundEmbedding {
+                values: vec![0.0, 1.0],
+                identity: identity(MODEL),
+            };
+            assert_eq!(
+                storage
+                    .publish_claimed_embedding(
+                        &claim,
+                        &claim.content_hash.unwrap(),
+                        &response.identity,
+                        &response,
+                    )
+                    .unwrap(),
+                ClaimOutcome::Applied(())
+            );
             assert_eq!(recover(&storage, &cx).already_published, 1);
         });
     }
@@ -411,8 +520,12 @@ mod tests {
             for id in ["failed", "skipped", "delayed", "processing", "legacy"] {
                 seed(&storage, id, "retained body", true);
             }
-            storage.mark_failed("failed", MODEL, "retry budget exhausted").unwrap();
-            storage.mark_skipped("skipped", MODEL, "intentional").unwrap();
+            storage
+                .mark_failed("failed", MODEL, "retry budget exhausted")
+                .unwrap();
+            storage
+                .mark_skipped("skipped", MODEL, "intentional")
+                .unwrap();
             let hash = ContentHasher::hash("retained body");
             queue.enqueue("processing", MODEL, &hash, 0).unwrap();
             let claim = queue.claim_batch("live", 1).unwrap().pop().unwrap();
@@ -421,16 +534,46 @@ mod tests {
             storage.connection().execute_sync(
                 "UPDATE embedding_jobs SET retry_count = 2, submitted_at = 9223372036854775807 WHERE status = 'pending';",
             ).unwrap();
-            storage.connection().execute_sync("UPDATE embedding_jobs SET content_hash = NULL WHERE doc_id = 'legacy';").unwrap();
-            let before_jobs = rows(&storage, "SELECT * FROM embedding_jobs ORDER BY job_id;", 14);
-            let before_status = rows(&storage, "SELECT * FROM embedding_status ORDER BY doc_id;", 7);
+            storage
+                .connection()
+                .execute_sync(
+                    "UPDATE embedding_jobs SET content_hash = NULL WHERE doc_id = 'legacy';",
+                )
+                .unwrap();
+            let before_jobs = rows(
+                &storage,
+                "SELECT * FROM embedding_jobs ORDER BY job_id;",
+                14,
+            );
+            let before_status = rows(
+                &storage,
+                "SELECT * FROM embedding_status ORDER BY doc_id;",
+                7,
+            );
             let page = recover(&storage, &cx);
             assert_eq!(page.terminal_documents, 2);
             assert_eq!(page.already_active, 3);
             assert_eq!(page.enqueued_jobs, 0);
-            assert_eq!(rows(&storage, "SELECT * FROM embedding_jobs ORDER BY job_id;", 14), before_jobs);
-            assert_eq!(rows(&storage, "SELECT * FROM embedding_status ORDER BY doc_id;", 7), before_status);
-            assert!(matches!(queue.check_claim(&claim, None).unwrap(), ClaimOutcome::Applied(_)));
+            assert_eq!(
+                rows(
+                    &storage,
+                    "SELECT * FROM embedding_jobs ORDER BY job_id;",
+                    14
+                ),
+                before_jobs
+            );
+            assert_eq!(
+                rows(
+                    &storage,
+                    "SELECT * FROM embedding_status ORDER BY doc_id;",
+                    7
+                ),
+                before_status
+            );
+            assert!(matches!(
+                queue.check_claim(&claim, None).unwrap(),
+                ClaimOutcome::Applied(_)
+            ));
         });
     }
 
@@ -445,11 +588,17 @@ mod tests {
             assert_eq!(recover(&storage, &cx).enqueued_jobs, 1);
             assert_eq!(queue.queue_depth().unwrap().processing, 1);
             assert!(queue.claim_batch("new", 1).unwrap().is_empty());
-            assert_eq!(queue.complete(&old, &old_hash).unwrap(), ClaimOutcome::Superseded);
+            assert_eq!(
+                queue.complete(&old, &old_hash).unwrap(),
+                ClaimOutcome::Superseded
+            );
             let replacement = queue.claim_batch("new", 1).unwrap().pop().unwrap();
             assert_eq!(replacement.content_hash, Some(new_hash));
             assert_ne!(replacement.job_id, old.job_id);
-            assert_eq!(queue.fail(&old, &old_hash, "late").unwrap(), ClaimOutcome::LostClaim);
+            assert_eq!(
+                queue.fail(&old, &old_hash, "late").unwrap(),
+                ClaimOutcome::LostClaim
+            );
         });
     }
 
@@ -457,14 +606,21 @@ mod tests {
     fn missing_full_input_is_reported_without_using_a_complete_preview() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (storage, queue) = fixture();
-            seed(&storage, "missing", "complete but unretained preview", false);
+            seed(
+                &storage,
+                "missing",
+                "complete but unretained preview",
+                false,
+            );
             storage.mark_embedded("missing", MODEL).unwrap();
             let page = recover(&storage, &cx);
             assert_eq!(page.missing_input, ["missing"]);
             assert_eq!(page.enqueued_jobs, 0);
             assert_eq!(queue.queue_depth().unwrap().pending, 0);
             assert_eq!(storage.count_by_status(MODEL).unwrap().embedded, 1);
-            storage.set_document_content("missing", "complete but unretained preview").unwrap();
+            storage
+                .set_document_content("missing", "complete but unretained preview")
+                .unwrap();
             assert_eq!(recover(&storage, &cx).enqueued_jobs, 1);
         });
     }
@@ -478,22 +634,62 @@ mod tests {
                 storage.mark_embedded(id, MODEL).unwrap();
             }
             let other = seed(&storage, "z-other-tier", "body", true);
-            queue.enqueue("z-other-tier", "other-tier", &other, 0).unwrap();
-            storage.connection().execute_sync("UPDATE embedding_jobs SET submitted_at = 9223372036854775807;").unwrap();
-            let before = rows(&storage, "SELECT * FROM embedding_status ORDER BY doc_id;", 7);
-            let error = storage.reconcile_published_embeddings(
-                &cx, MODEL, &identity(MODEL), None,
-                PublicationRecoveryConfig { page_size: 2, max_pending_jobs: 2, ..PublicationRecoveryConfig::default() },
-            ).unwrap_err();
-            assert!(matches!(error, SearchError::QueueFull { pending: 2, capacity: 2 }));
+            queue
+                .enqueue("z-other-tier", "other-tier", &other, 0)
+                .unwrap();
+            storage
+                .connection()
+                .execute_sync("UPDATE embedding_jobs SET submitted_at = 9223372036854775807;")
+                .unwrap();
+            let before = rows(
+                &storage,
+                "SELECT * FROM embedding_status ORDER BY doc_id;",
+                7,
+            );
+            let error = storage
+                .reconcile_published_embeddings(
+                    &cx,
+                    MODEL,
+                    &identity(MODEL),
+                    None,
+                    PublicationRecoveryConfig {
+                        page_size: 2,
+                        max_pending_jobs: 2,
+                        ..PublicationRecoveryConfig::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::QueueFull {
+                    pending: 2,
+                    capacity: 2
+                }
+            ));
             assert_eq!(queue.queue_depth().unwrap().pending, 1);
-            assert_eq!(rows(&storage, "SELECT * FROM embedding_status ORDER BY doc_id;", 7), before);
+            assert_eq!(
+                rows(
+                    &storage,
+                    "SELECT * FROM embedding_status ORDER BY doc_id;",
+                    7
+                ),
+                before
+            );
             assert!(!storage.connection().in_transaction());
             // Retrying the original cursor with a smaller page makes progress.
-            let page = storage.reconcile_published_embeddings(
-                &cx, MODEL, &identity(MODEL), None,
-                PublicationRecoveryConfig { page_size: 1, max_pending_jobs: 2, ..PublicationRecoveryConfig::default() },
-            ).unwrap();
+            let page = storage
+                .reconcile_published_embeddings(
+                    &cx,
+                    MODEL,
+                    &identity(MODEL),
+                    None,
+                    PublicationRecoveryConfig {
+                        page_size: 1,
+                        max_pending_jobs: 2,
+                        ..PublicationRecoveryConfig::default()
+                    },
+                )
+                .unwrap();
             assert_eq!(page.next_after.as_deref(), Some("a"));
             assert_eq!(page.enqueued_jobs, 1);
         });
@@ -504,17 +700,38 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (storage, queue) = fixture();
             publish(&storage, &queue, "doc", MODEL);
-            let history = rows(&storage, "SELECT * FROM embedding_jobs WHERE status = 'completed';", 14);
+            let history = rows(
+                &storage,
+                "SELECT * FROM embedding_jobs WHERE status = 'completed';",
+                14,
+            );
             let old = ContentHasher::hash("retained body");
             queue.enqueue("doc", MODEL, &old, 0).unwrap();
             let new = seed(&storage, "doc", "new body", true);
-            let page = storage.reconcile_published_embeddings(
-                &cx, MODEL, &identity(MODEL), None,
-                PublicationRecoveryConfig { max_pending_jobs: 1, max_retries: 7, priority: 42, ..PublicationRecoveryConfig::default() },
-            ).unwrap();
+            let page = storage
+                .reconcile_published_embeddings(
+                    &cx,
+                    MODEL,
+                    &identity(MODEL),
+                    None,
+                    PublicationRecoveryConfig {
+                        max_pending_jobs: 1,
+                        max_retries: 7,
+                        priority: 42,
+                        ..PublicationRecoveryConfig::default()
+                    },
+                )
+                .unwrap();
             assert_eq!(page.enqueued_jobs, 1);
             assert_eq!(queue.queue_depth().unwrap().pending, 1);
-            assert_eq!(rows(&storage, "SELECT * FROM embedding_jobs WHERE status = 'completed';", 14), history);
+            assert_eq!(
+                rows(
+                    &storage,
+                    "SELECT * FROM embedding_jobs WHERE status = 'completed';",
+                    14
+                ),
+                history
+            );
             let claim = queue.claim_batch("new", 1).unwrap().pop().unwrap();
             assert_eq!(claim.content_hash, Some(new));
             assert_eq!(claim.max_retries, 7);
@@ -531,10 +748,23 @@ mod tests {
                 seed(&storage, id, "retained body", true);
                 storage.mark_embedded(id, MODEL).unwrap();
             }
-            storage.connection().execute_sync("UPDATE document_contents SET canonical_text = 'corrupt' WHERE doc_id = 'z';").unwrap();
-            assert!(storage.reconcile_published_embeddings(
-                &cx, MODEL, &identity(MODEL), None, PublicationRecoveryConfig::default(),
-            ).is_err());
+            storage
+                .connection()
+                .execute_sync(
+                    "UPDATE document_contents SET canonical_text = 'corrupt' WHERE doc_id = 'z';",
+                )
+                .unwrap();
+            assert!(
+                storage
+                    .reconcile_published_embeddings(
+                        &cx,
+                        MODEL,
+                        &identity(MODEL),
+                        None,
+                        PublicationRecoveryConfig::default(),
+                    )
+                    .is_err()
+            );
             assert_eq!(queue.queue_depth().unwrap().pending, 0);
             assert_eq!(storage.count_by_status(MODEL).unwrap().embedded, 2);
             assert!(!storage.connection().in_transaction());
@@ -546,21 +776,33 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let (storage, queue) = fixture();
             let mut ids = vec!["z", "a\0tail", "a", "é", "数据"];
-            for id in &ids { seed(&storage, id, "body", true); }
+            for id in &ids {
+                seed(&storage, id, "body", true);
+            }
             ids.sort_unstable();
             let mut after = None;
             let mut examined = 0;
             let mut enqueued = 0;
             let mut cursors = Vec::new();
             loop {
-                let page = storage.reconcile_published_embeddings(
-                    &cx, MODEL, &identity(MODEL), after.as_deref(),
-                    PublicationRecoveryConfig { page_size: 2, ..PublicationRecoveryConfig::default() },
-                ).unwrap();
+                let page = storage
+                    .reconcile_published_embeddings(
+                        &cx,
+                        MODEL,
+                        &identity(MODEL),
+                        after.as_deref(),
+                        PublicationRecoveryConfig {
+                            page_size: 2,
+                            ..PublicationRecoveryConfig::default()
+                        },
+                    )
+                    .unwrap();
                 examined += page.examined_documents;
                 enqueued += page.enqueued_jobs;
                 after = page.next_after;
-                let Some(cursor) = after.as_ref() else { break; };
+                let Some(cursor) = after.as_ref() else {
+                    break;
+                };
                 cursors.push(cursor.clone());
             }
             assert_eq!(examined, ids.len());
@@ -578,23 +820,44 @@ mod tests {
             seed(&storage, "doc", "body", true);
             let before = storage.metrics_snapshot();
             for size in [0, 257, usize::MAX] {
-                assert!(storage.reconcile_published_embeddings(
-                    &cx, MODEL, &identity(MODEL), None,
-                    PublicationRecoveryConfig { page_size: size, ..PublicationRecoveryConfig::default() },
-                ).is_err());
+                assert!(
+                    storage
+                        .reconcile_published_embeddings(
+                            &cx,
+                            MODEL,
+                            &identity(MODEL),
+                            None,
+                            PublicationRecoveryConfig {
+                                page_size: size,
+                                ..PublicationRecoveryConfig::default()
+                            },
+                        )
+                        .is_err()
+                );
             }
             cx.cancel_with(asupersync::CancelKind::User, Some("stop recovery"));
-            assert!(matches!(storage.reconcile_published_embeddings(
-                &cx, MODEL, &identity(MODEL), None, PublicationRecoveryConfig::default(),
-            ), Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                storage.reconcile_published_embeddings(
+                    &cx,
+                    MODEL,
+                    &identity(MODEL),
+                    None,
+                    PublicationRecoveryConfig::default(),
+                ),
+                Err(SearchError::Cancelled { .. })
+            ));
             assert_eq!(storage.metrics_snapshot(), before);
         });
     }
 
     struct Canonical;
     impl Canonicalizer for Canonical {
-        fn canonicalize(&self, text: &str) -> String { text.to_owned() }
-        fn canonicalize_query(&self, query: &str) -> String { query.to_owned() }
+        fn canonicalize(&self, text: &str) -> String {
+            text.to_owned()
+        }
+        fn canonicalize_query(&self, query: &str) -> String {
+            query.to_owned()
+        }
     }
 
     struct Probe(Arc<Mutex<Vec<String>>>);
@@ -607,48 +870,109 @@ mod tests {
             self.0.lock().unwrap().push(value.to_owned());
             Box::pin(async { Ok(vec![1.0, 0.0]) })
         }
-        fn dimension(&self) -> usize { 2 }
-        fn id(&self) -> &'static str { MODEL }
-        fn model_name(&self) -> &'static str { MODEL }
-        fn is_semantic(&self) -> bool { true }
-        fn category(&self) -> ModelCategory { ModelCategory::StaticEmbedder }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &'static str {
+            MODEL
+        }
+        fn model_name(&self) -> &'static str {
+            MODEL
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
     }
 
     #[test]
     fn external_sink_migration_reopens_and_drains_into_complete_database_vectors() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
-            let config = StorageConfig { db_path: dir.path().join("recovery.sqlite3"), ..StorageConfig::default() };
+            let config = StorageConfig {
+                db_path: dir.path().join("recovery.sqlite3"),
+                ..StorageConfig::default()
+            };
             let observed = Arc::new(Mutex::new(Vec::new()));
             let sink = Arc::new(InMemoryVectorSink::default());
             let input = "Unicode café 数据 full source. ".repeat(40);
             {
                 let storage = Arc::new(Storage::open(config.clone()).unwrap());
                 let worker = PersistentEmbeddingWorker::new(
-                    storage.clone(), JobQueueConfig::default(), Arc::new(Canonical),
-                    Arc::new(Probe(observed.clone())), sink.clone(),
-                ).unwrap();
-                worker.runner().ingest(IngestRequest::new("migrate", &input)).unwrap();
-                assert_eq!(worker.process_batch(&cx, "external").await.unwrap().jobs_completed, 1);
+                    storage.clone(),
+                    JobQueueConfig::default(),
+                    Arc::new(Canonical),
+                    Arc::new(Probe(observed.clone())),
+                    sink.clone(),
+                )
+                .unwrap();
+                worker
+                    .runner()
+                    .ingest(IngestRequest::new("migrate", &input))
+                    .unwrap();
+                assert_eq!(
+                    worker
+                        .process_batch(&cx, "external")
+                        .await
+                        .unwrap()
+                        .jobs_completed,
+                    1
+                );
                 let worker = worker.with_database_publication();
-                assert_eq!(worker.runner().ingest(IngestRequest::new("migrate", &input)).unwrap().action, IngestAction::Unchanged);
+                assert_eq!(
+                    worker
+                        .runner()
+                        .ingest(IngestRequest::new("migrate", &input))
+                        .unwrap()
+                        .action,
+                    IngestAction::Unchanged
+                );
                 assert_eq!(worker.queue().queue_depth().unwrap().pending, 0);
-                assert!(storage.get_published_embedding("migrate", MODEL, &identity(MODEL)).unwrap().is_none());
+                assert!(
+                    storage
+                        .get_published_embedding("migrate", MODEL, &identity(MODEL))
+                        .unwrap()
+                        .is_none()
+                );
                 assert_eq!(recover(&storage, &cx).enqueued_jobs, 1);
             }
             let storage = Arc::new(Storage::open(config).unwrap());
             let worker = PersistentEmbeddingWorker::new(
-                storage.clone(), JobQueueConfig::default(), Arc::new(Canonical),
-                Arc::new(Probe(observed.clone())), sink.clone(),
-            ).unwrap().with_database_publication();
-            let outcome = worker.drain(&cx, "database", &AtomicBool::new(false), Duration::from_secs(5)).await.unwrap();
+                storage.clone(),
+                JobQueueConfig::default(),
+                Arc::new(Canonical),
+                Arc::new(Probe(observed.clone())),
+                sink.clone(),
+            )
+            .unwrap()
+            .with_database_publication();
+            let outcome = worker
+                .drain(
+                    &cx,
+                    "database",
+                    &AtomicBool::new(false),
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
             assert!(matches!(outcome, WorkerDrainOutcome::Drained { .. }));
             assert_eq!(outcome.report().work.jobs_completed, 1);
-            assert_eq!(sink.entries().len(), 1, "recovery must never call the old external sink");
+            assert_eq!(
+                sink.entries().len(),
+                1,
+                "recovery must never call the old external sink"
+            );
             assert_eq!(observed.lock().unwrap().as_slice(), [input.clone(), input]);
-            let snapshot = storage.load_published_embeddings(
-                &cx, MODEL, &identity(MODEL), PublishedEmbeddingReadLimits::default(),
-            ).unwrap();
+            let snapshot = storage
+                .load_published_embeddings(
+                    &cx,
+                    MODEL,
+                    &identity(MODEL),
+                    PublishedEmbeddingReadLimits::default(),
+                )
+                .unwrap();
             assert_eq!(snapshot.records.len(), 1);
             assert_eq!(snapshot.records[0].doc_id, "migrate");
             assert_eq!(recover(&storage, &cx).already_published, 1);

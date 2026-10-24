@@ -6,6 +6,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+
 use super::{ScopeSource, ScopedLexical, ScopedText};
 use crate::native_ann::builder::sharded::NativeBuiltShardedHybridIndex;
 use crate::native_ann::{
@@ -145,6 +147,45 @@ impl NativeScopedShardedHybridIndex<'_> {
             .with_allowed_documents(&self.lexical.allowed)
     }
 
+    /// Prepare scoped sharded progressive retrieval with complete retained
+    /// inventory traversal on the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Refuses invalid quality topology, candidate budget, identity, or cancellation.
+    pub fn progressive_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        let vectors = self.index.vectors();
+        let first = &vectors.partitions()[0];
+        let quality = match (vectors.quality(), first.quality()) {
+            (Some(shards), Some(tier)) => Some((shards, tier.embedder())),
+            (None, None) => None,
+            _ => {
+                return Err(invalid(
+                    "sharded_scope.quality",
+                    "inconsistent",
+                    "quality inventory and producing model must travel together",
+                ));
+            }
+        };
+        vectors
+            .fast()
+            .search_hybrid_progressive_with_pool(
+                cx,
+                first.fast().embedder(),
+                quality,
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )?
+            .with_allowed_documents_arc(Arc::clone(&self.lexical.allowed))
+    }
+
     /// Rerank only eligible candidates using their original retained source text.
     ///
     /// No excluded document reaches the scorer. Ranking moves each whole result
@@ -166,6 +207,23 @@ impl NativeScopedShardedHybridIndex<'_> {
             .with_reranker(reranker, self.text.as_ref(), window)
     }
 
+    /// Pool-aware scoped sharded progressive retrieval plus retained-source reranking.
+    ///
+    /// # Errors
+    /// Combines scoped progressive admission and existing rerank-window errors.
+    pub fn progressive_with_reranker_on_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        self.progressive_with_pool(cx, text, k, pool)?
+            .with_reranker(reranker, self.text.as_ref(), window)
+    }
+
     /// Scoped fast-plus-keyword retrieval without invoking the quality provider.
     ///
     /// # Errors
@@ -179,6 +237,20 @@ impl NativeScopedShardedHybridIndex<'_> {
         collect(self.primary(cx, text, k, false)?).await
     }
 
+    /// Pool-aware scoped fast-plus-keyword retrieval without invoking the quality provider.
+    ///
+    /// # Errors
+    /// Propagates required retrieval, widening, hydration and cancellation errors.
+    pub async fn search_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        collect(self.primary_with_pool(cx, text, k, false, pool)?).await
+    }
+
     /// Collect the scoped progressive query, requiring every configured phase.
     ///
     /// # Errors
@@ -190,6 +262,20 @@ impl NativeScopedShardedHybridIndex<'_> {
         k: usize,
     ) -> SearchResult<Vec<NativeShardedResult>> {
         collect(self.progressive(cx, text, k)?).await
+    }
+
+    /// Pool-aware collection of the scoped progressive query, requiring every configured phase.
+    ///
+    /// # Errors
+    /// A failed required quality phase is an error, not Initial-only success.
+    pub async fn search_refined_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        collect(self.progressive_with_pool(cx, text, k, pool)?).await
     }
 
     /// Independent scoped quality-plus-keyword retrieval without fast inference.
@@ -206,6 +292,30 @@ impl NativeScopedShardedHybridIndex<'_> {
         let mut results = collect(self.primary(cx, text, k, true)?).await?;
         for hit in &mut results {
             checkpoint(cx, "native_ann.sharded_scope.quality_result")?;
+            hit.quality_row = hit.fast_row.take();
+            hit.result.quality_score = hit.result.fast_score.take();
+            if hit.result.source == ScoreSource::SemanticFast {
+                hit.result.source = ScoreSource::SemanticQuality;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Pool-aware independent scoped quality-plus-keyword retrieval without fast inference.
+    ///
+    /// # Errors
+    /// Refuses absent quality before the empty-scope/zero-k fast paths and
+    /// propagates ordinary identity, retrieval, hydration and cancellation errors.
+    pub async fn search_quality_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        let mut results = collect(self.primary_with_pool(cx, text, k, true, pool)?).await?;
+        for hit in &mut results {
+            checkpoint(cx, "native_ann.sharded_scope.quality_pool_result")?;
             hit.quality_row = hit.fast_row.take();
             hit.result.quality_score = hit.result.fast_score.take();
             if hit.result.source == ScoreSource::SemanticFast {
@@ -241,7 +351,45 @@ impl NativeScopedShardedHybridIndex<'_> {
         };
         shards
             .search_hybrid_progressive(cx, tier.embedder(), None, &self.lexical, text, k)?
-            .with_allowed_documents(&self.lexical.allowed)
+            .with_allowed_documents_arc(Arc::clone(&self.lexical.allowed))
+    }
+
+    fn primary_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        quality: bool,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.sharded_scope.primary_pool")?;
+        let vectors = self.index.vectors();
+        let first = &vectors.partitions()[0];
+        let (shards, tier) = if quality {
+            match (vectors.quality(), first.quality()) {
+                (Some(shards), Some(tier)) => (shards, tier),
+                _ => {
+                    return Err(invalid(
+                        "sharded_scope.quality",
+                        "absent",
+                        "quality-primary search requires a complete quality tier",
+                    ));
+                }
+            }
+        } else {
+            (vectors.fast(), first.fast())
+        };
+        shards
+            .search_hybrid_progressive_with_pool(
+                cx,
+                tier.embedder(),
+                None,
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )?
+            .with_allowed_documents_arc(Arc::clone(&self.lexical.allowed))
     }
 }
 

@@ -3,6 +3,9 @@ use std::future::Future;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
+
+use asupersync::runtime::blocking_pool::BlockingPool;
 
 use super::super::tests::{Provider, Reply, generation};
 use crate::native_ann::builder::{NativeBuildPrecision, NativeBuildRetrieval};
@@ -117,6 +120,77 @@ fn real_quill_and_native_vectors_are_built_from_the_complete_same_cohort() {
             index.search_quality(&cx, "vertical", 1).await.unwrap()[0].doc_id,
             "b"
         );
+    });
+}
+
+#[test]
+fn pooled_built_queries_match_inline_results_and_phases() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("runtime context");
+        let dir = tempfile::tempdir().unwrap();
+        let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let quality = Arc::new(Provider::new("quality", 3, Reply::Correct));
+        let index = builder(&dir.path().join("hybrid"), &fast)
+            .with_quality_embedder(quality)
+            .unwrap()
+            .build_hybrid(&cx)
+            .await
+            .unwrap();
+        let pool = BlockingPool::new(0, 2);
+        let handle = pool.handle();
+
+        for query in ["vertical", "horizontal", "not-present"] {
+            let inline = index.search(&cx, query, 4).await.unwrap();
+            let pooled = index
+                .search_with_pool(&cx, query, 4, handle.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&pooled).unwrap(),
+                serde_json::to_value(&inline).unwrap()
+            );
+
+            let inline = index.search_refined(&cx, query, 4).await.unwrap();
+            let pooled = index
+                .search_refined_with_pool(&cx, query, 4, handle.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&pooled).unwrap(),
+                serde_json::to_value(&inline).unwrap()
+            );
+
+            let inline = index.search_quality(&cx, query, 4).await.unwrap();
+            let pooled = index
+                .search_quality_with_pool(&cx, query, 4, handle.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&pooled).unwrap(),
+                serde_json::to_value(&inline).unwrap()
+            );
+        }
+
+        let mut inline = index.progressive(&cx, "vertical", 2).unwrap();
+        let mut pooled = index
+            .progressive_with_pool(&cx, "vertical", 2, handle)
+            .unwrap();
+        loop {
+            let left = inline.next_phase().await.unwrap();
+            let right = pooled.next_phase().await.unwrap();
+            assert_eq!(
+                serde_json::to_value(right.as_ref().map(|phase| format!("{phase:?}"))).unwrap(),
+                serde_json::to_value(left.as_ref().map(|phase| format!("{phase:?}"))).unwrap()
+            );
+            if left.is_none() {
+                break;
+            }
+        }
+
+        assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
     });
 }
 

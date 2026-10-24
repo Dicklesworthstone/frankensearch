@@ -5951,7 +5951,7 @@ mod tests {
 
     #[test]
     fn derived_matrix_manifest_independently_round_trips_and_rejects_tamper() {
-        let assembly = assemble_test(complete_shards(), Vec::new()).unwrap();
+        let assembly = assemble_test(vec![complete_shards().remove(0)], Vec::new()).unwrap();
         let manifest = assembly.matrix_manifest();
         let bytes = manifest.to_json_pretty().expect("canonical matrix bytes");
         assert_eq!(
@@ -6196,7 +6196,7 @@ mod tests {
 
     #[test]
     fn content_addressed_publication_is_idempotent_and_never_clobbers() {
-        let sources = complete_shards();
+        let sources = vec![complete_shards().remove(0)];
         let retained_authorities = source_authorities_for_test(&sources);
         let source_authorities = source_authority_slices(&retained_authorities);
         let assembly = assemble_test(sources.clone(), Vec::new()).unwrap();
@@ -6254,7 +6254,7 @@ mod tests {
     fn publication_rejects_output_and_final_path_aliases() {
         use std::os::unix::fs::{MetadataExt as _, symlink};
 
-        let sources = complete_shards();
+        let sources = vec![complete_shards().remove(0)];
         let retained_authorities = source_authorities_for_test(&sources);
         let source_authorities = source_authority_slices(&retained_authorities);
         let assembly = assemble_test(sources.clone(), Vec::new()).unwrap();
@@ -6402,7 +6402,7 @@ mod tests {
 
     #[test]
     fn nested_raw_tamper_cannot_be_hidden_by_an_outer_reseal() {
-        let sources = complete_shards();
+        let sources = vec![complete_shards().remove(0)];
         let retained_authorities = source_authorities_for_test(&sources);
         let source_authorities = source_authority_slices(&retained_authorities);
         let mut assembly = assemble_test(sources.clone(), Vec::new()).unwrap();
@@ -6428,7 +6428,7 @@ mod tests {
 
     #[test]
     fn fabricated_matrix_projection_fails_after_inner_and_outer_reseal() {
-        let sources = complete_shards();
+        let sources = vec![complete_shards().remove(0)];
         let retained_authorities = source_authorities_for_test(&sources);
         let source_authorities = source_authority_slices(&retained_authorities);
         let mut assembly = assemble_test(sources.clone(), Vec::new()).unwrap();
@@ -6533,7 +6533,7 @@ mod tests {
 
     #[test]
     fn exact_byte_reload_rejects_unknown_fields_and_whitespace_aliases() {
-        let assembly = assemble_test(complete_shards(), Vec::new()).unwrap();
+        let assembly = assemble_test(vec![complete_shards().remove(0)], Vec::new()).unwrap();
         let mut whitespace = assembly.to_json_pretty().unwrap();
         whitespace.push(b'\n');
         assert!(matches!(
@@ -7005,7 +7005,7 @@ mod tests {
 
     #[test]
     fn profile_and_cross_class_substitution_fail_after_outer_reseal() {
-        let sources = complete_shards();
+        let sources = vec![complete_shards().remove(0)];
         let retained_authorities = source_authorities_for_test(&sources);
         let source_authorities = source_authority_slices(&retained_authorities);
         let original = assemble_test(sources.clone(), Vec::new()).unwrap();

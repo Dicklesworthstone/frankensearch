@@ -12,16 +12,13 @@ use frankensearch::Reranker;
 use frankensearch::SearchError;
 use frankensearch::native_ann::builder::deadline::NativeSearchDeadline;
 
-use super::{
-    Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, search, validate_query,
-};
+use super::{Arc, Cx, Error, Mode, Path, Result, SCHEMA, bad, cohort, filter, validate_query};
 
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 
 #[path = "query/tuning.rs"]
 mod tuning;
-pub use tuning::FullQuery;
-pub(crate) use tuning::{FullQueryOverride, deserialize_query_override};
+pub use tuning::{FullQuery, FullQueryOverride, deserialize_query_override};
 
 /// A server budget is both the default and a ceiling on request overrides.
 /// No configured budget preserves the previous unbounded-query policy.
@@ -31,6 +28,7 @@ pub struct Policy {
     pub(super) timer: Option<TimerDriverHandle>,
     pub(super) rerank: Option<Rerank>,
     pub(super) full_query: Option<FullQuery>,
+    pub(super) query_pool: Option<BlockingPoolHandle>,
 }
 
 impl Policy {
@@ -53,6 +51,10 @@ impl Policy {
         } else {
             None
         }
+    }
+
+    pub(super) fn query_pool(&self) -> Option<BlockingPoolHandle> {
+        self.query_pool.clone()
     }
 
     pub(super) fn effective_ms(&self, requested_ms: Option<u64>) -> Result<Option<u64>> {
@@ -152,15 +154,12 @@ pub async fn buffered<'i>(
 ) -> Result<serde_json::Value> {
     let index = index.into();
     let deadline = policy.start(cx, None)?;
-    within(cx, deadline.as_ref(), async {
+    Box::pin(within(cx, deadline.as_ref(), async {
         let rerank = policy.reranker_for(mode);
         if rerank.is_none() && (mode != Mode::Full || policy.full_query.is_none()) {
-            if let cohort::Index::Single(index) = index {
-                return search(index, cx, text, mode, limit, filters).await;
-            }
             validate_query(text)?;
             return cohort::Prepared::prepare(index, cx, filters)?
-                .search(cx, text, mode, limit)
+                .search_with_pool(cx, text, mode, limit, policy.query_pool())
                 .await;
         }
         validate_query(text)?;
@@ -191,7 +190,7 @@ pub async fn buffered<'i>(
         }
         policy.annotate_full_query(mode, &mut payload);
         Ok(payload)
-    })
+    }))
     .await
 }
 

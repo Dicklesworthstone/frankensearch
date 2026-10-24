@@ -483,6 +483,23 @@ fn normalize_in_place(vec: &mut [f32]) {
     }
 }
 
+/// Filter out empty strings and, when a batch spans multiple ONNX runs
+/// (`> FASTEMBED_TEXTS_PER_RUN`), sort non-empty inputs by `(text.len(), slot_idx)`
+/// so each `FASTEMBED_TEXTS_PER_RUN` micro-batch pads to a tight local maximum
+/// length while preserving deterministic scatter-back indices.
+fn bucket_non_empty_batch<'a>(texts: &'a [&'a str]) -> (Vec<usize>, Vec<&'a str>) {
+    let mut indexed: Vec<(usize, &'a str)> = texts
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, text)| !text.is_empty())
+        .collect();
+    if indexed.len() > FASTEMBED_TEXTS_PER_RUN {
+        indexed.sort_by_key(|&(slot_idx, text)| (text.len(), slot_idx));
+    }
+    indexed.into_iter().unzip()
+}
+
 impl Embedder for FastEmbedEmbedder {
     fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
         Box::pin(async move {
@@ -506,15 +523,7 @@ impl Embedder for FastEmbedEmbedder {
             }
 
             let mut output = vec![vec![0.0; self.dimension]; texts.len()];
-            let mut non_empty_indices = Vec::with_capacity(texts.len());
-            let mut non_empty_texts = Vec::with_capacity(texts.len());
-
-            for (idx, text) in texts.iter().enumerate() {
-                if !text.is_empty() {
-                    non_empty_indices.push(idx);
-                    non_empty_texts.push(*text);
-                }
-            }
+            let (non_empty_indices, non_empty_texts) = bucket_non_empty_batch(texts);
 
             if non_empty_texts.is_empty() {
                 return Ok(output);
@@ -904,6 +913,51 @@ mod tests {
     fn onnx_config_for_name_unknown_returns_none() {
         assert!(OnnxEmbedderConfig::for_name("unknown-model").is_none());
         assert!(OnnxEmbedderConfig::for_name("").is_none());
+    }
+
+    #[test]
+    fn bucket_non_empty_batch_groups_multi_run_inputs_by_length_and_preserves_slot_mapping() {
+        let single_run = ["long-text-alpha", "", "x", "mid-text", "yy"];
+        let (single_indices, single_texts) = bucket_non_empty_batch(&single_run);
+        assert_eq!(single_indices, vec![0, 2, 3, 4]);
+        assert_eq!(
+            single_texts,
+            vec!["long-text-alpha", "x", "mid-text", "yy"],
+            "batches within one FASTEMBED_TEXTS_PER_RUN micro-batch stay in arrival order"
+        );
+
+        let multi_run = [
+            "very-long-document-0-padding-outlier-zzzzzzzzzzzzzzzzzzzzzzzz",
+            "",
+            "s1",
+            "very-long-document-1-padding-outlier-yyyyyyyyyyyyyyyyyyyyyyyy",
+            "s2",
+            "s3",
+            "",
+            "s4",
+            "medium-document-2-wwwwwwwwwwww",
+            "s2",
+        ];
+        let (indices, texts) = bucket_non_empty_batch(&multi_run);
+        assert_eq!(texts.len(), 8);
+        assert_eq!(
+            &texts[..FASTEMBED_TEXTS_PER_RUN],
+            &["s1", "s2", "s3", "s4"],
+            "first micro-batch should group the four short 2-byte inputs instead of padding to the 61-byte outliers"
+        );
+        assert_eq!(indices, vec![2, 4, 5, 7, 9, 8, 0, 3]);
+
+        let mut scattered = vec!["<empty>"; multi_run.len()];
+        for (slot_idx, text) in indices.into_iter().zip(texts) {
+            scattered[slot_idx] = text;
+        }
+        for (idx, original) in multi_run.iter().enumerate() {
+            if original.is_empty() {
+                assert_eq!(scattered[idx], "<empty>");
+            } else {
+                assert_eq!(scattered[idx], *original);
+            }
+        }
     }
 
     #[test]

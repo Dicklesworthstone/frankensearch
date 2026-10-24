@@ -116,10 +116,7 @@ pub fn read_document_content(
 }
 
 /// Validate actual input bytes, not only a caller-supplied digest or preview length.
-pub fn verify_document_text(
-    document: &DocumentRecord,
-    canonical_text: &str,
-) -> SearchResult<()> {
+pub fn verify_document_text(document: &DocumentRecord, canonical_text: &str) -> SearchResult<()> {
     if ContentHasher::hash(canonical_text) != document.content_hash
         || canonical_text.chars().count() != document.content_length
     {
@@ -166,7 +163,9 @@ mod tests {
         let text = "café 日本語 🚀 \0 tail ".repeat(150);
         {
             let storage = Storage::open(config.clone()).unwrap();
-            storage.upsert_document(&document("durable", &text)).unwrap();
+            storage
+                .upsert_document(&document("durable", &text))
+                .unwrap();
             storage.set_document_content("durable", &text).unwrap();
         }
         let storage = Storage::open(config).unwrap();

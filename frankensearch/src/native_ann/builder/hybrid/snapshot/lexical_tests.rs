@@ -38,6 +38,9 @@ impl Embedder for Provider {
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
         Ok(&self.0)
     }
+    fn bound_batch_is_native(&self) -> bool {
+        true
+    }
     fn dimension(&self) -> usize {
         2
     }

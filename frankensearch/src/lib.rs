@@ -285,12 +285,12 @@ pub use asupersync::Cx;
 pub use frankensearch_core::error::{SearchError, SearchResult};
 
 // Configuration
-pub use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics};
+pub use frankensearch_core::config::{TwoTierConfig, TwoTierMetrics, ZeroSignalReason};
 
 // Search result types
 pub use frankensearch_core::types::{
-    FusedHit, IndexableDocument, PhaseMetrics, RankChanges, ScoreSource, ScoredResult, SearchMode,
-    SearchPhase, VectorHit,
+    FusedHit, IndexableDocument, PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource,
+    ScoredResult, SearchMode, SearchPhase, VectorHit,
 };
 
 // Telemetry types
@@ -304,11 +304,23 @@ pub use frankensearch_core::traits::{
     SyncRerankerAdapter,
 };
 pub use frankensearch_core::{
-    AttestedDaemonEmbeddingResponseV1, DAEMON_ATTESTATION_SCHEMA_V1, DAEMON_CHALLENGE_SCHEMA_V1,
-    DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonClient,
-    DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError, DaemonOperationV1,
-    DaemonRetryConfig, MIN_DAEMON_ATTESTATION_KEY_BYTES, daemon_embedding_payload_sha256,
-    daemon_endpoint_fingerprint, daemon_executable_fingerprint, daemon_ordered_request_sha256,
+    ARG_INDEX_DIR, ARG_MODEL_BUNDLE, ARG_SOURCE_DIR, AntiRollbackFloorRecordV1,
+    ArtifactGenerationIdentityV1, AttestedDaemonEmbeddingResponseV1, AuthorityFloorV1,
+    AuthorityRefV1, AuthoritySlotV1, COMPLETE_COVERAGE_PPM, DAEMON_ATTESTATION_SCHEMA_V1,
+    DAEMON_CHALLENGE_SCHEMA_V1, DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1,
+    DaemonClient, DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError,
+    DaemonOperationV1, DaemonRetryConfig, EmbeddingIdentityBundleV1,
+    FrozenEmbeddingIdentityBundleV1, GenerationAuthorityErrorV1, GenerationRootSecurityProfileV1,
+    InMemoryAntiRollbackFloorStoreV1, InteractionPolicy, LocalAntiRollbackFloorStoreV1,
+    MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS, MIN_DAEMON_ATTESTATION_KEY_BYTES,
+    MODEL_ACQUISITION_AUTHORIZATION_SCHEMA_VERSION, ModelAcquisitionAuthorization,
+    ModelAcquisitionAuthorizationSchemaVersion, ModelAcquisitionSource, ModelAcquisitionTarget,
+    ModelDestinationClass, NetworkPolicy, RECOVERY_PLAN_SCHEMA_VERSION, RecoveryAction,
+    RecoveryContractError, RecoveryPlan, RecoveryPlanSchemaVersion, RecoveryPolicy,
+    RecoveryRequest, RequestMode, Retryability, SemanticProvenance, SemanticReadiness,
+    SemanticResponseContract, TrustedRecoveryContext, UntrustedRecoveryPlan,
+    VerifiedSemanticProvenance, daemon_embedding_payload_sha256, daemon_endpoint_fingerprint,
+    daemon_executable_fingerprint, daemon_ordered_request_sha256, plan as plan_recovery,
 };
 
 // Reranker support types
@@ -336,13 +348,22 @@ pub use frankensearch_core::traits::{cosine_similarity, l2_normalize, truncate_e
 // ─── Embedder stack (always available) ──────────────────────────────────────
 
 pub use frankensearch_embed::auto_detect::{DimReduceEmbedder, EmbedderStack, TwoTierAvailability};
+pub use frankensearch_embed::batch_coalescer::{
+    BatchCoalescer, CoalescedBatch, CoalescerConfig, CoalescerLimits, CoalescerMetrics,
+    CoalescerUsage, Priority,
+};
+pub use frankensearch_embed::coalescing_embedder::{CoalescingDispatcher, CoalescingEmbedder};
 pub use frankensearch_embed::model_registry::{EmbedderRegistry, RegisteredEmbedder};
 
 // ─── Vector index (always available) ────────────────────────────────────────
 
+pub use frankensearch_index::generation_root::QualifiedGenerationRoot;
+pub use frankensearch_index::generation_root::authority_publisher::{
+    AntiRollbackFloorProviderV1, AuthorityPublisherV1,
+};
 pub use frankensearch_index::{
-    InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex, TwoTierIndexBuilder,
-    TwoTierIndexPaths, VectorIndex, VectorIndexWriter,
+    FsviV2IdentityBinding, InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex,
+    TwoTierIndexBuilder, TwoTierIndexPaths, ValidatedFsviBytes, VectorIndex, VectorIndexWriter,
 };
 
 pub mod native_ann;
@@ -357,6 +378,8 @@ pub use frankensearch_fusion::{
     AssumedDaemonClient, AssumedDaemonEmbeddingBatchV1, DaemonFallbackEmbedder,
     DaemonFallbackReranker, DaemonTrustLevelV1, FederatedConfig, FederatedCoverage,
     FederatedFusion, FederatedHit, FederatedResponse, FederatedSearcher, FederatedShardError,
+    GenerationActivationV1, GenerationCandidateV1, GenerationPublicationErrorV1,
+    GenerationPublicationResultV1, GenerationPublisherV1, GenerationReconciliationResultV1,
     NoopDaemonClient, PinnedDaemonVerifierV1, RrfConfig, SyncLexicalSearch, SyncSearchIterator,
     SyncTwoTierSearcher, TwoTierSearcher, blend_two_tier, candidate_count, rrf_fuse,
 };
@@ -437,9 +460,11 @@ pub mod prelude {
     pub use asupersync::Cx;
 
     pub use crate::{
-        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalRead, Reranker,
-        ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult, SyncTwoTierSearcher,
-        TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
+        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher,
+        GenerationRootSecurityProfileV1, LexicalRead, RecoveryPlan, RecoveryPolicy,
+        RecoveryRequest, Reranker, ScoreSource, ScoredResult, SearchError, SearchPhase,
+        SearchResult, SemanticReadiness, SyncTwoTierSearcher, TrustedRecoveryContext,
+        TwoTierConfig, TwoTierMetrics, TwoTierSearcher, plan_recovery,
     };
 
     #[cfg(feature = "storage")]
@@ -462,6 +487,38 @@ mod tests {
         let _config = TwoTierConfig::default();
         let _metrics = TwoTierMetrics::default();
         let _rrf = RrfConfig::default();
+        assert_eq!(
+            GenerationRootSecurityProfileV1::RequiredExternal.as_str(),
+            "required_external"
+        );
+        assert_eq!(
+            GenerationRootSecurityProfileV1::CooperativeLocal.as_str(),
+            "cooperative_local"
+        );
+        assert_eq!(
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored.as_str(),
+            "read_only_unanchored"
+        );
+        let _floor_store = InMemoryAntiRollbackFloorStoreV1::new();
+        let readiness = SemanticReadiness::IndexAbsent;
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        let recovery = plan_recovery(TrustedRecoveryContext::new(
+            &readiness,
+            RecoveryRequest {
+                mode: RequestMode::Hybrid,
+                requested_topology: RetrievalTopology::FullProgressive,
+            },
+            &policy,
+            None,
+            1_750_000_000,
+        ))
+        .expect("facade recovery_plan re-export plans IndexAbsent");
+        assert_eq!(recovery.state_code(), "recovery.state.index_absent");
+        assert!(!recovery.semantic_available());
     }
 
     #[test]

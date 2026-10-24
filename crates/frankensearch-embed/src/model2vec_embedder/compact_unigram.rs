@@ -9,10 +9,15 @@
 //! normalizer, pre-tokenizer, post-processor) is the library's own
 //! `TokenizerImpl`, deserialized from the same `tokenizer.json`.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 use tokenizers::models::unigram::{UnigramError, UnigramTrainer};
 use tokenizers::{
     DecoderWrapper, Model, NormalizerWrapper, PostProcessorWrapper, PreTokenizerWrapper, Token,
@@ -21,6 +26,51 @@ use tokenizers::{
 
 /// Score penalty for an unknown character (`K_UNK_PENALTY` in `tokenizers`).
 const UNK_PENALTY: f64 = 10.0;
+
+/// Filename of the persisted CSR `PieceTrie` sidecar next to `tokenizer.json`.
+pub(super) const UNIGRAM_TRIE_SIDECAR_FILENAME: &str = ".tokenizer.unigram-trie.v1";
+
+const TRIE_SIDECAR_MAGIC: &[u8; 8] = b"FSUTRIE1";
+const TRIE_SIDECAR_VERSION: u32 = 1;
+const TRIE_SIDECAR_HEADER_BYTES: usize = 88;
+
+thread_local! {
+    static ACTIVE_SIDECAR_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static SIDECAR_HITS: Cell<usize> = const { Cell::new(0) };
+    #[cfg(test)]
+    static SIDECAR_BUILDS: Cell<usize> = const { Cell::new(0) };
+}
+
+struct SidecarPathGuard {
+    previous: Option<PathBuf>,
+}
+
+impl SidecarPathGuard {
+    fn set(path: Option<PathBuf>) -> Self {
+        let previous = ACTIVE_SIDECAR_PATH.with(|slot| slot.replace(path));
+        Self { previous }
+    }
+}
+
+impl Drop for SidecarPathGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        ACTIVE_SIDECAR_PATH.with(|slot| {
+            slot.replace(previous);
+        });
+    }
+}
+
+/// Deserialize a [`CompactUnigramTokenizer`] from `content`, consulting and
+/// populating `sidecar_path` when supplied.
+pub(super) fn deserialize_unigram_tokenizer(
+    content: &str,
+    sidecar_path: Option<&Path>,
+) -> tokenizers::Result<CompactUnigramTokenizer> {
+    let _guard = SidecarPathGuard::set(sidecar_path.map(Path::to_path_buf));
+    Ok(serde_json::from_str(content)?)
+}
 
 /// A complete tokenizer whose model is [`CompactUnigram`].
 pub(super) type CompactUnigramTokenizer = TokenizerImpl<
@@ -35,6 +85,7 @@ pub(super) type CompactUnigramTokenizer = TokenizerImpl<
 /// the sorted child labels `labels[first[n]..first[n + 1]]` with the matching
 /// `targets`, and `piece[n]` is one more than the id of the piece ending at
 /// `n` (0 when no piece ends there).
+#[derive(Debug, PartialEq, Eq)]
 struct PieceTrie {
     first: Vec<u32>,
     labels: Vec<u8>,
@@ -98,6 +149,290 @@ impl PieceTrie {
         }
     }
 
+    fn vocab_digest(vocab: &[(String, f64)]) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch.compact_unigram.vocab.v1\0");
+        hasher.update(u64::try_from(vocab.len()).unwrap_or(u64::MAX).to_le_bytes());
+        for (piece, _) in vocab {
+            hasher.update(u32::try_from(piece.len()).unwrap_or(u32::MAX).to_le_bytes());
+            hasher.update(piece.as_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+    fn encode_sidecar(&self, vocab_digest: &[u8; 32], vocab_len: u32) -> Option<Vec<u8>> {
+        let node_count = u32::try_from(self.piece.len()).ok()?;
+        if self.first.len() != self.piece.len().checked_add(1)?
+            || self.labels.len() != self.targets.len()
+        {
+            return None;
+        }
+        let edge_count = u32::try_from(self.labels.len()).ok()?;
+        let payload_len = self
+            .first
+            .len()
+            .checked_mul(4)?
+            .checked_add(self.labels.len())?
+            .checked_add(self.targets.len().checked_mul(4)?)?
+            .checked_add(self.piece.len().checked_mul(4)?)?;
+        let total_len = TRIE_SIDECAR_HEADER_BYTES.checked_add(payload_len)?;
+        let mut out = Vec::with_capacity(total_len);
+        out.resize(TRIE_SIDECAR_HEADER_BYTES, 0);
+        for &value in &self.first {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        out.extend_from_slice(&self.labels);
+        for &value in &self.targets {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        for &value in &self.piece {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        let payload_sha256: [u8; 32] = Sha256::digest(&out[TRIE_SIDECAR_HEADER_BYTES..]).into();
+        out[0..8].copy_from_slice(TRIE_SIDECAR_MAGIC);
+        out[8..12].copy_from_slice(&TRIE_SIDECAR_VERSION.to_le_bytes());
+        out[12..16].copy_from_slice(&vocab_len.to_le_bytes());
+        out[16..20].copy_from_slice(&node_count.to_le_bytes());
+        out[20..24].copy_from_slice(&edge_count.to_le_bytes());
+        out[24..56].copy_from_slice(vocab_digest);
+        out[56..88].copy_from_slice(&payload_sha256);
+        Some(out)
+    }
+
+    fn decode_sidecar(
+        bytes: &[u8],
+        expected_vocab_digest: &[u8; 32],
+        expected_vocab_len: u32,
+    ) -> Option<Self> {
+        if bytes.len() < TRIE_SIDECAR_HEADER_BYTES || &bytes[0..8] != TRIE_SIDECAR_MAGIC {
+            return None;
+        }
+        let version = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+        if version != TRIE_SIDECAR_VERSION {
+            return None;
+        }
+        let vocab_len = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+        if vocab_len != expected_vocab_len {
+            return None;
+        }
+        let node_count = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+        if node_count == 0 {
+            return None;
+        }
+        let edge_count = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
+        // The builder numbers each newly discovered child consecutively.
+        // Require a tree, not merely a forward-only DAG with aliased paths.
+        if edge_count != node_count.checked_sub(1)? {
+            return None;
+        }
+        if &bytes[24..56] != expected_vocab_digest.as_slice() {
+            return None;
+        }
+        let node_len = usize::try_from(node_count).ok()?;
+        let first_len = node_len.checked_add(1)?;
+        let edge_len = usize::try_from(edge_count).ok()?;
+        let first_bytes = first_len.checked_mul(4)?;
+        let labels_bytes = edge_len;
+        let targets_bytes = edge_len.checked_mul(4)?;
+        let piece_bytes = node_len.checked_mul(4)?;
+        let payload_len = first_bytes
+            .checked_add(labels_bytes)?
+            .checked_add(targets_bytes)?
+            .checked_add(piece_bytes)?;
+        let total_len = TRIE_SIDECAR_HEADER_BYTES.checked_add(payload_len)?;
+        if bytes.len() != total_len {
+            return None;
+        }
+        let payload = &bytes[TRIE_SIDECAR_HEADER_BYTES..];
+        let actual_payload_sha256: [u8; 32] = Sha256::digest(payload).into();
+        if &bytes[56..88] != actual_payload_sha256.as_slice() {
+            return None;
+        }
+        let (first_raw, rest) = payload.split_at(first_bytes);
+        let (labels_raw, rest) = rest.split_at(labels_bytes);
+        let (targets_raw, piece_raw) = rest.split_at(targets_bytes);
+        let first = first_raw
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<_>>();
+        let labels = labels_raw.to_vec();
+        let targets = targets_raw
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<_>>();
+        let piece = piece_raw
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<_>>();
+
+        if !targets.iter().copied().eq(1..node_count) {
+            return None;
+        }
+        if *first.first()? != 0 || *first.last()? != edge_count {
+            return None;
+        }
+        for node_idx in 0..node_len {
+            let low = first[node_idx];
+            let high = first[node_idx + 1];
+            if low > high || high > edge_count || piece[node_idx] > expected_vocab_len {
+                return None;
+            }
+            if node_idx != 0 && low == high && piece[node_idx] == 0 {
+                return None;
+            }
+            let low_usize = usize::try_from(low).ok()?;
+            let high_usize = usize::try_from(high).ok()?;
+            if labels[low_usize..high_usize]
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            {
+                return None;
+            }
+            let node_u32 = u32::try_from(node_idx).ok()?;
+            if targets[low_usize..high_usize]
+                .iter()
+                .any(|&target| target <= node_u32 || target >= node_count)
+            {
+                return None;
+            }
+        }
+        Some(Self {
+            first,
+            labels,
+            targets,
+            piece,
+        })
+    }
+
+    fn load_or_build(vocab: &[(String, f64)], sidecar_path: Option<&Path>) -> Self {
+        let Some(path) = sidecar_path else {
+            return Self::build(vocab);
+        };
+        let Ok(vocab_len) = u32::try_from(vocab.len()) else {
+            return Self::build(vocab);
+        };
+        let vocab_digest = Self::vocab_digest(vocab);
+        if let Some(max_bytes) = Self::max_sidecar_bytes(vocab)
+            && let Some(bytes) = Self::read_sidecar(path, max_bytes)
+            && let Some(trie) = Self::decode_sidecar(&bytes, &vocab_digest, vocab_len)
+            && trie.matches_vocab(vocab)
+        {
+            #[cfg(test)]
+            SIDECAR_HITS.with(|hits| hits.set(hits.get() + 1));
+            return trie;
+        }
+        #[cfg(test)]
+        SIDECAR_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        let trie = Self::build(vocab);
+        if let Some(encoded) = trie.encode_sidecar(&vocab_digest, vocab_len) {
+            let _ = Self::persist_sidecar(path, &encoded);
+        }
+        trie
+    }
+
+    /// Checksums detect damaged bytes, not a cache which consistently asserts
+    /// the wrong trie for a vocabulary. Prove both directions without building
+    /// another trie or allocating a vocabulary map. Structural admission has
+    /// already established one path per node and no nonterminal leaves.
+    fn matches_vocab(&self, vocab: &[(String, f64)]) -> bool {
+        for (id, (text, _)) in vocab.iter().enumerate() {
+            let Some(actual) = self.exact(text.as_bytes()) else {
+                return false;
+            };
+            let Ok(actual) = usize::try_from(actual) else {
+                return false;
+            };
+            // Repeated pieces keep the LAST vocabulary id. Requiring >= id
+            // on every occurrence, plus equality of the referenced bytes,
+            // establishes that contract without a duplicate-tracking map.
+            if actual < id || !vocab.get(actual).is_some_and(|(value, _)| value == text) {
+                return false;
+            }
+        }
+        for (node, &stored) in self.piece.iter().enumerate() {
+            let Some(id) = stored.checked_sub(1) else {
+                continue;
+            };
+            let Ok(id) = usize::try_from(id) else {
+                return false;
+            };
+            let Some((text, _)) = vocab.get(id) else {
+                return false;
+            };
+            // Reject invented prefixes/aliases too, including terminals inside
+            // a UTF-8 code point. Checking only real vocabulary lookups would
+            // miss these additional tokenization candidates.
+            if self
+                .node_for(text.as_bytes())
+                .and_then(|n| usize::try_from(n).ok())
+                != Some(node)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Each vocabulary byte can add at most one node and one edge. A root
+    /// alone occupies 12 payload bytes; every added node/edge occupies 13.
+    /// Derive the read ceiling from authoritative input, not cache headers.
+    fn max_sidecar_bytes(vocab: &[(String, f64)]) -> Option<usize> {
+        vocab.iter().try_fold(
+            TRIE_SIDECAR_HEADER_BYTES.checked_add(12)?,
+            |size, (piece, _)| size.checked_add(piece.len().checked_mul(13)?),
+        )
+    }
+
+    fn read_sidecar(path: &Path, max_bytes: usize) -> Option<Vec<u8>> {
+        let limit = u64::try_from(max_bytes).ok()?;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return None;
+        }
+        let file = std::fs::File::open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return None;
+        }
+        // Limit the read itself too: a regular file can grow after metadata.
+        let mut bytes = Vec::new();
+        file.take(limit.checked_add(1)?)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        (bytes.len() <= max_bytes).then_some(bytes)
+    }
+
+    /// Publish a complete cache file by replacing its directory entry, never
+    /// by truncating an existing inode (which may be hard-linked or in use).
+    /// Keep ordinary symlinks and special entries untouched. The model
+    /// directory is caller-controlled; this is not a hostile-directory lease.
+    /// A cache write failure never prevents using the freshly built trie.
+    fn persist_sidecar(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tokenizer cache destination is not a regular file",
+                ));
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut staged = tempfile::Builder::new()
+            .prefix(".unigram-trie-")
+            .tempfile_in(parent)?;
+        staged.write_all(bytes)?;
+        staged.as_file().sync_all()?;
+        staged.persist(path).map_err(|error| error.error)?;
+        // The directory is not synced: this disposable cache can disappear
+        // after a crash. No model artifact or durable publication depends on it.
+        Ok(())
+    }
+
     fn child(&self, node: u32, label: u8) -> Option<u32> {
         let low = self.first[node as usize] as usize;
         let high = self.first[node as usize + 1] as usize;
@@ -111,12 +446,16 @@ impl PieceTrie {
         self.piece[node as usize].checked_sub(1)
     }
 
-    fn exact(&self, bytes: &[u8]) -> Option<u32> {
+    fn node_for(&self, bytes: &[u8]) -> Option<u32> {
         let mut node = 0;
         for &label in bytes {
             node = self.child(node, label)?;
         }
-        self.piece_id(node)
+        Some(node)
+    }
+
+    fn exact(&self, bytes: &[u8]) -> Option<u32> {
+        self.piece_id(self.node_for(bytes)?)
     }
 }
 
@@ -152,8 +491,9 @@ impl CompactUnigram {
                 min_score = *score;
             }
         }
+        let sidecar_path = ACTIVE_SIDECAR_PATH.with(|slot| slot.borrow().clone());
         Ok(Self {
-            trie: PieceTrie::build(&vocab),
+            trie: PieceTrie::load_or_build(&vocab, sidecar_path.as_deref()),
             vocab,
             min_score,
             unk_id,
@@ -606,5 +946,366 @@ mod tests {
         assert!(!is_unigram_tokenizer("{\"model\": {}}"));
         assert!(!is_unigram_tokenizer("not json"));
         assert!(serde_json::from_str::<CompactUnigramTokenizer>(&tokenizer_json("BPE")).is_err());
+    }
+
+    #[test]
+    fn piece_trie_sidecar_round_trip_and_tamper_invalidation() {
+        use super::{PieceTrie, TRIE_SIDECAR_HEADER_BYTES};
+        use sha2::{Digest, Sha256};
+
+        let sample_vocab = vocab();
+        let vocab_len = u32::try_from(sample_vocab.len()).unwrap();
+        let vocab_digest = PieceTrie::vocab_digest(&sample_vocab);
+        let built = PieceTrie::build(&sample_vocab);
+        let encoded = built
+            .encode_sidecar(&vocab_digest, vocab_len)
+            .expect("sidecar should encode");
+
+        let decoded = PieceTrie::decode_sidecar(&encoded, &vocab_digest, vocab_len)
+            .expect("valid sidecar should decode");
+        assert_eq!(decoded, built);
+
+        // Wrong vocabulary digest or length is rejected.
+        let mut wrong_digest = vocab_digest;
+        wrong_digest[0] ^= 0xFF;
+        assert!(PieceTrie::decode_sidecar(&encoded, &wrong_digest, vocab_len).is_none());
+        assert!(PieceTrie::decode_sidecar(&encoded, &vocab_digest, vocab_len + 1).is_none());
+
+        // Truncated or magic-tampered bytes are rejected.
+        assert!(
+            PieceTrie::decode_sidecar(&encoded[..encoded.len() - 1], &vocab_digest, vocab_len)
+                .is_none()
+        );
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] ^= 0x01;
+        assert!(PieceTrie::decode_sidecar(&bad_magic, &vocab_digest, vocab_len).is_none());
+
+        // Flipping a payload byte without updating payload_sha256 is rejected.
+        let mut flipped_payload = encoded;
+        let last_idx = flipped_payload.len() - 1;
+        flipped_payload[last_idx] ^= 0x01;
+        assert!(PieceTrie::decode_sidecar(&flipped_payload, &vocab_digest, vocab_len).is_none());
+
+        // Structural invariant gate: even with a valid payload_sha256, an out-of-bounds piece id
+        // or cyclic target is rejected by decode_sidecar.
+        let mut invalid_trie = PieceTrie::build(&sample_vocab);
+        invalid_trie.piece[0] = vocab_len + 1;
+        let mut invalid_encoded = invalid_trie
+            .encode_sidecar(&vocab_digest, vocab_len)
+            .unwrap();
+        let recomputed_sha: [u8; 32] =
+            Sha256::digest(&invalid_encoded[TRIE_SIDECAR_HEADER_BYTES..]).into();
+        invalid_encoded[56..88].copy_from_slice(&recomputed_sha);
+        assert!(PieceTrie::decode_sidecar(&invalid_encoded, &vocab_digest, vocab_len).is_none());
+    }
+
+    #[test]
+    fn deserialize_unigram_tokenizer_persists_and_reuses_sidecar_and_recovers_from_corruption() {
+        use super::{
+            SIDECAR_BUILDS, SIDECAR_HITS, UNIGRAM_TRIE_SIDECAR_FILENAME,
+            deserialize_unigram_tokenizer,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar_path = dir.path().join(UNIGRAM_TRIE_SIDECAR_FILENAME);
+        let json = tokenizer_json("Unigram");
+
+        let hits_before = SIDECAR_HITS.with(std::cell::Cell::get);
+        let builds_before = SIDECAR_BUILDS.with(std::cell::Cell::get);
+
+        let first = deserialize_unigram_tokenizer(&json, Some(&sidecar_path)).unwrap();
+        assert!(sidecar_path.exists(), "first load should write sidecar");
+        assert_eq!(SIDECAR_HITS.with(std::cell::Cell::get), hits_before);
+        assert_eq!(SIDECAR_BUILDS.with(std::cell::Cell::get), builds_before + 1);
+
+        let second = deserialize_unigram_tokenizer(&json, Some(&sidecar_path)).unwrap();
+        assert_eq!(SIDECAR_HITS.with(std::cell::Cell::get), hits_before + 1);
+        assert_eq!(SIDECAR_BUILDS.with(std::cell::Cell::get), builds_before + 1);
+
+        let probe = "ab ▁ab 日本語 🦀 unknown_word";
+        assert_eq!(
+            first.encode_fast(probe, false).unwrap().get_ids(),
+            second.encode_fast(probe, false).unwrap().get_ids()
+        );
+
+        // Corrupt the sidecar on disk: load must fall back to PieceTrie::build and repair it.
+        std::fs::write(&sidecar_path, b"corrupted-sidecar-bytes").unwrap();
+        let third = deserialize_unigram_tokenizer(&json, Some(&sidecar_path)).unwrap();
+        assert_eq!(SIDECAR_HITS.with(std::cell::Cell::get), hits_before + 1);
+        assert_eq!(SIDECAR_BUILDS.with(std::cell::Cell::get), builds_before + 2);
+        assert_eq!(
+            first.encode_fast(probe, false).unwrap().get_ids(),
+            third.encode_fast(probe, false).unwrap().get_ids()
+        );
+
+        // Subsequent load hits the repaired sidecar.
+        let fourth = deserialize_unigram_tokenizer(&json, Some(&sidecar_path)).unwrap();
+        assert_eq!(SIDECAR_HITS.with(std::cell::Cell::get), hits_before + 2);
+        assert_eq!(
+            first.encode_fast(probe, false).unwrap().get_ids(),
+            fourth.encode_fast(probe, false).unwrap().get_ids()
+        );
+    }
+
+    #[test]
+    fn sidecar_read_ceiling_comes_from_vocabulary_bytes() {
+        use super::PieceTrie;
+
+        assert_eq!(PieceTrie::max_sidecar_bytes(&[]), Some(100));
+        let sample = vec![("é\0中".to_owned(), -1.0)];
+        // Six UTF-8 bytes, not three Unicode characters.
+        assert_eq!(PieceTrie::max_sidecar_bytes(&sample), Some(178));
+        let digest = PieceTrie::vocab_digest(&sample);
+        let encoded = PieceTrie::build(&sample)
+            .encode_sidecar(&digest, 1)
+            .unwrap();
+        assert_eq!(encoded.len(), 178);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache");
+        std::fs::write(&path, &encoded).unwrap();
+        assert_eq!(PieceTrie::read_sidecar(&path, 178), Some(encoded));
+        assert!(PieceTrie::read_sidecar(&path, 177).is_none());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(179)
+            .unwrap();
+        assert!(PieceTrie::read_sidecar(&path, 178).is_none());
+    }
+
+    #[test]
+    fn unusable_sidecar_destinations_do_not_prevent_tokenizer_loading() {
+        use super::{PieceTrie, deserialize_unigram_tokenizer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let directory = dir.path().join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        let missing = dir.path().join("missing-parent").join("cache");
+        let json = tokenizer_json("Unigram");
+        let expected: CompactUnigramTokenizer = serde_json::from_str(&json).unwrap();
+        for path in [&directory, &missing] {
+            assert!(PieceTrie::read_sidecar(path, 1024).is_none());
+            assert!(PieceTrie::persist_sidecar(path, b"cache").is_err());
+            let loaded = deserialize_unigram_tokenizer(&json, Some(path)).unwrap();
+            assert_eq!(
+                loaded.encode("ab 日本語", false).unwrap().get_ids(),
+                expected.encode("ab 日本語", false).unwrap().get_ids()
+            );
+        }
+        assert!(directory.is_dir());
+        assert!(!missing.parent().unwrap().exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_publication_preserves_existing_readers_and_hard_link_targets() {
+        use super::PieceTrie;
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.safetensors");
+        let cache = dir.path().join("cache");
+        let original = b"model artifact must not be truncated";
+        std::fs::write(&model, original).unwrap();
+        std::fs::hard_link(&model, &cache).unwrap();
+        let mut retained = std::fs::File::open(&cache).unwrap();
+        let sample = vocab();
+        let trie = PieceTrie::load_or_build(&sample, Some(&cache));
+        assert_eq!(trie, PieceTrie::build(&sample));
+        assert_eq!(std::fs::read(&model).unwrap(), original);
+        let mut old_bytes = Vec::new();
+        retained.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, original);
+        let decoded = PieceTrie::decode_sidecar(
+            &std::fs::read(&cache).unwrap(),
+            &PieceTrie::vocab_digest(&sample),
+            u32::try_from(sample.len()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, trie);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_sidecars_neither_modify_nor_create_their_targets() {
+        use super::PieceTrie;
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("model.safetensors");
+        let absent = dir.path().join("absent-model");
+        std::fs::write(&existing, b"authoritative model bytes").unwrap();
+        for (name, target) in [("existing-link", &existing), ("dangling-link", &absent)] {
+            let cache = dir.path().join(name);
+            symlink(target, &cache).unwrap();
+            assert!(PieceTrie::read_sidecar(&cache, 1024).is_none());
+            assert_eq!(
+                PieceTrie::load_or_build(&vocab(), Some(&cache)),
+                PieceTrie::build(&vocab())
+            );
+            assert!(
+                std::fs::symlink_metadata(&cache)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            assert_eq!(std::fs::read_link(&cache).unwrap(), *target);
+        }
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            b"authoritative model bytes"
+        );
+        assert!(!absent.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn vocabulary_admission_preserves_duplicates_empty_pieces_and_score_changes() {
+        use super::PieceTrie;
+
+        let mut sample = vocab();
+        sample.push((String::new(), -3.0));
+        sample.push(("ab".to_owned(), -4.0));
+        for mut sample in [Vec::new(), vec![(String::new(), 0.0)], sample] {
+            let built = PieceTrie::build(&sample);
+            let digest = PieceTrie::vocab_digest(&sample);
+            let len = u32::try_from(sample.len()).unwrap();
+            let encoded = built.encode_sidecar(&digest, len).unwrap();
+            let decoded = PieceTrie::decode_sidecar(&encoded, &digest, len).unwrap();
+            assert!(decoded.matches_vocab(&sample));
+            assert_eq!(decoded, built);
+            // Scores are read from authoritative JSON, not from trie storage.
+            for (_, score) in &mut sample {
+                *score -= 7.0;
+            }
+            assert_eq!(PieceTrie::vocab_digest(&sample), digest);
+            assert!(decoded.matches_vocab(&sample));
+        }
+    }
+
+    #[test]
+    fn checksummed_wrong_piece_ids_are_rebuilt_before_tokenization() {
+        use super::{PieceTrie, SIDECAR_BUILDS, SIDECAR_HITS, deserialize_unigram_tokenizer};
+
+        let sample = vocab();
+        let digest = PieceTrie::vocab_digest(&sample);
+        let len = u32::try_from(sample.len()).unwrap();
+        let mut forged = PieceTrie::build(&sample);
+        let node = usize::try_from(forged.node_for(b"a").unwrap()).unwrap();
+        forged.piece[node] = forged.exact(b"b").unwrap() + 1;
+        // Re-encoding recomputes a VALID payload hash and preserves the correct
+        // vocabulary digest. Structural bounds alone accept this wrong mapping.
+        let encoded = forged.encode_sidecar(&digest, len).unwrap();
+        let decoded = PieceTrie::decode_sidecar(&encoded, &digest, len).unwrap();
+        assert!(!decoded.matches_vocab(&sample));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache");
+        std::fs::write(&path, encoded).unwrap();
+        let hits = SIDECAR_HITS.with(std::cell::Cell::get);
+        let builds = SIDECAR_BUILDS.with(std::cell::Cell::get);
+        let json = tokenizer_json("Unigram");
+        let loaded = deserialize_unigram_tokenizer(&json, Some(&path)).unwrap();
+        assert_eq!(SIDECAR_HITS.with(std::cell::Cell::get), hits);
+        assert_eq!(SIDECAR_BUILDS.with(std::cell::Cell::get), builds + 1);
+        let library = Tokenizer::from_str(&json).unwrap();
+        for text in ["a", "ab", "éa 日本語 🦀", "unknown_word"] {
+            assert_eq!(
+                loaded.encode(text, false).unwrap().get_ids(),
+                library.encode(text, false).unwrap().get_ids()
+            );
+        }
+        let repaired =
+            PieceTrie::decode_sidecar(&std::fs::read(&path).unwrap(), &digest, len).unwrap();
+        assert!(repaired.matches_vocab(&sample));
+        assert_eq!(repaired, PieceTrie::build(&sample));
+    }
+
+    #[test]
+    fn invented_terminals_cannot_hide_behind_correct_vocabulary_lookups() {
+        use super::PieceTrie;
+
+        let sample = vec![("ab".to_owned(), -1.0), ("é".to_owned(), -2.0)];
+        let digest = PieceTrie::vocab_digest(&sample);
+        for prefix in [b"".as_slice(), b"a".as_slice(), &[0xc3][..]] {
+            let mut forged = PieceTrie::build(&sample);
+            let node = usize::try_from(forged.node_for(prefix).unwrap()).unwrap();
+            forged.piece[node] = 1;
+            assert_eq!(forged.exact(b"ab"), Some(0));
+            assert_eq!(forged.exact("é".as_bytes()), Some(1));
+            let encoded = forged.encode_sidecar(&digest, 2).unwrap();
+            let decoded = PieceTrie::decode_sidecar(&encoded, &digest, 2).unwrap();
+            assert!(!decoded.matches_vocab(&sample));
+        }
+    }
+
+    #[test]
+    fn sidecar_cannot_restore_an_earlier_duplicate_piece_id() {
+        use super::PieceTrie;
+
+        let sample = vec![("ab".to_owned(), -1.0), ("ab".to_owned(), -7.0)];
+        let digest = PieceTrie::vocab_digest(&sample);
+        let mut forged = PieceTrie::build(&sample);
+        assert_eq!(forged.exact(b"ab"), Some(1));
+        let node = usize::try_from(forged.node_for(b"ab").unwrap()).unwrap();
+        forged.piece[node] = 1;
+        let encoded = forged.encode_sidecar(&digest, 2).unwrap();
+        let decoded = PieceTrie::decode_sidecar(&encoded, &digest, 2).unwrap();
+        // The bytes still match the referenced vocabulary entry and its path,
+        // but choosing the older id would change both scoring and token ids.
+        assert_eq!(decoded.exact(b"ab"), Some(0));
+        assert!(!decoded.matches_vocab(&sample));
+    }
+
+    #[test]
+    fn sidecar_structure_rejects_aliased_children_and_unreachable_or_dead_nodes() {
+        use super::PieceTrie;
+
+        let sample = vec![("a".to_owned(), -1.0), ("b".to_owned(), -2.0)];
+        let digest = PieceTrie::vocab_digest(&sample);
+        for corruption in ["alias", "unreachable", "dead", "swapped"] {
+            let mut forged = PieceTrie::build(&sample);
+            match corruption {
+                "alias" => forged.targets[1] = forged.targets[0],
+                "unreachable" => {
+                    forged.piece.push(1);
+                    forged.first.push(2);
+                }
+                "dead" => forged.piece[1] = 0,
+                "swapped" => forged.targets.swap(0, 1),
+                _ => unreachable!(),
+            }
+            let encoded = forged.encode_sidecar(&digest, 2).unwrap();
+            assert!(
+                PieceTrie::decode_sidecar(&encoded, &digest, 2).is_none(),
+                "{corruption}"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_warm_sidecar_matches_the_library_tokenizer_pipeline() {
+        use super::{SIDECAR_HITS, deserialize_unigram_tokenizer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache");
+        let json = tokenizer_json("Unigram");
+        let _cold = deserialize_unigram_tokenizer(&json, Some(&path)).unwrap();
+        let hits = SIDECAR_HITS.with(std::cell::Cell::get);
+        let warm = deserialize_unigram_tokenizer(&json, Some(&path)).unwrap();
+        assert_eq!(SIDECAR_HITS.with(std::cell::Cell::get), hits + 1);
+        let library = Tokenizer::from_str(&json).unwrap();
+        let mut rng = Lcg(0x51decaf);
+        for _ in 0..1_000 {
+            let text = random_sentence(&mut rng);
+            let expected = library.encode(text.as_str(), false).unwrap();
+            let actual = warm.encode(text.as_str(), false).unwrap();
+            assert_eq!(actual.get_ids(), expected.get_ids(), "{text:?}");
+            assert_eq!(actual.get_tokens(), expected.get_tokens(), "{text:?}");
+            assert_eq!(actual.get_offsets(), expected.get_offsets(), "{text:?}");
+        }
     }
 }

@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 
 use super::super::{checkpoint, invalid};
@@ -183,6 +184,26 @@ impl NativeBuiltHybridIndex {
             .await
     }
 
+    /// Fast-plus-lexical search with retained vector traversal on the caller pool.
+    ///
+    /// Inference, lexical scoring and hydration retain the ordinary async path;
+    /// only native/exact vector traversal is placed on the supplied blocking pool.
+    ///
+    /// # Errors
+    /// Propagates embedding, native retrieval, lexical, fusion and hydration errors.
+    pub async fn search_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let fast = self.vectors.fast();
+        fast.index
+            .search_hybrid_text_with_pool(cx, fast.embedder(), &self.lexical, text, k, pool)
+            .await
+    }
+
     /// Independent fast and quality retrieval, blended with lexical candidates.
     /// A generation built without quality performs its declared fast-only search;
     /// a configured quality failure never triggers an inference fallback here.
@@ -213,6 +234,36 @@ impl NativeBuiltHybridIndex {
         }
     }
 
+    /// Refined two-tier hybrid search with both retained traversals on the pool.
+    ///
+    /// # Errors
+    /// Propagates all configured retrieval and hydration errors.
+    pub async fn search_refined_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let fast = self.vectors.fast();
+        match self.vectors.quality() {
+            Some(quality) => {
+                fast.index
+                    .search_hybrid_refined_text_with_pool(
+                        cx,
+                        fast.embedder(),
+                        (&quality.index, quality.embedder()),
+                        &self.lexical,
+                        text,
+                        k,
+                        pool,
+                    )
+                    .await
+            }
+            None => self.search_with_pool(cx, text, k, pool).await,
+        }
+    }
+
     /// Primary quality-plus-lexical retrieval without running the fast model.
     ///
     /// # Errors
@@ -234,6 +285,38 @@ impl NativeBuiltHybridIndex {
         quality
             .index()
             .search_hybrid_quality_text(cx, quality.embedder(), &self.lexical, text, k)
+            .await
+    }
+
+    /// Quality-primary hybrid search with retained traversal on the caller pool.
+    ///
+    /// # Errors
+    /// Refuses a missing quality tier; otherwise propagates native quality errors.
+    pub async fn search_quality_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.builder.quality_pool_query")?;
+        let quality = self.vectors.quality().ok_or_else(|| {
+            invalid(
+                "builder.quality",
+                "absent",
+                "quality-primary search requires a built quality tier",
+            )
+        })?;
+        quality
+            .index
+            .search_hybrid_quality_text_with_pool(
+                cx,
+                quality.embedder(),
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )
             .await
     }
 
@@ -260,6 +343,32 @@ impl NativeBuiltHybridIndex {
         )
     }
 
+    /// Prepare progressive native retrieval with retained vector traversal on
+    /// the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Refuses invalid query topology, identity, candidate budget or cancellation.
+    pub fn progressive_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let fast = self.vectors.fast();
+        fast.index.search_hybrid_progressive_with_pool(
+            cx,
+            fast.embedder(),
+            self.vectors
+                .quality()
+                .map(|quality| (&quality.index, quality.embedder())),
+            &self.lexical,
+            text,
+            k,
+            pool,
+        )
+    }
+
     /// Prepare lazy native retrieval and cross-encoder reranking using the EXACT
     /// source content from this build. The caller supplies only the reranker,
     /// never a "latest text" resolver that could silently change document versions.
@@ -277,6 +386,23 @@ impl NativeBuiltHybridIndex {
         window: usize,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         self.progressive(cx, text, k)?
+            .with_reranker(reranker, self.text.as_ref(), window)
+    }
+
+    /// Pool-aware variant of progressive retrieval plus retained-source reranking.
+    ///
+    /// # Errors
+    /// Combines [`Self::progressive_with_pool`] admission and native rerank configuration errors.
+    pub fn progressive_with_reranker_on_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.progressive_with_pool(cx, text, k, pool)?
             .with_reranker(reranker, self.text.as_ref(), window)
     }
 }

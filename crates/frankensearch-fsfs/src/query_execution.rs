@@ -13,7 +13,9 @@ use crate::config::PressureProfile;
 use crate::orchestration::BackpressureMode;
 use crate::output_schema::{SearchHitPayload, SearchOutputPhase, SearchPayload};
 use crate::pressure::PressureState;
-use crate::query_planning::{QueryFallbackPath, QueryIntentDecision, RetrievalBudget};
+use crate::query_planning::{
+    QueryFallbackPath, QueryIntentClass, QueryIntentDecision, RetrievalBudget,
+};
 
 /// Query execution stages in deterministic order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -842,6 +844,152 @@ impl QueryExecutionOrchestrator {
             prior_signals,
             tuning,
             false,
+        )
+    }
+
+    /// Fuse lexical + semantic rankings and apply optional prior boosts,
+    /// placing the vector rank on `hash_rank` when `vector_is_hash` is true.
+    #[must_use]
+    pub fn fuse_rankings_with_priors_for_vector_lane(
+        &self,
+        lexical: &[LexicalCandidate],
+        semantic: &[SemanticCandidate],
+        limit: usize,
+        offset: usize,
+        prior_signals: &HashMap<String, RankingPriorSignals>,
+        tuning: RankingPriorTuning,
+        vector_is_hash: bool,
+    ) -> Vec<FusedCandidate> {
+        self.fuse_rankings_with_priors_lane(
+            lexical,
+            semantic,
+            limit,
+            offset,
+            prior_signals,
+            tuning,
+            vector_is_hash,
+        )
+    }
+
+    /// Build zero-I/O in-memory prior signals (code-structure path/module match
+    /// and optional path proximity) gated on code-navigation intent
+    /// ([`QueryIntentClass::Identifier`] or [`QueryIntentClass::ShortKeyword`])
+    /// and [`DegradedRetrievalMode::Normal`].
+    ///
+    /// Natural-language prose queries and degraded retrieval modes return an
+    /// empty signal map so their rankings keep `prior_boost == 0.0`.
+    #[must_use]
+    pub fn code_navigation_prior_signals(
+        intent: QueryIntentClass,
+        mode: DegradedRetrievalMode,
+        query: &str,
+        query_origin_path: Option<&str>,
+        lexical: &[LexicalCandidate],
+        semantic: &[SemanticCandidate],
+    ) -> HashMap<String, RankingPriorSignals> {
+        if !matches!(mode, DegradedRetrievalMode::Normal)
+            || !matches!(
+                intent,
+                QueryIntentClass::Identifier | QueryIntentClass::ShortKeyword
+            )
+        {
+            return HashMap::new();
+        }
+        let mut unique_ids = Vec::with_capacity(lexical.len() + semantic.len());
+        let mut seen = std::collections::HashSet::with_capacity(lexical.len() + semantic.len());
+        for candidate in lexical {
+            if seen.insert(candidate.doc_id.as_str()) {
+                unique_ids.push(candidate.doc_id.as_str());
+            }
+        }
+        for candidate in semantic {
+            if seen.insert(candidate.doc_id.as_str()) {
+                unique_ids.push(candidate.doc_id.as_str());
+            }
+        }
+        if unique_ids.is_empty() {
+            return HashMap::new();
+        }
+        let sidecar = crate::code_structure_sidecar::CodeStructureSidecar::from_documents(
+            unique_ids.iter().map(|&doc_id| (doc_id, doc_id, "")),
+        );
+        let fused_stub = unique_ids
+            .iter()
+            .map(|&doc_id| FusedCandidate {
+                doc_id: doc_id.to_owned(),
+                fused_score: 0.0,
+                prior_boost: 0.0,
+                lexical_rank: None,
+                semantic_rank: None,
+                hash_rank: None,
+                lexical_score: None,
+                semantic_score: None,
+                hash_score: None,
+                in_both_sources: false,
+            })
+            .collect::<Vec<_>>();
+        let mut signals = sidecar.prior_signals_for_candidates(query, &fused_stub);
+        if let Some(origin_path) = query_origin_path.filter(|p| !p.is_empty()) {
+            for &doc_id in &unique_ids {
+                let (mult, _, _) = crate::ranking_priors::path_proximity_multiplier(
+                    origin_path,
+                    doc_id,
+                    crate::ranking_priors::DEFAULT_PATH_PROXIMITY_RADIUS,
+                    1.0,
+                );
+                let path_signal = (mult - 1.0).clamp(0.0, 1.0);
+                if path_signal > 0.0 {
+                    let entry = signals.entry(doc_id.to_owned()).or_default();
+                    entry.path = Some(path_signal);
+                }
+            }
+        }
+        signals
+    }
+
+    /// Fuse rankings with code-navigation priors when `intent` is
+    /// [`QueryIntentClass::Identifier`] or [`QueryIntentClass::ShortKeyword`]
+    /// and `mode` is [`DegradedRetrievalMode::Normal`].
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fuse_code_navigation_rankings(
+        &self,
+        intent: QueryIntentClass,
+        mode: DegradedRetrievalMode,
+        profile: PressureProfile,
+        query: &str,
+        query_origin_path: Option<&str>,
+        lexical: &[LexicalCandidate],
+        semantic: &[SemanticCandidate],
+        limit: usize,
+        offset: usize,
+        vector_is_hash: bool,
+    ) -> Vec<FusedCandidate> {
+        let prior_signals = Self::code_navigation_prior_signals(
+            intent,
+            mode,
+            query,
+            query_origin_path,
+            lexical,
+            semantic,
+        );
+        if prior_signals.is_empty() {
+            return self.fuse_rankings_for_vector_lane(
+                lexical,
+                semantic,
+                limit,
+                offset,
+                vector_is_hash,
+            );
+        }
+        self.fuse_rankings_with_priors_for_vector_lane(
+            lexical,
+            semantic,
+            limit,
+            offset,
+            &prior_signals,
+            RankingPriorTuning::for_profile(profile),
+            vector_is_hash,
         )
     }
 
@@ -2757,6 +2905,125 @@ mod tests {
         assert!(names.contains(&RetrievalStage::FastSemanticRetrieve));
         assert!(!names.contains(&RetrievalStage::QualitySemanticRetrieve));
         assert_eq!(plan.reason_code, "query.execution.embed_deferred");
+    }
+
+    #[test]
+    fn code_navigation_rankings_boost_identifier_and_short_keyword_while_keeping_natural_language_and_degraded_at_zero()
+     {
+        use crate::query_planning::QueryIntentClass;
+
+        let orchestrator = QueryExecutionOrchestrator::default();
+        let lexical = vec![
+            LexicalCandidate::new("docs/architecture_overview.md", 1.0),
+            LexicalCandidate::new("crates/frankensearch-fsfs/src/query_execution.rs", 0.9),
+        ];
+        let semantic = vec![
+            SemanticCandidate::new("docs/architecture_overview.md", 0.95),
+            SemanticCandidate::new("crates/frankensearch-fsfs/src/query_execution.rs", 0.90),
+        ];
+
+        // 1. Identifier query matching file stem "query_execution" in Normal mode receives positive prior boost
+        // and promotes the matching code file above the slightly higher-scored prose doc.
+        let id_fused = orchestrator.fuse_code_navigation_rankings(
+            QueryIntentClass::Identifier,
+            DegradedRetrievalMode::Normal,
+            PressureProfile::Performance,
+            "query_execution",
+            Some("crates/frankensearch-fsfs/src/runtime.rs"),
+            &lexical,
+            &semantic,
+            10,
+            0,
+            false,
+        );
+        assert_eq!(id_fused.len(), 2);
+        let id_code_hit = id_fused
+            .iter()
+            .find(|c| c.doc_id.ends_with("query_execution.rs"))
+            .expect("code candidate present");
+        let id_doc_hit = id_fused
+            .iter()
+            .find(|c| c.doc_id.ends_with("architecture_overview.md"))
+            .expect("doc candidate present");
+        assert!(
+            id_code_hit.prior_boost > 0.0,
+            "Identifier query must apply positive code/path prior boost, got {}",
+            id_code_hit.prior_boost
+        );
+        assert_eq!(
+            id_fused[0].doc_id, "crates/frankensearch-fsfs/src/query_execution.rs",
+            "Code/path prior boost should promote exact file/module match to rank 1"
+        );
+        assert!(id_code_hit.prior_boost > id_doc_hit.prior_boost);
+
+        // 2. ShortKeyword query in Normal mode also receives positive prior boost.
+        let kw_fused = orchestrator.fuse_code_navigation_rankings(
+            QueryIntentClass::ShortKeyword,
+            DegradedRetrievalMode::Normal,
+            PressureProfile::Performance,
+            "query execution",
+            Some("crates/frankensearch-fsfs/src/runtime.rs"),
+            &lexical,
+            &semantic,
+            10,
+            0,
+            false,
+        );
+        let kw_code_hit = kw_fused
+            .iter()
+            .find(|c| c.doc_id.ends_with("query_execution.rs"))
+            .expect("code candidate present");
+        assert!(
+            kw_code_hit.prior_boost > 0.0,
+            "ShortKeyword query must apply positive prior boost"
+        );
+
+        // 3. NaturalLanguage prose query in Normal mode keeps prior_boost == 0.0 for all candidates.
+        let nl_fused = orchestrator.fuse_code_navigation_rankings(
+            QueryIntentClass::NaturalLanguage,
+            DegradedRetrievalMode::Normal,
+            PressureProfile::Performance,
+            "how does query_execution rank candidates in runtime",
+            Some("crates/frankensearch-fsfs/src/runtime.rs"),
+            &lexical,
+            &semantic,
+            10,
+            0,
+            false,
+        );
+        for candidate in &nl_fused {
+            assert!(
+                candidate.prior_boost.abs() < f64::EPSILON,
+                "NaturalLanguage prose query must keep prior_boost == 0.0, got {} for {}",
+                candidate.prior_boost,
+                candidate.doc_id
+            );
+        }
+        assert_eq!(nl_fused[0].doc_id, "docs/architecture_overview.md");
+
+        // 4. Degraded retrieval mode (LexicalOnly) keeps prior_boost == 0.0 even on Identifier intent.
+        let degraded_fused = orchestrator.fuse_code_navigation_rankings(
+            QueryIntentClass::Identifier,
+            DegradedRetrievalMode::LexicalOnly,
+            PressureProfile::Performance,
+            "query_execution",
+            Some("crates/frankensearch-fsfs/src/runtime.rs"),
+            &lexical,
+            &semantic,
+            10,
+            0,
+            true,
+        );
+        for candidate in &degraded_fused {
+            assert!(
+                candidate.prior_boost.abs() < f64::EPSILON,
+                "Degraded mode must keep prior_boost == 0.0, got {} for {}",
+                candidate.prior_boost,
+                candidate.doc_id
+            );
+            assert!(candidate.semantic_rank.is_none());
+            assert!(candidate.hash_rank.is_some());
+        }
     }
 
     // ─── bd-olv6 tests end ───

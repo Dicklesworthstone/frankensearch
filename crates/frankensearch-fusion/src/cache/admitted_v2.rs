@@ -125,6 +125,16 @@ fn validate_retained(index: &TwoTierIndex) -> SearchResult<()> {
 
 fn validate_admitted(index: &TwoTierIndex) -> SearchResult<()> {
     validate_retained(index)?;
+    // A prebuilt candidate can carry the legacy adapter even though this
+    // cache's own open specification contains only vector paths. Inspect the
+    // actual retrieval policy: rebuilding paths from the retained owners loses
+    // the candidate's ANN configuration, including feature-unified adapters.
+    if index.has_fast_ann() {
+        return Err(rejected(
+            "replace",
+            "this exact v2 cache cannot adopt a legacy fast-tier ANN adapter",
+        ));
+    }
     if index.has_native_fast_hnsw() || index.has_native_quality_hnsw() {
         return Err(rejected(
             "replace",

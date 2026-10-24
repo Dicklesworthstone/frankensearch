@@ -207,27 +207,39 @@ never wakes itself. These are cooperative bounds, not preemption of a blocking
 synchronous poll. No detached worker is added and one request timing out does
 not cancel the shared daemon context.
 
-## Watching and current boundaries
+## Watching, mutations, retention, and current boundaries
 
-Complete-store routing also supports `watch` and `index --watch`, using full
-replacement builds without holding a serving-index writer between publications.
-See [complete-generation watch](complete-generation-watch.md) for the bounded
+Complete-store routing also supports `watch` and `index --watch`, publishing
+successor generations (including source-aware watch deltas for small edits)
+without holding a serving-index writer between publications. See
+[complete-generation watch](complete-generation-watch.md) for the bounded
 notification queue, source recheck, framed receipts and remaining update costs.
 Buffered and progressive Unix-socket serving preserve the daemon shutdown path.
 
-TUI, direct query expansion, automatic search-to-daemon forwarding and in-place
-mutators remain outside this route. Legacy roots without a complete-generation
-selection or staging tree retain their ordinary behavior when the new layout is
-not explicitly selected. The legacy mutable watch/search exclusion issue is not
-resolved by this opt-in route, nor is incremental artifact/embedding reuse.
+Complete-generation stores also support:
+- `fsfs tui` (pins one admitted generation for the dashboard session),
+- `fsfs explain <rank>` and `fsfs search --explain`,
+- `fsfs search --expand` (pins one generation across query variants; executes directly in process rather than through daemon forwarding),
+- `fsfs append-batch`, `fsfs delete` (exact IDs and `--prefix`), and `fsfs compact` (each publishes a new complete successor generation while existing readers keep their bundle),
+- `fsfs flush` (revalidates and synchronizes the selected generation, inventory, and selection descriptor), and
+- `fsfs-recover` (`inspect`, `prepare`, `apply`, `confirm-durability`, and `--repair-vectors` from `.fec` RaptorQ sidecars; workspace binary target `crates/frankensearch-fsfs/src/bin/fsfs-recover.rs`).
 
-There is no automatic garbage collection. Retained predecessors and failed
-builds consume disk space. The store assumes cooperating writers and a trusted
-directory tree; its inventory checks are not an anti-rollback authority or a
-security boundary against hostile ancestor replacement. Within one process, a
-file whose device, inode, length and modification and change times are
-unchanged since that process hashed it is not hashed again; a new process
-verifies every byte.
+Every command that publishes a successor (`index`, `watch`, `append-batch`,
+`delete`, `compact`) automatically reclaims older generations: it keeps the
+selected generation and its immediate predecessor (the rollback target), removes
+older generations and abandoned unsealed builds, and never removes a generation
+still held by a live reader (`FSFS_GENERATION_RETENTION=report` reports without
+deleting; `FSFS_GENERATION_RETENTION=off` disables reclamation).
+
+Legacy roots without a complete-generation selection keep their legacy layout
+unless converted with `FSFS_COMPLETE_GENERATIONS=1`; unconverted legacy roots
+retain the mutable watcher writer-lock exclusion (`bd-z2nfa`). The complete-generation
+store assumes cooperating writers and a trusted directory tree; its inventory
+checks are not a hostile-directory anti-rollback authority (`bd-xomn`). Within
+one process, a file whose device, inode, length and modification and change
+times are unchanged since that process hashed it is not hashed again; a new
+process verifies every byte unless seeded from a compatible `FSFS-REUSE.json`
+receipt.
 
 ## Focused validation
 

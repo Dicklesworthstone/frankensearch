@@ -13,6 +13,15 @@ use thiserror::Error;
 use crate::keeper::{ConcatMergeSizing, KeeperError, manifest_concat_fits};
 use crate::{KeeperSnapshot, ManifestSegment, QuillIndex, QuillIndexError};
 
+mod bounded;
+mod maintenance;
+
+pub use bounded::plan_bounded_session_merge;
+pub use maintenance::{
+    SessionMergeAttempt, SessionMergeBudget, SessionMergeFailure, SessionMergeProgress,
+    SessionMergeReceipt, SessionMergeReport, SessionMergeStop,
+};
+
 /// Maximum number of source entries examined in one candidate window.
 pub const MAX_SESSION_MERGE_FANOUT: usize = 64;
 
@@ -21,6 +30,8 @@ pub const MAX_SESSION_MERGE_FANOUT: usize = 64;
 pub struct SessionMergePolicy {
     /// Consecutive segments of the same row-count tier required for a merge.
     /// Must be in `2..=MAX_SESSION_MERGE_FANOUT`.
+    /// The opt-in bounded planner instead treats this as a maximum; both
+    /// planners use the same value as the physical-row tier radix.
     pub fanout: usize,
     /// Maximum total physical rows in a selected run, including tombstoned rows.
     pub max_input_docs: u64,
@@ -125,10 +136,10 @@ pub enum SessionMergeError {
     /// Cancellation was observed before publication was attempted.
     #[error("session merge planning was cancelled")]
     Cancelled,
-    /// The selected source-ID vector could not be reserved.
-    #[error("could not allocate {count} session merge source ids")]
+    /// A source-ID or maintenance-progress vector could not be reserved.
+    #[error("could not allocate {count} session merge entries")]
     Allocation {
-        /// Requested source count.
+        /// Requested entry count.
         count: usize,
     },
     /// The production snapshot, writer, codec, or publication path failed.
@@ -138,6 +149,37 @@ pub enum SessionMergeError {
 
 fn checkpoint(cx: &Cx) -> Result<(), SessionMergeError> {
     cx.checkpoint().map_err(|_| SessionMergeError::Cancelled)
+}
+
+fn validate_session_merge(
+    cx: &Cx,
+    segments: &[ManifestSegment],
+    policy: SessionMergePolicy,
+) -> Result<(), SessionMergeError> {
+    checkpoint(cx)?;
+    policy.validate()?;
+    for (index, segment) in segments.iter().enumerate() {
+        checkpoint(cx)?;
+        let reason =
+            if segment.docid_lo >= segment.docid_hi || segment.docid_hi > u64::from(u32::MAX) + 1 {
+                Some("range must be nonempty and fit the global u32 document space")
+            } else if u64::from(segment.doc_count) > segment.docid_hi - segment.docid_lo {
+                Some("physical row count exceeds the covering interval")
+            } else if segment.tombstones.cardinality() > u64::from(segment.doc_count) {
+                Some("tombstone count exceeds physical row count")
+            } else if index > 0 && segments[index - 1].docid_hi > segment.docid_lo {
+                Some("manifest ranges overlap or are out of order")
+            } else {
+                None
+            };
+        if let Some(reason) = reason {
+            return Err(SessionMergeError::InvalidSegment {
+                segment_id: segment.segment_id,
+                reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Select a same-row-tier run without rejecting unused document-ID leases.
@@ -175,29 +217,7 @@ fn plan_session_merge_with_fit(
     policy: SessionMergePolicy,
     mut fits: impl FnMut(std::ops::Range<usize>) -> bool,
 ) -> Result<Option<SessionMergePlan>, SessionMergeError> {
-    checkpoint(cx)?;
-    policy.validate()?;
-    for (index, segment) in segments.iter().enumerate() {
-        checkpoint(cx)?;
-        let reason =
-            if segment.docid_lo >= segment.docid_hi || segment.docid_hi > u64::from(u32::MAX) + 1 {
-                Some("range must be nonempty and fit the global u32 document space")
-            } else if u64::from(segment.doc_count) > segment.docid_hi - segment.docid_lo {
-                Some("physical row count exceeds the covering interval")
-            } else if segment.tombstones.cardinality() > u64::from(segment.doc_count) {
-                Some("tombstone count exceeds physical row count")
-            } else if index > 0 && segments[index - 1].docid_hi > segment.docid_lo {
-                Some("manifest ranges overlap or are out of order")
-            } else {
-                None
-            };
-        if let Some(reason) = reason {
-            return Err(SessionMergeError::InvalidSegment {
-                segment_id: segment.segment_id,
-                reason,
-            });
-        }
-    }
+    validate_session_merge(cx, segments, policy)?;
 
     let mut selected: Option<(u32, usize, u64, u64)> = None;
     for (start, sources) in segments.windows(policy.fanout).enumerate() {

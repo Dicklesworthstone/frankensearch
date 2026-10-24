@@ -37,6 +37,9 @@ mod filter;
 #[path = "native_cli/models.rs"]
 mod models;
 
+#[path = "native_cli/query_cache.rs"]
+mod query_cache;
+
 #[path = "native_cli/cohort.rs"]
 mod cohort;
 
@@ -48,6 +51,9 @@ mod live;
 
 #[path = "native_cli/lexical.rs"]
 mod lexical;
+
+#[path = "native_cli/generation.rs"]
+mod generation;
 
 #[path = "native_cli/tests.rs"]
 #[cfg(test)]
@@ -67,6 +73,8 @@ const MAX_DOCUMENTS: usize = 100_000;
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
+  authority-index / authority-search: fixed AUTHORITY exact generations\n\
+         (use authority-index --help for the complete command contract)\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N] [--shard-size N]\n\
   search --receipt JSON --query TEXT [--model-dir DIR]\n\
@@ -77,6 +85,7 @@ const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
          [--allow-activation] [--allow-updates] [--filter JSON] [--timeout-ms N]\n\
          [--allow-model-migration (explicit sealed replacement models)]\n\
          [--reranker-dir DIR] [--rerank-window N]\n\
+         [--query-cache-entries N (0..1024 per model, default 0)]\n\
          [--lexical-only (fixed snapshot; no models or write controls)]\n\n\
   update --receipt OLD_JSON --index-dir NEW_DIR --new-receipt NEW_JSON\n\
          [--input CHANGES_JSONL] [--model-dir DIR] [--batch-size N]\n\
@@ -164,6 +173,7 @@ struct Options {
     reranker_dir: Option<PathBuf>,
     rerank_window: usize,
     full_query: Option<query::FullQuery>,
+    query_cache: query_cache::Config,
 }
 
 impl Options {
@@ -212,6 +222,7 @@ impl Options {
             reranker_dir: None,
             rerank_window: 50,
             full_query: None,
+            query_cache: query_cache::Config::default(),
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -295,6 +306,9 @@ impl Options {
                 "--full-query" if matches!(command, Command::Search | Command::Serve) => {
                     options.full_query = Some(query::FullQuery::parse(&value(&mut args)?)?);
                 }
+                "--query-cache-entries" if command == Command::Serve => {
+                    options.query_cache = query_cache::Config::parse(&value(&mut args)?)?;
+                }
                 _ => return Err(bad("unknown or inapplicable option; use --help")),
             }
         }
@@ -313,6 +327,7 @@ impl Options {
                 "--allow-updates",
                 "--allow-model-migration",
                 "--full-query",
+                "--query-cache-entries",
             ]
             .iter()
             .any(|flag| seen.contains(*flag))
@@ -568,6 +583,7 @@ fn new_path(path: &Path) -> Result<PathBuf> {
             "native.sharded.json",
             "native.sharded-hybrid.json",
             "FSFS-BUNDLE.json",
+            "AUTHORITY",
         ] {
             match fs::symlink_metadata(ancestor.join(marker)) {
                 Ok(_) => {
@@ -693,6 +709,7 @@ fn save_selection(selection: &Selection, path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn search(
     index: &NativeBuiltHybridIndex,
     cx: &Cx,
@@ -781,12 +798,14 @@ async fn execute(
                 &options.quality,
                 pool.clone(),
             )?;
+            let models = options.query_cache.wrap(cx, models)?;
             let index = sharded::Opened::open(cx, &selection, models).await?;
             // Index/model admission is startup work. Each accepted query starts
             // its own total budget after that, before scoping or provider work.
             let mut policy = query::Policy::new(cx, options.timeout_ms)?;
             policy.rerank = rerank;
             policy.full_query = options.full_query;
+            policy.query_pool = pool.clone();
             if options.command == Command::Serve {
                 let live = live::Serving::new(cx, index)?;
                 let controls = serve::Controls {
@@ -798,7 +817,8 @@ async fn execute(
                 } else {
                     controls.into()
                 };
-                return serve::run_with_controls(
+                let controls = controls.with_query_cache(options.query_cache);
+                return Box::pin(serve::run_with_controls(
                     live.borrow(),
                     cx,
                     &mut io::stdin().lock(),
@@ -807,7 +827,7 @@ async fn execute(
                     controls,
                     options.filter.as_ref(),
                     &policy,
-                )
+                ))
                 .await;
             }
             if options.stream {
@@ -819,7 +839,7 @@ async fn execute(
                     filter: options.filter,
                     timeout_ms: None,
                 };
-                return if serve::stream_one(
+                return if Box::pin(serve::stream_one(
                     index.borrow(),
                     cx,
                     &request,
@@ -828,7 +848,7 @@ async fn execute(
                     output,
                     None,
                     &policy,
-                )
+                ))
                 .await?
                 {
                     Ok(())
@@ -838,7 +858,7 @@ async fn execute(
                     ))
                 };
             }
-            let page = query::buffered(
+            let page = Box::pin(query::buffered(
                 index.borrow(),
                 cx,
                 options
@@ -849,7 +869,7 @@ async fn execute(
                 options.limit,
                 [None, options.filter.as_ref()],
                 &policy,
-            )
+            ))
             .await?;
             emit(output, &page)
         }
@@ -908,6 +928,12 @@ fn run() -> Result<()> {
                 .map_err(|_| bad("command arguments must be UTF-8"))
         })
         .collect::<Result<Vec<_>>>()?;
+    if args
+        .first()
+        .is_some_and(|command| generation::is_command(command))
+    {
+        return generation::run(args);
+    }
     let Some(options) = Options::parse(args)? else {
         io::stdout().lock().write_all(HELP.as_bytes())?;
         return Ok(());
@@ -931,7 +957,8 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            let mut payload = query::failure(error.as_ref());
+            let mut payload = generation::publication_failure(error.as_ref())
+                .unwrap_or_else(|| query::failure(error.as_ref()));
             payload["schema"] = serde_json::json!(SCHEMA);
             payload["ok"] = serde_json::json!(false);
             payload["event"] = serde_json::json!("error");

@@ -1,6 +1,9 @@
 //! Independent native quality retrieval and two-tier candidate union.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
 use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
@@ -35,6 +38,36 @@ impl NativeAnnIndex {
             .await?;
         for result in &mut results {
             checkpoint(cx, "native_ann.quality_result")?;
+            result.quality_score = result.fast_score.take();
+            if result.source == ScoreSource::SemanticFast {
+                result.source = ScoreSource::SemanticQuality;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Quality-primary hybrid retrieval with vector traversal on the caller pool.
+    ///
+    /// The provider still runs through the ordinary identity-bound inference path.
+    /// Only retained graph/exact traversal moves to the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// Has the same error surface as [`Self::search_hybrid_text_with_pool`].
+    pub async fn search_hybrid_quality_text_with_pool(
+        self: &Arc<Self>,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = self
+            .search_hybrid_text_with_pool(cx, embedder, lexical, text, k, pool)
+            .await?;
+        for result in &mut results {
+            checkpoint(cx, "native_ann.quality_pool_result")?;
             result.quality_score = result.fast_score.take();
             if result.source == ScoreSource::SemanticFast {
                 result.source = ScoreSource::SemanticQuality;
@@ -99,6 +132,68 @@ impl NativeAnnIndex {
                 checked_lexical(cx, lexical, text, budget),
             ),
         )
+        .await?;
+        refined_winners(
+            cx,
+            lexical,
+            &batch,
+            &fast_hits,
+            &quality_hits,
+            k,
+            RefinementFusion {
+                quality_weight: 0.7,
+                rrf: &RrfConfig::default(),
+                is_hash,
+            },
+        )
+        .await
+    }
+    /// Independently embed both tiers, then execute their retained traversals
+    /// on the caller-owned blocking pool before ordinary blend/RRF/hydration.
+    ///
+    /// Both vector arms remain required. A failed, cancelled or abandoned worker
+    /// never becomes a fast-only successful page.
+    ///
+    /// # Errors
+    ///
+    /// Propagates admission, inference, blocking-pool, lexical, and hydration errors.
+    pub async fn search_hybrid_refined_text_with_pool(
+        self: &Arc<Self>,
+        cx: &Cx,
+        fast_embedder: &dyn Embedder,
+        quality: (&Arc<Self>, &dyn Embedder),
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let is_hash = admit_pair(
+            cx,
+            self.as_ref(),
+            fast_embedder,
+            (quality.0.as_ref(), quality.1),
+        )?;
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let budget = candidate_count(k, 0, 3);
+        let (fast_query, (quality_query, batch)) = join_sources(
+            cx,
+            self.embed_query(cx, fast_embedder, text),
+            join_sources(
+                cx,
+                quality.0.embed_query(cx, quality.1, text),
+                checked_lexical(cx, lexical, text, budget),
+            ),
+        )
+        .await?;
+        let (fast_hits, quality_hits) = Box::pin(join_sources(
+            cx,
+            self.search_with_pool(cx, fast_query, budget, None, pool.clone()),
+            quality
+                .0
+                .search_with_pool(cx, quality_query, budget, None, pool),
+        ))
         .await?;
         refined_winners(
             cx,

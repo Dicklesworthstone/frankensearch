@@ -15,11 +15,13 @@ not enable source updates, ordinary activation, downloads, generation deletion,
 or writes to index artifacts or selection receipts. It cannot be combined with
 `--lexical-only`.
 
-The control currently supports **single-layout** CLI-built F32 cohorts, using
-exact retrieval or the CLI's native HNSW parameters and seed. It explicitly
-refuses sharded migration before reading the requested receipt or loading models;
-there is no flattening or partial-inventory fallback. The ready frame reports
-`model_migration_enabled` and `model_migration_supported` separately.
+The control supports **single and sharded** CLI-built F32 cohorts, using exact
+retrieval or the CLI's native HNSW parameters and seed. A replacement must keep
+the selected layout; a single receipt cannot replace a sharded cohort, or vice
+versa. Sharded migration admits every partition and the global Quill index
+before one whole-cohort install. There is no flattening or partial-inventory
+fallback. The ready frame reports `model_migration_supported: true` for both
+layouts, separately from the explicit `model_migration_enabled` startup grant.
 
 Model loading and selected reopening run on the command's owning lane between
 requests. Replacement native models retain the existing caller-owned blocking
@@ -55,6 +57,14 @@ backend/model-directory options. The control must request the same local models
 and the same exact-versus-HNSW policy used by that rebuild. Quality addition or
 removal is explicit in the selected cohort; a failed quality load never drops
 that tier as a fallback.
+
+For a sharded predecessor, `rebuild` also requires `--shard-size N`. The new size
+may differ from the old partition size, including when models or quality-tier
+presence change. For example, add `--shard-size 5000` to the rebuild above. The
+sealed sharded receipt selects the complete new partition inventory; do not add
+`shard_size` to the activation request. An empty cohort still retains one
+identity-bearing partition. Activation opens the already rebuilt artifacts and
+does not run embedding inference or create any replacement files.
 
 ## Activate through the existing session
 
@@ -110,16 +120,26 @@ In this serial example the migration produces one terminal frame. Successful
 acknowledgement includes the new generation,
 previous generation, document count, quality presence, and both complete producer
 fingerprints (`quality_producer` is null for fast-only). Subsequent searches use
-the installed providers without reloading them per query.
+the installed providers without reloading them per query. Sharded replies also
+report `layout: "sharded"` and the installed `partitions` count. Subsequent result
+rows refer to this new inventory; previously returned shard coordinates still
+belong to their original retained snapshot.
 
 ## Refusal and recovery semantics
 
 Before any requested path is read, the command verifies the independent startup
-grant, layout, and exact expected generation. The existing offline verified model
-loader then binds the requested models to the selected receipt. Native migration
+grant and exact expected generation. After reading the bounded selection receipt,
+it rejects a different layout, non-newer generation or changed document count
+before loading models. The existing offline verified model loader then binds the
+requested models to the selected receipt. Native migration
 admission verifies exact source IDs, content, titles and metadata; complete model
 and prepared-input identities; generation including nonce; required tiers; vector
 precision; graph parameters/seed; and the sealed Quill/vector artifacts.
+For sharded targets, these checks cover every partition under the existing
+aggregate reopen limits, not just the first shard. A damaged final vector or graph
+rejects the entire migration and preserves the installed predecessor. Old model
+metadata need not remain available: migration uses its captured input contracts
+and retained source documents, never a fresh old-model inference or identity read.
 
 A valid receipt for different source documents is not enough to replace the live
 cohort, even if document count and model dimensions match. Changed prepared-input
@@ -154,6 +174,13 @@ host with the repository's pinned dependencies and toolchain:
 rch exec -- cargo test -p frankensearch --features quill \
   --bin frankensearch-native model_migration
 ```
+
+The `serve::model_migration::sharded_tests` cases cover live repartitioning,
+quality addition/removal, retained predecessor queries and shard coordinates,
+source-field substitution, final-partition corruption, wrong retrieval policy,
+stale-writer fencing, cancellation, offline old models, lost acknowledgements,
+and an empty identity-bearing target. Existing single-layout regressions remain
+part of the same test filter.
 
 Compilation, tests, rustfmt, Clippy, real-model execution and the unchanged full
 quality gate remain required before release qualification. Their execution was

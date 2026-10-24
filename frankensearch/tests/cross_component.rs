@@ -710,6 +710,164 @@ fn cache_sentinel_hash_change_detects_staleness() {
     assert!(cache.is_stale().expect("check"));
 }
 
+// The facade enables index/ann without adding an ann feature to fusion. This
+// exercises dependency unification: cache admission must inspect the candidate's
+// actual policy rather than fusion's local compilation features.
+#[cfg(feature = "ann")]
+mod exact_cache_ann_policy {
+    use std::sync::Arc;
+
+    use asupersync::Cx;
+    use frankensearch_core::generation::{
+        ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+    };
+    use frankensearch_index::FsviV2IdentityBinding;
+
+    use super::*;
+
+    struct Fixture {
+        _directory: TempDir,
+        paths: TwoTierIndexPaths,
+        ann_paths: TwoTierIndexPaths,
+        config: TwoTierConfig,
+        binding: FsviV2IdentityBinding,
+        cache: IndexCache,
+    }
+
+    impl Fixture {
+        fn new(cx: &Cx) -> Self {
+            let directory = temp_dir("exact-cache-ann-policy");
+            let paths = TwoTierIndexPaths::new(directory.path().join("fast.fsvi"));
+            let ann_paths = paths
+                .clone()
+                .with_fast_ann(directory.path().join("fast.ann"));
+            let mut identity =
+                EmbeddingIdentityBundleV1::explicit_test_model("cache-ann-control", 4);
+            "fsvi-v2".clone_into(&mut identity.storage.format);
+            "little-endian".clone_into(&mut identity.storage.endianness);
+            identity.storage.quantization = QuantizationFormat::F32;
+            let binding = FsviV2IdentityBinding::new(
+                ArtifactGenerationIdentityV1::new(1, [7; 16]).unwrap(),
+                identity.freeze().unwrap(),
+            )
+            .unwrap();
+            let mut writer = VectorIndex::create_v2(paths.fast_index(), binding.clone()).unwrap();
+            writer.write_record("a", &[1.0, 0.0, 0.0, 0.0]).unwrap();
+            writer.write_record("b", &[0.0, 1.0, 0.0, 0.0]).unwrap();
+            writer.write_record("c", &[0.0, 0.0, 1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let config = TwoTierConfig {
+                hnsw_threshold: 1,
+                ..TwoTierConfig::default()
+            };
+            let cache = IndexCache::open_admitted_v2_with_paths(
+                cx,
+                paths.clone(),
+                directory.path(),
+                config.clone(),
+                &binding,
+                None,
+                Box::new(SentinelFileDetector::new()),
+            )
+            .unwrap();
+            Self {
+                _directory: directory,
+                paths,
+                ann_paths,
+                config,
+                binding,
+                cache,
+            }
+        }
+
+        fn candidate(&self, approximate: bool) -> TwoTierIndex {
+            let paths = if approximate {
+                &self.ann_paths
+            } else {
+                &self.paths
+            };
+            let index = TwoTierIndex::open_admitted_v2_with_paths(
+                paths,
+                self.config.clone(),
+                &self.binding,
+                None,
+            )
+            .unwrap();
+            assert_eq!(index.has_fast_ann(), approximate);
+            assert!(!index.has_native_fast_hnsw());
+            index
+        }
+    }
+
+    #[test]
+    fn exact_v2_cache_rejects_legacy_ann_through_every_replacement_entry() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = Fixture::new(&cx);
+            let retained = fixture.cache.current();
+            assert!(!retained.has_fast_ann());
+            let query = [0.0, 1.0, 0.0, 0.0];
+            let expected_hits = retained.search_fast(&query, 3).unwrap();
+            let source_bytes = std::fs::read(fixture.paths.fast_index()).unwrap();
+
+            for entry in 0..3 {
+                let candidate = fixture.candidate(true);
+                let result = match entry {
+                    0 => fixture.cache.replace(candidate).map(|()| true),
+                    1 => fixture.cache.replace_if_current(&retained, candidate),
+                    _ => fixture
+                        .cache
+                        .replace_admitted_v2_if_current(&cx, &retained, candidate),
+                };
+                assert!(matches!(
+                    result,
+                    Err(SearchError::InvalidConfig { field, value, reason })
+                        if field == "index_cache.replace"
+                            && value == "admitted-v2"
+                            && reason.contains("legacy fast-tier ANN")
+                ));
+                assert!(Arc::ptr_eq(&retained, &fixture.cache.current()));
+                assert!(!fixture.cache.current().has_fast_ann());
+                assert_eq!(
+                    fixture.cache.current().search_fast(&query, 3).unwrap(),
+                    expected_hits
+                );
+                assert_eq!(
+                    std::fs::read(fixture.paths.fast_index()).unwrap(),
+                    source_bytes
+                );
+            }
+
+            // A real exact candidate remains installable after every refusal.
+            assert!(
+                fixture
+                    .cache
+                    .replace_admitted_v2_if_current(&cx, &retained, fixture.candidate(false))
+                    .unwrap()
+            );
+            fixture.cache.reload().unwrap();
+            assert!(!fixture.cache.current().has_fast_ann());
+            assert_eq!(retained.search_fast(&query, 3).unwrap(), expected_hits);
+        });
+    }
+
+    #[test]
+    fn exact_v2_cache_cancellation_precedes_legacy_ann_rejection() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = Fixture::new(&cx);
+            let retained = fixture.cache.current();
+            let candidate = fixture.candidate(true);
+            cx.set_cancel_requested(true);
+            let result = fixture
+                .cache
+                .replace_admitted_v2_if_current(&cx, &retained, candidate);
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert!(Arc::ptr_eq(&retained, &fixture.cache.current()));
+            assert!(!fixture.cache.current().has_fast_ann());
+        });
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 6. Error propagation across crate boundaries
 // ═══════════════════════════════════════════════════════════════════════════

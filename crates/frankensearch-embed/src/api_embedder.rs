@@ -8,10 +8,12 @@ use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::Cx;
 use asupersync::bytes::Buf;
+use asupersync::channel::oneshot;
 use asupersync::http::body::{Body, Frame};
 use asupersync::http::h1::{ClientError, HttpClient, HttpClientConfig, Method, RedirectPolicy};
 use sha2::{Digest, Sha256};
@@ -48,7 +50,9 @@ pub struct ApiEmbedderConfig {
     pub retry_base_delay: Duration,
     /// Requests per minute limit (0 = unlimited).
     pub requests_per_minute: u32,
-    /// Total timeout for one HTTP attempt.
+    /// Maximum HTTP exchange time per attempt, through the complete response
+    /// body. Rate-admission and retry delays are separate. Synchronous parsing
+    /// and provider callbacks cannot be preempted.
     pub request_timeout: Duration,
     /// Maximum response bytes admitted before parsing.
     pub max_response_bytes: usize,
@@ -233,9 +237,15 @@ struct RateLimiter {
     requests_per_minute: u32,
 }
 
+// One permit costs a minute of nanoseconds; each elapsed nanosecond earns
+// `requests_per_minute` credits. Integer arithmetic retains partial credit and
+// rounds the next attempt UP without floating-point boundary spin. Even the
+// largest u32 rate and its initially full bucket fit comfortably in u128.
+const RATE_LIMIT_PERMIT_CREDITS: u128 = 60_000_000_000;
+
 #[derive(Debug)]
 struct RateLimiterState {
-    available_permits: f64,
+    available_credits: u128,
     last_refill: Instant,
 }
 
@@ -243,39 +253,328 @@ impl RateLimiter {
     fn new(requests_per_minute: u32) -> Self {
         Self {
             state: Mutex::new(RateLimiterState {
-                available_permits: f64::from(requests_per_minute),
+                available_credits: u128::from(requests_per_minute) * RATE_LIMIT_PERMIT_CREDITS,
                 last_refill: Instant::now(),
             }),
             requests_per_minute,
         }
     }
 
-    /// Returns the duration to wait before making a request, or `None` if
-    /// a token is available immediately.
+    /// Consume exactly one available permit, or suggest when to retry.
+    /// A delay is NOT a permit or reservation: every awakened caller must
+    /// compete again. Failed probes never consume partially refilled credit.
     fn acquire(&self) -> Option<Duration> {
+        self.acquire_at(Instant::now())
+    }
+
+    fn acquire_at(&self, now: Instant) -> Option<Duration> {
         if self.requests_per_minute == 0 {
             return None;
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-        let elapsed = now.duration_since(state.last_refill).as_secs_f64();
-        let requests_per_minute = f64::from(self.requests_per_minute);
-        let refill = elapsed * (requests_per_minute / 60.0);
-        state.available_permits = (state.available_permits + refill).min(requests_per_minute);
+        // A caller can sample time, then lose the mutex to a newer caller.
+        // Never move the shared clock backwards and count an interval twice.
+        let now = now.max(state.last_refill);
+        let rate = u128::from(self.requests_per_minute);
+        let refill = now
+            .duration_since(state.last_refill)
+            .as_nanos()
+            .saturating_mul(rate);
+        state.available_credits = state
+            .available_credits
+            .saturating_add(refill)
+            .min(rate * RATE_LIMIT_PERMIT_CREDITS);
         state.last_refill = now;
 
-        if state.available_permits >= 1.0 {
-            state.available_permits -= 1.0;
-            drop(state);
+        let wait = if state.available_credits >= RATE_LIMIT_PERMIT_CREDITS {
+            state.available_credits -= RATE_LIMIT_PERMIT_CREDITS;
             None
         } else {
-            let deficit = 1.0 - state.available_permits;
-            state.available_permits = 0.0; // consume all partial permits
-            drop(state);
-            let wait_secs = deficit / (requests_per_minute / 60.0);
-            Some(Duration::from_secs_f64(wait_secs))
-        }
+            let deficit = RATE_LIMIT_PERMIT_CREDITS - state.available_credits;
+            // A positive deficit and nonzero rate require 1 ns through 60 s.
+            // The conservative fallback cannot grant an early permit.
+            let nanos = u64::try_from(deficit.div_ceil(rate)).unwrap_or(60_000_000_000);
+            Some(Duration::from_nanos(nanos))
+        };
+        drop(state);
+        wait
     }
+
+    /// No waiter owns future credit, so abandoning a wait creates no debt.
+    /// Admission is work-conserving, not FIFO: only the caller consuming a
+    /// permit may proceed, even when many timers become ready together.
+    async fn wait_for_permit(&self, cx: &Cx) -> SearchResult<()> {
+        wait_for_api_permit(cx, || self.acquire(), |delay| wait_api_delay(cx, delay)).await
+    }
+}
+
+/// Production uses the shared bucket and cancel-aware runtime delay. Separate
+/// callbacks let deterministic tests schedule a competing permit acquisition
+/// between a completed delay and the required admission recheck.
+async fn wait_for_api_permit<F>(
+    cx: &Cx,
+    mut acquire: impl FnMut() -> Option<Duration> + Send,
+    mut pause: impl FnMut(Duration) -> F + Send,
+) -> SearchResult<()>
+where
+    F: std::future::Future<Output = SearchResult<()>> + Send,
+{
+    loop {
+        embed_checkpoint(cx, "api.rate_limit")?;
+        let wait = acquire();
+        embed_checkpoint(cx, "api.rate_limit")?;
+        let Some(wait) = wait else {
+            return Ok(());
+        };
+        pause(wait).await?;
+    }
+}
+
+/// Rate-limit and retry sleeps must wake on cancellation, not just expiry.
+/// The private sender stays alive without sending; the receive registers the
+/// caller's cancellation waker independently of the runtime timer. Both futures
+/// are owned here and released before returning. No task or context is created.
+async fn wait_api_delay(cx: &Cx, duration: Duration) -> SearchResult<()> {
+    embed_checkpoint(cx, "api.delay")?;
+    if duration.is_zero() {
+        return Ok(());
+    }
+    let (sender, mut receiver) = oneshot::channel::<()>();
+    let outcome = {
+        let mut cancelled = std::pin::pin!(receiver.recv(cx));
+        let mut timer = std::pin::pin!(asupersync::time::sleep(cx.now(), duration));
+        poll_fn(|context| {
+            if let Err(error) = embed_checkpoint(cx, "api.delay") {
+                return Poll::Ready(Err(error));
+            }
+            if cancelled.as_mut().poll(context).is_ready() {
+                return Poll::Ready(Err(SearchError::Cancelled {
+                    phase: "api.delay".to_owned(),
+                    reason: "remote API wait cancelled".to_owned(),
+                }));
+            }
+            let outcome = timer.as_mut().poll(context);
+            match embed_checkpoint(cx, "api.delay") {
+                Ok(()) => outcome.map(Ok),
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        })
+        .await
+    };
+    drop(receiver);
+    drop(sender);
+    embed_checkpoint(cx, "api.delay")?;
+    outcome
+}
+
+/// Transport failures keep the existing retry policy; cancellation and input
+/// bounds must never turn into a retry with the same rejected response.
+#[derive(Debug)]
+enum ApiAttemptError {
+    Retry(SearchError),
+    Terminal(SearchError),
+}
+
+type ApiAttemptResult<T> = Result<T, ApiAttemptError>;
+
+/// One HTTP exchange owns its connection through the complete bounded body.
+/// HttpClient's streaming deadline ends at the response head, so it cannot
+/// protect this caller's subsequent body reads. Start after rate admission and
+/// keep one deadline across connect, headers and all chunks; never reset it on
+/// body progress. Decoding/authentication remain in the calling request path.
+async fn request_api_response(
+    cx: &Cx,
+    client: &HttpClient,
+    provider: &dyn ApiProvider,
+    config: &ApiEmbedderConfig,
+    url: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> ApiAttemptResult<(u16, Vec<u8>)> {
+    let work = async {
+        let response = client
+            .request_streaming(cx, Method::Post, url, headers.to_vec(), body)
+            .await
+            .map_err(|error| {
+                let error = api_client_error_to_search(&error, provider);
+                if matches!(error, SearchError::Cancelled { .. }) {
+                    ApiAttemptError::Terminal(error)
+                } else {
+                    ApiAttemptError::Retry(error)
+                }
+            })?;
+        let status = response.head.status;
+        let bytes = read_api_response_body(cx, provider, response.body, config.max_response_bytes)
+            .await?;
+        Ok((status, bytes))
+    };
+    let started = cx.now();
+    let wall_started = Instant::now();
+    run_api_attempt_with_elapsed(cx, provider, config.request_timeout, work, || {
+        Duration::from_nanos(cx.now().duration_since(started)).max(wall_started.elapsed())
+    })
+    .await
+}
+
+// Bound both copied payload and callback work. Empty frames/trailers and a
+// fragmented Buf can cost work without making comparable byte progress.
+const API_BODY_BYTES_PER_POLL: usize = 64 * 1024;
+const API_BODY_STEPS_PER_POLL: usize = 32;
+
+/// Collect under the enclosing attempt's original deadline. Even continuously
+/// ready bodies must yield, otherwise an outer timer cannot regain control.
+/// A partially consumed frame remains owned across polls; no data is replayed
+/// or discarded at a cooperative boundary. Individual synchronous Body/Buf
+/// callbacks still cannot be preempted.
+async fn read_api_response_body<B>(
+    cx: &Cx,
+    provider: &dyn ApiProvider,
+    mut body: B,
+    max_bytes: usize,
+) -> ApiAttemptResult<Vec<u8>>
+where
+    B: Body + Unpin + Send,
+    B::Data: Send,
+    B::Error: Send,
+{
+    let outcome = {
+        let mut bytes = Vec::new();
+        let mut pending: Option<B::Data> = None;
+        poll_fn(|task| {
+            let mut copy_left = API_BODY_BYTES_PER_POLL;
+            for _ in 0..API_BODY_STEPS_PER_POLL {
+                if let Err(error) = embed_checkpoint(cx, "api.response_body") {
+                    return Poll::Ready(Err(ApiAttemptError::Terminal(error)));
+                }
+                if copy_left == 0 {
+                    break;
+                }
+                if let Some(chunk) = pending.as_mut() {
+                    let remaining = chunk.remaining();
+                    if remaining == 0 {
+                        // Drop a consumed frame before asking for another one.
+                        // Its destructor may itself request cancellation.
+                        pending = None;
+                        continue;
+                    }
+                    if remaining > max_bytes.saturating_sub(bytes.len()) {
+                        return Poll::Ready(Err(ApiAttemptError::Terminal(
+                            bounded_embedding_failure(
+                                provider,
+                                "remote response exceeded the configured byte budget",
+                            ),
+                        )));
+                    }
+                    let part = chunk.chunk();
+                    if part.is_empty() || part.len() > remaining {
+                        // A broken buffer is not an empty body. In particular,
+                        // never decode the valid prefix after silently losing
+                        // a nonempty frame whose chunk() made no progress.
+                        return Poll::Ready(Err(ApiAttemptError::Terminal(
+                            bounded_embedding_failure(
+                                provider,
+                                "remote response buffer violated its length contract",
+                            ),
+                        )));
+                    }
+                    let count = part.len().min(copy_left);
+                    bytes.extend_from_slice(&part[..count]);
+                    chunk.advance(count);
+                    copy_left -= count;
+                } else {
+                    let frame = Pin::new(&mut body).poll_frame(task);
+                    if let Err(error) = embed_checkpoint(cx, "api.response_body") {
+                        return Poll::Ready(Err(ApiAttemptError::Terminal(error)));
+                    }
+                    match frame {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(None) => {
+                            return Poll::Ready(Ok(std::mem::take(&mut bytes)));
+                        }
+                        Poll::Ready(Some(Ok(Frame::Data(chunk)))) => pending = Some(chunk),
+                        Poll::Ready(Some(Ok(Frame::Trailers(_)))) => {}
+                        Poll::Ready(Some(Err(_))) => {
+                            return Poll::Ready(Err(ApiAttemptError::Retry(
+                                bounded_embedding_failure(
+                                    provider,
+                                    "remote HTTP response body failed",
+                                ),
+                            )));
+                        }
+                    }
+                }
+            }
+            if let Err(error) = embed_checkpoint(cx, "api.response_body") {
+                return Poll::Ready(Err(ApiAttemptError::Terminal(error)));
+            }
+            // The body may be entirely ready and register no wake of its own.
+            // Yield the owning task, not a timer or an independently spawned task.
+            task.waker().wake_by_ref();
+            Poll::Pending
+        })
+        .await
+    };
+    // Release partial frames and the connection before reporting completion,
+    // including when their destructors turn an ordinary outcome into cancel.
+    drop(body);
+    embed_checkpoint(cx, "api.response_body").map_err(ApiAttemptError::Terminal)?;
+    outcome
+}
+
+/// The elapsed callback is production's runtime/wall clock, not a new timer.
+/// Injection lets tests cross exact boundaries without sleeps. The existing
+/// delay future provides both a timer wake and an independent cancellation
+/// wake even if an HTTP body returns Pending without waking itself.
+async fn run_api_attempt_with_elapsed<T: Send>(
+    cx: &Cx,
+    provider: &dyn ApiProvider,
+    budget: Duration,
+    work: impl std::future::Future<Output = ApiAttemptResult<T>> + Send,
+    elapsed: impl Fn() -> Duration + Send + Sync,
+) -> ApiAttemptResult<T> {
+    embed_checkpoint(cx, "api.response").map_err(ApiAttemptError::Terminal)?;
+    let timed_out = || {
+        ApiAttemptError::Retry(api_client_error_to_search(
+            &ClientError::DeadlineExceeded,
+            provider,
+        ))
+    };
+    let outcome = {
+        let mut deadline = std::pin::pin!(wait_api_delay(cx, budget.saturating_sub(elapsed())));
+        let mut work = std::pin::pin!(work);
+        poll_fn(|task| {
+            if let Err(error) = embed_checkpoint(cx, "api.response") {
+                return Poll::Ready(Err(ApiAttemptError::Terminal(error)));
+            }
+            if elapsed() >= budget {
+                return Poll::Ready(Err(timed_out()));
+            }
+            if let Poll::Ready(result) = deadline.as_mut().poll(task) {
+                return Poll::Ready(Err(match result {
+                    Ok(()) => timed_out(),
+                    Err(error) => ApiAttemptError::Terminal(error),
+                }));
+            }
+            let outcome = work.as_mut().poll(task);
+            if let Err(error) = embed_checkpoint(cx, "api.response") {
+                return Poll::Ready(Err(ApiAttemptError::Terminal(error)));
+            }
+            // Preserve an observed hard failure (especially a byte-limit
+            // refusal), rather than disguising it as a retryable timeout.
+            if matches!(&outcome, Poll::Ready(Err(_))) {
+                return outcome;
+            }
+            if elapsed() >= budget {
+                return Poll::Ready(Err(timed_out()));
+            }
+            outcome
+        })
+        .await
+    };
+    // Both the connection-owning work and the timer/registration are gone,
+    // including on cancellation. Destructors may themselves request cancel.
+    embed_checkpoint(cx, "api.response").map_err(ApiAttemptError::Terminal)?;
+    outcome
 }
 
 // ─── ApiEmbedder ────────────────────────────────────────────────────────────
@@ -520,7 +819,7 @@ impl ApiEmbedder {
     /// Wrap with the default cache capacity (4096 entries).
     #[must_use]
     pub fn cached_default(self) -> CachedEmbedder {
-        CachedEmbedder::new(Arc::new(self), 4096)
+        self.cached(4096)
     }
 
     /// Make a single producer-authenticated API request for a batch, with retry.
@@ -532,7 +831,7 @@ impl ApiEmbedder {
         let safe_provider = self.provider_contract.provider_name.as_str();
 
         let mut last_err = None;
-        'retry: for attempt in 0..=self.config.max_retries {
+        for attempt in 0..=self.config.max_retries {
             embed_checkpoint(cx, "api.request_batch")?;
             let mut nonce_entropy = [0_u8; 32];
             cx.random_bytes(&mut nonce_entropy);
@@ -557,72 +856,29 @@ impl ApiEmbedder {
                     backoff_ms = backoff.as_millis(),
                     "retrying API request"
                 );
-                asupersync::time::sleep(cx.now(), backoff).await;
+                wait_api_delay(cx, backoff).await?;
             }
 
-            if let Some(wait) = self.rate_limiter.acquire() {
-                asupersync::time::sleep(cx.now(), wait).await;
-            }
+            self.rate_limiter.wait_for_permit(cx).await?;
 
-            let response = self
-                .client
-                .request_streaming(
-                    cx,
-                    Method::Post,
-                    &url,
-                    headers
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                    body,
-                )
-                .await;
-
-            let mut response = match response {
+            let (status, response_body) = match request_api_response(
+                cx,
+                &self.client,
+                self.provider.as_ref(),
+                &self.config,
+                &url,
+                &headers,
+                body,
+            )
+            .await
+            {
                 Ok(response) => response,
-                Err(error) => {
-                    let error = api_client_error_to_search(&error, self.provider.as_ref());
-                    if matches!(error, SearchError::Cancelled { .. }) {
-                        return Err(error);
-                    }
+                Err(ApiAttemptError::Retry(error)) => {
                     last_err = Some(error);
                     continue;
                 }
+                Err(ApiAttemptError::Terminal(error)) => return Err(error),
             };
-
-            let status = response.head.status;
-            let mut response_body = Vec::new();
-            while let Some(frame) = poll_fn(|cx| Pin::new(&mut response.body).poll_frame(cx)).await
-            {
-                match frame {
-                    Ok(Frame::Data(mut chunk)) => {
-                        while chunk.has_remaining() {
-                            let bytes = chunk.chunk();
-                            if bytes.is_empty() {
-                                break;
-                            }
-                            if response_body.len().saturating_add(bytes.len())
-                                > self.config.max_response_bytes
-                            {
-                                return Err(bounded_embedding_failure(
-                                    self.provider.as_ref(),
-                                    "remote response exceeded the configured byte budget",
-                                ));
-                            }
-                            response_body.extend_from_slice(bytes);
-                            chunk.advance(bytes.len());
-                        }
-                    }
-                    Ok(Frame::Trailers(_)) => {}
-                    Err(_error) => {
-                        last_err = Some(bounded_embedding_failure(
-                            self.provider.as_ref(),
-                            "remote HTTP response body failed",
-                        ));
-                        continue 'retry;
-                    }
-                }
-            }
 
             if (200..300).contains(&status) {
                 let embeddings =
@@ -885,7 +1141,7 @@ impl AssumedRemoteApi {
         })?;
 
         let mut last_err = None;
-        'retry: for attempt in 0..=self.config.max_retries {
+        for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 let multiplier = 1_u32.checked_shl((attempt - 1).min(31)).unwrap_or(u32::MAX);
                 let backoff = self.config.retry_base_delay.saturating_mul(multiplier);
@@ -896,71 +1152,29 @@ impl AssumedRemoteApi {
                     trust = "assumed-remote",
                     "retrying transient API request"
                 );
-                asupersync::time::sleep(cx.now(), backoff).await;
+                wait_api_delay(cx, backoff).await?;
             }
 
-            if let Some(wait) = self.rate_limiter.acquire() {
-                asupersync::time::sleep(cx.now(), wait).await;
-            }
+            self.rate_limiter.wait_for_permit(cx).await?;
 
-            let response = self
-                .client
-                .request_streaming(
-                    cx,
-                    Method::Post,
-                    &url,
-                    headers
-                        .iter()
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                    body.clone(),
-                )
-                .await;
-            let mut response = match response {
+            let (status, response_body) = match request_api_response(
+                cx,
+                &self.client,
+                self.provider.as_ref(),
+                &self.config,
+                &url,
+                &headers,
+                body.clone(),
+            )
+            .await
+            {
                 Ok(response) => response,
-                Err(error) => {
-                    let error = api_client_error_to_search(&error, self.provider.as_ref());
-                    if matches!(error, SearchError::Cancelled { .. }) {
-                        return Err(error);
-                    }
+                Err(ApiAttemptError::Retry(error)) => {
                     last_err = Some(error);
                     continue;
                 }
+                Err(ApiAttemptError::Terminal(error)) => return Err(error),
             };
-
-            let status = response.head.status;
-            let mut response_body = Vec::new();
-            while let Some(frame) = poll_fn(|cx| Pin::new(&mut response.body).poll_frame(cx)).await
-            {
-                match frame {
-                    Ok(Frame::Data(mut chunk)) => {
-                        while chunk.has_remaining() {
-                            let bytes = chunk.chunk();
-                            if bytes.is_empty() {
-                                break;
-                            }
-                            if response_body.len().saturating_add(bytes.len())
-                                > self.config.max_response_bytes
-                            {
-                                return Err(bounded_embedding_failure(
-                                    self.provider.as_ref(),
-                                    "remote response exceeded the configured byte budget",
-                                ));
-                            }
-                            response_body.extend_from_slice(bytes);
-                            chunk.advance(bytes.len());
-                        }
-                    }
-                    Ok(Frame::Trailers(_)) => {}
-                    Err(_error) => {
-                        last_err = Some(bounded_embedding_failure(
-                            self.provider.as_ref(),
-                            "remote HTTP response body failed",
-                        ));
-                        continue 'retry;
-                    }
-                }
-            }
 
             if (200..300).contains(&status) {
                 let embeddings =
@@ -1550,7 +1764,6 @@ mod tests {
     }
 
     #[derive(Debug, Deserialize, serde::Serialize)]
-    #[serde(deny_unknown_fields)]
     struct TestGatewayResponse {
         vectors: Vec<Vec<f32>>,
         attestation: Option<RemoteEmbeddingAttestationV1>,
@@ -1776,6 +1989,892 @@ mod tests {
         assert!(rl.acquire().is_none());
         // Third should require waiting.
         assert!(rl.acquire().is_some());
+    }
+
+    #[test]
+    fn rate_limiter_denied_probes_preserve_fractional_credit() {
+        let limiter = RateLimiter::new(60);
+        let start = limiter.state.lock().unwrap().last_refill;
+        for _ in 0..60 {
+            assert!(limiter.acquire_at(start).is_none());
+        }
+        for _ in 0..128 {
+            assert_eq!(
+                limiter.acquire_at(start + Duration::from_millis(250)),
+                Some(Duration::from_millis(750))
+            );
+        }
+        assert_eq!(
+            limiter.acquire_at(start + Duration::from_millis(500)),
+            Some(Duration::from_millis(500))
+        );
+        assert!(limiter.acquire_at(start + Duration::from_secs(1)).is_none());
+        assert_eq!(
+            limiter.acquire_at(start + Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn rate_limiter_same_instant_contenders_share_one_refilled_permit() {
+        let limiter = RateLimiter::new(3);
+        let start = limiter.state.lock().unwrap().last_refill;
+        for _ in 0..3 {
+            assert!(limiter.acquire_at(start).is_none());
+        }
+        for tick in 1..=4 {
+            let now = start + Duration::from_secs(tick * 20);
+            // The mutex serializes the actual contenders in precisely this way.
+            let admitted = (0..128)
+                .filter(|_| limiter.acquire_at(now).is_none())
+                .count();
+            assert_eq!(admitted, 1);
+        }
+        // Idle time can refill the configured burst, not accumulate unbounded debt.
+        let later = start + Duration::from_secs(3_600);
+        for _ in 0..3 {
+            assert!(limiter.acquire_at(later).is_none());
+        }
+        assert_eq!(limiter.acquire_at(later), Some(Duration::from_secs(20)));
+    }
+
+    #[test]
+    fn rate_limiter_stale_clock_samples_cannot_duplicate_refill() {
+        let limiter = RateLimiter::new(60);
+        let start = limiter.state.lock().unwrap().last_refill;
+        for _ in 0..60 {
+            assert!(limiter.acquire_at(start).is_none());
+        }
+        let newer = start + Duration::from_millis(750);
+        assert_eq!(limiter.acquire_at(newer), Some(Duration::from_millis(250)));
+        // A thread sampled this instant before another thread won the lock.
+        let older = start + Duration::from_millis(250);
+        assert_eq!(limiter.acquire_at(older), Some(Duration::from_millis(250)));
+        assert_eq!(limiter.state.lock().unwrap().last_refill, newer);
+        let due = start + Duration::from_secs(1);
+        assert!(limiter.acquire_at(due).is_none());
+        assert_eq!(limiter.acquire_at(due), Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn rate_limiter_rounds_waits_up_at_nanosecond_and_maximum_rate_boundaries() {
+        for rate in [1, 2, 3, 7, 60, 997, u32::MAX] {
+            let limiter = RateLimiter::new(rate);
+            let start = {
+                let mut state = limiter.state.lock().unwrap();
+                state.available_credits = 0;
+                state.last_refill
+            };
+            let nanos = 60_000_000_000_u64.div_ceil(u64::from(rate));
+            let delay = Duration::from_nanos(nanos);
+            assert_eq!(limiter.acquire_at(start), Some(delay));
+            assert_eq!(
+                limiter.acquire_at(start + delay - Duration::from_nanos(1)),
+                Some(Duration::from_nanos(1))
+            );
+            assert!(limiter.acquire_at(start + delay).is_none());
+            assert!(limiter.acquire_at(start + delay).is_some());
+        }
+    }
+
+    #[test]
+    fn rate_wait_rechecks_after_another_caller_consumes_the_refill() {
+        run_test_with_cx(|cx| async move {
+            let limiter = RateLimiter::new(1);
+            let start = limiter.state.lock().unwrap().last_refill;
+            assert!(limiter.acquire_at(start).is_none());
+            let clock = Mutex::new(start);
+            let mut pauses = 0;
+            wait_for_api_permit(
+                &cx,
+                || limiter.acquire_at(*clock.lock().unwrap()),
+                |delay| {
+                    pauses += 1;
+                    assert!(pauses <= 2, "admission must make bounded test progress");
+                    assert_eq!(delay, Duration::from_secs(60));
+                    let now = {
+                        let mut clock = clock.lock().unwrap();
+                        *clock += delay;
+                        *clock
+                    };
+                    if pauses == 1 {
+                        // Another awakened request wins the sole permit first.
+                        assert!(limiter.acquire_at(now).is_none());
+                    }
+                    std::future::ready(Ok(()))
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(pauses, 2, "one completed delay does not authorize a request");
+            assert_eq!(
+                limiter.acquire_at(*clock.lock().unwrap()),
+                Some(Duration::from_secs(60))
+            );
+        });
+    }
+
+    struct AdmissionWake(std::sync::atomic::AtomicUsize);
+
+    impl std::task::Wake for AdmissionWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cancelled_rate_admission_never_consumes_an_available_permit() {
+        for rate in [0, 1] {
+            run_test_with_cx(|cx| async move {
+                let limiter = RateLimiter::new(rate);
+                let before = limiter.state.lock().unwrap().available_credits;
+                cx.cancel_with(asupersync::CancelKind::User, Some("cancel before admission"));
+                assert!(matches!(
+                    limiter.wait_for_permit(&cx).await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert_eq!(limiter.state.lock().unwrap().available_credits, before);
+            });
+        }
+    }
+
+    #[test]
+    fn pending_rate_waits_cancel_or_drop_without_leaving_reserved_debt() {
+        use std::task::{Context, Waker};
+
+        for cancel in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let limiter = RateLimiter::new(1);
+                // Freeze wall-clock refill for this manually polled test. The
+                // injected future instant also exercises stale-sample clamping.
+                let start = Instant::now() + Duration::from_secs(3_600);
+                assert!(limiter.acquire_at(start).is_none());
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(limiter.wait_for_permit(&cx));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                if cancel {
+                    let before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("stop rate waiter"));
+                    assert!(wake.0.load(Ordering::SeqCst) > before);
+                    assert!(matches!(
+                        operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(SearchError::Cancelled { .. }))
+                    ));
+                }
+                drop(operation);
+                assert_eq!(limiter.state.lock().unwrap().available_credits, 0);
+                assert!(limiter.acquire_at(start + Duration::from_secs(60)).is_none());
+                if !cancel {
+                    let before = wake.0.load(Ordering::SeqCst);
+                    assert!(!cx.is_cancel_requested());
+                    cx.cancel_with(asupersync::CancelKind::User, Some("after waiter drop"));
+                    assert_eq!(wake.0.load(Ordering::SeqCst), before);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn retry_delay_cancels_before_expiry_and_zero_delay_still_checks_cancellation() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            wait_api_delay(&cx, Duration::ZERO).await.unwrap();
+            let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut delay = Box::pin(wait_api_delay(&cx, Duration::from_secs(3_600)));
+            assert!(
+                delay
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let before = wake.0.load(Ordering::SeqCst);
+            cx.cancel_with(asupersync::CancelKind::User, Some("stop retry backoff"));
+            // No wall-clock sleep, timer advancement, or forced poll supplies this wake.
+            assert!(wake.0.load(Ordering::SeqCst) > before);
+            assert!(matches!(
+                delay.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            assert!(matches!(
+                wait_api_delay(&cx, Duration::ZERO).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+        });
+    }
+
+    #[test]
+    fn verified_and_transient_attempts_wait_for_admission_before_connecting() {
+        use std::task::{Context, Waker};
+
+        for verified in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let provider = TestGatewayProvider {
+                    endpoint: format!("http://{}/embeddings", listener.local_addr().unwrap()),
+                    dimension: 4,
+                };
+                let config = ApiEmbedderConfig {
+                    requests_per_minute: 1,
+                    max_retries: 0,
+                    ..ApiEmbedderConfig::default()
+                };
+                let authenticated = ApiEmbedder::new_verified(
+                    Box::new(provider.clone()),
+                    config.clone(),
+                    Some(remote_test_identity(4)),
+                    test_attester(),
+                )
+                .unwrap();
+                let transient = AssumedRemoteApi::new(
+                    Box::new(provider),
+                    config,
+                    Some(remote_test_identity(4)),
+                )
+                .unwrap();
+                let limiter = if verified {
+                    &authenticated.rate_limiter
+                } else {
+                    &transient.rate_limiter
+                };
+                let start = Instant::now() + Duration::from_secs(3_600);
+                assert!(limiter.acquire_at(start).is_none());
+                let texts = ["quota-test"];
+                let mut operation = Box::pin(async {
+                    if verified {
+                        authenticated.request_batch(&cx, &texts).await
+                    } else {
+                        transient.request_batch_unattested(&cx, &texts).await
+                    }
+                });
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+                let before = wake.0.load(Ordering::SeqCst);
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel queued API attempt"),
+                );
+                assert!(wake.0.load(Ordering::SeqCst) > before);
+                assert!(matches!(
+                    operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(SearchError::Cancelled { .. }))
+                ));
+                assert!(matches!(
+                    listener.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ));
+                drop(operation);
+                assert_eq!(limiter.state.lock().unwrap().available_credits, 0);
+            });
+        }
+    }
+
+    struct AttemptBody {
+        frames: std::collections::VecDeque<Result<Frame<&'static [u8]>, std::io::Error>>,
+        pending: bool,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AttemptBody {
+        fn new(
+            frames: Vec<Result<Frame<&'static [u8]>, std::io::Error>>,
+            pending: bool,
+        ) -> Self {
+            Self {
+                frames: frames.into(),
+                pending,
+                polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                dropped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl Body for AttemptBody {
+        type Data = &'static [u8];
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if let Some(frame) = self.frames.pop_front() {
+                Poll::Ready(Some(frame))
+            } else if self.pending {
+                // Deliberately no waker registration or Cx observation.
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            }
+        }
+    }
+
+    impl Drop for AttemptBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedResponseBuffer {
+        bytes: Arc<Vec<u8>>,
+        offset: usize,
+        max_chunk: usize,
+        copied: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Buf for TrackedResponseBuffer {
+        fn remaining(&self) -> usize {
+            self.bytes.len() - self.offset
+        }
+
+        fn chunk(&self) -> &[u8] {
+            let count = self.remaining().min(self.max_chunk);
+            &self.bytes[self.offset..self.offset + count]
+        }
+
+        fn advance(&mut self, count: usize) {
+            assert!(count <= self.remaining());
+            self.offset += count;
+            self.copied.fetch_add(count, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedResponseBody {
+        data: Option<TrackedResponseBuffer>,
+        polls: Arc<std::sync::atomic::AtomicUsize>,
+        copied: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TrackedResponseBody {
+        fn new(bytes: Arc<Vec<u8>>, max_chunk: usize) -> Self {
+            let copied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                data: Some(TrackedResponseBuffer {
+                    bytes,
+                    offset: 0,
+                    max_chunk,
+                    copied: Arc::clone(&copied),
+                }),
+                polls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                copied,
+            }
+        }
+    }
+
+    impl Body for TrackedResponseBody {
+        type Data = TrackedResponseBuffer;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(self.data.take().map(|data| Ok(Frame::Data(data))))
+        }
+    }
+
+    #[test]
+    fn always_ready_empty_frames_cannot_starve_the_attempt_deadline_or_cancellation() {
+        use std::task::{Context, Waker};
+
+        struct EmptyFrames {
+            trailers: bool,
+            polls: Arc<std::sync::atomic::AtomicUsize>,
+            dropped: Arc<std::sync::atomic::AtomicBool>,
+        }
+
+        impl Body for EmptyFrames {
+            type Data = &'static [u8];
+            type Error = std::convert::Infallible;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                let before = self.polls.fetch_add(1, Ordering::SeqCst);
+                // Fail the old unbounded collector instead of hanging the test.
+                assert!(before < API_BODY_STEPS_PER_POLL, "body drained without yielding");
+                Poll::Ready(Some(Ok(if self.trailers {
+                    Frame::Trailers(Default::default())
+                } else {
+                    Frame::Data(&[])
+                })))
+            }
+        }
+
+        impl Drop for EmptyFrames {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+
+        for trailers in [false, true] {
+            for cancel in [false, true] {
+                run_test_with_cx(|cx| async move {
+                    let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+                    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let body = EmptyFrames {
+                        trailers,
+                        polls: Arc::clone(&polls),
+                        dropped: Arc::clone(&dropped),
+                    };
+                    let elapsed = AtomicU64::new(0);
+                    let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                    let waker = Waker::from(Arc::clone(&wake));
+                    let mut operation = Box::pin(run_api_attempt_with_elapsed(
+                        &cx,
+                        &provider,
+                        Duration::from_millis(50),
+                        read_api_response_body(&cx, &provider, body, 1024),
+                        || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+                    ));
+                    assert!(
+                        operation
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                    let polled = polls.load(Ordering::SeqCst);
+                    assert!((1..=API_BODY_STEPS_PER_POLL).contains(&polled));
+                    assert!(
+                        wake.0.load(Ordering::SeqCst) > 0,
+                        "collector must schedule continuation"
+                    );
+                    assert!(!dropped.load(Ordering::SeqCst));
+                    if cancel {
+                        let before = wake.0.load(Ordering::SeqCst);
+                        cx.cancel_with(asupersync::CancelKind::User, Some("empty frame stream"));
+                        assert!(wake.0.load(Ordering::SeqCst) > before);
+                    } else {
+                        elapsed.store(50, Ordering::SeqCst);
+                    }
+                    let result = operation.as_mut().poll(&mut Context::from_waker(&waker));
+                    if cancel {
+                        assert!(matches!(
+                            result,
+                            Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. })))
+                        ));
+                    } else {
+                        assert!(matches!(
+                            result,
+                            Poll::Ready(Err(ApiAttemptError::Retry(_)))
+                        ));
+                    }
+                    assert_eq!(polls.load(Ordering::SeqCst), polled);
+                    assert!(dropped.load(Ordering::SeqCst));
+                    assert_eq!(cx.is_cancel_requested(), cancel);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn ready_frame_turns_preserve_order_and_schedule_their_own_continuations() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+            let mut frames = Vec::new();
+            for _ in 0..65 {
+                frames.push(Ok(Frame::Data(b"\0".as_slice())));
+                frames.push(Ok(Frame::Data("é".as_bytes())));
+                frames.push(Ok(Frame::Data(b"".as_slice())));
+                frames.push(Ok(Frame::Trailers(Default::default())));
+            }
+            let body = AttemptBody::new(frames, false);
+            let polls = Arc::clone(&body.polls);
+            let dropped = Arc::clone(&body.dropped);
+            let expected = "\0é".repeat(65).into_bytes();
+            let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut operation = Box::pin(read_api_response_body(
+                &cx,
+                &provider,
+                body,
+                expected.len(),
+            ));
+            let mut turns = 0;
+            let result = loop {
+                turns += 1;
+                assert!(turns <= 261, "collector stopped making progress");
+                let before = polls.load(Ordering::SeqCst);
+                let wakes_before = wake.0.load(Ordering::SeqCst);
+                let result = operation.as_mut().poll(&mut Context::from_waker(&waker));
+                assert!(polls.load(Ordering::SeqCst) - before <= API_BODY_STEPS_PER_POLL);
+                if let Poll::Ready(result) = result {
+                    break result.unwrap();
+                }
+                assert!(wake.0.load(Ordering::SeqCst) > wakes_before);
+            };
+            assert!(turns > 1);
+            assert_eq!(result, expected);
+            assert_eq!(polls.load(Ordering::SeqCst), 261);
+            assert!(dropped.load(Ordering::SeqCst));
+
+            // Ordinary short responses do not incur an unconditional yield.
+            let short = AttemptBody::new(vec![Ok(Frame::Data(b"ok"))], false);
+            let mut operation = Box::pin(read_api_response_body(&cx, &provider, short, 2));
+            assert!(matches!(
+                operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Ok(bytes)) if bytes == b"ok"
+            ));
+        });
+    }
+
+    #[test]
+    fn large_and_fragmented_single_frames_keep_their_cursor_across_polls() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            for width in [1, 17, usize::MAX] {
+                let length = if width == 1 {
+                    1_043
+                } else {
+                    2 * API_BODY_BYTES_PER_POLL + 17
+                };
+                let input = Arc::new(
+                    (0..length)
+                        .map(|i| u8::try_from(i % 251).unwrap())
+                        .collect(),
+                );
+                let body = TrackedResponseBody::new(Arc::clone(&input), width);
+                let copied = Arc::clone(&body.copied);
+                let polls = Arc::clone(&body.polls);
+                let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(read_api_response_body(&cx, &provider, body, length));
+                let mut turns = 0;
+                let result = loop {
+                    turns += 1;
+                    assert!(turns <= length + 2, "retained frame stopped making progress");
+                    let before = copied.load(Ordering::SeqCst);
+                    let wakes_before = wake.0.load(Ordering::SeqCst);
+                    let result = operation.as_mut().poll(&mut Context::from_waker(&waker));
+                    assert!(copied.load(Ordering::SeqCst) - before <= API_BODY_BYTES_PER_POLL);
+                    if let Poll::Ready(result) = result {
+                        break result.unwrap();
+                    }
+                    assert!(wake.0.load(Ordering::SeqCst) > wakes_before);
+                };
+                assert!(turns > 1);
+                assert_eq!(result.as_slice(), input.as_slice());
+                assert_eq!(copied.load(Ordering::SeqCst), length);
+                assert_eq!(polls.load(Ordering::SeqCst), 2, "one frame followed by EOF");
+                assert_eq!(
+                    Arc::strong_count(&input),
+                    1,
+                    "completed future retained its frame"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn over_budget_frames_fail_before_copying_and_nonprogressing_buffers_are_not_eof() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+            let input = Arc::new(vec![b'x'; API_BODY_BYTES_PER_POLL + 1]);
+            for (width, limit) in [(usize::MAX, input.len() - 1), (0, input.len())] {
+                let body = TrackedResponseBody::new(Arc::clone(&input), width);
+                let copied = Arc::clone(&body.copied);
+                let polls = Arc::clone(&body.polls);
+                let mut operation = Box::pin(read_api_response_body(&cx, &provider, body, limit));
+                assert!(matches!(
+                    operation.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::EmbeddingFailed { .. })))
+                ));
+                assert_eq!(copied.load(Ordering::SeqCst), 0);
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert_eq!(Arc::strong_count(&input), 1);
+            }
+        });
+    }
+
+    #[test]
+    fn cancellation_or_abandonment_releases_a_partially_copied_frame() {
+        use std::task::{Context, Waker};
+
+        for cancel in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+                let input = Arc::new(vec![b'x'; 2 * API_BODY_BYTES_PER_POLL + 1]);
+                let body = TrackedResponseBody::new(Arc::clone(&input), usize::MAX);
+                let copied = Arc::clone(&body.copied);
+                let polls = Arc::clone(&body.polls);
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(run_api_attempt_with_elapsed(
+                    &cx,
+                    &provider,
+                    Duration::from_secs(3_600),
+                    read_api_response_body(&cx, &provider, body, input.len()),
+                    || Duration::ZERO,
+                ));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert_eq!(copied.load(Ordering::SeqCst), API_BODY_BYTES_PER_POLL);
+                assert_eq!(Arc::strong_count(&input), 2);
+                if cancel {
+                    let before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("stop a partial frame"));
+                    assert!(wake.0.load(Ordering::SeqCst) > before);
+                    assert!(matches!(
+                        operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. })))
+                    ));
+                    assert_eq!(Arc::strong_count(&input), 1);
+                }
+                drop(operation);
+                assert_eq!(Arc::strong_count(&input), 1);
+                assert_eq!(copied.load(Ordering::SeqCst), API_BODY_BYTES_PER_POLL);
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                assert_eq!(cx.is_cancel_requested(), cancel);
+            });
+        }
+    }
+
+    #[test]
+    fn full_attempt_deadline_includes_partial_body_and_drops_it_before_return() {
+        use std::task::{Context, Waker};
+
+        run_test_with_cx(|cx| async move {
+            let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+            let body = AttemptBody::new(vec![Ok(Frame::Data(b"{\"data\":"))], true);
+            let dropped = Arc::clone(&body.dropped);
+            let polls = Arc::clone(&body.polls);
+            let elapsed = AtomicU64::new(0);
+            let work = async {
+                // Model the head consuming 20 ms. The body does NOT get a
+                // fresh 50 ms: it must be stopped at the original 50 ms mark.
+                elapsed.store(20, Ordering::SeqCst);
+                read_api_response_body(&cx, &provider, body, 1024).await
+            };
+            let mut operation = Box::pin(run_api_attempt_with_elapsed(
+                &cx,
+                &provider,
+                Duration::from_millis(50),
+                work,
+                || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+            ));
+            assert!(
+                operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert!(!dropped.load(Ordering::SeqCst));
+            elapsed.store(50, Ordering::SeqCst);
+            let result = operation.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            match result {
+                Poll::Ready(Err(ApiAttemptError::Retry(error))) => {
+                    assert!(error.to_string().contains("deadline exceeded"));
+                }
+                other => panic!("expected the full-exchange deadline, got {other:?}"),
+            }
+            // No additional body poll, forced socket close or outer-future
+            // destruction is needed to release the partial response.
+            assert_eq!(polls.load(Ordering::SeqCst), 2);
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn pending_body_cancellation_and_abandonment_release_work_and_waiters() {
+        use std::task::{Context, Waker};
+
+        for cancel in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+                let body = AttemptBody::new(Vec::new(), true);
+                let dropped = Arc::clone(&body.dropped);
+                let polls = Arc::clone(&body.polls);
+                let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(run_api_attempt_with_elapsed(
+                    &cx,
+                    &provider,
+                    Duration::from_secs(3_600),
+                    read_api_response_body(&cx, &provider, body, 1024),
+                    || Duration::ZERO,
+                ));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                if cancel {
+                    let before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("stop stalled body"));
+                    assert!(wake.0.load(Ordering::SeqCst) > before);
+                    assert!(matches!(
+                        operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. })))
+                    ));
+                    assert!(dropped.load(Ordering::SeqCst));
+                }
+                drop(operation);
+                assert!(dropped.load(Ordering::SeqCst));
+                assert_eq!(polls.load(Ordering::SeqCst), 1);
+                if !cancel {
+                    assert!(!cx.is_cancel_requested());
+                    let before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("after body abandonment"));
+                    assert_eq!(wake.0.load(Ordering::SeqCst), before);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn body_collection_keeps_exact_bytes_and_distinguishes_terminal_bounds_from_retryable_io() {
+        run_test_with_cx(|cx| async move {
+            let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+            for limit in [3, 4] {
+                let body = AttemptBody::new(
+                    vec![
+                        Ok(Frame::Data("é".as_bytes())),
+                        Ok(Frame::Trailers(Default::default())),
+                        Ok(Frame::Data(b"\0x")),
+                    ],
+                    false,
+                );
+                let dropped = Arc::clone(&body.dropped);
+                let result = read_api_response_body(&cx, &provider, body, limit).await;
+                if limit == 4 {
+                    assert_eq!(result.unwrap(), "é\0x".as_bytes());
+                } else {
+                    assert!(matches!(result, Err(ApiAttemptError::Terminal(_))));
+                }
+                assert!(dropped.load(Ordering::SeqCst));
+            }
+            let body = AttemptBody::new(
+                vec![
+                    Ok(Frame::Data(b"prefix")),
+                    Err(std::io::Error::other("private-body-error-canary")),
+                ],
+                false,
+            );
+            let dropped = Arc::clone(&body.dropped);
+            match read_api_response_body(&cx, &provider, body, 1024).await {
+                Err(ApiAttemptError::Retry(error)) => {
+                    assert!(error.to_string().contains("response body failed"));
+                    assert!(!error.to_string().contains("private-body-error-canary"));
+                }
+                other => panic!("expected retryable body I/O, got {other:?}"),
+            }
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn full_attempt_rejects_late_success_without_weakening_a_terminal_error() {
+        run_test_with_cx(|cx| async move {
+            let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+            for finish in [49, 50, 51] {
+                let elapsed = AtomicU64::new(0);
+                let result = run_api_attempt_with_elapsed(
+                    &cx,
+                    &provider,
+                    Duration::from_millis(50),
+                    async {
+                        elapsed.store(finish, Ordering::SeqCst);
+                        Ok(7)
+                    },
+                    || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+                )
+                .await;
+                if finish < 50 {
+                    assert_eq!(result.unwrap(), 7);
+                } else {
+                    assert!(matches!(result, Err(ApiAttemptError::Retry(_))));
+                }
+            }
+            let elapsed = AtomicU64::new(0);
+            let result = run_api_attempt_with_elapsed(
+                &cx,
+                &provider,
+                Duration::from_millis(50),
+                async {
+                    elapsed.store(60, Ordering::SeqCst);
+                    Err::<(), _>(ApiAttemptError::Terminal(bounded_embedding_failure(
+                        &provider,
+                        "terminal byte limit",
+                    )))
+                },
+                || Duration::from_millis(elapsed.load(Ordering::SeqCst)),
+            )
+            .await;
+            assert!(matches!(result, Err(ApiAttemptError::Terminal(_))));
+            assert!(!cx.is_cancel_requested());
+        });
+    }
+
+    #[test]
+    fn cancellation_after_a_ready_http_poll_wins_over_success_or_retry() {
+        for fails in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let provider = OpenAiProvider::text_embedding_3_small("unused", Some(4));
+                let result = run_api_attempt_with_elapsed(
+                    &cx,
+                    &provider,
+                    Duration::from_secs(3_600),
+                    async {
+                        cx.cancel_with(asupersync::CancelKind::User, Some("ready HTTP callback"));
+                        if fails {
+                            Err(ApiAttemptError::Retry(bounded_embedding_failure(
+                                &provider,
+                                "ordinary transport failure",
+                            )))
+                        } else {
+                            Ok(7)
+                        }
+                    },
+                    || Duration::ZERO,
+                )
+                .await;
+                assert!(matches!(
+                    result,
+                    Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. }))
+                ));
+            });
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use super::{NativeAnnIndex, NativeRetrievalMode, checkpoint, invalid};
 use crate::{Cx, Embedder, SearchResult};
 
 /// A physical row is meaningful only together with its retained shard ordinal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NativeShardRow {
     /// Position in the exact ordered shard inventory admitted by this set.
     pub shard: usize,

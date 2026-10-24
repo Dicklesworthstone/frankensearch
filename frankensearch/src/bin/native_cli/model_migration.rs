@@ -8,13 +8,15 @@
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch::SearchError;
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
-use frankensearch::native_ann::builder::live::{NativeHybridCandidate, NativeHybridSnapshot};
+use frankensearch::native_ann::builder::live::NativeHybridSnapshot;
+use frankensearch::native_ann::builder::sharded::NativeShardedHybridReopenLimits;
+use frankensearch::native_ann::builder::sharded::live::NativeShardedSnapshot;
 
 use super::validate_id;
 use crate::{
     ArtifactGenerationIdentityV1, Cx, Deserialize, GenerationComponentReceiptV1, HnswParams,
     MAX_DOCUMENTS, Models, NativeBuildPrecision, NativeBuildRetrieval, Path, PathBuf, Result,
-    SCHEMA, SELECTION_SCHEMA, Selection, Write, bad, emit, live, models, query,
+    SCHEMA, SELECTION_SCHEMA, Selection, Write, bad, cohort, emit, live, models, query, sharded,
 };
 
 type Loader = dyn Fn(&Cx, &Path, bool, &models::QualityOptions) -> Result<Models> + Send + Sync;
@@ -32,6 +34,21 @@ impl Authority {
         Self {
             load: Box::new(move |cx, directory, quality, options| {
                 models::load(cx, Some(directory), quality, options, pool.clone())
+            }),
+        }
+    }
+
+    pub(super) fn with_query_cache(self, cache: crate::query_cache::Config) -> Self {
+        if !cache.enabled() {
+            return self;
+        }
+        let load = self.load;
+        Self {
+            load: Box::new(move |cx, directory, quality, options| {
+                checkpoint(cx)?;
+                let outcome = load(cx, directory, quality, options);
+                checkpoint(cx)?;
+                cache.wrap(cx, outcome?)
             }),
         }
     }
@@ -81,16 +98,25 @@ fn validate_path(path: &Path) -> Result<()> {
 }
 
 struct Prepared {
-    candidate: NativeHybridCandidate,
+    candidate: live::Candidate,
     selection: Selection,
 }
 
-async fn prepare(
-    base: &NativeHybridSnapshot,
+struct Selected {
+    selection: Selection,
+    models: Models,
+    retrieval: NativeBuildRetrieval,
+}
+
+// Both layouts share authority-independent preflight, receipt selection and
+// model admission. Only the native typed migration/open operation differs.
+// Never infer a layout by trying one opener and falling back to the other.
+fn select(
+    base: cohort::Index<'_>,
     cx: &Cx,
     request: &Request,
     authority: &Authority,
-) -> Result<Prepared> {
+) -> Result<Selected> {
     let Request::ActivateModelMigration {
         expected_generation,
         receipt,
@@ -122,12 +148,16 @@ async fn prepare(
     let outcome = Selection::read(receipt);
     checkpoint(cx)?;
     let selection = outcome?;
-    if selection.schema != SELECTION_SCHEMA
-        || selection.documents != base.index().vectors().documents().len()
+    let schema = match base {
+        cohort::Index::Single(_) => SELECTION_SCHEMA,
+        cohort::Index::Sharded(_) => sharded::SELECTION_SCHEMA,
+    };
+    if selection.schema != schema
+        || selection.documents != base.document_count()
         || selection.generation.sequence <= base.generation().sequence
     {
         return Err(bad(
-            "migration requires a strictly newer single-layout selection of the entire retained source cohort",
+            "migration requires a strictly newer same-layout selection of the entire retained source cohort",
         ));
     }
     let has_quality = selection.quality_producer.is_some();
@@ -138,14 +168,6 @@ async fn prepare(
     let admission = selection.admit_models(&models);
     checkpoint(cx)?;
     admission?;
-    let outcome = base.begin_model_migration(
-        cx,
-        &selection.directory,
-        selection.generation,
-        models.fast,
-        models.quality,
-    );
-    checkpoint(cx)?;
     let retrieval = if *exact {
         NativeBuildRetrieval::Exact
     } else {
@@ -154,8 +176,34 @@ async fn prepare(
             seed: 42,
         }
     };
+    Ok(Selected {
+        selection,
+        models,
+        retrieval,
+    })
+}
+
+async fn prepare(
+    base: &NativeHybridSnapshot,
+    cx: &Cx,
+    request: &Request,
+    authority: &Authority,
+) -> Result<Prepared> {
+    let Selected {
+        selection,
+        models,
+        retrieval,
+    } = select(base.index().into(), cx, request, authority)?;
+    let outcome = base.begin_model_migration(
+        cx,
+        &selection.directory,
+        selection.generation,
+        models.fast,
+        models.quality,
+    );
+    checkpoint(cx)?;
     let mut migration = outcome?.with_fast_storage(NativeBuildPrecision::F32, retrieval);
-    if has_quality {
+    if selection.quality_producer.is_some() {
         migration = migration.with_quality_storage(NativeBuildPrecision::F32, retrieval)?;
     }
     let expected = GenerationComponentReceiptV1 {
@@ -170,7 +218,48 @@ async fn prepare(
     let outcome = Box::pin(migration.open_selected(cx, &expected, limits)).await;
     checkpoint(cx)?;
     Ok(Prepared {
-        candidate: outcome?,
+        candidate: live::Candidate::Single(outcome?),
+        selection,
+    })
+}
+
+async fn prepare_sharded(
+    base: &NativeShardedSnapshot,
+    cx: &Cx,
+    request: &Request,
+    authority: &Authority,
+) -> Result<Prepared> {
+    let Selected {
+        selection,
+        models,
+        retrieval,
+    } = select(base.index().into(), cx, request, authority)?;
+    let outcome = base.begin_model_migration(
+        cx,
+        &selection.directory,
+        selection.generation,
+        models.fast,
+        models.quality,
+    );
+    checkpoint(cx)?;
+    let mut migration = outcome?.with_fast_storage(NativeBuildPrecision::F32, retrieval);
+    if selection.quality_producer.is_some() {
+        migration = migration.with_quality_storage(NativeBuildPrecision::F32, retrieval)?;
+    }
+    let expected = GenerationComponentReceiptV1 {
+        byte_len: selection.snapshot.byte_len,
+        sha256: selection.snapshot.sha256,
+    };
+    let mut limits = NativeShardedHybridReopenLimits::default();
+    limits.vectors.max_documents = MAX_DOCUMENTS;
+    // Admit every partition plus global Quill and exact source fields through
+    // the existing migration gate. Its private candidate keeps THIS base pin.
+    // The receipt chooses partition boundaries, not a new untrusted shard-size
+    // parameter. A missing final artifact never becomes an accepted prefix.
+    let outcome = Box::pin(migration.open_selected(cx, &expected, limits)).await;
+    checkpoint(cx)?;
+    Ok(Prepared {
+        candidate: live::Candidate::Sharded(outcome?),
         selection,
     })
 }
@@ -190,13 +279,12 @@ pub(super) async fn execute<W: Write>(
         let authority = authority.ok_or_else(|| {
             bad("model migration is disabled; start serve with --allow-model-migration for a trusted controller")
         })?;
-        // Layout refusal precedes every controller-selected read or model load.
-        let live::Live::Single(live) = live else {
-            return Err(bad("model migration currently requires a single-layout live index"));
-        };
         let base = live.snapshot(cx).await?;
         previous = Some(base.generation());
-        let prepared = prepare(&base, cx, request, authority).await?;
+        let prepared = match &base {
+            live::Snapshot::Single(base) => prepare(base, cx, request, authority).await?,
+            live::Snapshot::Sharded(base) => prepare_sharded(base, cx, request, authority).await?,
+        };
         // Exact original predecessor Arc, not a new snapshot after loading.
         // All fallible model/receipt checks precede this atomic operation.
         let installed = live.install(cx, &prepared.candidate).await?;
@@ -209,7 +297,7 @@ pub(super) async fn execute<W: Write>(
             "fast_producer": prepared.selection.fast_producer,
             "quality_producer": prepared.selection.quality_producer,
         });
-        live::Snapshot::Single(installed).index().annotate(&mut payload);
+        installed.index().annotate(&mut payload);
         Ok(payload)
     }
     .await;
@@ -241,3 +329,7 @@ pub(super) async fn execute<W: Write>(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "model_migration_tests.rs"]
 mod tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "model_migration_sharded_tests.rs"]
+mod sharded_tests;

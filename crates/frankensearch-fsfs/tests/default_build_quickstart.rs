@@ -697,6 +697,8 @@ mod loader_only {
                 let deadline = Instant::now() + FAILURE_TIMEOUT;
                 while Instant::now() < deadline {
                     if let Ok(Some(status)) = self.child.try_wait() {
+                        let _ = fs::remove_file(&self.socket);
+                        let _ = fs::remove_file(self.socket.with_extension("lock"));
                         if !thread::panicking() {
                             assert!(status.success());
                         }
@@ -706,6 +708,8 @@ mod loader_only {
                 }
                 let _ = self.child.kill();
                 let _ = self.child.wait();
+                let _ = fs::remove_file(&self.socket);
+                let _ = fs::remove_file(self.socket.with_extension("lock"));
                 assert!(
                     thread::panicking(),
                     "progressive daemon failed graceful shutdown"
@@ -958,6 +962,12 @@ mod loader_only {
         impl Drop for DaemonOwner {
             fn drop(&mut self) {
                 request_daemon_stop(&self.0, self.1);
+                let deadline = Instant::now() + FAILURE_TIMEOUT;
+                while self.0.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                let _ = fs::remove_file(&self.0);
+                let _ = fs::remove_file(self.0.with_extension("lock"));
             }
         }
         #[cfg(unix)]

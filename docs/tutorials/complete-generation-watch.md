@@ -167,8 +167,10 @@ still seeded into the candidate (Quill segments are shared by hard link, since
 Quill never rewrites one; vector, catalog and every other file is copied),
 discovery still runs, and the normal validation and publication barriers remain.
 Pausing hot sources bounds repeated candidate creation until quiet observations
-agree, not total lifetime disk use or event-to-visible latency. Retained and
-abandoned generations consume disk space; automatic reclamation is not implemented.
+agree, not total event-to-visible latency. Each published successor reclaims
+older generations beyond the active generation and its immediate predecessor
+(unless `FSFS_GENERATION_RETENTION=report` or `off` is set), while never
+removing a generation still held by a live reader.
 
 The observation is not an atomic filesystem snapshot. There remains an ordinary
 cooperative-writer race between the final source check and pointer rename; later
@@ -178,7 +180,10 @@ This is not hostile-directory, anti-rollback, or privileged-adversary protection
 
 Complete-store readers support buffered CLI forwarding and progressive socket
 requests as described in [complete-generation serving](complete-generation-rebuilds.md).
-Legacy watcher migration remains outside this workflow. Restart reuse beyond the
+An existing legacy index can be converted into a complete-generation store by
+running a build or watch with `FSFS_COMPLETE_GENERATIONS=1`, which seeds from
+`FSFS-LEGACY-REUSE.json` when the completion receipt matches the running binary
+and configuration. Restart reuse beyond the
 Linux proof described above remains process-local. Ctrl-C cancellation is wired
 through the existing shutdown coordinator; no hard real-time latency is claimed
 for synchronous native operations or indexing work. The first SIGINT or SIGTERM

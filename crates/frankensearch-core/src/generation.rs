@@ -558,6 +558,16 @@ pub enum GenerationRootSecurityProfileV1 {
 }
 
 impl GenerationRootSecurityProfileV1 {
+    /// Canonical stable identifier for diagnostics and telemetry receipts.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RequiredExternal => "required_external",
+            Self::CooperativeLocal => "cooperative_local",
+            Self::ReadOnlyUnanchored => "read_only_unanchored",
+        }
+    }
+
     /// Whether this profile authorizes a caller to mutate a generation root.
     #[must_use]
     pub const fn permits_mutation(self) -> bool {
@@ -5102,8 +5112,33 @@ fn check_activation_invariants(m: &GenerationManifest, f: &mut Vec<ValidationFin
 }
 
 fn check_document_count_consistency(m: &GenerationManifest, f: &mut Vec<ValidationFinding>) {
-    let vector_total: u64 = m.vector_artifacts.iter().map(|a| a.vector_count).sum();
-    let lexical_total: u64 = m.lexical_artifacts.iter().map(|a| a.document_count).sum();
+    let vector_total = m
+        .vector_artifacts
+        .iter()
+        .try_fold(0_u64, |total, artifact| {
+            total.checked_add(artifact.vector_count)
+        });
+    let lexical_total = m
+        .lexical_artifacts
+        .iter()
+        .try_fold(0_u64, |total, artifact| {
+            total.checked_add(artifact.document_count)
+        });
+
+    if vector_total.is_none() {
+        f.push(ValidationFinding {
+            check: "vector_count_overflow",
+            severity: FindingSeverity::Error,
+            message: "aggregate vector count exceeds u64::MAX".into(),
+        });
+    }
+    if lexical_total.is_none() {
+        f.push(ValidationFinding {
+            check: "lexical_document_count_overflow",
+            severity: FindingSeverity::Error,
+            message: "aggregate lexical document count exceeds u64::MAX".into(),
+        });
+    }
 
     // Vector count should match declared total (per tier, so may be 2x for two-tier).
     // We only warn if there's a gross mismatch.
@@ -5116,7 +5151,10 @@ fn check_document_count_consistency(m: &GenerationManifest, f: &mut Vec<Validati
         });
     }
 
-    if !m.lexical_artifacts.is_empty() && lexical_total != m.total_documents {
+    if let Some(lexical_total) = lexical_total
+        && !m.lexical_artifacts.is_empty()
+        && lexical_total != m.total_documents
+    {
         f.push(ValidationFinding {
             check: "lexical_document_count",
             severity: FindingSeverity::Warning,
@@ -5129,9 +5167,12 @@ fn check_document_count_consistency(m: &GenerationManifest, f: &mut Vec<Validati
 
     // For two-tier, vector_total may be 2 * total_documents (fast + quality tier).
     // Flag only if it doesn't match any reasonable multiple.
-    if !m.vector_artifacts.is_empty()
+    // An unrepresentable two-tier total cannot match a representable aggregate,
+    // but it must not invalidate a matching single-tier total.
+    if let Some(vector_total) = vector_total
+        && !m.vector_artifacts.is_empty()
         && vector_total != m.total_documents
-        && vector_total != m.total_documents * 2
+        && m.total_documents.checked_mul(2) != Some(vector_total)
     {
         f.push(ValidationFinding {
             check: "vector_count_consistency",
@@ -9058,6 +9099,64 @@ mod tests {
             r.warnings()
                 .iter()
                 .any(|f| f.check == "lexical_document_count")
+        );
+    }
+
+    #[test]
+    fn aggregate_document_count_overflow_is_error() {
+        let mut m = valid_manifest();
+        m.vector_artifacts[0].vector_count = u64::MAX;
+        m.vector_artifacts
+            .push(sample_vector_artifact("vectors/overflow.fsvi", 1));
+        m.lexical_artifacts[0].document_count = u64::MAX;
+        m.lexical_artifacts
+            .push(sample_lexical_artifact("lexical/overflow", 1));
+        refresh_manifest_hash(&mut m);
+
+        let r = validate_manifest(&m);
+        assert!(!r.is_valid());
+        assert!(
+            r.errors()
+                .iter()
+                .any(|f| f.check == "vector_count_overflow")
+        );
+        assert!(
+            r.errors()
+                .iter()
+                .any(|f| f.check == "lexical_document_count_overflow")
+        );
+        assert!(r.warnings().is_empty(), "findings: {:#?}", r.findings);
+    }
+
+    #[test]
+    fn single_tier_document_count_near_u64_max_is_valid() {
+        for total_documents in [u64::MAX / 2 + 1, u64::MAX] {
+            let mut m = valid_manifest();
+            m.total_documents = total_documents;
+            m.vector_artifacts[0].vector_count = total_documents;
+            m.lexical_artifacts[0].document_count = total_documents;
+            refresh_manifest_hash(&mut m);
+
+            let r = validate_manifest(&m);
+            assert!(r.is_valid(), "findings: {:#?}", r.findings);
+            assert!(r.warnings().is_empty(), "findings: {:#?}", r.findings);
+        }
+    }
+
+    #[test]
+    fn large_document_count_does_not_accept_wrapped_two_tier_total() {
+        let mut m = valid_manifest();
+        m.total_documents = u64::MAX;
+        m.vector_artifacts[0].vector_count = u64::MAX - 1;
+        m.lexical_artifacts[0].document_count = u64::MAX;
+        refresh_manifest_hash(&mut m);
+
+        let r = validate_manifest(&m);
+        assert!(r.is_valid(), "findings: {:#?}", r.findings);
+        assert!(
+            r.warnings()
+                .iter()
+                .any(|f| f.check == "vector_count_consistency")
         );
     }
 

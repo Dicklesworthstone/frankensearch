@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch_core::generation::{ArtifactGenerationIdentityV1, GenerationComponentReceiptV1};
 use frankensearch_quill::{QuillConfig, QuillSearchIndex};
 use serde::{Deserialize, Serialize};
@@ -317,6 +318,31 @@ impl NativeBuiltShardedHybridIndex {
             .await
     }
 
+    /// Fast-plus-global-lexical retrieval with the complete shard traversal on
+    /// the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Propagates embedding, shard retrieval, lexical, fusion, and hydration errors.
+    pub async fn search_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        self.vectors
+            .fast
+            .search_hybrid_text_with_pool(
+                cx,
+                self.vectors.partitions[0].fast.embedder(),
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )
+            .await
+    }
+
     /// Independent quality retrieval, not rescoring only the fast candidates.
     /// A declared fast-only cohort executes fast search; required-tier errors
     /// never silently remove quality or omit a failing partition.
@@ -352,6 +378,42 @@ impl NativeBuiltShardedHybridIndex {
         }
     }
 
+    /// Refined fast/quality shard retrieval with both complete inventories on
+    /// the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Propagates all configured retrieval, fusion and hydration failures.
+    pub async fn search_refined_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        let first = &self.vectors.partitions[0];
+        match (&self.vectors.quality, &first.quality) {
+            (Some(shards), Some(tier)) => {
+                self.vectors
+                    .fast
+                    .search_hybrid_refined_text_with_pool(
+                        cx,
+                        first.fast.embedder(),
+                        (shards, tier.embedder()),
+                        &self.lexical,
+                        text,
+                        k,
+                        pool,
+                    )
+                    .await
+            }
+            (None, None) => self.search_with_pool(cx, text, k, pool).await,
+            _ => Err(rejected(
+                "quality",
+                "quality inventory and provider must travel together",
+            )),
+        }
+    }
+
     /// Quality-primary plus lexical retrieval without invoking the fast provider.
     ///
     /// # Errors
@@ -374,6 +436,32 @@ impl NativeBuiltShardedHybridIndex {
             .ok_or_else(|| rejected("quality", "quality provider was not configured"))?;
         shards
             .search_hybrid_quality_text(cx, tier.embedder(), &self.lexical, text, k)
+            .await
+    }
+
+    /// Quality-primary sharded hybrid retrieval on the caller-owned pool.
+    ///
+    /// # Errors
+    /// Refuses absent quality, including zero-result queries, and propagates errors.
+    pub async fn search_quality_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<NativeShardedResult>> {
+        checkpoint(cx, "native_ann.sharded_hybrid.quality_pool")?;
+        let shards = self
+            .vectors
+            .quality
+            .as_ref()
+            .ok_or_else(|| rejected("quality", "quality tier was not configured"))?;
+        let tier = self.vectors.partitions[0]
+            .quality
+            .as_ref()
+            .ok_or_else(|| rejected("quality", "quality provider was not configured"))?;
+        shards
+            .search_hybrid_quality_text_with_pool(cx, tier.embedder(), &self.lexical, text, k, pool)
             .await
     }
 
@@ -404,6 +492,36 @@ impl NativeBuiltShardedHybridIndex {
         )
     }
 
+    /// Prepare progressive sharded retrieval with retained inventory traversal
+    /// on the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Refuses invalid identity, topology, candidate budgets or cancellation.
+    pub fn progressive_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        let first = &self.vectors.partitions[0];
+        let quality = self
+            .vectors
+            .quality
+            .as_ref()
+            .zip(first.quality.as_ref())
+            .map(|(shards, tier)| (shards, tier.embedder()));
+        self.vectors.fast.search_hybrid_progressive_with_pool(
+            cx,
+            first.fast.embedder(),
+            quality,
+            &self.lexical,
+            text,
+            k,
+            pool,
+        )
+    }
+
     /// Add lazy cross-encoder ordering of source text from this exact cohort.
     /// The window can exceed displayed k. Source and per-tier shard rows remain
     /// tied to this handle throughout every phase, including scorer failure.
@@ -419,6 +537,23 @@ impl NativeBuiltShardedHybridIndex {
         window: usize,
     ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
         self.progressive(cx, text, k)?
+            .with_reranker(reranker, self.text.as_ref(), window)
+    }
+
+    /// Pool-aware progressive sharded retrieval plus retained-source reranking.
+    ///
+    /// # Errors
+    /// Combines progressive admission and native reranker configuration errors.
+    pub fn progressive_with_reranker_on_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeShardedProgressiveSearch<'a>> {
+        self.progressive_with_pool(cx, text, k, pool)?
             .with_reranker(reranker, self.text.as_ref(), window)
     }
 

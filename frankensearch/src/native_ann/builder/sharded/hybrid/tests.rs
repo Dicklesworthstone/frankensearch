@@ -7,6 +7,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
+
+use asupersync::runtime::blocking_pool::BlockingPool;
 
 use crate::native_ann::NativeShardedSearchPhase;
 use crate::native_ann::builder::tests::{Provider, Reply, generation};
@@ -151,6 +154,115 @@ impl Embedder for Directional {
             })
         })
     }
+}
+
+#[test]
+fn pooled_sharded_queries_match_inline_results_and_rows() {
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async move {
+        let cx = Cx::current().expect("runtime context");
+        let parent = tempfile::tempdir().unwrap();
+        let (fast, quality) = models();
+        let built = builder(&parent.path().join("partitioned"), &fast, &quality, true)
+            .build_sharded_hybrid(&cx, 2)
+            .await
+            .unwrap();
+        let pool = BlockingPool::new(0, 2);
+        let handle = pool.handle();
+
+        for query in ["vertical", "horizontal", "title:rare", "notincorpus"] {
+            let inline = built.search(&cx, query, 5).await.unwrap();
+            let pooled = built
+                .search_with_pool(&cx, query, 5, handle.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    inline
+                        .iter()
+                        .map(|hit| (&hit.result, hit.fast_row, hit.quality_row))
+                        .collect::<Vec<_>>()
+                )
+                .unwrap(),
+                serde_json::to_value(
+                    pooled
+                        .iter()
+                        .map(|hit| (&hit.result, hit.fast_row, hit.quality_row))
+                        .collect::<Vec<_>>()
+                )
+                .unwrap()
+            );
+
+            let inline = built.search_refined(&cx, query, 5).await.unwrap();
+            let pooled = built
+                .search_refined_with_pool(&cx, query, 5, handle.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                inline
+                    .iter()
+                    .map(|hit| (
+                        hit.result.doc_id.as_str(),
+                        hit.fast_row,
+                        hit.quality_row,
+                        hit.result.score.to_bits()
+                    ))
+                    .collect::<Vec<_>>(),
+                pooled
+                    .iter()
+                    .map(|hit| (
+                        hit.result.doc_id.as_str(),
+                        hit.fast_row,
+                        hit.quality_row,
+                        hit.result.score.to_bits()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+
+            let inline = built.search_quality(&cx, query, 5).await.unwrap();
+            let pooled = built
+                .search_quality_with_pool(&cx, query, 5, handle.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                inline
+                    .iter()
+                    .map(|hit| (
+                        hit.result.doc_id.as_str(),
+                        hit.fast_row,
+                        hit.quality_row,
+                        hit.result.score.to_bits()
+                    ))
+                    .collect::<Vec<_>>(),
+                pooled
+                    .iter()
+                    .map(|hit| (
+                        hit.result.doc_id.as_str(),
+                        hit.fast_row,
+                        hit.quality_row,
+                        hit.result.score.to_bits()
+                    ))
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        let mut inline = built.progressive(&cx, "vertical", 2).unwrap();
+        let mut pooled = built
+            .progressive_with_pool(&cx, "vertical", 2, handle)
+            .unwrap();
+        loop {
+            let left = inline.next_phase().await.unwrap();
+            let right = pooled.next_phase().await.unwrap();
+            assert_eq!(format!("{right:?}"), format!("{left:?}"));
+            if left.is_none() {
+                break;
+            }
+        }
+
+        assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
+    });
 }
 
 #[test]

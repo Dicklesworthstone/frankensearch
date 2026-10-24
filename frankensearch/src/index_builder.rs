@@ -2040,8 +2040,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    #[cfg(target_os = "linux")]
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     #[cfg(not(any(feature = "lexical", feature = "quill")))]
     use asupersync::types::CancelKind;
@@ -2303,30 +2301,25 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn owned_admitted_v2_sync_dir() -> std::path::PathBuf {
-        static NONCE: AtomicU64 = AtomicU64::new(0);
-        let parent = std::env::temp_dir().join("frankensearch_admitted_v2_sync_tests");
-        std::fs::create_dir_all(&parent).expect("create durable test parent");
-        for _ in 0..1024 {
-            let nonce = NONCE.fetch_add(1, AtomicOrdering::Relaxed);
-            let dir = parent.join(format!(
-                "{}-{}-{nonce}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ));
-            match std::fs::create_dir(&dir) {
-                Ok(()) => return dir,
-                // A name this process already minted: fall through to the next
-                // nonce. The match is the loop body's final expression, so an
-                // empty arm retries exactly as an explicit `continue` did.
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => panic!("create unique admitted-v2 sync directory: {error}"),
-            }
+    struct OwnedAdmittedV2SyncDir(tempfile::TempDir);
+
+    #[cfg(target_os = "linux")]
+    impl std::ops::Deref for OwnedAdmittedV2SyncDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.0.path()
         }
-        panic!("exhausted admitted-v2 sync test directory names")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn owned_admitted_v2_sync_dir() -> OwnedAdmittedV2SyncDir {
+        OwnedAdmittedV2SyncDir(
+            tempfile::Builder::new()
+                .prefix("frankensearch_admitted_v2_sync_tests_")
+                .tempdir()
+                .expect("create unique admitted-v2 sync directory"),
+        )
     }
 
     struct StubEmbedder {
@@ -3723,14 +3716,56 @@ mod tests {
     }
 
     #[cfg(feature = "lexical-tantivy")]
-    fn retained_tantivy_builder_dir() -> PathBuf {
+    struct TantivyBuilderTestDir(Option<tempfile::TempDir>);
+
+    #[cfg(feature = "lexical-tantivy")]
+    impl std::ops::Deref for TantivyBuilderTestDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            self.0
+                .as_ref()
+                .expect("live Tantivy builder fixture")
+                .path()
+        }
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    impl AsRef<std::path::Path> for TantivyBuilderTestDir {
+        fn as_ref(&self) -> &std::path::Path {
+            self
+        }
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    impl AsRef<std::ffi::OsStr> for TantivyBuilderTestDir {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.as_os_str()
+        }
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    impl Drop for TantivyBuilderTestDir {
+        fn drop(&mut self) {
+            if std::thread::panicking()
+                && let Some(dir) = self.0.take()
+            {
+                let path = dir.keep();
+                eprintln!(
+                    "retained Tantivy builder fixture on panic: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn retained_tantivy_builder_dir() -> TantivyBuilderTestDir {
         let dir = tempfile::Builder::new()
             .prefix("frankensearch-tantivy-builder-")
             .tempdir()
-            .expect("create Tantivy builder fixture")
-            .keep();
-        eprintln!("retained Tantivy builder fixture: {}", dir.display());
-        dir
+            .expect("create Tantivy builder fixture");
+        TantivyBuilderTestDir(Some(dir))
     }
 
     #[cfg(all(feature = "hash", feature = "lexical-tantivy"))]

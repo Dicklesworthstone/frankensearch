@@ -23,7 +23,9 @@ use crate::document_content::read_document_content;
 use crate::{ClaimOutcome, ClaimedJob, Storage};
 
 mod reader;
-pub use reader::{PublishedEmbeddingReadLimits, PublishedEmbeddingScanStats, PublishedEmbeddingSnapshot};
+pub use reader::{
+    PublishedEmbeddingReadLimits, PublishedEmbeddingScanStats, PublishedEmbeddingSnapshot,
+};
 
 /// Shared by fresh bootstrap and the additive v10 migration.
 pub(crate) const CREATE_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS published_embeddings (\
@@ -130,7 +132,10 @@ impl Storage {
         claim: &ClaimedJob,
         embedder: &dyn Embedder,
     ) -> SearchResult<ClaimOutcome<()>> {
-        match self.attempt_claimed_publication(cx, claim, embedder).await? {
+        match self
+            .attempt_claimed_publication(cx, claim, embedder)
+            .await?
+        {
             ClaimOutcome::Applied(PublicationAttempt::Published) => Ok(ClaimOutcome::Applied(())),
             ClaimOutcome::Applied(PublicationAttempt::Rejected { error, .. }) => Err(error),
             ClaimOutcome::LostClaim => Ok(ClaimOutcome::LostClaim),
@@ -170,7 +175,9 @@ impl Storage {
         let Some(text) = text else {
             return reject_attempt(
                 document.content_hash,
-                publication_error("complete canonical input is not retained; re-ingest the document"),
+                publication_error(
+                    "complete canonical input is not retained; re-ingest the document",
+                ),
             );
         };
 
@@ -239,16 +246,18 @@ impl Storage {
         publication_checkpoint(cx)?;
         // A publication failure rolls back all writes and propagates. It is
         // never fed to queue.fail as though the provider rejected this job.
-        Ok(match self.publish_claimed_embedding(
-            claim,
-            &document.content_hash,
-            &expected,
-            &response,
-        )? {
-            ClaimOutcome::Applied(()) => ClaimOutcome::Applied(PublicationAttempt::Published),
-            ClaimOutcome::LostClaim => ClaimOutcome::LostClaim,
-            ClaimOutcome::Superseded => ClaimOutcome::Superseded,
-        })
+        Ok(
+            match self.publish_claimed_embedding(
+                claim,
+                &document.content_hash,
+                &expected,
+                &response,
+            )? {
+                ClaimOutcome::Applied(()) => ClaimOutcome::Applied(PublicationAttempt::Published),
+                ClaimOutcome::LostClaim => ClaimOutcome::LostClaim,
+                ClaimOutcome::Superseded => ClaimOutcome::Superseded,
+            },
+        )
     }
 
     /// Publish a prepared response and complete its exact attempt atomically.
@@ -281,7 +290,8 @@ impl Storage {
             // Admit ownership first: even a malformed late response cannot
             // fail a successor or hide the fact that this attempt lost its claim.
             validate_response(expected_identity, response)?;
-            let identity_json = serde_json::to_string(expected_identity).map_err(map_storage_error)?;
+            let identity_json =
+                serde_json::to_string(expected_identity).map_err(map_storage_error)?;
             let vector_le = encode_vector(&response.values)?;
             let now_ms = unix_ms()?;
             let record_hash = publication_hash(
@@ -318,7 +328,9 @@ impl Storage {
                 .execute_with_params_sync(COMPLETE_ATTEMPT_SQL, &params)
                 .map_err(map_storage_error)?;
             if updated != 1 {
-                return Err(publication_error("attempt changed during atomic publication"));
+                return Err(publication_error(
+                    "attempt changed during atomic publication",
+                ));
             }
             mark_embedded_inner(conn, &claim.doc_id, &claim.embedder_id, now_ms)?;
             Ok(ClaimOutcome::Applied(()))
@@ -338,7 +350,9 @@ impl Storage {
         expected_identity: &EmbeddingIdentityBundleV1,
     ) -> SearchResult<Option<PublishedEmbedding>> {
         if doc_id.trim().is_empty() || embedder_id.trim().is_empty() {
-            return Err(publication_error("document and embedder IDs must not be empty"));
+            return Err(publication_error(
+                "document and embedder IDs must not be empty",
+            ));
         }
         reader::validate_read_identity(expected_identity)?;
         self.transaction(|conn| {
@@ -401,7 +415,9 @@ fn capture_producer(
     queued_id: &str,
 ) -> SearchResult<EmbeddingIdentityBundleV1> {
     if embedder.id() != queued_id {
-        return Err(publication_error("provider does not match the queued embedder"));
+        return Err(publication_error(
+            "provider does not match the queued embedder",
+        ));
     }
     let identity = embedder.identity()?.clone();
     identity.validate()?;
@@ -413,7 +429,9 @@ fn capture_producer(
             "native-f32-values" | "native-test-only"
         )
     {
-        return Err(publication_error("provider must declare matching in-memory f32 output"));
+        return Err(publication_error(
+            "provider must declare matching in-memory f32 output",
+        ));
     }
     Ok(identity)
 }
@@ -435,7 +453,10 @@ fn owned_document(
         return Ok(ClaimOutcome::LostClaim);
     }
     if let Some(document) = get_document_inner(conn, &claim.doc_id)?
-        && claim.content_hash.as_ref().is_none_or(|hash| *hash == document.content_hash)
+        && claim
+            .content_hash
+            .as_ref()
+            .is_none_or(|hash| *hash == document.content_hash)
         && expected_hash.is_none_or(|hash| *hash == document.content_hash)
     {
         return Ok(ClaimOutcome::Applied(document));
@@ -452,7 +473,9 @@ fn claim_params(claim: &ClaimedJob) -> [SqliteValue; 6] {
         text_value(&claim.worker_id),
         text_value(&claim.doc_id),
         text_value(&claim.embedder_id),
-        claim.content_hash.map_or(SqliteValue::Null, |hash| SqliteValue::Blob(hash.to_vec().into())),
+        claim.content_hash.map_or(SqliteValue::Null, |hash| {
+            SqliteValue::Blob(hash.to_vec().into())
+        }),
     ]
 }
 
@@ -461,18 +484,36 @@ fn validate_response(
     response: &IdentityBoundEmbedding,
 ) -> SearchResult<()> {
     if &response.identity != expected {
-        return Err(publication_error("embedding response differs from the admitted producer"));
+        return Err(publication_error(
+            "embedding response differs from the admitted producer",
+        ));
     }
     response.validate()?;
-    let norm_sq: f32 = response.values.iter().map(|value| value * value).sum();
+    // Widen BEFORE multiplying. Finite f32 coordinates can have squares that
+    // overflow f32 or underflow to zero, although their cosine is well-defined.
+    // The identity bounds dimension to u32, so every finite f32 vector's
+    // squared norm fits f64. Match the exact reader's arithmetic without
+    // normalizing or rewriting any stored coordinate bits.
+    let norm_sq: f64 = response
+        .values
+        .iter()
+        .map(|&value| {
+            let value = f64::from(value);
+            value * value
+        })
+        .sum();
     if norm_sq == 0.0 || !norm_sq.is_finite() {
-        return Err(publication_error("embedding must have finite, non-zero squared norm"));
+        return Err(publication_error(
+            "embedding must have finite, non-zero squared norm",
+        ));
     }
     Ok(())
 }
 
 fn encode_vector(values: &[f32]) -> SearchResult<Vec<u8>> {
-    let length = values.len().checked_mul(4)
+    let length = values
+        .len()
+        .checked_mul(4)
         .ok_or_else(|| publication_error("embedding byte length overflow"))?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(length).map_err(map_storage_error)?;
@@ -494,7 +535,13 @@ fn publication_hash(
     hasher.update(b"frankensearch.published-embedding.v1\0");
     // Length framing prevents ambiguous field boundaries and binds row keys,
     // producer, source revision, vector bytes, attempt, and publication time.
-    for part in [doc_id.as_bytes(), embedder_id.as_bytes(), content_hash.as_slice(), identity_json.as_bytes(), vector_le] {
+    for part in [
+        doc_id.as_bytes(),
+        embedder_id.as_bytes(),
+        content_hash.as_slice(),
+        identity_json.as_bytes(),
+        vector_le,
+    ] {
         let length = u64::try_from(part.len())
             .map_err(|_| publication_error("embedding record field length overflow"))?;
         hasher.update(length.to_le_bytes());
@@ -513,31 +560,40 @@ fn text_value(value: &str) -> SqliteValue {
 fn text_column(row: &Row, column: usize) -> SearchResult<&str> {
     match row.get(column) {
         Some(SqliteValue::Text(value)) => Ok(value),
-        _ => Err(publication_error("embedding record text column has an invalid type")),
+        _ => Err(publication_error(
+            "embedding record text column has an invalid type",
+        )),
     }
 }
 
 fn blob_column(row: &Row, column: usize) -> SearchResult<&[u8]> {
     match row.get(column) {
         Some(SqliteValue::Blob(value)) => Ok(value),
-        _ => Err(publication_error("embedding record blob column has an invalid type")),
+        _ => Err(publication_error(
+            "embedding record blob column has an invalid type",
+        )),
     }
 }
 
 fn hash_column(row: &Row, column: usize) -> SearchResult<[u8; 32]> {
-    blob_column(row, column)?.try_into()
+    blob_column(row, column)?
+        .try_into()
         .map_err(|_| publication_error("embedding record digest must have 32 bytes"))
 }
 
 fn integer_column(row: &Row, column: usize) -> SearchResult<i64> {
     match row.get(column) {
         Some(SqliteValue::Integer(value)) => Ok(*value),
-        _ => Err(publication_error("embedding record integer column has an invalid type")),
+        _ => Err(publication_error(
+            "embedding record integer column has an invalid type",
+        )),
     }
 }
 
 fn unix_ms() -> SearchResult<i64> {
-    let duration = SystemTime::now().duration_since(UNIX_EPOCH).map_err(map_storage_error)?;
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(map_storage_error)?;
     i64::try_from(duration.as_millis())
         .map_err(|_| publication_error("embedding publication timestamp overflow"))
 }
@@ -582,38 +638,67 @@ mod tests {
         }
     }
 
-    fn fixture() -> (Arc<Storage>, PersistentJobQueue, ClaimedJob, IdentityBoundEmbedding) {
+    fn fixture() -> (
+        Arc<Storage>,
+        PersistentJobQueue,
+        ClaimedJob,
+        IdentityBoundEmbedding,
+    ) {
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
         let doc = document("doc", "original body");
         storage.upsert_document(&doc).unwrap();
-        storage.set_document_content("doc", "original body").unwrap();
+        storage
+            .set_document_content("doc", "original body")
+            .unwrap();
         queue.enqueue("doc", "model", &doc.content_hash, 0).unwrap();
         let claim = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
         (storage, queue, claim, response("model", vec![0.6, 0.8]))
     }
 
     fn rows(storage: &Storage, sql: &str, columns: usize) -> Vec<Vec<SqliteValue>> {
-        storage.connection().query_sync(sql).unwrap().iter().map(|row| {
-            (0..columns).map(|column| row.get(column).unwrap().clone()).collect()
-        }).collect()
+        storage
+            .connection()
+            .query_sync(sql)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (0..columns)
+                    .map(|column| row.get(column).unwrap().clone())
+                    .collect()
+            })
+            .collect()
     }
 
     fn state(storage: &Storage) -> Vec<Vec<Vec<SqliteValue>>> {
         vec![
             rows(storage, "SELECT * FROM embedding_jobs ORDER BY job_id;", 14),
-            rows(storage, "SELECT * FROM embedding_status ORDER BY doc_id, embedder_id;", 7),
-            rows(storage, "SELECT * FROM published_embeddings ORDER BY doc_id, embedder_id;", 10),
+            rows(
+                storage,
+                "SELECT * FROM embedding_status ORDER BY doc_id, embedder_id;",
+                7,
+            ),
+            rows(
+                storage,
+                "SELECT * FROM published_embeddings ORDER BY doc_id, embedder_id;",
+                10,
+            ),
         ]
     }
 
-    fn publish(storage: &Storage, claim: &ClaimedJob, output: &IdentityBoundEmbedding) -> ClaimOutcome<()> {
-        storage.publish_claimed_embedding(
-            claim,
-            &ContentHasher::hash("original body"),
-            &output.identity,
-            output,
-        ).unwrap()
+    fn publish(
+        storage: &Storage,
+        claim: &ClaimedJob,
+        output: &IdentityBoundEmbedding,
+    ) -> ClaimOutcome<()> {
+        storage
+            .publish_claimed_embedding(
+                claim,
+                &ContentHasher::hash("original body"),
+                &output.identity,
+                output,
+            )
+            .unwrap()
     }
 
     #[test]
@@ -632,20 +717,35 @@ mod tests {
             storage.upsert_document(&doc).unwrap();
             queue.enqueue("doc", "model", &doc.content_hash, 0).unwrap();
             claim = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
-            assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
+            assert_eq!(
+                publish(&storage, &claim, &output),
+                ClaimOutcome::Applied(())
+            );
             assert_eq!(queue.queue_depth().unwrap().completed, 1);
             assert_eq!(queue.queue_depth().unwrap().processing, 0);
             assert_eq!(storage.count_by_status("model").unwrap().embedded, 1);
         }
         let storage = Storage::open(config).unwrap();
-        let retained = storage.get_published_embedding("doc", "model", &output.identity).unwrap().unwrap();
+        let retained = storage
+            .get_published_embedding("doc", "model", &output.identity)
+            .unwrap()
+            .unwrap();
         assert_eq!(retained.source_job_id, claim.job_id);
         assert_eq!(retained.claim_epoch, claim.claim_epoch);
         assert_eq!(retained.content_hash, ContentHasher::hash("original body"));
         assert_eq!(retained.embedding.identity, output.identity);
         assert_eq!(
-            retained.embedding.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            output.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            retained
+                .embedding
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            output
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
         );
         assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::LostClaim);
     }
@@ -653,17 +753,33 @@ mod tests {
     #[test]
     fn reclaimed_same_worker_cannot_overwrite_successor_vector() {
         let (storage, queue, old, old_output) = fixture();
-        storage.connection().execute_sync("UPDATE embedding_jobs SET started_at = 0;").unwrap();
+        storage
+            .connection()
+            .execute_sync("UPDATE embedding_jobs SET started_at = 0;")
+            .unwrap();
         assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
         let current = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
         assert_eq!(current.job_id, old.job_id);
         assert_eq!(current.claim_epoch, old.claim_epoch + 1);
         let output = response("model", vec![0.8, 0.6]);
-        assert_eq!(publish(&storage, &current, &output), ClaimOutcome::Applied(()));
+        assert_eq!(
+            publish(&storage, &current, &output),
+            ClaimOutcome::Applied(())
+        );
         let before = state(&storage);
-        assert_eq!(publish(&storage, &old, &old_output), ClaimOutcome::LostClaim);
+        assert_eq!(
+            publish(&storage, &old, &old_output),
+            ClaimOutcome::LostClaim
+        );
         assert_eq!(state(&storage), before);
-        assert_eq!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().unwrap().embedding, output);
+        assert_eq!(
+            storage
+                .get_published_embedding("doc", "model", &output.identity)
+                .unwrap()
+                .unwrap()
+                .embedding,
+            output
+        );
     }
 
     #[test]
@@ -681,14 +797,21 @@ mod tests {
                 "hash" => forged.content_hash = None,
                 _ => unreachable!(),
             }
-            assert_eq!(publish(&storage, &forged, &output), ClaimOutcome::LostClaim, "{field}");
+            assert_eq!(
+                publish(&storage, &forged, &output),
+                ClaimOutcome::LostClaim,
+                "{field}"
+            );
             assert_eq!(state(&storage), before, "{field}");
         }
         let mut malformed = output.clone();
         malformed.values = vec![f32::NAN];
         let mut stale = claim.clone();
         stale.claim_epoch = 0;
-        assert_eq!(publish(&storage, &stale, &malformed), ClaimOutcome::LostClaim);
+        assert_eq!(
+            publish(&storage, &stale, &malformed),
+            ClaimOutcome::LostClaim
+        );
         assert_eq!(state(&storage), before);
     }
 
@@ -697,37 +820,76 @@ mod tests {
         let (storage, queue, old, output) = fixture();
         let current_doc = document("doc", "replacement body");
         storage.upsert_document(&current_doc).unwrap();
-        queue.enqueue("doc", "model", &current_doc.content_hash, 0).unwrap();
+        queue
+            .enqueue("doc", "model", &current_doc.content_hash, 0)
+            .unwrap();
         let catalog_before = rows(&storage, "SELECT * FROM embedding_status;", 7);
         assert_eq!(publish(&storage, &old, &output), ClaimOutcome::Superseded);
-        assert_eq!(rows(&storage, "SELECT * FROM embedding_status;", 7), catalog_before);
+        assert_eq!(
+            rows(&storage, "SELECT * FROM embedding_status;", 7),
+            catalog_before
+        );
         assert!(rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty());
         assert_eq!(queue.queue_depth().unwrap().pending, 1);
         let current = queue.claim_batch("next", 1).unwrap().pop().unwrap();
-        assert_eq!(storage.publish_claimed_embedding(
-            &current, &current_doc.content_hash, &output.identity, &output,
-        ).unwrap(), ClaimOutcome::Applied(()));
-        assert_eq!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().unwrap().content_hash, current_doc.content_hash);
+        assert_eq!(
+            storage
+                .publish_claimed_embedding(
+                    &current,
+                    &current_doc.content_hash,
+                    &output.identity,
+                    &output,
+                )
+                .unwrap(),
+            ClaimOutcome::Applied(())
+        );
+        assert_eq!(
+            storage
+                .get_published_embedding("doc", "model", &output.identity)
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            current_doc.content_hash
+        );
     }
 
     #[test]
     fn invalid_outputs_leave_claim_catalog_and_previous_vectors_unchanged() {
         let (storage, queue, first, output) = fixture();
-        assert_eq!(publish(&storage, &first, &output), ClaimOutcome::Applied(()));
-        queue.enqueue("doc", "model", &ContentHasher::hash("original body"), 0).unwrap();
+        assert_eq!(
+            publish(&storage, &first, &output),
+            ClaimOutcome::Applied(())
+        );
+        queue
+            .enqueue("doc", "model", &ContentHasher::hash("original body"), 0)
+            .unwrap();
         let claim = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
         let before = state(&storage);
         let mut candidates = Vec::new();
-        for values in [vec![], vec![0.5], vec![f32::NAN, 1.0], vec![f32::INFINITY, 1.0], vec![0.0, -0.0], vec![f32::MAX, 1.0]] {
+        for values in [
+            vec![],
+            vec![0.5],
+            vec![f32::NAN, 1.0],
+            vec![f32::INFINITY, 1.0],
+            vec![0.0, -0.0],
+            vec![f32::NEG_INFINITY, 1.0],
+        ] {
             let mut invalid = output.clone();
             invalid.values = values;
             candidates.push(invalid);
         }
         candidates.push(response("different-producer", vec![0.6, 0.8]));
         for invalid in candidates {
-            assert!(storage.publish_claimed_embedding(
-                &claim, &ContentHasher::hash("original body"), &output.identity, &invalid,
-            ).is_err());
+            assert!(
+                storage
+                    .publish_claimed_embedding(
+                        &claim,
+                        &ContentHasher::hash("original body"),
+                        &output.identity,
+                        &invalid,
+                    )
+                    .is_err()
+            );
             assert_eq!(state(&storage), before);
         }
     }
@@ -735,24 +897,45 @@ mod tests {
     #[test]
     fn final_catalog_failure_rolls_back_vector_queue_and_completed_history() {
         let (storage, queue, first, output) = fixture();
-        assert_eq!(publish(&storage, &first, &output), ClaimOutcome::Applied(()));
-        queue.enqueue("doc", "model", &ContentHasher::hash("original body"), 0).unwrap();
+        assert_eq!(
+            publish(&storage, &first, &output),
+            ClaimOutcome::Applied(())
+        );
+        queue
+            .enqueue("doc", "model", &ContentHasher::hash("original body"), 0)
+            .unwrap();
         let claim = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
         let before = state(&storage);
         // Owned-attempt admission does not read embedding_status. This fails
         // after both the vector UPSERT and queue/history transitions occurred.
-        storage.connection().execute_sync(
-            "ALTER TABLE embedding_status RENAME COLUMN status TO unavailable_status;",
-        ).unwrap();
+        storage
+            .connection()
+            .execute_sync(
+                "ALTER TABLE embedding_status RENAME COLUMN status TO unavailable_status;",
+            )
+            .unwrap();
         let replacement = response("model", vec![0.8, 0.6]);
-        assert!(storage.publish_claimed_embedding(
-            &claim, &ContentHasher::hash("original body"), &replacement.identity, &replacement,
-        ).is_err());
+        assert!(
+            storage
+                .publish_claimed_embedding(
+                    &claim,
+                    &ContentHasher::hash("original body"),
+                    &replacement.identity,
+                    &replacement,
+                )
+                .is_err()
+        );
         assert_eq!(state(&storage), before);
-        storage.connection().execute_sync(
-            "ALTER TABLE embedding_status RENAME COLUMN unavailable_status TO status;",
-        ).unwrap();
-        assert_eq!(publish(&storage, &claim, &replacement), ClaimOutcome::Applied(()));
+        storage
+            .connection()
+            .execute_sync(
+                "ALTER TABLE embedding_status RENAME COLUMN unavailable_status TO status;",
+            )
+            .unwrap();
+        assert_eq!(
+            publish(&storage, &claim, &replacement),
+            ClaimOutcome::Applied(())
+        );
         assert_eq!(queue.queue_depth().unwrap().completed, 1);
     }
 
@@ -768,75 +951,254 @@ mod tests {
             "UPDATE published_embeddings SET record_version = 2;",
         ] {
             let (storage, _queue, claim, output) = fixture();
-            assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
+            assert_eq!(
+                publish(&storage, &claim, &output),
+                ClaimOutcome::Applied(())
+            );
             storage.connection().execute_sync(mutation).unwrap();
-            assert!(storage.get_published_embedding("doc", "model", &output.identity).is_err(), "{mutation}");
+            assert!(
+                storage
+                    .get_published_embedding("doc", "model", &output.identity)
+                    .is_err(),
+                "{mutation}"
+            );
         }
     }
 
     #[test]
     fn producer_mismatch_is_not_silent_reinterpretation() {
         let (storage, _queue, claim, output) = fixture();
-        assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
+        assert_eq!(
+            publish(&storage, &claim, &output),
+            ClaimOutcome::Applied(())
+        );
         let foreign = response("foreign", vec![0.6, 0.8]);
-        assert!(storage.get_published_embedding("doc", "model", &foreign.identity).is_err());
-        assert_eq!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().unwrap().embedding, output);
+        assert!(
+            storage
+                .get_published_embedding("doc", "model", &foreign.identity)
+                .is_err()
+        );
+        assert_eq!(
+            storage
+                .get_published_embedding("doc", "model", &output.identity)
+                .unwrap()
+                .unwrap()
+                .embedding,
+            output
+        );
     }
 
     #[test]
     fn current_revision_and_catalog_status_gate_vector_visibility() {
         for status in ["pending", "failed", "skipped"] {
             let (storage, _queue, claim, output) = fixture();
-            assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
-            storage.connection().execute_with_params_sync(
-                "UPDATE embedding_status SET status = ?1;", &[text_value(status)],
-            ).unwrap();
-            assert!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().is_none());
+            assert_eq!(
+                publish(&storage, &claim, &output),
+                ClaimOutcome::Applied(())
+            );
+            storage
+                .connection()
+                .execute_with_params_sync(
+                    "UPDATE embedding_status SET status = ?1;",
+                    &[text_value(status)],
+                )
+                .unwrap();
+            assert!(
+                storage
+                    .get_published_embedding("doc", "model", &output.identity)
+                    .unwrap()
+                    .is_none()
+            );
         }
         let (storage, _queue, claim, output) = fixture();
-        assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
-        storage.upsert_document(&document("doc", "new body")).unwrap();
+        assert_eq!(
+            publish(&storage, &claim, &output),
+            ClaimOutcome::Applied(())
+        );
+        storage
+            .upsert_document(&document("doc", "new body"))
+            .unwrap();
         // Even an out-of-band mark_embedded cannot bless the old vector's hash.
         storage.mark_embedded("doc", "model").unwrap();
-        assert!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().is_none());
+        assert!(
+            storage
+                .get_published_embedding("doc", "model", &output.identity)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn deleting_document_cascades_vectors_but_pruning_jobs_does_not() {
         let (storage, _queue, claim, output) = fixture();
-        assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
-        storage.connection().execute_sync("DELETE FROM embedding_jobs;").unwrap();
-        assert!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().is_some());
+        assert_eq!(
+            publish(&storage, &claim, &output),
+            ClaimOutcome::Applied(())
+        );
+        storage
+            .connection()
+            .execute_sync("DELETE FROM embedding_jobs;")
+            .unwrap();
+        assert!(
+            storage
+                .get_published_embedding("doc", "model", &output.identity)
+                .unwrap()
+                .is_some()
+        );
         assert!(storage.delete_document("doc").unwrap());
         assert!(rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty());
-        storage.upsert_document(&document("doc", "original body")).unwrap();
+        storage
+            .upsert_document(&document("doc", "original body"))
+            .unwrap();
         storage.mark_embedded("doc", "model").unwrap();
-        assert!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().is_none());
+        assert!(
+            storage
+                .get_published_embedding("doc", "model", &output.identity)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn legacy_unknown_claim_hash_is_bound_to_the_captured_input_revision() {
         let (storage, queue, old, output) = fixture();
-        storage.connection().execute_sync("UPDATE embedding_jobs SET content_hash = NULL, started_at = 0;").unwrap();
+        storage
+            .connection()
+            .execute_sync("UPDATE embedding_jobs SET content_hash = NULL, started_at = 0;")
+            .unwrap();
         assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
         let legacy = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
         assert_eq!(legacy.content_hash, None);
         assert_eq!(publish(&storage, &old, &output), ClaimOutcome::LostClaim);
-        assert_eq!(publish(&storage, &legacy, &output), ClaimOutcome::Applied(()));
-        assert_eq!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().unwrap().content_hash, ContentHasher::hash("original body"));
+        assert_eq!(
+            publish(&storage, &legacy, &output),
+            ClaimOutcome::Applied(())
+        );
+        assert_eq!(
+            storage
+                .get_published_embedding("doc", "model", &output.identity)
+                .unwrap()
+                .unwrap()
+                .content_hash,
+            ContentHasher::hash("original body")
+        );
     }
 
     #[test]
     fn fast_and_quality_publications_do_not_replace_each_other() {
         let (storage, queue, fast, output) = fixture();
         assert_eq!(publish(&storage, &fast, &output), ClaimOutcome::Applied(()));
-        queue.enqueue("doc", "quality", &ContentHasher::hash("original body"), 0).unwrap();
+        queue
+            .enqueue("doc", "quality", &ContentHasher::hash("original body"), 0)
+            .unwrap();
         let quality = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
         let quality_output = response("quality", vec![1.0, 0.0, 0.0]);
-        assert_eq!(publish(&storage, &quality, &quality_output), ClaimOutcome::Applied(()));
-        assert_eq!(storage.get_published_embedding("doc", "model", &output.identity).unwrap().unwrap().embedding, output);
-        assert_eq!(storage.get_published_embedding("doc", "quality", &quality_output.identity).unwrap().unwrap().embedding, quality_output);
-        assert_eq!(rows(&storage, "SELECT * FROM published_embeddings;", 10).len(), 2);
+        assert_eq!(
+            publish(&storage, &quality, &quality_output),
+            ClaimOutcome::Applied(())
+        );
+        assert_eq!(
+            storage
+                .get_published_embedding("doc", "model", &output.identity)
+                .unwrap()
+                .unwrap()
+                .embedding,
+            output
+        );
+        assert_eq!(
+            storage
+                .get_published_embedding("doc", "quality", &quality_output.identity)
+                .unwrap()
+                .unwrap()
+                .embedding,
+            quality_output
+        );
+        assert_eq!(
+            rows(&storage, "SELECT * FROM published_embeddings;", 10).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn norm_admission_does_not_overflow_or_underflow_finite_coordinates() {
+        for values in [
+            vec![f32::MAX, 1.0],
+            vec![f32::MAX, f32::MAX],
+            vec![f32::MIN_POSITIVE, -0.0],
+            vec![f32::from_bits(1), -0.0],
+            vec![3.0, 4.0],
+        ] {
+            let output = response("model", values);
+            let before: Vec<_> = output.values.iter().map(|v| v.to_bits()).collect();
+            validate_response(&output.identity, &output).unwrap();
+            assert_eq!(
+                output.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                before
+            );
+        }
+        // Correcting arithmetic must not admit genuinely undefined cosines.
+        for values in [
+            vec![0.0, -0.0],
+            vec![f32::NAN, 1.0],
+            vec![f32::INFINITY, 1.0],
+            vec![f32::NEG_INFINITY, 1.0],
+        ] {
+            let output = response("model", values);
+            assert!(validate_response(&output.identity, &output).is_err());
+        }
+    }
+
+    #[test]
+    fn extreme_finite_publications_round_trip_and_agree_with_exact_queries() {
+        use frankensearch_core::BoundQueryEmbedding;
+        use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for scale in [f32::MAX, f32::MIN_POSITIVE, f32::from_bits(1)] {
+                let (storage, _queue, claim, _) = fixture();
+                let mut output = response("model", vec![scale, -0.0]);
+                // Synthetic semantic admission, not evidence of model quality.
+                output.identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+                output.identity.space.hash_control = None;
+                output.identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+                output.identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+                    role: "weights".to_owned(),
+                    sha256: "b".repeat(64),
+                    size: 1,
+                }];
+                output.identity.producer.space_fingerprint = output.identity.space.fingerprint();
+                output.identity.validate().unwrap();
+                assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
+                let point = storage
+                    .get_published_embedding("doc", "model", &output.identity)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(point.embedding.values[0].to_bits(), scale.to_bits());
+                assert_eq!(point.embedding.values[1].to_bits(), (-0.0_f32).to_bits());
+                let query = BoundQueryEmbedding::new(vec![1.0, 0.0], output.identity.clone())
+                    .unwrap();
+                let limits = crate::PublishedSearchReadLimits::default();
+                let captured = storage
+                    .load_published_embeddings(&cx, "model", &output.identity, limits.embeddings)
+                    .unwrap();
+                let expected = captured.search(&cx, &query, 1).unwrap();
+                assert_eq!(expected.len(), 1);
+                assert_eq!(expected[0].score.to_bits(), 1.0_f32.to_bits());
+                let direct = storage
+                    .query_published_embeddings(&cx, "model", &query, 1, limits.embeddings)
+                    .unwrap();
+                assert_eq!(direct.hits().len(), 1);
+                assert_eq!(direct.hits()[0].hit(), &expected[0]);
+                assert_eq!(direct.hits()[0].publication(), &point);
+                let hydrated = storage
+                    .query_published_search(&cx, "model", &query, 1, limits)
+                    .unwrap();
+                assert_eq!(hydrated.hits().len(), 1);
+                assert_eq!(hydrated.hits()[0].hit(), &expected[0]);
+                assert_eq!(hydrated.hits()[0].publication(), &point);
+                assert_eq!(hydrated.hits()[0].document().canonical_text(), "original body");
+            }
+        });
     }
 
     mod inference {
@@ -896,8 +1258,12 @@ mod tests {
 
         impl Drop for ScopedHook {
             fn drop(&mut self) {
-                INFERENCE_HOOK.with(|slot| { slot.borrow_mut().take(); });
-                METADATA_HOOK.with(|slot| { slot.borrow_mut().take(); });
+                INFERENCE_HOOK.with(|slot| {
+                    slot.borrow_mut().take();
+                });
+                METADATA_HOOK.with(|slot| {
+                    slot.borrow_mut().take();
+                });
             }
         }
 
@@ -926,7 +1292,9 @@ mod tests {
         impl Embedder for Probe {
             fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
                 let hook = METADATA_HOOK.with(|slot| slot.borrow_mut().take());
-                if let Some(hook) = hook { hook(); }
+                if let Some(hook) = hook {
+                    hook();
+                }
                 if self.behavior == Behavior::MissingIdentity {
                     return Err(publication_error("test provider has no identity"));
                 }
@@ -952,11 +1320,19 @@ mod tests {
                     // Drop the non-Send callback before yielding the Send future.
                     {
                         let hook = INFERENCE_HOOK.with(|slot| slot.borrow_mut().take());
-                        if let Some(hook) = hook { hook(); }
+                        if let Some(hook) = hook {
+                            hook();
+                        }
                     }
                     asupersync::runtime::yield_now().await;
-                    if matches!(self.behavior, Behavior::CancelSuccess | Behavior::CancelFailure) {
-                        cx.cancel_with(asupersync::CancelKind::User, Some("cancel atomic inference"));
+                    if matches!(
+                        self.behavior,
+                        Behavior::CancelSuccess | Behavior::CancelFailure
+                    ) {
+                        cx.cancel_with(
+                            asupersync::CancelKind::User,
+                            Some("cancel atomic inference"),
+                        );
                     }
                     if self.behavior == Behavior::TypedCancellation {
                         return Err(SearchError::Cancelled {
@@ -964,10 +1340,16 @@ mod tests {
                             reason: "typed cancellation without changing Cx".to_owned(),
                         });
                     }
-                    if matches!(self.behavior, Behavior::DriftSuccess | Behavior::DriftFailure) {
+                    if matches!(
+                        self.behavior,
+                        Behavior::DriftSuccess | Behavior::DriftFailure
+                    ) {
                         self.drifted.store(true, Ordering::SeqCst);
                     }
-                    if matches!(self.behavior, Behavior::Failure | Behavior::CancelFailure | Behavior::DriftFailure) {
+                    if matches!(
+                        self.behavior,
+                        Behavior::Failure | Behavior::CancelFailure | Behavior::DriftFailure
+                    ) {
                         return Err(SearchError::EmbeddingFailed {
                             model: "model".to_owned(),
                             source: Box::new(io::Error::other("provider failed after its await")),
@@ -985,23 +1367,38 @@ mod tests {
             }
 
             fn dimension(&self) -> usize {
-                if self.behavior == Behavior::WrongDimension { 3 } else { 2 }
+                if self.behavior == Behavior::WrongDimension {
+                    3
+                } else {
+                    2
+                }
             }
 
             fn id(&self) -> &'static str {
-                if self.behavior == Behavior::WrongRouting { "wrong-model" } else { "model" }
+                if self.behavior == Behavior::WrongRouting {
+                    "wrong-model"
+                } else {
+                    "model"
+                }
             }
 
-            fn model_name(&self) -> &'static str { "model" }
-            fn is_semantic(&self) -> bool { true }
-            fn category(&self) -> ModelCategory { ModelCategory::StaticEmbedder }
+            fn model_name(&self) -> &'static str {
+                "model"
+            }
+            fn is_semantic(&self) -> bool {
+                true
+            }
+            fn category(&self) -> ModelCategory {
+                ModelCategory::StaticEmbedder
+            }
         }
 
         #[test]
         fn complete_retained_input_is_embedded_outside_any_database_transaction() {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let storage = Arc::new(Storage::open_in_memory().unwrap());
-                let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
+                let queue =
+                    PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
                 let body = "canonical café 日本語 body \0 tail ".repeat(100);
                 let doc = document("doc", &body);
                 assert_eq!(doc.content_preview.chars().count(), 400);
@@ -1017,10 +1414,24 @@ mod tests {
                     // transaction were still open on this same connection.
                     hook_storage.transaction(|_| Ok(())).unwrap();
                 });
-                assert_eq!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await.unwrap(), ClaimOutcome::Applied(()));
+                assert_eq!(
+                    storage
+                        .embed_and_publish_claimed(&cx, &claim, &probe)
+                        .await
+                        .unwrap(),
+                    ClaimOutcome::Applied(())
+                );
                 assert_eq!(*probe.inputs.lock().unwrap(), vec![body]);
                 assert_eq!(queue.queue_depth().unwrap().completed, 1);
-                assert_eq!(storage.get_published_embedding("doc", "model", &probe.identity).unwrap().unwrap().embedding.values, vec![0.6, 0.8]);
+                assert_eq!(
+                    storage
+                        .get_published_embedding("doc", "model", &probe.identity)
+                        .unwrap()
+                        .unwrap()
+                        .embedding
+                        .values,
+                    vec![0.6, 0.8]
+                );
             });
         }
 
@@ -1036,7 +1447,12 @@ mod tests {
                     storage.connection().execute_sync(mutation).unwrap();
                     let before = state(&storage);
                     let probe = Probe::new(Behavior::Valid);
-                    assert!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await.is_err());
+                    assert!(
+                        storage
+                            .embed_and_publish_claimed(&cx, &claim, &probe)
+                            .await
+                            .is_err()
+                    );
                     assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
                     assert_eq!(state(&storage), before);
                 });
@@ -1045,12 +1461,21 @@ mod tests {
 
         #[test]
         fn wrong_provider_metadata_is_rejected_before_inference() {
-            for behavior in [Behavior::WrongRouting, Behavior::WrongDimension, Behavior::MissingIdentity] {
+            for behavior in [
+                Behavior::WrongRouting,
+                Behavior::WrongDimension,
+                Behavior::MissingIdentity,
+            ] {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let (storage, _queue, claim, _) = fixture();
                     let before = state(&storage);
                     let probe = Probe::new(behavior);
-                    assert!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await.is_err());
+                    assert!(
+                        storage
+                            .embed_and_publish_claimed(&cx, &claim, &probe)
+                            .await
+                            .is_err()
+                    );
                     assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
                     assert_eq!(state(&storage), before);
                 });
@@ -1059,19 +1484,36 @@ mod tests {
 
         #[test]
         fn provider_errors_foreign_responses_and_identity_drift_never_publish() {
-            for behavior in [Behavior::Failure, Behavior::InvalidVector, Behavior::ForeignResponse, Behavior::DriftSuccess, Behavior::DriftFailure] {
+            for behavior in [
+                Behavior::Failure,
+                Behavior::InvalidVector,
+                Behavior::ForeignResponse,
+                Behavior::DriftSuccess,
+                Behavior::DriftFailure,
+            ] {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let (storage, queue, claim, _) = fixture();
                     let before = state(&storage);
                     let probe = Probe::new(behavior);
-                    assert!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await.is_err());
+                    assert!(
+                        storage
+                            .embed_and_publish_claimed(&cx, &claim, &probe)
+                            .await
+                            .is_err()
+                    );
                     assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
                     assert_eq!(state(&storage), before);
                     assert_eq!(queue.queue_depth().unwrap().processing, 1);
                     // Failure did not consume the valid claim. Its owner can
                     // retry explicitly, or let bounded lease recovery handle it.
                     let good = Probe::new(Behavior::Valid);
-                    assert_eq!(storage.embed_and_publish_claimed(&cx, &claim, &good).await.unwrap(), ClaimOutcome::Applied(()));
+                    assert_eq!(
+                        storage
+                            .embed_and_publish_claimed(&cx, &claim, &good)
+                            .await
+                            .unwrap(),
+                        ClaimOutcome::Applied(())
+                    );
                 });
             }
         }
@@ -1085,14 +1527,20 @@ mod tests {
                     let cancel_cx = cx.clone();
                     let _hook = if during_metadata {
                         Some(ScopedHook::metadata(move || {
-                            cancel_cx.cancel_with(asupersync::CancelKind::User, Some("metadata cancellation"));
+                            cancel_cx.cancel_with(
+                                asupersync::CancelKind::User,
+                                Some("metadata cancellation"),
+                            );
                         }))
                     } else {
                         cx.cancel_with(asupersync::CancelKind::User, Some("already cancelled"));
                         None
                     };
                     let probe = Probe::new(Behavior::MissingIdentity);
-                    assert!(matches!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await, Err(SearchError::Cancelled { .. })));
+                    assert!(matches!(
+                        storage.embed_and_publish_claimed(&cx, &claim, &probe).await,
+                        Err(SearchError::Cancelled { .. })
+                    ));
                     assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
                     assert_eq!(state(&storage), before);
                 });
@@ -1101,12 +1549,19 @@ mod tests {
 
         #[test]
         fn cancellation_after_the_provider_await_preserves_the_uncompleted_claim() {
-            for behavior in [Behavior::CancelSuccess, Behavior::CancelFailure, Behavior::TypedCancellation] {
+            for behavior in [
+                Behavior::CancelSuccess,
+                Behavior::CancelFailure,
+                Behavior::TypedCancellation,
+            ] {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let (storage, _queue, claim, _) = fixture();
                     let before = state(&storage);
                     let probe = Probe::new(behavior);
-                    assert!(matches!(storage.embed_and_publish_claimed(&cx, &claim, &probe).await, Err(SearchError::Cancelled { .. })));
+                    assert!(matches!(
+                        storage.embed_and_publish_claimed(&cx, &claim, &probe).await,
+                        Err(SearchError::Cancelled { .. })
+                    ));
                     assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
                     assert_eq!(state(&storage), before);
                 });
@@ -1115,7 +1570,12 @@ mod tests {
 
         #[test]
         fn a_late_success_or_failure_cannot_overwrite_the_reclaimed_successor() {
-            for behavior in [Behavior::Valid, Behavior::Failure, Behavior::InvalidVector, Behavior::ForeignResponse] {
+            for behavior in [
+                Behavior::Valid,
+                Behavior::Failure,
+                Behavior::InvalidVector,
+                Behavior::ForeignResponse,
+            ] {
                 asupersync::test_utils::run_test_with_cx(|cx| async move {
                     let (storage, queue, old, _) = fixture();
                     let hook_storage = Arc::clone(&storage);
@@ -1123,17 +1583,37 @@ mod tests {
                     let hook_state = Rc::clone(&state_after);
                     let _hook = ScopedHook::inference(move || {
                         assert!(!hook_storage.connection().in_transaction());
-                        hook_storage.connection().execute_sync("UPDATE embedding_jobs SET started_at = 0;").unwrap();
+                        hook_storage
+                            .connection()
+                            .execute_sync("UPDATE embedding_jobs SET started_at = 0;")
+                            .unwrap();
                         assert_eq!(queue.reclaim_stale_jobs().unwrap(), 1);
                         let current = queue.claim_batch("worker", 1).unwrap().pop().unwrap();
                         let output = response("model", vec![0.8, 0.6]);
-                        assert_eq!(publish(&hook_storage, &current, &output), ClaimOutcome::Applied(()));
+                        assert_eq!(
+                            publish(&hook_storage, &current, &output),
+                            ClaimOutcome::Applied(())
+                        );
                         *hook_state.borrow_mut() = Some(state(&hook_storage));
                     });
                     let probe = Probe::new(behavior);
-                    assert_eq!(storage.embed_and_publish_claimed(&cx, &old, &probe).await.unwrap(), ClaimOutcome::LostClaim);
+                    assert_eq!(
+                        storage
+                            .embed_and_publish_claimed(&cx, &old, &probe)
+                            .await
+                            .unwrap(),
+                        ClaimOutcome::LostClaim
+                    );
                     assert_eq!(state(&storage), state_after.borrow().clone().unwrap());
-                    assert_eq!(storage.get_published_embedding("doc", "model", &probe.identity).unwrap().unwrap().embedding.values, vec![0.8, 0.6]);
+                    assert_eq!(
+                        storage
+                            .get_published_embedding("doc", "model", &probe.identity)
+                            .unwrap()
+                            .unwrap()
+                            .embedding
+                            .values,
+                        vec![0.8, 0.6]
+                    );
                 });
             }
         }
@@ -1145,7 +1625,10 @@ mod tests {
                     asupersync::test_utils::run_test_with_cx(|cx| async move {
                         let (storage, queue, mut old, _) = fixture();
                         if legacy {
-                            storage.connection().execute_sync("UPDATE embedding_jobs SET content_hash = NULL;").unwrap();
+                            storage
+                                .connection()
+                                .execute_sync("UPDATE embedding_jobs SET content_hash = NULL;")
+                                .unwrap();
                             old.content_hash = None;
                         }
                         let hook_storage = Arc::clone(&storage);
@@ -1153,19 +1636,44 @@ mod tests {
                         let _hook = ScopedHook::inference(move || {
                             let doc = document("doc", "new body");
                             hook_storage.upsert_document(&doc).unwrap();
-                            hook_storage.set_document_content("doc", "new body").unwrap();
-                            hook_queue.enqueue("doc", "model", &doc.content_hash, 0).unwrap();
+                            hook_storage
+                                .set_document_content("doc", "new body")
+                                .unwrap();
+                            hook_queue
+                                .enqueue("doc", "model", &doc.content_hash, 0)
+                                .unwrap();
                         });
                         let probe = Probe::new(behavior);
-                        assert_eq!(storage.embed_and_publish_claimed(&cx, &old, &probe).await.unwrap(), ClaimOutcome::Superseded);
+                        assert_eq!(
+                            storage
+                                .embed_and_publish_claimed(&cx, &old, &probe)
+                                .await
+                                .unwrap(),
+                            ClaimOutcome::Superseded
+                        );
                         assert_eq!(queue.queue_depth().unwrap().pending, 1);
                         assert_eq!(queue.queue_depth().unwrap().processing, 0);
-                        assert!(rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty());
+                        assert!(
+                            rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty()
+                        );
                         let current = queue.claim_batch("next", 1).unwrap().pop().unwrap();
                         let good = Probe::new(Behavior::Valid);
-                        assert_eq!(storage.embed_and_publish_claimed(&cx, &current, &good).await.unwrap(), ClaimOutcome::Applied(()));
+                        assert_eq!(
+                            storage
+                                .embed_and_publish_claimed(&cx, &current, &good)
+                                .await
+                                .unwrap(),
+                            ClaimOutcome::Applied(())
+                        );
                         assert_eq!(*good.inputs.lock().unwrap(), vec!["new body"]);
-                        assert_eq!(storage.get_published_embedding("doc", "model", &good.identity).unwrap().unwrap().content_hash, ContentHasher::hash("new body"));
+                        assert_eq!(
+                            storage
+                                .get_published_embedding("doc", "model", &good.identity)
+                                .unwrap()
+                                .unwrap()
+                                .content_hash,
+                            ContentHasher::hash("new body")
+                        );
                     });
                 }
             }
@@ -1177,10 +1685,18 @@ mod tests {
                 let (storage, _queue, old, _) = fixture();
                 let hook_storage = Arc::clone(&storage);
                 let _hook = ScopedHook::metadata(move || {
-                    hook_storage.upsert_document(&document("doc", "new body")).unwrap();
+                    hook_storage
+                        .upsert_document(&document("doc", "new body"))
+                        .unwrap();
                 });
                 let probe = Probe::new(Behavior::Valid);
-                assert_eq!(storage.embed_and_publish_claimed(&cx, &old, &probe).await.unwrap(), ClaimOutcome::Superseded);
+                assert_eq!(
+                    storage
+                        .embed_and_publish_claimed(&cx, &old, &probe)
+                        .await
+                        .unwrap(),
+                    ClaimOutcome::Superseded
+                );
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
                 assert!(rows(&storage, "SELECT * FROM published_embeddings;", 10).is_empty());
             });
@@ -1190,11 +1706,21 @@ mod tests {
         fn rejected_legacy_attempt_retains_its_original_revision_for_failure_fencing() {
             asupersync::test_utils::run_test_with_cx(|cx| async move {
                 let (storage, queue, mut claim, _) = fixture();
-                storage.connection().execute_sync("UPDATE embedding_jobs SET content_hash = NULL;").unwrap();
+                storage
+                    .connection()
+                    .execute_sync("UPDATE embedding_jobs SET content_hash = NULL;")
+                    .unwrap();
                 claim.content_hash = None;
                 let probe = Probe::new(Behavior::Failure);
-                let attempt = storage.attempt_claimed_publication(&cx, &claim, &probe).await.unwrap();
-                let ClaimOutcome::Applied(PublicationAttempt::Rejected { document_hash, error }) = attempt else {
+                let attempt = storage
+                    .attempt_claimed_publication(&cx, &claim, &probe)
+                    .await
+                    .unwrap();
+                let ClaimOutcome::Applied(PublicationAttempt::Rejected {
+                    document_hash,
+                    error,
+                }) = attempt
+                else {
                     panic!("expected a revision-bound provider rejection: {attempt:?}");
                 };
                 assert_eq!(document_hash, ContentHasher::hash("original body"));
@@ -1202,9 +1728,18 @@ mod tests {
                 assert_eq!(queue.metrics().snapshot().total_retried, 0);
                 let replacement = document("doc", "replacement body");
                 storage.upsert_document(&replacement).unwrap();
-                storage.set_document_content("doc", "replacement body").unwrap();
-                queue.enqueue("doc", "model", &replacement.content_hash, 0).unwrap();
-                assert_eq!(queue.fail(&claim, &document_hash, &error.to_string()).unwrap(), ClaimOutcome::Superseded);
+                storage
+                    .set_document_content("doc", "replacement body")
+                    .unwrap();
+                queue
+                    .enqueue("doc", "model", &replacement.content_hash, 0)
+                    .unwrap();
+                assert_eq!(
+                    queue
+                        .fail(&claim, &document_hash, &error.to_string())
+                        .unwrap(),
+                    ClaimOutcome::Superseded
+                );
                 assert_eq!(queue.queue_depth().unwrap().pending, 1);
                 assert_eq!(queue.queue_depth().unwrap().failed, 0);
                 assert_eq!(storage.count_by_status("model").unwrap().failed, 0);
@@ -1221,13 +1756,18 @@ mod tests {
                     // replacement in the post-inference identity callback.
                     METADATA_HOOK.with(|slot| {
                         *slot.borrow_mut() = Some(Box::new(move || {
-                            hook_storage.upsert_document(&document("doc", "replacement body")).unwrap();
+                            hook_storage
+                                .upsert_document(&document("doc", "replacement body"))
+                                .unwrap();
                         }));
                     });
                 });
                 let probe = Probe::new(Behavior::DriftFailure);
                 assert!(matches!(
-                    storage.attempt_claimed_publication(&cx, &claim, &probe).await.unwrap(),
+                    storage
+                        .attempt_claimed_publication(&cx, &claim, &probe)
+                        .await
+                        .unwrap(),
                     ClaimOutcome::Superseded
                 ));
                 assert_eq!(queue.queue_depth().unwrap().processing, 0);

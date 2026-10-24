@@ -78,7 +78,12 @@ impl RetentionOutcome {
             Self::Reported(plan) => format!(
                 "retention report: {} older generation(s), {:.1} MB reclaimable",
                 plan.reclaimable.len(),
-                megabytes(plan.reclaimable.iter().map(|generation| generation.bytes).sum())
+                megabytes(
+                    plan.reclaimable
+                        .iter()
+                        .map(|generation| generation.bytes)
+                        .sum()
+                )
             ),
             Self::Off => "predecessors retained".to_owned(),
             Self::Failed { mode, error } => {
@@ -165,8 +170,8 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let Some(root) = self.complete_generation_command_root(initialize_store)? else {
             return match shutdown {
-                Some(shutdown) => self.run_mode_with_shutdown(cx, mode, shutdown).await,
-                None => self.run_mode(cx, mode).await,
+                Some(shutdown) => Box::pin(self.run_mode_with_shutdown(cx, mode, shutdown)).await,
+                None => Box::pin(self.run_mode(cx, mode)).await,
             };
         };
         let dashboard = mode == InterfaceMode::Tui || self.cli_input.command == CliCommand::Tui;
@@ -179,51 +184,57 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
         if dashboard {
-            return self.run_complete_generation_tui(cx, &root).await;
+            return Box::pin(self.run_complete_generation_tui(cx, &root)).await;
         }
         let mut stdout = std::io::stdout();
         match self.cli_input.command {
             CliCommand::Index if !self.cli_input.watch && !self.config.indexing.watch_mode => {
-                self.run_complete_generation_index_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_index_with_writer(cx, &root, &mut stdout))
                     .await
             }
             #[cfg(unix)]
             CliCommand::Watch | CliCommand::Index => graceful_stop(
-                self.run_complete_generation_watch_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_watch_with_writer(cx, &root, &mut stdout))
                     .await,
                 shutdown,
             ),
             CliCommand::Search => {
-                self.run_complete_generation_search_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_search_with_writer(cx, &root, &mut stdout))
                     .await
             }
             CliCommand::Explain => {
-                self.run_complete_generation_explain_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_explain_with_writer(cx, &root, &mut stdout))
                     .await
             }
             CliCommand::Flush => {
                 self.run_complete_generation_flush_with_writer(cx, &root, &mut stdout)
             }
             CliCommand::Delete => {
-                self.run_complete_generation_delete_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_delete_with_writer(cx, &root, &mut stdout))
                     .await
             }
             CliCommand::AppendBatch => {
-                self.run_complete_generation_append_batch_with_writer(cx, &root, &mut stdout)
-                    .await
+                Box::pin(self.run_complete_generation_append_batch_with_writer(
+                    cx,
+                    &root,
+                    &mut stdout,
+                ))
+                .await
             }
             CliCommand::Compact => {
-                self.run_complete_generation_compact_with_writer(cx, &root, &mut stdout)
+                Box::pin(self.run_complete_generation_compact_with_writer(cx, &root, &mut stdout))
                     .await
             }
             #[cfg(unix)]
-            CliCommand::Serve => {
-                graceful_stop(self.run_complete_generation_serve(cx, &root).await, shutdown)
-            }
+            CliCommand::Serve => graceful_stop(
+                Box::pin(self.run_complete_generation_serve(cx, &root)).await,
+                shutdown,
+            ),
             #[cfg(unix)]
-            CliCommand::Daemon => {
-                graceful_stop(self.run_complete_generation_daemon(cx, &root).await, shutdown)
-            }
+            CliCommand::Daemon => graceful_stop(
+                Box::pin(self.run_complete_generation_daemon(cx, &root)).await,
+                shutdown,
+            ),
             CliCommand::Status | CliCommand::Doctor => {
                 let reader = self.open_complete_generation_diagnostics(cx, &root)?;
                 if self.cli_input.command == CliCommand::Status {
@@ -247,13 +258,21 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         let store = CompleteGenerationStore::open(cx, root)?;
         let generation = store.active(cx)?;
-        // A failed first build can leave only staging. Status and doctor must
-        // still describe that absent index. Admit the inventory, not search
-        // resources: a missing model is diagnostic information, not a reason
-        // to load/download a model or refuse inspection of the store.
-        let described = generation
-            .as_ref()
-            .map_or_else(|| root.to_path_buf(), |selected| selected.path().to_path_buf());
+        retained_search_checkpoint(cx)?;
+        // A surviving legacy root cannot prove current authority after the
+        // complete-generation protocol has been selected.
+        if generation.is_none() && legacy_index_exists(store.root())? {
+            return Err(complete_cli_error(
+                "selection",
+                "no complete generation is selected; legacy artifacts cannot establish current authority; repair the selection or rebuild the complete store",
+            ));
+        }
+        // A failed first build with no legacy artifacts can still describe an
+        // absent index without loading or downloading semantic models.
+        let described = generation.as_ref().map_or_else(
+            || root.to_path_buf(),
+            |selected| selected.path().to_path_buf(),
+        );
         let mut input = self.cli_input.clone();
         input.index_dir = Some(described);
         input.daemon = false;
@@ -369,17 +388,11 @@ impl FsfsRuntime {
         ) {
             return Ok(None);
         }
-        let root = if matches!(
-            self.cli_input.command,
-            CliCommand::Index | CliCommand::Watch
-        ) {
+        let root = if matches!(self.cli_input.command, CliCommand::Index | CliCommand::Watch) {
             self.resolve_index_root(&self.resolve_target_root()?)?
         } else {
             self.resolve_status_index_root()?
         };
-        // An otherwise new legacy index below a sealed bundle would still
-        // change its inventory. Check every ancestor before allowing fallback,
-        // including when --index-dir names a child that does not exist yet.
         for ancestor in root.ancestors() {
             if complete_entry_exists(&ancestor.join(COMPLETE_GENERATION_MANIFEST))? {
                 return Err(complete_cli_error(
@@ -388,57 +401,47 @@ impl FsfsRuntime {
                 ));
             }
         }
-        // Check directory entries, not Path::exists: a dangling symlink or an
-        // unreadable descriptor is not permission to enter the legacy path.
-        let selected = complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?;
-        let staging = complete_entry_exists(&root.join("generations"))?;
+
+        // Complete-store entries select the authority protocol, not merely a
+        // healthy generation. Missing/corrupt selection must never reactivate
+        // stale legacy data, including through the mutating legacy daemon.
+        if complete_entry_exists(&root.join(COMPLETE_GENERATION_POINTER))?
+            || complete_entry_exists(&root.join("generations"))?
+        {
+            return Ok(Some(root));
+        }
+
+        // Only a build may choose a new layout.
+        if !matches!(self.cli_input.command, CliCommand::Index | CliCommand::Watch) {
+            return Ok(None);
+        }
+        if initialize_store {
+            return Ok(Some(root));
+        }
+        if !self.complete_generations_for_new_roots
+            || !store_admits_source(&root, &self.resolve_target_root()?)
+        {
+            return Ok(None);
+        }
+
         let legacy = legacy_index_exists(&root)?;
-        // Routing uses completion only to decide whether a safe predecessor
-        // exists. Malformed legacy metadata stays on a fail-closed path and is
-        // diagnosed by the ordinary legacy admission instead of being upgraded.
+        let one_shot_index = self.cli_input.command == CliCommand::Index
+            && !self.cli_input.watch
+            && !self.config.indexing.watch_mode;
+        let watch_start = self.cli_input.command == CliCommand::Watch
+            || (self.cli_input.command == CliCommand::Index
+                && (self.cli_input.watch || self.config.indexing.watch_mode));
+        // On the default complete-generation policy, a completed legacy root
+        // is converted before a watcher takes ownership. The generation build
+        // later acquires this same root's publication lease, so a competing
+        // legacy writer refuses promotion instead of racing the seed copy.
         let legacy_complete = legacy
+            && (one_shot_index || watch_start)
             && Self::read_index_sentinel(&root)
                 .ok()
                 .flatten()
                 .is_some_and(|sentinel| sentinel.generation_complete);
-
-        // A one-shot migration builds entirely below generations/ and leaves
-        // the legacy predecessor untouched until FSFS-CURRENT is published.
-        // Keep read-only traffic on that predecessor while the first complete
-        // generation is staging, including after an interrupted migration.
-        // Once a pointer exists it is authoritative: corruption there must be
-        // surfaced rather than hidden by a legacy fallback.
-        let read_only = matches!(
-            self.cli_input.command,
-            CliCommand::Search
-                | CliCommand::Serve
-                | CliCommand::Status
-                | CliCommand::Doctor
-                | CliCommand::Daemon
-                | CliCommand::Explain
-                | CliCommand::Tui
-        );
-        if !selected && staging && legacy_complete && read_only {
-            return Ok(None);
-        }
-
-        // Only a build chooses a layout. Explicit opt-in still accepts any
-        // admissible root. The platform default starts new roots and also
-        // migrates a completed legacy root on a one-shot index rebuild; an
-        // interrupted legacy root stays on the legacy recovery path. Watch
-        // keeps its existing layout unless explicitly opted in.
-        let builds = matches!(
-            self.cli_input.command,
-            CliCommand::Index | CliCommand::Watch
-        );
-        let one_shot_index = self.cli_input.command == CliCommand::Index
-            && !self.cli_input.watch
-            && !self.config.indexing.watch_mode;
-        let default_complete_build = self.complete_generations_for_new_roots
-            && store_admits_source(&root, &self.resolve_target_root()?)
-            && (!legacy || (one_shot_index && legacy_complete));
-        let starts_complete = builds && (initialize_store || default_complete_build);
-        Ok((selected || staging || starts_complete).then_some(root))
+        Ok((!legacy || legacy_complete).then_some(root))
     }
 
     /// Confirm durability of the selected immutable bundle without rescanning
@@ -499,7 +502,9 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         let started = Instant::now();
-        let (publication, summary) = self.rebuild_retained_generation_with_summary(cx, root).await?;
+        let (publication, summary) = self
+            .rebuild_retained_generation_with_summary(cx, root)
+            .await?;
         let generation = require_durable_publication(publication)?;
         let retention = self.retire_superseded_generations(cx, root);
         let build = IndexBuildReport {
@@ -791,12 +796,7 @@ impl FsfsRuntime {
                 "Compacted all present vector tiers into an isolated successor"
             )?;
             return self.emit_complete_generation_receipt(
-                root,
-                generation,
-                "compact",
-                retention,
-                None,
-                writer,
+                root, generation, "compact", retention, None, writer,
             );
         }
         payload["generation_changed"] = serde_json::json!(generation.is_some());
@@ -1544,7 +1544,10 @@ mod diagnostic_retention_tests {
                     .open_complete_generation_diagnostics(&cx, root.path())
                     .unwrap();
                 assert_eq!(reader.runtime.cli_input.command, command);
-                assert_eq!(reader.runtime.cli_input.index_dir.as_deref(), Some(old_path.as_path()));
+                assert_eq!(
+                    reader.runtime.cli_input.index_dir.as_deref(),
+                    Some(old_path.as_path())
+                );
                 assert_eq!(runtime.cli_input.index_dir.as_deref(), Some(root.path()));
                 drop(publish_bundle(&store, &cx));
                 let current = publish_bundle(&store, &cx);
@@ -1580,7 +1583,10 @@ mod diagnostic_retention_tests {
                     .open_complete_generation_diagnostics(&cx, root.path())
                     .unwrap();
                 assert!(reader.generation.is_none());
-                assert_eq!(reader.runtime.cli_input.index_dir.as_deref(), Some(root.path()));
+                assert_eq!(
+                    reader.runtime.cli_input.index_dir.as_deref(),
+                    Some(root.path())
+                );
                 assert!(abandoned.is_dir());
                 assert!(!root.path().join("missing-models").exists());
                 assert!(!root.path().join(COMPLETE_GENERATION_POINTER).exists());
@@ -1592,6 +1598,39 @@ mod diagnostic_retention_tests {
                     if field == "complete_generation.selection"
             ));
             assert!(abandoned.is_dir());
+        });
+    }
+
+    #[test]
+    fn diagnostics_refuse_stale_legacy_root_without_complete_selection() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let build = store.begin(&cx).unwrap();
+            drop(build);
+            let runtime = diagnostic_runtime(root.path(), CliCommand::Status);
+            let sentinel = super::super::IndexSentinel {
+                schema_version: 1,
+                generation_complete: true,
+                generated_at_ms: 1,
+                command: "index".to_owned(),
+                target_root: root.path().display().to_string(),
+                index_root: root.path().display().to_string(),
+                discovered_files: 1,
+                indexed_files: 1,
+                skipped_files: 0,
+                reason_codes: Vec::new(),
+                total_canonical_bytes: 1,
+                source_hash_hex: "stale-legacy".to_owned(),
+                fast_window_max_per_file: 1,
+            };
+            runtime.write_index_sentinel(root.path(), &sentinel).unwrap();
+            assert!(matches!(
+                runtime.open_complete_generation_diagnostics(&cx, root.path()),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "complete_generation.selection"
+            ));
+            assert!(!root.path().join(COMPLETE_GENERATION_POINTER).exists());
         });
     }
 
@@ -1641,7 +1680,10 @@ mod diagnostic_retention_tests {
                     std::slice::from_ref(&old_id)
                 );
                 assert_eq!(reader.generation.as_ref().unwrap().id(), old_id);
-                Err(complete_cli_error("diagnostic_test", "injected inspection failure"))
+                Err(complete_cli_error(
+                    "diagnostic_test",
+                    "injected inspection failure",
+                ))
             })();
             assert!(matches!(result, Err(SearchError::InvalidConfig { .. })));
             assert_eq!(store.collect_retained(&cx, 0).unwrap().removed, [old_id]);
@@ -1692,7 +1734,10 @@ mod diagnostic_retention_tests {
             assert_eq!(receipt["ok"], true);
             assert_eq!(receipt["data"]["publication"], "durable");
             assert_eq!(receipt["data"]["generation_id"], selected.id());
-            assert_eq!(receipt["data"]["retention"]["partial_collection_possible"], true);
+            assert_eq!(
+                receipt["data"]["retention"]["partial_collection_possible"],
+                true
+            );
             assert!(receipt["data"]["retention"]["error"].is_string());
             runtime.cli_input.format = OutputFormat::Table;
             output.clear();
@@ -1780,7 +1825,10 @@ mod diagnostic_retention_tests {
             assert_eq!(receipt["mode"], mode.as_str());
             assert_eq!(receipt["error"], "injected failure");
             assert_eq!(receipt["partial_collection_possible"], partial);
-            assert_eq!(outcome.summary().contains("no generations removed"), !partial);
+            assert_eq!(
+                outcome.summary().contains("no generations removed"),
+                !partial
+            );
         }
     }
 }
@@ -2123,7 +2171,10 @@ mod tests {
                 .unwrap();
             let text = String::from_utf8(output).unwrap();
             assert!(text.starts_with("Discovered 1 file(s) under "), "{text}");
-            let line = text.lines().find(|line| line.starts_with("Indexed ")).unwrap();
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("Indexed "))
+                .unwrap();
             let tokens = line.split_whitespace().collect::<Vec<_>>();
             let after = |marker: &str| {
                 tokens
@@ -2140,7 +2191,10 @@ mod tests {
                 .active(&cx)
                 .unwrap()
                 .unwrap();
-            assert!(line.contains(&selected.path().display().to_string()), "{line}");
+            assert!(
+                line.contains(&selected.path().display().to_string()),
+                "{line}"
+            );
         });
     }
 
@@ -2223,7 +2277,10 @@ mod tests {
             .unwrap();
             assert_eq!(lexical["data"]["skip_reason"], "lexical_only", "{lexical}");
             // The lexical-only reader never opened the vector tier.
-            assert!(lexical["data"]["vector_generation_id"].is_null(), "{lexical}");
+            assert!(
+                lexical["data"]["vector_generation_id"].is_null(),
+                "{lexical}"
+            );
             let hits = lexical["data"]["hits"].as_array().unwrap();
             assert_eq!(hits.len(), 1, "{lexical}");
             assert!(
@@ -2296,8 +2353,11 @@ mod tests {
             );
 
             let batch = directory.path().join("append.jsonl");
-            fs::write(&batch, r#"{"id":"notes/kiwi.md","text":"sharedtoken kiwi birds"}"#)
-                .unwrap();
+            fs::write(
+                &batch,
+                r#"{"id":"notes/kiwi.md","text":"sharedtoken kiwi birds"}"#,
+            )
+            .unwrap();
             let mut append = runtime.clone();
             append.cli_input.command = CliCommand::AppendBatch;
             append.cli_input.input_file = Some(batch);
@@ -2333,7 +2393,10 @@ mod tests {
                 .unwrap();
             let compacted: serde_json::Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(compacted["data"]["lexical_only"], true, "{compacted}");
-            assert_eq!(compacted["data"]["generation_changed"], false, "{compacted}");
+            assert_eq!(
+                compacted["data"]["generation_changed"], false,
+                "{compacted}"
+            );
             assert_eq!(
                 store.active(&cx).unwrap().unwrap().id(),
                 active.id(),
@@ -2382,7 +2445,8 @@ mod tests {
                     });
                     let finished = Arc::new(Mutex::new(handle));
                     *daemon_thread.lock().unwrap() = Some(finished.clone());
-                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished())) as DaemonExited)
+                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished()))
+                        as DaemonExited)
                 }))
             };
 
@@ -2409,7 +2473,10 @@ mod tests {
                 .run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new())
                 .await
                 .unwrap();
-            assert!(spawns.lock().unwrap().is_empty(), "--no-daemon starts nothing");
+            assert!(
+                spawns.lock().unwrap().is_empty(),
+                "--no-daemon starts nothing"
+            );
 
             search.cli_input.daemon = true;
             let mut output = Vec::new();
@@ -2424,7 +2491,10 @@ mod tests {
                     .is_some_and(|hits| !hits.is_empty()),
                 "{envelope}"
             );
-            assert_eq!(spawns.lock().unwrap().as_slice(), std::slice::from_ref(&socket));
+            assert_eq!(
+                spawns.lock().unwrap().as_slice(),
+                std::slice::from_ref(&socket)
+            );
             // A slow start lets the first search run in process; the daemon
             // still comes up and serves the store.
             bound(&socket);
@@ -2434,7 +2504,10 @@ mod tests {
                 .await
                 .expect("the started daemon answers a stop request");
             let handle = Arc::try_unwrap(handle).ok().unwrap().into_inner().unwrap();
-            handle.join().unwrap().expect("the daemon exits cleanly on stop");
+            handle
+                .join()
+                .unwrap()
+                .expect("the daemon exits cleanly on stop");
             assert!(!socket.exists());
 
             // A named socket outside the store gets a daemon of its own.
@@ -2466,14 +2539,21 @@ mod tests {
                 serde_json::from_slice::<serde_json::Value>(&output).unwrap()["ok"],
                 true
             );
-            assert_eq!(spawns.lock().unwrap().len(), 2, "an answering daemon is reused");
+            assert_eq!(
+                spawns.lock().unwrap().len(),
+                2,
+                "an answering daemon is reused"
+            );
             let (stopper, handle) = stop_and_join(Some(named.clone()));
             stopper
                 .run_complete_generation_daemon(&cx, &root)
                 .await
                 .expect("the named daemon answers a stop request");
             let handle = Arc::try_unwrap(handle).ok().unwrap().into_inner().unwrap();
-            handle.join().unwrap().expect("the daemon exits cleanly on stop");
+            handle
+                .join()
+                .unwrap()
+                .expect("the daemon exits cleanly on stop");
             assert!(!named.exists());
         });
     }
@@ -2517,7 +2597,8 @@ mod tests {
                     });
                     let finished = Arc::new(Mutex::new(handle));
                     daemons.lock().unwrap().push(finished.clone());
-                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished())) as DaemonExited)
+                    Some(Box::new(move || Ok(finished.lock().unwrap().is_finished()))
+                        as DaemonExited)
                 }))
             };
             let bound = |socket: &Path| {
@@ -2532,21 +2613,33 @@ mod tests {
             };
             let join = |daemon: Arc<Mutex<std::thread::JoinHandle<SearchResult<()>>>>| {
                 let handle = Arc::try_unwrap(daemon).ok().unwrap().into_inner().unwrap();
-                handle.join().unwrap().expect("the daemon exits cleanly on stop");
+                handle
+                    .join()
+                    .unwrap()
+                    .expect("the daemon exits cleanly on stop");
             };
 
             let mut search = search_runtime(&runtime);
             search.cli_input.daemon = true;
-            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new()))
-                .await
-                .unwrap();
+            Box::pin(search.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await
+            .unwrap();
             bound(&socket);
             assert_eq!(daemons.lock().unwrap().len(), 1);
 
             let mut edited = search.clone();
             // Not a per-request search knob: the daemon contract holds it exact.
             edited.config.indexing.embedding_batch_size = 32;
-            spawning.lock().unwrap().config.indexing.embedding_batch_size = 32;
+            spawning
+                .lock()
+                .unwrap()
+                .config
+                .indexing
+                .embedding_batch_size = 32;
             let mut named = edited.clone();
             named.cli_input.daemon_socket = Some(socket.clone());
             let refused = Box::pin(named.run_complete_generation_search_with_writer(
@@ -2582,13 +2675,9 @@ mod tests {
             bound(&socket);
             // The replacement serves the edited configuration: a named socket
             // fails closed unless that daemon answers.
-            Box::pin(named.run_complete_generation_search_with_writer(
-                &cx,
-                &root,
-                &mut Vec::new(),
-            ))
-            .await
-            .expect("the replacement serves the edited configuration");
+            Box::pin(named.run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new()))
+                .await
+                .expect("the replacement serves the edited configuration");
 
             let mut stopper = edited.clone();
             stopper.cli_input.daemon_stop = true;
@@ -2614,7 +2703,9 @@ mod tests {
             let (runtime, _, root) = fixture(directory.path());
             publish(&runtime, &cx, &root).await;
             let sockets = tempfile::tempdir().unwrap();
-            let socket = fs::canonicalize(sockets.path()).unwrap().join("policy.sock");
+            let socket = fs::canonicalize(sockets.path())
+                .unwrap()
+                .join("policy.sock");
             let mut daemon_runtime = runtime.clone();
             daemon_runtime.cli_input.command = CliCommand::Daemon;
             daemon_runtime.cli_input.daemon_socket = Some(socket.clone());
@@ -2660,7 +2751,11 @@ mod tests {
                 let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
                 let hit = &envelope["data"]["hits"][0];
                 // Rank 0 in each lane that found it: 1 / (k + 1) per lane.
-                let lanes = if hit["in_both_sources"] == true { 2.0 } else { 1.0 };
+                let lanes = if hit["in_both_sources"] == true {
+                    2.0
+                } else {
+                    1.0
+                };
                 let fused = hit["score"].as_f64().unwrap();
                 assert!(
                     (fused * (rrf_k + 1.0) - lanes).abs() < 1e-9,
@@ -3100,10 +3195,20 @@ mod tests {
         // before the first complete build stays on the legacy route, which
         // reports the missing index instead of an I/O error.
         let search = search_runtime(&runtime);
-        assert!(search.complete_generation_command_root(true).unwrap().is_none());
+        assert!(
+            search
+                .complete_generation_command_root(true)
+                .unwrap()
+                .is_none()
+        );
         let mut status = runtime.clone();
         status.cli_input.command = CliCommand::Status;
-        assert!(status.complete_generation_command_root(true).unwrap().is_none());
+        assert!(
+            status
+                .complete_generation_command_root(true)
+                .unwrap()
+                .is_none()
+        );
         assert!(!root.exists(), "route selection is read-only");
         fs::create_dir(&root).unwrap();
         fs::create_dir(root.join("generations")).unwrap();
@@ -3182,16 +3287,26 @@ mod tests {
                     .is_none(),
                 "{marker} alone does not prove a completed legacy predecessor"
             );
+            let mut watch = build.clone();
+            watch.cli_input.command = CliCommand::Watch;
+            watch.config.indexing.watch_mode = true;
+            assert!(
+                watch
+                    .complete_generation_command_root(false)
+                    .unwrap()
+                    .is_none(),
+                "{marker} alone must not be auto-promoted by watch"
+            );
             assert_eq!(
                 build.complete_generation_command_root(true).unwrap(),
                 Some(legacy)
             );
         }
 
-        // A completed legacy predecessor migrates on the default one-shot
-        // index route. While its first immutable successor is only staging,
-        // read-only commands still use that predecessor; mutation continues on
-        // the complete route, and a published pointer becomes authoritative.
+        // A completed legacy predecessor migrates on the default one-shot or
+        // watch-start route. Once staging exists, every command stays on
+        // complete-store authority; an absent pointer is not evidence for a
+        // legacy fallback.
         let legacy = directory.path().join("legacy-complete");
         fs::create_dir(&legacy).unwrap();
         let sentinel = IndexSentinel {
@@ -3217,9 +3332,23 @@ mod tests {
             Some(legacy.clone()),
             "a healthy legacy one-shot rebuild should stage an immutable successor"
         );
-        let disabled = build
-            .clone()
-            .with_complete_generations_for_new_roots(false);
+        let mut watch = build.clone();
+        watch.cli_input.command = CliCommand::Watch;
+        watch.config.indexing.watch_mode = true;
+        assert_eq!(
+            watch.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "Linux-default watch should promote a completed legacy root"
+        );
+        let mut index_watch = build.clone();
+        index_watch.cli_input.watch = true;
+        index_watch.config.indexing.watch_mode = true;
+        assert_eq!(
+            index_watch.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "index --watch should promote a completed legacy root"
+        );
+        let disabled = build.clone().with_complete_generations_for_new_roots(false);
         assert!(
             disabled
                 .complete_generation_command_root(false)
@@ -3227,23 +3356,35 @@ mod tests {
                 .is_none(),
             "an explicit false policy must retain the legacy layout"
         );
-        fs::create_dir(legacy.join("generations")).unwrap();
-        let search = search_runtime(&build);
+        let mut disabled_watch = watch.with_complete_generations_for_new_roots(false);
+        disabled_watch.config.indexing.watch_mode = true;
         assert!(
-            search
+            disabled_watch
                 .complete_generation_command_root(false)
                 .unwrap()
                 .is_none(),
-            "search must keep serving the legacy predecessor until selection publishes"
+            "an explicit false policy must retain the legacy watcher"
+        );
+        fs::create_dir(legacy.join("generations")).unwrap();
+        let search = search_runtime(&build);
+        assert_eq!(
+            search.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "search must refuse absent complete selection, never reactivate legacy data"
         );
         let mut status = build.clone();
         status.cli_input.command = CliCommand::Status;
-        assert!(
-            status
-                .complete_generation_command_root(false)
-                .unwrap()
-                .is_none(),
-            "status must describe the still-authoritative legacy predecessor"
+        assert_eq!(
+            status.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "status must inspect complete-store authority, not stale legacy data"
+        );
+        let mut daemon = build.clone();
+        daemon.cli_input.command = CliCommand::Daemon;
+        assert_eq!(
+            daemon.complete_generation_command_root(false).unwrap(),
+            Some(legacy.clone()),
+            "daemon must not fall back to the legacy mutating path during migration"
         );
         let mut append = build.clone();
         append.cli_input.command = CliCommand::AppendBatch;
@@ -3252,11 +3393,7 @@ mod tests {
             Some(legacy.clone()),
             "mutators must not write into the predecessor during migration"
         );
-        fs::write(
-            legacy.join(COMPLETE_GENERATION_POINTER),
-            b"corrupt-pointer",
-        )
-        .unwrap();
+        fs::write(legacy.join(COMPLETE_GENERATION_POINTER), b"corrupt-pointer").unwrap();
         assert_eq!(
             search.complete_generation_command_root(false).unwrap(),
             Some(legacy),
@@ -3297,19 +3434,31 @@ mod tests {
             fs::write(source.join(".ignore"), "!.frankensearch/\n").unwrap();
             for build in 0..2 {
                 let receipt = publish(&runtime, &cx, &root).await;
-                assert_eq!(receipt["data"]["discovered_files"], 1, "build {build}: {receipt}");
-                assert_eq!(receipt["data"]["indexed_files"], 1, "build {build}: {receipt}");
+                assert_eq!(
+                    receipt["data"]["discovered_files"], 1,
+                    "build {build}: {receipt}"
+                );
+                assert_eq!(
+                    receipt["data"]["indexed_files"], 1,
+                    "build {build}: {receipt}"
+                );
             }
             let mut output = Vec::new();
-            Box::pin(search_runtime(&runtime).run_complete_generation_search_with_writer(
-                &cx,
-                &root,
-                &mut output,
-            ))
+            Box::pin(
+                search_runtime(&runtime).run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output,
+                ),
+            )
             .await
             .unwrap();
             let search: serde_json::Value = serde_json::from_slice(&output).unwrap();
-            assert_eq!(search["data"]["hits"].as_array().unwrap().len(), 1, "{search}");
+            assert_eq!(
+                search["data"]["hits"].as_array().unwrap().len(),
+                1,
+                "{search}"
+            );
             assert_eq!(search["data"]["hits"][0]["path"], "alpha.md", "{search}");
 
             // A store inside the source but not beneath a hidden directory is
@@ -3642,7 +3791,9 @@ mod tests {
             let (mut runtime, source, root) = fixture(directory.path());
             publish(&runtime, &cx, &root).await;
             runtime.cli_input.command = CliCommand::Status;
-            let reader = runtime.open_complete_generation_diagnostics(&cx, &root).unwrap();
+            let reader = runtime
+                .open_complete_generation_diagnostics(&cx, &root)
+                .unwrap();
             let old = reader.generation.as_ref().unwrap();
             let old_id = old.id().to_owned();
             let old_path = old.path().to_path_buf();
@@ -3702,7 +3853,10 @@ mod tests {
                     .is_some_and(|dimension| dimension > 0),
                 "{data}"
             );
-            assert!(data["quality_generation"].is_null(), "the fixture is fast-only");
+            assert!(
+                data["quality_generation"].is_null(),
+                "the fixture is fast-only"
+            );
             // Publication renames only the selection pointer: the directory a
             // build wrote is the selected generation, a readable index.
             assert_eq!(data["index_root"], data["generation_path"], "{data}");
@@ -3735,6 +3889,79 @@ mod tests {
                     .unwrap()
                     .is_some()
             );
+        });
+    }
+
+    #[test]
+    fn gh43_complete_rebuild_cancelled_after_sealing_or_by_shutdown_preserves_predecessor_and_retries()
+     {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let predecessor = store.active(&cx).unwrap().unwrap();
+            let before_inventory = sealed_inventory(predecessor.path());
+            let mut old_reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+
+            fs::write(source.join("beta.md"), "sharedtoken beta new document").unwrap();
+            let error = runtime
+                .rebuild_retained_generation_with_precommit(&cx, &root, |cx| {
+                    cx.set_cancel_requested(true);
+                    Ok(())
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
+            assert_eq!(sealed_inventory(predecessor.path()), before_inventory);
+
+            let shutdown = ShutdownCoordinator::new();
+            shutdown.request_shutdown(crate::ShutdownReason::Signal(2));
+            let error = runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, Some(&shutdown), false)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+            cx.set_cancel_requested(false);
+            assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
+
+            let mut fresh_before_retry = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let hits_before_retry = fresh_before_retry
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            assert_eq!(hits_before_retry.len(), 1);
+            assert!(hits_before_retry[0].path.ends_with("alpha.md"));
+
+            runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await
+                .unwrap();
+            let successor = store.active(&cx).unwrap().unwrap();
+            assert_ne!(successor.id(), predecessor.id());
+
+            let mut fresh_after_retry = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let hits_after_retry = fresh_after_retry
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            assert_eq!(hits_after_retry.len(), 2);
+            let old_hits = old_reader
+                .search(&cx, "sharedtoken", 10)
+                .await
+                .unwrap()
+                .pop()
+                .unwrap()
+                .hits;
+            assert_eq!(old_hits.len(), 1);
         });
     }
 

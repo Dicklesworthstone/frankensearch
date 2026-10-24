@@ -76,6 +76,9 @@ impl Embedder for Provider {
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
         Ok(&self.identity)
     }
+    fn bound_batch_is_native(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         &self.identity.space.logical_model_id
     }
@@ -553,6 +556,7 @@ fn sharded_timeout_after_initial_starts_no_quality_or_rerank_and_later_query_rec
             maximum_ms: Some(10),
             timer: Some(timer),
             rerank: Some(query::Rerank::new(scorer.clone(), 4).unwrap()),
+            ..query::Policy::default()
         };
         let mut output = Delivery {
             bytes: Vec::new(),

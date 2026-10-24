@@ -493,53 +493,92 @@ impl NativeEmbedder {
                 "certificate trace only accepts the frozen public corpus"
             );
         }
-        checkpoint()?;
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let token_batches: Vec<Vec<i64>> = texts
-            .iter()
-            .map(|t| {
-                checkpoint()?;
-                self.tokenize(t)
-            })
-            .collect::<SearchResult<_>>()?;
-        #[cfg(test)]
-        for (document, ids) in token_batches.iter().enumerate() {
-            crate::native::certificate_trace::ids(&format!("document.{document}.tokens"), ids);
-        }
-        let mut model = self.lock_model()?;
-        let mut out = Vec::with_capacity(texts.len());
-        // Chunk inputs by total token budget so each forward's intermediates stay
-        // bounded; a single over-budget input is still run alone.
-        let mut start = 0usize;
-        while start < token_batches.len() {
-            checkpoint()?;
-            let mut end = start;
-            let mut tok = 0usize;
-            while end < token_batches.len() {
-                let len = token_batches[end].len().max(1);
-                if end > start && tok + len > MAX_BATCH_TOKENS {
-                    break;
+        // Acquire only when the first bounded group is ready, then retain the
+        // same model guard across the request as before. In particular, a
+        // failed first tokenization never acquires model admission.
+        let mut model: Option<std::sync::MutexGuard<'_, Model>> = None;
+        let out = embed_native_batches(
+            texts,
+            &self.name,
+            &checkpoint,
+            |document, text| {
+                let ids = self.tokenize(text)?;
+                #[cfg(test)]
+                crate::native::certificate_trace::ids(&format!("document.{document}.tokens"), &ids);
+                #[cfg(not(test))]
+                let _ = document;
+                Ok(ids)
+            },
+            |batch| {
+                if let Some(model) = model.as_mut() {
+                    model.embed_forward(batch)
+                } else {
+                    let mut acquired = self.lock_model()?;
+                    let result = acquired.embed_forward(batch);
+                    model = Some(acquired);
+                    result
                 }
-                tok += len;
-                end += 1;
-            }
-            out.extend(model.embed_forward(&token_batches[start..end])?);
-            start = end;
-        }
+            },
+        )?;
         drop(model);
         checkpoint()?;
-        if out.len() != texts.len() || out.iter().any(|vector| vector.len() != DIM) {
-            return Err(SearchError::EmbeddingFailed {
-                model: self.name.clone(),
-                source:
-                    "native backend returned a batch shape inconsistent with its attested identity"
-                        .into(),
-            });
-        }
         Ok(out)
     }
+}
+
+/// Tokenize only the next forward's inputs plus one lookahead document.
+/// Preserve the original greedy, input-order partition (empty inputs cost one
+/// token, and a single over-budget input runs alone). The token vectors of a
+/// finished forward are dropped before collecting its successor. Caller input
+/// strings and the returned output vectors are not covered by this bound.
+fn embed_native_batches(
+    texts: &[&str],
+    name: &str,
+    checkpoint: impl Fn() -> SearchResult<()>,
+    mut tokenize: impl FnMut(usize, &str) -> SearchResult<Vec<i64>>,
+    mut forward: impl FnMut(&[Vec<i64>]) -> SearchResult<Vec<Vec<f32>>>,
+) -> SearchResult<Vec<Vec<f32>>> {
+    checkpoint()?;
+    let mut out = Vec::with_capacity(texts.len());
+    {
+        let mut flush = |batch: &mut Vec<Vec<i64>>| -> SearchResult<()> {
+            checkpoint()?;
+            let vectors = forward(batch)?;
+            checkpoint()?;
+            // Validate each forward, not only the aggregate. Missing rows in
+            // one chunk must not be concealed by extra rows in a later chunk.
+            if vectors.len() != batch.len() || vectors.iter().any(|vector| vector.len() != DIM) {
+                return Err(SearchError::EmbeddingFailed {
+                    model: name.to_owned(),
+                    source:
+                        "native backend returned a batch shape inconsistent with its attested identity"
+                            .into(),
+                });
+            }
+            out.extend(vectors);
+            batch.clear();
+            Ok(())
+        };
+        let mut batch = Vec::new();
+        let mut tokens = 0_usize;
+        for (document, text) in texts.iter().enumerate() {
+            checkpoint()?;
+            let ids = tokenize(document, text)?;
+            checkpoint()?;
+            let width = ids.len().max(1);
+            if !batch.is_empty() && width > MAX_BATCH_TOKENS.saturating_sub(tokens) {
+                flush(&mut batch)?;
+                tokens = 0;
+            }
+            tokens = tokens.saturating_add(width);
+            batch.push(ids);
+        }
+        if !batch.is_empty() {
+            flush(&mut batch)?;
+        }
+    }
+    checkpoint()?;
+    Ok(out)
 }
 
 fn native_checkpoint(cx: &Cx) -> SearchResult<()> {
@@ -1357,5 +1396,279 @@ mod tests {
             repeat_elapsed.as_millis(),
             conformance_elapsed.as_millis()
         );
+    }
+
+    fn batch_marker_vectors(batch: &[Vec<i64>]) -> Vec<Vec<f32>> {
+        batch
+            .iter()
+            .map(|ids| {
+                let marker = ids.first().map_or(-1.0, |id| {
+                    f32::from(i16::try_from(*id).expect("small test document ID"))
+                });
+                vec![marker; DIM]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn streaming_token_batches_preserve_greedy_boundaries_and_document_order() {
+        let texts = ["0", "2048", "1", "2047", "2049", "0", "1024", "1024", "1"];
+        let mut groups = Vec::new();
+        let output = embed_native_batches(
+            &texts,
+            "test",
+            || Ok(()),
+            |document, text| {
+                Ok(vec![i64::try_from(document).unwrap(); text.parse::<usize>().unwrap()])
+            },
+            |batch| {
+                groups.push(batch.iter().map(Vec::len).collect::<Vec<_>>());
+                Ok(batch_marker_vectors(batch))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            groups,
+            vec![
+                vec![0],
+                vec![2048],
+                vec![1, 2047],
+                vec![2049],
+                vec![0, 1024],
+                vec![1024, 1],
+            ]
+        );
+        let expected = [-1.0, 1.0, 2.0, 3.0, 4.0, -1.0, 6.0, 7.0, 8.0];
+        assert_eq!(output.len(), expected.len());
+        for (vector, expected) in output.iter().zip(expected) {
+            assert_eq!(vector, &vec![expected; DIM]);
+        }
+    }
+
+    #[test]
+    fn native_tokenization_is_lazy_and_keeps_only_one_document_of_lookahead() {
+        use std::cell::Cell;
+
+        let encoded = Cell::new(0_usize);
+        let consumed = Cell::new(0_usize);
+        let mut first_forward_at = None;
+        let output = embed_native_batches(
+            &["text"; 64],
+            "test",
+            || Ok(()),
+            |document, _| {
+                encoded.set(encoded.get() + 1);
+                assert!(encoded.get() - consumed.get() <= 5);
+                Ok(vec![i64::try_from(document).unwrap(); 512])
+            },
+            |batch| {
+                first_forward_at.get_or_insert(encoded.get());
+                assert_eq!(batch.len(), 4);
+                assert_eq!(batch.iter().map(Vec::len).sum::<usize>(), MAX_BATCH_TOKENS);
+                consumed.set(consumed.get() + batch.len());
+                Ok(batch_marker_vectors(batch))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first_forward_at,
+            Some(5),
+            "do not tokenize the full request first"
+        );
+        assert_eq!(encoded.get(), 64);
+        assert_eq!(consumed.get(), 64);
+        for (document, vector) in output.iter().enumerate() {
+            assert_eq!(vector, &vec![f32::from(u16::try_from(document).unwrap()); DIM]);
+        }
+    }
+
+    #[test]
+    fn native_batch_tokenization_failure_does_not_return_a_completed_prefix() {
+        use std::cell::Cell;
+
+        let encoded = Cell::new(0_usize);
+        let forwards = Cell::new(0_usize);
+        let result = embed_native_batches(
+            &["text"; 20],
+            "test",
+            || Ok(()),
+            |document, _| {
+                encoded.set(encoded.get() + 1);
+                if document == 5 {
+                    return Err(SearchError::EmbeddingFailed {
+                        model: "test".to_owned(),
+                        source: "tokenization failure sentinel".into(),
+                    });
+                }
+                Ok(vec![i64::try_from(document).unwrap(); 512])
+            },
+            |batch| {
+                forwards.set(forwards.get() + 1);
+                Ok(batch_marker_vectors(batch))
+            },
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("tokenization failure sentinel")
+        );
+        assert_eq!(encoded.get(), 6);
+        assert_eq!(forwards.get(), 1);
+    }
+
+    #[test]
+    fn native_batch_shape_failures_stop_before_later_chunks_can_mask_them() {
+        use std::cell::Cell;
+
+        for malformed in 0..3 {
+            let encoded = Cell::new(0_usize);
+            let forwards = Cell::new(0_usize);
+            let result = embed_native_batches(
+                &["text"; 8],
+                "test",
+                || Ok(()),
+                |document, _| {
+                    encoded.set(encoded.get() + 1);
+                    Ok(vec![i64::try_from(document).unwrap(); 512])
+                },
+                |batch| {
+                    forwards.set(forwards.get() + 1);
+                    let mut vectors = batch_marker_vectors(batch);
+                    if forwards.get() == 1 {
+                        match malformed {
+                            0 => {
+                                vectors.pop();
+                            }
+                            1 => vectors.push(vec![0.0; DIM]),
+                            _ => {
+                                vectors[0].pop();
+                            }
+                        }
+                    } else if malformed == 0 {
+                        // The old aggregate-only check would accept 3 + 5 rows.
+                        vectors.push(vec![0.0; DIM]);
+                    } else if malformed == 1 {
+                        vectors.pop();
+                    }
+                    Ok(vectors)
+                },
+            );
+            assert!(matches!(result, Err(SearchError::EmbeddingFailed { .. })));
+            assert_eq!(forwards.get(), 1);
+            assert_eq!(
+                encoded.get(),
+                5,
+                "only the first chunk and its lookahead are read"
+            );
+        }
+    }
+
+    #[test]
+    fn native_batch_cancellation_stops_before_more_tokenization_or_inference() {
+        use std::cell::Cell;
+
+        for cancel_at in [0, 1, 2] {
+            let cancelled = Cell::new(cancel_at == 0);
+            let encoded = Cell::new(0_usize);
+            let forwards = Cell::new(0_usize);
+            let result = embed_native_batches(
+                &["text"; 12],
+                "test",
+                || {
+                    if cancelled.get() {
+                        Err(SearchError::Cancelled {
+                            phase: "native.test".to_owned(),
+                            reason: "cancelled at a synchronous boundary".to_owned(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+                |document, _| {
+                    encoded.set(encoded.get() + 1);
+                    if cancel_at == 1 && document == 4 {
+                        cancelled.set(true);
+                    }
+                    Ok(vec![i64::try_from(document).unwrap(); 512])
+                },
+                |batch| {
+                    forwards.set(forwards.get() + 1);
+                    if cancel_at == 2 {
+                        cancelled.set(true);
+                    }
+                    Ok(batch_marker_vectors(batch))
+                },
+            );
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert_eq!(encoded.get(), if cancel_at == 0 { 0 } else { 5 });
+            assert_eq!(forwards.get(), usize::from(cancel_at == 2));
+        }
+        let empty = embed_native_batches(
+            &[],
+            "test",
+            || Ok(()),
+            |_, _| panic!("empty batch must not tokenize"),
+            |_| panic!("empty batch must not run inference"),
+        )
+        .unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires verified native MiniLM assets via MINILM_FIXTURE_DIR; run optimized"]
+    fn streaming_fixture_matches_the_previous_eager_partition_bit_for_bit() {
+        let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let long = "Search finds related documents across the library. ".repeat(100);
+        let owned = (0..24)
+            .map(|index| match index % 3 {
+                0 => long.clone(),
+                1 => "identifier fsvi_v2".to_owned(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>();
+        let texts = owned.iter().map(String::as_str).collect::<Vec<_>>();
+        for profile in [
+            NativeEmbeddingModel::AllMiniLmL6V2,
+            NativeEmbeddingModel::AllMiniLmL6V2F32,
+        ] {
+            let native = NativeEmbedder::load_model(&dir, profile).unwrap();
+            let token_batches = texts
+                .iter()
+                .map(|text| native.tokenize(text).unwrap())
+                .collect::<Vec<_>>();
+            let mut expected = Vec::new();
+            let mut model = native.lock_model().unwrap();
+            let mut start = 0;
+            let mut forwards = 0;
+            while start < token_batches.len() {
+                let mut end = start;
+                let mut tokens = 0;
+                while end < token_batches.len() {
+                    let len = token_batches[end].len().max(1);
+                    if end > start && tokens + len > MAX_BATCH_TOKENS {
+                        break;
+                    }
+                    tokens += len;
+                    end += 1;
+                }
+                expected.extend(model.embed_forward(&token_batches[start..end]).unwrap());
+                forwards += 1;
+                start = end;
+            }
+            drop(model);
+            assert!(forwards > 1, "fixture must cross a real forward boundary");
+            let actual = native.embed_batch_sync(&texts).unwrap();
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(actual.len(), expected.len());
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected)
+                        .all(|(a, b)| a.to_bits() == b.to_bits())
+                );
+            }
+        }
     }
 }

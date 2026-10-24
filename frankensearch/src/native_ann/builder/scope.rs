@@ -7,6 +7,8 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+
 use super::NativeBuiltHybridIndex;
 use super::sharded::NativeBuiltShardedHybridIndex;
 use crate::native_ann::{NativeProgressiveSearch, NativeSearchPhase, checkpoint, invalid};
@@ -148,6 +150,33 @@ impl NativeScopedHybridIndex<'_> {
             .with_allowed_documents(&self.lexical.allowed)
     }
 
+    /// Prepare scoped progressive retrieval with retained vector traversal on
+    /// the caller-owned blocking pool.
+    ///
+    /// # Errors
+    /// Refuses invalid candidate budgets, identity mismatches, or cancellation.
+    pub fn progressive_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let vectors = self.index.vectors();
+        let fast = vectors.fast();
+        fast.index
+            .search_hybrid_progressive_with_pool(
+                cx,
+                fast.embedder(),
+                vectors.quality().map(|tier| (&tier.index, tier.embedder())),
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )?
+            .with_allowed_documents_arc(Arc::clone(&self.lexical.allowed))
+    }
+
     /// Add lazy reranking of scoped candidates using their retained source text.
     ///
     /// Excluded documents never enter the rerank window, even when their global
@@ -168,12 +197,43 @@ impl NativeScopedHybridIndex<'_> {
             .with_reranker(reranker, self.text.as_ref(), window)
     }
 
+    /// Pool-aware scoped progressive retrieval plus retained-source reranking.
+    ///
+    /// # Errors
+    /// Combines scoped progressive admission and native rerank configuration errors.
+    pub fn progressive_with_reranker_on_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        reranker: &'a dyn Reranker,
+        window: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.progressive_with_pool(cx, text, k, pool)?
+            .with_reranker(reranker, self.text.as_ref(), window)
+    }
+
     /// Scoped fast-plus-lexical search; never starts the quality provider.
     ///
     /// # Errors
     /// Propagates native retrieval, lexical expansion, hydration and cancellation errors.
     pub async fn search(&self, cx: &Cx, text: &str, k: usize) -> SearchResult<Vec<ScoredResult>> {
         collect(self.primary(cx, text, k, false)?).await
+    }
+
+    /// Pool-aware scoped fast-plus-lexical search; never starts the quality provider.
+    ///
+    /// # Errors
+    /// Propagates native retrieval, lexical expansion, hydration and cancellation errors.
+    pub async fn search_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        collect(self.primary_with_pool(cx, text, k, false, pool)?).await
     }
 
     /// Collect the scoped progressive pipeline, requiring configured refinement.
@@ -193,6 +253,20 @@ impl NativeScopedHybridIndex<'_> {
         collect(self.progressive(cx, text, k)?).await
     }
 
+    /// Pool-aware collection of the scoped progressive pipeline, requiring configured refinement.
+    ///
+    /// # Errors
+    /// Propagates every required phase's errors, including refinement failure.
+    pub async fn search_refined_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        collect(self.progressive_with_pool(cx, text, k, pool)?).await
+    }
+
     /// Scoped quality-primary retrieval, without running the fast model.
     /// Returned indices belong to the quality owner; hash controls stay nonsemantic.
     ///
@@ -207,6 +281,28 @@ impl NativeScopedHybridIndex<'_> {
         let mut results = collect(self.primary(cx, text, k, true)?).await?;
         for result in &mut results {
             checkpoint(cx, "native_ann.scope.quality_result")?;
+            result.quality_score = result.fast_score.take();
+            if result.source == ScoreSource::SemanticFast {
+                result.source = ScoreSource::SemanticQuality;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Pool-aware scoped quality-primary retrieval, without running the fast model.
+    ///
+    /// # Errors
+    /// Refuses an absent quality tier and propagates retrieval/hydration errors.
+    pub async fn search_quality_with_pool(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.primary_with_pool(cx, text, k, true, pool)?).await?;
+        for result in &mut results {
+            checkpoint(cx, "native_ann.scope.quality_pool_result")?;
             result.quality_score = result.fast_score.take();
             if result.source == ScoreSource::SemanticFast {
                 result.source = ScoreSource::SemanticQuality;
@@ -237,7 +333,41 @@ impl NativeScopedHybridIndex<'_> {
         };
         tier.index()
             .search_hybrid_progressive(cx, tier.embedder(), None, &self.lexical, text, k)?
-            .with_allowed_documents(&self.lexical.allowed)
+            .with_allowed_documents_arc(Arc::clone(&self.lexical.allowed))
+    }
+
+    fn primary_with_pool<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+        k: usize,
+        quality: bool,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.scope.primary_pool")?;
+        let vectors = self.index.vectors();
+        let tier = if quality {
+            vectors.quality().ok_or_else(|| {
+                invalid(
+                    "scope.quality",
+                    "absent",
+                    "quality-primary search requires a quality tier",
+                )
+            })?
+        } else {
+            vectors.fast()
+        };
+        tier.index
+            .search_hybrid_progressive_with_pool(
+                cx,
+                tier.embedder(),
+                None,
+                &self.lexical,
+                text,
+                k,
+                pool,
+            )?
+            .with_allowed_documents_arc(Arc::clone(&self.lexical.allowed))
     }
 }
 
@@ -562,6 +692,9 @@ mod tests {
         }
         fn id(&self) -> &str {
             &self.identity.space.logical_model_id
+        }
+        fn bound_batch_is_native(&self) -> bool {
+            true
         }
         fn model_name(&self) -> &str {
             self.id()

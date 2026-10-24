@@ -40,6 +40,8 @@ use crate::generation_store::{
 #[path = "retained_reuse/append_input.rs"]
 mod append_input;
 pub(super) use append_input::read_append_documents;
+#[path = "retained_reuse/configuration.rs"]
+mod configuration;
 #[path = "retained_reuse/execution.rs"]
 mod execution;
 
@@ -62,6 +64,9 @@ struct ReuseReceipt {
     // cold misses. Absence never grants cross-process reuse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     executable_sha256: Option<String>,
+    // Explicit indexing-pipeline contract digest (`IndexingContractDigestV1`, bd-ky0j2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    indexing_contract_sha256: Option<String>,
     configuration_sha256: String,
     checkpoint: IndexingCheckpoint,
 }
@@ -97,18 +102,11 @@ fn session_id() -> SearchResult<&'static str> {
 }
 
 fn configuration_digest(runtime: &FsfsRuntime) -> SearchResult<String> {
-    // Persist a digest, not the configuration (which can contain private paths
-    // or provider settings). A conservative mismatch simply starts cold.
-    // Whether the command keeps watching afterwards indexes nothing
-    // differently; hashing it made the first `fsfs watch` after `fsfs index`
-    // discard the keyword index and re-embed every file.
-    let mut config = runtime.config().clone();
-    config.indexing.watch_mode = false;
-    let bytes = serde_json::to_vec(&config).map_err(|source| SearchError::SubsystemError {
-        subsystem: "fsfs.complete_generation.reuse_config",
-        source: Box::new(source),
-    })?;
-    Ok(content_sha256_hex(&bytes))
+    configuration::digest(runtime.config())
+}
+
+fn indexing_contract_digest(runtime: &FsfsRuntime) -> SearchResult<String> {
+    configuration::contract_digest(runtime.config())
 }
 
 fn open_regular(path: &Path) -> SearchResult<File> {
@@ -171,9 +169,53 @@ fn compatible_execution(receipt: &ReuseReceipt, executable: Option<&str>, sessio
     }
 }
 
+fn compatible_contract_upgrade_execution(
+    receipt: &ReuseReceipt,
+    executable: Option<&str>,
+    session: &str,
+    expected_contract: &str,
+) -> bool {
+    if compatible_execution(receipt, executable, session) {
+        return receipt
+            .indexing_contract_sha256
+            .as_deref()
+            .is_none_or(|contract| contract == expected_contract);
+    }
+    match (
+        receipt.executable_sha256.as_deref(),
+        executable,
+        receipt.indexing_contract_sha256.as_deref(),
+    ) {
+        (Some(recorded_exe), Some(actual_exe), Some(recorded_contract)) => {
+            hex_digest(recorded_exe)
+                && hex_digest(actual_exe)
+                && hex_digest(recorded_contract)
+                && recorded_contract == expected_contract
+        }
+        _ => false,
+    }
+}
+
 fn compatible_receipt(runtime: &FsfsRuntime, receipt: &ReuseReceipt) -> SearchResult<bool> {
-    Ok(receipt.version == RECEIPT_VERSION
-        && compatible_execution(receipt, execution::fingerprint(), session_id()?)
+    if receipt.version != RECEIPT_VERSION {
+        return Ok(false);
+    }
+    let expected_contract = indexing_contract_digest(runtime)?;
+    let execution_ok = if runtime.contract_upgrade_reuse_enabled() {
+        compatible_contract_upgrade_execution(
+            receipt,
+            execution::fingerprint(),
+            session_id()?,
+            &expected_contract,
+        )
+    } else {
+        compatible_execution(receipt, execution::fingerprint(), session_id()?)
+            && receipt
+                .indexing_contract_sha256
+                .as_deref()
+                .is_none_or(|contract| contract == expected_contract)
+    };
+    Ok(execution_ok
         && receipt.configuration_sha256 == configuration_digest(runtime)?
         && receipt.checkpoint.target_root == runtime.resolve_target_root()?.display().to_string())
 }
@@ -268,6 +310,7 @@ fn completed_receipt(
         version: RECEIPT_VERSION,
         session: session_id()?.to_owned(),
         executable_sha256: execution::fingerprint().map(str::to_owned),
+        indexing_contract_sha256: Some(indexing_contract_digest(runtime)?),
         configuration_sha256: configuration_digest(runtime)?,
         checkpoint: checkpoint.clone(),
     })
@@ -361,11 +404,9 @@ pub(super) fn retain_legacy_checkpoint(
     root: &Path,
     payload: &FsfsIndexPayload,
 ) -> SearchResult<()> {
-    retain_or_start_cold(write_legacy_evidence(
-        cx,
-        root,
-        || completed_receipt(runtime, root, payload),
-    ))
+    retain_or_start_cold(write_legacy_evidence(cx, root, || {
+        completed_receipt(runtime, root, payload)
+    }))
 }
 
 fn retain_or_start_cold(result: SearchResult<()>) -> SearchResult<()> {
@@ -526,7 +567,9 @@ pub(super) fn retain_mutated_checkpoint(
             checkpoint.files.insert(key.clone(), entry);
         }
         drop(replaced);
-        checkpoint.source_hash_hex.clone_from(&sentinel.source_hash_hex);
+        checkpoint
+            .source_hash_hex
+            .clone_from(&sentinel.source_hash_hex);
         checkpoint.discovered_files = sentinel.discovered_files;
         checkpoint.skipped_files = sentinel.skipped_files;
         checkpoint.updated_at_ms = super::pressure_timestamp_ms();
@@ -539,6 +582,7 @@ pub(super) fn retain_mutated_checkpoint(
             version: RECEIPT_VERSION,
             session: session_id()?.to_owned(),
             executable_sha256: execution::fingerprint().map(str::to_owned),
+            indexing_contract_sha256: Some(indexing_contract_digest(runtime)?),
             configuration_sha256: configuration_digest(runtime)?,
             checkpoint,
         })
@@ -992,7 +1036,13 @@ fn seed_candidate_from_legacy(
         }
         if metadata.is_dir() {
             fs::create_dir(&target)?;
-            copy_tree(cx, &source, &target, relative.components().count(), &mut stats)?;
+            copy_tree(
+                cx,
+                &source,
+                &target,
+                relative.components().count(),
+                &mut stats,
+            )?;
         } else if metadata.is_file() {
             copy_file(cx, &source, &target, &mut stats)?;
         } else {
@@ -1015,7 +1065,11 @@ fn seed_candidate_from_legacy(
     sentinel.index_root.clone_from(&label);
     let mut checkpoint = receipt.checkpoint;
     checkpoint.index_root = label;
-    let eligible = checkpoint.files.values().filter(|entry| proven(entry)).count();
+    let eligible = checkpoint
+        .files
+        .values()
+        .filter(|entry| proven(entry))
+        .count();
     runtime.write_index_sentinel(destination, &sentinel)?;
     write_indexing_checkpoint(destination, &checkpoint)?;
     File::open(destination)?.sync_all()?;
@@ -1121,7 +1175,8 @@ fn copy_tree(
 /// Share a Quill segment by hard link, else copy `source` to the new file
 /// `target`, sync it and check the copy against the bytes read.
 fn copy_file(cx: &Cx, source: &Path, target: &Path, stats: &mut CopyStats) -> SearchResult<()> {
-    if target.file_name().is_some_and(is_quill_segment_name) && fs::hard_link(source, target).is_ok()
+    if target.file_name().is_some_and(is_quill_segment_name)
+        && fs::hard_link(source, target).is_ok()
     {
         // Quill writes a segment once and afterwards only renames or unlinks
         // it, so the candidate shares the predecessor's instead of writing and
@@ -1450,7 +1505,8 @@ mod copy_tests {
             };
             let (intact, stats) = seed("intact").unwrap();
             assert_eq!((stats.files, stats.linked), (1, 1));
-            let inode = |root: &Path, relative: &str| fs::metadata(root.join(relative)).unwrap().ino();
+            let inode =
+                |root: &Path, relative: &str| fs::metadata(root.join(relative)).unwrap().ino();
             assert_eq!(inode(&intact, segment), inode(predecessor.path(), segment));
             assert_ne!(
                 inode(&intact, "vector/fast.idx"),
@@ -1467,10 +1523,8 @@ mod copy_tests {
             };
             decay("vector/fast.idx", b"original");
             let error = seed("copied").unwrap_err();
-            assert!(
-                matches!(error, SearchError::InvalidConfig { reason, .. }
-                if reason.contains("differs from its sealed inventory"))
-            );
+            assert!(matches!(error, SearchError::InvalidConfig { reason, .. }
+                if reason.contains("differs from its sealed inventory")));
             fs::write(predecessor.path().join("vector/fast.idx"), b"original").unwrap();
 
             // The copy never reads a segment it links; sealing the successor
@@ -1818,6 +1872,12 @@ mod generation_tests {
             if operation == "config_drift" {
                 runtime.config.indexing.embedding_batch_size = 2;
             }
+            if operation == "query_tuning" {
+                runtime.config.search.quality_weight = 0.25;
+                runtime.config.search.rrf_k = 30.0;
+                runtime.config.search.quality_timeout_ms = 10_000;
+                runtime.config.search.rerank_timeout_ms = 5_000;
+            }
             runtime.cli_input.full_reindex = operation == "force";
             if operation == "daemon" {
                 runtime.cli_input.daemon_socket = Some(parent.join("daemon.sock"));
@@ -2049,47 +2109,6 @@ mod generation_tests {
             });
         }
 
-        /// A file whose mtime moved over unchanged bytes keeps both of its
-        /// vectors: its digest confirms the bytes, so only its rows and
-        /// manifest take the new revision (bd-rhpnx). Changed bytes are still
-        /// embedded again.
-        #[test]
-        fn an_mtime_only_change_keeps_vectors_and_records_the_new_revision() {
-            run_test_with_cx(|cx| async move {
-                let parent = tempfile::tempdir().unwrap();
-                let (_, source, root) = fixture(parent.path(), 2);
-                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
-
-                let touched = source.join("doc-0.md");
-                let later = fs::metadata(&touched).unwrap().modified().unwrap()
-                    + std::time::Duration::from_secs(60);
-                fs::File::options()
-                    .write(true)
-                    .open(&touched)
-                    .unwrap()
-                    .set_modified(later)
-                    .unwrap();
-                let report = run_counted_legacy(&cx, parent.path(), "index").await;
-                assert_index_calls(&report, 0, 0);
-                assert_eq!(report["indexed_files"], 2);
-                let revision = FsfsRuntime::read_index_manifest(&root)
-                    .unwrap()
-                    .unwrap()
-                    .into_iter()
-                    .find(|entry| entry.file_key == "doc-0.md")
-                    .unwrap()
-                    .revision;
-                assert_eq!(
-                    revision,
-                    i64::try_from(super::super::super::system_time_to_ms(later)).unwrap(),
-                    "the touched file's rows take its new modification time"
-                );
-
-                fs::write(&touched, "sharedtoken rewritten document").unwrap();
-                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 1, 1);
-            });
-        }
-
         #[test]
         fn fast_window_later_batch_failure_never_publishes_a_partial_source() {
             run_test_with_cx(|cx| async move {
@@ -2316,7 +2335,10 @@ mod generation_tests {
             let _restore = RestoreEmbedders::install(fast.clone(), quality.clone());
             let (pipeline, vector_index) = runtime.build_live_ingest_pipeline(cx).await.unwrap();
             let reuse = pipeline.reuse_ledger();
-            assert!(reuse.is_some(), "the completed generation's evidence is admitted");
+            assert!(
+                reuse.is_some(),
+                "the completed generation's evidence is admitted"
+            );
             let path = source.join(name);
             let revision = i64::try_from(super::super::super::system_time_to_ms(
                 fs::metadata(&path).unwrap().modified().unwrap(),
@@ -2371,11 +2393,25 @@ mod generation_tests {
 
                 // Without evidence, one watched edit costs the next start
                 // every file (bd-oikhm).
-                Box::pin(watch_edit(&cx, parent.path(), "doc-1.md", "sharedtoken watched one", false)).await;
+                Box::pin(watch_edit(
+                    &cx,
+                    parent.path(),
+                    "doc-1.md",
+                    "sharedtoken watched one",
+                    false,
+                ))
+                .await;
                 assert_index_calls(&index().await, 3, 3);
 
-                Box::pin(watch_edit(&cx, parent.path(), "doc-2.md", "sharedtoken watched two", true)).await;
-                assert_index_calls(&index().await, 1, 1);
+                Box::pin(watch_edit(
+                    &cx,
+                    parent.path(),
+                    "doc-2.md",
+                    "sharedtoken watched two",
+                    true,
+                ))
+                .await;
+                assert_index_calls(&index().await, 0, 0);
 
                 // Restoring the pre-watch bytes and mtime must re-embed: the
                 // rows hold the watched version, which has the same length and
@@ -2384,7 +2420,14 @@ mod generation_tests {
                 let path = source.join("doc-0.md");
                 let before = fs::read(&path).unwrap();
                 let modified = fs::metadata(&path).unwrap().modified().unwrap();
-                Box::pin(watch_edit(&cx, parent.path(), "doc-0.md", "sharedtoken documenu 0", true)).await;
+                Box::pin(watch_edit(
+                    &cx,
+                    parent.path(),
+                    "doc-0.md",
+                    "sharedtoken documenu 0",
+                    true,
+                ))
+                .await;
                 fs::write(&path, &before).unwrap();
                 File::options()
                     .write(true)
@@ -2405,7 +2448,8 @@ mod generation_tests {
                 for max_windows in [1, 2] {
                     let parent = tempfile::tempdir().unwrap();
                     fixture(parent.path(), 3);
-                    let index = || run_counted_legacy_windows(&cx, parent.path(), "index", max_windows);
+                    let index =
+                        || run_counted_legacy_windows(&cx, parent.path(), "index", max_windows);
                     assert_index_calls(&index().await, 3, 3);
                     let (mut runtime, _, _) = two_tier_fixture(parent.path(), max_windows);
                     runtime.cli_input.command = CliCommand::Delete;
@@ -2452,6 +2496,47 @@ mod generation_tests {
                 assert_eq!(removed["indexed_files"], 1);
                 fs::write(source.join("added.md"), "sharedtoken newly added content").unwrap();
                 assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 1, 1);
+            });
+        }
+
+        #[test]
+        fn an_mtime_only_change_keeps_vectors_and_records_the_new_revision() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, root) = fixture(parent.path(), 2);
+                assert_index_calls(&run_counted_legacy(&cx, parent.path(), "index").await, 2, 2);
+
+                let path = source.join("doc-0.md");
+                let before_modified = fs::metadata(&path).unwrap().modified().unwrap();
+                let before_revision = FsfsRuntime::read_matching_manifest_generation(&root)
+                    .unwrap()
+                    .unwrap()["doc-0.md"]
+                    .revision;
+                let touched_modified = before_modified + std::time::Duration::from_secs(60);
+                File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(std::fs::FileTimes::new().set_modified(touched_modified))
+                    .unwrap();
+                let expected_revision = i64::try_from(super::super::super::system_time_to_ms(
+                    fs::metadata(&path).unwrap().modified().unwrap(),
+                ))
+                .unwrap();
+                assert!(expected_revision > before_revision);
+
+                let touched = run_counted_legacy(&cx, parent.path(), "index").await;
+                assert_index_calls(&touched, 0, 0);
+                assert_eq!(touched["indexed_files"], 2);
+                let after_revision = FsfsRuntime::read_matching_manifest_generation(&root)
+                    .unwrap()
+                    .unwrap()["doc-0.md"]
+                    .revision;
+                assert_eq!(after_revision, expected_revision);
+
+                fs::write(&path, "sharedtoken edited after touch").unwrap();
+                let edited = run_counted_legacy(&cx, parent.path(), "index").await;
+                assert_index_calls(&edited, 1, 1);
             });
         }
 
@@ -2634,6 +2719,12 @@ mod generation_tests {
             runtime.config.search.fast_only = false;
             runtime.config.search.quality_timeout_ms = 5_000;
             "reuse-quality".clone_into(&mut runtime.config.indexing.quality_model);
+            if operation == "query_tuning" {
+                runtime.config.search.quality_weight = 0.25;
+                runtime.config.search.rrf_k = 30.0;
+                runtime.config.search.quality_timeout_ms = 10_000;
+                runtime.config.search.rerank_timeout_ms = 5_000;
+            }
             runtime.cli_input.full_reindex = operation == "force";
             let fast = Arc::new(CountingEmbedder::new(
                 "reuse-fast",
@@ -2703,6 +2794,37 @@ mod generation_tests {
                 assert_eq!(phases.last().unwrap().hits.len(), 2);
             }
             report
+        }
+
+        #[test]
+        fn query_policy_tuning_reuses_both_layouts_without_hiding_source_changes() {
+            run_test_with_cx(|cx| async move {
+                for retained in [false, true] {
+                    let parent = tempfile::tempdir().unwrap();
+                    let (_, source, _) = fixture(parent.path(), 2);
+                    let run = |operation: &'static str| {
+                        let cx = &cx;
+                        let parent = parent.path();
+                        async move {
+                            if retained {
+                                run_counted(cx, parent, operation).await
+                            } else {
+                                run_counted_legacy(cx, parent, operation).await
+                            }
+                        }
+                    };
+                    assert_index_calls(&run("index").await, 2, 2);
+                    assert_index_calls(&run("query_tuning").await, 0, 0);
+                    assert_index_calls(&run("index").await, 0, 0);
+                    fs::write(
+                        source.join("doc-0.md"),
+                        "sharedtoken changed after query tuning",
+                    )
+                    .unwrap();
+                    assert_index_calls(&run("query_tuning").await, 1, 1);
+                    assert_index_calls(&run("force").await, 2, 2);
+                }
+            });
         }
 
         #[test]
@@ -2850,7 +2972,11 @@ mod generation_tests {
                         "invalid current evidence must not be accepted"
                     );
                 } else {
-                    assert_eq!(result.unwrap(), None, "unsupported evidence grants no reuse");
+                    assert_eq!(
+                        result.unwrap(),
+                        None,
+                        "unsupported evidence grants no reuse"
+                    );
                 }
                 assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
                 assert_eq!(store.active(&cx).unwrap(), Some(selected));
@@ -2932,7 +3058,10 @@ mod generation_tests {
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             let build = store.begin(&cx).unwrap();
             let next = candidate(&runtime, build.path());
-            assert_eq!(seed_candidate(&cx, &next, &store, build.path()).unwrap(), Some(4));
+            assert_eq!(
+                seed_candidate(&cx, &next, &store, build.path()).unwrap(),
+                Some(4)
+            );
             let checkpoint: IndexingCheckpoint =
                 read_json(&cx, &build.path().join(FSFS_CHECKPOINT_FILE)).unwrap();
             assert_eq!(checkpoint.index_root, build.path().display().to_string());
@@ -2989,7 +3118,10 @@ mod generation_tests {
             let build = store.begin(&cx).unwrap();
             let mut next = candidate(&runtime, build.path());
             next.cli_input.full_reindex = true;
-            assert_eq!(seed_candidate(&cx, &next, &store, build.path()).unwrap(), None);
+            assert_eq!(
+                seed_candidate(&cx, &next, &store, build.path()).unwrap(),
+                None
+            );
             assert_eq!(fs::read_dir(build.path()).unwrap().count(), 0);
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor));
         });
@@ -3036,6 +3168,69 @@ mod generation_tests {
                     .unwrap(),
                 Some(predecessor)
             );
+        });
+    }
+
+    #[test]
+    fn contract_upgrade_reuse_admits_changed_executable_when_contract_matches_and_rejects_contract_drift()
+     {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(parent.path(), 4);
+            let predecessor = publish(&runtime, &cx, &root).await;
+            let mut receipt: ReuseReceipt =
+                read_json(&cx, &predecessor.path().join(RECEIPT_FILE)).unwrap();
+            let expected_contract = indexing_contract_digest(&runtime).unwrap();
+            assert_eq!(
+                receipt.indexing_contract_sha256.as_deref(),
+                Some(expected_contract.as_str())
+            );
+            assert!(!runtime.contract_upgrade_reuse_enabled());
+
+            // Simulate a binary upgrade: executable_sha256 changes to another valid 64-hex
+            // digest while indexing_contract_sha256 and configuration_sha256 remain identical.
+            let upgraded_exe = "f".repeat(64);
+            receipt.executable_sha256 = Some("a".repeat(64));
+            receipt.session = "previous-process-session".to_owned();
+
+            // Strict default rejects changed executable_sha256.
+            assert!(!compatible_execution(
+                &receipt,
+                Some(&upgraded_exe),
+                "current-process-session"
+            ));
+            assert!(!compatible_receipt(&runtime, &receipt).unwrap());
+
+            // Contract-upgrade reuse admits changed executable_sha256 when contract matches.
+            assert!(compatible_contract_upgrade_execution(
+                &receipt,
+                Some(&upgraded_exe),
+                "current-process-session",
+                &expected_contract
+            ));
+            let upgrade_runtime = runtime.clone().with_contract_upgrade_reuse(true);
+            assert!(upgrade_runtime.contract_upgrade_reuse_enabled());
+            if execution::fingerprint().is_some() {
+                assert!(compatible_receipt(&upgrade_runtime, &receipt).unwrap());
+            }
+
+            // Contract drift or missing executable proof is always rejected even with
+            // contract_upgrade_reuse enabled.
+            assert!(!compatible_contract_upgrade_execution(
+                &receipt,
+                Some(&upgraded_exe),
+                "current-process-session",
+                &"c".repeat(64)
+            ));
+            assert!(!compatible_contract_upgrade_execution(
+                &receipt,
+                None,
+                "current-process-session",
+                &expected_contract
+            ));
+            receipt.indexing_contract_sha256 = Some("d".repeat(64));
+            assert!(!compatible_receipt(&upgrade_runtime, &receipt).unwrap());
+            assert!(!compatible_receipt(&runtime, &receipt).unwrap());
         });
     }
 

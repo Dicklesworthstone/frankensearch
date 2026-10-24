@@ -1929,11 +1929,22 @@ impl TwoTierIndex {
         self.quality_source.is_some()
     }
 
-    /// Returns true when fast-tier ANN is loaded/enabled.
-    #[cfg(feature = "ann")]
+    /// Returns true when the legacy fast-tier ANN adapter is loaded/enabled.
+    ///
+    /// Available even without this crate's `ann` feature so consumers can
+    /// enforce an exact-search policy when another dependency enables `ann`
+    /// through Cargo feature unification. Native HNSW has separate per-tier
+    /// accessors and is not included here.
     #[must_use]
     pub const fn has_fast_ann(&self) -> bool {
-        self.fast_ann.is_some()
+        #[cfg(feature = "ann")]
+        {
+            self.fast_ann.is_some()
+        }
+        #[cfg(not(feature = "ann"))]
+        {
+            false
+        }
     }
 
     /// Number of fast-tier ANN queries that degraded to an exact scan.

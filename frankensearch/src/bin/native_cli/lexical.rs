@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 
+use super::serve::source;
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 use frankensearch::native_ann::builder::sharded::{
     NativeBuiltShardedHybridIndex, NativeShardedHybridReopenLimits,
@@ -355,6 +356,7 @@ async fn stream_one<W: Write>(
 #[serde(untagged)]
 enum Message {
     Search(serve::Request),
+    Fetch(source::Request),
     Control(Control),
 }
 
@@ -408,6 +410,10 @@ fn describe(
         "selection_policy": "fixed_snapshot", "activation_enabled": false,
         "updates_enabled": false, "default_filter_applied": base_filter.is_some(),
         "maximum_timeout_ms": policy.maximum_ms(),
+        "source_fetch_supported": true,
+        "source_fetch_max_documents": source::MAX_DOCUMENTS,
+        "source_fetch_max_content_bytes": source::MAX_CONTENT_BYTES,
+        "source_fetch_max_response_bytes": source::MAX_RESPONSE_BYTES,
     })
 }
 
@@ -445,12 +451,27 @@ async fn run_opened<R: BufRead, W: Write>(
                     "event": "terminal", "ok": false, "status": "failed",
                     "partial_results": false, "retrieval": "lexical",
                     "semantic_components_verified": false,
-                    "error": format!("invalid keyword request ({:?} at column {}); only search and status are supported", error.classify(), error.column()),
+                    "error": format!("invalid keyword request ({:?} at column {}); only search, fetch and status are supported", error.classify(), error.column()),
                 }))?;
                 continue;
             }
         };
         match message {
+            Message::Fetch(request) => {
+                // Share the hybrid server's complete source protocol and byte
+                // limits, using this already-admitted model-free source owner.
+                source::execute(
+                    cx,
+                    index.generation,
+                    &request,
+                    ordinal,
+                    base_filter,
+                    policy,
+                    |id| index.document(id),
+                    output,
+                )
+                .await?;
+            }
             Message::Search(request) => {
                 match stream_one(
                     cx,
@@ -500,3 +521,7 @@ async fn run_opened<R: BufRead, W: Write>(
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[path = "lexical_tests.rs"]
 mod tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[path = "lexical_source_tests.rs"]
+mod source_tests;

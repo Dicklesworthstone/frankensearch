@@ -1,6 +1,9 @@
 //! Lazy native refinement over the same retained fast and lexical candidates.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
 use frankensearch_core::LexicalCandidateBatch;
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
@@ -46,9 +49,64 @@ impl NativeAnnIndex {
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         let search = NativeProgressiveSearch {
             fast: self,
+            fast_owner: None,
             cx,
             fast_embedder,
             quality,
+            quality_owner: None,
+            pool: None,
+            lexical,
+            text,
+            k,
+            reranker: None,
+            allowed_documents: None,
+            candidate_multiplier: 3,
+            rrf: RrfConfig::default(),
+            quality_weight: 0.7,
+            fast_ef: None,
+            quality_ef: None,
+            budget: k.checked_mul(3).ok_or_else(|| {
+                invalid(
+                    "progressive.candidate_budget",
+                    "overflow",
+                    "three times the requested result count must fit usize",
+                )
+            })?,
+            state: State::Initial,
+        };
+        search.admit()?;
+        Ok(search)
+    }
+
+    /// Prepare progressive retrieval whose retained vector owners are safe to
+    /// move onto the caller-owned blocking pool between phases.
+    ///
+    /// Inference, lexical scoring, hydration and reranking retain their ordinary
+    /// async ownership. Only native/exact traversal may use the supplied pool.
+    /// Scoped queries continue inline until their membership predicate has an
+    /// independently owned worker-safe representation.
+    ///
+    /// # Errors
+    ///
+    /// Has the same admission and candidate-budget error surface as [`Self::search_hybrid_progressive`].
+    pub fn search_hybrid_progressive_with_pool<'a>(
+        self: &'a Arc<Self>,
+        cx: &'a Cx,
+        fast_embedder: &'a dyn Embedder,
+        quality: Option<(&'a Arc<Self>, &'a dyn Embedder)>,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        pool: BlockingPoolHandle,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        let search = NativeProgressiveSearch {
+            fast: self.as_ref(),
+            fast_owner: Some(Arc::clone(self)),
+            cx,
+            fast_embedder,
+            quality: quality.map(|(index, embedder)| (index.as_ref(), embedder)),
+            quality_owner: quality.map(|(index, _)| Arc::clone(index)),
+            pool: Some(pool),
             lexical,
             text,
             k,
@@ -163,9 +221,12 @@ enum State {
 /// Construct with [`NativeAnnIndex::search_hybrid_progressive`].
 pub struct NativeProgressiveSearch<'a> {
     fast: &'a NativeAnnIndex,
+    fast_owner: Option<Arc<NativeAnnIndex>>,
     cx: &'a Cx,
     fast_embedder: &'a dyn Embedder,
     quality: Option<(&'a NativeAnnIndex, &'a dyn Embedder)>,
+    quality_owner: Option<Arc<NativeAnnIndex>>,
+    pool: Option<BlockingPoolHandle>,
     lexical: &'a dyn LexicalRead,
     text: &'a str,
     k: usize,
@@ -178,7 +239,7 @@ pub struct NativeProgressiveSearch<'a> {
     reranker: Option<RerankRequest<'a>>,
     // Installed only by the built-cohort scope adapter, together with its
     // filtered lexical reader. None preserves the ordinary unscoped path.
-    allowed_documents: Option<&'a BTreeSet<String>>,
+    allowed_documents: Option<Arc<BTreeSet<String>>>,
     state: State,
 }
 
@@ -310,8 +371,16 @@ impl<'a> NativeProgressiveSearch<'a> {
 
     #[cfg(feature = "quill")]
     pub(in crate::native_ann) fn with_allowed_documents(
+        self,
+        allowed: &BTreeSet<String>,
+    ) -> SearchResult<Self> {
+        self.with_allowed_documents_arc(Arc::new(allowed.clone()))
+    }
+
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_allowed_documents_arc(
         mut self,
-        allowed: &'a BTreeSet<String>,
+        allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<Self> {
         checkpoint(self.cx, "native_ann.scope.configure")?;
         if !matches!(self.state, State::Initial) {
@@ -325,29 +394,64 @@ impl<'a> NativeProgressiveSearch<'a> {
         Ok(self)
     }
 
+    fn owned_index(&self, index: &NativeAnnIndex) -> Option<Arc<NativeAnnIndex>> {
+        self.fast_owner
+            .as_ref()
+            .filter(|owner| std::ptr::eq(owner.as_ref(), index))
+            .cloned()
+            .or_else(|| {
+                self.quality_owner
+                    .as_ref()
+                    .filter(|owner| std::ptr::eq(owner.as_ref(), index))
+                    .cloned()
+            })
+    }
+
     async fn search_tier(
         &self,
         index: &NativeAnnIndex,
         embedder: &dyn Embedder,
         ef: Option<usize>,
     ) -> SearchResult<Vec<VectorHit>> {
-        match self.allowed_documents {
+        match self.allowed_documents.as_ref() {
             Some(allowed) => {
-                index
-                    .search_text_filtered(
-                        self.cx,
-                        embedder,
-                        self.text,
-                        self.budget.min(allowed.len()),
-                        ef,
-                        |id| allowed.contains(id),
-                    )
-                    .await
+                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
+                    let query = owner.embed_query(self.cx, embedder, self.text).await?;
+                    let allowed = Arc::clone(allowed);
+                    owner
+                        .search_filtered_with_pool(
+                            self.cx,
+                            query,
+                            self.budget.min(allowed.len()),
+                            ef,
+                            pool,
+                            move |id| allowed.contains(id),
+                        )
+                        .await
+                } else {
+                    index
+                        .search_text_filtered(
+                            self.cx,
+                            embedder,
+                            self.text,
+                            self.budget.min(allowed.len()),
+                            ef,
+                            |id| allowed.contains(id),
+                        )
+                        .await
+                }
             }
             None => {
-                index
-                    .search_text(self.cx, embedder, self.text, self.budget, ef)
-                    .await
+                if let (Some(pool), Some(owner)) = (self.pool.clone(), self.owned_index(index)) {
+                    let query = owner.embed_query(self.cx, embedder, self.text).await?;
+                    owner
+                        .search_with_pool(self.cx, query, self.budget, ef, pool)
+                        .await
+                } else {
+                    index
+                        .search_text(self.cx, embedder, self.text, self.budget, ef)
+                        .await
+                }
             }
         }
     }

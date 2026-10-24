@@ -418,14 +418,19 @@ mod tests {
             symlink(&root, &alias).unwrap();
             assert!(write(&cx, &alias.join("receipt"), &root, &report()).is_err());
             assert!(!root.join("receipt").exists());
-            let fifo = directory.path().join("pipe");
-            rustix::fs::mkfifoat(
-                rustix::fs::CWD,
-                &fifo,
-                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            )
-            .unwrap();
-            assert!(read(&fifo, &root).is_err());
+            // rustix has no mkfifoat on Apple targets; the other FIFO tests are
+            // Linux-only too.
+            #[cfg(target_os = "linux")]
+            {
+                let fifo = directory.path().join("pipe");
+                rustix::fs::mkfifoat(
+                    rustix::fs::CWD,
+                    &fifo,
+                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+                )
+                .unwrap();
+                assert!(read(&fifo, &root).is_err());
+            }
         });
     }
 

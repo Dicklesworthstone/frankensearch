@@ -645,6 +645,85 @@ impl EmbedderStack {
         Ok(self)
     }
 
+    /// Wrap the stack's fast and optional quality embedders in
+    /// [`CoalescingEmbedder`](crate::CoalescingEmbedder) handles bound to each
+    /// tier's verified [`EmbeddingIdentityBundleV1`], returning the wrapped
+    /// stack alongside the caller-driven dispatchers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cx` is cancelled, `config`/`limits` are invalid, or
+    /// either tier's identity bundle cannot be verified for in-memory f32
+    /// coalescing.
+    pub fn into_coalescing(
+        self,
+        cx: &frankensearch_core::Cx,
+        config: crate::batch_coalescer::CoalescerConfig,
+        limits: crate::batch_coalescer::CoalescerLimits,
+    ) -> SearchResult<(
+        Self,
+        crate::coalescing_embedder::CoalescingDispatcher,
+        Option<crate::coalescing_embedder::CoalescingDispatcher>,
+    )> {
+        let fast_identity = self.fast.identity()?.clone();
+        let (fast_coalescing, fast_dispatcher) =
+            crate::coalescing_embedder::CoalescingEmbedder::new(
+                cx,
+                Arc::clone(&self.fast),
+                fast_identity,
+                config.clone(),
+                limits,
+            )?;
+        let (quality_arc, quality_dispatcher) = if let Some(quality) = self.quality {
+            let quality_identity = quality.identity()?.clone();
+            let (quality_coalescing, dispatcher) =
+                crate::coalescing_embedder::CoalescingEmbedder::new(
+                    cx,
+                    quality,
+                    quality_identity,
+                    config,
+                    limits,
+                )?;
+            let arc: Arc<dyn Embedder> = Arc::new(quality_coalescing);
+            (Some(arc), Some(dispatcher))
+        } else {
+            (None, None)
+        };
+        let fast_arc: Arc<dyn Embedder> = Arc::new(fast_coalescing);
+        let stack = Self::from_parts(fast_arc, quality_arc);
+        Ok((stack, fast_dispatcher, quality_dispatcher))
+    }
+
+    /// Wrap the stack's fast and optional quality embedders in self-driving
+    /// [`CoalescingEmbedder::new_auto`](crate::CoalescingEmbedder::new_auto)
+    /// handles bound to each tier's verified [`EmbeddingIdentityBundleV1`].
+    ///
+    /// Unlike [`Self::into_coalescing`], concurrent callers of `embed_bound`
+    /// automatically elect a leader to dispatch batches with zero idle wait
+    /// when concurrency is 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `cx` is cancelled, `config`/`limits` are invalid, or
+    /// either tier's identity bundle cannot be verified for in-memory f32
+    /// coalescing.
+    pub fn with_auto_coalescing(
+        self,
+        cx: &frankensearch_core::Cx,
+        config: crate::batch_coalescer::CoalescerConfig,
+        limits: crate::batch_coalescer::CoalescerLimits,
+    ) -> SearchResult<Self> {
+        let (stack, fast_dispatcher, quality_dispatcher) =
+            self.into_coalescing(cx, config, limits)?;
+        let fast_auto: Arc<dyn Embedder> = Arc::new(fast_dispatcher.into_auto_embedder());
+        let quality_auto = quality_dispatcher.map(|dispatcher| {
+            let arc: Arc<dyn Embedder> = Arc::new(dispatcher.into_auto_embedder());
+            arc
+        });
+        let _ = stack;
+        Ok(Self::from_parts(fast_auto, quality_auto))
+    }
+
     /// Fast embedder reference.
     #[must_use]
     pub fn fast(&self) -> &dyn Embedder {
@@ -3881,5 +3960,75 @@ mod remote_intent_tests {
             ..RemoteIntentEnv::default()
         };
         expect_unverifiable(&env, "empty identity object");
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn embedder_stack_into_coalescing_batches_fast_and_quality_tiers() {
+        use super::{Arc, Embedder, EmbedderStack};
+        use crate::HashEmbedder;
+        use crate::batch_coalescer::{CoalescerConfig, CoalescerLimits};
+        use asupersync::test_utils::run_test_with_cx;
+        use std::task::{Context, Poll, Waker};
+
+        run_test_with_cx(|cx| async move {
+            let fast = Arc::new(HashEmbedder::default_256());
+            let quality = Arc::new(HashEmbedder::default_384());
+            let expected_fast_a = fast.embed(&cx, "alpha").await.unwrap();
+            let expected_fast_b = fast.embed(&cx, "beta").await.unwrap();
+            let expected_qual_a = quality.embed(&cx, "alpha").await.unwrap();
+            let expected_qual_b = quality.embed(&cx, "beta").await.unwrap();
+
+            let stack = EmbedderStack::from_parts(fast, Some(quality));
+            let (coalesced_stack, mut fast_dispatcher, quality_dispatcher) = stack
+                .into_coalescing(
+                    &cx,
+                    CoalescerConfig {
+                        max_batch_size: 8,
+                        max_wait_ms: 0,
+                        min_batch_size: 1,
+                        use_priority_lanes: true,
+                    },
+                    CoalescerLimits {
+                        max_outstanding_requests: 16,
+                        max_outstanding_text_bytes: 4096,
+                    },
+                )
+                .expect("wrap stack in coalescing embedders");
+            let mut quality_dispatcher = quality_dispatcher.expect("quality dispatcher present");
+
+            let mut fast_fut_a = coalesced_stack.fast().embed(&cx, "alpha");
+            let mut fast_fut_b = coalesced_stack.fast().embed(&cx, "beta");
+            let noop = Waker::noop();
+            let mut poll_cx = Context::from_waker(noop);
+            assert!(matches!(
+                fast_fut_a.as_mut().poll(&mut poll_cx),
+                Poll::Pending
+            ));
+            assert!(matches!(
+                fast_fut_b.as_mut().poll(&mut poll_cx),
+                Poll::Pending
+            ));
+
+            assert_eq!(fast_dispatcher.dispatch_ready(&cx).await.unwrap(), 2);
+            assert_eq!(fast_fut_a.await.unwrap(), expected_fast_a);
+            assert_eq!(fast_fut_b.await.unwrap(), expected_fast_b);
+
+            let qual = coalesced_stack.quality().expect("quality tier present");
+            let mut qual_fut_a = qual.embed(&cx, "alpha");
+            let mut qual_fut_b = qual.embed(&cx, "beta");
+            assert!(matches!(
+                qual_fut_a.as_mut().poll(&mut poll_cx),
+                Poll::Pending
+            ));
+            assert!(matches!(
+                qual_fut_b.as_mut().poll(&mut poll_cx),
+                Poll::Pending
+            ));
+
+            assert_eq!(quality_dispatcher.dispatch_ready(&cx).await.unwrap(), 2);
+            assert_eq!(qual_fut_a.await.unwrap(), expected_qual_a);
+            assert_eq!(qual_fut_b.await.unwrap(), expected_qual_b);
+        });
     }
 }

@@ -8,7 +8,9 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-const CANDIDATE_REV: &str = "18a5a1a9982138822c34d4c3fb29f4c883715069";
+const CANDIDATE_PACKAGE: &str = "frankenhnsw";
+const CANDIDATE_VERSION: &str = "0.3.5";
+const BASELINE_PACKAGE: &str = "hnsw_rs";
 const BASELINE_VERSION: &str = "0.3.4";
 const WORKSPACE_SOURCE_RECEIPT_SCHEMA: &str = "frankensearch.hnsw-workspace-source-receipt.v1";
 const WORKSPACE_SOURCE_FIXED_INPUTS: &[&str] = &[
@@ -97,9 +99,12 @@ fn main() {
         let workspace_receipt = workspace_source_receipt(&workspace);
         write_embedded_workspace_source_receipt(&workspace_receipt);
         let cargo_home = cargo_home();
-        let candidate = find_candidate_checkout(&cargo_home);
-        require_clean_tracked_checkout(&candidate);
-        let baseline = find_registry_baseline(&cargo_home);
+        // Both A/B engines are Cargo-resolved registry packages. Hash those exact
+        // sources instead of requiring an unrelated Git checkout to have been
+        // pre-populated in CARGO_HOME; fresh Cargo homes now have all required
+        // inputs after normal dependency resolution.
+        let candidate = find_registry_source(&cargo_home, CANDIDATE_PACKAGE, CANDIDATE_VERSION);
+        let baseline = find_registry_source(&cargo_home, BASELINE_PACKAGE, BASELINE_VERSION);
         emit("CANDIDATE_SOURCE_SHA256", hash_source_tree(&candidate));
         emit("BASELINE_SOURCE_SHA256", hash_source_tree(&baseline));
     } else {
@@ -279,31 +284,16 @@ fn cargo_home() -> PathBuf {
     )
 }
 
-fn find_candidate_checkout(cargo_home: &Path) -> PathBuf {
-    let checkouts = cargo_home.join("git/checkouts");
-    let mut matches = Vec::new();
-    for repository in read_dirs(&checkouts) {
-        for checkout in read_dirs(&repository) {
-            if checkout.join("Cargo.toml").is_file()
-                && git_text(&checkout, &["rev-parse", "HEAD"]).as_deref() == Some(CANDIDATE_REV)
-            {
-                matches.push(checkout);
-            }
-        }
-    }
-    unique_match(matches, "candidate hnsw_rs git checkout")
-}
-
-fn find_registry_baseline(cargo_home: &Path) -> PathBuf {
+fn find_registry_source(cargo_home: &Path, package: &str, version: &str) -> PathBuf {
     let registry_src = cargo_home.join("registry/src");
     let mut matches = Vec::new();
     for registry in read_dirs(&registry_src) {
-        let candidate = registry.join(format!("hnsw_rs-{BASELINE_VERSION}"));
+        let candidate = registry.join(format!("{package}-{version}"));
         if candidate.join("Cargo.toml").is_file() {
             matches.push(candidate);
         }
     }
-    unique_match(matches, "published hnsw_rs 0.3.4 source")
+    unique_match(matches, &format!("published {package} {version} source"))
 }
 
 fn unique_match(mut matches: Vec<PathBuf>, description: &str) -> PathBuf {
@@ -331,43 +321,6 @@ fn read_dirs(path: &Path) -> Vec<PathBuf> {
         })
         .filter(|entry| entry.is_dir())
         .collect()
-}
-
-fn require_clean_tracked_checkout(checkout: &Path) {
-    let head = git_text(checkout, &["rev-parse", "HEAD"])
-        .unwrap_or_else(|| panic!("candidate checkout has no readable HEAD"));
-    assert_eq!(head, CANDIDATE_REV, "candidate checkout revision changed");
-    for args in [
-        ["diff", "--quiet", "HEAD", "--"].as_slice(),
-        ["diff", "--cached", "--quiet", "HEAD", "--"].as_slice(),
-    ] {
-        let status = git_command(checkout)
-            .args(args)
-            .status()
-            .unwrap_or_else(|error| panic!("failed to inspect candidate tracked dirt: {error}"));
-        assert!(
-            status.success(),
-            "candidate checkout has tracked modifications: {}",
-            checkout.display()
-        );
-    }
-}
-
-fn git_text(cwd: &Path, args: &[&str]) -> Option<String> {
-    let output = git_command(cwd).args(args).output().ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-fn git_command(cwd: &Path) -> Command {
-    let mut command = Command::new("git");
-    command
-        .arg("-c")
-        .arg(format!("safe.directory={}", cwd.display()))
-        .current_dir(cwd);
-    command
 }
 
 fn hash_source_tree(root: &Path) -> String {
