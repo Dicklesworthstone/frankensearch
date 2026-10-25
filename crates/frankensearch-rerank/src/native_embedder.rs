@@ -717,13 +717,69 @@ mod tests {
     const fn assert_async_embed<T: frankensearch_core::traits::Embedder>() {}
     const _: () = assert_async_embed::<NativeEmbedder>();
 
+    fn resolve_minilm_fixture_dir() -> String {
+        if let Ok(explicit) = std::env::var("MINILM_FIXTURE_DIR")
+            && !explicit.trim().is_empty()
+        {
+            return explicit;
+        }
+        for candidate in [
+            frankensearch_embed::model_cache::resolve_cache_root().join("all-MiniLM-L6-v2"),
+            frankensearch_embed::model_cache::resolve_cache_root().join("all-MiniLM-L6-v2-native"),
+            std::path::PathBuf::from("/root/.local/share/frankensearch/models/all-MiniLM-L6-v2"),
+            std::path::PathBuf::from(
+                "/root/.local/share/frankensearch/models/all-MiniLM-L6-v2-native",
+            ),
+            std::path::PathBuf::from("/root/claude-models/all-MiniLM-L6-v2-native"),
+            std::path::PathBuf::from(
+                "/home/ubuntu/.local/share/frankensearch/models/all-MiniLM-L6-v2",
+            ),
+            std::path::PathBuf::from(
+                "/home/ubuntu/.local/share/frankensearch/models/all-MiniLM-L6-v2-native",
+            ),
+        ] {
+            if candidate.join("tokenizer.json").is_file()
+                && candidate.join("model.safetensors").is_file()
+            {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        panic!("set MINILM_FIXTURE_DIR to an all-MiniLM-L6-v2 model directory");
+    }
+
+    fn resolve_multilingual_minilm_fixture_dir() -> String {
+        if let Ok(explicit) = std::env::var("MULTILINGUAL_MINILM_FIXTURE_DIR")
+            && !explicit.trim().is_empty()
+        {
+            return explicit;
+        }
+        for candidate in [
+            frankensearch_embed::model_cache::resolve_cache_root()
+                .join("paraphrase-multilingual-MiniLM-L12-v2"),
+            std::path::PathBuf::from(
+                "/root/.local/share/frankensearch/models/paraphrase-multilingual-MiniLM-L12-v2",
+            ),
+            std::path::PathBuf::from("/root/claude-models/paraphrase-multilingual-MiniLM-L12-v2"),
+            std::path::PathBuf::from(
+                "/home/ubuntu/.local/share/frankensearch/models/paraphrase-multilingual-MiniLM-L12-v2",
+            ),
+        ] {
+            if candidate.join("tokenizer.json").is_file()
+                && candidate.join("model.safetensors").is_file()
+            {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+        panic!("set MULTILINGUAL_MINILM_FIXTURE_DIR to paraphrase-multilingual-MiniLM-L12-v2");
+    }
+
     #[test]
     #[ignore = "requires verified native MiniLM assets via MINILM_FIXTURE_DIR"]
     fn async_fixture_preserves_vectors_and_requires_explicit_pool() {
         use frankensearch_core::traits::Embedder;
         use frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
 
-        let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let dir = resolve_minilm_fixture_dir();
         let native = NativeEmbedder::load_model(dir, NativeEmbeddingModel::AllMiniLmL6V2F32)
             .expect("load actual F32 producer");
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -790,7 +846,7 @@ mod tests {
 
     fn load_async_f32_fixture() -> NativeEmbedder {
         NativeEmbedder::load_model(
-            std::env::var("MINILM_FIXTURE_DIR").expect("verified native fixture required"),
+            resolve_minilm_fixture_dir(),
             NativeEmbeddingModel::AllMiniLmL6V2F32,
         )
         .expect("load actual F32 producer")
@@ -979,7 +1035,7 @@ mod tests {
         use std::task::Poll;
         use std::time::{Duration, Instant};
 
-        let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let dir = resolve_minilm_fixture_dir();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .blocking_threads(0, 2)
             .build()
@@ -1151,7 +1207,7 @@ mod tests {
     fn f32_fixture_proves_certificate_batching_and_repeatability() {
         use frankensearch_core::generation::GoldenVectorCertificateV1;
         use frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
-        let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let dir = resolve_minilm_fixture_dir();
         let profile = NativeEmbeddingModel::AllMiniLmL6V2F32;
         let manifest = profile.manifest().unwrap();
         let trace = crate::native::certificate_trace::begin();
@@ -1244,8 +1300,7 @@ mod tests {
     #[test]
     #[ignore = "requires a local all-MiniLM-L6-v2 model dir via MINILM_FIXTURE_DIR"]
     fn embeds_unit_vector_from_fixture() {
-        let dir = std::env::var("MINILM_FIXTURE_DIR")
-            .expect("set MINILM_FIXTURE_DIR to an all-MiniLM-L6-v2 model directory");
+        let dir = resolve_minilm_fixture_dir();
         let embedder = NativeEmbedder::load(&dir).expect("load native MiniLM embedder");
         assert_eq!(embedder.dimension(), DIM);
         let v = embedder.embed_sync("hello world").expect("embed");
@@ -1274,8 +1329,7 @@ mod tests {
     #[test]
     #[ignore = "requires a verified all-MiniLM-L6-v2 model dir via MINILM_FIXTURE_DIR"]
     fn conformance_certificate_matches_fixture() {
-        let dir = std::env::var("MINILM_FIXTURE_DIR")
-            .expect("set MINILM_FIXTURE_DIR to an all-MiniLM-L6-v2 model directory");
+        let dir = resolve_minilm_fixture_dir();
         let manifest = ModelArtifactManifestV1::minilm_native_frankentorch()
             .expect("registered native MiniLM manifest");
         let expected_identity = manifest
@@ -1314,8 +1368,7 @@ mod tests {
     #[test]
     #[ignore = "requires a verified multilingual MiniLM model dir via MULTILINGUAL_MINILM_FIXTURE_DIR"]
     fn multilingual_fixture_proves_cross_language_retrieval_and_determinism() {
-        let dir = std::env::var("MULTILINGUAL_MINILM_FIXTURE_DIR")
-            .expect("set MULTILINGUAL_MINILM_FIXTURE_DIR to paraphrase-multilingual-MiniLM-L12-v2");
+        let dir = resolve_multilingual_minilm_fixture_dir();
         let load_started = std::time::Instant::now();
         let embedder = NativeEmbedder::load_multilingual(&dir)
             .expect("load verified multilingual MiniLM embedder");
@@ -1623,7 +1676,7 @@ mod tests {
     #[test]
     #[ignore = "requires verified native MiniLM assets via MINILM_FIXTURE_DIR; run optimized"]
     fn streaming_fixture_matches_the_previous_eager_partition_bit_for_bit() {
-        let dir = std::env::var("MINILM_FIXTURE_DIR").expect("native fixture required");
+        let dir = resolve_minilm_fixture_dir();
         let long = "Search finds related documents across the library. ".repeat(100);
         let owned = (0..24)
             .map(|index| match index % 3 {

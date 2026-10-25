@@ -2629,9 +2629,7 @@ mod tests {
     }
 
     fn verified_async_fixture() -> NativeReranker {
-        let dir = std::path::PathBuf::from(
-            std::env::var("FRANKENSEARCH_RERANK_MODEL_DIR").expect("reranker fixture required"),
-        );
+        let dir = model_dir().expect("reranker fixture required");
         frankensearch_embed::model_manifest::ModelManifest::ms_marco_reranker()
             .verify_dir(&dir)
             .expect("registered cross-encoder artifacts");
@@ -3026,6 +3024,15 @@ mod tests {
         }
         candidates.push(
             frankensearch_embed::model_cache::resolve_cache_root().join(CACHE_MODEL_DIR_NAME),
+        );
+        candidates.push(
+            std::path::PathBuf::from("/root/.local/share/frankensearch/models")
+                .join(CACHE_MODEL_DIR_NAME),
+        );
+        candidates.push(std::path::PathBuf::from("/root/claude-models").join(CACHE_MODEL_DIR_NAME));
+        candidates.push(
+            std::path::PathBuf::from("/home/ubuntu/.local/share/frankensearch/models")
+                .join(CACHE_MODEL_DIR_NAME),
         );
         candidates.push(std::path::PathBuf::from(LEGACY_MODEL_DIR));
         candidates.into_iter().find(|dir| dir_has_model(dir))
