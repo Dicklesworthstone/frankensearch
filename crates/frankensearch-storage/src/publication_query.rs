@@ -57,7 +57,10 @@ impl std::fmt::Debug for PublishedQueryOptions<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PublishedQueryOptions")
             .field("limit", &self.limit)
-            .field("allowed_doc_id_count", &self.allowed_doc_ids.map(BTreeSet::len))
+            .field(
+                "allowed_doc_id_count",
+                &self.allowed_doc_ids.map(BTreeSet::len),
+            )
             .finish()
     }
 }

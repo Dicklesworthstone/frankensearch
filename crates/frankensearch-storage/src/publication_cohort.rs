@@ -1269,7 +1269,14 @@ mod tests {
             ("d-shared", "fast", [-1.0, 0.0]),
             ("d-shared", "quality", [0.0, -1.0]),
         ] {
-            publish(&storage, &queue, id, tier, &format!("source for {id}"), values);
+            publish(
+                &storage,
+                &queue,
+                id,
+                tier,
+                &format!("source for {id}"),
+                values,
+            );
         }
         for id in ["b-fast", "c-quality\0数据", "d-shared"] {
             scope_metadata(&storage, id, true);
@@ -1351,7 +1358,11 @@ mod tests {
                             .map(|hit| hit.hit())
                             .collect();
                         assert_eq!(
-                            result.hits().iter().map(|hit| hit.hit()).collect::<Vec<_>>(),
+                            result
+                                .hits()
+                                .iter()
+                                .map(|hit| hit.hit())
+                                .collect::<Vec<_>>(),
                             expected
                         );
                         assert!(std::ptr::eq(result.snapshot(), full.snapshot()));
@@ -1361,7 +1372,10 @@ mod tests {
                     .search_filtered(&cx, &requests[..1], Some(&filter))
                     .unwrap();
                 assert_eq!(selected.len(), 1);
-                assert_eq!(selected[0].snapshot().embedder_id(), requests[0].embedder_id);
+                assert_eq!(
+                    selected[0].snapshot().embedder_id(),
+                    requests[0].embedder_id
+                );
                 assert_eq!(selected[0].hits().len(), 2);
             }
             assert_eq!(storage.metrics_snapshot(), before);
@@ -1387,7 +1401,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(original[0].hits()[0].hit().doc_id.as_str(), "b-fast");
-            assert_eq!(original[1].hits()[0].hit().doc_id.as_str(), "c-quality\0数据");
+            assert_eq!(
+                original[1].hits()[0].hit().doc_id.as_str(),
+                "c-quality\0数据"
+            );
             assert_eq!(
                 original[1].hits()[0].document().canonical_text(),
                 "source for c-quality\0数据"
@@ -1420,7 +1437,10 @@ mod tests {
             ) -> SearchFuture<'a, Vec<RerankScore>> {
                 Box::pin(async move {
                     assert_eq!(
-                        documents.iter().map(|doc| doc.doc_id.as_str()).collect::<Vec<_>>(),
+                        documents
+                            .iter()
+                            .map(|doc| doc.doc_id.as_str())
+                            .collect::<Vec<_>>(),
                         ["b-fast", "d-shared", "c-quality\0数据"]
                     );
                     Ok(documents
@@ -1439,10 +1459,10 @@ mod tests {
                         .collect())
                 })
             }
-            fn id(&self) -> &str {
+            fn id(&self) -> &'static str {
                 "scope-probe"
             }
-            fn model_name(&self) -> &str {
+            fn model_name(&self) -> &'static str {
                 "scope-probe"
             }
         }
@@ -1475,7 +1495,8 @@ mod tests {
                 .unwrap();
             drop(tiers);
             assert_eq!(
-                reranked.iter()
+                reranked
+                    .iter()
                     .map(|hit| hit.document().catalog().doc_id.as_str())
                     .collect::<Vec<_>>(),
                 ["b-fast", "d-shared", "c-quality\0数据"]
@@ -1500,20 +1521,17 @@ mod tests {
                 }],
             ] {
                 assert!(
-                    cohort.search_text_filtered(&cx, "question", &requests, Some(&filter))
-                        .await.is_err()
+                    cohort
+                        .search_text_filtered(&cx, "question", &requests, Some(&filter))
+                        .await
+                        .is_err()
                 );
             }
             assert_eq!(fast.calls.load(Ordering::SeqCst), 0);
             assert_eq!(filter.calls.load(Ordering::SeqCst), 0);
             for (text, limit) in [("question", 0), (" \t ", 1)] {
                 let hits = cohort
-                    .search_text_filtered(
-                        &cx,
-                        text,
-                        &[fast.request(&policy, limit)],
-                        Some(&filter),
-                    )
+                    .search_text_filtered(&cx, text, &[fast.request(&policy, limit)], Some(&filter))
                     .await
                     .unwrap();
                 assert!(hits[0].hits().is_empty());
@@ -1527,17 +1545,20 @@ mod tests {
                     Some(&filter),
                 )
                 .await;
-            assert!(matches!(result, Err(SearchError::InvalidConfig { field, .. })
-                if field == "publication_search.identity"));
+            assert!(
+                matches!(result, Err(SearchError::InvalidConfig { field, .. })
+                if field == "publication_search.identity")
+            );
             // Only fast reached the predicate; a foreign bound quality response
             // cannot yield a filtered successful prefix or invoke its filter.
             assert_eq!(filter.calls.load(Ordering::SeqCst), 3);
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
             quality.drift.store(true, Ordering::SeqCst);
             assert!(
-                cohort.search_text_filtered(
-                    &cx, "", &[quality.request(&policy, 0)], Some(&filter)
-                ).await.is_err()
+                cohort
+                    .search_text_filtered(&cx, "", &[quality.request(&policy, 0)], Some(&filter))
+                    .await
+                    .is_err()
             );
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
             cx.cancel_with(asupersync::CancelKind::User, Some("cancel filtered query"));
@@ -1546,7 +1567,9 @@ mod tests {
                 Err(SearchError::Cancelled { .. })
             ));
             assert!(matches!(
-                cohort.search_text_filtered(&cx, "", &[], Some(&filter)).await,
+                cohort
+                    .search_text_filtered(&cx, "", &[], Some(&filter))
+                    .await,
                 Err(SearchError::Cancelled { .. })
             ));
             assert_eq!(filter.calls.load(Ordering::SeqCst), 3);

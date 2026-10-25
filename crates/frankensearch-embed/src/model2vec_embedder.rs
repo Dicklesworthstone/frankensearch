@@ -78,16 +78,13 @@ enum Model2VecTokenizer {
 impl Model2VecTokenizer {
     fn from_file(path: &Path) -> tokenizers::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        if is_unigram_tokenizer(&content) {
-            let sidecar_path = path
-                .parent()
-                .map(|dir| dir.join(UNIGRAM_TRIE_SIDECAR_FILENAME));
-            Ok(Self::CompactUnigram(deserialize_unigram_tokenizer(
-                &content,
-                sidecar_path.as_deref(),
-            )?))
-        } else {
-            Ok(Self::Library(serde_json::from_str(&content)?))
+        let sidecar_path = path
+            .parent()
+            .map(|dir| dir.join(UNIGRAM_TRIE_SIDECAR_FILENAME));
+        match deserialize_unigram_tokenizer(&content, sidecar_path.as_deref()) {
+            Ok(tokenizer) => Ok(Self::CompactUnigram(tokenizer)),
+            Err(err) if is_unigram_tokenizer(&content) => Err(err),
+            Err(_) => Ok(Self::Library(serde_json::from_str(&content)?)),
         }
     }
 
@@ -873,7 +870,6 @@ fn discover_tensor_name(names: &[&str]) -> Option<String> {
 /// process start; any mismatch — size, mtime, ctime, device or inode — falls
 /// back to the full pass, so a model replaced or rewritten on disk cannot be
 /// admitted on the strength of the old receipt.
-#[cfg(not(test))]
 fn admit_registered_potion(model_dir: &Path) -> SearchResult<EmbeddingIdentityBundleV1> {
     let verified = ModelArtifactManifestV1::potion_128m_native()?.verify_dir_cached(
         &crate::model_manifest::ModelManifest::potion_128m(),
@@ -2143,18 +2139,17 @@ mod tests {
     #[test]
     #[ignore = "requires a verified potion model dir via POTION_FIXTURE_DIR"]
     fn conformance_certificate_matches_fixture() {
-        let dir = std::env::var("POTION_FIXTURE_DIR")
-            .expect("set POTION_FIXTURE_DIR to a potion-multilingual-128M directory");
+        let dir = resolve_potion_fixture_dir();
         let manifest = crate::model_manifest::ModelArtifactManifestV1::potion_128m_native()
             .expect("registered potion manifest");
         let verified = manifest
-            .verify_dir(Path::new(&dir))
+            .verify_dir(&dir)
             .expect("verify frozen potion artifacts");
         let expected_identity = verified
             .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
             .expect("derive verified potion identity");
         let embedder = Model2VecEmbedder::load_preverified(
-            Path::new(&dir),
+            &dir,
             DEFAULT_MODEL_NAME,
             expected_identity.clone(),
         )
@@ -2397,6 +2392,64 @@ mod tests {
     fn real_model_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn resolve_potion_fixture_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("POTION_FIXTURE_DIR") {
+            return PathBuf::from(dir);
+        }
+        for candidate in [
+            "/root/.local/share/frankensearch/models/potion-multilingual-128M",
+            "/home/ubuntu/.local/share/frankensearch/models/potion-multilingual-128M",
+        ] {
+            let path = PathBuf::from(candidate);
+            if path.join("model.safetensors").is_file() && path.join("tokenizer.json").is_file() {
+                return path;
+            }
+        }
+        panic!("set POTION_FIXTURE_DIR to a potion-multilingual-128M directory");
+    }
+
+    fn stage_real_potion_model_dir(source_dir: &Path, target_dir: &Path) {
+        let manifest = crate::model_manifest::ModelManifest::potion_128m();
+        for artifact in &manifest.files {
+            let src = source_dir.join(&artifact.name);
+            let dst = target_dir.join(&artifact.name);
+            if let Some(parent) = dst.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            if artifact.name == "model.safetensors" {
+                if fs::hard_link(&src, &dst).is_err() {
+                    fs::copy(&src, &dst).unwrap();
+                }
+            } else {
+                fs::copy(&src, &dst).unwrap();
+            }
+        }
+    }
+
+    fn read_proc_status_kb() -> (u64, u64) {
+        let Ok(status) = fs::read_to_string("/proc/self/status") else {
+            return (0, 0);
+        };
+        let mut rss_kb = 0_u64;
+        let mut hwm_kb = 0_u64;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                rss_kb = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+                hwm_kb = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        (rss_kb, hwm_kb)
     }
 
     /// Decode a safetensors file the way the loader did BEFORE #46: read the
@@ -2650,9 +2703,8 @@ mod tests {
         let _serialized = real_model_test_lock()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let dir = std::env::var("POTION_FIXTURE_DIR")
-            .expect("set POTION_FIXTURE_DIR to a potion-multilingual-128M directory");
-        let dir = Path::new(&dir);
+        let dir_buf = resolve_potion_fixture_dir();
+        let dir = dir_buf.as_path();
 
         let embedder = Model2VecEmbedder::load_with_name(dir, DEFAULT_MODEL_NAME).unwrap();
         let (vocab_size, dimensions, expected) = whole_buffer_decode(dir);
@@ -2709,9 +2761,8 @@ mod tests {
         let _serialized = real_model_test_lock()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let dir = std::env::var("POTION_FIXTURE_DIR")
-            .expect("set POTION_FIXTURE_DIR to a potion-multilingual-128M directory");
-        let dir = Path::new(&dir);
+        let dir_buf = resolve_potion_fixture_dir();
+        let dir = dir_buf.as_path();
         let key = std::fs::canonicalize(dir).unwrap();
 
         let before = model2vec_full_loads_for(&key);
@@ -2728,6 +2779,272 @@ mod tests {
             "the second real-model load must be served from the process cache"
         );
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    /// Full GH #46 (`bd-u8cof`) qualification on the registered real Potion
+    /// artifact set:
+    /// 1. Cold `Model2VecEmbedder::load_with_name` builds the `PieceTrie` once
+    ///    and persists `.tokenizer.unigram-trie.v1`.
+    /// 2. Warm `Model2VecEmbedder::load_with_name` admits the directory with
+    ///    `.tokenizer.unigram-trie.v1` present and serves the trie directly
+    ///    from the sidecar (`SIDECAR_HITS + 1`, `SIDECAR_BUILDS + 0`), proving
+    ///    trie construction is skipped.
+    /// 3. Tokenizer IDs and embedding vectors are bit-identical across cold
+    ///    `CompactUnigram`, warm sidecar `CompactUnigram`, and the unchanged
+    ///    library `Tokenizer::from_file` + `whole_buffer_decode` reference over
+    ///    `MODEL_CONFORMANCE_TEXTS_V1`, multilingual scripts, added/special
+    ///    tokens (`[PAD]`, `[UNK]`), OOV inputs, and >512-token long inputs,
+    ///    preserving `GoldenVectorCertificateV1`.
+    /// 4. Corruption/mutation admission controls: corrupted sidecar bytes fall
+    ///    back to `PieceTrie::build` and self-repair; mutated `tokenizer.json`
+    ///    is rejected by `admit_registered_potion` even when a valid sidecar
+    ///    and cached verification receipt exist; unverified extra files are
+    ///    rejected.
+    /// 5. Emits paired same-invocation cold/warm/incumbent load time, RSS/HWM,
+    ///    and embedding-batch throughput countermetrics.
+    #[test]
+    #[ignore = "requires a real potion model dir via POTION_FIXTURE_DIR"]
+    #[allow(clippy::too_many_lines)]
+    fn real_model_unigram_sidecar_parity_admission_and_cold_warm_countermetrics() {
+        let _serialized = real_model_test_lock()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let source_dir = resolve_potion_fixture_dir();
+        let stage = tempfile::tempdir().unwrap();
+        stage_real_potion_model_dir(&source_dir, stage.path());
+        let sidecar_path = stage.path().join(UNIGRAM_TRIE_SIDECAR_FILENAME);
+        let tokenizer_path = stage.path().join("tokenizer.json");
+        assert!(!sidecar_path.exists());
+
+        let load_production_potion = |dir: &Path| -> SearchResult<Model2VecEmbedder> {
+            let identity = admit_registered_potion(dir)?;
+            Model2VecEmbedder::load_preverified(dir, DEFAULT_MODEL_NAME, identity)
+        };
+
+        let (rss_start_kb, hwm_start_kb) = read_proc_status_kb();
+
+        // 1. Cold full load builds and persists the Unigram trie sidecar.
+        let builds_0 = compact_unigram::sidecar_builds_for_test();
+        let hits_0 = compact_unigram::sidecar_hits_for_test();
+        let cold_t0 = std::time::Instant::now();
+        let cold_embedder = load_production_potion(stage.path()).unwrap();
+        let cold_load_ms = cold_t0.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(compact_unigram::sidecar_builds_for_test(), builds_0 + 1);
+        assert_eq!(compact_unigram::sidecar_hits_for_test(), hits_0);
+        assert!(sidecar_path.is_file(), "cold load must persist sidecar");
+        let sidecar_bytes = fs::metadata(&sidecar_path).unwrap().len();
+        assert!(
+            sidecar_bytes > 1_000_000,
+            "real Potion sidecar should be >1 MB"
+        );
+        let (rss_after_cold_kb, hwm_after_cold_kb) = read_proc_status_kb();
+
+        // 2. Warm full load admits `.tokenizer.unigram-trie.v1` and skips trie construction.
+        let warm_t0 = std::time::Instant::now();
+        let warm_embedder = load_production_potion(stage.path()).unwrap();
+        let warm_load_ms = warm_t0.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            compact_unigram::sidecar_builds_for_test(),
+            builds_0 + 1,
+            "warm load must skip PieceTrie::build"
+        );
+        assert_eq!(
+            compact_unigram::sidecar_hits_for_test(),
+            hits_0 + 1,
+            "warm load must hit the persisted PieceTrie sidecar"
+        );
+        let (rss_after_warm_kb, hwm_after_warm_kb) = read_proc_status_kb();
+
+        // 3. Isolated tokenizer-only cold vs warm vs upstream library load timing.
+        let tok_stage = tempfile::tempdir().unwrap();
+        let tok_stage_json = tok_stage.path().join("tokenizer.json");
+        fs::copy(&tokenizer_path, &tok_stage_json).unwrap();
+        let cold_tok_t0 = std::time::Instant::now();
+        let _cold_tok = Model2VecTokenizer::from_file(&tok_stage_json).unwrap();
+        let cold_tokenizer_ms = cold_tok_t0.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(compact_unigram::sidecar_builds_for_test(), builds_0 + 2);
+        let warm_tok_t0 = std::time::Instant::now();
+        let _warm_tok = Model2VecTokenizer::from_file(&tok_stage_json).unwrap();
+        let warm_tokenizer_ms = warm_tok_t0.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(compact_unigram::sidecar_builds_for_test(), builds_0 + 2);
+        assert_eq!(compact_unigram::sidecar_hits_for_test(), hits_0 + 2);
+
+        let lib_tok_t0 = std::time::Instant::now();
+        let lib_tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
+        let library_tokenizer_ms = lib_tok_t0.elapsed().as_secs_f64() * 1000.0;
+
+        // 4. Incumbent pre-#46 whole-buffer + library tokenizer load in the same invocation.
+        let incumbent_t0 = std::time::Instant::now();
+        let (vocab_size, dimensions, expected_matrix) = whole_buffer_decode(stage.path());
+        let incumbent_tokenizer = Tokenizer::from_file(&tokenizer_path).unwrap();
+        let incumbent_load_ms = incumbent_t0.elapsed().as_secs_f64() * 1000.0;
+        let (rss_after_incumbent_kb, hwm_after_incumbent_kb) = read_proc_status_kb();
+
+        let reference = Model2VecEmbedder {
+            tokenizer: Model2VecTokenizer::Library(incumbent_tokenizer),
+            embeddings: expected_matrix,
+            dimensions,
+            vocab_size,
+            name: DEFAULT_MODEL_NAME.to_owned(),
+            model_dir: stage.path().to_path_buf(),
+            identity: warm_embedder.identity.clone(),
+            dropped_token_id: warm_embedder.dropped_token_id,
+            last_tokenizer_route_was_offset_free: AtomicBool::new(false),
+        };
+
+        // 5. Tokenizer-ID and embedding-vector bit parity across conformance,
+        //    multilingual, added/special, unknown, and >512-token inputs.
+        let added_vocab = warm_embedder.tokenizer.get_added_vocabulary().get_vocab();
+        let pad_id = *added_vocab.get("[PAD]").expect("[PAD] in added vocab");
+        let unk_id = *added_vocab.get("[UNK]").expect("[UNK] in added vocab");
+        let added_special_text = "hello [PAD] [UNK] world";
+        let long_over_512_text = std::iter::repeat_n("hello", 1024)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut parity_texts = crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1
+            .iter()
+            .map(|text| (*text).to_owned())
+            .collect::<Vec<_>>();
+        parity_texts.extend(
+            [
+                "naïve café Zürich — Straße, déjà vu",
+                "Съешь же ещё этих мягких французских булок",
+                "Ζεῦ πάτερ, ἄγγελος",
+                "مرحبا بالعالم، هذا اختبار",
+                "שלום עולם",
+                "नमस्ते दुनिया",
+                "東京都の天気は晴れです。日本語の文章",
+                "我们使用多语言模型进行检索",
+                "안녕하세요 세계",
+                "สวัสดีชาวโลก",
+                "🦀🔥 emoji 👩‍👩‍👧 zero\u{200d}width and e\u{301} combining",
+                added_special_text,
+                "\tmetaspace  boundaries\tand unseen-oov-\u{10ffff}",
+                "",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        parity_texts.push(long_over_512_text);
+
+        for text in &parity_texts {
+            let expected_ids = lib_tokenizer.encode_fast(text.as_str(), false).unwrap();
+            let cold_ids = cold_embedder
+                .tokenizer
+                .encode_fast(text.as_str(), false)
+                .unwrap();
+            let warm_ids = warm_embedder
+                .tokenizer
+                .encode_fast(text.as_str(), false)
+                .unwrap();
+            assert_eq!(
+                cold_ids.get_ids(),
+                expected_ids.get_ids(),
+                "cold token IDs diverged on {text:?}"
+            );
+            assert_eq!(
+                warm_ids.get_ids(),
+                expected_ids.get_ids(),
+                "warm sidecar token IDs diverged on {text:?}"
+            );
+            let ref_vec = reference.embed_sync(text).unwrap();
+            let cold_vec = cold_embedder.embed_sync(text).unwrap();
+            let warm_vec = warm_embedder.embed_sync(text).unwrap();
+            assert_f32_bits_eq(&cold_vec, &ref_vec, "cold vs reference vector bits");
+            assert_f32_bits_eq(&warm_vec, &ref_vec, "warm sidecar vs reference vector bits");
+        }
+        let special_ids = warm_embedder
+            .tokenizer
+            .encode_fast(added_special_text, false)
+            .unwrap();
+        assert!(
+            special_ids.get_ids().contains(&pad_id) && special_ids.get_ids().contains(&unk_id),
+            "warm sidecar tokenizer must preserve [PAD] and [UNK] added-token IDs"
+        );
+
+        // Conformance golden certificate check + paired throughput countermetrics.
+        let conformance_texts = &crate::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
+        let warm_batch_t0 = std::time::Instant::now();
+        let mut warm_vectors = Vec::new();
+        for _ in 0..10 {
+            warm_vectors = warm_embedder.embed_batch_sync(conformance_texts).unwrap();
+        }
+        let warm_batch_10x_ms = warm_batch_t0.elapsed().as_secs_f64() * 1000.0;
+
+        let ref_batch_t0 = std::time::Instant::now();
+        let mut ref_vectors = Vec::new();
+        for _ in 0..10 {
+            ref_vectors = reference.embed_batch_sync(conformance_texts).unwrap();
+        }
+        let ref_batch_10x_ms = ref_batch_t0.elapsed().as_secs_f64() * 1000.0;
+        for (actual, expected) in warm_vectors.iter().zip(&ref_vectors) {
+            assert_f32_bits_eq(actual, expected, "warm batch vs reference batch bits");
+        }
+        let manifest = crate::model_manifest::ModelArtifactManifestV1::potion_128m_native()
+            .expect("registered potion manifest");
+        let observed_cert =
+            frankensearch_core::generation::GoldenVectorCertificateV1::from_exact_f32(
+                conformance_texts,
+                &warm_vectors,
+            )
+            .unwrap();
+        assert_eq!(observed_cert, manifest.execution.golden_vectors);
+
+        // 6. Corruption / mutation admission controls on the real staged directory.
+        let mut corrupted_sidecar = fs::read(&sidecar_path).unwrap();
+        let mid = corrupted_sidecar.len() / 2;
+        corrupted_sidecar[mid] ^= 0x5A;
+        fs::write(&sidecar_path, &corrupted_sidecar).unwrap();
+        let builds_before_corrupt = compact_unigram::sidecar_builds_for_test();
+        let hits_before_corrupt = compact_unigram::sidecar_hits_for_test();
+        let repaired = load_production_potion(stage.path()).unwrap();
+        assert_eq!(
+            compact_unigram::sidecar_builds_for_test(),
+            builds_before_corrupt + 1,
+            "corrupted sidecar must be rejected and rebuilt from tokenizer.json"
+        );
+        assert_eq!(
+            compact_unigram::sidecar_hits_for_test(),
+            hits_before_corrupt,
+            "corrupted sidecar must not register a hit"
+        );
+        assert_f32_bits_eq(
+            &repaired.embed_sync("Café naïve — 東京 🦀").unwrap(),
+            &reference.embed_sync("Café naïve — 東京 🦀").unwrap(),
+            "repaired embedder must preserve exact vector bits",
+        );
+        // Subsequent load hits the repaired sidecar.
+        let _after_repair = load_production_potion(stage.path()).unwrap();
+        assert_eq!(
+            compact_unigram::sidecar_hits_for_test(),
+            hits_before_corrupt + 1
+        );
+
+        // Unregistered semantic-role artifact must be rejected by verify_no_extra_artifacts.
+        let extra_path = stage.path().join("model.onnx");
+        fs::write(&extra_path, b"untrusted").unwrap();
+        assert!(
+            load_production_potion(stage.path()).is_err(),
+            "extra unregistered semantic-role file must fail admission"
+        );
+        fs::remove_file(&extra_path).unwrap();
+
+        // Mutated tokenizer.json must fail closed even when `.tokenizer.unigram-trie.v1`
+        // and `.verified` receipt are present.
+        let original_tokenizer = fs::read(&tokenizer_path).unwrap();
+        let mut mutated_tokenizer = original_tokenizer.clone();
+        let flip_idx = mutated_tokenizer.len() / 2;
+        mutated_tokenizer[flip_idx] ^= 0x01;
+        fs::write(&tokenizer_path, &mutated_tokenizer).unwrap();
+        assert!(
+            load_production_potion(stage.path()).is_err(),
+            "mutated tokenizer.json must fail closed before consulting sidecar"
+        );
+        fs::write(&tokenizer_path, &original_tokenizer).unwrap();
+
+        println!(
+            "{{\"bd\":\"bd-u8cof\",\"cold_load_ms\":{cold_load_ms:.2},\"warm_load_ms\":{warm_load_ms:.2},\"incumbent_load_ms\":{incumbent_load_ms:.2},\"cold_tokenizer_ms\":{cold_tokenizer_ms:.2},\"warm_tokenizer_ms\":{warm_tokenizer_ms:.2},\"library_tokenizer_ms\":{library_tokenizer_ms:.2},\"sidecar_bytes\":{sidecar_bytes},\"warm_batch_10x_ms\":{warm_batch_10x_ms:.2},\"ref_batch_10x_ms\":{ref_batch_10x_ms:.2},\"rss_start_kb\":{rss_start_kb},\"hwm_start_kb\":{hwm_start_kb},\"rss_after_cold_kb\":{rss_after_cold_kb},\"hwm_after_cold_kb\":{hwm_after_cold_kb},\"rss_after_warm_kb\":{rss_after_warm_kb},\"hwm_after_warm_kb\":{hwm_after_warm_kb},\"rss_after_incumbent_kb\":{rss_after_incumbent_kb},\"hwm_after_incumbent_kb\":{hwm_after_incumbent_kb}}}"
+        );
     }
 
     /// Offset validation must survive the move off `SafeTensors::deserialize`.

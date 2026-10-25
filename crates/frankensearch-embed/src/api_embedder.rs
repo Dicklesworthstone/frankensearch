@@ -404,8 +404,8 @@ async fn request_api_response(
                 }
             })?;
         let status = response.head.status;
-        let bytes = read_api_response_body(cx, provider, response.body, config.max_response_bytes)
-            .await?;
+        let bytes =
+            read_api_response_body(cx, provider, response.body, config.max_response_bytes).await?;
         Ok((status, bytes))
     };
     let started = cx.now();
@@ -2106,7 +2106,10 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(pauses, 2, "one completed delay does not authorize a request");
+            assert_eq!(
+                pauses, 2,
+                "one completed delay does not authorize a request"
+            );
             assert_eq!(
                 limiter.acquire_at(*clock.lock().unwrap()),
                 Some(Duration::from_secs(60))
@@ -2132,7 +2135,10 @@ mod tests {
             run_test_with_cx(|cx| async move {
                 let limiter = RateLimiter::new(rate);
                 let before = limiter.state.lock().unwrap().available_credits;
-                cx.cancel_with(asupersync::CancelKind::User, Some("cancel before admission"));
+                cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel before admission"),
+                );
                 assert!(matches!(
                     limiter.wait_for_permit(&cx).await,
                     Err(SearchError::Cancelled { .. })
@@ -2173,7 +2179,11 @@ mod tests {
                 }
                 drop(operation);
                 assert_eq!(limiter.state.lock().unwrap().available_credits, 0);
-                assert!(limiter.acquire_at(start + Duration::from_secs(60)).is_none());
+                assert!(
+                    limiter
+                        .acquire_at(start + Duration::from_secs(60))
+                        .is_none()
+                );
                 if !cancel {
                     let before = wake.0.load(Ordering::SeqCst);
                     assert!(!cx.is_cancel_requested());
@@ -2299,10 +2309,7 @@ mod tests {
     }
 
     impl AttemptBody {
-        fn new(
-            frames: Vec<Result<Frame<&'static [u8]>, std::io::Error>>,
-            pending: bool,
-        ) -> Self {
+        fn new(frames: Vec<Result<Frame<&'static [u8]>, std::io::Error>>, pending: bool) -> Self {
             Self {
                 frames: frames.into(),
                 pending,
@@ -2417,7 +2424,10 @@ mod tests {
             ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
                 let before = self.polls.fetch_add(1, Ordering::SeqCst);
                 // Fail the old unbounded collector instead of hanging the test.
-                assert!(before < API_BODY_STEPS_PER_POLL, "body drained without yielding");
+                assert!(
+                    before < API_BODY_STEPS_PER_POLL,
+                    "body drained without yielding"
+                );
                 Poll::Ready(Some(Ok(if self.trailers {
                     Frame::Trailers(Default::default())
                 } else {
@@ -2477,7 +2487,9 @@ mod tests {
                     if cancel {
                         assert!(matches!(
                             result,
-                            Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. })))
+                            Poll::Ready(Err(ApiAttemptError::Terminal(
+                                SearchError::Cancelled { .. }
+                            )))
                         ));
                     } else {
                         assert!(matches!(
@@ -2512,12 +2524,8 @@ mod tests {
             let expected = "\0é".repeat(65).into_bytes();
             let wake = Arc::new(AdmissionWake(std::sync::atomic::AtomicUsize::new(0)));
             let waker = Waker::from(Arc::clone(&wake));
-            let mut operation = Box::pin(read_api_response_body(
-                &cx,
-                &provider,
-                body,
-                expected.len(),
-            ));
+            let mut operation =
+                Box::pin(read_api_response_body(&cx, &provider, body, expected.len()));
             let mut turns = 0;
             let result = loop {
                 turns += 1;
@@ -2572,7 +2580,10 @@ mod tests {
                 let mut turns = 0;
                 let result = loop {
                     turns += 1;
-                    assert!(turns <= length + 2, "retained frame stopped making progress");
+                    assert!(
+                        turns <= length + 2,
+                        "retained frame stopped making progress"
+                    );
                     let before = copied.load(Ordering::SeqCst);
                     let wakes_before = wake.0.load(Ordering::SeqCst);
                     let result = operation.as_mut().poll(&mut Context::from_waker(&waker));
@@ -2608,8 +2619,12 @@ mod tests {
                 let polls = Arc::clone(&body.polls);
                 let mut operation = Box::pin(read_api_response_body(&cx, &provider, body, limit));
                 assert!(matches!(
-                    operation.as_mut().poll(&mut Context::from_waker(Waker::noop())),
-                    Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::EmbeddingFailed { .. })))
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Ready(Err(ApiAttemptError::Terminal(
+                        SearchError::EmbeddingFailed { .. }
+                    )))
                 ));
                 assert_eq!(copied.load(Ordering::SeqCst), 0);
                 assert_eq!(polls.load(Ordering::SeqCst), 1);
@@ -2652,7 +2667,9 @@ mod tests {
                     assert!(wake.0.load(Ordering::SeqCst) > before);
                     assert!(matches!(
                         operation.as_mut().poll(&mut Context::from_waker(&waker)),
-                        Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. })))
+                        Poll::Ready(Err(ApiAttemptError::Terminal(
+                            SearchError::Cancelled { .. }
+                        )))
                     ));
                     assert_eq!(Arc::strong_count(&input), 1);
                 }
@@ -2697,7 +2714,9 @@ mod tests {
             assert_eq!(polls.load(Ordering::SeqCst), 2);
             assert!(!dropped.load(Ordering::SeqCst));
             elapsed.store(50, Ordering::SeqCst);
-            let result = operation.as_mut().poll(&mut Context::from_waker(Waker::noop()));
+            let result = operation
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()));
             match result {
                 Poll::Ready(Err(ApiAttemptError::Retry(error))) => {
                     assert!(error.to_string().contains("deadline exceeded"));
@@ -2744,7 +2763,9 @@ mod tests {
                     assert!(wake.0.load(Ordering::SeqCst) > before);
                     assert!(matches!(
                         operation.as_mut().poll(&mut Context::from_waker(&waker)),
-                        Poll::Ready(Err(ApiAttemptError::Terminal(SearchError::Cancelled { .. })))
+                        Poll::Ready(Err(ApiAttemptError::Terminal(
+                            SearchError::Cancelled { .. }
+                        )))
                     ));
                     assert!(dropped.load(Ordering::SeqCst));
                 }

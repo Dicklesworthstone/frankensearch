@@ -2,9 +2,9 @@
 
 use super::{
     AsyncConnection, BinaryHeap, BoundQueryEmbedding, Cx, EmbeddingSpaceKindV1, Ordering,
-    PublishedEmbedding, PublishedEmbeddingReadLimits, RankedHit, SearchResult, Storage,
-    VectorHit, cosine, map_storage_error, publication_checkpoint, publication_error,
-    query_norm, scan_on, validate_read_request,
+    PublishedEmbedding, PublishedEmbeddingReadLimits, RankedHit, SearchResult, Storage, VectorHit,
+    cosine, map_storage_error, publication_checkpoint, publication_error, query_norm, scan_on,
+    validate_read_request,
 };
 use crate::{
     PublishedEmbeddingQueryHit, PublishedEmbeddingQueryResult, PublishedQueryOptions,
@@ -83,7 +83,13 @@ impl Storage {
         }
         let result = self.transaction(|conn| {
             let selected = select_on(
-                conn, cx, embedder_id, query, norm, options, limits.embeddings,
+                conn,
+                cx,
+                embedder_id,
+                query,
+                norm,
+                options,
+                limits.embeddings,
             )?;
             hydrate_on(conn, cx, selected, limits.max_source_bytes)
         });
@@ -162,9 +168,8 @@ impl Storage {
                 scan_stats: None,
             });
         }
-        let result = self.transaction(|conn| {
-            select_on(conn, cx, embedder_id, query, norm, options, limits)
-        });
+        let result =
+            self.transaction(|conn| select_on(conn, cx, embedder_id, query, norm, options, limits));
         publication_checkpoint(cx)?;
         result
     }
@@ -191,7 +196,10 @@ fn hydrate_on(
         remaining = remaining
             .checked_sub(bytes)
             .ok_or_else(|| publication_error("winning source exceeded its admitted budget"))?;
-        hits.push(PublishedSearchQueryHit { embedding, document });
+        hits.push(PublishedSearchQueryHit {
+            embedding,
+            document,
+        });
     }
     publication_checkpoint(cx)?;
     Ok(PublishedSearchQueryResult {
@@ -232,9 +240,8 @@ fn select_on(
         query.identity(),
         limits,
         |publication| {
-            let index = u32::try_from(ordinal).map_err(|_| {
-                publication_error("query position exceeds vector-hit index width")
-            })?;
+            let index = u32::try_from(ordinal)
+                .map_err(|_| publication_error("query position exceeds vector-hit index width"))?;
             // scan_on has already validated this publication, including its
             // norm. Advance the complete-scan position even when excluded.
             ordinal = ordinal
@@ -374,7 +381,12 @@ mod tests {
         let preview: String = body.chars().take(400).collect();
         storage
             .upsert_document(&DocumentRecord::new(
-                id, preview, hash, body.chars().count(), 1, 1,
+                id,
+                preview,
+                hash,
+                body.chars().count(),
+                1,
+                1,
             ))
             .unwrap();
         storage.set_document_content(id, body).unwrap();
@@ -405,25 +417,45 @@ mod tests {
             ids.sort();
             for (index, id) in ids.iter().enumerate().rev() {
                 let values = match index % 4 {
-                    0 => [2.0, -0.0], 1 => [3.0, 4.0], 2 => [0.0, 2.0], _ => [-5.0, 0.0],
+                    0 => [2.0, -0.0],
+                    1 => [3.0, 4.0],
+                    2 => [0.0, 2.0],
+                    _ => [-5.0, 0.0],
                 };
                 publish(&storage, &queue, id, "body", "model", values);
             }
             let query = query();
             let limits = PublishedEmbeddingReadLimits::default();
-            let captured = storage.load_published_embeddings(&cx, "model", query.identity(), limits).unwrap();
+            let captured = storage
+                .load_published_embeddings(&cx, "model", query.identity(), limits)
+                .unwrap();
             let full = captured.search(&cx, &query, usize::MAX).unwrap();
             for limit in [0, 1, 2, 17, 64, 70, 71, usize::MAX] {
                 let before = storage.metrics_snapshot();
-                let result = storage.query_published_embeddings(&cx, "model", &query, limit, limits).unwrap();
+                let result = storage
+                    .query_published_embeddings(&cx, "model", &query, limit, limits)
+                    .unwrap();
                 assert_eq!(result.hits().len(), limit.min(ids.len()));
-                assert_eq!(result.scan_stats(), if limit == 0 { None } else { Some(captured.stats) });
+                assert_eq!(
+                    result.scan_stats(),
+                    if limit == 0 {
+                        None
+                    } else {
+                        Some(captured.stats)
+                    }
+                );
                 for (actual, expected) in result.hits().iter().zip(&full) {
                     assert_eq!(actual.hit(), expected);
-                    assert_eq!(actual.publication(), &captured.records[usize::try_from(expected.index).unwrap()]);
+                    assert_eq!(
+                        actual.publication(),
+                        &captured.records[usize::try_from(expected.index).unwrap()]
+                    );
                     assert_eq!(actual.hit().score.to_bits(), expected.score.to_bits());
                 }
-                assert_eq!(storage.metrics_snapshot().tx_commits, before.tx_commits + u64::from(limit != 0));
+                assert_eq!(
+                    storage.metrics_snapshot().tx_commits,
+                    before.tx_commits + u64::from(limit != 0)
+                );
                 assert!(!storage.connection().in_transaction());
             }
         });
@@ -435,14 +467,39 @@ mod tests {
             run_test_with_cx(|cx| async move {
                 let (storage, queue) = fixture();
                 publish(&storage, &queue, "a", "first", "model", [1.0, 0.0]);
-                publish(&storage, &queue, "z", "last", if corruption == "producer" { "foreign" } else { "model" }, [-1.0, 0.0]);
+                publish(
+                    &storage,
+                    &queue,
+                    "z",
+                    "last",
+                    if corruption == "producer" {
+                        "foreign"
+                    } else {
+                        "model"
+                    },
+                    [-1.0, 0.0],
+                );
                 match corruption {
-                    "checksum" => { storage.connection().execute_sync("UPDATE published_embeddings SET vector_le = X'0000' WHERE doc_id = 'z';").unwrap(); }
-                    "version" => { storage.connection().execute_sync("UPDATE published_embeddings SET record_version = 99 WHERE doc_id = 'z';").unwrap(); }
+                    "checksum" => {
+                        storage.connection().execute_sync("UPDATE published_embeddings SET vector_le = X'0000' WHERE doc_id = 'z';").unwrap();
+                    }
+                    "version" => {
+                        storage.connection().execute_sync("UPDATE published_embeddings SET record_version = 99 WHERE doc_id = 'z';").unwrap();
+                    }
                     _ => {}
                 }
                 let before = storage.metrics_snapshot();
-                assert!(storage.query_published_embeddings(&cx, "model", &query(), 1, PublishedEmbeddingReadLimits::default()).is_err());
+                assert!(
+                    storage
+                        .query_published_embeddings(
+                            &cx,
+                            "model",
+                            &query(),
+                            1,
+                            PublishedEmbeddingReadLimits::default()
+                        )
+                        .is_err()
+                );
                 let after = storage.metrics_snapshot();
                 assert_eq!(after.tx_commits, before.tx_commits);
                 assert_eq!(after.tx_rollbacks, before.tx_rollbacks + 1);
@@ -457,24 +514,61 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let (storage, queue) = fixture();
             let query = query();
-            let zero = PublishedEmbeddingReadLimits { max_records: 0, max_payload_bytes: 0 };
-            let empty = storage.query_published_embeddings(&cx, "model", &query, 1, zero).unwrap();
+            let zero = PublishedEmbeddingReadLimits {
+                max_records: 0,
+                max_payload_bytes: 0,
+            };
+            let empty = storage
+                .query_published_embeddings(&cx, "model", &query, 1, zero)
+                .unwrap();
             assert_eq!(empty.scan_stats().unwrap().records, 0);
             publish(&storage, &queue, "a", "body", "model", [1.0, 0.0]);
             publish(&storage, &queue, "z", "body", "model", [-1.0, 0.0]);
-            let reference = storage.load_published_embeddings(&cx, "model", query.identity(), PublishedEmbeddingReadLimits::default()).unwrap();
-            let exact = PublishedEmbeddingReadLimits { max_records: 2, max_payload_bytes: reference.stats.payload_bytes };
-            assert_eq!(storage.query_published_embeddings(&cx, "model", &query, 1, exact).unwrap().scan_stats(), Some(reference.stats));
+            let reference = storage
+                .load_published_embeddings(
+                    &cx,
+                    "model",
+                    query.identity(),
+                    PublishedEmbeddingReadLimits::default(),
+                )
+                .unwrap();
+            let exact = PublishedEmbeddingReadLimits {
+                max_records: 2,
+                max_payload_bytes: reference.stats.payload_bytes,
+            };
+            assert_eq!(
+                storage
+                    .query_published_embeddings(&cx, "model", &query, 1, exact)
+                    .unwrap()
+                    .scan_stats(),
+                Some(reference.stats)
+            );
             for (limits, field) in [
-                (PublishedEmbeddingReadLimits { max_records: 1, ..exact }, "published_embeddings.max_records"),
-                (PublishedEmbeddingReadLimits { max_payload_bytes: exact.max_payload_bytes - 1, ..exact }, "published_embeddings.max_payload_bytes"),
+                (
+                    PublishedEmbeddingReadLimits {
+                        max_records: 1,
+                        ..exact
+                    },
+                    "published_embeddings.max_records",
+                ),
+                (
+                    PublishedEmbeddingReadLimits {
+                        max_payload_bytes: exact.max_payload_bytes - 1,
+                        ..exact
+                    },
+                    "published_embeddings.max_payload_bytes",
+                ),
                 (zero, "published_embeddings.max_records"),
             ] {
                 let result = storage.query_published_embeddings(&cx, "model", &query, 1, limits);
-                assert!(matches!(result, Err(SearchError::InvalidConfig { field: actual, .. }) if actual == field));
+                assert!(
+                    matches!(result, Err(SearchError::InvalidConfig { field: actual, .. }) if actual == field)
+                );
             }
             let before = storage.metrics_snapshot();
-            let noop = storage.query_published_embeddings(&cx, "model", &query, 0, zero).unwrap();
+            let noop = storage
+                .query_published_embeddings(&cx, "model", &query, 0, zero)
+                .unwrap();
             assert!(noop.hits().is_empty());
             assert_eq!(noop.scan_stats(), None);
             assert_eq!(storage.metrics_snapshot(), before);
@@ -488,20 +582,46 @@ mod tests {
             publish(&storage, &queue, "doc", "original", "model", [1.0, -0.0]);
             let limits = PublishedEmbeddingReadLimits::default();
             let query = query();
-            let old = storage.query_published_embeddings(&cx, "model", &query, 1, limits).unwrap();
-            let changed = DocumentRecord::new("doc", "replacement", ContentHasher::hash("replacement"), 11, 1, 2);
+            let old = storage
+                .query_published_embeddings(&cx, "model", &query, 1, limits)
+                .unwrap();
+            let changed = DocumentRecord::new(
+                "doc",
+                "replacement",
+                ContentHasher::hash("replacement"),
+                11,
+                1,
+                2,
+            );
             storage.upsert_document(&changed).unwrap();
             storage.set_document_content("doc", "replacement").unwrap();
-            assert!(storage.query_published_embeddings(&cx, "model", &query, 1, limits).unwrap().hits().is_empty());
+            assert!(
+                storage
+                    .query_published_embeddings(&cx, "model", &query, 1, limits)
+                    .unwrap()
+                    .hits()
+                    .is_empty()
+            );
             publish(&storage, &queue, "doc", "replacement", "model", [-1.0, 0.0]);
-            let new = storage.query_published_embeddings(&cx, "model", &query, 1, limits).unwrap();
+            let new = storage
+                .query_published_embeddings(&cx, "model", &query, 1, limits)
+                .unwrap();
             drop(queue);
             drop(storage);
             assert_eq!(old.hits()[0].hit().score.to_bits(), 1.0_f32.to_bits());
             assert_eq!(new.hits()[0].hit().score.to_bits(), (-1.0_f32).to_bits());
-            assert_eq!(old.hits()[0].publication().content_hash, ContentHasher::hash("original"));
-            assert_eq!(new.hits()[0].publication().content_hash, changed.content_hash);
-            assert_eq!(old.hits()[0].publication().embedding.values[1].to_bits(), (-0.0_f32).to_bits());
+            assert_eq!(
+                old.hits()[0].publication().content_hash,
+                ContentHasher::hash("original")
+            );
+            assert_eq!(
+                new.hits()[0].publication().content_hash,
+                changed.content_hash
+            );
+            assert_eq!(
+                old.hits()[0].publication().embedding.values[1].to_bits(),
+                (-0.0_f32).to_bits()
+            );
         });
     }
 
@@ -556,19 +676,30 @@ mod tests {
         run_test_with_cx(|cx| async move {
             let (storage, _) = fixture();
             let zero = BoundQueryEmbedding::new(vec![0.0, -0.0], identity("model")).unwrap();
-            let hash = BoundQueryEmbedding::new(vec![1.0, 0.0], EmbeddingIdentityBundleV1::explicit_test_model("model", 2)).unwrap();
+            let hash = BoundQueryEmbedding::new(
+                vec![1.0, 0.0],
+                EmbeddingIdentityBundleV1::explicit_test_model("model", 2),
+            )
+            .unwrap();
             let valid = query();
             let limits = PublishedEmbeddingReadLimits::default();
             let before = storage.metrics_snapshot();
             for limit in [0, 1] {
                 for (tier, query) in [("model", &zero), ("model", &hash), (" ", &valid)] {
-                    assert!(storage.query_published_embeddings(&cx, tier, query, limit, limits).is_err());
+                    assert!(
+                        storage
+                            .query_published_embeddings(&cx, tier, query, limit, limits)
+                            .is_err()
+                    );
                 }
             }
             assert_eq!(storage.metrics_snapshot(), before);
             cx.set_cancel_requested(true);
             for limit in [0, 1] {
-                assert!(matches!(storage.query_published_embeddings(&cx, "model", &valid, limit, limits), Err(SearchError::Cancelled { .. })));
+                assert!(matches!(
+                    storage.query_published_embeddings(&cx, "model", &valid, limit, limits),
+                    Err(SearchError::Cancelled { .. })
+                ));
             }
             cx.set_cancel_requested(false);
             assert_eq!(storage.metrics_snapshot(), before);
@@ -599,7 +730,10 @@ mod tests {
                 .unwrap();
             assert_eq!(storage.metrics_snapshot().tx_commits, before.tx_commits + 1);
             assert_eq!(result.scan_stats(), Some(captured.vector_stats()));
-            assert_eq!(result.source_payload_bytes(), captured.source_payload_bytes());
+            assert_eq!(
+                result.source_payload_bytes(),
+                captured.source_payload_bytes()
+            );
             assert!(!storage.connection().in_transaction());
             {
                 let expected = captured.search(&cx, &query, 2).unwrap();
@@ -856,13 +990,15 @@ mod tests {
                     let before = storage.metrics_snapshot();
                     let vectors = storage
                         .query_published_embeddings_with_options(
-                            &cx, "model", &query, options, limits.embeddings,
+                            &cx,
+                            "model",
+                            &query,
+                            options,
+                            limits.embeddings,
                         )
                         .unwrap();
                     let sources = storage
-                        .query_published_search_with_options(
-                            &cx, "model", &query, options, limits,
-                        )
+                        .query_published_search_with_options(&cx, "model", &query, options, limits)
                         .unwrap();
                     assert_eq!(vectors.hits().len(), expected.len());
                     assert_eq!(sources.hits().len(), expected.len());
@@ -873,10 +1009,7 @@ mod tests {
                         assert_eq!(source.hit(), expected.hit());
                         assert_eq!(vector.publication(), expected.publication());
                         assert_eq!(source.publication(), expected.publication());
-                        assert_eq!(
-                            vector.hit().score.to_bits(),
-                            expected.hit().score.to_bits()
-                        );
+                        assert_eq!(vector.hit().score.to_bits(), expected.hit().score.to_bits());
                         assert_eq!(source.document().canonical_text(), "body");
                     }
                     let stats = (limit != 0).then_some(captured.vector_stats());
@@ -908,7 +1041,11 @@ mod tests {
                 publish(&storage, &queue, id, "body", "model", values);
             }
             let allowed = [
-                "scope\0right", "é", "SCOPE", "scope-extra-missing", "x' OR 1=1 --",
+                "scope\0right",
+                "é",
+                "SCOPE",
+                "scope-extra-missing",
+                "x' OR 1=1 --",
             ]
             .map(str::to_owned)
             .into_iter()
@@ -930,10 +1067,7 @@ mod tests {
                 if limit > 1 {
                     assert_eq!(result.hits()[1].hit().doc_id.as_str(), "é");
                     assert_eq!(result.hits()[1].hit().index, 5);
-                    assert_eq!(
-                        result.hits()[1].hit().score.to_bits(),
-                        (-1.0_f32).to_bits()
-                    );
+                    assert_eq!(result.hits()[1].hit().score.to_bits(), (-1.0_f32).to_bits());
                 }
                 assert_eq!(result.scan_stats().unwrap().records, 6);
             }
@@ -978,14 +1112,22 @@ mod tests {
                     assert!(
                         storage
                             .query_published_embeddings_with_options(
-                                &cx, "model", &query(), options, limits.embeddings,
+                                &cx,
+                                "model",
+                                &query(),
+                                options,
+                                limits.embeddings,
                             )
                             .is_err()
                     );
                     assert!(
                         storage
                             .query_published_search_with_options(
-                                &cx, "model", &query(), options, limits,
+                                &cx,
+                                "model",
+                                &query(),
+                                options,
+                                limits,
                             )
                             .is_err()
                     );
@@ -1008,7 +1150,10 @@ mod tests {
             let query = query();
             let captured = storage
                 .load_published_embeddings(
-                    &cx, "model", query.identity(), PublishedEmbeddingReadLimits::default(),
+                    &cx,
+                    "model",
+                    query.identity(),
+                    PublishedEmbeddingReadLimits::default(),
                 )
                 .unwrap();
             let exact = PublishedEmbeddingReadLimits {
@@ -1018,15 +1163,16 @@ mod tests {
             for allowed in [BTreeSet::new(), BTreeSet::from(["a".to_owned()])] {
                 let options = PublishedQueryOptions::new(1).with_doc_ids(&allowed);
                 let result = storage
-                    .query_published_embeddings_with_options(
-                        &cx, "model", &query, options, exact,
-                    )
+                    .query_published_embeddings_with_options(&cx, "model", &query, options, exact)
                     .unwrap();
                 assert_eq!(result.hits().len(), allowed.len());
                 assert_eq!(result.scan_stats(), Some(captured.stats));
                 for (limits, field) in [
                     (
-                        PublishedEmbeddingReadLimits { max_records: 1, ..exact },
+                        PublishedEmbeddingReadLimits {
+                            max_records: 1,
+                            ..exact
+                        },
                         "published_embeddings.max_records",
                     ),
                     (
@@ -1100,17 +1246,21 @@ mod tests {
                         "model",
                         &query,
                         options,
-                        PublishedSearchReadLimits { max_source_bytes: 17, ..limits },
+                        PublishedSearchReadLimits {
+                            max_source_bytes: 17,
+                            ..limits
+                        },
                     )
                     .is_err()
             );
             // Without a scope the highest-ranked corrupt source still refuses.
             assert!(
-                storage.query_published_search(&cx, "model", &query, 1, limits).is_err()
+                storage
+                    .query_published_search(&cx, "model", &query, 1, limits)
+                    .is_err()
             );
-            let changed = DocumentRecord::new(
-                "b", "changed", ContentHasher::hash("changed"), 7, 1, 2,
-            );
+            let changed =
+                DocumentRecord::new("b", "changed", ContentHasher::hash("changed"), 7, 1, 2);
             storage.upsert_document(&changed).unwrap();
             storage.set_document_content("b", "changed").unwrap();
             let stale = storage
@@ -1154,11 +1304,18 @@ mod tests {
                 let limits = PublishedSearchReadLimits::default();
                 let vectors = storage
                     .query_published_embeddings_with_options(
-                        &cx, "model", &query(), options, limits.embeddings,
+                        &cx,
+                        "model",
+                        &query(),
+                        options,
+                        limits.embeddings,
                     )
                     .unwrap();
                 assert_eq!(
-                    vectors.hits().iter().map(|hit| hit.hit().doc_id.as_str())
+                    vectors
+                        .hits()
+                        .iter()
+                        .map(|hit| hit.hit().doc_id.as_str())
                         .collect::<Vec<_>>(),
                     ["b", "c"]
                 );
@@ -1166,7 +1323,11 @@ mod tests {
                 assert!(
                     storage
                         .query_published_search_with_options(
-                            &cx, "model", &query(), options, limits,
+                            &cx,
+                            "model",
+                            &query(),
+                            options,
+                            limits,
                         )
                         .is_err()
                 );
@@ -1202,13 +1363,18 @@ mod tests {
             let hash = BoundQueryEmbedding::new(
                 vec![1.0, 0.0],
                 EmbeddingIdentityBundleV1::explicit_test_model("model", 2),
-            ).unwrap();
+            )
+            .unwrap();
             let before = storage.metrics_snapshot();
             for allowed in [&empty, &allowed] {
                 let options = PublishedQueryOptions::new(0).with_doc_ids(allowed);
                 let vectors = storage
                     .query_published_embeddings_with_options(
-                        &cx, "model", &query, options, limits.embeddings,
+                        &cx,
+                        "model",
+                        &query,
+                        options,
+                        limits.embeddings,
                     )
                     .unwrap();
                 let sources = storage
@@ -1222,14 +1388,22 @@ mod tests {
                     let options = PublishedQueryOptions::new(limit).with_doc_ids(allowed);
                     for (tier, query) in [("model", &zero), ("model", &hash), (" ", &query)] {
                         assert!(
-                            storage.query_published_embeddings_with_options(
-                                &cx, tier, query, options, limits.embeddings,
-                            ).is_err()
+                            storage
+                                .query_published_embeddings_with_options(
+                                    &cx,
+                                    tier,
+                                    query,
+                                    options,
+                                    limits.embeddings,
+                                )
+                                .is_err()
                         );
                         assert!(
-                            storage.query_published_search_with_options(
-                                &cx, tier, query, options, limits,
-                            ).is_err()
+                            storage
+                                .query_published_search_with_options(
+                                    &cx, tier, query, options, limits,
+                                )
+                                .is_err()
                         );
                     }
                 }
@@ -1240,7 +1414,11 @@ mod tests {
                 let options = PublishedQueryOptions::new(limit).with_doc_ids(&empty);
                 assert!(matches!(
                     storage.query_published_embeddings_with_options(
-                        &cx, "model", &query, options, limits.embeddings,
+                        &cx,
+                        "model",
+                        &query,
+                        options,
+                        limits.embeddings,
                     ),
                     Err(SearchError::Cancelled { .. })
                 ));
@@ -1264,7 +1442,10 @@ mod tests {
         assert!(all.allowed_doc_ids.is_none());
         let scoped = all.with_doc_ids(&ids);
         assert_eq!(scoped.limit, 3);
-        assert!(std::ptr::eq(scoped.allowed_doc_ids.unwrap(), &ids));
+        assert!(std::ptr::eq(
+            scoped.allowed_doc_ids.unwrap(),
+            &raw const ids
+        ));
         assert!(all.allowed_doc_ids.is_none());
         let rendered = format!("{scoped:?}");
         assert!(rendered.contains("Some(1)"));

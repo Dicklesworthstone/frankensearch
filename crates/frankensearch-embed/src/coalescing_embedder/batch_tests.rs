@@ -175,7 +175,7 @@ impl Embedder for Provider {
     fn dimension(&self) -> usize {
         2
     }
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "coalescing-batch-test"
     }
     fn model_name(&self) -> &str {

@@ -185,7 +185,14 @@ impl PublishedEmbeddingSnapshot {
             let score = cosine(cx, query.vector(), &record.embedding.values, query_norm)?;
             // A candidate carries no owned ID. The validated source position
             // provides the same binary-ID tie order, even through sparse filters.
-            retain_hit(&mut heap, RankedHit { index: position, score }, limit)?;
+            retain_hit(
+                &mut heap,
+                RankedHit {
+                    index: position,
+                    score,
+                },
+                limit,
+            )?;
         }
         publication_checkpoint(cx)?;
         // The greatest heap element is the worst hit. Ascending heap order
@@ -194,13 +201,15 @@ impl PublishedEmbeddingSnapshot {
         // passed admission. Losing rows never allocate a temporary result ID.
         let ranked = heap.into_sorted_vec();
         let mut hits = Vec::new();
-        hits.try_reserve_exact(ranked.len()).map_err(map_storage_error)?;
+        hits.try_reserve_exact(ranked.len())
+            .map_err(map_storage_error)?;
         for hit in ranked {
             publication_checkpoint(cx)?;
             let index = usize::try_from(hit.index).map_err(map_storage_error)?;
-            let record = self.records.get(index).ok_or_else(|| {
-                publication_error("ranked hit is outside its captured snapshot")
-            })?;
+            let record = self
+                .records
+                .get(index)
+                .ok_or_else(|| publication_error("ranked hit is outside its captured snapshot"))?;
             hits.push(VectorHit {
                 index: hit.index,
                 score: hit.score,
@@ -1553,7 +1562,7 @@ mod tests {
     fn numeric_cutoffs_preserve_long_id_ties_and_sparse_source_positions() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let prefix = "common-prefix/".repeat(128);
-            let mut ids = vec![
+            let mut ids = [
                 "a".to_owned(),
                 "a\0tail".to_owned(),
                 format!("{prefix}0"),
@@ -1595,12 +1604,17 @@ mod tests {
                     .cloned()
                     .collect();
                 for limit in (0..=ids.len() + 1).chain([usize::MAX]) {
-                    let hits = snapshot
-                        .search_matching(&cx, &query, limit, |index, _| {
-                            Ok(mask & (1 << index) != 0)
-                        })
-                        .unwrap();
-                    assert_eq!(hits, expected[..limit.min(expected.len())], "mask={mask} k={limit}");
+                    let hits =
+                        snapshot
+                            .search_matching(&cx, &query, limit, |index, _| {
+                                Ok(mask & (1 << index) != 0)
+                            })
+                            .unwrap();
+                    assert_eq!(
+                        hits,
+                        expected[..limit.min(expected.len())],
+                        "mask={mask} k={limit}"
+                    );
                 }
             }
             assert_eq!(snapshot, before);

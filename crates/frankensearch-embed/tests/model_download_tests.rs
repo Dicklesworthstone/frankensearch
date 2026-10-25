@@ -37,8 +37,8 @@ fn test_manifest() -> ModelManifest {
 fn verified_fixture_manifest() -> ModelManifest {
     let mut manifest = test_manifest();
     manifest.revision = "a".repeat(40);
-    manifest.files[0].sha256 =
-        "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9".to_owned();
+    "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        .clone_into(&mut manifest.files[0].sha256);
     manifest.files[0].size = 11;
     manifest.download_size_bytes = 11;
     manifest

@@ -536,7 +536,9 @@ fn cancellation_wakes_a_stalled_group_and_preserves_completed_group_accounting()
             assert!(latest.0.load(Ordering::SeqCst) > before_latest);
             assert_eq!(first.0.load(Ordering::SeqCst), before_first);
             assert!(matches!(
-                operation.as_mut().poll(&mut Context::from_waker(&latest_waker)),
+                operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&latest_waker)),
                 Poll::Ready(Err(SearchError::Cancelled { .. }))
             ));
             // Cleanup cannot depend on dropping an already-completed future.
@@ -578,7 +580,10 @@ fn cancelling_a_later_singleton_discards_the_groups_successful_prefix() {
         );
         assert_eq!(backend.widths(), [1, 1]);
         let before = wake.0.load(Ordering::SeqCst);
-        cx.cancel_with(asupersync::CancelKind::User, Some("cancel second singleton"));
+        cx.cancel_with(
+            asupersync::CancelKind::User,
+            Some("cancel second singleton"),
+        );
         assert!(wake.0.load(Ordering::SeqCst) > before);
         assert!(matches!(
             operation.as_mut().poll(&mut Context::from_waker(&waker)),
@@ -634,7 +639,9 @@ fn abandoned_inference_registration_does_not_remove_a_siblings_cancellation_wake
         assert_eq!(abandoned.0.load(Ordering::SeqCst), abandoned_before);
         assert!(sibling.0.load(Ordering::SeqCst) > sibling_before);
         assert!(matches!(
-            second.as_mut().poll(&mut Context::from_waker(&sibling_waker)),
+            second
+                .as_mut()
+                .poll(&mut Context::from_waker(&sibling_waker)),
             Poll::Ready(Err(SearchError::Cancelled { .. }))
         ));
     });

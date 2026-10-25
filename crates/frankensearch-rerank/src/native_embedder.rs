@@ -510,14 +510,13 @@ impl NativeEmbedder {
                 Ok(ids)
             },
             |batch| {
-                if let Some(model) = model.as_mut() {
-                    model.embed_forward(batch)
-                } else {
-                    let mut acquired = self.lock_model()?;
-                    let result = acquired.embed_forward(batch);
-                    model = Some(acquired);
-                    result
+                if model.is_none() {
+                    model = Some(self.lock_model()?);
                 }
+                model
+                    .as_mut()
+                    .expect("model guard acquired above")
+                    .embed_forward(batch)
             },
         )?;
         drop(model);
@@ -1419,7 +1418,10 @@ mod tests {
             "test",
             || Ok(()),
             |document, text| {
-                Ok(vec![i64::try_from(document).unwrap(); text.parse::<usize>().unwrap()])
+                Ok(vec![
+                    i64::try_from(document).unwrap();
+                    text.parse::<usize>().unwrap()
+                ])
             },
             |batch| {
                 groups.push(batch.iter().map(Vec::len).collect::<Vec<_>>());
@@ -1462,7 +1464,7 @@ mod tests {
                 Ok(vec![i64::try_from(document).unwrap(); 512])
             },
             |batch| {
-                first_forward_at.get_or_insert(encoded.get());
+                first_forward_at.get_or_insert_with(|| encoded.get());
                 assert_eq!(batch.len(), 4);
                 assert_eq!(batch.iter().map(Vec::len).sum::<usize>(), MAX_BATCH_TOKENS);
                 consumed.set(consumed.get() + batch.len());
@@ -1478,7 +1480,10 @@ mod tests {
         assert_eq!(encoded.get(), 64);
         assert_eq!(consumed.get(), 64);
         for (document, vector) in output.iter().enumerate() {
-            assert_eq!(vector, &vec![f32::from(u16::try_from(document).unwrap()); DIM]);
+            assert_eq!(
+                vector,
+                &vec![f32::from(u16::try_from(document).unwrap()); DIM]
+            );
         }
     }
 

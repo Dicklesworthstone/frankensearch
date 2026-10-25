@@ -1107,7 +1107,6 @@ mod tests {
             assert_eq!(stream.state(), PublishedSearchStreamState::Complete);
             assert!(stream.next(&cx).await.is_none());
             drop(stream);
-            drop(filter);
             assert_eq!(
                 initial.hits()[0].document().canonical_text(),
                 "retained source for shared"
@@ -1371,7 +1370,9 @@ mod tests {
         cx.cancel_with(asupersync::CancelKind::User, Some("stop remaining work"));
         assert!(current.0.load(Ordering::SeqCst) > before);
         assert!(matches!(
-            sibling.as_mut().poll(&mut Context::from_waker(&current_waker)),
+            sibling
+                .as_mut()
+                .poll(&mut Context::from_waker(&current_waker)),
             Poll::Ready(Err(SearchError::Cancelled { .. }))
         ));
     }
@@ -1435,10 +1436,8 @@ mod tests {
         impl Drop for Work<'_> {
             fn drop(&mut self) {
                 self.drops.set(self.drops.get() + 1);
-                self.cx.cancel_with(
-                    asupersync::CancelKind::User,
-                    Some("work destructor"),
-                );
+                self.cx
+                    .cancel_with(asupersync::CancelKind::User, Some("work destructor"));
             }
         }
 

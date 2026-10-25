@@ -1247,7 +1247,10 @@ mod tests {
             );
             assert_eq!(hits[0].hit().doc_id.as_str(), "b-keep");
             assert_eq!(hits[0].hit().index, 1);
-            assert!(std::ptr::eq(hits[0].document(), &old.documents()[1]));
+            assert!(std::ptr::eq(
+                hits[0].document(),
+                &raw const old.documents()[1]
+            ));
             assert_eq!(
                 storage.metrics_snapshot(),
                 before,
@@ -1434,7 +1437,10 @@ mod tests {
             assert_eq!(hits[0].hit().doc_id.as_str(), "b-keep");
             assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
             assert_eq!(*probe.inputs.lock().unwrap(), ["orchard"]);
-            assert!(std::ptr::eq(hits[0].document(), &captured.documents()[1]));
+            assert!(std::ptr::eq(
+                hits[0].document(),
+                &raw const captured.documents()[1]
+            ));
             for reply in [
                 QueryReply::Foreign,
                 QueryReply::BadDimension,

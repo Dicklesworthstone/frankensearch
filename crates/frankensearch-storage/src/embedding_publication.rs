@@ -1132,7 +1132,11 @@ mod tests {
             let before: Vec<_> = output.values.iter().map(|v| v.to_bits()).collect();
             validate_response(&output.identity, &output).unwrap();
             assert_eq!(
-                output.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                output
+                    .values
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
                 before
             );
         }
@@ -1168,15 +1172,18 @@ mod tests {
                 }];
                 output.identity.producer.space_fingerprint = output.identity.space.fingerprint();
                 output.identity.validate().unwrap();
-                assert_eq!(publish(&storage, &claim, &output), ClaimOutcome::Applied(()));
+                assert_eq!(
+                    publish(&storage, &claim, &output),
+                    ClaimOutcome::Applied(())
+                );
                 let point = storage
                     .get_published_embedding("doc", "model", &output.identity)
                     .unwrap()
                     .unwrap();
                 assert_eq!(point.embedding.values[0].to_bits(), scale.to_bits());
                 assert_eq!(point.embedding.values[1].to_bits(), (-0.0_f32).to_bits());
-                let query = BoundQueryEmbedding::new(vec![1.0, 0.0], output.identity.clone())
-                    .unwrap();
+                let query =
+                    BoundQueryEmbedding::new(vec![1.0, 0.0], output.identity.clone()).unwrap();
                 let limits = crate::PublishedSearchReadLimits::default();
                 let captured = storage
                     .load_published_embeddings(&cx, "model", &output.identity, limits.embeddings)
@@ -1196,7 +1203,10 @@ mod tests {
                 assert_eq!(hydrated.hits().len(), 1);
                 assert_eq!(hydrated.hits()[0].hit(), &expected[0]);
                 assert_eq!(hydrated.hits()[0].publication(), &point);
-                assert_eq!(hydrated.hits()[0].document().canonical_text(), "original body");
+                assert_eq!(
+                    hydrated.hits()[0].document().canonical_text(),
+                    "original body"
+                );
             }
         });
     }

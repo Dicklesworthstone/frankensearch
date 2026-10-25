@@ -601,7 +601,7 @@ mod tests {
                 Ok(scores)
             })
         }
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "retained-rerank-probe"
         }
         fn model_name(&self) -> &str {
@@ -1150,7 +1150,10 @@ mod tests {
                 assert!(probe.dropped.load(Ordering::SeqCst));
                 assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
                 drop(operation);
-                assert_eq!(tiers[0].hits()[0].document().canonical_text(), "first source");
+                assert_eq!(
+                    tiers[0].hits()[0].document().canonical_text(),
+                    "first source"
+                );
 
                 // Cancellation belongs to this call, not the immutable cohort.
                 // Explicit new work can use the same retained candidates.
@@ -1200,7 +1203,7 @@ mod tests {
                 })
             }
 
-            fn id(&self) -> &str {
+            fn id(&self) -> &'static str {
                 "cancelling-factory"
             }
 
@@ -1247,7 +1250,9 @@ mod tests {
                     }
                 });
                 assert!(matches!(
-                    operation.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
                     Poll::Ready(Err(SearchError::Cancelled { .. }))
                 ));
                 assert_eq!(provider.calls.load(Ordering::SeqCst), 1);

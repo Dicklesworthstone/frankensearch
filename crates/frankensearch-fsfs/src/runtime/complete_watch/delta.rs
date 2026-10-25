@@ -271,7 +271,7 @@ async fn read_text_batch(
     cx: &Cx,
     requests: Vec<(PathBuf, SourceStamp)>,
 ) -> SearchResult<Option<TextReads>> {
-    read_text_batch_with(cx, requests, |job| asupersync::runtime::spawn_blocking(job)).await
+    read_text_batch_with(cx, requests, asupersync::runtime::spawn_blocking).await
 }
 
 /// One submission boundary shared with deterministic queue/drop tests. The

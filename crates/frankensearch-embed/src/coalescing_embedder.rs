@@ -1038,10 +1038,10 @@ mod service_tests {
         fn dimension(&self) -> usize {
             2
         }
-        fn id(&self) -> &str {
+        fn id(&self) -> &'static str {
             "service-test"
         }
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "service-test"
         }
         fn is_semantic(&self) -> bool {
@@ -1439,13 +1439,14 @@ mod service_tests {
             run_test_with_cx(|cx| async move {
                 let (provider, client, mut dispatcher) = fixture(&cx);
                 let owner = Cx::for_testing();
-                let mut request = None;
-                if mode == "provider" {
+                let request = if mode == "provider" {
                     provider.fail.store(true, Ordering::SeqCst);
                     let mut submitted = client.embed_bound(&cx, "1");
                     pending(submitted.as_mut(), Waker::noop());
-                    request = Some(submitted);
-                }
+                    Some(submitted)
+                } else {
+                    None
+                };
                 if mode == "before" {
                     owner.cancel_with(asupersync::CancelKind::User, Some("before service"));
                 }

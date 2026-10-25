@@ -52985,7 +52985,7 @@ mod tests {
                 super::DoctorVerdict::Warn,
                 "cached files cannot make a model-free binary loader-capable"
             );
-            assert!(check.detail.contains("this binary has no"));
+            assert!(check.detail.contains("has no Model2Vec/FastEmbed loader"));
             assert!(
                 check.suggestion.as_deref().is_some_and(|suggestion| {
                     suggestion.contains("cargo build --release -p frankensearch-fsfs")

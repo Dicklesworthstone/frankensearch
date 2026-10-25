@@ -42,6 +42,16 @@ thread_local! {
     static SIDECAR_BUILDS: Cell<usize> = const { Cell::new(0) };
 }
 
+#[cfg(test)]
+pub(super) fn sidecar_hits_for_test() -> usize {
+    SIDECAR_HITS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn sidecar_builds_for_test() -> usize {
+    SIDECAR_BUILDS.with(Cell::get)
+}
+
 struct SidecarPathGuard {
     previous: Option<PathBuf>,
 }
@@ -252,17 +262,26 @@ impl PieceTrie {
         let (labels_raw, rest) = rest.split_at(labels_bytes);
         let (targets_raw, piece_raw) = rest.split_at(targets_bytes);
         let first = first_raw
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
             .collect::<Vec<_>>();
         let labels = labels_raw.to_vec();
         let targets = targets_raw
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
             .collect::<Vec<_>>();
         let piece = piece_raw
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
             .collect::<Vec<_>>();
 
         if !targets.iter().copied().eq(1..node_count) {
@@ -335,6 +354,63 @@ impl PieceTrie {
     /// another trie or allocating a vocabulary map. Structural admission has
     /// already established one path per node and no nonterminal leaves.
     fn matches_vocab(&self, vocab: &[(String, f64)]) -> bool {
+        // Walk the validated tree once in DFS order (zero binary searches) to
+        // verify that every terminal node's root-to-node byte path equals the
+        // vocabulary entry at `piece[node] - 1`. Rejects invented prefixes,
+        // aliases, and mid-UTF-8 terminals in a single linear pass.
+        let mut terminal_count = 0_usize;
+        let mut path = Vec::with_capacity(64);
+        let mut stack = Vec::with_capacity(64);
+        if let Some(id) = self.piece[0].checked_sub(1) {
+            let Ok(id) = usize::try_from(id) else {
+                return false;
+            };
+            if vocab.get(id).is_none_or(|(text, _)| !text.is_empty()) {
+                return false;
+            }
+            terminal_count += 1;
+        }
+        stack.push((0_usize, self.first[0] as usize));
+        while let Some(&(node, edge)) = stack.last() {
+            let high = self.first[node + 1] as usize;
+            if edge >= high {
+                stack.pop();
+                path.pop();
+                continue;
+            }
+            if let Some(top) = stack.last_mut() {
+                top.1 = edge + 1;
+            }
+            let child = self.targets[edge] as usize;
+            path.push(self.labels[edge]);
+            if let Some(id) = self.piece[child].checked_sub(1) {
+                let Ok(id) = usize::try_from(id) else {
+                    return false;
+                };
+                if vocab
+                    .get(id)
+                    .is_none_or(|(text, _)| text.as_bytes() != path.as_slice())
+                {
+                    return false;
+                }
+                terminal_count += 1;
+            }
+            stack.push((child, self.first[child] as usize));
+        }
+        // Structural admission proved that `node -> path(node)` is injective
+        // (sibling labels are strictly increasing in a rooted tree). Therefore
+        // all `terminal_count` terminal paths are pairwise distinct byte
+        // strings, and since `vocab[id(node)].0 == path(node)`, the map
+        // `terminal_node -> id(node)` is injective into `0..vocab.len()`.
+        // When `terminal_count == vocab.len()`, that injection is a bijection
+        // onto `0..vocab.len()`, proving that all vocabulary pieces are
+        // distinct and every `vocab[id]` maps to its exact terminal node.
+        if terminal_count == vocab.len() {
+            return true;
+        }
+
+        // Fallback when `vocab` contains duplicate pieces (`terminal_count < vocab.len()`).
+        let mut matched_terminals = 0_usize;
         for (id, (text, _)) in vocab.iter().enumerate() {
             let Some(actual) = self.exact(text.as_bytes()) else {
                 return false;
@@ -345,32 +421,12 @@ impl PieceTrie {
             // Repeated pieces keep the LAST vocabulary id. Requiring >= id
             // on every occurrence, plus equality of the referenced bytes,
             // establishes that contract without a duplicate-tracking map.
-            if actual < id || !vocab.get(actual).is_some_and(|(value, _)| value == text) {
+            if actual < id || vocab.get(actual).is_none_or(|(value, _)| value != text) {
                 return false;
             }
+            matched_terminals += usize::from(actual == id);
         }
-        for (node, &stored) in self.piece.iter().enumerate() {
-            let Some(id) = stored.checked_sub(1) else {
-                continue;
-            };
-            let Ok(id) = usize::try_from(id) else {
-                return false;
-            };
-            let Some((text, _)) = vocab.get(id) else {
-                return false;
-            };
-            // Reject invented prefixes/aliases too, including terminals inside
-            // a UTF-8 code point. Checking only real vocabulary lookups would
-            // miss these additional tokenization candidates.
-            if self
-                .node_for(text.as_bytes())
-                .and_then(|n| usize::try_from(n).ok())
-                != Some(node)
-            {
-                return false;
-            }
-        }
-        true
+        terminal_count == matched_terminals
     }
 
     /// Each vocabulary byte can add at most one node and one edge. A root
@@ -677,13 +733,17 @@ impl<'de> Deserialize<'de> for CompactUnigram {
         }
 
         let fields = Fields::deserialize(deserializer)?;
-        if let Some(kind) = fields.kind.as_deref()
-            && kind != "Unigram"
-        {
-            return Err(serde::de::Error::invalid_value(
-                serde::de::Unexpected::Str(kind),
-                &"Unigram",
-            ));
+        match fields.kind.as_deref() {
+            Some("Unigram") => {}
+            Some(kind) => {
+                return Err(serde::de::Error::invalid_value(
+                    serde::de::Unexpected::Str(kind),
+                    &"Unigram",
+                ));
+            }
+            None => {
+                return Err(serde::de::Error::missing_field("type"));
+            }
         }
         let vocab = fields
             .vocab
@@ -891,8 +951,20 @@ mod tests {
     #[test]
     #[ignore = "requires the potion-multilingual-128M tokenizer via POTION_FIXTURE_DIR"]
     fn real_potion_tokenizer_matches_the_library() {
-        let dir = std::env::var("POTION_FIXTURE_DIR")
-            .expect("POTION_FIXTURE_DIR must name the potion-multilingual-128M directory");
+        let dir = std::env::var("POTION_FIXTURE_DIR").unwrap_or_else(|_| {
+            for candidate in [
+                "/root/.local/share/frankensearch/models/potion-multilingual-128M",
+                "/home/ubuntu/.local/share/frankensearch/models/potion-multilingual-128M",
+            ] {
+                if std::path::Path::new(candidate)
+                    .join("tokenizer.json")
+                    .is_file()
+                {
+                    return candidate.to_owned();
+                }
+            }
+            panic!("POTION_FIXTURE_DIR must name the potion-multilingual-128M directory");
+        });
         let content =
             std::fs::read_to_string(std::path::Path::new(&dir).join("tokenizer.json")).unwrap();
         assert!(is_unigram_tokenizer(&content));
@@ -1298,7 +1370,7 @@ mod tests {
         let warm = deserialize_unigram_tokenizer(&json, Some(&path)).unwrap();
         assert_eq!(SIDECAR_HITS.with(std::cell::Cell::get), hits + 1);
         let library = Tokenizer::from_str(&json).unwrap();
-        let mut rng = Lcg(0x51decaf);
+        let mut rng = Lcg(0x051d_ecaf);
         for _ in 0..1_000 {
             let text = random_sentence(&mut rng);
             let expected = library.encode(text.as_str(), false).unwrap();
