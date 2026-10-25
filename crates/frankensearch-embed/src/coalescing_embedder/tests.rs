@@ -218,7 +218,7 @@ fn concurrent_trait_callers_receive_bound_values_without_raw_inference() {
             );
             assert_eq!(client.usage(), CoalescerUsage::default());
             assert_eq!(dispatcher.dispatch_ready(&cx).await.unwrap(), 0);
-            assert!(!client.bound_batch_is_native());
+            assert!(client.bound_batch_is_native());
             assert!(!client.is_semantic());
         }
     });

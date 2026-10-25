@@ -137,7 +137,9 @@ pub use degradation_advisor::{
     AdviceOutputSurface, DEGRADATION_ADVICE_SCHEMA_VERSION, DegradationAdvice,
     DegradationAdviceInput, DegradationAdviceSeverity, DegradationFailureKind,
     DegradationNextAction, advice_for_search_error, advice_for_zero_signal, classify_search_error,
-    synthetic_degradation_advice_fixture,
+    recovery_plan_for_readiness, recovery_plan_for_search_error, recovery_plan_for_zero_signal,
+    semantic_readiness_for_failure, semantic_readiness_for_search_error,
+    semantic_readiness_for_zero_signal, synthetic_degradation_advice_fixture,
 };
 pub use evidence::{
     ALL_FSFS_REASON_CODES, FsfsEventFamily, FsfsEvidenceEvent, FsfsReasonCode, ScopeDecision,

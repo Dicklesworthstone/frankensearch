@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use asupersync::Cx;
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{
+    GenerationAuthorityErrorV1, GenerationRootSecurityProfileV1, SearchError, SearchResult,
+};
 use frankensearch_storage::ContentHasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -55,6 +57,7 @@ static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone)]
 pub struct CompleteGenerationStore {
     root: PathBuf,
+    profile: GenerationRootSecurityProfileV1,
 }
 
 /// One admitted generation. Retaining it pins a directory, not a changing CURRENT.
@@ -174,20 +177,51 @@ impl CompleteGenerationStore {
     /// without changing its selection. A sealed generation and all of its
     /// descendants are refused before creating any directory.
     ///
+    /// Opens under [`GenerationRootSecurityProfileV1::CooperativeLocal`].
+    ///
     /// # Errors
     /// Returns cancellation, unsupported-platform, path, or filesystem errors.
     pub fn create(cx: &Cx, root: &Path) -> SearchResult<Self> {
+        Self::create_with_profile(cx, root, GenerationRootSecurityProfileV1::CooperativeLocal)
+    }
+
+    /// Create or open a store under an explicit [`GenerationRootSecurityProfileV1`].
+    ///
+    /// [`GenerationRootSecurityProfileV1::RequiredExternal`] is refused because
+    /// `CompleteGenerationStore` uses the cooperative local `FSFS-CURRENT`
+    /// protocol without an external anti-rollback floor; it never silently
+    /// downgrades to [`GenerationRootSecurityProfileV1::CooperativeLocal`].
+    /// [`GenerationRootSecurityProfileV1::ReadOnlyUnanchored`] refuses to
+    /// create a missing store directory and permits inspection only on an
+    /// existing store.
+    ///
+    /// # Errors
+    /// Returns cancellation, unsupported-platform, profile-authorization, path,
+    /// or filesystem errors.
+    pub fn create_with_profile(
+        cx: &Cx,
+        root: &Path,
+        profile: GenerationRootSecurityProfileV1,
+    ) -> SearchResult<Self> {
         checkpoint(cx)?;
         require_supported_platform()?;
+        require_store_profile_admissible(root, profile)?;
         reject_symlink_if_present(root)?;
         crate::lifecycle::reject_sealed_ancestry(root)?;
         checkpoint(cx)?;
-        let created = match fs::create_dir(root) {
-            Ok(()) => true,
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+        let created = match fs::symlink_metadata(root) {
+            Ok(_) => false,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                require_store_mutation_authorized(root, profile)?;
+                match fs::create_dir(root) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+                    Err(error) => return Err(error.into()),
+                }
+            }
             Err(error) => return Err(error.into()),
         };
-        let store = Self::open(cx, root)?;
+        let store = Self::open_with_profile(cx, root, profile)?;
         if created {
             File::open(store.root())?.sync_all()?;
             if let Some(parent) = store.root().parent() {
@@ -199,16 +233,37 @@ impl CompleteGenerationStore {
 
     /// Open an existing store without creating directories or lock files.
     ///
+    /// Opens under [`GenerationRootSecurityProfileV1::CooperativeLocal`].
+    ///
     /// # Errors
     /// Returns an error for a missing, non-directory, or symlinked root, or a
     /// root inside a sealed generation.
     pub fn open(cx: &Cx, root: &Path) -> SearchResult<Self> {
+        Self::open_with_profile(cx, root, GenerationRootSecurityProfileV1::CooperativeLocal)
+    }
+
+    /// Open an existing store under an explicit [`GenerationRootSecurityProfileV1`].
+    ///
+    /// [`GenerationRootSecurityProfileV1::RequiredExternal`] is refused because
+    /// `CompleteGenerationStore` has no external anti-rollback floor anchor and
+    /// must never silently downgrade to `CooperativeLocal`.
+    ///
+    /// # Errors
+    /// Returns an error for an inadmissible security profile, or a missing,
+    /// non-directory, or symlinked root, or a root inside a sealed generation.
+    pub fn open_with_profile(
+        cx: &Cx,
+        root: &Path,
+        profile: GenerationRootSecurityProfileV1,
+    ) -> SearchResult<Self> {
         checkpoint(cx)?;
         require_supported_platform()?;
+        require_store_profile_admissible(root, profile)?;
         require_directory(root)?;
         crate::lifecycle::reject_sealed_ancestry(root)?;
         Ok(Self {
             root: fs::canonicalize(root)?,
+            profile,
         })
     }
 
@@ -216,6 +271,28 @@ impl CompleteGenerationStore {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Explicit security posture under which this store handle operates.
+    #[must_use]
+    pub const fn security_profile(&self) -> GenerationRootSecurityProfileV1 {
+        self.profile
+    }
+
+    /// Rebind this handle to an explicit [`GenerationRootSecurityProfileV1`].
+    #[must_use]
+    pub const fn with_security_profile(mut self, profile: GenerationRootSecurityProfileV1) -> Self {
+        self.profile = profile;
+        self
+    }
+
+    pub(crate) fn require_profile_admissible(&self) -> SearchResult<()> {
+        require_store_profile_admissible(&self.root, self.profile)
+    }
+
+    pub(crate) fn require_mutation_authorized(&self) -> SearchResult<()> {
+        self.require_profile_admissible()?;
+        require_store_mutation_authorized(&self.root, self.profile)
     }
 
     /// Resolve one descriptor and verify exactly the files it authenticates.
@@ -241,6 +318,7 @@ impl CompleteGenerationStore {
         F: FnMut(&Self, &Cx, &str, &str) -> SearchResult<PublishedGeneration>,
     {
         checkpoint(cx)?;
+        self.require_profile_admissible()?;
         let Some(mut pointer) = read_pointer(&self.root)? else {
             return Ok(None);
         };
@@ -288,6 +366,7 @@ impl CompleteGenerationStore {
     /// Returns cancellation, invalid-descriptor, or filesystem errors.
     pub fn is_selected(&self, cx: &Cx, generation: &PublishedGeneration) -> SearchResult<bool> {
         checkpoint(cx)?;
+        self.require_profile_admissible()?;
         let Some(pointer) = read_pointer(&self.root)? else {
             return Ok(false);
         };
@@ -303,6 +382,7 @@ impl CompleteGenerationStore {
     /// Returns contention, cancellation, corrupt-current, or filesystem errors.
     pub fn begin(&self, cx: &Cx) -> SearchResult<GenerationBuild> {
         checkpoint(cx)?;
+        self.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation build entry")?;
         // A corrupt predecessor must be repaired explicitly, not silently
@@ -622,6 +702,7 @@ impl CompleteGenerationStore {
     /// until it is repaired.
     pub fn plan_retention(&self, cx: &Cx, keep_predecessors: usize) -> SearchResult<RetentionPlan> {
         checkpoint(cx)?;
+        self.require_profile_admissible()?;
         let active = match read_pointer(&self.root)? {
             Some(pointer) => Some(decode_pointer(&pointer, &self.root)?.0),
             None => None,
@@ -711,6 +792,7 @@ impl CompleteGenerationStore {
         keep_predecessors: usize,
     ) -> SearchResult<RetentionReport> {
         checkpoint(cx)?;
+        self.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation retention")?;
         let expected_selection = read_pointer(&self.root)?;
@@ -1357,6 +1439,38 @@ fn require_supported_platform() -> SearchResult<()> {
         )));
     }
     Ok(())
+}
+
+fn require_store_profile_admissible(
+    root: &Path,
+    profile: GenerationRootSecurityProfileV1,
+) -> SearchResult<()> {
+    match profile {
+        GenerationRootSecurityProfileV1::RequiredExternal => Err(invalid(
+            root,
+            &format!(
+                "{}: CompleteGenerationStore uses cooperative local FSFS-CURRENT selection without an external anti-rollback floor; use QualifiedGenerationRoot::open_generation_snapshot or AuthorityPublisherV1 with an external floor provider",
+                GenerationAuthorityErrorV1::ExternalFloorRequired,
+            ),
+        )),
+        GenerationRootSecurityProfileV1::CooperativeLocal
+        | GenerationRootSecurityProfileV1::ReadOnlyUnanchored => Ok(()),
+    }
+}
+
+fn require_store_mutation_authorized(
+    root: &Path,
+    profile: GenerationRootSecurityProfileV1,
+) -> SearchResult<()> {
+    profile.require_mutation_authorized().map_err(|error| {
+        invalid(
+            root,
+            &format!(
+                "{error}: CompleteGenerationStore opened with {} profile permits inspection only",
+                profile.as_str(),
+            ),
+        )
+    })
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -2672,6 +2786,119 @@ mod tests {
             fs::write(generation.path().join("vector.idx"), "tampered").unwrap();
             assert!(store.is_selected(&cx, &generation).unwrap());
             assert!(store.active(&cx).is_err());
+        });
+    }
+
+    #[test]
+    fn security_profiles_enforce_external_floor_refusal_and_read_only_inspection() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let missing = root.path().join("missing-store");
+
+            // RequiredExternal must fail closed on CompleteGenerationStore and
+            // never silently downgrade to CooperativeLocal.
+            let err = CompleteGenerationStore::create_with_profile(
+                &cx,
+                &missing,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&GenerationAuthorityErrorV1::ExternalFloorRequired.to_string()),
+                "expected ExternalFloorRequired error, got: {err}",
+            );
+            assert!(!missing.exists());
+
+            // ReadOnlyUnanchored must not create a missing store directory.
+            let err = CompleteGenerationStore::create_with_profile(
+                &cx,
+                &missing,
+                GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&GenerationAuthorityErrorV1::ReadOnlyProfile.to_string()),
+                "expected ReadOnlyProfile error when creating missing store, got: {err}",
+            );
+            assert!(!missing.exists());
+
+            // CooperativeLocal is the explicit default for create/open and permits
+            // the full build/publish/retention lifecycle.
+            let cooperative = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            assert_eq!(
+                cooperative.security_profile(),
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+            );
+            let first = publish(&cooperative, &cx, "first");
+            let second = publish(&cooperative, &cx, "second");
+
+            // Opening an existing store with RequiredExternal still fails closed.
+            let err = CompleteGenerationStore::open_with_profile(
+                &cx,
+                root.path(),
+                GenerationRootSecurityProfileV1::RequiredExternal,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&GenerationAuthorityErrorV1::ExternalFloorRequired.to_string()),
+                "expected ExternalFloorRequired error on open_with_profile, got: {err}",
+            );
+            let rebound_external = cooperative
+                .clone()
+                .with_security_profile(GenerationRootSecurityProfileV1::RequiredExternal);
+            assert!(rebound_external.active(&cx).is_err());
+            assert!(rebound_external.is_selected(&cx, &second).is_err());
+            assert!(rebound_external.begin(&cx).is_err());
+
+            // ReadOnlyUnanchored permits inspection (open_with_profile, active,
+            // is_selected, open_retained, plan_retention) and refuses every
+            // mutation, repair, restore, flush, and collection path.
+            let read_only = CompleteGenerationStore::open_with_profile(
+                &cx,
+                root.path(),
+                GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+            )
+            .unwrap();
+            assert_eq!(
+                read_only.security_profile(),
+                GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+            );
+            assert_eq!(read_only.active(&cx).unwrap(), Some(second.clone()));
+            assert!(read_only.is_selected(&cx, &second).unwrap());
+            assert!(!read_only.is_selected(&cx, &first).unwrap());
+            assert_eq!(
+                read_only
+                    .open_retained(&cx, first.id(), first.manifest_sha256())
+                    .unwrap(),
+                first,
+            );
+            let plan = read_only.plan_retention(&cx, 0).unwrap();
+            assert_eq!(plan.active.as_deref(), Some(second.id()));
+            assert_eq!(plan.reclaimable.len(), 1);
+
+            for err in [
+                read_only.begin(&cx).unwrap_err(),
+                read_only.prepare_restore(&cx, &first).unwrap_err(),
+                read_only.flush_selected(&cx).unwrap_err(),
+                read_only
+                    .confirm_retained_durability(&cx, &second)
+                    .unwrap_err(),
+                read_only.collect_retained(&cx, 0).unwrap_err(),
+            ] {
+                assert!(
+                    err.to_string()
+                        .contains(&GenerationAuthorityErrorV1::ReadOnlyProfile.to_string()),
+                    "expected ReadOnlyProfile error, got: {err}",
+                );
+            }
+
+            // Preparing a restore through CooperativeLocal and rebinding the store
+            // handle will not bypass ReadOnlyUnanchored if prepared on a read-only
+            // store, and the selected generation remains unchanged.
+            assert_eq!(cooperative.active(&cx).unwrap(), Some(second));
         });
     }
 }

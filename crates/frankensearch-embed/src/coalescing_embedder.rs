@@ -439,6 +439,9 @@ impl Embedder for CoalescingEmbedder {
         })
     }
 
+    // Queue a bounded group together in both ownership modes. Awaiting each
+    // manual input separately would force the service to infer singleton
+    // batches, even when the caller explicitly requested a complete batch.
     fn embed_batch_bound<'a>(
         &'a self,
         cx: &'a Cx,
@@ -459,44 +462,40 @@ impl Embedder for CoalescingEmbedder {
             outputs
                 .try_reserve_exact(texts.len())
                 .map_err(|_| invalid("batch", "batch output allocation failed"))?;
-            if self.auto_dispatcher.is_some() {
-                let chunk_limit = self
-                    .shared
-                    .queue
-                    .config()
-                    .max_batch_size
-                    .min(self.shared.queue.limits().max_outstanding_requests)
-                    .max(1);
-                let mut remaining = texts;
-                while !remaining.is_empty() {
-                    let count = batch::prefix_len(cx, remaining, chunk_limit, max_text_bytes)?;
-                    let (chunk, rest) = remaining.split_at(count);
-                    let mut futures = Vec::new();
-                    futures
-                        .try_reserve_exact(count)
-                        .map_err(|_| invalid("batch", "batch future allocation failed"))?;
-                    futures.extend(chunk.iter().map(|text| self.embed_bound(cx, text)));
-                    // A known error ends the whole call; do not wait for an
-                    // unrelated pending provider before returning that error.
-                    outputs.extend(batch::collect(cx, futures).await?);
-                    remaining = rest;
-                }
-            } else {
-                for text in texts {
-                    outputs.push(self.embed_bound(cx, text).await?);
-                }
+            let chunk_limit = self
+                .shared
+                .queue
+                .config()
+                .max_batch_size
+                .min(self.shared.queue.limits().max_outstanding_requests)
+                .max(1);
+            let mut remaining = texts;
+            while !remaining.is_empty() {
+                let count = batch::prefix_len(cx, remaining, chunk_limit, max_text_bytes)?;
+                let (chunk, rest) = remaining.split_at(count);
+                let mut futures = Vec::new();
+                futures
+                    .try_reserve_exact(count)
+                    .map_err(|_| invalid("batch", "batch future allocation failed"))?;
+                futures.extend(chunk.iter().map(|text| self.embed_bound(cx, text)));
+                // These are the real bound-single calls, not raw provider
+                // inference. Manual mode still needs its caller-driven service;
+                // grouping neither takes dispatch ownership nor reserves credit.
+                // Fail fast without exposing a successful prefix or retrying.
+                outputs.extend(batch::collect(cx, futures).await?);
+                remaining = rest;
             }
             checkpoint(cx)?;
             Ok(outputs)
         })
     }
 
-    // Auto batching preserves every bound-single override through the same
-    // dispatcher. Advertise it so bound-aware indexers do not serialize all
-    // requests before the coalescer has a chance to form a group. Manual mode
-    // remains conservative and still requires its external dispatch owner.
+    // Both ownership modes preserve bound-single identity and validation through
+    // the same dispatcher. This capability describes batch equivalence, not
+    // automatic scheduling: manual clients still need their external service.
+    // A false capability would make bound-aware indexers serialize the inputs.
     fn bound_batch_is_native(&self) -> bool {
-        self.auto_dispatcher.is_some()
+        true
     }
 
     fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {

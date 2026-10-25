@@ -70,6 +70,7 @@ impl CompleteGenerationStore {
         manifest_sha256: &str,
     ) -> SearchResult<PublishedGeneration> {
         checkpoint(cx)?;
+        self.require_profile_admissible()?;
         // Bound untrusted strings before constructing either a path or pointer.
         if id.len() != 60 || !hex(manifest_sha256, 64) {
             return Err(invalid(
@@ -198,6 +199,7 @@ impl CompleteGenerationStore {
         expected_sha256: Option<&str>,
     ) -> SearchResult<PreparedGenerationRestore> {
         checkpoint(cx)?;
+        self.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation restore preparation")?;
         let expected_selection = selection_evidence(&self.root)?;
@@ -287,6 +289,7 @@ impl CompleteGenerationStore {
         S: FnOnce(&Path) -> io::Result<()>,
     {
         checkpoint(cx)?;
+        self.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.root)?;
         lease.fence("complete-generation flush entry")?;
         let expected = selection_evidence(&self.root)?;
@@ -371,6 +374,7 @@ impl PreparedGenerationRestore {
         S: FnOnce(&Path) -> io::Result<()>,
     {
         checkpoint(cx)?;
+        self.store.require_mutation_authorized()?;
         let lease = PublicationLease::acquire(&self.store.root)?;
         lease.fence("complete-generation restore entry")?;
         ensure_selection(&self.store.root, self.expected_selection.as_deref())?;

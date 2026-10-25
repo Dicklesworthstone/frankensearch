@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use asupersync::Cx;
-use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_core::{GenerationRootSecurityProfileV1, SearchError, SearchResult};
 
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
@@ -256,7 +256,11 @@ impl FsfsRuntime {
         root: &Path,
     ) -> SearchResult<CompleteGenerationDiagnosticReader> {
         retained_search_checkpoint(cx)?;
-        let store = CompleteGenerationStore::open(cx, root)?;
+        let store = CompleteGenerationStore::open_with_profile(
+            cx,
+            root,
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        )?;
         let generation = store.active(cx)?;
         retained_search_checkpoint(cx)?;
         // A surviving legacy root cannot prove current authority after the
@@ -388,7 +392,10 @@ impl FsfsRuntime {
         ) {
             return Ok(None);
         }
-        let root = if matches!(self.cli_input.command, CliCommand::Index | CliCommand::Watch) {
+        let root = if matches!(
+            self.cli_input.command,
+            CliCommand::Index | CliCommand::Watch
+        ) {
             self.resolve_index_root(&self.resolve_target_root()?)?
         } else {
             self.resolve_status_index_root()?
@@ -412,7 +419,10 @@ impl FsfsRuntime {
         }
 
         // Only a build may choose a new layout.
-        if !matches!(self.cli_input.command, CliCommand::Index | CliCommand::Watch) {
+        if !matches!(
+            self.cli_input.command,
+            CliCommand::Index | CliCommand::Watch
+        ) {
             return Ok(None);
         }
         if initialize_store {
@@ -626,6 +636,7 @@ impl FsfsRuntime {
                 "store_root": root,
                 "manifest_sha256": generation.manifest_sha256(),
                 "publication": "durable",
+                "security_profile": GenerationRootSecurityProfileV1::CooperativeLocal.as_str(),
                 "generation_complete": true,
                 "vector_generation": Self::inspect_published_vector_generation(generation.path()),
                 "quality_generation": Self::inspect_published_quality_generation(generation.path()),
@@ -1629,7 +1640,9 @@ mod diagnostic_retention_tests {
                 source_hash_hex: "stale-legacy".to_owned(),
                 fast_window_max_per_file: 1,
             };
-            runtime.write_index_sentinel(root.path(), &sentinel).unwrap();
+            runtime
+                .write_index_sentinel(root.path(), &sentinel)
+                .unwrap();
             assert!(matches!(
                 runtime.open_complete_generation_diagnostics(&cx, root.path()),
                 Err(SearchError::InvalidConfig { field, .. })
@@ -1840,18 +1853,23 @@ mod diagnostic_retention_tests {
 
 #[cfg(all(test, unix, not(feature = "embedded-models")))]
 mod tests {
+    #[cfg(feature = "semantic-support")]
     use super::super::{
-        DashboardSearchStage, FSFS_EXPLAIN_SESSION_FILE, IndexSentinel, SearchDashboardState,
-        SearchExecutionMode, set_test_fast_embedder, set_test_quality_embedder,
-        test_fast_embedder_override, test_quality_embedder_override,
+        DashboardSearchStage, SearchDashboardState, SearchExecutionMode, set_test_fast_embedder,
+        set_test_quality_embedder, test_fast_embedder_override, test_quality_embedder_override,
     };
+    use super::super::{FSFS_EXPLAIN_SESSION_FILE, IndexSentinel};
     use super::*;
-    use crate::output_schema::{SearchHitPayload, SearchOutputPhase};
+    use crate::output_schema::SearchHitPayload;
+    #[cfg(feature = "semantic-support")]
+    use crate::output_schema::SearchOutputPhase;
     use crate::stream_protocol::StreamFrame;
     use crate::{CliInput, FsfsConfig};
     use asupersync::test_utils::run_test_with_cx;
+    #[cfg(feature = "semantic-support")]
     use frankensearch_core::{Embedder, EmbeddingIdentityBundleV1, ModelCategory, SearchFuture};
     use std::collections::BTreeMap;
+    #[cfg(feature = "semantic-support")]
     use std::sync::Arc;
 
     fn fixture(parent: &Path) -> (FsfsRuntime, PathBuf, PathBuf) {
@@ -1884,6 +1902,7 @@ mod tests {
         runtime.clone().with_cli_input(input)
     }
 
+    #[cfg(feature = "semantic-support")]
     async fn search_under_override(
         runtime: &FsfsRuntime,
         cx: &Cx,
@@ -1930,11 +1949,13 @@ mod tests {
 
     // Deterministic, independently identified semantic fixtures exercise the
     // real dashboard's stage routing; they make no model-quality claim.
+    #[cfg(feature = "semantic-support")]
     struct DashboardEmbedder {
         identity: EmbeddingIdentityBundleV1,
         category: ModelCategory,
     }
 
+    #[cfg(feature = "semantic-support")]
     impl Embedder for DashboardEmbedder {
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
             Ok(&self.identity)
@@ -1965,11 +1986,13 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "semantic-support")]
     struct RestoreDashboardEmbedders {
         fast: Option<Arc<dyn Embedder>>,
         quality: Option<Arc<dyn Embedder>>,
     }
 
+    #[cfg(feature = "semantic-support")]
     impl RestoreDashboardEmbedders {
         fn install() -> Self {
             let previous = Self {
@@ -1988,6 +2011,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "semantic-support")]
     impl Drop for RestoreDashboardEmbedders {
         fn drop(&mut self) {
             set_test_fast_embedder(self.fast.take());
@@ -1995,6 +2019,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn complete_tui_stages_pin_vectors_lexical_and_snippets_across_publication() {
         let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -2254,6 +2279,7 @@ mod tests {
     /// lexical-only drops the semantic lane (and opens no vector tier),
     /// metadata-only and paused refuse. A build without semantic loaders runs
     /// every search lexical-only the same way.
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn complete_search_runs_in_the_mode_the_degradation_override_allows() {
         use crate::config::DegradationOverrideMode;
@@ -2336,6 +2362,7 @@ mod tests {
     /// adds keyword rows and the successor stays lexical-only; `compact` has
     /// nothing to do and publishes nothing, all as on the legacy layout. A
     /// semantic search still refuses the generation, as on the legacy layout.
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn complete_lexical_only_generation_serves_search_append_and_compact() {
         use crate::config::DegradationOverrideMode::{Auto, ForceLexicalOnly};
@@ -3585,6 +3612,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn complete_cli_inline_explanations_match_buffered_and_streamed_rankings() {
         let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -3704,6 +3732,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn complete_inline_explanations_keep_the_searched_generation_after_publication() {
         run_test_with_cx(|cx| async move {
@@ -3840,6 +3869,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn complete_index_receipt_reports_the_build_summary() {
         run_test_with_cx(|cx| async move {
@@ -4410,6 +4440,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn complete_cli_mutation_receipts_match_selection_and_preserve_old_readers() {
         run_test_with_cx(|cx| async move {

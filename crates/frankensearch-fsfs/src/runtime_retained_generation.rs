@@ -259,7 +259,10 @@ fn canonical_store_root(root: &Path) -> SearchResult<PathBuf> {
         Ok(root) => Ok(root),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let name = root.file_name().ok_or_else(|| {
-                complete_cli::complete_cli_error("store_root", "a store root needs a directory name")
+                complete_cli::complete_cli_error(
+                    "store_root",
+                    "a store root needs a directory name",
+                )
             })?;
             let parent = root
                 .parent()
@@ -322,7 +325,11 @@ impl FsfsRuntime {
     ) -> SearchResult<LiveRetainedSearchReader> {
         retained_search_checkpoint(cx)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
-        let store = crate::generation_store::CompleteGenerationStore::open(cx, store_root)?;
+        let store = crate::generation_store::CompleteGenerationStore::open_with_profile(
+            cx,
+            store_root,
+            frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        )?;
         let reader = self.open_retained_search(cx, store.root()).await?;
         Ok(LiveRetainedSearchReader { store, reader })
     }
@@ -360,7 +367,11 @@ impl FsfsRuntime {
             });
         }
         validate_retained_catalog_path(&self.config.storage.db_path)?;
-        let store = CompleteGenerationStore::open(cx, store_root)?;
+        let store = CompleteGenerationStore::open_with_profile(
+            cx,
+            store_root,
+            frankensearch_core::GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        )?;
         let generation = store
             .active(cx)?
             .ok_or_else(|| SearchError::InvalidConfig {
@@ -436,7 +447,10 @@ impl FsfsRuntime {
         &self,
         cx: &Cx,
         store_root: &Path,
-    ) -> SearchResult<(crate::generation_store::GenerationPublication, FsfsIndexPayload)> {
+    ) -> SearchResult<(
+        crate::generation_store::GenerationPublication,
+        FsfsIndexPayload,
+    )> {
         self.rebuild_retained_generation_with_precommit(cx, store_root, |_| Ok(()))
             .await
     }
@@ -449,7 +463,10 @@ impl FsfsRuntime {
         cx: &Cx,
         store_root: &Path,
         precommit: F,
-    ) -> SearchResult<(crate::generation_store::GenerationPublication, FsfsIndexPayload)>
+    ) -> SearchResult<(
+        crate::generation_store::GenerationPublication,
+        FsfsIndexPayload,
+    )>
     where
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
@@ -2795,10 +2812,7 @@ mod retained_search_tests {
                 .open_retained_search(&cx, &root)
                 .await
                 .expect("reader");
-            let phases = reader
-                .search(&cx, "sharedtoken", 10)
-                .await
-                .expect("search");
+            let phases = reader.search(&cx, "sharedtoken", 10).await.expect("search");
             assert_eq!(phases.last().expect("phase").hits.len(), 5);
         });
     }

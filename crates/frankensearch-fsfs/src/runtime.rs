@@ -29776,7 +29776,9 @@ fn emit_model_free_build_hint() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    #[cfg(feature = "semantic-support")]
+    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::future::{Future, poll_fn};
 
@@ -30127,6 +30129,8 @@ mod tests {
 
     #[cfg(unix)]
     use super::FSFS_DAEMON_REQUEST_MAX_BYTES;
+    #[cfg(feature = "semantic-support")]
+    use super::SearchCacheKey;
     use super::{
         ContextPreviewFormat, EmbedderAvailability, ExplainSessionHit,
         FSFS_SEARCH_SNIPPET_HEAD_LIMIT, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
@@ -30137,10 +30141,10 @@ mod tests {
         FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
         FsfsFlushAck, FsfsFlushRequest, FsfsIndexStatus, FsfsModelStatus, FsfsRuntime,
         FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, IndexingBatchEmbeddingOutcome,
-        InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheKey, SearchCacheRecord,
-        SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources,
-        SearchServeRequest, SemanticGateDecisionInput, SemanticRecallDecisionInput,
-        VectorIndexWriteAction, VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
+        InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheRecord, SearchDashboardState,
+        SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
+        SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
+        VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
         degradation_controller_config_for_profile, detect_context_preview_format,
         is_likely_html_fragment, normalize_html_fragment_for_markdown,
         payload_has_admitted_semantic_hits, payload_has_hash_control_hits, read_durable_json,

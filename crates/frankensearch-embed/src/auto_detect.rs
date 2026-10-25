@@ -2675,6 +2675,7 @@ mod tests {
         assert!(stack.require_semantic().is_ok());
     }
 
+    #[cfg(feature = "hash")]
     #[test]
     fn auto_detect_hash_only_when_no_models_present() {
         let temp = tempfile::tempdir().unwrap();
@@ -2907,17 +2908,20 @@ mod tests {
         serde_json::Value::Object(vocab)
     }
 
+    #[cfg(feature = "hash")]
     struct SemanticTestEmbedder {
         id: &'static str,
         dimension: usize,
     }
 
+    #[cfg(feature = "hash")]
     impl SemanticTestEmbedder {
         const fn new(id: &'static str, dimension: usize) -> Self {
             Self { id, dimension }
         }
     }
 
+    #[cfg(feature = "hash")]
     impl Embedder for SemanticTestEmbedder {
         fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             let dim = self.dimension;

@@ -4,6 +4,12 @@ use std::path::Path;
 
 use frankensearch_core::SearchError;
 use frankensearch_core::config::ZeroSignalReason;
+use frankensearch_core::recovery_plan::{
+    ModelAcquisitionTarget, RecoveryContractError, RecoveryPlan, RecoveryPolicy, RecoveryRequest,
+    RequestMode, SemanticReadiness, TrustedRecoveryContext, VerifiedSemanticProvenance, plan,
+};
+use frankensearch_core::traits::ModelTier;
+use frankensearch_core::types::RetrievalTopology;
 use serde::{Deserialize, Serialize};
 
 pub const DEGRADATION_ADVICE_SCHEMA_VERSION: &str = "fsfs.degradation.advice.v2";
@@ -244,6 +250,152 @@ pub fn classify_search_error(error: &SearchError) -> DegradationFailureKind {
         | SearchError::HashMismatch { .. }
         | SearchError::QueryParseError { .. } => DegradationFailureKind::RefinementFailed,
     }
+}
+
+/// Map a [`DegradationFailureKind`] to the canonical [`SemanticReadiness`]
+/// state under the caller's requested mode and retrieval topology.
+#[must_use]
+pub const fn semantic_readiness_for_failure(
+    failure: DegradationFailureKind,
+    mode: RequestMode,
+    requested_topology: RetrievalTopology,
+) -> SemanticReadiness {
+    if matches!(mode, RequestMode::HashControl) {
+        return SemanticReadiness::HashControl;
+    }
+    let tier = if matches!(requested_topology, RetrievalTopology::FastOnly) {
+        ModelTier::Fast
+    } else {
+        ModelTier::Quality
+    };
+    match failure {
+        DegradationFailureKind::MissingQualityModel => SemanticReadiness::ModelMissing { tier },
+        DegradationFailureKind::RefinementFailed | DegradationFailureKind::Timeout => {
+            SemanticReadiness::PartialQualityCoverage {
+                provenance: VerifiedSemanticProvenance::Local,
+                coverage_ppm: 500_000,
+            }
+        }
+        DegradationFailureKind::LexicalFallback | DegradationFailureKind::CacheMiss => {
+            SemanticReadiness::IndexAbsent
+        }
+        DegradationFailureKind::UnverifiableEmbeddingSpace => SemanticReadiness::RemoteUnverified,
+        DegradationFailureKind::CorruptIndex => SemanticReadiness::ManifestUnsafe,
+        DegradationFailureKind::SemanticZeroSignal => {
+            SemanticReadiness::IndexEmpty(ZeroSignalReason::NoUsableVectors)
+        }
+        DegradationFailureKind::HashControlGeneration => SemanticReadiness::IdentityMismatch,
+    }
+}
+
+/// Map a [`SearchError`] to its canonical [`SemanticReadiness`] state without
+/// formatting or inspecting opaque provider error bodies.
+#[must_use]
+pub fn semantic_readiness_for_search_error(
+    error: &SearchError,
+    mode: RequestMode,
+    requested_topology: RetrievalTopology,
+) -> SemanticReadiness {
+    if matches!(mode, RequestMode::HashControl) {
+        return SemanticReadiness::HashControl;
+    }
+    let tier = if matches!(requested_topology, RetrievalTopology::FastOnly) {
+        ModelTier::Fast
+    } else {
+        ModelTier::Quality
+    };
+    match error {
+        SearchError::ModelNotFound { .. } | SearchError::EmbedderUnavailable { .. } => {
+            SemanticReadiness::ModelMissing { tier }
+        }
+        SearchError::ModelLoadFailed { .. } | SearchError::HashMismatch { .. } => {
+            SemanticReadiness::ModelUnloadable { tier }
+        }
+        SearchError::DimensionMismatch { .. } | SearchError::IndexVersionMismatch { .. } => {
+            SemanticReadiness::IdentityMismatch
+        }
+        SearchError::InvalidConfig { field, value, .. }
+            if field == "semantic.vector_generation" && value == "legacy_hash" =>
+        {
+            SemanticReadiness::IdentityMismatch
+        }
+        other => {
+            semantic_readiness_for_failure(classify_search_error(other), mode, requested_topology)
+        }
+    }
+}
+
+/// Map a [`ZeroSignalReason`] to its canonical [`SemanticReadiness`] state.
+#[must_use]
+pub const fn semantic_readiness_for_zero_signal(reason: ZeroSignalReason) -> SemanticReadiness {
+    SemanticReadiness::IndexEmpty(reason)
+}
+
+/// Compute a canonical [`RecoveryPlan`] from a typed [`SemanticReadiness`]
+/// state and trusted runtime context.
+///
+/// # Errors
+///
+/// Returns [`RecoveryContractError`] if the request topology, readiness state,
+/// or acquisition authorization fails validation.
+pub fn recovery_plan_for_readiness(
+    state: &SemanticReadiness,
+    request: RecoveryRequest,
+    policy: &RecoveryPolicy,
+    acquisition_target: Option<&ModelAcquisitionTarget>,
+    evaluation_time_unix_seconds: u64,
+) -> Result<RecoveryPlan, RecoveryContractError> {
+    plan(TrustedRecoveryContext::new(
+        state,
+        request,
+        policy,
+        acquisition_target,
+        evaluation_time_unix_seconds,
+    ))
+}
+
+/// Compute a canonical [`RecoveryPlan`] for a [`SearchError`] without parsing
+/// or formatting error strings.
+///
+/// # Errors
+///
+/// Returns [`RecoveryContractError`] if the request topology or acquisition
+/// authorization is invalid.
+pub fn recovery_plan_for_search_error(
+    error: &SearchError,
+    request: RecoveryRequest,
+    policy: &RecoveryPolicy,
+    acquisition_target: Option<&ModelAcquisitionTarget>,
+    evaluation_time_unix_seconds: u64,
+) -> Result<RecoveryPlan, RecoveryContractError> {
+    let state =
+        semantic_readiness_for_search_error(error, request.mode, request.requested_topology);
+    recovery_plan_for_readiness(
+        &state,
+        request,
+        policy,
+        acquisition_target,
+        evaluation_time_unix_seconds,
+    )
+}
+
+/// Compute a canonical [`RecoveryPlan`] for a [`ZeroSignalReason`].
+///
+/// # Errors
+///
+/// Returns [`RecoveryContractError`] if the request topology is invalid.
+pub fn recovery_plan_for_zero_signal(
+    reason: ZeroSignalReason,
+    request: RecoveryRequest,
+    policy: &RecoveryPolicy,
+    evaluation_time_unix_seconds: u64,
+) -> Result<RecoveryPlan, RecoveryContractError> {
+    let state = if matches!(request.mode, RequestMode::HashControl) {
+        SemanticReadiness::HashControl
+    } else {
+        semantic_readiness_for_zero_signal(reason)
+    };
+    recovery_plan_for_readiness(&state, request, policy, None, evaluation_time_unix_seconds)
 }
 
 #[must_use]
@@ -725,6 +877,68 @@ mod tests {
         assert!(!action_text.to_ascii_lowercase().contains("delete"));
         Ok(())
     }
+
+    #[test]
+    fn typed_recovery_plan_covers_every_failure_and_zero_signal_state() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        for mode in [RequestMode::ExplicitSemantic, RequestMode::Hybrid] {
+            for topology in [
+                RetrievalTopology::FastOnly,
+                RetrievalTopology::QualityOnly,
+                RetrievalTopology::FullProgressive,
+            ] {
+                let request = RecoveryRequest {
+                    mode,
+                    requested_topology: topology,
+                };
+                for fixture in synthetic_degradation_advice_fixture() {
+                    let readiness =
+                        super::semantic_readiness_for_failure(fixture.failure, mode, topology);
+                    let plan = super::recovery_plan_for_readiness(
+                        &readiness,
+                        request,
+                        &policy,
+                        None,
+                        1_750_000_000,
+                    )
+                    .expect("every DegradationFailureKind must produce a valid RecoveryPlan");
+                    assert_eq!(plan.state(), &readiness);
+                    assert_eq!(plan.mode(), mode);
+                    assert_eq!(plan.requested_topology(), topology);
+                }
+                for reason in [
+                    ZeroSignalReason::NewlyCreatedEmpty,
+                    ZeroSignalReason::AllTombstoned,
+                    ZeroSignalReason::WalOnlyNoLiveRecords,
+                    ZeroSignalReason::NoUsableVectors,
+                    ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors,
+                    ZeroSignalReason::CallerRequestedZeroK,
+                    ZeroSignalReason::FilterEliminatedAll,
+                    ZeroSignalReason::NonFiniteQuery,
+                    ZeroSignalReason::ZeroNormQuery,
+                ] {
+                    let plan = super::recovery_plan_for_zero_signal(
+                        reason,
+                        request,
+                        &policy,
+                        1_750_000_000,
+                    )
+                    .expect("every ZeroSignalReason must produce a valid RecoveryPlan");
+                    assert_eq!(plan.state_code(), "recovery.state.index_empty");
+                    assert!(!plan.semantic_available());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -832,6 +1046,26 @@ mod public_advice_tests {
                     Some(output_error_from(&error).message)
                 );
                 assert_public(&serde_json::to_string(&advice).unwrap());
+
+                let policy = frankensearch_core::recovery_plan::RecoveryPolicy {
+                    interaction:
+                        frankensearch_core::recovery_plan::InteractionPolicy::NonInteractive,
+                    network: frankensearch_core::recovery_plan::NetworkPolicy::Offline,
+                    acquisition_authorization: None,
+                };
+                let plan = recovery_plan_for_search_error(
+                    &error,
+                    frankensearch_core::recovery_plan::RecoveryRequest {
+                        mode: frankensearch_core::recovery_plan::RequestMode::Hybrid,
+                        requested_topology:
+                            frankensearch_core::types::RetrievalTopology::FullProgressive,
+                    },
+                    &policy,
+                    None,
+                    1_750_000_000,
+                )
+                .expect("recovery_plan_for_search_error succeeds without formatting opaque source");
+                assert_public(&serde_json::to_string(&plan).unwrap());
             }
             assert_eq!(source.formatted.load(Ordering::Relaxed), 0);
         }
