@@ -331,7 +331,7 @@ impl CoalescingEmbedder {
         YieldOnce(false).await;
         let outcome = loop {
             enum Step {
-                Received(Result<SearchResult<IdentityBoundEmbedding>, oneshot::RecvError>),
+                Received(Box<Result<SearchResult<IdentityBoundEmbedding>, oneshot::RecvError>>),
                 Locked(asupersync::sync::OwnedMutexGuard<CoalescingDispatcher>),
                 LockFailed,
             }
@@ -343,7 +343,7 @@ impl CoalescingEmbedder {
                 ));
                 std::future::poll_fn(|task_cx| {
                     if let std::task::Poll::Ready(outcome) = recv_fut.as_mut().poll(task_cx) {
-                        return std::task::Poll::Ready(Step::Received(outcome));
+                        return std::task::Poll::Ready(Step::Received(Box::new(outcome)));
                     }
                     match lock_fut.as_mut().poll(task_cx) {
                         std::task::Poll::Ready(Ok(guard)) => {
@@ -356,7 +356,7 @@ impl CoalescingEmbedder {
                 .await
             };
             match step {
-                Step::Received(outcome) => break outcome,
+                Step::Received(outcome) => break *outcome,
                 Step::LockFailed => {
                     checkpoint(cx)?;
                     return Err(stopped("coalesced dispatcher lock failed"));
@@ -546,6 +546,7 @@ impl Shared {
     /// whole prefixes whose recipients have all disconnected. Keep the FIFO paired
     /// under its existing lock; never drain a live row or an in-flight batch.
     /// Channel destruction and credit release happen after both locks leave.
+    #[allow(clippy::significant_drop_tightening)]
     fn discard_abandoned_front(&self) -> SearchResult<()> {
         let width = self.queue.config().max_batch_size;
         let batches = self.lock()?.replies.len().div_ceil(width);
@@ -734,7 +735,7 @@ impl CoalescingDispatcher {
         .await
     }
 
-    async fn wait_for_work(&mut self, cx: &Cx) -> SearchResult<bool> {
+    async fn wait_for_work(&self, cx: &Cx) -> SearchResult<bool> {
         loop {
             checkpoint(cx)?;
             let receiver = {
