@@ -212,10 +212,13 @@ impl CompleteGenerationStore {
                     expected_selection.as_deref(),
                 )
         }) {
-            return Err(invalid(
-                &self.root,
-                "prepared recovery selection differs; resume cannot rebase onto current state",
-            ));
+            return Err(SearchError::InvalidConfig {
+                field: "expected_selection_sha256".to_owned(),
+                value: self.root.display().to_string(),
+                reason:
+                    "prepared recovery selection differs; resume cannot rebase onto current state"
+                        .to_owned(),
+            });
         }
         let target = self.open_retained(cx, id, manifest_sha256)?;
         ensure_selection(&self.root, expected_selection.as_deref())?;

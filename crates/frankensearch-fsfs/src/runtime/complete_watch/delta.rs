@@ -271,10 +271,7 @@ async fn read_text_batch(
     cx: &Cx,
     requests: Vec<(PathBuf, SourceStamp)>,
 ) -> SearchResult<Option<TextReads>> {
-    read_text_batch_with(cx, requests, |job| {
-        asupersync::runtime::spawn_blocking(job)
-    })
-    .await
+    read_text_batch_with(cx, requests, |job| asupersync::runtime::spawn_blocking(job)).await
 }
 
 /// One submission boundary shared with deterministic queue/drop tests. The
@@ -513,8 +510,8 @@ mod tests;
 #[cfg(test)]
 mod metadata_tests {
     use std::future::Future;
-    use std::sync::{Arc, Mutex};
     use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
     use std::task::{Context, Poll, Waker};
     use std::time::Instant;
 
@@ -536,7 +533,7 @@ mod metadata_tests {
         fs::write(source.join("alpha.md"), "privatebody original text").unwrap();
         fs::write(source.join("stable.md"), "stableword unchanged text").unwrap();
         let mut config = FsfsConfig::default();
-        config.discovery.max_file_size_mb = 1;
+        config.discovery.max_file_size_mb = 3;
         config.indexing.offline = true;
         config.indexing.quality_model.clear();
         config.search.fast_only = true;
@@ -562,7 +559,11 @@ mod metadata_tests {
         session
     }
 
-    async fn change(session: &mut CompleteWatchSession, cx: &Cx, path: &Path) -> PublishedGeneration {
+    async fn change(
+        session: &mut CompleteWatchSession,
+        cx: &Cx,
+        path: &Path,
+    ) -> PublishedGeneration {
         let now = Instant::now();
         {
             let mut changes = lock_changes(&session.changes).unwrap();
@@ -574,8 +575,12 @@ mod metadata_tests {
     }
 
     fn grow_metadata_source(path: &Path) {
-        OpenOptions::new().write(true).open(path).unwrap()
-            .set_len(MAX_SOURCE_BYTES + 1).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_len(MAX_SOURCE_BYTES + 1)
+            .unwrap();
     }
 
     #[test]
@@ -592,16 +597,29 @@ mod metadata_tests {
             }
             let after = source.observe(&cx, &runtime.config.discovery).unwrap();
             for name in ["binary.md", "document.pdf"] {
-                assert_eq!(after.classes[&path.join(name)], IngestionClass::MetadataOnly);
+                assert_eq!(
+                    after.classes[&path.join(name)],
+                    IngestionClass::MetadataOnly
+                );
             }
-            assert!(prepare(&cx, &runtime, &source, &before, &after, None)
-                .await.unwrap().is_some());
+            assert!(
+                prepare(&cx, &runtime, &source, &before, &after, None)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
             // The same large file is still outside the content-reading lane's
             // limits. This change must not weaken lexical/semantic admission.
             let mut content = after;
-            content.classes.insert(path.join("binary.md"), IngestionClass::LexicalOnly);
-            assert!(prepare(&cx, &runtime, &source, &before, &content, None)
-                .await.unwrap().is_none());
+            content
+                .classes
+                .insert(path.join("binary.md"), IngestionClass::LexicalOnly);
+            assert!(
+                prepare(&cx, &runtime, &source, &before, &content, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         });
     }
 
@@ -619,15 +637,21 @@ mod metadata_tests {
             let retained = directory.path().join("retained.md");
             fs::rename(&path, &retained).unwrap();
             fs::write(&path, b"\xff\0not decoded").unwrap();
-            assert!(is_source_changed(&metadata_modified_ms(&cx, &path, &expected).unwrap_err()));
+            assert!(is_source_changed(
+                &metadata_modified_ms(&cx, &path, &expected).unwrap_err()
+            ));
             let link = directory.path().join("alias.md");
             symlink(&retained, &link).unwrap();
             let link_stamp = SourceStamp::from_metadata(&fs::symlink_metadata(&link).unwrap());
-            assert!(is_source_changed(&metadata_modified_ms(&cx, &link, &link_stamp).unwrap_err()));
+            assert!(is_source_changed(
+                &metadata_modified_ms(&cx, &link, &link_stamp).unwrap_err()
+            ));
             let socket = directory.path().join("socket");
             let _listener = UnixListener::bind(&socket).unwrap();
             let socket_stamp = SourceStamp::from_metadata(&fs::symlink_metadata(&socket).unwrap());
-            assert!(is_source_changed(&metadata_modified_ms(&cx, &socket, &socket_stamp).unwrap_err()));
+            assert!(is_source_changed(
+                &metadata_modified_ms(&cx, &socket, &socket_stamp).unwrap_err()
+            ));
             cx.set_cancel_requested(true);
             let cancelled = metadata_modified_ms(&cx, &path, &expected);
             cx.set_cancel_requested(false);
@@ -643,7 +667,8 @@ mod metadata_tests {
             let mut session = session(&runtime, &cx, &root);
             let old = require_durable_publication(
                 session.advance(&cx, Instant::now()).await.unwrap().unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             let source = SourceRoot::open(source_path.clone()).unwrap();
             let before = source.observe(&cx, &runtime.config.discovery).unwrap();
             let file = source_path.join("alpha.md");
@@ -651,17 +676,27 @@ mod metadata_tests {
             let after = source.observe(&cx, &runtime.config.discovery).unwrap();
             assert_eq!(after.classes[&file], IngestionClass::MetadataOnly);
             let batch = prepare(&cx, &runtime, &source, &before, &after, None)
-                .await.unwrap().unwrap();
+                .await
+                .unwrap()
+                .unwrap();
             let retained = directory.path().join("preserved-large.md");
-            let result = runtime.apply_retained_source_batch_with_precommit(
-                &cx, &root, &old, batch, move |_| {
+            let result = runtime
+                .apply_retained_source_batch_with_precommit(&cx, &root, &old, batch, move |_| {
                     fs::rename(&file, retained)?;
                     fs::write(&file, "recreated during precommit")?;
                     Ok(())
-                },
-            ).await;
-            assert!(is_source_changed(&result.expect_err("source replacement must refuse publication")));
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(old));
+                })
+                .await;
+            assert!(is_source_changed(
+                &result.expect_err("source replacement must refuse publication")
+            ));
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(old)
+            );
         });
     }
 
@@ -673,42 +708,162 @@ mod metadata_tests {
             let mut session = session(&runtime, &cx, &root);
             let old = require_durable_publication(
                 session.advance(&cx, Instant::now()).await.unwrap().unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             let mut query_runtime = runtime.clone();
-            query_runtime.config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
-            let mut pinned = query_runtime.open_retained_search(&cx, &root).await.unwrap();
-            let before = FsfsRuntime::read_matching_manifest_generation(old.path()).unwrap().unwrap();
+            query_runtime.config.pressure.degradation_override =
+                DegradationOverrideMode::ForceLexicalOnly;
+            let mut pinned = query_runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            let before = FsfsRuntime::read_matching_manifest_generation(old.path())
+                .unwrap()
+                .unwrap();
             grow_metadata_source(&source.join("alpha.md"));
             let second = change(&mut session, &cx, &source.join("alpha.md")).await;
-            assert_eq!(FsfsRuntime::read_index_sentinel(second.path()).unwrap().unwrap().command, "retained-batch");
-            let manifests = FsfsRuntime::read_matching_manifest_generation(second.path()).unwrap().unwrap();
+            assert_eq!(
+                FsfsRuntime::read_index_sentinel(second.path())
+                    .unwrap()
+                    .unwrap()
+                    .command,
+                "retained-batch"
+            );
+            let manifests = FsfsRuntime::read_matching_manifest_generation(second.path())
+                .unwrap()
+                .unwrap();
             assert_eq!(manifests["alpha.md"].ingestion_class, "metadata_only");
-            assert_eq!(manifests["alpha.md"].reason_code, "index.plan.metadata_only");
+            assert_eq!(
+                manifests["alpha.md"].reason_code,
+                "index.plan.metadata_only"
+            );
             assert!(manifests["alpha.md"].fast_windows.is_none());
-            assert_eq!(serde_json::to_value(&manifests["stable.md"]).unwrap(),
-                serde_json::to_value(&before["stable.md"]).unwrap());
-            let mut metadata_reader = query_runtime.open_retained_search(&cx, &root).await.unwrap();
-            assert!(metadata_reader.search(&cx, "privatebody", 10).await.unwrap().last().unwrap().hits.is_empty());
-            assert_eq!(metadata_reader.search(&cx, "alpha", 10).await.unwrap().last().unwrap().hits.len(), 1);
-            assert_eq!(pinned.search(&cx, "privatebody", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            assert_eq!(
+                serde_json::to_value(&manifests["stable.md"]).unwrap(),
+                serde_json::to_value(&before["stable.md"]).unwrap()
+            );
+            let mut metadata_reader = query_runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            assert!(
+                metadata_reader
+                    .search(&cx, "privatebody", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
+            assert_eq!(
+                metadata_reader
+                    .search(&cx, "alpha", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(
+                pinned
+                    .search(&cx, "privatebody", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
 
             fs::rename(source.join("alpha.md"), source.join("renamed.md")).unwrap();
             let third = change(&mut session, &cx, &source.join("alpha.md")).await;
-            assert_eq!(FsfsRuntime::read_index_sentinel(third.path()).unwrap().unwrap().command, "retained-batch");
-            let renamed = FsfsRuntime::read_matching_manifest_generation(third.path()).unwrap().unwrap();
+            assert_eq!(
+                FsfsRuntime::read_index_sentinel(third.path())
+                    .unwrap()
+                    .unwrap()
+                    .command,
+                "retained-batch"
+            );
+            let renamed = FsfsRuntime::read_matching_manifest_generation(third.path())
+                .unwrap()
+                .unwrap();
             assert!(!renamed.contains_key("alpha.md"));
             assert_eq!(renamed["renamed.md"].ingestion_class, "metadata_only");
-            let mut current = query_runtime.open_retained_search(&cx, &root).await.unwrap();
-            assert_eq!(current.search(&cx, "renamed", 10).await.unwrap().last().unwrap().hits.len(), 1);
-            assert!(current.search(&cx, "alpha", 10).await.unwrap().last().unwrap().hits.is_empty());
+            let mut current = query_runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(
+                current
+                    .search(&cx, "renamed", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert!(
+                current
+                    .search(&cx, "alpha", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
 
             fs::write(source.join("renamed.md"), "promotedword now index the body").unwrap();
             let fourth = change(&mut session, &cx, &source.join("renamed.md")).await;
-            assert_eq!(FsfsRuntime::read_index_sentinel(fourth.path()).unwrap().unwrap().command, "retained-batch");
-            let mut promoted = query_runtime.open_retained_search(&cx, &root).await.unwrap();
-            assert_eq!(promoted.search(&cx, "promotedword", 10).await.unwrap().last().unwrap().hits.len(), 1);
-            assert!(current.search(&cx, "promotedword", 10).await.unwrap().last().unwrap().hits.is_empty());
-            assert_eq!(promoted.search(&cx, "stableword", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            assert_eq!(
+                FsfsRuntime::read_index_sentinel(fourth.path())
+                    .unwrap()
+                    .unwrap()
+                    .command,
+                "retained-batch"
+            );
+            let mut promoted = query_runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(
+                promoted
+                    .search(&cx, "promotedword", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert!(
+                current
+                    .search(&cx, "promotedword", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
+            assert_eq!(
+                promoted
+                    .search(&cx, "stableword", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
             assert_eq!(pinned.generation(), &old);
             assert_eq!(metadata_reader.generation(), &second);
             assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 4);
@@ -766,15 +921,36 @@ mod metadata_tests {
             let over_total = vec![first.clone(), second, (seed.clone(), one_byte.clone())];
             assert!(read_text_batch(&cx, over_total).await.unwrap().is_none());
             stamp.bytes = MAX_SOURCE_BYTES + 1;
-            assert!(read_text_batch(&cx, vec![(first.0.clone(), stamp)]).await.unwrap().is_none());
-            assert!(read_text_batch(&cx, vec![first.clone(), first]).await.unwrap().is_none());
+            assert!(
+                read_text_batch(&cx, vec![(first.0.clone(), stamp)])
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                read_text_batch(&cx, vec![first.clone(), first])
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             let mut maximum = (0..MAX_CHANGED_PATHS)
-                .map(|number| (directory.path().join(format!("missing-{number}.md")), one_byte.clone()))
+                .map(|number| {
+                    (
+                        directory.path().join(format!("missing-{number}.md")),
+                        one_byte.clone(),
+                    )
+                })
                 .collect::<Vec<_>>();
             assert!(text_batch_supported(&cx, &maximum).unwrap());
             maximum.push((seed, one_byte));
             assert!(read_text_batch(&cx, maximum).await.unwrap().is_none());
-            assert!(read_text_batch(&cx, Vec::new()).await.unwrap().unwrap().is_empty());
+            assert!(
+                read_text_batch(&cx, Vec::new())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
         });
     }
 
@@ -790,7 +966,11 @@ mod metadata_tests {
             fs::rename(&second, directory.path().join("preserved-second.md")).unwrap();
             fs::write(&second, "second valid text").unwrap();
             let result = read_text_batch(&cx, vec![request(&first), stale]).await;
-            assert!(is_source_changed(&result.err().expect("replacement must refuse the whole batch")));
+            assert!(is_source_changed(
+                &result
+                    .err()
+                    .expect("replacement must refuse the whole batch")
+            ));
 
             // Unsupported content returns no partial text map and stops before
             // the missing third file. The normal indexer owns this case.
@@ -798,8 +978,12 @@ mod metadata_tests {
                 fs::write(&second, bytes).unwrap();
                 let mut missing = request(&first);
                 missing.0 = directory.path().join("not-read-after-refusal.md");
-                assert!(read_text_batch(&cx, vec![request(&first), request(&second), missing])
-                    .await.unwrap().is_none());
+                assert!(
+                    read_text_batch(&cx, vec![request(&first), request(&second), missing])
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
             }
         });
     }
@@ -827,26 +1011,85 @@ mod metadata_tests {
             let mut watcher = session(&runtime, &cx, &root);
             let old = require_durable_publication(
                 watcher.advance(&cx, Instant::now()).await.unwrap().unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             let mut query_runtime = runtime.clone();
-            query_runtime.config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
-            let mut pinned = query_runtime.open_retained_search(&cx, &root).await.unwrap();
+            query_runtime.config.pressure.degradation_override =
+                DegradationOverrideMode::ForceLexicalOnly;
+            let mut pinned = query_runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
             fs::write(source.join("alpha.md"), "batchedreplacement alpha text").unwrap();
             fs::write(source.join("second.md"), "batchedreplacement second text").unwrap();
             fs::write(source.join("inventory.pdf"), [0xff, 0x00, 0xfe]).unwrap();
             grow_metadata_source(&source.join("inventory.pdf"));
             let next = change(&mut watcher, &cx, &source.join("alpha.md")).await;
-            assert_eq!(FsfsRuntime::read_index_sentinel(next.path()).unwrap().unwrap().command, "retained-batch");
-            let before = FsfsRuntime::read_matching_manifest_generation(old.path()).unwrap().unwrap();
-            let after = FsfsRuntime::read_matching_manifest_generation(next.path()).unwrap().unwrap();
-            assert_eq!(serde_json::to_value(&before["stable.md"]).unwrap(),
-                serde_json::to_value(&after["stable.md"]).unwrap());
+            assert_eq!(
+                FsfsRuntime::read_index_sentinel(next.path())
+                    .unwrap()
+                    .unwrap()
+                    .command,
+                "retained-batch"
+            );
+            let before = FsfsRuntime::read_matching_manifest_generation(old.path())
+                .unwrap()
+                .unwrap();
+            let after = FsfsRuntime::read_matching_manifest_generation(next.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(&before["stable.md"]).unwrap(),
+                serde_json::to_value(&after["stable.md"]).unwrap()
+            );
             assert_eq!(after["inventory.pdf"].ingestion_class, "metadata_only");
-            let mut reader = query_runtime.open_retained_search(&cx, &root).await.unwrap();
-            assert_eq!(reader.search(&cx, "batchedreplacement", 10).await.unwrap().last().unwrap().hits.len(), 2);
-            assert_eq!(reader.search(&cx, "inventory", 10).await.unwrap().last().unwrap().hits.len(), 1);
-            assert!(reader.search(&cx, "privatebody", 10).await.unwrap().last().unwrap().hits.is_empty());
-            assert_eq!(pinned.search(&cx, "privatebody", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            let mut reader = query_runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(
+                reader
+                    .search(&cx, "batchedreplacement", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
+            assert_eq!(
+                reader
+                    .search(&cx, "inventory", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert!(
+                reader
+                    .search(&cx, "privatebody", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .is_empty()
+            );
+            assert_eq!(
+                pinned
+                    .search(&cx, "privatebody", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
             assert_eq!(pinned.generation(), &old);
         });
     }
@@ -859,7 +1102,8 @@ mod metadata_tests {
             let mut watcher = session(&runtime, &cx, &root);
             let old = require_durable_publication(
                 watcher.advance(&cx, Instant::now()).await.unwrap().unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
             let source = SourceRoot::open(source_path.clone()).unwrap();
             let before = source.observe(&cx, &runtime.config.discovery).unwrap();
             fs::write(source_path.join("alpha.md"), "retrycohort alpha changed").unwrap();
@@ -869,22 +1113,44 @@ mod metadata_tests {
             fs::rename(&second, directory.path().join("preserved-second.md")).unwrap();
             fs::write(&second, "retrycohort second changed").unwrap();
             let result = prepare(&cx, &runtime, &source, &before, &stale, None).await;
-            assert!(is_source_changed(&result.err().expect("later changed source must refuse preparation")));
+            assert!(is_source_changed(
+                &result
+                    .err()
+                    .expect("later changed source must refuse preparation")
+            ));
             let store = CompleteGenerationStore::open(&cx, &root).unwrap();
             assert_eq!(store.active(&cx).unwrap().as_ref(), Some(&old));
             assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), 1);
             let current = source.observe(&cx, &runtime.config.discovery).unwrap();
-            let batch = prepare(&cx, &runtime, &source, &before, &current, None).await.unwrap().unwrap();
-            let outcome = runtime.apply_retained_source_batch_with_precommit(
-                &cx, &root, &old, batch, |_| Ok(()),
-            ).await.unwrap();
+            let batch = prepare(&cx, &runtime, &source, &before, &current, None)
+                .await
+                .unwrap()
+                .unwrap();
+            let outcome = runtime
+                .apply_retained_source_batch_with_precommit(&cx, &root, &old, batch, |_| Ok(()))
+                .await
+                .unwrap();
             assert_eq!((outcome.upserted, outcome.deleted), (2, 0));
             let next = require_durable_publication(outcome.publication.unwrap()).unwrap();
             assert_eq!(store.active(&cx).unwrap().as_ref(), Some(&next));
             let mut query_runtime = runtime.clone();
-            query_runtime.config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
-            let mut reader = query_runtime.open_retained_search(&cx, &root).await.unwrap();
-            assert_eq!(reader.search(&cx, "retrycohort", 10).await.unwrap().last().unwrap().hits.len(), 2);
+            query_runtime.config.pressure.degradation_override =
+                DegradationOverrideMode::ForceLexicalOnly;
+            let mut reader = query_runtime
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(
+                reader
+                    .search(&cx, "retrycohort", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
         });
     }
 
@@ -902,13 +1168,22 @@ mod metadata_tests {
             let results = read_text_batch_with(&cx, requests, |job| {
                 submitted.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(job())
-            }).await.unwrap().unwrap();
+            })
+            .await
+            .unwrap()
+            .unwrap();
             assert_eq!(submitted.load(Ordering::SeqCst), 1);
             assert_eq!(results.len(), 3);
-            assert!(read_text_batch_with(&cx, Vec::new(), |_| {
-                submitted.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Err(source_changed()))
-            }).await.unwrap().unwrap().is_empty());
+            assert!(
+                read_text_batch_with(&cx, Vec::new(), |_| {
+                    submitted.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Err(source_changed()))
+                })
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
+            );
             assert_eq!(submitted.load(Ordering::SeqCst), 1);
         });
     }
@@ -927,7 +1202,14 @@ mod metadata_tests {
             drop(future);
             assert_eq!(submitted.load(Ordering::SeqCst), 0);
             assert!(!cx.is_cancel_requested());
-            assert_eq!(read_text_batch(&cx, vec![request(&path)]).await.unwrap().unwrap().len(), 1);
+            assert_eq!(
+                read_text_batch(&cx, vec![request(&path)])
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .len(),
+                1
+            );
         });
     }
 
@@ -939,22 +1221,34 @@ mod metadata_tests {
             fs::write(&path, "original source text").unwrap();
             let queued = Arc::new(Mutex::new(None::<ReadJob>));
             let captured = Arc::clone(&queued);
-            let mut future = Box::pin(read_text_batch_with(&cx, vec![request(&path)], move |job| {
-                assert!(captured.lock().unwrap().replace(job).is_none());
-                std::future::pending()
-            }));
+            let mut future = Box::pin(read_text_batch_with(
+                &cx,
+                vec![request(&path)],
+                move |job| {
+                    assert!(captured.lock().unwrap().replace(job).is_none());
+                    std::future::pending()
+                },
+            ));
             let waker = Waker::noop();
-            assert!(matches!(future.as_mut().poll(&mut Context::from_waker(waker)), Poll::Pending));
+            assert!(matches!(
+                future.as_mut().poll(&mut Context::from_waker(waker)),
+                Poll::Pending
+            ));
             drop(future);
             // If dropping the future did not stop the queued job, this would
             // now be an I/O/source-changed error, not the exact local cancel.
             fs::rename(&path, directory.path().join("preserved-source.md")).unwrap();
             let job = queued.lock().unwrap().take().unwrap();
-            assert!(matches!(job(), Err(SearchError::Cancelled { ref phase, .. })
-                if phase == "complete_watch.read_batch"));
+            assert!(
+                matches!(job(), Err(SearchError::Cancelled { ref phase, .. })
+                if phase == "complete_watch.read_batch")
+            );
             assert!(!cx.is_cancel_requested());
             fs::write(&path, "fresh retry text").unwrap();
-            let results = read_text_batch(&cx, vec![request(&path)]).await.unwrap().unwrap();
+            let results = read_text_batch(&cx, vec![request(&path)])
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(results[&path].text, "fresh retry text");
         });
     }
@@ -978,10 +1272,16 @@ mod metadata_tests {
                     // Deterministic boundary: the scalar read has completed,
                     // but its result has not yet entered the shared batch.
                     drop(guard.take());
-                    if fail_read { Err(source_changed()) } else { result }
+                    if fail_read {
+                        Err(source_changed())
+                    } else {
+                        result
+                    }
                 });
-                assert!(matches!(result, Err(SearchError::Cancelled { ref phase, .. })
-                    if phase == "complete_watch.read_batch"));
+                assert!(
+                    matches!(result, Err(SearchError::Cancelled { ref phase, .. })
+                    if phase == "complete_watch.read_batch")
+                );
                 assert_eq!(reads, 1, "abandoned work must not open the second source");
                 assert!(!cx.is_cancel_requested());
             }
@@ -996,10 +1296,15 @@ mod metadata_tests {
             fs::write(&path, "original source text").unwrap();
             let result = read_text_batch_with(&cx, vec![request(&path)], |job| {
                 let result = job();
-                assert!(result.as_ref().is_ok_and(|batch| batch.as_ref().is_some_and(|batch| batch.len() == 1)));
+                assert!(
+                    result
+                        .as_ref()
+                        .is_ok_and(|batch| batch.as_ref().is_some_and(|batch| batch.len() == 1))
+                );
                 cx.set_cancel_requested(true);
                 std::future::ready(result)
-            }).await;
+            })
+            .await;
             cx.set_cancel_requested(false);
             assert!(matches!(result, Err(SearchError::Cancelled { .. })));
         });

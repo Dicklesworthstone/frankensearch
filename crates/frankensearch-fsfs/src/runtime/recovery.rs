@@ -39,7 +39,10 @@ impl std::fmt::Debug for PreparedRetainedRecovery {
         formatter
             .debug_struct("PreparedRetainedRecovery")
             .field("generation", &self.reader.generation().id())
-            .field("manifest_sha256", &self.reader.generation().manifest_sha256())
+            .field(
+                "manifest_sha256",
+                &self.reader.generation().manifest_sha256(),
+            )
             // Do not expose the potentially malformed incumbent descriptor.
             .finish_non_exhaustive()
     }
@@ -283,7 +286,8 @@ impl FsfsRuntime {
     ) -> SearchResult<PreparedRetainedRecovery> {
         self.preflight_retained_recovery(cx)?;
         let store = crate::generation_store::CompleteGenerationStore::open(cx, store_root)?;
-        let plan = store.prepare_vector_repair(cx, generation_id, manifest_sha256, max_copy_bytes)?;
+        let plan =
+            store.prepare_vector_repair(cx, generation_id, manifest_sha256, max_copy_bytes)?;
         let generation = plan.target().clone();
         let reader = self
             .open_retained_recovery_target(cx, &store, generation)
@@ -575,7 +579,11 @@ mod retained_recovery_tests {
         let source = parent.join("source");
         let root = parent.join("store");
         fs::create_dir(&source).unwrap();
-        fs::write(source.join("alpha.md"), "sharedtoken original alpha document").unwrap();
+        fs::write(
+            source.join("alpha.md"),
+            "sharedtoken original alpha document",
+        )
+        .unwrap();
         let mut config = FsfsConfig::default();
         "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
         "all-minilm-l6-v2".clone_into(&mut config.indexing.quality_model);
@@ -583,19 +591,23 @@ mod retained_recovery_tests {
         config.search.fast_only = false;
         config.search.rerank = false;
         config.search.quality_timeout_ms = 5_000;
-        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+        let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
             command: CliCommand::Index,
             target_path: Some(source.clone()),
             index_dir: Some(root.clone()),
             quiet: true,
             ..CliInput::default()
         });
+        runtime.lexical_only_indexing = false;
         (runtime, source, root)
     }
 
     fn fresh_runtime(runtime: &FsfsRuntime) -> FsfsRuntime {
         // Do not let a previous successful load mask a changed provider fixture.
-        FsfsRuntime::new(runtime.config().clone()).with_cli_input(runtime.cli_input.clone())
+        let mut fresh =
+            FsfsRuntime::new(runtime.config().clone()).with_cli_input(runtime.cli_input.clone());
+        fresh.lexical_only_indexing = runtime.lexical_only_indexing;
+        fresh
     }
 
     async fn publish(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> PublishedGeneration {
@@ -632,7 +644,11 @@ mod retained_recovery_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, source, root) = fixture(directory.path());
             let old = publish(&runtime, &cx, &root).await;
-            fs::write(source.join("beta.md"), "sharedtoken successor beta document").unwrap();
+            fs::write(
+                source.join("beta.md"),
+                "sharedtoken successor beta document",
+            )
+            .unwrap();
             let new = publish(&runtime, &cx, &root).await;
             let old_bytes = file_bytes(old.path());
             let new_bytes = file_bytes(new.path());
@@ -666,7 +682,11 @@ mod retained_recovery_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, source, root) = fixture(directory.path());
             let old = publish(&runtime, &cx, &root).await;
-            fs::write(source.join("beta.md"), "sharedtoken successor beta document").unwrap();
+            fs::write(
+                source.join("beta.md"),
+                "sharedtoken successor beta document",
+            )
+            .unwrap();
             let new = publish(&runtime, &cx, &root).await;
             let before = file_bytes(&root);
             for (id, digest) in [
@@ -707,7 +727,12 @@ mod retained_recovery_tests {
             let directory = tempfile::tempdir().unwrap();
             let (mut runtime, _, root) = fixture(directory.path());
             let generation = publish(&runtime, &cx, &root).await;
-            assert!(generation.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).is_file());
+            assert!(
+                generation
+                    .path()
+                    .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                    .is_file()
+            );
             runtime.config.search.fast_only = true;
             let before = file_bytes(&root);
             for producer in [&models.fast, &models.quality] {
@@ -762,8 +787,7 @@ mod retained_recovery_tests {
             // Intentionally exercise only the container's inventory seal here.
             // This is NOT a valid engine publication: the recovery adapter must
             // supply the missing engine/producer admission and refuse it.
-            let GenerationPublication::Durable(target) =
-                build.publish(&cx, |_, _| Ok(())).unwrap()
+            let GenerationPublication::Durable(target) = build.publish(&cx, |_, _| Ok(())).unwrap()
             else {
                 panic!("fixture inventory must be durable"); // ubs:ignore — cfg(test) assertion.
             };
@@ -773,12 +797,7 @@ mod retained_recovery_tests {
             let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
             assert!(
                 runtime
-                    .prepare_retained_recovery(
-                        &cx,
-                        &root,
-                        target.id(),
-                        target.manifest_sha256(),
-                    )
+                    .prepare_retained_recovery(&cx, &root, target.id(), target.manifest_sha256(),)
                     .await
                     .is_err()
             );
@@ -803,8 +822,7 @@ mod retained_recovery_tests {
                 if shadow {
                     invalid.config.search.shadow_mode = true;
                 } else {
-                    "{index_dir}/../outside.sqlite"
-                        .clone_into(&mut invalid.config.storage.db_path);
+                    "{index_dir}/../outside.sqlite".clone_into(&mut invalid.config.storage.db_path);
                 }
                 assert!(
                     invalid
@@ -844,12 +862,18 @@ mod retained_recovery_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, source, root) = fixture(directory.path());
             let old = publish(&runtime, &cx, &root).await;
-            fs::write(source.join("beta.md"), "sharedtoken successor beta document").unwrap();
+            fs::write(
+                source.join("beta.md"),
+                "sharedtoken successor beta document",
+            )
+            .unwrap();
             let new = publish(&runtime, &cx, &root).await;
             let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
             let mut live = runtime.open_live_retained_search(&cx, &root).await.unwrap();
             assert_eq!(
-                live.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                live.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
                 2
             );
             let old_bytes = file_bytes(old.path());
@@ -873,18 +897,24 @@ mod retained_recovery_tests {
             );
             assert_eq!(recovered.generation(), &old);
             assert_eq!(
-                recovered.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                recovered.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
                 1
             );
             assert!(live.refresh(&cx).await.unwrap());
             assert_eq!(live.generation(), &old);
             assert_eq!(
-                live.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                live.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
                 1
             );
             assert_eq!(pinned.generation(), &new);
             assert_eq!(
-                pinned.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                pinned.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
                 2
             );
             assert_eq!(file_bytes(old.path()), old_bytes);
@@ -895,7 +925,9 @@ mod retained_recovery_tests {
                 .unwrap();
             assert_eq!(fresh.generation(), &old);
             assert_eq!(
-                fresh.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                fresh.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
                 1
             );
         });
@@ -908,7 +940,11 @@ mod retained_recovery_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, source, root) = fixture(directory.path());
             let old = publish(&runtime, &cx, &root).await;
-            fs::write(source.join("beta.md"), "sharedtoken successor beta document").unwrap();
+            fs::write(
+                source.join("beta.md"),
+                "sharedtoken successor beta document",
+            )
+            .unwrap();
             let damaged = publish(&runtime, &cx, &root).await;
             fs::write(damaged.path().join("unsealed-damage"), b"retained evidence").unwrap();
             let evidence = file_bytes(damaged.path());
@@ -1021,7 +1057,11 @@ mod retained_recovery_tests {
             let directory = tempfile::tempdir().unwrap();
             let (runtime, source, root) = fixture(directory.path());
             let old = publish(&runtime, &cx, &root).await;
-            fs::write(source.join("beta.md"), "sharedtoken successor beta document").unwrap();
+            fs::write(
+                source.join("beta.md"),
+                "sharedtoken successor beta document",
+            )
+            .unwrap();
             let current = publish(&runtime, &cx, &root).await;
             let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
             let plan = runtime
@@ -1029,7 +1069,10 @@ mod retained_recovery_tests {
                 .await
                 .unwrap();
             cx.set_cancel_requested(true);
-            assert!(matches!(plan.restore(&cx), Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                plan.restore(&cx),
+                Err(SearchError::Cancelled { .. })
+            ));
             cx.set_cancel_requested(false);
             assert_eq!(
                 fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
@@ -1078,7 +1121,9 @@ mod retained_recovery_tests {
             let mut reader = plan.into_retained();
             assert_eq!(reader.generation(), &generation);
             assert_eq!(
-                reader.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(),
+                reader.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
                 1
             );
             assert_eq!(fs::read(pointer).unwrap(), b"explicit repair required");
@@ -1096,11 +1141,18 @@ mod retained_recovery_tests {
         let build = store.begin(cx).unwrap();
         let mut input = runtime.cli_input.clone();
         input.index_dir = Some(build.path().to_path_buf());
-        runtime.clone().with_cli_input(input)
-            .run_retained_index_with_reuse(cx, &store, build.path()).await.unwrap();
-        let protector = FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default()).unwrap();
+        runtime
+            .clone()
+            .with_cli_input(input)
+            .run_retained_index_with_reuse(cx, &store, build.path())
+            .await
+            .unwrap();
+        let protector =
+            FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default()).unwrap();
         for relative in [FSFS_VECTOR_INDEX_FILE, FSFS_VECTOR_QUALITY_INDEX_FILE] {
-            protector.protect_file(&build.path().join(relative)).unwrap();
+            protector
+                .protect_file(&build.path().join(relative))
+                .unwrap();
         }
         // The real writers made these files. Admit all engines/producers before
         // introducing damage; the fixture's first seal alone is not that proof.
@@ -1108,9 +1160,17 @@ mod retained_recovery_tests {
         else {
             panic!("protected fixture must be durable"); // ubs:ignore — test assertion.
         };
-        drop(runtime.open_retained_search_from_receipt(
-            cx, root, generation.id(), generation.manifest_sha256(),
-        ).await.unwrap());
+        drop(
+            runtime
+                .open_retained_search_from_receipt(
+                    cx,
+                    root,
+                    generation.id(),
+                    generation.manifest_sha256(),
+                )
+                .await
+                .unwrap(),
+        );
         generation
     }
 
@@ -1136,27 +1196,69 @@ mod retained_recovery_tests {
             let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
             fs::rename(source, directory.path().join("source-unavailable")).unwrap();
             assert!(runtime.open_retained_search(&cx, &root).await.is_err());
-            let mut plan = fresh_runtime(&runtime).prepare_retained_vector_repair(
-                &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
-            ).await.unwrap();
+            let mut plan = fresh_runtime(&runtime)
+                .prepare_retained_vector_repair(
+                    &cx,
+                    &root,
+                    original.id(),
+                    original.manifest_sha256(),
+                    1024 * 1024 * 1024,
+                )
+                .await
+                .unwrap();
             let repaired = plan.generation().clone();
             assert_ne!(repaired.id(), original.id());
             assert!(plan.reader.resources.fast_embedder.is_some());
             assert!(plan.reader.resources.quality_embedder.is_some());
             let preview = plan.search(&cx, "sharedtoken", 10).await.unwrap();
-            assert!(preview.iter().all(|phase| phase.phase != SearchOutputPhase::RefinementFailed));
+            assert!(
+                preview
+                    .iter()
+                    .all(|phase| phase.phase != SearchOutputPhase::RefinementFailed)
+            );
             assert_eq!(preview.last().unwrap().hits[0].path, "alpha.md");
-            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
             assert_eq!(file_bytes(original.path()), damaged);
             for relative in [FSFS_VECTOR_INDEX_FILE, FSFS_VECTOR_QUALITY_INDEX_FILE] {
-                assert_eq!(fs::read(repaired.path().join(relative)).unwrap(), healthy[Path::new(relative)]);
+                assert_eq!(
+                    fs::read(repaired.path().join(relative)).unwrap(),
+                    healthy[Path::new(relative)]
+                );
             }
             let (publication, mut retained) = plan.restore(&cx).unwrap();
-            assert!(matches!(publication, GenerationPublication::Durable(ref value) if value == &repaired));
-            assert_eq!(retained.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 1);
-            let mut reopened = fresh_runtime(&runtime).open_retained_search(&cx, &root).await.unwrap();
+            assert!(
+                matches!(publication, GenerationPublication::Durable(ref value) if value == &repaired)
+            );
+            assert_eq!(
+                retained
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            let mut reopened = fresh_runtime(&runtime)
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
             assert_eq!(reopened.generation(), &repaired);
-            assert_eq!(reopened.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 1);
+            assert_eq!(
+                reopened
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
             assert_eq!(file_bytes(original.path()), damaged);
         });
     }
@@ -1174,19 +1276,41 @@ mod retained_recovery_tests {
             runtime.config.search.fast_only = true;
             for producer in [&models.fast, &models.quality] {
                 producer.changed.store(true, Ordering::Relaxed);
-                let result = fresh_runtime(&runtime).prepare_retained_vector_repair(
-                    &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
-                ).await;
+                let result = fresh_runtime(&runtime)
+                    .prepare_retained_vector_repair(
+                        &cx,
+                        &root,
+                        original.id(),
+                        original.manifest_sha256(),
+                        1024 * 1024 * 1024,
+                    )
+                    .await;
                 producer.changed.store(false, Ordering::Relaxed);
-                assert!(matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })));
-                let plan = fresh_runtime(&runtime).prepare_retained_vector_repair(
-                    &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
-                ).await.unwrap();
+                assert!(matches!(
+                    result,
+                    Err(SearchError::UnverifiableRemoteSpace { .. })
+                ));
+                let plan = fresh_runtime(&runtime)
+                    .prepare_retained_vector_repair(
+                        &cx,
+                        &root,
+                        original.id(),
+                        original.manifest_sha256(),
+                        1024 * 1024 * 1024,
+                    )
+                    .await
+                    .unwrap();
                 producer.changed.store(true, Ordering::Relaxed);
                 let result = plan.restore(&cx);
                 producer.changed.store(false, Ordering::Relaxed);
-                assert!(matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })));
-                assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+                assert!(matches!(
+                    result,
+                    Err(SearchError::UnverifiableRemoteSpace { .. })
+                ));
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    pointer
+                );
                 assert_eq!(file_bytes(original.path()), damaged);
             }
         });
@@ -1203,25 +1327,64 @@ mod retained_recovery_tests {
             let selected = publish(&runtime, &cx, &root).await;
             let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
             damage_recovery_vector(&original, FSFS_VECTOR_INDEX_FILE);
-            let plan = fresh_runtime(&runtime).prepare_retained_vector_repair(
-                &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
-            ).await.unwrap();
+            let plan = fresh_runtime(&runtime)
+                .prepare_retained_vector_repair(
+                    &cx,
+                    &root,
+                    original.id(),
+                    original.manifest_sha256(),
+                    1024 * 1024 * 1024,
+                )
+                .await
+                .unwrap();
             fs::write(source.join("gamma.md"), "sharedtoken concurrent source").unwrap();
             let winner = publish(&runtime, &cx, &root).await;
             let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
-            assert!(plan.restore(&cx).is_err(), "repair cannot overwrite the concurrent publisher");
-            let mut plan = fresh_runtime(&runtime).prepare_retained_vector_repair(
-                &cx, &root, original.id(), original.manifest_sha256(), 1024 * 1024 * 1024,
-            ).await.unwrap();
+            assert!(
+                plan.restore(&cx).is_err(),
+                "repair cannot overwrite the concurrent publisher"
+            );
+            let mut plan = fresh_runtime(&runtime)
+                .prepare_retained_vector_repair(
+                    &cx,
+                    &root,
+                    original.id(),
+                    original.manifest_sha256(),
+                    1024 * 1024 * 1024,
+                )
+                .await
+                .unwrap();
             cx.set_cancel_requested(true);
             let preview = plan.search(&cx, "sharedtoken", 10).await;
             cx.set_cancel_requested(false);
             assert!(matches!(preview, Err(SearchError::Cancelled { .. })));
-            assert!(plan.restore(&cx).is_err(), "clearing cancellation cannot authorize a failed preview");
-            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(winner));
+            assert!(
+                plan.restore(&cx).is_err(),
+                "clearing cancellation cannot authorize a failed preview"
+            );
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(winner)
+            );
             assert_eq!(pinned.generation(), &selected);
-            assert_eq!(pinned.search(&cx, "sharedtoken", 10).await.unwrap().last().unwrap().hits.len(), 2);
+            assert_eq!(
+                pinned
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
         });
     }
 
@@ -1240,7 +1403,11 @@ mod retained_recovery_tests {
             let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
             let mut plan = runtime
                 .prepare_retained_vector_repair(
-                    &cx, &root, original.id(), original.manifest_sha256(), 1 << 30,
+                    &cx,
+                    &root,
+                    original.id(),
+                    original.manifest_sha256(),
+                    1 << 30,
                 )
                 .await
                 .unwrap();
@@ -1255,9 +1422,7 @@ mod retained_recovery_tests {
             let count = fs::read_dir(root.join("generations")).unwrap().count();
             drop(plan);
             let mut resumed = fresh_runtime(&runtime)
-                .resume_retained_recovery(
-                    &cx, &root, target.id(), target.manifest_sha256(), &token,
-                )
+                .resume_retained_recovery(&cx, &root, target.id(), target.manifest_sha256(), &token)
                 .await
                 .unwrap();
             assert_eq!(resumed.expected_selection_sha256(&cx).unwrap(), token);
@@ -1268,19 +1433,36 @@ mod retained_recovery_tests {
             assert_eq!(page.last().unwrap().hits[0].path, "alpha.md");
             assert_eq!(fs::metadata(&vector_path).unwrap().ino(), inode);
             assert_eq!(file_bytes(target.path()), before);
-            assert_eq!(fs::read_dir(root.join("generations")).unwrap().count(), count);
-            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
+            assert_eq!(
+                fs::read_dir(root.join("generations")).unwrap().count(),
+                count
+            );
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
             let (publication, mut reader) = resumed.restore(&cx).unwrap();
             assert!(matches!(publication,
                 GenerationPublication::Durable(ref value) if value == &target));
-            assert_eq!(reader.search(&cx, "sharedtoken", 10).await.unwrap()[0].hits.len(), 1);
+            assert_eq!(
+                reader.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
+                1
+            );
             assert_eq!(file_bytes(original.path()), damaged);
-            assert!(fresh_runtime(&runtime)
-                .resume_retained_recovery(
-                    &cx, &root, target.id(), target.manifest_sha256(), &token,
-                )
-                .await
-                .is_err());
+            assert!(
+                fresh_runtime(&runtime)
+                    .resume_retained_recovery(
+                        &cx,
+                        &root,
+                        target.id(),
+                        target.manifest_sha256(),
+                        &token,
+                    )
+                    .await
+                    .is_err()
+            );
         });
     }
 
@@ -1303,16 +1485,25 @@ mod retained_recovery_tests {
             fs::rename(old.path(), directory.path().join("saved-old")).unwrap();
             models.quality.changed.store(true, Ordering::Relaxed);
             let error = fresh_runtime(&runtime)
-                .resume_retained_recovery(
-                    &cx, &root, old.id(), old.manifest_sha256(), &token,
-                )
+                .resume_retained_recovery(&cx, &root, old.id(), old.manifest_sha256(), &token)
                 .await
                 .unwrap_err();
             models.quality.changed.store(false, Ordering::Relaxed);
-            assert!(matches!(error, SearchError::InvalidConfig { ref reason, .. }
-                if reason.contains("cannot rebase")));
-            assert_eq!(fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(), pointer);
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(winner));
+            assert!(
+                matches!(error, SearchError::InvalidConfig { ref reason, .. }
+                if reason.contains("cannot rebase"))
+            );
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(winner)
+            );
         });
     }
 
@@ -1330,8 +1521,14 @@ mod retained_recovery_tests {
                 .unwrap();
             let token = plan.expected_selection_sha256(&cx).unwrap();
             cx.set_cancel_requested(true);
-            assert!(matches!(plan.expected_selection_sha256(&cx), Err(SearchError::Cancelled { .. })));
-            assert!(matches!(plan.search(&cx, "sharedtoken", 10).await, Err(SearchError::Cancelled { .. })));
+            assert!(matches!(
+                plan.expected_selection_sha256(&cx),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                plan.search(&cx, "sharedtoken", 10).await,
+                Err(SearchError::Cancelled { .. })
+            ));
             cx.set_cancel_requested(false);
             assert!(plan.expected_selection_sha256(&cx).is_err());
             plan.search(&cx, "sharedtoken", 10).await.unwrap();
@@ -1341,16 +1538,21 @@ mod retained_recovery_tests {
                 assert!(plan.expected_selection_sha256(&cx).is_err());
                 let result = fresh_runtime(&runtime)
                     .resume_retained_recovery(
-                        &cx, &root, target.id(), target.manifest_sha256(), &token,
+                        &cx,
+                        &root,
+                        target.id(),
+                        target.manifest_sha256(),
+                        &token,
                     )
                     .await;
                 producer.changed.store(false, Ordering::Relaxed);
-                assert!(matches!(result, Err(SearchError::UnverifiableRemoteSpace { .. })));
+                assert!(matches!(
+                    result,
+                    Err(SearchError::UnverifiableRemoteSpace { .. })
+                ));
             }
             let resumed = fresh_runtime(&runtime)
-                .resume_retained_recovery(
-                    &cx, &root, target.id(), target.manifest_sha256(), &token,
-                )
+                .resume_retained_recovery(&cx, &root, target.id(), target.manifest_sha256(), &token)
                 .await
                 .unwrap();
             fs::write(source.join("beta.md"), "sharedtoken concurrent update").unwrap();
@@ -1360,7 +1562,13 @@ mod retained_recovery_tests {
             assert_eq!(plan.expected_selection_sha256(&cx).unwrap(), token);
             assert_eq!(resumed.expected_selection_sha256(&cx).unwrap(), token);
             assert!(resumed.restore(&cx).is_err());
-            assert_eq!(CompleteGenerationStore::open(&cx, &root).unwrap().active(&cx).unwrap(), Some(winner));
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(winner)
+            );
         });
     }
 }

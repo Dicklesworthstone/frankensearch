@@ -350,9 +350,12 @@ mod tests {
             ] {
                 let mut writer =
                     VectorIndex::create_v2(&staged.path().join(name), identity.clone()).unwrap();
-                for id in ids {
+                for (rank, id) in ids.iter().enumerate() {
                     let mut vector = vec![0.0; identity.dimension()];
-                    vector[0] = 1.0;
+                    #[allow(clippy::cast_precision_loss)]
+                    let angle = (rank as f32) * 0.25;
+                    vector[0] = angle.cos();
+                    vector[1] = angle.sin();
                     writer.write_record(id, &vector).unwrap();
                 }
                 writer.finish().unwrap();
