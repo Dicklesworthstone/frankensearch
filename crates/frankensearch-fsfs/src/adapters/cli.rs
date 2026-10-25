@@ -2200,11 +2200,20 @@ mod tests {
         command
             .split_whitespace()
             .map(|token| {
-                let placeholder = (token.starts_with('<') && token.ends_with('>'))
-                    || (token.starts_with('{') && token.ends_with('}'))
-                    || token.starts_with('$')
-                    || (token.len() > 1
-                        && token.chars().all(|c| c.is_ascii_uppercase() || c == '_'));
+                let unquoted = token
+                    .strip_prefix('\'')
+                    .and_then(|inner| inner.strip_suffix('\''))
+                    .or_else(|| {
+                        token
+                            .strip_prefix('"')
+                            .and_then(|inner| inner.strip_suffix('"'))
+                    })
+                    .unwrap_or(token);
+                let placeholder = (unquoted.starts_with('<') && unquoted.ends_with('>'))
+                    || (unquoted.starts_with('{') && unquoted.ends_with('}'))
+                    || unquoted.starts_with('$')
+                    || (unquoted.len() > 1
+                        && unquoted.chars().all(|c| c.is_ascii_uppercase() || c == '_'));
                 if placeholder { "<X>" } else { token }
             })
             .collect::<Vec<_>>()
