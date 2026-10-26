@@ -8023,7 +8023,8 @@ mod tests {
             let (_index_dir, index) = if identified {
                 query_admission_index("stamped-v1")
             } else {
-                build_test_index_with_quality(4)
+                let (directory, index) = build_test_index_with_quality(4);
+                (OwnerBackedDir(directory), index)
             };
             let pending = Arc::new(SilentPendingProvider {
                 identity: identified.then(|| query_admission_embedder(tier).identity),
