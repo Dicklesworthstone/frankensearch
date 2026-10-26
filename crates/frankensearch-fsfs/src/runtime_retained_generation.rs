@@ -674,7 +674,12 @@ impl FsfsRuntime {
                 };
                 for (ordinal, text) in texts.into_iter().enumerate() {
                     retained_search_checkpoint(cx)?;
-                    let response = fast_embedder.embed_bound(cx, text).await;
+                    let response = with_cancellation(
+                        cx,
+                        "fsfs.append_batch.fast",
+                        fast_embedder.embed_bound(cx, text),
+                    )
+                    .await;
                     retained_search_checkpoint(cx)?;
                     let embedding = response?;
                     embedding.validate()?;
@@ -691,7 +696,12 @@ impl FsfsRuntime {
             }
             if let Some((embedder, identity)) = quality.as_ref() {
                 retained_search_checkpoint(cx)?;
-                let response = embedder.embed_bound(cx, &document.embedding_text).await;
+                let response = with_cancellation(
+                    cx,
+                    "fsfs.append_batch.quality",
+                    embedder.embed_bound(cx, &document.embedding_text),
+                )
+                .await;
                 retained_search_checkpoint(cx)?;
                 let embedding = response?;
                 embedding.validate()?;

@@ -32,7 +32,7 @@ use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
     HitExplanation, IndexableDocument, LexicalTermScore, ModelCategory, RerankDocument, Reranker,
-    ScoreComponent, SearchError, SearchResult, VectorHit,
+    ScoreComponent, SearchError, SearchResult, VectorHit, with_cancellation,
 };
 use frankensearch_durability::{
     DefaultSymbolCodec, DurabilityConfig, FsviProtector, FsviVerifyResult,
@@ -1156,16 +1156,15 @@ impl AdmittedEmbedder {
     /// precedence over identity drift, which takes precedence over a provider
     /// error.
     async fn embed_admitted(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
+        FsfsRuntime::semantic_retry_checkpoint(cx, "admitted_embedding")?;
         self.check_current_identity()?;
-        let response = if let Some(coalescer) = &self.coalescer {
-            coalescer.embed_bound(cx, text).await
+        let inference = if let Some(coalescer) = &self.coalescer {
+            coalescer.embed_bound(cx, text)
         } else {
-            self.embedder.embed_bound(cx, text).await
+            self.embedder.embed_bound(cx, text)
         };
-        cx.checkpoint().map_err(|_| SearchError::Cancelled {
-            phase: "admitted_embedding".to_owned(),
-            reason: "runtime cancellation requested".to_owned(),
-        })?;
+        let response = with_cancellation(cx, "admitted_embedding", inference).await;
+        FsfsRuntime::semantic_retry_checkpoint(cx, "admitted_embedding")?;
         // A provider that changed producer while inferring may still label the
         // response with the identity it was asked for.
         self.check_current_identity()?;
@@ -1179,12 +1178,19 @@ impl AdmittedEmbedder {
 
     /// Embed a batch through the provider's bound batch operation; the
     /// provider must advertise the admitted identity before and after
-    /// inference, and every response must validate and carry it. The caller
-    /// checks cancellation and the response count, which the indexing retry
-    /// loop already does after inference.
+    /// inference, and every response must validate and carry it. Cancellation
+    /// wakes the wait even when the provider does not register its own wake.
+    /// The indexing retry loop checks the response count after inference.
     async fn embed_batch_admitted(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
+        FsfsRuntime::semantic_retry_checkpoint(cx, "admitted_batch_embedding")?;
         self.check_current_identity()?;
-        let responses = self.embedder.embed_batch_bound(cx, texts).await;
+        let responses = with_cancellation(
+            cx,
+            "admitted_batch_embedding",
+            self.embedder.embed_batch_bound(cx, texts),
+        )
+        .await;
+        FsfsRuntime::semantic_retry_checkpoint(cx, "admitted_batch_embedding")?;
         self.check_current_identity()?;
         let responses = responses?;
         let mut values = Vec::with_capacity(responses.len());
@@ -7772,6 +7778,29 @@ impl FsfsRuntime {
         shutdown: Option<&ShutdownCoordinator>,
     ) -> SearchResult<()> {
         self.validate_command_inputs(command)?;
+        // Bind the supplied signal coordinator before foreground query/model
+        // waits. Keep this scope inside the initial watch pass so watcher
+        // finalization still uses its graceful-shutdown lifecycle. Serve and
+        // daemon retain their own stop/drain protocol.
+        let cancellation_scope = shutdown
+            .filter(|_| {
+                matches!(
+                    command,
+                    CliCommand::Index
+                        | CliCommand::Watch
+                        | CliCommand::Search
+                        | CliCommand::Explain
+                        | CliCommand::AppendBatch
+                        | CliCommand::Delete
+                        | CliCommand::Compact
+                        | CliCommand::Flush
+                        | CliCommand::Download
+                )
+            })
+            .map(|shutdown| shutdown.cancellation_scope(cx));
+        if cancellation_scope.is_some() {
+            Self::semantic_retry_checkpoint(cx, "fsfs.cli")?;
+        }
         // A paused stage halts writes (pressure.rs contract); stopping the
         // compaction daemon sheds work and stays allowed.
         let writes = matches!(
@@ -7894,7 +7923,6 @@ impl FsfsRuntime {
         );
 
         if matches!(command, CliCommand::Index | CliCommand::Watch) {
-            let _cancellation_scope = shutdown.map(|shutdown| shutdown.cancellation_scope(cx));
             self.run_one_shot_index_scaffold(cx, command).await?;
         }
 
@@ -14452,7 +14480,9 @@ impl FsfsRuntime {
             };
             for (ordinal, text) in texts.into_iter().enumerate() {
                 retained_search_checkpoint(cx)?;
-                let response = embedder.embed_bound(cx, text).await;
+                let response =
+                    with_cancellation(cx, "fsfs.append_batch.fast", embedder.embed_bound(cx, text))
+                        .await;
                 retained_search_checkpoint(cx)?;
                 let embedding = response?;
                 embedding.validate()?;
@@ -14467,9 +14497,12 @@ impl FsfsRuntime {
                 entries.push((semantic_windows::row_id(id, ordinal), embedding.values));
             }
             if let Some((quality_embedder, identity)) = quality.as_ref() {
-                let response = quality_embedder
-                    .embed_bound(cx, &document.embedding_text)
-                    .await;
+                let response = with_cancellation(
+                    cx,
+                    "fsfs.append_batch.quality",
+                    quality_embedder.embed_bound(cx, &document.embedding_text),
+                )
+                .await;
                 retained_search_checkpoint(cx)?;
                 let embedding = response?;
                 embedding.validate()?;
@@ -20263,12 +20296,20 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         for attempt in 0..=retry_backoffs_ms.len() {
             Self::semantic_retry_checkpoint(cx, "fsfs.semantic_probe")?;
-            let embedding_result = embedder.embed(cx, "probe").await;
+            let embedding_result = with_cancellation(
+                cx,
+                "fsfs.semantic_probe_after_inference",
+                embedder.embed(cx, "probe"),
+            )
+            .await;
+            // Preserve the runtime's cancellation phase and reason when the
+            // caller cancels during inference, including a stalled provider.
+            // A provider's own cancellation remains intact on a healthy Cx.
+            Self::semantic_retry_checkpoint(cx, "fsfs.semantic_probe_after_inference")?;
             let embedding_result = match embedding_result {
                 Err(error @ SearchError::Cancelled { .. }) => return Err(error),
                 other => other,
             };
-            Self::semantic_retry_checkpoint(cx, "fsfs.semantic_probe_after_inference")?;
             let probe_result = embedding_result.and_then(|embedding| {
                 Self::validate_semantic_embedding_vector(embedder, &embedding)
             });
@@ -20870,7 +20911,7 @@ impl FsfsRuntime {
 
         let started = Instant::now();
         let deadline = cx.now() + Duration::from_millis(stage.timeout_ms);
-        let score_result = {
+        let score_result = with_cancellation(cx, "rerank", async {
             let work = async {
                 let documents = self
                     .rerank_documents(cx, index_root, query, &fused[..depth])
@@ -20906,7 +20947,8 @@ impl FsfsRuntime {
                 })
             })
             .await
-        };
+        })
+        .await;
         let mut scores = match score_result {
             Ok(Some(scores)) => scores,
             Ok(None) => {
@@ -22053,26 +22095,12 @@ impl FsfsRuntime {
     {
         let budget_ms = self.config.search.quality_timeout_ms;
         let started = Instant::now();
-        let mut timed = std::pin::pin!(asupersync::time::timeout(
-            cx.now(),
-            Duration::from_millis(budget_ms),
-            work
-        ));
-        std::future::poll_fn(|task_cx| {
-            // Caller cancellation takes precedence over timeout and late success.
-            if let Err(error) = cx.checkpoint() {
-                return Poll::Ready(Err(SearchError::Cancelled {
-                    phase: "quality_refinement".to_owned(),
-                    reason: error.to_string(),
-                }));
-            }
-            timed.as_mut().poll(task_cx).map(|result| {
-                result.unwrap_or_else(|_| {
-                    Err(SearchError::SearchTimeout {
-                        elapsed_ms: u64::try_from(started.elapsed().as_millis())
-                            .unwrap_or(u64::MAX),
-                        budget_ms,
-                    })
+        let timed = asupersync::time::timeout(cx.now(), Duration::from_millis(budget_ms), work);
+        with_cancellation(cx, "quality_refinement", async {
+            timed.await.unwrap_or_else(|_| {
+                Err(SearchError::SearchTimeout {
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    budget_ms,
                 })
             })
         })
@@ -24460,7 +24488,11 @@ impl FsfsRuntime {
         cx: &Cx,
         shutdown: &ShutdownCoordinator,
     ) -> SearchResult<()> {
-        self.run_tui(cx).await?;
+        {
+            let _cancellation_scope = shutdown.cancellation_scope(cx);
+            Self::semantic_retry_checkpoint(cx, "fsfs.tui")?;
+            self.run_tui(cx).await?;
+        }
         if self.cli_input.command == CliCommand::Tui {
             return Ok(());
         }
@@ -30130,7 +30162,7 @@ mod tests {
     }
     use frankensearch_core::{
         Canonicalizer as _, DefaultCanonicalizer, Embedder, IndexableDocument, LexicalRead as _,
-        ModelCategory, SearchError, SearchFuture,
+        ModelCategory, SearchError, SearchFuture, SearchResult,
     };
     // QuillIndex writes go through its inherent methods; the only trait-dispatched
     // writer here is the Tantivy oracle, which lives behind `shadow-oracle`.
@@ -33895,6 +33927,304 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct RuntimeInferenceWake(AtomicUsize);
+
+    impl std::task::Wake for RuntimeInferenceWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingSemanticEmbedder {
+        id: &'static str,
+        dimension: usize,
+        calls: AtomicUsize,
+        dropped: AtomicUsize,
+    }
+
+    impl PendingSemanticEmbedder {
+        fn new(id: &'static str, dimension: usize) -> Self {
+            Self {
+                id,
+                dimension,
+                calls: AtomicUsize::new(0),
+                dropped: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Embedder for PendingSemanticEmbedder {
+        fn embed<'a>(&'a self, _: &'a Cx, _: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                struct Guard<'a>(&'a AtomicUsize);
+                impl Drop for Guard<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                let _guard = Guard(&self.dropped);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                // Deliberately does not observe Cx, a timer or its task's waker.
+                std::future::pending().await
+            })
+        }
+
+        fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+            Ok(test_identity(self.id, self.dimension))
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &'static str {
+            self.id
+        }
+
+        fn model_name(&self) -> &'static str {
+            "Pending semantic provider"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[test]
+    fn foreground_cli_dispatch_binds_an_already_requested_shutdown_before_work() {
+        for command in [
+            CliCommand::Index,
+            CliCommand::Watch,
+            CliCommand::Search,
+            CliCommand::Explain,
+            CliCommand::AppendBatch,
+            CliCommand::Delete,
+            CliCommand::Compact,
+            CliCommand::Flush,
+            CliCommand::Download,
+        ] {
+            run_test_with_cx(|cx| async move {
+                let temp = tempfile::tempdir().unwrap();
+                let mut config = FsfsConfig::default();
+                config.indexing.offline = true;
+                config.indexing.model_dir = temp.path().join("models").display().to_string();
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command,
+                    query: Some("query".to_owned()),
+                    result_id: Some("R1".to_owned()),
+                    target_path: Some(temp.path().join("missing-source")),
+                    index_dir: Some(temp.path().join("missing-index")),
+                    ..CliInput::default()
+                });
+                let shutdown = ShutdownCoordinator::new();
+                shutdown.request_shutdown(ShutdownReason::UserRequest);
+                assert!(!cx.is_cancel_requested());
+                let result = runtime
+                    .run_mode_with_shutdown(&cx, InterfaceMode::Cli, &shutdown)
+                    .await;
+                assert!(
+                    matches!(result, Err(SearchError::Cancelled { .. })),
+                    "{command:?}: {result:?}"
+                );
+                assert!(temp.path().read_dir().unwrap().next().is_none());
+                cx.set_cancel_requested(false);
+            });
+        }
+    }
+
+    #[test]
+    fn pending_semantic_inference_wakes_on_shutdown_without_provider_progress() {
+        use std::task::{Context, Waker};
+
+        for lane in ["query", "batch", "probe"] {
+            run_test_with_cx(|cx| async move {
+                let backend = Arc::new(PendingSemanticEmbedder::new("pending-semantic-4", 4));
+                let admitted = admitted_shared(&backend);
+                let shutdown = ShutdownCoordinator::new();
+                let _scope = shutdown.cancellation_scope(&cx);
+                let retries = AtomicUsize::new(0);
+                let texts = ["first document", "second document"];
+                let mut operation: std::pin::Pin<Box<dyn Future<Output = SearchResult<()>>>> =
+                    match lane {
+                        "query" => Box::pin(async {
+                            admitted.embed_admitted(&cx, "query").await.map(|_| ())
+                        }),
+                        "batch" => Box::pin(async {
+                            FsfsRuntime::embed_indexing_batch_with_backoffs(
+                                &cx,
+                                &admitted,
+                                &texts,
+                                &[0, 0],
+                                |_, _, _, _, _| {
+                                    retries.fetch_add(1, Ordering::SeqCst);
+                                    Ok(())
+                                },
+                            )
+                            .await
+                            .map(|_| ())
+                        }),
+                        _ => Box::pin(FsfsRuntime::probe_indexing_embedder_with_backoffs(
+                            &cx,
+                            backend.as_ref(),
+                            &[0, 0],
+                        )),
+                    };
+                let wake = Arc::new(RuntimeInferenceWake::default());
+                let waker = Waker::from(Arc::clone(&wake));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 1, "{lane}");
+                let before = wake.0.load(Ordering::SeqCst);
+                shutdown.request_shutdown(ShutdownReason::UserRequest);
+                assert!(
+                    wake.0.load(Ordering::SeqCst) > before,
+                    "{lane} must be woken by cancellation without provider progress or a timer"
+                );
+                assert!(matches!(
+                    operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(SearchError::Cancelled { .. }))
+                ));
+                // Keep the completed outer future alive: cancellation must
+                // already have dropped inference and must never retry it.
+                assert_eq!(backend.dropped.load(Ordering::SeqCst), 1, "{lane}");
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 1, "{lane}");
+                assert_eq!(retries.load(Ordering::SeqCst), 0, "{lane}");
+                drop(operation);
+                cx.set_cancel_requested(false);
+            });
+        }
+    }
+
+    #[test]
+    fn pending_progressive_search_cancellation_preserves_only_completed_phases() {
+        use std::task::{Context, Waker};
+
+        for quality in [false, true] {
+            run_on_runtime_task(|cx| async move {
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                let backend = Arc::new(PendingSemanticEmbedder::new(
+                    if quality {
+                        "blend-quality-2"
+                    } else {
+                        "blend-fast-2"
+                    },
+                    2,
+                ));
+                if quality {
+                    resources.quality_embedder = Some(admitted_shared(&backend));
+                } else {
+                    resources.fast_embedder = Some(admitted_shared(&backend));
+                }
+                let mut config = FsfsConfig::default();
+                config.search.quality_timeout_ms = 60_000;
+                let runtime = FsfsRuntime::new(config);
+                let phases = std::cell::RefCell::new(Vec::new());
+                let mut sink = |payload: &SearchPayload| {
+                    phases.borrow_mut().push(payload.phase);
+                    Ok(())
+                };
+                let shutdown = ShutdownCoordinator::new();
+                let _scope = shutdown.cancellation_scope(&cx);
+                let wake = Arc::new(RuntimeInferenceWake::default());
+                let waker = Waker::from(Arc::clone(&wake));
+                let mut operation = Box::pin(
+                    runtime.execute_search_phase_artifacts_with_mode_using_resources(
+                        &cx,
+                        "recover failed network requests",
+                        10,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                        SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                        Some(&mut sink),
+                    ),
+                );
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+                let completed = if quality {
+                    vec![SearchOutputPhase::Initial]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(*phases.borrow(), completed);
+                let before = wake.0.load(Ordering::SeqCst);
+                thread::scope(|scope| {
+                    scope.spawn(|| shutdown.request_shutdown(ShutdownReason::UserRequest));
+                });
+                assert!(wake.0.load(Ordering::SeqCst) > before);
+                assert!(matches!(
+                    operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                    Poll::Ready(Err(SearchError::Cancelled { .. }))
+                ));
+                assert_eq!(
+                    *phases.borrow(),
+                    completed,
+                    "cancelled work must publish no late phase"
+                );
+                assert_eq!(backend.dropped.load(Ordering::SeqCst), 1);
+                drop(operation);
+                cx.set_cancel_requested(false);
+            });
+        }
+    }
+
+    #[test]
+    fn quality_deadline_wakes_on_cancellation_before_its_timeout() {
+        use std::task::{Context, Waker};
+
+        run_on_runtime_task(|cx| async move {
+            let backend = PendingSemanticEmbedder::new("pending-quality-4", 4);
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 60_000;
+            let runtime = FsfsRuntime::new(config);
+            let wake = Arc::new(RuntimeInferenceWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut operation =
+                Box::pin(runtime.with_quality_deadline(&cx, backend.embed(&cx, "quality query")));
+            assert!(
+                operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            let before = wake.0.load(Ordering::SeqCst);
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("cancel quality inference"),
+            );
+            assert!(wake.0.load(Ordering::SeqCst) > before);
+            assert!(matches!(
+                operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            assert_eq!(backend.dropped.load(Ordering::SeqCst), 1);
+            drop(operation);
+            cx.set_cancel_requested(false);
+        });
+    }
+
     #[test]
     fn quality_deadline_caller_cancellation_wins_without_late_publication() {
         run_on_runtime_task(|cx| async move {
@@ -34800,12 +35130,14 @@ mod tests {
                 .await
                 .expect_err("inference-time cancellation must override non-cancel batch output");
                 cx.set_cancel_requested(false);
-                // The bound batch boundary observes the cancellation first.
+                // The admission boundary owns caller cancellation even when
+                // the provider's bound operation also observes the request.
                 assert!(
                     matches!(
                         error,
-                        SearchError::Cancelled { ref phase, .. }
-                            if phase == "embedder.embed_batch_bound"
+                        SearchError::Cancelled { ref phase, ref reason }
+                            if phase == "admitted_batch_embedding"
+                                && reason == "runtime cancellation requested"
                     ),
                     "{error:?}"
                 );

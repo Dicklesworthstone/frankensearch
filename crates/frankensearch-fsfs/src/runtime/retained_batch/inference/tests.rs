@@ -1,5 +1,7 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
 
 use asupersync::test_utils::run_test_with_cx;
 use frankensearch_core::{Embedder, EmbeddingIdentityBundleV1, ModelCategory, SearchFuture};
@@ -608,12 +610,14 @@ fn abandoned_inference_registration_does_not_remove_a_siblings_cancellation_wake
         let sibling = Arc::new(InferenceWake::default());
         let abandoned_waker = Waker::from(Arc::clone(&abandoned));
         let sibling_waker = Waker::from(Arc::clone(&sibling));
-        let mut first = Box::pin(cancellable_inference(
+        let mut first = Box::pin(with_cancellation(
             &cx,
+            "fsfs.retained_batch.inference",
             std::future::pending::<SearchResult<()>>(),
         ));
-        let mut second = Box::pin(cancellable_inference(
+        let mut second = Box::pin(with_cancellation(
             &cx,
+            "fsfs.retained_batch.inference",
             std::future::pending::<SearchResult<()>>(),
         ));
         assert!(
@@ -663,7 +667,11 @@ fn completed_inference_releases_registration_and_preserves_provider_errors() {
             };
             let wake = Arc::new(InferenceWake::default());
             let waker = Waker::from(Arc::clone(&wake));
-            let mut operation = Box::pin(cancellable_inference(&cx, std::future::ready(result)));
+            let mut operation = Box::pin(with_cancellation(
+                &cx,
+                "fsfs.retained_batch.inference",
+                std::future::ready(result),
+            ));
             match operation.as_mut().poll(&mut Context::from_waker(&waker)) {
                 Poll::Ready(Ok(value)) => {
                     assert!(!fails);
@@ -732,7 +740,12 @@ fn cancellation_from_inference_destruction_wins_before_any_result_is_returned() 
 
     run_test_with_cx(|cx| async move {
         assert!(matches!(
-            cancellable_inference(&cx, CancelOnDrop(cx.clone())).await,
+            with_cancellation(
+                &cx,
+                "fsfs.retained_batch.inference",
+                CancelOnDrop(cx.clone())
+            )
+            .await,
             Err(SearchError::Cancelled { .. })
         ));
     });

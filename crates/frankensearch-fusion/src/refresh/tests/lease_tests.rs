@@ -3,8 +3,8 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
-use std::task::{Context, Poll, Waker};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::task::{Context, Poll, Wake, Waker};
 
 use super::*;
 
@@ -256,6 +256,132 @@ fn dropped_fast_embedding_preserves_capacity_order_and_newer_updates() {
 #[test]
 fn dropped_quality_embedding_preserves_capacity_order_and_newer_updates() {
     assert_pending_drop_restores_work(true);
+}
+
+#[derive(Default)]
+struct RefreshWake(AtomicUsize);
+
+impl Wake for RefreshWake {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn cancellation_wakes_pending_refresh_and_restores_its_lease_before_return() {
+    for quality_pending in [false, true] {
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let dir = temp_index_dir("leased-cancel-wake");
+            let queue = make_queue(4);
+            submit(&queue, "a", "first payload");
+            submit(&queue, "b", "second payload");
+            let cache = if quality_pending {
+                make_cache_with_quality(&dir, DIMENSION, DIMENSION)
+            } else {
+                make_cache(&dir, DIMENSION)
+            };
+            let before = cache.current();
+            let fast: Arc<dyn Embedder> = if quality_pending {
+                Arc::new(StubEmbedder::new("stub-fast", DIMENSION))
+            } else {
+                Arc::new(ControlledEmbedder::new("stub-fast", BatchBehavior::Pending))
+            };
+            let mut worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                fast,
+                cache.clone(),
+            );
+            if quality_pending {
+                worker = worker.with_quality_embedder(Arc::new(ControlledEmbedder::new(
+                    "stub-quality",
+                    BatchBehavior::Pending,
+                )));
+            }
+            let wake = Arc::new(RefreshWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut task = Context::from_waker(&waker);
+            let mut cycle = Box::pin(worker.run_cycle(&cx));
+            assert!(cycle.as_mut().poll(&mut task).is_pending());
+            assert_eq!(queue.in_flight_count(), 2);
+            let wakes_before = wake.0.load(Ordering::SeqCst);
+
+            cx.cancel_with(asupersync::CancelKind::User, Some("stop pending refresh"));
+            // This provider never wakes itself. An explicit cancellation must
+            // schedule the task before any test-driven poll or timeout.
+            assert!(wake.0.load(Ordering::SeqCst) > wakes_before);
+            assert!(matches!(
+                cycle.as_mut().poll(&mut task),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            // Retain the completed future: lease recovery cannot depend on the
+            // caller dropping it after receiving the cancellation result.
+            assert_eq!(queue.in_flight_count(), 0);
+            assert_eq!(queue.pending_count(), 2);
+            assert!(Arc::ptr_eq(&before, &cache.current()));
+            assert_eq!(worker.metrics().index_rebuilds.load(Ordering::Relaxed), 0);
+            assert_eq!(worker.metrics().docs_failed.load(Ordering::Relaxed), 0);
+            let jobs = queue.drain_batch();
+            assert_eq!(
+                jobs.iter()
+                    .map(|job| job.doc_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["a", "b"]
+            );
+            assert!(jobs.iter().all(|job| job.retry_count == 0));
+        });
+    }
+}
+
+#[test]
+fn cancellation_wakes_pending_staged_inference_without_writing_or_acknowledging() {
+    for quality_pending in [false, true] {
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let dir = temp_index_dir("staged-cancel-wake");
+            let queue = make_queue(4);
+            submit(&queue, "a", "first payload");
+            let jobs = queue.drain_batch();
+            let cache = make_cache(&dir, DIMENSION);
+            let fast: Arc<dyn Embedder> = if quality_pending {
+                Arc::new(StubEmbedder::new("stub-fast", DIMENSION))
+            } else {
+                Arc::new(ControlledEmbedder::new("stub-fast", BatchBehavior::Pending))
+            };
+            let mut worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                fast,
+                cache.clone(),
+            );
+            if quality_pending {
+                worker = worker.with_quality_embedder(Arc::new(ControlledEmbedder::new(
+                    "stub-quality",
+                    BatchBehavior::Pending,
+                )));
+            }
+            let wake = Arc::new(RefreshWake::default());
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut task = Context::from_waker(&waker);
+            let mut stage = Box::pin(worker.stage_identity_bound_generation(&cx, &jobs));
+            assert!(stage.as_mut().poll(&mut task).is_pending());
+            let wakes_before = wake.0.load(Ordering::SeqCst);
+            cx.cancel_with(asupersync::CancelKind::User, Some("stop pending stage"));
+            assert!(wake.0.load(Ordering::SeqCst) > wakes_before);
+            assert!(matches!(
+                stage.as_mut().poll(&mut task),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            assert_eq!(cache.current().doc_count(), 0);
+            assert_eq!(queue.metrics().total_succeeded.load(Ordering::Relaxed), 0);
+            assert_eq!(worker.metrics().docs_failed.load(Ordering::Relaxed), 0);
+            assert!(!dir.join(STAGED_V2_DIR_NAME).exists());
+            assert_eq!(jobs[0].retry_count, 0);
+        });
+    }
 }
 
 #[test]

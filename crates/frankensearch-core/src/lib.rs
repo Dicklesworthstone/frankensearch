@@ -12,6 +12,7 @@ pub mod activation;
 #[cfg(feature = "bench-internals")]
 pub mod bench_support;
 pub mod cache;
+pub mod cancellation;
 pub mod canonicalize;
 pub mod collectors;
 pub mod commit_replay;
@@ -48,6 +49,7 @@ pub use activation::{
     check_invariants,
 };
 pub use cache::{CachePolicy, NoCache, S3FifoCache, S3FifoConfig};
+pub use cancellation::with_cancellation;
 pub use canonicalize::{Canonicalizer, DefaultCanonicalizer};
 pub use collectors::{
     CollectorConfig, CollectorSnapshot, DEFAULT_COLLECTION_INTERVAL_MS,

@@ -79,7 +79,9 @@ use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
 };
 use frankensearch_core::traits::{Embedder, IdentityBoundEmbedding};
-use frankensearch_core::{BoundQueryEmbedding, SpaceIdentityAdmission, TieredQueryEmbeddings};
+use frankensearch_core::{
+    BoundQueryEmbedding, SpaceIdentityAdmission, TieredQueryEmbeddings, with_cancellation,
+};
 use frankensearch_index::two_tier::{ActivatedTierSearch, FsviTierObservation, observe_tier};
 use frankensearch_index::{
     FsviAdmissionError, FsviV2IdentityBinding, FsviV2IdentityMetadata, TwoTierIndex,
@@ -825,8 +827,9 @@ impl std::fmt::Debug for StagedIdentityBoundGeneration {
 ///
 /// # Cancellation
 ///
-/// The worker checks cancellation before leasing, after embedding awaits and
-/// before publication. Provider cancellation is not a retryable embedding
+/// The worker checks cancellation before leasing, independently wakes pending
+/// embedding awaits on cancellation, and checks again before publication.
+/// Provider cancellation is not a retryable embedding
 /// failure or permission to publish a fast-only replacement. Dropping a
 /// suspended cycle restores its unacknowledged leased jobs. The synchronous
 /// rebuild/cache publication section finishes before jobs are acknowledged.
@@ -1168,7 +1171,10 @@ impl RefreshWorker {
         // embedder fails here typed (`embedder.identity`), which also means
         // it can no longer publish provenance-free vectors through this
         // worker — that is the C4-write bound-carrier contract.
-        let fast_result = self.fast_embedder.embed_batch_bound(cx, &texts).await;
+        let fast_result = with_cancellation(cx, "refresh.fast_embedding", async {
+            self.fast_embedder.embed_batch_bound(cx, &texts).await
+        })
+        .await;
         Self::check_refresh_cancellation(cx, "refresh.fast_embedding")?;
         let fast_bound = match fast_result {
             Ok(embeddings) => embeddings,
@@ -1207,7 +1213,10 @@ impl RefreshWorker {
         // Quality-tier identity-bound embedding (optional).
         let mut quality_bound: Option<Vec<Option<IdentityBoundEmbedding>>> =
             if let Some(ref quality) = self.quality_embedder {
-                let result = quality.embed_batch_bound(cx, &texts).await;
+                let result = with_cancellation(cx, "refresh.quality_embedding", async {
+                    quality.embed_batch_bound(cx, &texts).await
+                })
+                .await;
                 Self::check_refresh_cancellation(cx, "refresh.quality_embedding")?;
                 match result {
                     Ok(embeddings) => {
@@ -1632,7 +1641,10 @@ impl RefreshWorker {
     ) -> SearchResult<Vec<RefreshRecord>> {
         let embed_start = Instant::now();
         let texts: Vec<&str> = jobs.iter().map(|j| j.canonical_text.as_str()).collect();
-        let fast_result = self.fast_embedder.embed_batch_bound(cx, &texts).await;
+        let fast_result = with_cancellation(cx, "refresh.staged_fast_embedding", async {
+            self.fast_embedder.embed_batch_bound(cx, &texts).await
+        })
+        .await;
         Self::check_refresh_cancellation(cx, "refresh.staged_fast_embedding")?;
         let fast_bound = fast_result?;
         if fast_bound.len() != jobs.len() {
@@ -1648,7 +1660,11 @@ impl RefreshWorker {
         }
         let quality_bound = match &self.quality_embedder {
             Some(quality) => {
-                let quality_result = quality.embed_batch_bound(cx, &texts).await;
+                let quality_result =
+                    with_cancellation(cx, "refresh.staged_quality_embedding", async {
+                        quality.embed_batch_bound(cx, &texts).await
+                    })
+                    .await;
                 Self::check_refresh_cancellation(cx, "refresh.staged_quality_embedding")?;
                 let bound = quality_result?;
                 if bound.len() != jobs.len() {
