@@ -7021,13 +7021,17 @@ pub mod generation_reader {
                 SnapshotRefusalV1::PendingReconciliation
             );
 
-            // Reconciliation says NotCommitted; the attempt frame stays until
-            // the next completed publication, so readers keep failing closed.
+            // Reconciling with a mismatched permit refuses to clear the attempt
+            // frame, so readers keep failing closed.
+            let mismatched_permit = crate::generation_root::authority_publisher::AttemptPermitV1 {
+                attempt_id: [0x99; 16],
+                ..permit
+            };
             assert_eq!(
                 publisher
-                    .reconcile(&permit, Some(&floor))
-                    .expect("reconcile runs"),
-                ReconcileOutcomeV1::NotCommitted
+                    .reconcile(&mismatched_permit, Some(&floor))
+                    .expect("mismatched reconcile runs"),
+                ReconcileOutcomeV1::RepairRequired(GenerationAuthorityErrorV1::UnresolvedAttempt)
             );
             assert_eq!(
                 refused(open(
@@ -7036,6 +7040,26 @@ pub mod generation_reader {
                     Some(&floor)
                 )),
                 SnapshotRefusalV1::PendingReconciliation
+            );
+
+            // Reconciling with the authentic permit proves NotCommitted and
+            // clears the aborted attempt frame in place while preserving the
+            // previous owner frame, restoring readers to the intact genesis head.
+            assert_eq!(
+                publisher
+                    .reconcile(&permit, Some(&floor))
+                    .expect("reconcile runs"),
+                ReconcileOutcomeV1::NotCommitted
+            );
+            let restored = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                Some(&floor),
+            ));
+            assert_eq!(restored.head(), genesis_slot);
+            assert_eq!(
+                restored.health(),
+                SnapshotHealthV1::ExternallyAnchored { cas_version: 1 }
             );
 
             // The retried publication commits and unblocks fresh readers.
@@ -8662,22 +8686,20 @@ pub mod generation_reader {
                     );
                 } else {
                     assert_eq!(verdict, ReconcileOutcomeV1::NotCommitted, "{crash_at:?}");
-                    let after_reconcile = open(
+                    // Proven NotCommitted reconciliation clears any aborted
+                    // attempt frame in place while preserving the previous
+                    // owner frame, so fresh readers serve the intact genesis head.
+                    let after_reconcile = opened(open(
                         &root,
                         GenerationRootSecurityProfileV1::RequiredExternal,
                         Some(&floor),
+                    ));
+                    assert_eq!(after_reconcile.head(), genesis_slot, "{crash_at:?}");
+                    assert_eq!(
+                        after_reconcile.health(),
+                        SnapshotHealthV1::ExternallyAnchored { cas_version: 1 },
+                        "{crash_at:?}"
                     );
-                    if crash_at == B::BeforePublishAttemptFrame {
-                        // Nothing ever reached the LOCK: the old head serves.
-                        assert_eq!(opened(after_reconcile).head(), genesis_slot);
-                    } else {
-                        // The attempt frame still has no completing owner frame.
-                        assert_eq!(
-                            refused(after_reconcile),
-                            SnapshotRefusalV1::PendingReconciliation,
-                            "{crash_at:?}"
-                        );
-                    }
                     let retry = publisher
                         .publish(successor, expected, Some(&floor), [0x72; 16])
                         .expect("retry runs");
