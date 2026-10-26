@@ -408,7 +408,8 @@ pub use frankensearch_lexical::cass_compat;
 
 #[cfg(feature = "quill")]
 pub use frankensearch_quill::{
-    QueryExplanation, QuillConfig, QuillIndex, QuillSearchIndex, QuillSearchResult, SegmentStats,
+    ParallelIngestTerminal, QueryExplanation, QuillConfig, QuillIndex, QuillObservedUpsert,
+    QuillScaleoutRoute, QuillScaleoutWitness, QuillSearchIndex, QuillSearchResult, SegmentStats,
     SegmentStatsProvider, SnippetConfig,
 };
 
@@ -590,6 +591,27 @@ mod tests {
         // Advanced users can access sub-crate modules directly.
         let _ = core::error::SearchError::DurabilityDisabled;
         let _ = fusion::rrf::RrfConfig::default();
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn quill_scaleout_witness_types_accessible() {
+        let index = QuillIndex::in_memory(QuillConfig::default()).expect("in-memory quill index");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut observed = index
+                .upsert_documents_observed(
+                    &cx,
+                    &[IndexableDocument::new("doc-1", "facade witness probe")],
+                )
+                .await;
+            assert!(observed.is_success(), "result: {:?}", observed.result);
+            let witness = observed.take_witness().expect("serial witness");
+            assert_eq!(witness.route, Some(QuillScaleoutRoute::Serial));
+            assert_eq!(
+                witness.accumulation_terminal,
+                ParallelIngestTerminal::SerialCompleted
+            );
+        });
     }
 
     #[cfg(any(feature = "native", feature = "rerank"))]
