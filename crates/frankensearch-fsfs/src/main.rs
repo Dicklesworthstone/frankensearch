@@ -318,11 +318,20 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     shutdown.register_signals()?;
     let run_with_shutdown = matches!(interface_mode, InterfaceMode::Tui)
         || app_runtime.config().indexing.watch_mode
-        || command == CliCommand::Index
-        || command == CliCommand::Search
-        || command == CliCommand::Watch
-        || command == CliCommand::Daemon
-        || command == CliCommand::Serve;
+        || matches!(
+            command,
+            CliCommand::Index
+                | CliCommand::Search
+                | CliCommand::Explain
+                | CliCommand::Watch
+                | CliCommand::AppendBatch
+                | CliCommand::Delete
+                | CliCommand::Compact
+                | CliCommand::Flush
+                | CliCommand::Download
+                | CliCommand::Daemon
+                | CliCommand::Serve
+        );
     // ── Startup version check (non-blocking) ──────────────────────────
     // Print a one-line update notice from cache. If the cache is expired
     // or missing, spawn a background thread to refresh it for next time.
