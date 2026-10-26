@@ -175,11 +175,31 @@ impl FsfsRuntime {
             };
         };
         let dashboard = mode == InterfaceMode::Tui || self.cli_input.command == CliCommand::Tui;
-        self.validate_command_inputs(if dashboard {
+        let effective_command = if dashboard {
             CliCommand::Tui
         } else {
             self.cli_input.command
-        })?;
+        };
+        self.validate_command_inputs(effective_command)?;
+        let writes = !dashboard
+            && (matches!(
+                effective_command,
+                CliCommand::Index
+                    | CliCommand::Watch
+                    | CliCommand::AppendBatch
+                    | CliCommand::Delete
+                    | CliCommand::Compact
+                    | CliCommand::Flush
+            ) || (effective_command == CliCommand::Daemon && !self.cli_input.daemon_stop));
+        if writes
+            && self.config.pressure.degradation_override
+                == crate::config::DegradationOverrideMode::ForcePaused
+        {
+            return Err(super::degradation_refusal(
+                self.config.pressure.degradation_override,
+                "writing to the index",
+            ));
+        }
         let _cancellation_scope = shutdown.map(|shutdown| shutdown.cancellation_scope(cx));
         retained_search_checkpoint(cx)?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
@@ -3960,6 +3980,44 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, SearchError::Cancelled { .. }));
             cx.set_cancel_requested(false);
+            assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
+
+            let mut pressure_cfg = runtime.config.clone();
+            pressure_cfg.pressure.memory_ceiling_mb = 128;
+            let pressure_error = runtime
+                .rebuild_retained_generation_with_precommit(&cx, &root, |_| {
+                    super::super::IndexRunControl::new(&pressure_cfg)
+                        .admit_memory(100.0, "index.semantic_batch")
+                })
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &pressure_error,
+                SearchError::SubsystemError {
+                    subsystem: "fsfs.index.memory_pressure",
+                    ..
+                }
+            ));
+            assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
+            assert_eq!(sealed_inventory(predecessor.path()), before_inventory);
+
+            for command in [CliCommand::Index, CliCommand::Delete, CliCommand::Compact, CliCommand::Flush] {
+                let mut paused = runtime.clone();
+                paused.config.pressure.degradation_override =
+                    crate::config::DegradationOverrideMode::ForcePaused;
+                paused.cli_input.command = command;
+                if command == CliCommand::Delete {
+                    paused.cli_input.delete_ids = vec!["alpha.md".to_owned()];
+                }
+                let paused_err = paused
+                    .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(&paused_err, SearchError::InvalidConfig { field, .. } if field == "pressure.degradation_override"),
+                    "{command:?}: {paused_err:?}"
+                );
+            }
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
 
             let mut fresh_before_retry = runtime.open_retained_search(&cx, &root).await.unwrap();
