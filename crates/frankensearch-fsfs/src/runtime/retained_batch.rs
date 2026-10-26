@@ -856,12 +856,17 @@ impl FsfsRuntime {
         if !lexical_reclaimed {
             reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
         }
+        let candidate_mode = if lexical_only {
+            SearchExecutionMode::LexicalOnly
+        } else {
+            SearchExecutionMode::Full
+        };
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
                 build.path(),
-                SearchExecutionMode::Full,
-                SearchExecutionMode::Full,
+                candidate_mode,
+                candidate_mode,
             ),
         )
         .await?;
@@ -880,7 +885,7 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         let publication = build.publish_with_precommit(
             cx,
-            |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
+            |_, path| Self::validate_search_generation_at_root(path, candidate_mode),
             precommit,
         )?;
         Ok(RetainedBatchResult {

@@ -19,10 +19,12 @@ mod loader_only {
     #[cfg(feature = "semantic-loaders")]
     use frankensearch_embed::model_manifest::is_verification_cached;
     use frankensearch_embed::model_manifest::{ModelManifest, ModelTier};
+    #[cfg(feature = "semantic-loaders")]
     use frankensearch_index::VectorIndex;
     use serde_json::Value;
 
     const FAILURE_TIMEOUT: Duration = Duration::from_secs(30);
+    #[cfg(feature = "semantic-loaders")]
     const QUICKSTART_TIMEOUT: Duration = Duration::from_secs(240);
     #[cfg(feature = "semantic-loaders")]
     const QUICKSTART_DOCUMENT_COUNT: usize = 10;
@@ -950,6 +952,7 @@ mod loader_only {
         );
     }
 
+    #[cfg(feature = "semantic-loaders")]
     fn configured_model_root() -> PathBuf {
         for key in [
             "FSFS_DEFAULT_E2E_MODEL_DIR",

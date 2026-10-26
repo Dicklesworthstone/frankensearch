@@ -1,10 +1,11 @@
 # Watch while complete-generation searches remain available
 
 This route is for the Unix complete-generation store, which a watch into a
-directory with no index creates on Linux (on macOS, set
-`FSFS_COMPLETE_GENERATIONS=1`). It does not change the legacy mutable watcher:
-an existing legacy index keeps watching on that layout unless a build converts
-it with `FSFS_COMPLETE_GENERATIONS=1`. Use a store outside the source tree or
+directory with no index—or into a completed legacy index root
+(`index_sentinel.json` with `generation_complete = true`)—creates on Linux (on
+macOS, or to force-convert an incomplete legacy root, set
+`FSFS_COMPLETE_GENERATIONS=1`; `FSFS_COMPLETE_GENERATIONS=0` keeps the legacy
+mutable watcher). Use a store outside the source tree or
 beneath one of its hidden directories, like the default in-project
 `.frankensearch`; the watcher ignores the store's own writes. Its parent must
 already exist. Configure verified
@@ -180,10 +181,12 @@ This is not hostile-directory, anti-rollback, or privileged-adversary protection
 
 Complete-store readers support buffered CLI forwarding and progressive socket
 requests as described in [complete-generation serving](complete-generation-rebuilds.md).
-An existing legacy index can be converted into a complete-generation store by
-running a build or watch with `FSFS_COMPLETE_GENERATIONS=1`, which seeds from
-`FSFS-LEGACY-REUSE.json` when the completion receipt matches the running binary
-and configuration. Restart reuse beyond the
+On Linux, a completed legacy index (`index_sentinel.json` with
+`generation_complete = true`) is automatically promoted into a
+complete-generation store on the next `fsfs index`, `fsfs watch`, or
+`fsfs index --watch` (on macOS, or for an incomplete legacy root, set
+`FSFS_COMPLETE_GENERATIONS=1`), seeding from `FSFS-LEGACY-REUSE.json` when the
+completion receipt matches the running binary and configuration. Restart reuse beyond the
 Linux proof described above remains process-local. Ctrl-C cancellation is wired
 through the existing shutdown coordinator; no hard real-time latency is claimed
 for synchronous native operations or indexing work. The first SIGINT or SIGTERM

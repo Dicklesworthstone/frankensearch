@@ -40,16 +40,20 @@ fsfs search "ownership model in background workers" --limit 10
 
 ### Legacy index roots and non-Linux hosts (`bd-z2nfa`)
 
-An index that uses the **legacy mutable layout**—an older index created before
-complete generations were the default, an index on macOS created without
-`FSFS_COMPLETE_GENERATIONS=1`, an index built with `FSFS_COMPLETE_GENERATIONS=0`,
-or an index placed inside a non-hidden directory of the source tree—still holds
-an exclusive vector writer lock (`fsvi.map_lock`) for the lifetime of the
-watcher (`bd-z2nfa`).
+On Linux, running `fsfs index`, `fsfs watch`, or `fsfs index --watch` against a
+completed legacy index root (`index_sentinel.json` with
+`generation_complete = true`) automatically promotes it into a
+complete-generation store while searches continue serving from the legacy
+predecessor until `FSFS-CURRENT` publishes the first generation.
 
-To convert an existing legacy index root into a complete-generation store (or to
-create one on macOS), run one build or watch pass with
-`FSFS_COMPLETE_GENERATIONS=1`:
+An index that remains on the **legacy mutable layout**—an incomplete/interrupted
+legacy root, an index on macOS created without `FSFS_COMPLETE_GENERATIONS=1`, an
+index built with `FSFS_COMPLETE_GENERATIONS=0`, or an index placed inside a
+non-hidden directory of the source tree—still holds an exclusive vector writer
+lock (`fsvi.map_lock`) for the lifetime of the watcher (`bd-z2nfa`).
+
+To force-convert an incomplete legacy root or create a complete-generation store
+on macOS, run one build or watch pass with `FSFS_COMPLETE_GENERATIONS=1`:
 
 ```bash
 FSFS_COMPLETE_GENERATIONS=1 fsfs index .

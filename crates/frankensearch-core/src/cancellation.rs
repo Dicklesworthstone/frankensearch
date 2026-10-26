@@ -294,9 +294,9 @@ mod tests {
                 drop(future);
                 assert_eq!(state.drops.load(Ordering::SeqCst), 1);
                 assert_eq!(Arc::strong_count(&counter), baseline);
-                let wakes = counter.0.load(Ordering::SeqCst);
+                let wake_count = counter.0.load(Ordering::SeqCst);
                 cx.cancel_fast(asupersync::CancelKind::User);
-                assert_eq!(counter.0.load(Ordering::SeqCst), wakes);
+                assert_eq!(counter.0.load(Ordering::SeqCst), wake_count);
             }
         }
     }

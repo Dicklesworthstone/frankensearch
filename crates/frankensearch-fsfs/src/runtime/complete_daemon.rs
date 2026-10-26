@@ -1727,7 +1727,11 @@ mod tests {
         use std::cell::Cell;
         use std::task::{Context, Waker};
 
-        run_test_with_cx(|cx| async move {
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        scheduler.block_on(async {
+            let cx = Cx::current().expect("runtime root installs a timer-backed Cx");
             let (client, mut server) = UnixStream::pair().unwrap();
             server.set_nonblocking(true).unwrap();
             let polls = Cell::new(0);

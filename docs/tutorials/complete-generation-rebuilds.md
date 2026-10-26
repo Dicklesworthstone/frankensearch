@@ -7,8 +7,11 @@ admission checks succeed. Old bundles and abandoned builds are retained.
 
 This route is currently Unix-only. Start with a fresh store outside the source
 tree or beneath one of its hidden directories, with an existing parent
-directory. In-place migration of a legacy index
-is not qualified by this workflow. Configure a generation-local catalog:
+directory. On Linux, a completed legacy root (`index_sentinel.json` with
+`generation_complete = true`) is also migrated automatically into this store on
+its next `fsfs index`, `fsfs watch`, or `fsfs index --watch` while searches keep
+reading the legacy predecessor until `FSFS-CURRENT` publishes the first
+generation. Configure a generation-local catalog:
 
 ```toml
 [storage]
@@ -31,13 +34,17 @@ refuses searches here as it does on the legacy layout.
 On Linux a build into a directory with no index creates the store (on macOS
 the build sets `FSFS_COMPLETE_GENERATIONS=1`). Inside the source tree the store
 must sit beneath a hidden directory, like the default in-project
-`.frankensearch`; a new index anywhere else inside the source stays legacy. A
-directory that already holds
-a legacy index keeps its layout unless the build sets
+`.frankensearch`; a new index anywhere else inside the source stays legacy. On
+Linux, a directory that already holds a completed legacy index
+(`index_sentinel.json` with `generation_complete = true`) is automatically
+migrated into this store on its next `fsfs index`, `fsfs watch`, or
+`fsfs index --watch` while readers keep using the legacy predecessor until
+`FSFS-CURRENT` publishes the first generation; an incomplete/interrupted legacy
+root keeps its recovery path unless the build sets
 `FSFS_COMPLETE_GENERATIONS=1` (the longer `FRANKENSEARCH_COMPLETE_GENERATIONS`
-spelling takes precedence), which converts it, seeding the first generation
-from the legacy index when its completion receipt comes from the same fsfs build
-and configuration; `=0` keeps building legacy indexes:
+spelling takes precedence), which forces conversion, seeding the first
+generation from the legacy index when its completion receipt comes from the same
+fsfs build and configuration; `=0` keeps building legacy indexes:
 
 ```sh
 fsfs index /work/source \
@@ -231,9 +238,12 @@ older generations and abandoned unsealed builds, and never removes a generation
 still held by a live reader (`FSFS_GENERATION_RETENTION=report` reports without
 deleting; `FSFS_GENERATION_RETENTION=off` disables reclamation).
 
-Legacy roots without a complete-generation selection keep their legacy layout
-unless converted with `FSFS_COMPLETE_GENERATIONS=1`; unconverted legacy roots
-retain the mutable watcher writer-lock exclusion (`bd-z2nfa`). The complete-generation
+On Linux, completed legacy roots (`index_sentinel.json` with
+`generation_complete = true`) migrate automatically on the next `fsfs index`,
+`fsfs watch`, or `fsfs index --watch`; incomplete legacy roots, non-Linux hosts
+without `FSFS_COMPLETE_GENERATIONS=1`, and roots with
+`FSFS_COMPLETE_GENERATIONS=0` keep their legacy layout and retain the mutable
+watcher writer-lock exclusion (`bd-z2nfa`). The complete-generation
 store assumes cooperating writers and a trusted directory tree; its inventory
 checks are not a hostile-directory anti-rollback authority (`bd-xomn`). Within
 one process, a file whose device, inode, length and modification and change

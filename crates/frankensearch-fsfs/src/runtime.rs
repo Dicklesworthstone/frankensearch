@@ -1158,11 +1158,10 @@ impl AdmittedEmbedder {
     async fn embed_admitted(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
         FsfsRuntime::semantic_retry_checkpoint(cx, "admitted_embedding")?;
         self.check_current_identity()?;
-        let inference = if let Some(coalescer) = &self.coalescer {
-            coalescer.embed_bound(cx, text)
-        } else {
-            self.embedder.embed_bound(cx, text)
-        };
+        let inference = self.coalescer.as_ref().map_or_else(
+            || self.embedder.embed_bound(cx, text),
+            |coalescer| coalescer.embed_bound(cx, text),
+        );
         let response = with_cancellation(cx, "admitted_embedding", inference).await;
         FsfsRuntime::semantic_retry_checkpoint(cx, "admitted_embedding")?;
         // A provider that changed producer while inferring may still label the
@@ -11172,7 +11171,19 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
-        self.execute_search_payloads_with_mode(cx, query, limit, SearchExecutionMode::Full)
+        let mode = match self.config.pressure.degradation_override {
+            DegradationOverrideMode::ForceLexicalOnly => SearchExecutionMode::LexicalOnly,
+            DegradationOverrideMode::ForceMetadataOnly | DegradationOverrideMode::ForcePaused => {
+                return Err(degradation_refusal(
+                    self.config.pressure.degradation_override,
+                    "search",
+                ));
+            }
+            DegradationOverrideMode::Auto
+            | DegradationOverrideMode::ForceFull
+            | DegradationOverrideMode::ForceEmbedDeferred => SearchExecutionMode::Full,
+        };
+        self.execute_search_payloads_with_mode(cx, query, limit, mode)
             .await
     }
 
@@ -12765,8 +12776,29 @@ impl FsfsRuntime {
         .await
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn execute_search_phase_artifacts_with_mode_using_resources(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        mode: SearchExecutionMode,
+        resources: &mut SearchExecutionResources,
+        flags: SearchExecutionFlags,
+        phase_sink: Option<SearchPhaseSink<'_>>,
+    ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        // Boxed: the multi-stage search future carries initial, quality, and
+        // rerank state and would otherwise inflate every caller's future past
+        // the `large_futures` budget.
+        Box::pin(
+            self.execute_search_phase_artifacts_with_mode_using_resources_inner(
+                cx, query, limit, mode, resources, flags, phase_sink,
+            ),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn execute_search_phase_artifacts_with_mode_using_resources_inner(
         &self,
         cx: &Cx,
         query: &str,
@@ -29996,6 +30028,7 @@ mod tests {
             config.indexing.quality_model = quality.manifest_id().to_owned();
             let runtime = FsfsRuntime::new(config.clone());
             let selected = runtime.missing_interactive_model_downloads(temp.path());
+            #[allow(clippy::needless_bool)]
             let supported = if quality.is_native() {
                 cfg!(feature = "rerank")
             } else {
@@ -31739,6 +31772,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn quality_blend_real_retrieval_daemon_disk_explain_and_tui_share_policy() {
         run_on_runtime_task(|cx| async move {
@@ -32828,6 +32862,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "semantic-support")]
     #[test]
     fn quality_deadline_retries_bound_worker_occupancy_and_do_not_cache_failures() {
         run_on_runtime_task(|cx| async move {
@@ -34113,7 +34148,7 @@ mod tests {
         use std::task::{Context, Waker};
 
         for quality in [false, true] {
-            run_on_runtime_task(|cx| async move {
+            run_on_runtime_task(move |cx| async move {
                 let temp = tempfile::tempdir().unwrap();
                 let mut resources = disagreeing_blend_resources(temp.path());
                 let backend = Arc::new(PendingSemanticEmbedder::new(
@@ -34132,9 +34167,9 @@ mod tests {
                 let mut config = FsfsConfig::default();
                 config.search.quality_timeout_ms = 60_000;
                 let runtime = FsfsRuntime::new(config);
-                let phases = std::cell::RefCell::new(Vec::new());
+                let phases = std::sync::Mutex::new(Vec::new());
                 let mut sink = |payload: &SearchPayload| {
-                    phases.borrow_mut().push(payload.phase);
+                    phases.lock().unwrap().push(payload.phase);
                     Ok(())
                 };
                 let shutdown = ShutdownCoordinator::new();
@@ -34167,7 +34202,7 @@ mod tests {
                 } else {
                     Vec::new()
                 };
-                assert_eq!(*phases.borrow(), completed);
+                assert_eq!(*phases.lock().unwrap(), completed);
                 let before = wake.0.load(Ordering::SeqCst);
                 thread::scope(|scope| {
                     scope.spawn(|| shutdown.request_shutdown(ShutdownReason::UserRequest));
@@ -34178,7 +34213,7 @@ mod tests {
                     Poll::Ready(Err(SearchError::Cancelled { .. }))
                 ));
                 assert_eq!(
-                    *phases.borrow(),
+                    *phases.lock().unwrap(),
                     completed,
                     "cancelled work must publish no late phase"
                 );
@@ -42975,7 +43010,7 @@ mod tests {
     #[cfg(all(unix, feature = "semantic-support", not(feature = "embedded-models")))]
     #[test]
     fn forced_lexical_only_rebuilds_both_topology_transitions_and_refuses_semantic_appends() {
-        run_test_with_cx(|cx| async move {
+        run_on_runtime_task(|cx| async move {
             let _models = AppendEmbedderOverrides::install();
             for complete in [false, true] {
                 let temp = tempfile::tempdir().expect("topology transition fixture");

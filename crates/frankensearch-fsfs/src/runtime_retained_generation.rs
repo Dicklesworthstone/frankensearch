@@ -504,20 +504,25 @@ impl FsfsRuntime {
         // An indexing command can return success with deferred semantic rows.
         // Apply the same full-generation admission used by actual search, then
         // open its real lexical/vector/producer resources before sealing.
-        Self::validate_search_generation_at_root(build.path(), SearchExecutionMode::Full)?;
+        let candidate_mode = if candidate.lexical_only_indexing {
+            SearchExecutionMode::LexicalOnly
+        } else {
+            SearchExecutionMode::Full
+        };
+        Self::validate_search_generation_at_root(build.path(), candidate_mode)?;
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
                 build.path(),
-                SearchExecutionMode::Full,
-                SearchExecutionMode::Full,
+                candidate_mode,
+                candidate_mode,
             ),
         )
         .await?;
         drop(resources);
         let publication = build.publish_with_precommit(
             cx,
-            |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
+            |_, path| Self::validate_search_generation_at_root(path, candidate_mode),
             precommit,
         )?;
         Ok((publication, summary))
@@ -880,19 +885,24 @@ impl FsfsRuntime {
         if !lexical_reclaimed {
             reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
         }
+        let candidate_mode = if lexical_only {
+            SearchExecutionMode::LexicalOnly
+        } else {
+            SearchExecutionMode::Full
+        };
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
                 build.path(),
-                SearchExecutionMode::Full,
-                SearchExecutionMode::Full,
+                candidate_mode,
+                candidate_mode,
             ),
         )
         .await?;
         drop(resources);
         let publication = build.publish_with_precommit(
             cx,
-            |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
+            |_, path| Self::validate_search_generation_at_root(path, candidate_mode),
             precommit,
         )?;
         Ok((Some(publication), documents.len()))
@@ -1097,19 +1107,24 @@ impl FsfsRuntime {
         if !lexical_reclaimed {
             reclaim_unpublished_lexical_garbage(cx, build.path()).await?;
         }
+        let candidate_mode = if Self::is_lexical_only_generation(build.path()) {
+            SearchExecutionMode::LexicalOnly
+        } else {
+            SearchExecutionMode::Full
+        };
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
                 build.path(),
-                SearchExecutionMode::Full,
-                SearchExecutionMode::Full,
+                candidate_mode,
+                candidate_mode,
             ),
         )
         .await?;
         drop(resources);
         let publication = build.publish_with_precommit(
             cx,
-            |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
+            |_, path| Self::validate_search_generation_at_root(path, candidate_mode),
             precommit,
         )?;
         Ok((Some(publication), targets.len()))
