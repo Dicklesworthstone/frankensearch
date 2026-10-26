@@ -575,6 +575,7 @@ impl FsfsRuntime {
             )
         })?;
         Self::validate_search_generation_at_root(predecessor.path(), SearchExecutionMode::Full)?;
+        self.validate_append_indexing_mode(predecessor.path())?;
         let mut manifests = Self::read_matching_manifest_generation(predecessor.path())?
             .ok_or_else(|| {
                 complete_cli::complete_cli_error(
@@ -583,9 +584,9 @@ impl FsfsRuntime {
                 )
             })?;
 
-        // A lexical-only predecessor (built without semantic loaders) has no
-        // vector tier: as on the legacy layout, only keyword rows and membership
-        // change, and nothing is embedded.
+        // A lexical-only predecessor (explicitly selected or built without
+        // semantic loaders) has no vector tier: as on the legacy layout, only
+        // keyword rows and membership change, and nothing is embedded.
         let lexical_only = Self::is_lexical_only_generation(predecessor.path());
         let window_maximum = if lexical_only {
             for id in documents.keys() {

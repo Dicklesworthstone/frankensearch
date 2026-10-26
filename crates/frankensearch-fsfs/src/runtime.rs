@@ -6246,7 +6246,8 @@ pub struct FsfsRuntime {
     /// store; a root that holds a legacy index keeps its layout (bd-z2nfa).
     complete_generations_for_new_roots: bool,
     /// Build generations with the lexical arm only: no embedder, no vector
-    /// tiers. Always set in a build without semantic loaders (bd-636yz).
+    /// tiers. Selected by `force_lexical_only`, and always set in a build
+    /// without semantic loaders (bd-636yz).
     lexical_only_indexing: bool,
     /// Source files a complete-generation watch observed unchanged since the
     /// generation it extends: same inode, length, and modification and change
@@ -6281,6 +6282,9 @@ pub const BUNDLED_MODEL_MATERIALIZER_FLAG: &str = "--internal-materialize-bundle
 impl FsfsRuntime {
     #[must_use]
     pub fn new(config: FsfsConfig) -> Self {
+        let lexical_only_indexing = !SEMANTIC_LOADERS_COMPILED
+            || config.pressure.degradation_override
+                == crate::config::DegradationOverrideMode::ForceLexicalOnly;
         Self {
             config,
             cli_input: CliInput::default(),
@@ -6296,7 +6300,7 @@ impl FsfsRuntime {
             bundled_model_materializer: None,
             generation_retention: crate::generation_store::GenerationRetention::default(),
             complete_generations_for_new_roots: false,
-            lexical_only_indexing: !SEMANTIC_LOADERS_COMPILED,
+            lexical_only_indexing,
             unchanged_sources: None,
             seeded_from_receipt: false,
             discovery_excluded_root: None,
@@ -14204,6 +14208,23 @@ impl FsfsRuntime {
 
     // ─── WAL-based incremental mutation commands ─────────────────────────
 
+    /// Appending cannot change a generation's retrieval topology: dropping only
+    /// the new vectors would leave a partially updated semantic generation.
+    /// A forced lexical-only rebuild selects that topology before later appends.
+    fn validate_append_indexing_mode(&self, index_root: &Path) -> SearchResult<()> {
+        if self.config.pressure.degradation_override
+            == crate::config::DegradationOverrideMode::ForceLexicalOnly
+            && !Self::is_lexical_only_generation(index_root)
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "pressure.degradation_override".to_owned(),
+                value: "force_lexical_only".to_owned(),
+                reason: "the selected generation has semantic tiers; rebuild with `fsfs index` under force_lexical_only before appending without embeddings".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Mutation uses the generation's persisted input policy, rather than a
     /// possibly different policy in the process issuing an append or delete.
     fn fast_window_policy_at_root(index_root: &Path) -> SearchResult<usize> {
@@ -14327,6 +14348,7 @@ impl FsfsRuntime {
                 writer,
             );
         }
+        self.validate_append_indexing_mode(&index_root)?;
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         {
@@ -17831,8 +17853,8 @@ impl FsfsRuntime {
         candidates.sort_by(|left, right| left.file_key.cmp(&right.file_key));
 
         // A lexical-only generation indexes every embeddable file through the
-        // lexical arm alone and resolves no embedder: a build without semantic
-        // loaders has none to resolve (bd-636yz).
+        // lexical arm alone and resolves no embedder, either by explicit
+        // pressure override or in a build without semantic loaders (bd-636yz).
         let lexical_only = self.lexical_only_indexing;
         if lexical_only {
             for candidate in &mut candidates {
@@ -42526,6 +42548,238 @@ mod tests {
                     .any(|hit| hit.path.contains("auth") || hit.path.contains("README")),
                 "expected auth-related hit path in payload"
             );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forced_lexical_only_index_and_append_never_load_configured_models() {
+        run_test_with_cx(|cx| async move {
+            for complete in [false, true] {
+                let temp = tempfile::tempdir().expect("forced lexical fixture");
+                let project = temp.path().join("project");
+                let root = temp.path().join("index");
+                let models = temp.path().join("must-not-create-models");
+                fs::create_dir(&project).unwrap();
+                fs::write(project.join("alpha.md"), "quokka authentication guide").unwrap();
+                let input = temp.path().join("append.jsonl");
+                fs::write(
+                    &input,
+                    "{\"id\":\"beta.md\",\"text\":\"quokka append guide\"}\n",
+                )
+                .unwrap();
+                let mut config = FsfsConfig::default();
+                config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+                config.indexing.model_dir = models.display().to_string();
+                config.indexing.fast_model = "unused-unregistered-fast-model".to_owned();
+                config.indexing.quality_model = "unused-unregistered-quality-model".to_owned();
+                config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+                config.search.rerank = false;
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project),
+                    index_dir: Some(root.clone()),
+                    format: OutputFormat::Json,
+                    quiet: true,
+                    ..CliInput::default()
+                });
+                runtime
+                    .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, complete)
+                    .await
+                    .expect("forced lexical indexing must not validate or acquire either model");
+                let mut append = runtime.clone();
+                append.cli_input.command = CliCommand::AppendBatch;
+                append.cli_input.input_file = Some(input);
+                append
+                    .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                    .await
+                    .expect("append to a forced lexical generation must not resolve models");
+
+                let retained = complete.then(|| {
+                    crate::generation_store::CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap()
+                        .unwrap()
+                });
+                let index_root = retained
+                    .as_ref()
+                    .map_or(root.as_path(), |active| active.path());
+                assert!(FsfsRuntime::is_lexical_only_generation(index_root));
+                assert!(!index_root.join(super::FSFS_VECTOR_INDEX_FILE).exists());
+                assert!(
+                    !index_root
+                        .join(super::FSFS_VECTOR_QUALITY_INDEX_FILE)
+                        .exists()
+                );
+                let manifests = FsfsRuntime::read_matching_manifest_generation(index_root)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(manifests.len(), 2);
+                assert!(
+                    manifests
+                        .values()
+                        .all(|entry| entry.ingestion_class == "lexical_only")
+                );
+                let mut search = runtime;
+                search.cli_input.index_dir = Some(index_root.to_path_buf());
+                let payload = search
+                    .execute_search_payload(&cx, "quokka", 10)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    payload.hits.len(),
+                    2,
+                    "both indexed and appended documents are searchable"
+                );
+                assert!(
+                    !models.exists(),
+                    "no model cache or provisioning side effects"
+                );
+            }
+        });
+    }
+
+    #[cfg(all(unix, feature = "semantic-support", not(feature = "embedded-models")))]
+    #[test]
+    fn forced_lexical_only_rebuilds_both_topology_transitions_and_refuses_semantic_appends() {
+        run_test_with_cx(|cx| async move {
+            let _models = AppendEmbedderOverrides::install();
+            for complete in [false, true] {
+                let temp = tempfile::tempdir().expect("topology transition fixture");
+                let project = temp.path().join("project");
+                let root = temp.path().join("index");
+                fs::create_dir(&project).unwrap();
+                fs::write(project.join("alpha.md"), "quokka original guide").unwrap();
+                let input = temp.path().join("append.jsonl");
+                fs::write(
+                    &input,
+                    "{\"id\":\"forbidden.md\",\"text\":\"rejected append\"}\n",
+                )
+                .unwrap();
+                let mut config = FsfsConfig::default();
+                config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+                config.indexing.offline = true;
+                config.search.rerank = false;
+                let cli_input = CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    index_dir: Some(root.clone()),
+                    format: OutputFormat::Json,
+                    quiet: true,
+                    ..CliInput::default()
+                };
+                let full = FsfsRuntime::new(config.clone()).with_cli_input(cli_input.clone());
+                full.run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, complete)
+                    .await
+                    .unwrap();
+                let selected = || {
+                    complete.then(|| {
+                        crate::generation_store::CompleteGenerationStore::open(&cx, &root)
+                            .unwrap()
+                            .active(&cx)
+                            .unwrap()
+                            .unwrap()
+                    })
+                };
+                let before = selected();
+                let original = before
+                    .as_ref()
+                    .map_or(root.as_path(), |active| active.path());
+                let fast_before = fs::read(original.join(super::FSFS_VECTOR_INDEX_FILE)).unwrap();
+                let quality_before =
+                    fs::read(original.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap();
+                let sentinel_before = fs::read(original.join(super::FSFS_SENTINEL_FILE)).unwrap();
+                config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+                let lexical = FsfsRuntime::new(config).with_cli_input(cli_input);
+                let mut append = lexical.clone();
+                append.cli_input.command = CliCommand::AppendBatch;
+                append.cli_input.input_file = Some(input);
+                let error = append
+                    .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                    .await
+                    .expect_err("an append must not silently create incomplete semantic coverage");
+                assert!(
+                    matches!(&error, SearchError::InvalidConfig { field, value, .. }
+                    if field == "pressure.degradation_override" && value == "force_lexical_only"),
+                    "{error}"
+                );
+                if let Some(expected) = before.as_ref() {
+                    let error = lexical
+                        .apply_retained_batch(
+                            &cx,
+                            &root,
+                            expected,
+                            &[super::retained_batch::RetainedMutation::Upsert {
+                                id: "forbidden.md".to_owned(),
+                                text: "rejected direct batch".to_owned(),
+                            }],
+                        )
+                        .await
+                        .expect_err("the public retained batch obeys the same indexing override");
+                    assert!(
+                        matches!(&error, SearchError::InvalidConfig { field, .. }
+                        if field == "pressure.degradation_override"),
+                        "{error}"
+                    );
+                    assert_eq!(selected().unwrap().id(), expected.id());
+                }
+                assert_eq!(
+                    fs::read(original.join(super::FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                    fast_before
+                );
+                assert_eq!(
+                    fs::read(original.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap(),
+                    quality_before
+                );
+                assert_eq!(
+                    fs::read(original.join(super::FSFS_SENTINEL_FILE)).unwrap(),
+                    sentinel_before
+                );
+
+                for _ in 0..2 {
+                    lexical
+                        .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                        .await
+                        .expect("forced rebuild and its warm rerun");
+                    let active = selected();
+                    let path = active
+                        .as_ref()
+                        .map_or(root.as_path(), |generation| generation.path());
+                    assert!(FsfsRuntime::is_lexical_only_generation(path));
+                    assert!(!path.join(super::FSFS_VECTOR_INDEX_FILE).exists());
+                    assert!(!path.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE).exists());
+                }
+
+                // Ordinary indexing must not mistake the lexical receipt for
+                // completed semantic work, including for unchanged source bytes.
+                full.run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                    .await
+                    .expect("returning to full indexing rebuilds both semantic tiers");
+                let active = selected();
+                let path = active
+                    .as_ref()
+                    .map_or(root.as_path(), |generation| generation.path());
+                assert!(!FsfsRuntime::is_lexical_only_generation(path));
+                for relative in [
+                    super::FSFS_VECTOR_INDEX_FILE,
+                    super::FSFS_VECTOR_QUALITY_INDEX_FILE,
+                ] {
+                    let index = VectorIndex::open_read_only(&path.join(relative)).unwrap();
+                    assert_eq!(
+                        super::vector_live_doc_ids(&index).unwrap(),
+                        HashSet::from(["alpha.md".to_owned()])
+                    );
+                }
+                let mut search = full;
+                search.cli_input.index_dir = Some(path.to_path_buf());
+                let payloads = search
+                    .execute_search_payloads(&cx, "quokka original guide", 10)
+                    .await
+                    .unwrap();
+                assert_eq!(payloads.last().unwrap().phase, SearchOutputPhase::Refined);
+                assert_eq!(payloads.last().unwrap().hits.len(), 1);
+            }
         });
     }
 

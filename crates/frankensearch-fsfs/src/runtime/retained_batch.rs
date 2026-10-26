@@ -568,6 +568,9 @@ impl FsfsRuntime {
                 deleted,
             });
         }
+        if upserted > 0 {
+            self.validate_append_indexing_mode(predecessor.path())?;
+        }
         let lexical_only = Self::is_lexical_only_generation(predecessor.path());
         if lexical_only
             && documents

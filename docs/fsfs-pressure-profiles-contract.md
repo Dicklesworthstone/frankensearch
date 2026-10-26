@@ -86,10 +86,16 @@ search with `SearchError::InvalidConfig` on `pressure.degradation_override`.
 `force_paused` also refuses `index`, `watch`, `append-batch`, `delete`,
 `compact`, `flush` and the compaction daemon; `daemon --stop` stays allowed.
 The query daemon's socket name includes the override, so clients with
-different overrides never share a daemon. Indexing does not yet defer
-embedding or index metadata only, so `force_embed_deferred` changes nothing
-and `force_lexical_only` / `force_metadata_only` still embed while indexing;
-each raises a `config.setting.no_effect` warning saying so. The same warning
+different overrides never share a daemon. `force_lexical_only` also builds
+lexical-only generations without loading or provisioning either semantic model;
+watch updates and appends to those generations remain lexical-only. Appending to
+an existing semantic generation under that override is refused until `fsfs index`
+rebuilds it as lexical-only. On builds with semantic support, returning to ordinary
+indexing rebuilds the semantic tiers instead of reusing the lexical-only
+completion receipt. Indexing does not yet defer embedding or index metadata only,
+so `force_embed_deferred` changes
+nothing and `force_metadata_only` still embeds while indexing; each raises a
+`config.setting.no_effect` warning saying so. The same warning
 covers a `strict` or `degraded` profile (its quality ceiling applies; its
 resolved concurrency and scheduler limits are not read yet) and non-default
 `cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and `load_ceiling_per_mille`,
