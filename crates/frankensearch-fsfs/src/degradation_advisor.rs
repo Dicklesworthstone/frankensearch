@@ -171,6 +171,40 @@ impl DegradationAdvice {
             ],
         }
     }
+
+    /// Map this advice's failure kind to its canonical [`SemanticReadiness`]
+    /// state under the caller's requested mode and retrieval topology.
+    #[must_use]
+    pub const fn semantic_readiness(
+        &self,
+        mode: RequestMode,
+        requested_topology: RetrievalTopology,
+    ) -> SemanticReadiness {
+        semantic_readiness_for_failure(self.failure, mode, requested_topology)
+    }
+
+    /// Compute the canonical [`RecoveryPlan`] for this degradation advice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecoveryContractError`] if the request topology, readiness
+    /// state, or acquisition authorization fails validation.
+    pub fn recovery_plan(
+        &self,
+        request: RecoveryRequest,
+        policy: &RecoveryPolicy,
+        acquisition_target: Option<&ModelAcquisitionTarget>,
+        evaluation_time_unix_seconds: u64,
+    ) -> Result<RecoveryPlan, RecoveryContractError> {
+        let readiness = self.semantic_readiness(request.mode, request.requested_topology);
+        recovery_plan_for_readiness(
+            &readiness,
+            request,
+            policy,
+            acquisition_target,
+            evaluation_time_unix_seconds,
+        )
+    }
 }
 
 #[must_use]
@@ -903,6 +937,7 @@ mod tests {
                 for fixture in synthetic_degradation_advice_fixture() {
                     let readiness =
                         super::semantic_readiness_for_failure(fixture.failure, mode, topology);
+                    assert_eq!(fixture.semantic_readiness(mode, topology), readiness);
                     let plan = super::recovery_plan_for_readiness(
                         &readiness,
                         request,
@@ -911,6 +946,10 @@ mod tests {
                         1_750_000_000,
                     )
                     .expect("every DegradationFailureKind must produce a valid RecoveryPlan");
+                    let advice_plan = fixture
+                        .recovery_plan(request, &policy, None, 1_750_000_000)
+                        .expect("DegradationAdvice::recovery_plan must match canonical plan");
+                    assert_eq!(advice_plan, plan);
                     assert_eq!(plan.state(), &readiness);
                     assert_eq!(plan.mode(), mode);
                     assert_eq!(plan.requested_topology(), topology);

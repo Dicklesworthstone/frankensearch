@@ -119,7 +119,8 @@ use crate::config::{
 };
 use crate::degradation_advisor::{
     DegradationAdvice, DegradationAdviceInput, DegradationFailureKind, advice_for_zero_signal,
-    classify_search_error,
+    classify_search_error, recovery_plan_for_readiness, recovery_plan_for_search_error,
+    recovery_plan_for_zero_signal,
 };
 use crate::explanation_payload::{FsfsExplanationPayload, FusionContext, RankingExplanation};
 use crate::file_classification::{
@@ -4993,6 +4994,8 @@ struct FsfsDoctorPayload {
     warn_count: usize,
     fail_count: usize,
     overall: DoctorVerdict,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    semantic_readiness: Option<frankensearch_core::recovery_plan::SemanticReadiness>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -13261,14 +13264,28 @@ impl FsfsRuntime {
                                 winning_windows = windowed.winning_windows;
                                 let classified = windowed.classified;
                                 if let Some(reason) = classified.zero_signal {
+                                    let recovery_state_code = recovery_plan_for_zero_signal(
+                                        reason,
+                                        Self::runtime_recovery_request(mode, hash_control_lane),
+                                        &self.runtime_recovery_policy(),
+                                        0,
+                                    )
+                                    .ok()
+                                    .map(|plan| plan.state_code().to_owned());
                                     if hash_control_lane {
                                         debug!(
                                             reason_code = reason.reason_code(),
+                                            recovery_state_code = recovery_state_code
+                                                .as_deref()
+                                                .unwrap_or("recovery.state.hash_control"),
                                             "fsfs hash-control lane returned zero results"
                                         );
                                     } else {
                                         debug!(
                                             reason_code = reason.reason_code(),
+                                            recovery_state_code = recovery_state_code
+                                                .as_deref()
+                                                .unwrap_or("recovery.state.index_empty"),
                                             "fsfs semantic lane returned zero results"
                                         );
                                     }
@@ -13608,18 +13625,36 @@ impl FsfsRuntime {
                 Err(error) => {
                     let error_code = error_code_for(&error);
                     let reason = Self::semantic_runtime_failure_summary(&error);
+                    let recovery_state_code = recovery_plan_for_search_error(
+                        &error,
+                        Self::runtime_recovery_request(
+                            mode,
+                            Self::vector_generation_is_hash_control(resources),
+                        ),
+                        &self.runtime_recovery_policy(),
+                        None,
+                        0,
+                    )
+                    .ok()
+                    .map(|plan| plan.state_code().to_owned());
                     if let SearchError::DimensionMismatch { .. } = error {
                         resources.quality_embedder = None;
                         resources.quality_embedder_attempted = true;
                         info!(
                             error_code,
                             reason,
+                            recovery_state_code = recovery_state_code
+                                .as_deref()
+                                .unwrap_or("recovery.state.identity_mismatch"),
                             "fsfs quality refinement disabled for this session after embedder/index dimension mismatch"
                         );
                     } else {
                         info!(
                             error_code,
                             reason,
+                            recovery_state_code = recovery_state_code
+                                .as_deref()
+                                .unwrap_or("recovery.state.partial_quality_coverage"),
                             "fsfs quality refinement failed; falling back to initial phase payload"
                         );
                     }
@@ -14174,6 +14209,15 @@ impl FsfsRuntime {
 
     fn run_doctor_command(&self) -> SearchResult<()> {
         let payload = self.collect_doctor_payload()?;
+        if let Ok(plan) = self.doctor_recovery_plan(&payload, 0) {
+            debug!(
+                event = "fsfs.doctor_recovery_plan",
+                state_code = plan.state_code(),
+                semantic_available = plan.semantic_available(),
+                retryability = ?plan.retryability(),
+                "fsfs doctor evaluated canonical semantic recovery plan"
+            );
+        }
         let failed = matches!(payload.overall, DoctorVerdict::Fail);
         if self.cli_input.format == OutputFormat::Table {
             let table = render_doctor_table(&payload, self.cli_input.no_color);
@@ -15769,8 +15813,9 @@ impl FsfsRuntime {
         // 2. Model cache checks
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
         let index_root = self.resolve_status_index_root()?;
-        for status in self.collect_model_statuses()? {
-            checks.push(Self::model_doctor_check(&status, &index_root));
+        let model_statuses = self.collect_model_statuses()?;
+        for status in &model_statuses {
+            checks.push(Self::model_doctor_check(status, &index_root));
         }
 
         // 3. Model directory permissions. Doctor is an observer: an actual
@@ -15854,8 +15899,12 @@ impl FsfsRuntime {
 
         checks.push(Self::collect_lexical_engine_doctor_check(&index_root)?);
         checks.push(self.collect_shadow_oracle_doctor_check(&index_root)?);
+        let mut zero_signal_reason = None;
         if SEMANTIC_LOADERS_COMPILED {
-            checks.push(Self::collect_zero_signal_doctor_check(&index_root));
+            let (zero_signal_check, reason) =
+                Self::collect_zero_signal_doctor_check_with_reason(&index_root);
+            zero_signal_reason = reason;
+            checks.push(zero_signal_check);
             checks.push(Self::collect_vector_generation_doctor_check(&index_root));
             checks.push(Self::collect_quality_generation_doctor_check(&index_root));
             checks.push(Self::collect_vector_durability_doctor_check(&index_root));
@@ -15947,6 +15996,11 @@ impl FsfsRuntime {
         } else {
             DoctorVerdict::Pass
         };
+        let semantic_readiness = Some(Self::derive_doctor_semantic_readiness(
+            &model_statuses,
+            &checks,
+            zero_signal_reason,
+        ));
 
         Ok(FsfsDoctorPayload {
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -15955,7 +16009,210 @@ impl FsfsRuntime {
             warn_count,
             fail_count,
             overall,
+            semantic_readiness,
         })
+    }
+
+    const fn runtime_recovery_request(
+        mode: SearchExecutionMode,
+        hash_control_lane: bool,
+    ) -> frankensearch_core::recovery_plan::RecoveryRequest {
+        use frankensearch_core::recovery_plan::{RecoveryRequest, RequestMode};
+        use frankensearch_core::types::RetrievalTopology;
+
+        if hash_control_lane {
+            RecoveryRequest {
+                mode: RequestMode::HashControl,
+                requested_topology: RetrievalTopology::HashControl,
+            }
+        } else {
+            let requested_topology = match mode {
+                SearchExecutionMode::FastOnly => RetrievalTopology::FastOnly,
+                SearchExecutionMode::Full | SearchExecutionMode::LexicalOnly => {
+                    RetrievalTopology::FullProgressive
+                }
+            };
+            RecoveryRequest {
+                mode: RequestMode::Hybrid,
+                requested_topology,
+            }
+        }
+    }
+
+    const fn runtime_recovery_policy(&self) -> frankensearch_core::recovery_plan::RecoveryPolicy {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy,
+        };
+
+        let interaction = if matches!(self.cli_input.format, OutputFormat::Table) {
+            InteractionPolicy::Interactive
+        } else {
+            InteractionPolicy::NonInteractive
+        };
+        let offline = match self.cli_input.overrides.offline {
+            Some(value) => value,
+            None => self.config.indexing.offline,
+        };
+        let network = if offline {
+            NetworkPolicy::Offline
+        } else {
+            NetworkPolicy::Allowed
+        };
+        RecoveryPolicy {
+            interaction,
+            network,
+            acquisition_authorization: None,
+        }
+    }
+
+    fn derive_doctor_semantic_readiness(
+        model_statuses: &[FsfsModelStatus],
+        checks: &[DoctorCheck],
+        zero_signal_reason: Option<frankensearch_core::config::ZeroSignalReason>,
+    ) -> frankensearch_core::recovery_plan::SemanticReadiness {
+        use frankensearch_core::recovery_plan::{SemanticReadiness, VerifiedSemanticProvenance};
+        use frankensearch_core::traits::ModelTier;
+
+        let check_by_name =
+            |name: &str| checks.iter().find(|check| check.name == name);
+        let index_check = check_by_name("index");
+        if index_check.is_some_and(|check| {
+            check.verdict == DoctorVerdict::Fail
+                || check.detail.contains("semantic indexing is incomplete")
+        }) {
+            return SemanticReadiness::GenerationIncomplete;
+        }
+
+        let vector_gen_check = check_by_name("semantic.vector_generation");
+        let quality_gen_check = check_by_name("semantic.quality_generation");
+        if vector_gen_check.is_some_and(|check| {
+            check.verdict == DoctorVerdict::Fail && check.detail.contains("hash control artifact")
+        }) || quality_gen_check.is_some_and(|check| {
+            check.verdict == DoctorVerdict::Fail && check.detail.contains("hash control artifact")
+        }) || checks.iter().any(|check| {
+            check.name.starts_with("model.")
+                && check.verdict == DoctorVerdict::Fail
+                && check.suggestion.as_deref().is_some_and(|text| {
+                    text.starts_with("rebuild the index with the verified model")
+                })
+        }) {
+            return SemanticReadiness::IdentityMismatch;
+        }
+
+        let sidecar_check = check_by_name("durability.vector_sidecars");
+        if vector_gen_check.is_some_and(|check| check.verdict == DoctorVerdict::Fail)
+            || sidecar_check.is_some_and(|check| check.verdict == DoctorVerdict::Fail)
+            || quality_gen_check.is_some_and(|check| {
+                check.verdict == DoctorVerdict::Fail
+                    && !check.detail.contains("the tiers have diverged")
+            })
+        {
+            return SemanticReadiness::ManifestUnsafe;
+        }
+
+        if let Some(reason) = zero_signal_reason {
+            return SemanticReadiness::IndexEmpty(reason);
+        }
+
+        if vector_gen_check.is_some_and(|check| check.verdict == DoctorVerdict::Pass)
+            && quality_gen_check.is_some_and(|check| {
+                check.verdict == DoctorVerdict::Warn
+                    || (check.verdict == DoctorVerdict::Fail
+                        && check.detail.contains("the tiers have diverged"))
+            })
+        {
+            return SemanticReadiness::PartialQualityCoverage {
+                provenance: VerifiedSemanticProvenance::Local,
+                coverage_ppm: 500_000,
+            };
+        }
+
+        if !SEMANTIC_LOADERS_COMPILED {
+            return SemanticReadiness::ModelMissing {
+                tier: ModelTier::Fast,
+            };
+        }
+
+        for (tier_name, tier) in [("fast", ModelTier::Fast), ("quality", ModelTier::Quality)] {
+            let status_unloadable = model_statuses
+                .iter()
+                .find(|status| status.tier == tier_name)
+                .is_some_and(|status| {
+                    !matches!(status.verification_state.as_str(), "verified" | "missing")
+                });
+            let check_failed = check_by_name(&format!("model.{tier_name}"))
+                .is_some_and(|check| check.verdict == DoctorVerdict::Fail);
+            if status_unloadable || check_failed {
+                return SemanticReadiness::ModelUnloadable { tier };
+            }
+        }
+
+        if model_statuses
+            .iter()
+            .find(|status| status.tier == "fast")
+            .is_some_and(|status| status.verification_state == "missing")
+        {
+            return SemanticReadiness::ModelMissing {
+                tier: ModelTier::Fast,
+            };
+        }
+
+        if index_check.is_some_and(|check| {
+            check.verdict == DoctorVerdict::Warn
+                && (check.detail == "no index found" || check.detail.contains("no sentinel found"))
+        }) || vector_gen_check.is_some_and(|check| check.verdict == DoctorVerdict::Warn)
+        {
+            return SemanticReadiness::IndexAbsent;
+        }
+
+        if model_statuses
+            .iter()
+            .find(|status| status.tier == "quality")
+            .is_some_and(|status| status.verification_state == "missing")
+        {
+            return SemanticReadiness::ModelMissing {
+                tier: ModelTier::Quality,
+            };
+        }
+
+        SemanticReadiness::Ready {
+            provenance: VerifiedSemanticProvenance::Local,
+        }
+    }
+
+    fn doctor_recovery_plan(
+        &self,
+        payload: &FsfsDoctorPayload,
+        evaluation_time_unix_seconds: u64,
+    ) -> Result<
+        frankensearch_core::recovery_plan::RecoveryPlan,
+        frankensearch_core::recovery_plan::RecoveryContractError,
+    > {
+        use frankensearch_core::recovery_plan::{SemanticReadiness, VerifiedSemanticProvenance};
+
+        let readiness = payload
+            .semantic_readiness
+            .clone()
+            .unwrap_or(SemanticReadiness::Ready {
+                provenance: VerifiedSemanticProvenance::Local,
+            });
+        let fast_only = self
+            .cli_input
+            .overrides
+            .fast_only
+            .unwrap_or(self.config.search.fast_only);
+        let mode = if fast_only {
+            SearchExecutionMode::FastOnly
+        } else {
+            SearchExecutionMode::Full
+        };
+        recovery_plan_for_readiness(
+            &readiness,
+            Self::runtime_recovery_request(mode, false),
+            &self.runtime_recovery_policy(),
+            None,
+            evaluation_time_unix_seconds,
+        )
     }
 
     fn model_doctor_check(status: &FsfsModelStatus, index_root: &Path) -> DoctorCheck {
@@ -16475,50 +16732,71 @@ impl FsfsRuntime {
         }
     }
 
+    #[cfg(test)]
     fn collect_zero_signal_doctor_check(index_root: &Path) -> DoctorCheck {
+        Self::collect_zero_signal_doctor_check_with_reason(index_root).0
+    }
+
+    fn collect_zero_signal_doctor_check_with_reason(
+        index_root: &Path,
+    ) -> (
+        DoctorCheck,
+        Option<frankensearch_core::config::ZeroSignalReason>,
+    ) {
         use frankensearch_core::config::ZeroSignalReason;
 
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
         if !vector_path.exists() {
-            return DoctorCheck {
-                name: "semantic.zero_signal".to_owned(),
-                verdict: DoctorVerdict::Warn,
-                detail: format!(
-                    "semantic lane unavailable: no vector index at {}",
-                    vector_path.display()
-                ),
-                suggestion: Some("run `fsfs index <dir>` to build the semantic index".to_owned()),
-            };
+            return (
+                DoctorCheck {
+                    name: "semantic.zero_signal".to_owned(),
+                    verdict: DoctorVerdict::Warn,
+                    detail: format!(
+                        "semantic lane unavailable: no vector index at {}",
+                        vector_path.display()
+                    ),
+                    suggestion: Some(
+                        "run `fsfs index <dir>` to build the semantic index".to_owned(),
+                    ),
+                },
+                None,
+            );
         }
         let index = match VectorIndex::open_read_only(&vector_path) {
             Ok(index) => index,
             Err(error) => {
-                return DoctorCheck {
-                    name: "semantic.zero_signal".to_owned(),
-                    verdict: DoctorVerdict::Fail,
-                    detail: format!(
-                        "vector index at {} could not be opened: {error}",
-                        vector_path.display()
-                    ),
-                    suggestion: Some(
-                        "rebuild index artifacts in place with `fsfs index --full`".to_owned(),
-                    ),
-                };
+                return (
+                    DoctorCheck {
+                        name: "semantic.zero_signal".to_owned(),
+                        verdict: DoctorVerdict::Fail,
+                        detail: format!(
+                            "vector index at {} could not be opened: {error}",
+                            vector_path.display()
+                        ),
+                        suggestion: Some(
+                            "rebuild index artifacts in place with `fsfs index --full`".to_owned(),
+                        ),
+                    },
+                    None,
+                );
             }
         };
         if Self::is_legacy_hash_vector_generation(index.embedder_id()) {
-            return DoctorCheck {
-                name: "semantic.zero_signal".to_owned(),
-                verdict: DoctorVerdict::Warn,
-                detail: format!(
-                    "hash control generation `{}` is not a semantic lane",
-                    index.embedder_id()
-                ),
-                suggestion: Some(
-                    "see semantic.vector_generation; rebuild with a verified semantic embedder"
-                        .to_owned(),
-                ),
-            };
+            return (
+                DoctorCheck {
+                    name: "semantic.zero_signal".to_owned(),
+                    verdict: DoctorVerdict::Warn,
+                    detail: format!(
+                        "hash control generation `{}` is not a semantic lane",
+                        index.embedder_id()
+                    ),
+                    suggestion: Some(
+                        "see semantic.vector_generation; rebuild with a verified semantic embedder"
+                            .to_owned(),
+                    ),
+                },
+                None,
+            );
         }
         let state = index.zero_signal_state();
         let census = format!(
@@ -16530,47 +16808,59 @@ impl FsfsRuntime {
             state.usable_vector_count
         );
         match state.state_reason() {
-            Some(reason @ ZeroSignalReason::NoUsableVectors) => DoctorCheck {
-                name: "semantic.zero_signal".to_owned(),
-                verdict: DoctorVerdict::Fail,
-                detail: format!("{}: {census}", reason.reason_code()),
-                suggestion: Some(
-                    "live records carry no usable vectors (zero-norm or corrupt); rebuild with `fsfs index --full`"
-                        .to_owned(),
-                ),
-            },
-            Some(reason) => DoctorCheck {
-                name: "semantic.zero_signal".to_owned(),
-                verdict: DoctorVerdict::Warn,
-                detail: format!("{}: {census}", reason.reason_code()),
-                suggestion: Some(match reason {
-                    ZeroSignalReason::AllTombstoned => {
-                        "every record is tombstoned; compact or re-run `fsfs index`".to_owned()
-                    }
-                    _ => "index is empty; run `fsfs index <dir>` to populate it".to_owned(),
-                }),
-            },
+            Some(reason @ ZeroSignalReason::NoUsableVectors) => (
+                DoctorCheck {
+                    name: "semantic.zero_signal".to_owned(),
+                    verdict: DoctorVerdict::Fail,
+                    detail: format!("{}: {census}", reason.reason_code()),
+                    suggestion: Some(
+                        "live records carry no usable vectors (zero-norm or corrupt); rebuild with `fsfs index --full`"
+                            .to_owned(),
+                    ),
+                },
+                Some(reason),
+            ),
+            Some(reason) => (
+                DoctorCheck {
+                    name: "semantic.zero_signal".to_owned(),
+                    verdict: DoctorVerdict::Warn,
+                    detail: format!("{}: {census}", reason.reason_code()),
+                    suggestion: Some(match reason {
+                        ZeroSignalReason::AllTombstoned => {
+                            "every record is tombstoned; compact or re-run `fsfs index`".to_owned()
+                        }
+                        _ => "index is empty; run `fsfs index <dir>` to populate it".to_owned(),
+                    }),
+                },
+                Some(reason),
+            ),
             None if state.live_count > 0 && state.usable_vector_count < state.live_count => {
                 // Partial coverage loss: searches still work, but some live
                 // records carry unusable (zero-norm/corrupt) vectors and can
                 // never be found semantically. Warn-worthy per bd-tqhc even
                 // though no query would classify it (results are non-empty).
+                (
+                    DoctorCheck {
+                        name: "semantic.zero_signal".to_owned(),
+                        verdict: DoctorVerdict::Warn,
+                        detail: format!("partial usable-vector coverage: {census}"),
+                        suggestion: Some(
+                            "some live records have unusable vectors and are invisible to semantic search; rebuild with `fsfs index --full`"
+                                .to_owned(),
+                        ),
+                    },
+                    None,
+                )
+            }
+            None => (
                 DoctorCheck {
                     name: "semantic.zero_signal".to_owned(),
-                    verdict: DoctorVerdict::Warn,
-                    detail: format!("partial usable-vector coverage: {census}"),
-                    suggestion: Some(
-                        "some live records have unusable vectors and are invisible to semantic search; rebuild with `fsfs index --full`"
-                            .to_owned(),
-                    ),
-                }
-            }
-            None => DoctorCheck {
-                name: "semantic.zero_signal".to_owned(),
-                verdict: DoctorVerdict::Pass,
-                detail: census,
-                suggestion: None,
-            },
+                    verdict: DoctorVerdict::Pass,
+                    detail: census,
+                    suggestion: None,
+                },
+                None,
+            ),
         }
     }
 
@@ -52325,6 +52615,7 @@ mod tests {
         assert_eq!(roundtrip.version, payload.version);
         assert_eq!(roundtrip.checks.len(), payload.checks.len());
         assert_eq!(roundtrip.overall, payload.overall);
+        assert_eq!(roundtrip.semantic_readiness, payload.semantic_readiness);
     }
 
     #[test]
@@ -52341,6 +52632,7 @@ mod tests {
             warn_count: 0,
             fail_count: 0,
             overall: super::DoctorVerdict::Pass,
+            semantic_readiness: None,
         };
         assert_eq!(all_pass.overall, super::DoctorVerdict::Pass);
 
@@ -52364,6 +52656,7 @@ mod tests {
             warn_count: 1,
             fail_count: 0,
             overall: super::DoctorVerdict::Warn,
+            semantic_readiness: None,
         };
         assert_eq!(has_warn.overall, super::DoctorVerdict::Warn);
     }
@@ -52390,6 +52683,7 @@ mod tests {
             warn_count: 0,
             fail_count: 1,
             overall: super::DoctorVerdict::Fail,
+            semantic_readiness: None,
         };
 
         let error = FsfsRuntime::doctor_failure_error(&payload);
@@ -52463,6 +52757,7 @@ mod tests {
             warn_count: 0,
             fail_count: 3,
             overall: super::DoctorVerdict::Fail,
+            semantic_readiness: None,
         };
 
         let error = FsfsRuntime::doctor_failure_error(&payload);
@@ -52470,6 +52765,55 @@ mod tests {
             error.suggestion.as_deref(),
             Some("run `fsfs index '/src' --index-dir '/idx'` to finish it; run `fsfs compact`")
         );
+    }
+
+    #[test]
+    fn doctor_payload_derives_canonical_semantic_readiness_and_recovery_plan() {
+        use frankensearch_core::recovery_plan::SemanticReadiness;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            index_dir: Some(index_root.clone()),
+            format: OutputFormat::Json,
+            ..CliInput::default()
+        });
+        runtime
+            .write_index_sentinel(
+                &index_root,
+                &super::IndexSentinel {
+                    schema_version: 1,
+                    generation_complete: false,
+                    generated_at_ms: super::pressure_timestamp_ms(),
+                    command: "index".to_owned(),
+                    target_root: temp.path().join("project").display().to_string(),
+                    index_root: index_root.display().to_string(),
+                    discovered_files: 2,
+                    indexed_files: 2,
+                    skipped_files: 0,
+                    reason_codes: Vec::new(),
+                    total_canonical_bytes: 128,
+                    source_hash_hex: "partial-generation".to_owned(),
+                    fast_window_max_per_file: 1,
+                },
+            )
+            .expect("write incomplete sentinel");
+
+        let payload = runtime
+            .collect_doctor_payload()
+            .expect("collect doctor payload");
+        assert_eq!(
+            payload.semantic_readiness,
+            Some(SemanticReadiness::GenerationIncomplete)
+        );
+        let plan = runtime
+            .doctor_recovery_plan(&payload, 1_750_000_000)
+            .expect("compute canonical recovery plan from doctor payload");
+        assert_eq!(plan.state(), &SemanticReadiness::GenerationIncomplete);
+        assert_eq!(plan.state_code(), "recovery.state.generation_incomplete");
+        assert!(!plan.semantic_available());
     }
 
     // ─── Self-Update Tests ─────────────────────────────────────────────────
