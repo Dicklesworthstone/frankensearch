@@ -193,7 +193,11 @@ pub async fn rerank_step_with_combine(
     // Cancellation outranks BOTH successful output and an ordinary provider
     // error. Do not return a graceful skip before observing the invocation.
     rerank_checkpoint(cx, "reranker_before_inference")?;
-    let response = reranker.rerank(cx, query, &rerank_docs).await;
+    let response =
+        frankensearch_core::with_cancellation(cx, "reranker_to_score_validation", async {
+            reranker.rerank(cx, query, &rerank_docs).await
+        })
+        .await;
     rerank_checkpoint(cx, "reranker_to_score_validation")?;
     let scores = match response {
         Ok(scores) => scores,

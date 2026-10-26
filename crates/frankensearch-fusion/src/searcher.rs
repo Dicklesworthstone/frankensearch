@@ -256,14 +256,17 @@ async fn embed_admitted_query(
         "fast" => "fast_embed_to_activation",
         _ => "quality_embed_to_prf",
     };
-    let response = if expected.is_some() {
-        embedder
-            .embed_bound(cx, query)
-            .await
-            .map(|bound| (bound.values, Some(bound.identity)))
-    } else {
-        embedder.embed(cx, query).await.map(|values| (values, None))
-    };
+    let response = frankensearch_core::with_cancellation(cx, after_phase, async {
+        if expected.is_some() {
+            embedder
+                .embed_bound(cx, query)
+                .await
+                .map(|bound| (bound.values, Some(bound.identity)))
+        } else {
+            embedder.embed(cx, query).await.map(|values| (values, None))
+        }
+    })
+    .await;
     // Cancellation wins over a late response, provider error or identity drift.
     cancellation_checkpoint(cx, after_phase)?;
     let producer = validate_query_producer(embedder, expected, tier);
@@ -1454,6 +1457,16 @@ impl TwoTierSearcher {
             let timeout_budget = Duration::from_millis(self.config.quality_timeout_ms);
             let timeout_start = cx.now();
             let phase2_result = timeout(timeout_start, timeout_budget, phase2_future).await;
+            // A deadline may win its poll or drop pending inference that then
+            // cancels the invocation. Observe that before publishing failure,
+            // retaining a more specific cancellation already returned by a stage.
+            let phase2_result = match phase2_result {
+                Ok(Err(error @ SearchError::Cancelled { .. })) => Ok(Err(error)),
+                result => match cancellation_checkpoint(cx, "phase2_to_refined") {
+                    Ok(()) => result,
+                    Err(error) => Ok(Err(error)),
+                },
+            };
 
             match phase2_result {
                 Err(_elapsed) => {
@@ -4297,8 +4310,10 @@ fn poll_immediate<T>(
     clippy::significant_drop_tightening
 )]
 mod tests {
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::task::{Context, Poll, Wake, Waker};
 
     use frankensearch_core::generation::{
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
@@ -4536,6 +4551,113 @@ mod tests {
 
         fn category(&self) -> ModelCategory {
             ModelCategory::StaticEmbedder
+        }
+    }
+
+    #[derive(Default)]
+    struct SilentPendingProvider {
+        identity: Option<EmbeddingIdentityBundleV1>,
+        started: AtomicU64,
+        dropped: AtomicU64,
+        cancel_on_drop: bool,
+    }
+
+    struct SilentProviderDrop<'a> {
+        provider: &'a SilentPendingProvider,
+        cx: &'a Cx,
+    }
+
+    impl Drop for SilentProviderDrop<'_> {
+        fn drop(&mut self) {
+            self.provider.dropped.fetch_add(1, Ordering::SeqCst);
+            if self.provider.cancel_on_drop {
+                self.cx.cancel_with(
+                    asupersync::CancelKind::User,
+                    Some("cancel while dropping timed-out inference"),
+                );
+            }
+        }
+    }
+
+    impl SilentPendingProvider {
+        fn pending<'a, T: Send + 'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, T> {
+            Box::pin(async move {
+                let _drop = SilentProviderDrop { provider: self, cx };
+                self.started.fetch_add(1, Ordering::SeqCst);
+                // Deliberately neither observe cancellation nor register a Waker.
+                std::future::pending().await
+            })
+        }
+    }
+
+    impl Embedder for SilentPendingProvider {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.pending(cx)
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.identity
+                .as_ref()
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "embedder.identity".to_owned(),
+                    value: "silent-provider".to_owned(),
+                    reason: "legacy test provider has no identity".to_owned(),
+                })
+        }
+
+        fn dimension(&self) -> usize {
+            self.identity.as_ref().map_or(4, |identity| {
+                usize::try_from(identity.space.dimension).expect("test dimension")
+            })
+        }
+
+        fn id(&self) -> &str {
+            "silent-provider"
+        }
+
+        fn model_name(&self) -> &str {
+            "silent-provider"
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::ApiEmbedder
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    impl Reranker for SilentPendingProvider {
+        fn rerank<'a>(
+            &'a self,
+            cx: &'a Cx,
+            _query: &'a str,
+            _documents: &'a [frankensearch_core::RerankDocument],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::RerankScore>> {
+            self.pending(cx)
+        }
+
+        fn id(&self) -> &str {
+            "silent-reranker"
+        }
+
+        fn model_name(&self) -> &str {
+            "silent-reranker"
+        }
+    }
+
+    #[derive(Default)]
+    struct PendingSearchWake(AtomicU64);
+
+    impl Wake for PendingSearchWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -7885,6 +8007,160 @@ mod tests {
             );
             assert!(metrics.quality_embed_ms > 0.0);
         });
+    }
+
+    #[test]
+    fn public_search_pending_providers_wake_on_cancel_without_late_phases() {
+        for (tier, identified) in [
+            ("fast", false),
+            ("fast", true),
+            ("quality", false),
+            ("quality", true),
+            #[cfg(feature = "rerank")]
+            ("rerank", false),
+        ] {
+            let cx = Cx::for_testing();
+            let (_index_dir, index) = if identified {
+                query_admission_index("stamped-v1")
+            } else {
+                build_test_index_with_quality(4)
+            };
+            let pending = Arc::new(SilentPendingProvider {
+                identity: identified.then(|| query_admission_embedder(tier).identity),
+                ..SilentPendingProvider::default()
+            });
+            let fast: Arc<dyn Embedder> = if tier == "fast" {
+                pending.clone()
+            } else if identified {
+                Arc::new(query_admission_embedder("fast"))
+            } else {
+                Arc::new(StubEmbedder::new("fast", 4))
+            };
+            let quality: Arc<dyn Embedder> = if tier == "quality" {
+                pending.clone()
+            } else if identified {
+                Arc::new(query_admission_embedder("quality"))
+            } else {
+                Arc::new(StubEmbedder::new("quality", 4))
+            };
+            let adapter = Arc::new(RecordingHostAdapter::new("silent_pending_search"));
+            let searcher = TwoTierSearcher::new(
+                index,
+                fast,
+                TwoTierConfig {
+                    quality_timeout_ms: 60_000,
+                    ..TwoTierConfig::default()
+                },
+            )
+            .with_quality_embedder(quality)
+            .with_host_adapter(adapter.clone());
+            #[cfg(feature = "rerank")]
+            let searcher = if tier == "rerank" {
+                searcher.with_reranker(pending.clone())
+            } else {
+                searcher
+            };
+            let phases = Mutex::new(Vec::new());
+            let mut future = Box::pin(searcher.search(
+                &cx,
+                "find related documents",
+                5,
+                |_| Some("candidate text".to_owned()),
+                |phase| {
+                    phases.lock().unwrap().push(match phase {
+                        SearchPhase::Initial { .. } => "initial",
+                        SearchPhase::Refined { .. } => "refined",
+                        SearchPhase::Reranked { .. } => "reranked",
+                        SearchPhase::RefinementFailed { .. } => "refinement_failed",
+                    });
+                },
+            ));
+            let wake = Arc::new(PendingSearchWake::default());
+            let waker = Waker::from(wake.clone());
+            let mut task = Context::from_waker(&waker);
+
+            assert!(future.as_mut().poll(&mut task).is_pending(), "{tier}");
+            assert_eq!(pending.started.load(Ordering::SeqCst), 1, "{tier}");
+            assert_eq!(pending.dropped.load(Ordering::SeqCst), 0, "{tier}");
+            let wakes_before_cancel = wake.0.load(Ordering::SeqCst);
+            cx.cancel_with(asupersync::CancelKind::User, Some("cancel silent provider"));
+            assert!(
+                wake.0.load(Ordering::SeqCst) > wakes_before_cancel,
+                "{tier}: cancellation must wake the suspended search before a repoll"
+            );
+            let Poll::Ready(Err(error)) = future.as_mut().poll(&mut task) else {
+                panic!("{tier}: cancelled search must return without the provider");
+            };
+            let (expected_phase, expected_phases): (&str, &[&str]) = match tier {
+                "fast" => ("fast_embed_to_activation", &[]),
+                "quality" => ("quality_embed_to_prf", &["initial"]),
+                _ => ("reranker_to_score_validation", &["initial", "refined"]),
+            };
+            assert!(matches!(
+                error,
+                SearchError::Cancelled { phase, reason }
+                    if phase == expected_phase && reason == "user: cancel silent provider"
+            ));
+            assert_eq!(phases.lock().unwrap().as_slice(), expected_phases);
+            assert_eq!(pending.dropped.load(Ordering::SeqCst), 1, "{tier}");
+            assert_single_cancelled_session_stop(&adapter, expected_phase);
+            drop(future);
+            assert_eq!(pending.dropped.load(Ordering::SeqCst), 1, "{tier}");
+        }
+    }
+
+    #[test]
+    fn quality_timeout_cancellation_from_dropped_inference_emits_no_failure_phase() {
+        // No ambient runtime clock: timeout polls the work before its zero
+        // budget expires, then dropping that pending work requests cancellation.
+        let cx = Cx::for_testing();
+        let (_index_dir, index) = build_test_index_with_quality(4);
+        let pending = Arc::new(SilentPendingProvider {
+            cancel_on_drop: true,
+            ..SilentPendingProvider::default()
+        });
+        let adapter = Arc::new(RecordingHostAdapter::new("cancelled_quality_timeout"));
+        let searcher = TwoTierSearcher::new(
+            index,
+            Arc::new(StubEmbedder::new("fast", 4)),
+            TwoTierConfig {
+                quality_timeout_ms: 0,
+                ..TwoTierConfig::default()
+            },
+        )
+        .with_quality_embedder(pending.clone())
+        .with_host_adapter(adapter.clone());
+        let phases = Mutex::new(Vec::new());
+        let mut future = Box::pin(searcher.search(
+            &cx,
+            "find related documents",
+            5,
+            |_| None,
+            |phase| {
+                phases.lock().unwrap().push(match phase {
+                    SearchPhase::Initial { .. } => "initial",
+                    SearchPhase::Refined { .. } => "refined",
+                    SearchPhase::Reranked { .. } => "reranked",
+                    SearchPhase::RefinementFailed { .. } => "refinement_failed",
+                });
+            },
+        ));
+        let Poll::Ready(Err(error)) = future
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        else {
+            panic!("zero-budget timeout must observe cancellation from its discarded work");
+        };
+        assert!(matches!(
+            error,
+            SearchError::Cancelled { phase, reason }
+                if phase == "phase2_to_refined"
+                    && reason == "user: cancel while dropping timed-out inference"
+        ));
+        assert_eq!(pending.started.load(Ordering::SeqCst), 1);
+        assert_eq!(pending.dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(phases.lock().unwrap().as_slice(), ["initial"]);
+        assert_single_cancelled_session_stop(&adapter, "phase2_to_refined");
     }
 
     #[test]
