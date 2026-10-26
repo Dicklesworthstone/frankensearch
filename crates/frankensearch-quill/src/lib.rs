@@ -57,11 +57,11 @@ pub use index::{
     ConformancePruningTraceReceipt, ConformanceSegmentPruningReceipt,
 };
 pub use index::{
-    QUILL_LEXICAL_BACKEND, QuillClauseKind, QuillDocumentWitness, QuillHit, QuillIndex,
-    QuillIndexError, QuillScoreExplanation, QuillSearchIndex, QuillSearchResult,
-    QuillSearchSnapshot, QuillSnapshotIndex, QuillSnippetHit, QuillTermScore,
-    RootBoundQuillSearchIndex, SchemaDocument, SnapshotError, SnapshotPublisher,
-    indexable_document_content_hash,
+    ParallelIngestTerminal, QUILL_LEXICAL_BACKEND, QuillClauseKind, QuillDocumentWitness, QuillHit,
+    QuillIndex, QuillIndexError, QuillObservedUpsert, QuillScaleoutRoute, QuillScaleoutWitness,
+    QuillScoreExplanation, QuillSearchIndex, QuillSearchResult, QuillSearchSnapshot,
+    QuillSnapshotIndex, QuillSnippetHit, QuillTermScore, RootBoundQuillSearchIndex, SchemaDocument,
+    SnapshotError, SnapshotPublisher, indexable_document_content_hash,
 };
 #[cfg(feature = "profile-internals")]
 #[doc(hidden)]

@@ -175,9 +175,10 @@ pub use interaction_primitives::{
 pub use lexical_pipeline::{
     InMemoryLexicalBackend, InMemoryLexicalEntry, LexicalAction, LexicalBatchStats, LexicalChunk,
     LexicalChunkPolicy, LexicalIndexBackend, LexicalMutation, LexicalMutationKind,
-    LexicalPerformanceTargets, LexicalPipeline, LexicalToken, QuillLexicalBackend,
-    QuillResumeStats, TARGET_INCREMENTAL_P95_LATENCY_MS, TARGET_INCREMENTAL_UPDATES_PER_SECOND,
-    TARGET_INITIAL_DOCS_PER_SECOND, tokenize_lexical,
+    LexicalPerformanceTargets, LexicalPipeline, LexicalToken, ParallelIngestTerminal,
+    QuillLexicalBackend, QuillObservedUpsert, QuillResumeStats, QuillScaleoutRoute,
+    QuillScaleoutWitness, TARGET_INCREMENTAL_P95_LATENCY_MS,
+    TARGET_INCREMENTAL_UPDATES_PER_SECOND, TARGET_INITIAL_DOCS_PER_SECOND, tokenize_lexical,
 };
 pub use lifecycle::{
     DaemonPhase, DaemonStatus, DiskBudgetAction, DiskBudgetPolicy, DiskBudgetSnapshot,

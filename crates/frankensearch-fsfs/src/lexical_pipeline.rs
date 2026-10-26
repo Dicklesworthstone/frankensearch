@@ -12,6 +12,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use asupersync::Cx;
 use compact_str::CompactString;
 use frankensearch_core::{IndexableDocument, LexicalWrite, SearchError, SearchResult};
+pub use frankensearch_quill::{
+    ParallelIngestTerminal, QuillObservedUpsert, QuillScaleoutRoute, QuillScaleoutWitness,
+};
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillIndex, indexable_document_content_hash};
 use tracing::debug;
 
@@ -526,6 +529,7 @@ impl LexicalIndexBackend for InMemoryLexicalBackend {
 pub struct QuillLexicalBackend<'a> {
     index: &'a QuillIndex,
     pending: Vec<LexicalAction>,
+    scaleout_witnesses: Vec<QuillScaleoutWitness>,
 }
 
 /// Classification totals from one crash-resumable Quill flush.
@@ -548,6 +552,7 @@ impl<'a> QuillLexicalBackend<'a> {
         Self {
             index,
             pending: Vec::new(),
+            scaleout_witnesses: Vec::new(),
         }
     }
 
@@ -556,10 +561,36 @@ impl<'a> QuillLexicalBackend<'a> {
         self.pending.len()
     }
 
+    /// Return the `run_seq` of the most recent unconsumed scaleout witness, if
+    /// any batch entered the Quill accumulation driver during prior flushes.
+    #[must_use]
+    pub fn latest_scaleout_run_seq(&self) -> Option<u64> {
+        self.scaleout_witnesses.last().map(|witness| witness.run_seq)
+    }
+
+    /// Consume and return the run-scoped [`QuillScaleoutWitness`] matching
+    /// `run_seq`, leaving any other unconsumed witnesses intact.
+    ///
+    /// Consume-once: a second call with the same `run_seq` returns `None`.
+    pub fn take_scaleout_witness(&mut self, run_seq: u64) -> Option<QuillScaleoutWitness> {
+        self.scaleout_witnesses
+            .iter()
+            .position(|witness| witness.run_seq == run_seq)
+            .map(|index| self.scaleout_witnesses.remove(index))
+    }
+
+    /// Consume and return all retained [`QuillScaleoutWitness`] values in exact
+    /// batch execution order across upsert and delete barriers.
+    ///
+    /// Consume-once: a second call without another flush returns an empty `Vec`.
+    pub fn take_scaleout_witnesses(&mut self) -> Vec<QuillScaleoutWitness> {
+        std::mem::take(&mut self.scaleout_witnesses)
+    }
+
     /// Flush every planned action in order through Quill.
     ///
-    /// Contiguous upserts share one `index_documents` call. Deletes form
-    /// ordering barriers so repeated document ids retain planner order.
+    /// Contiguous upserts share one `upsert_documents_observed` call. Deletes
+    /// form ordering barriers so repeated document ids retain planner order.
     ///
     /// Errors, cancellation, and dropping the future retain unacknowledged
     /// actions in planner order. A failed backend call may have partially
@@ -637,7 +668,8 @@ impl<'a> QuillLexicalBackend<'a> {
                 }
                 LexicalAction::Delete { doc_id, .. } => {
                     if !documents.is_empty() {
-                        LexicalWrite::index_documents(self.index, cx, &documents).await?;
+                        let observed = self.index.upsert_documents_observed(cx, &documents).await;
+                        record_observed_upsert(&mut self.scaleout_witnesses, observed)?;
                         documents.clear();
                     }
                     if self.index.has_uncommitted_changes() {
@@ -658,13 +690,24 @@ impl<'a> QuillLexicalBackend<'a> {
             }
         }
         if !documents.is_empty() {
-            LexicalWrite::index_documents(self.index, cx, &documents).await?;
+            let observed = self.index.upsert_documents_observed(cx, &documents).await;
+            record_observed_upsert(&mut self.scaleout_witnesses, observed)?;
         }
         // Quill may publish replacements here; new rows can remain staged.
         // The caller still owns the final commit barrier for pending writes.
         progress.acknowledge_through(progress.actions().len());
         Ok(stats)
     }
+}
+
+fn record_observed_upsert(
+    scaleout_witnesses: &mut Vec<QuillScaleoutWitness>,
+    mut observed: frankensearch_quill::QuillObservedUpsert,
+) -> SearchResult<()> {
+    if let Some(witness) = observed.take_witness() {
+        scaleout_witnesses.push(witness);
+    }
+    observed.result.map_err(SearchError::from)
 }
 
 fn lexical_flush_checkpoint(cx: &Cx) -> SearchResult<()> {
@@ -2164,5 +2207,177 @@ mod tests {
             TARGET_INCREMENTAL_UPDATES_PER_SECOND + 500,
             TARGET_INCREMENTAL_P95_LATENCY_MS.saturating_sub(5),
         ));
+    }
+
+    #[test]
+    fn quill_lexical_backend_binds_scaleout_witnesses_across_parallel_serial_barriers_and_errors() {
+        use asupersync::Cx;
+        use frankensearch_quill::{ParallelIngestTerminal, QuillScaleoutRoute};
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(frankensearch_quill::QuillConfig {
+                max_ingest_shards: 4,
+                max_visibility_lag_ms: 60_000,
+                scribe_shard_budget_bytes: 512 * 1024 * 1024,
+                ..frankensearch_quill::QuillConfig::default()
+            })
+            .expect("in-memory QuillIndex for scaleout witness test");
+            let mut pipeline = LexicalPipeline::new(QuillLexicalBackend::new(&index));
+
+            // 1. Parallel SharedNothing batch (256 docs with substantial token payload).
+            let heavy_text = "alpha beta gamma delta epsilon zeta eta theta ".repeat(256);
+            let parallel_mutations = (0..256)
+                .map(|ordinal| {
+                    LexicalMutation::upsert(
+                        format!("scaleout-doc-{ordinal:04}"),
+                        1,
+                        IngestionClass::FullSemanticLexical,
+                        heavy_text.clone(),
+                        "initial_index",
+                    )
+                })
+                .collect::<Vec<_>>();
+            pipeline
+                .apply_initial(&parallel_mutations)
+                .expect("plan parallel batch");
+            pipeline
+                .backend_mut()
+                .flush(&cx)
+                .await
+                .expect("flush parallel batch");
+
+            let run_seq_1 = pipeline
+                .backend()
+                .latest_scaleout_run_seq()
+                .expect("parallel batch must record a run_seq");
+            let witness_1 = pipeline
+                .backend_mut()
+                .take_scaleout_witness(run_seq_1)
+                .expect("consume witness_1 by run_seq");
+            assert!(
+                pipeline
+                    .backend_mut()
+                    .take_scaleout_witness(run_seq_1)
+                    .is_none(),
+                "take_scaleout_witness must be consume-once"
+            );
+            assert_eq!(witness_1.run_seq, run_seq_1);
+            assert!(
+                witness_1.pool_threads >= 2,
+                "expected multi-thread Rayon pool, got {witness_1:?}"
+            );
+            assert!(
+                witness_1.started_shards >= 2,
+                "expected multi-shard fan-out, got {witness_1:?}"
+            );
+            assert_eq!(witness_1.completed_shards, witness_1.started_shards);
+            assert!(
+                witness_1.peak_shards_in_flight >= 2,
+                "expected real multi-shard overlap, got {witness_1:?}"
+            );
+            assert!(
+                witness_1.distinct_worker_slots >= 2,
+                "expected multiple Rayon workers, got {witness_1:?}"
+            );
+            assert!(!witness_1.shared_nothing_declined);
+            assert_eq!(witness_1.route, Some(QuillScaleoutRoute::SharedNothing));
+            assert_eq!(
+                witness_1.accumulation_terminal,
+                ParallelIngestTerminal::FanoutCompleted
+            );
+            assert_eq!(witness_1.parallel_fanout(), Some(witness_1));
+
+            // 2. Multi-batch flush across a Delete barrier + serial route (< 128 docs).
+            let barrier_mutations = vec![
+                LexicalMutation::upsert(
+                    "serial-before-delete",
+                    2,
+                    IngestionClass::FullSemanticLexical,
+                    "short serial text before delete barrier",
+                    "incremental_upsert",
+                ),
+                LexicalMutation::delete(
+                    "scaleout-doc-0000",
+                    2,
+                    IngestionClass::Skip,
+                    "explicit_delete",
+                ),
+                LexicalMutation::upsert(
+                    "serial-after-delete",
+                    2,
+                    IngestionClass::FullSemanticLexical,
+                    "short serial text after delete barrier",
+                    "incremental_upsert",
+                ),
+            ];
+            pipeline
+                .apply_incremental(&barrier_mutations)
+                .expect("plan barrier mutations");
+            let resume_stats = pipeline
+                .backend_mut()
+                .flush_resumable(&cx)
+                .await
+                .expect("flush barrier mutations");
+            assert_eq!(resume_stats.absent, 2);
+            assert_eq!(resume_stats.deleted, 1);
+
+            let barrier_witnesses = pipeline.backend_mut().take_scaleout_witnesses();
+            assert_eq!(
+                barrier_witnesses.len(),
+                2,
+                "delete barrier must preserve both upsert batch witnesses in order"
+            );
+            assert!(
+                pipeline.backend_mut().take_scaleout_witnesses().is_empty(),
+                "take_scaleout_witnesses must be consume-once"
+            );
+            assert!(barrier_witnesses[0].run_seq > witness_1.run_seq);
+            assert!(barrier_witnesses[1].run_seq > barrier_witnesses[0].run_seq);
+            for witness in &barrier_witnesses {
+                assert!(witness.shared_nothing_declined);
+                assert_eq!(witness.started_shards, 0);
+                assert_eq!(witness.completed_shards, 0);
+                assert_eq!(witness.peak_shards_in_flight, 0);
+                assert_eq!(witness.route, Some(QuillScaleoutRoute::Serial));
+                assert_eq!(
+                    witness.accumulation_terminal,
+                    ParallelIngestTerminal::SerialCompleted
+                );
+                assert!(witness.parallel_fanout().is_none());
+            }
+
+            // 3. Admission refusal inside the accumulation driver retains Aborted witness.
+            let invalid_mutation = [LexicalMutation::upsert(
+                "serial-after-delete",
+                3,
+                IngestionClass::FullSemanticLexical,
+                "duplicate uncommitted document id must fail batch admission",
+                "duplicate_uncommitted_upsert",
+            )];
+            pipeline
+                .apply_incremental(&invalid_mutation)
+                .expect("plan duplicate uncommitted mutation");
+            let flush_err = pipeline.backend_mut().flush(&cx).await;
+            assert!(
+                flush_err.is_err(),
+                "duplicate uncommitted doc_id must fail Quill admission"
+            );
+            let aborted_witnesses = pipeline.backend_mut().take_scaleout_witnesses();
+            assert_eq!(aborted_witnesses.len(), 1);
+            assert!(aborted_witnesses[0].run_seq > barrier_witnesses[1].run_seq);
+            assert_eq!(
+                aborted_witnesses[0].accumulation_terminal,
+                ParallelIngestTerminal::Aborted
+            );
+            assert!(aborted_witnesses[0].route.is_none());
+            assert!(aborted_witnesses[0].parallel_fanout().is_none());
+
+            // 4. Pre-driver cancellation produces no witness.
+            let cancelled_cx = Cx::for_testing();
+            cancelled_cx.set_cancel_requested(true);
+            let pre_cancel_err = pipeline.backend_mut().flush(&cancelled_cx).await;
+            assert!(matches!(pre_cancel_err, Err(SearchError::Cancelled { .. })));
+            assert!(pipeline.backend_mut().take_scaleout_witnesses().is_empty());
+        });
     }
 }

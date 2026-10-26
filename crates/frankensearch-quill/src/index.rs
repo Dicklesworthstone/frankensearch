@@ -1848,37 +1848,40 @@ struct ParallelShardWork {
 /// receipt are attributable to a specific run rather than to "some batch".
 static PARALLEL_INGEST_RUN_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// How a shared-nothing batch ended.
+/// How a Quill ingest accumulation batch ended.
 ///
 /// The default is [`Aborted`](ParallelIngestTerminal::Aborted), NOT success:
 /// the terminal state is only promoted by an explicit `finish`, so every
 /// unwind, `?` early return, and cancelled exit reports honestly without the
 /// exit path having to remember to say so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum ParallelIngestTerminal {
-    /// Default. The whole ingest operation did not reach a successful end: a
+pub enum ParallelIngestTerminal {
+    /// Default. The accumulation batch did not reach a successful end: a
     /// worker failed, a later step errored, or the future was dropped.
     #[default]
     Aborted,
-    /// A shared-nothing fan-out published a receipt AND the whole operation
+    /// A shared-nothing fan-out published a receipt AND the accumulation phase
     /// then completed. Never set merely because a route returned `Ok(None)`.
     FanoutCompleted,
-    /// The shared-nothing routes declined and the whole operation completed on
-    /// the legacy `index_batch_fanout` path. That path is ALSO Rayon-parallel,
-    /// so it must not be published as serial; its shards are witnessed like
-    /// any other.
+    /// The shared-nothing routes declined and the accumulation phase completed
+    /// on the legacy `index_batch_fanout` path. That path is ALSO
+    /// Rayon-parallel, so it must not be published as serial; its shards are
+    /// witnessed like any other.
     FanoutFallbackCompleted,
-    /// The routes declined and the whole operation completed on the genuinely
-    /// SERIAL path. Any shard counts on this batch belong to a shared-nothing
-    /// attempt whose work was discarded.
+    /// The routes declined and the accumulation phase completed on the
+    /// genuinely SERIAL path. Any shard counts on this batch belong to a
+    /// shared-nothing attempt whose work was discarded.
     SerialCompleted,
     /// Nothing to do: the batch was empty. A success, with no work witnessed.
     NoWork,
+    /// Accumulation ended because cancellation was requested.
     Cancelled,
 }
 
 impl ParallelIngestTerminal {
-    const fn as_str(self) -> &'static str {
+    /// Canonical lowercase telemetry label for this terminal state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Aborted => "aborted",
             Self::FanoutCompleted => "fanout_completed",
@@ -1911,11 +1914,12 @@ impl ParallelIngestTerminal {
         }
     }
 
-    /// Whether the WHOLE ingest operation reached a successful end.
+    /// Whether the ingest accumulation phase reached a successful end.
     ///
     /// True for an empty batch and for a serial-only run: it says the
-    /// operation finished, NOT that anything was fanned out.
-    const fn is_success(self) -> bool {
+    /// accumulation phase finished, NOT that anything was fanned out.
+    #[must_use]
+    pub const fn is_success(self) -> bool {
         matches!(
             self,
             Self::FanoutCompleted
@@ -1936,6 +1940,169 @@ impl ParallelIngestTerminal {
             QuillIndexError::Cancelled { .. } => Self::Cancelled,
             _ => Self::Aborted,
         }
+    }
+}
+
+/// Concrete execution route entered by a Quill ingest accumulation batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuillScaleoutRoute {
+    /// Shared-nothing multi-shard parallel accumulation
+    /// (`try_index_documents_internal_parallel` or `try_index_documents_parallel`).
+    SharedNothing,
+    /// Shared-nothing declined, and the batch entered the Rayon-parallel
+    /// `index_batch_fanout` fallback path.
+    FallbackFanout,
+    /// Shared-nothing declined, and the batch entered the single-threaded
+    /// `index_batch_serial` path.
+    Serial,
+}
+
+impl QuillScaleoutRoute {
+    /// Canonical lowercase telemetry label for this execution route.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SharedNothing => "shared_nothing",
+            Self::FallbackFanout => "fallback_fanout",
+            Self::Serial => "serial",
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::SharedNothing),
+            2 => Some(Self::FallbackFanout),
+            3 => Some(Self::Serial),
+            _ => None,
+        }
+    }
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::SharedNothing => 1,
+            Self::FallbackFanout => 2,
+            Self::Serial => 3,
+        }
+    }
+}
+
+/// Run-scoped public scaleout telemetry witness for one Quill ingest
+/// accumulation batch.
+///
+/// Snapshot from the batch's internal observation after typed terminal
+/// classification in `index_documents_with_replacements_observed`.
+///
+/// Notice that `accumulation_terminal` records how the *accumulation* phase
+/// ended (`index_documents_with_replacements_observed`). In
+/// [`QuillIndex::upsert_documents_observed`], four post-accumulation steps
+/// (`flush_all_shards`, `prepare_pending_manifest`, `publish_pending_segments`,
+/// and `apply_tier_policy`) run after accumulation completes; check
+/// [`QuillObservedUpsert::is_success`] (or [`QuillObservedUpsert::result`]) for
+/// the whole upsert outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuillScaleoutWitness {
+    /// Process-monotonic sequence number uniquely identifying this accumulation run.
+    pub run_seq: u64,
+    /// Width of the Rayon thread pool that executed this batch.
+    pub pool_threads: usize,
+    /// Shard tasks that entered execution during this batch.
+    pub started_shards: usize,
+    /// Shard tasks that completed execution during this batch.
+    pub completed_shards: usize,
+    /// Distinct Rayon pool worker indices observed across shard tasks.
+    pub distinct_worker_slots: usize,
+    /// Shard tasks that executed outside an identifiable Rayon worker thread.
+    pub unidentified_shards: usize,
+    /// Exact high-water mark of shard tasks simultaneously in flight.
+    pub peak_shards_in_flight: usize,
+    /// True if the worker-identity mutex could not be acquired at least once.
+    pub identity_degraded: bool,
+    /// True if the shared-nothing parallel routes declined this batch.
+    pub shared_nothing_declined: bool,
+    /// Concrete execution route entered by this batch, or `None` if the batch
+    /// exited before entering any route (for example `NoWork`, admission
+    /// refusal, or pre-route cancellation).
+    pub route: Option<QuillScaleoutRoute>,
+    /// Terminal classification of the accumulation phase.
+    pub accumulation_terminal: ParallelIngestTerminal,
+}
+
+impl QuillScaleoutWitness {
+    /// Return `Some(self)` when this batch executed on a parallel route
+    /// ([`QuillScaleoutRoute::SharedNothing`] or
+    /// [`QuillScaleoutRoute::FallbackFanout`]) and started at least one shard
+    /// task (`started_shards > 0`), or `None` when the batch executed serially
+    /// or did not fan out.
+    #[must_use]
+    pub const fn parallel_fanout(self) -> Option<Self> {
+        if self.started_shards > 0
+            && matches!(
+                self.route,
+                Some(QuillScaleoutRoute::SharedNothing | QuillScaleoutRoute::FallbackFanout)
+            )
+        {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+/// Outcome of an observed Quill batch ingest or upsert operation, pairing the
+/// whole-call `result` with the run-scoped [`QuillScaleoutWitness`] when the
+/// accumulation driver was entered.
+#[derive(Debug)]
+pub struct QuillObservedUpsert {
+    /// Whole-operation result (including post-accumulation flush, manifest
+    /// preparation, segment publication, and tier policy for upserts).
+    pub result: Result<(), QuillIndexError>,
+    witness: Option<QuillScaleoutWitness>,
+}
+
+impl QuillObservedUpsert {
+    /// Construct an observed outcome from a call result and optional witness.
+    #[must_use]
+    pub const fn new(
+        result: Result<(), QuillIndexError>,
+        witness: Option<QuillScaleoutWitness>,
+    ) -> Self {
+        Self { result, witness }
+    }
+
+    /// True iff the whole operation (`self.result`) succeeded.
+    ///
+    /// Unlike [`QuillScaleoutWitness::accumulation_terminal`], this reflects
+    /// any post-accumulation failure in `flush_all_shards`,
+    /// `prepare_pending_manifest`, `publish_pending_segments`, or
+    /// `apply_tier_policy`.
+    #[must_use]
+    pub const fn is_success(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    /// Process-monotonic `run_seq` of the accumulation batch if the
+    /// accumulation driver was entered, or `None` if the call exited before
+    /// entering the accumulation driver (for example pre-lock cancellation,
+    /// dirty-writer refusal, or active-delta refusal) or after the witness was
+    /// consumed by [`Self::take_witness`].
+    #[must_use]
+    pub const fn run_seq(&self) -> Option<u64> {
+        match &self.witness {
+            Some(witness) => Some(witness.run_seq),
+            None => None,
+        }
+    }
+
+    /// Borrow the unconsumed [`QuillScaleoutWitness`], if one was produced.
+    #[must_use]
+    pub const fn witness(&self) -> Option<&QuillScaleoutWitness> {
+        self.witness.as_ref()
+    }
+
+    /// Consume and return the run-scoped [`QuillScaleoutWitness`], leaving
+    /// `None` in its place so a second call returns `None`.
+    pub const fn take_witness(&mut self) -> Option<QuillScaleoutWitness> {
+        self.witness.take()
     }
 }
 
@@ -1974,6 +2141,7 @@ struct ParallelBatchObservation {
     /// panic or a dropped future must still publish `Aborted` rather than a
     /// stale "declined" that reads like an ending.
     shared_nothing_declined: AtomicBool,
+    route: AtomicU8,
     terminal: AtomicU8,
     /// Test-only rendezvous: when set, each shard waits inside `enter_shard`
     /// until `rendezvous_width` shards are in flight (or a deadline passes),
@@ -2004,6 +2172,7 @@ impl Default for ParallelBatchObservation {
             worker_ids: StdMutex::new(Vec::new()),
             identity_degraded: AtomicBool::new(false),
             shared_nothing_declined: AtomicBool::new(false),
+            route: AtomicU8::new(0),
             terminal: AtomicU8::new(ParallelIngestTerminal::Aborted.code()),
             #[cfg(test)]
             rendezvous_width: AtomicUsize::new(0),
@@ -2077,6 +2246,7 @@ impl ParallelBatchObservation {
     /// with each other.
     #[cfg(test)]
     fn arm_rendezvous(&self, width: usize) {
+        self.rendezvous_arrived.store(0, Ordering::Release);
         self.rendezvous_width.store(width, Ordering::Release);
     }
 
@@ -2092,6 +2262,14 @@ impl ParallelBatchObservation {
             .fetch_add(1, Ordering::AcqRel);
     }
 
+    fn set_route(&self, route: QuillScaleoutRoute) {
+        self.route.store(route.code(), Ordering::Release);
+    }
+
+    fn route(&self) -> Option<QuillScaleoutRoute> {
+        QuillScaleoutRoute::from_code(self.route.load(Ordering::Acquire))
+    }
+
     /// Set the terminal state. A SUCCESS terminal is set only after the whole
     /// ingest operation has finished, never because the parallel attempt
     /// returned `Ok`.
@@ -2101,6 +2279,23 @@ impl ParallelBatchObservation {
 
     fn terminal(&self) -> ParallelIngestTerminal {
         ParallelIngestTerminal::from_code(self.terminal.load(Ordering::Acquire))
+    }
+
+    fn scaleout_witness(&self) -> QuillScaleoutWitness {
+        let snapshot = self.snapshot();
+        QuillScaleoutWitness {
+            run_seq: snapshot.run_seq,
+            pool_threads: snapshot.pool_threads,
+            started_shards: snapshot.started_shards,
+            completed_shards: snapshot.completed_shards,
+            distinct_worker_slots: snapshot.distinct_worker_slots,
+            unidentified_shards: snapshot.unidentified_shards,
+            peak_shards_in_flight: snapshot.peak_shards_in_flight,
+            identity_degraded: snapshot.identity_degraded,
+            shared_nothing_declined: snapshot.shared_nothing_declined,
+            route: self.route(),
+            accumulation_terminal: self.terminal(),
+        }
     }
 
     fn snapshot(&self) -> ParallelWorkerWitness {
@@ -6913,7 +7108,7 @@ impl QuillWriterState {
         documents: IngestBatch<'_>,
     ) -> Result<(), QuillIndexError> {
         let replacement_ids = BTreeSet::new();
-        self.index_documents_with_replacements(
+        self.index_documents_with_replacements_observed(
             cx,
             documents,
             &replacement_ids,
@@ -6921,6 +7116,25 @@ impl QuillWriterState {
             IngestParallelismPolicy::Adaptive,
         )
         .await
+        .0
+    }
+
+    async fn index_documents_batch_observed(
+        &mut self,
+        cx: &Cx,
+        documents: IngestBatch<'_>,
+    ) -> QuillObservedUpsert {
+        let replacement_ids = BTreeSet::new();
+        let (result, witness) = self
+            .index_documents_with_replacements_observed(
+                cx,
+                documents,
+                &replacement_ids,
+                true,
+                IngestParallelismPolicy::Adaptive,
+            )
+            .await;
+        QuillObservedUpsert::new(result, Some(witness))
     }
 
     /// Index through the production scalar accumulator without parallel-planner
@@ -6945,7 +7159,7 @@ impl QuillWriterState {
     ) -> Result<(), QuillIndexError> {
         let documents = IngestBatch::Default(documents);
         let replacement_ids = BTreeSet::new();
-        self.index_documents_with_replacements(
+        self.index_documents_with_replacements_observed(
             cx,
             documents,
             &replacement_ids,
@@ -6953,6 +7167,7 @@ impl QuillWriterState {
             IngestParallelismPolicy::ScalarTopologyConformance,
         )
         .await
+        .0
     }
 
     async fn try_index_documents_internal_parallel(
@@ -7062,6 +7277,7 @@ impl QuillWriterState {
         if self.force_ingest_overlap_rendezvous {
             observation.arm_rendezvous(plan.active_shards);
         }
+        observation.set_route(QuillScaleoutRoute::SharedNothing);
         let completed = work
             .into_par_iter()
             .map(|work| {
@@ -7348,6 +7564,7 @@ impl QuillWriterState {
         if self.force_ingest_overlap_rendezvous {
             observation.arm_rendezvous(plan.active_shards);
         }
+        observation.set_route(QuillScaleoutRoute::SharedNothing);
         let completed = work
             .into_par_iter()
             .map(|work| {
@@ -7562,14 +7779,14 @@ impl QuillWriterState {
         Ok(())
     }
 
-    async fn index_documents_with_replacements(
+    async fn index_documents_with_replacements_observed(
         &mut self,
         cx: &Cx,
         documents: IngestBatch<'_>,
         replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
         parallelism_policy: IngestParallelismPolicy,
-    ) -> Result<(), QuillIndexError> {
+    ) -> (Result<(), QuillIndexError>, QuillScaleoutWitness) {
         let ingest_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::SCRIBE_INGEST,
@@ -7782,6 +7999,7 @@ impl QuillWriterState {
                         // shared-nothing route, and its own terminal, so it can never
                         // be published as serial.
                         used_fallback_fanout = true;
+                        observation.set_route(QuillScaleoutRoute::FallbackFanout);
                         self.index_batch_fanout(
                             cx,
                             documents,
@@ -7791,6 +8009,7 @@ impl QuillWriterState {
                         )
                         .await?
                     } else {
+                        observation.set_route(QuillScaleoutRoute::Serial);
                         self.index_batch_serial(cx, documents, allow_automatic_publication)
                             .await?
                     };
@@ -7826,7 +8045,8 @@ impl QuillWriterState {
             if let Err(error) = &outcome {
                 observation.set_terminal(ParallelIngestTerminal::from_error(error));
             }
-            outcome
+            let witness = observation.scaleout_witness();
+            (outcome, witness)
         }
         .instrument(instrumented)
         .await
@@ -8128,6 +8348,8 @@ impl QuillWriterState {
                 // Shared-nothing parallel accumulate. Disjoint `&mut` shard
                 // borrows are carved out in ascending shard order, scoped so
                 // the shard-vector borrow ends before the seal pass below.
+                #[cfg(test)]
+                let force_overlap = self.force_ingest_overlap_rendezvous;
                 let outcomes = {
                     let mut work: Vec<(&mut ScribeShardState, IngestBatch<'_>, DocIdSpan)> =
                         Vec::with_capacity(allocations.len());
@@ -8147,6 +8369,10 @@ impl QuillWriterState {
                             invalid_state("shard span is outside the fan-out wave")
                         })?;
                         work.push((&mut head[0], assigned, *span));
+                    }
+                    #[cfg(test)]
+                    if force_overlap {
+                        observation.arm_rendezvous(work.len());
                     }
                     work.into_par_iter()
                         .map(|(state, assigned, span)| {
@@ -8760,12 +8986,14 @@ impl QuillWriterState {
         }
     }
 
-    async fn upsert_documents_batch(
+    async fn upsert_documents_batch_observed(
         &mut self,
         cx: &Cx,
         documents: IngestBatch<'_>,
-    ) -> Result<(), QuillIndexError> {
-        check_cancel(cx, "upsert documents")?;
+    ) -> QuillObservedUpsert {
+        if let Err(error) = check_cancel(cx, "upsert documents") {
+            return QuillObservedUpsert::new(Err(error), None);
+        }
         // Publish an unrelated pending batch before replacing a live document.
         //
         // The refusal below exists because the replacement MANIFEST is derived
@@ -8803,7 +9031,10 @@ impl QuillWriterState {
         if !scalar_retry_pending
             && self.has_uncommitted_changes()
             && !self.has_active_deltas()
-            && self.batch_replaces_published_document(cx, documents)?
+            && match self.batch_replaces_published_document(cx, documents) {
+                Ok(replaces) => replaces,
+                Err(error) => return QuillObservedUpsert::new(Err(error), None),
+            }
         {
             // Refuse a malformed batch BEFORE publishing anything. Publication
             // is a side effect of accepting this call, so a batch that
@@ -8818,20 +9049,45 @@ impl QuillWriterState {
             // published snapshot, and publishing is exactly what changes that
             // answer, so those are left to the full admission pass that runs
             // after the commit against the re-derived snapshot.
-            Self::validate_commit_invariant_batch_shape(cx, documents)?;
-            self.commit(cx).await?;
+            if let Err(error) = Self::validate_commit_invariant_batch_shape(cx, documents) {
+                return QuillObservedUpsert::new(Err(error), None);
+            }
+            if let Err(error) = self.commit(cx).await {
+                return QuillObservedUpsert::new(Err(error), None);
+            }
         }
-        let snapshot = self.authority_snapshot()?;
-        let mut manifest = snapshot.next_manifest()?;
+        let snapshot = match self.authority_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => return QuillObservedUpsert::new(Err(error), None),
+        };
+        let mut manifest = match snapshot.next_manifest() {
+            Ok(manifest) => manifest,
+            Err(error) => return QuillObservedUpsert::new(Err(error.into()), None),
+        };
         let mut replacement_ids = BTreeSet::new();
         for document in documents {
-            check_cancel(cx, "upsert document batch")?;
-            if snapshot.delete_document(&mut manifest, document.id())? {
-                replacement_ids.insert(document.id());
+            if let Err(error) = check_cancel(cx, "upsert document batch") {
+                return QuillObservedUpsert::new(Err(error), None);
+            }
+            match snapshot.delete_document(&mut manifest, document.id()) {
+                Ok(true) => {
+                    replacement_ids.insert(document.id());
+                }
+                Ok(false) => {}
+                Err(error) => return QuillObservedUpsert::new(Err(error.into()), None),
             }
         }
         if replacement_ids.is_empty() {
-            return self.index_documents_batch(cx, documents).await;
+            let (result, witness) = self
+                .index_documents_with_replacements_observed(
+                    cx,
+                    documents,
+                    &replacement_ids,
+                    true,
+                    IngestParallelismPolicy::Adaptive,
+                )
+                .await;
+            return QuillObservedUpsert::new(result, Some(witness));
         }
         // `ingest_retry_required` is checked HERE, next to the pending-state
         // refusal, because `has_uncommitted_changes` does not include it: a
@@ -8857,25 +9113,28 @@ impl QuillWriterState {
             } else {
                 "uncommitted changes must be committed before replacing live documents"
             };
-            return Err(invalid_state(message));
+            return QuillObservedUpsert::new(Err(invalid_state(message)), None);
         }
         if self.has_active_deltas() {
-            return Err(invalid_state(
-                "upsert documents cannot mutate a frozen process-local Delta epoch",
-            ));
+            return QuillObservedUpsert::new(
+                Err(invalid_state(
+                    "upsert documents cannot mutate a frozen process-local Delta epoch",
+                )),
+                None,
+            );
         }
 
         self.pending_replacement_manifest = Some(manifest);
-        if let Err(error) = self
-            .index_documents_with_replacements(
+        let (accumulation_result, witness) = self
+            .index_documents_with_replacements_observed(
                 cx,
                 documents,
                 &replacement_ids,
                 false,
                 IngestParallelismPolicy::Adaptive,
             )
-            .await
-        {
+            .await;
+        if let Err(error) = accumulation_result {
             // The batch did not land — admission refused it, it was cancelled
             // or a shard failed partway through — but the proposal above
             // already carries a tombstone for every identity it meant to
@@ -8888,17 +9147,21 @@ impl QuillWriterState {
             // staged, and the retry guard disarmed because there is nothing
             // to retry.
             self.discard_scalar_transaction();
-            return Err(error);
+            return QuillObservedUpsert::new(Err(error), Some(witness));
         }
-        self.flush_all_shards(cx, LifecycleTrigger::ExplicitFlush)
-            .await?;
-        self.prepare_pending_manifest()?;
-        self.publish_pending_segments(cx, LifecycleTrigger::ExplicitFlush)
-            .await?;
-        if !self.config.bulk_load_mode {
-            self.apply_tier_policy(cx).await?;
+        let post_result = async {
+            self.flush_all_shards(cx, LifecycleTrigger::ExplicitFlush)
+                .await?;
+            self.prepare_pending_manifest()?;
+            self.publish_pending_segments(cx, LifecycleTrigger::ExplicitFlush)
+                .await?;
+            if !self.config.bulk_load_mode {
+                self.apply_tier_policy(cx).await?;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        QuillObservedUpsert::new(post_result, Some(witness))
     }
 
     /// The admission conditions that publishing cannot change.
@@ -12632,6 +12895,29 @@ impl QuillIndex {
         writer.index_documents(cx, documents).await
     }
 
+    /// Accumulate one bounded batch into the scalar writer and return the
+    /// whole-call outcome paired with its run-scoped [`QuillScaleoutWitness`].
+    ///
+    /// Pre-driver exits (such as cancellation while acquiring the writer lock)
+    /// return a [`QuillObservedUpsert`] with `result: Err(...)` and
+    /// `witness() == None` (`run_seq() == None`).
+    pub async fn index_documents_observed(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> QuillObservedUpsert {
+        let mut writer = match self.lock_writer(cx, "index writer lock").await {
+            Ok(writer) => writer,
+            Err(error) => return QuillObservedUpsert::new(Err(error), None),
+        };
+        let index_future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = QuillObservedUpsert> + Send + '_>,
+        > = Box::pin(
+            writer.index_documents_batch_observed(cx, IngestBatch::Default(documents)),
+        );
+        index_future.await
+    }
+
     /// Accumulate one bounded batch already projected onto this index's
     /// compiled schema.
     ///
@@ -12940,12 +13226,34 @@ impl QuillIndex {
         writer.delete_all(cx).await
     }
 
-    async fn upsert_documents(
+    /// Upsert one bounded batch into the scalar writer.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, writer-lock, accumulation, flush, or
+    /// publication failures.
+    pub async fn upsert_documents(
         &self,
         cx: &Cx,
         documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
-        self.upsert_documents_batch(cx, IngestBatch::Default(documents))
+        self.upsert_documents_batch_observed(cx, IngestBatch::Default(documents))
+            .await
+            .result
+    }
+
+    /// Upsert one bounded batch into the scalar writer and return the
+    /// whole-call outcome paired with its run-scoped [`QuillScaleoutWitness`].
+    ///
+    /// Pre-driver exits (such as cancellation or deduplication failure before
+    /// the accumulation driver is entered) return a [`QuillObservedUpsert`]
+    /// with `result: Err(...)` and `witness() == None` (`run_seq() == None`).
+    pub async fn upsert_documents_observed(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> QuillObservedUpsert {
+        self.upsert_documents_batch_observed(cx, IngestBatch::Default(documents))
             .await
     }
 
@@ -12959,22 +13267,30 @@ impl QuillIndex {
         cx: &Cx,
         documents: &[SchemaDocument],
     ) -> Result<(), QuillIndexError> {
-        self.upsert_documents_batch(cx, IngestBatch::Schema(documents))
+        self.upsert_documents_batch_observed(cx, IngestBatch::Schema(documents))
             .await
+            .result
     }
 
-    async fn upsert_documents_batch(
+    async fn upsert_documents_batch_observed(
         &self,
         cx: &Cx,
         documents: IngestBatch<'_>,
-    ) -> Result<(), QuillIndexError> {
-        check_cancel(cx, "upsert documents")?;
+    ) -> QuillObservedUpsert {
+        if let Err(error) = check_cancel(cx, "upsert documents") {
+            return QuillObservedUpsert::new(Err(error), None);
+        }
         let mut final_positions = HashMap::new();
-        final_positions
+        if let Err(error) = final_positions
             .try_reserve(documents.len())
-            .map_err(|_| invalid_state("could not reserve upsert identity map"))?;
+            .map_err(|_| invalid_state("could not reserve upsert identity map"))
+        {
+            return QuillObservedUpsert::new(Err(error), None);
+        }
         for (position, document) in documents.iter().enumerate() {
-            check_cancel(cx, "upsert documents")?;
+            if let Err(error) = check_cancel(cx, "upsert documents") {
+                return QuillObservedUpsert::new(Err(error), None);
+            }
             final_positions.insert(document.id(), position);
         }
 
@@ -12982,11 +13298,18 @@ impl QuillIndex {
             None
         } else {
             let mut canonical =
-                OwnedIngestBatch::with_capacity_like(documents, final_positions.len())?;
+                match OwnedIngestBatch::with_capacity_like(documents, final_positions.len()) {
+                    Ok(canonical) => canonical,
+                    Err(error) => return QuillObservedUpsert::new(Err(error), None),
+                };
             for (position, document) in documents.iter().enumerate() {
-                check_cancel(cx, "upsert documents")?;
+                if let Err(error) = check_cancel(cx, "upsert documents") {
+                    return QuillObservedUpsert::new(Err(error), None);
+                }
                 if final_positions.get(document.id()) == Some(&position) {
-                    canonical.push(document)?;
+                    if let Err(error) = canonical.push(document) {
+                        return QuillObservedUpsert::new(Err(error), None);
+                    }
                 }
             }
             Some(canonical)
@@ -12996,8 +13319,14 @@ impl QuillIndex {
         let documents = canonical
             .as_ref()
             .map_or(documents, OwnedIngestBatch::as_batch);
-        let mut writer = self.lock_writer(cx, "upsert writer lock").await?;
-        writer.upsert_documents_batch(cx, documents).await
+        let mut writer = match self.lock_writer(cx, "upsert writer lock").await {
+            Ok(writer) => writer,
+            Err(error) => return QuillObservedUpsert::new(Err(error), None),
+        };
+        let upsert_future: std::pin::Pin<
+            Box<dyn std::future::Future<Output = QuillObservedUpsert> + Send + '_>,
+        > = Box::pin(writer.upsert_documents_batch_observed(cx, documents));
+        upsert_future.await
     }
 
     /// Parse and exhaustively execute one query over the published snapshot.
@@ -37568,6 +37897,148 @@ mod tests {
                 Err(QuillIndexError::Config(SearchError::InvalidConfig { value, .. }))
                     if value == "commit_failed_after_sync"
             ));
+        });
+    }
+
+    #[test]
+    fn scaleout_witness_binds_parallel_fanout_fallback_serial_and_pre_driver_exits() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-thread scaleout witness pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let mut index = QuillIndex::in_memory(QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    scribe_shard_budget_bytes: 512 * 1024 * 1024,
+                    ..QuillConfig::default()
+                })
+                .expect("scaleout witness index");
+                index.writer_mut().force_ingest_overlap_rendezvous = true;
+
+                // 1. SharedNothing parallel fan-out (250 docs -> 3 active shards).
+                let batch1 = (0..250)
+                    .map(|ordinal| {
+                        IndexableDocument::new(
+                            format!("scaleout-sn-{ordinal:05}"),
+                            "alpha beta gamma delta",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut observed1 = index.upsert_documents_observed(&cx, &batch1).await;
+                assert!(observed1.is_success(), "result: {:?}", observed1.result);
+                let run_seq1 = observed1.run_seq().expect("shared-nothing run_seq");
+                let witness1 = observed1.take_witness().expect("shared-nothing witness");
+                assert!(
+                    observed1.take_witness().is_none(),
+                    "take_witness must be consume-once"
+                );
+                assert_eq!(witness1.run_seq, run_seq1);
+                assert_eq!(witness1.pool_threads, 4);
+                assert_eq!(witness1.started_shards, 3);
+                assert_eq!(witness1.completed_shards, 3);
+                assert_eq!(witness1.peak_shards_in_flight, 3);
+                assert_eq!(witness1.distinct_worker_slots, 3);
+                assert!(!witness1.identity_degraded);
+                assert!(!witness1.shared_nothing_declined);
+                assert_eq!(witness1.route, Some(QuillScaleoutRoute::SharedNothing));
+                assert_eq!(
+                    witness1.accumulation_terminal,
+                    ParallelIngestTerminal::FanoutCompleted
+                );
+                assert_eq!(witness1.parallel_fanout(), Some(witness1));
+
+                // 2. FallbackFanout (shards are dirty from batch1, 4 * FANOUT_MIN_SHARD_DOCUMENTS docs -> 4 shards).
+                let batch2 = (0..(4 * FANOUT_MIN_SHARD_DOCUMENTS))
+                    .map(|ordinal| {
+                        IndexableDocument::new(
+                            format!("scaleout-fb-{ordinal:05}"),
+                            "epsilon zeta eta theta",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut observed2 = index.upsert_documents_observed(&cx, &batch2).await;
+                assert!(observed2.is_success(), "result: {:?}", observed2.result);
+                let witness2 = observed2.take_witness().expect("fallback-fanout witness");
+                assert!(witness2.run_seq > witness1.run_seq);
+                assert_eq!(witness2.started_shards, 4);
+                assert_eq!(witness2.completed_shards, 4);
+                assert_eq!(witness2.peak_shards_in_flight, 4);
+                assert_eq!(witness2.distinct_worker_slots, 4);
+                assert!(witness2.shared_nothing_declined);
+                assert_eq!(witness2.route, Some(QuillScaleoutRoute::FallbackFanout));
+                assert_eq!(
+                    witness2.accumulation_terminal,
+                    ParallelIngestTerminal::FanoutFallbackCompleted
+                );
+                assert_eq!(witness2.parallel_fanout(), Some(witness2));
+
+                // 3. Serial route (8 docs < FANOUT_MIN_SHARD_DOCUMENTS * 2).
+                let batch3 = (0..8)
+                    .map(|ordinal| {
+                        IndexableDocument::new(
+                            format!("scaleout-serial-{ordinal:05}"),
+                            "iota kappa lambda mu",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut observed3 = index.upsert_documents_observed(&cx, &batch3).await;
+                assert!(observed3.is_success(), "result: {:?}", observed3.result);
+                let witness3 = observed3.take_witness().expect("serial witness");
+                assert!(witness3.run_seq > witness2.run_seq);
+                assert_eq!(witness3.started_shards, 0);
+                assert_eq!(witness3.completed_shards, 0);
+                assert_eq!(witness3.peak_shards_in_flight, 0);
+                assert_eq!(witness3.distinct_worker_slots, 0);
+                assert!(witness3.shared_nothing_declined);
+                assert_eq!(witness3.route, Some(QuillScaleoutRoute::Serial));
+                assert_eq!(
+                    witness3.accumulation_terminal,
+                    ParallelIngestTerminal::SerialCompleted
+                );
+                assert!(witness3.parallel_fanout().is_none());
+
+                // 4. Pre-driver early exit (pre-cancelled Cx before upsert_documents_observed).
+                let cancelled_cx = Cx::for_testing();
+                cancelled_cx.set_cancel_requested(true);
+                let mut observed_pre_cancel =
+                    index.upsert_documents_observed(&cancelled_cx, &batch3).await;
+                assert!(!observed_pre_cancel.is_success());
+                assert!(observed_pre_cancel.run_seq().is_none());
+                assert!(observed_pre_cancel.witness().is_none());
+                assert!(observed_pre_cancel.take_witness().is_none());
+
+                // 5. Mid-accumulation cancellation inside the accumulation driver.
+                index.commit(&cx).await.expect("commit prior batches");
+                index.writer_mut().cancel_ingest_after_documents = Some(2);
+                let mid_cancel_cx = Cx::for_testing();
+                let batch4 = (0..8)
+                    .map(|ordinal| {
+                        IndexableDocument::new(
+                            format!("scaleout-midcancel-{ordinal:05}"),
+                            "nu xi omicron pi",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut observed_mid_cancel =
+                    index.upsert_documents_observed(&mid_cancel_cx, &batch4).await;
+                assert!(!observed_mid_cancel.is_success());
+                assert!(matches!(
+                    observed_mid_cancel.result,
+                    Err(QuillIndexError::Cancelled { .. })
+                ));
+                let witness_mid = observed_mid_cancel
+                    .take_witness()
+                    .expect("mid-accumulation cancel must still produce a run-scoped witness");
+                assert!(witness_mid.run_seq > witness3.run_seq);
+                assert_eq!(witness_mid.route, Some(QuillScaleoutRoute::Serial));
+                assert_eq!(
+                    witness_mid.accumulation_terminal,
+                    ParallelIngestTerminal::Cancelled
+                );
+                assert!(witness_mid.parallel_fanout().is_none());
+            });
         });
     }
 }

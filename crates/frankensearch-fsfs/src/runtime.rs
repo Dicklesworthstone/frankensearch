@@ -19136,17 +19136,40 @@ impl FsfsRuntime {
                 let mut pipeline = LexicalPipeline::new(backend);
                 let _stats = pipeline.apply_initial(&lexical_batch)?;
                 publication_lease.fence("one-shot lexical batch resumable flush")?;
-                let resume_stats = if lexical_starts_empty {
+                let flush_result = if lexical_starts_empty {
                     // Every row is new: a file enters one batch per build and
                     // the engine held nothing, so there is no witness to check.
-                    pipeline.backend_mut().flush(cx).await?;
-                    QuillResumeStats {
-                        absent: u64::try_from(lexical_batch.len()).unwrap_or(u64::MAX),
-                        ..QuillResumeStats::default()
-                    }
+                    pipeline
+                        .backend_mut()
+                        .flush(cx)
+                        .await
+                        .map(|()| QuillResumeStats {
+                            absent: u64::try_from(lexical_batch.len()).unwrap_or(u64::MAX),
+                            ..QuillResumeStats::default()
+                        })
                 } else {
-                    pipeline.backend_mut().flush_resumable(cx).await?
+                    pipeline.backend_mut().flush_resumable(cx).await
                 };
+                for witness in pipeline.backend_mut().take_scaleout_witnesses() {
+                    debug!(
+                        run_seq = witness.run_seq,
+                        pool_threads = witness.pool_threads,
+                        started_shards = witness.started_shards,
+                        completed_shards = witness.completed_shards,
+                        distinct_worker_slots = witness.distinct_worker_slots,
+                        unidentified_shards = witness.unidentified_shards,
+                        peak_shards_in_flight = witness.peak_shards_in_flight,
+                        identity_degraded = witness.identity_degraded,
+                        shared_nothing_declined = witness.shared_nothing_declined,
+                        route = witness
+                            .route
+                            .map_or("none", frankensearch_quill::QuillScaleoutRoute::as_str),
+                        accumulation_terminal = witness.accumulation_terminal.as_str(),
+                        parallel_fanout = witness.parallel_fanout().is_some(),
+                        "Quill lexical batch scaleout witness"
+                    );
+                }
+                let resume_stats = flush_result?;
                 lexical_resume_absent = lexical_resume_absent.saturating_add(resume_stats.absent);
                 lexical_resume_unchanged =
                     lexical_resume_unchanged.saturating_add(resume_stats.unchanged);
@@ -21612,7 +21635,27 @@ impl FsfsRuntime {
             let backend = QuillLexicalBackend::new(&index);
             let mut pipeline = LexicalPipeline::new(backend);
             let stats = pipeline.apply_incremental(mutations)?;
-            pipeline.backend_mut().flush(cx).await?;
+            let flush_result = pipeline.backend_mut().flush(cx).await;
+            for witness in pipeline.backend_mut().take_scaleout_witnesses() {
+                debug!(
+                    run_seq = witness.run_seq,
+                    pool_threads = witness.pool_threads,
+                    started_shards = witness.started_shards,
+                    completed_shards = witness.completed_shards,
+                    distinct_worker_slots = witness.distinct_worker_slots,
+                    unidentified_shards = witness.unidentified_shards,
+                    peak_shards_in_flight = witness.peak_shards_in_flight,
+                    identity_degraded = witness.identity_degraded,
+                    shared_nothing_declined = witness.shared_nothing_declined,
+                    route = witness
+                        .route
+                        .map_or("none", frankensearch_quill::QuillScaleoutRoute::as_str),
+                    accumulation_terminal = witness.accumulation_terminal.as_str(),
+                    parallel_fanout = witness.parallel_fanout().is_some(),
+                    "Quill incremental lexical batch scaleout witness"
+                );
+            }
+            flush_result?;
             stats
         };
         // `flush` only hands the documents to Quill's accumulator; readers see
