@@ -1852,7 +1852,6 @@ impl InMemoryVectorIndex {
         // sidecar must remain reusable from a read-only cache root. Its full
         // source-derived comparison is necessary before attachment, but must
         // not require a publication capability that reuse never consumes.
-        #[cfg(target_os = "linux")]
         let Ok(candidate_layout) =
             ExactResidualLayout::for_shape(index.record_count(), index.dimension)
         else {
@@ -1860,11 +1859,6 @@ impl InMemoryVectorIndex {
         };
         let mut derived = None;
         for candidate in candidates {
-            // Every read of `candidate` below is behind the Linux descriptor
-            // API; off Linux the loop only re-derives, so name the deliberate
-            // non-use rather than emit an unused-variable warning there.
-            #[cfg(not(target_os = "linux"))]
-            let _ = &candidate;
             // Fail-cheap admission. Discovery filters on the header alone, so a
             // corrupt body would otherwise reach the byte-exact comparison and
             // force a full source derivation solely to learn the candidate was
@@ -1873,7 +1867,6 @@ impl InMemoryVectorIndex {
             // candidate's own self-covering digest decides that without
             // deriving anything, which is what lets the reservation-before-
             // derivation ordering below hold even when candidates exist.
-            #[cfg(target_os = "linux")]
             match exact_residual_sidecar_stream_is_self_consistent(&candidate, &candidate_layout) {
                 Ok(true) => {}
                 Ok(false) | Err(_) => continue,
@@ -1884,15 +1877,12 @@ impl InMemoryVectorIndex {
                 };
                 derived = Some(sidecar);
             }
-            #[cfg(target_os = "linux")]
             let exactly_matches = {
                 let Some(expected) = derived.as_ref() else {
                     return Ok(index);
                 };
                 exact_residual_sidecar_stream_matches_derived(&candidate, expected).unwrap_or(false)
             };
-            #[cfg(not(target_os = "linux"))]
-            let exactly_matches = false;
             if exactly_matches {
                 let Some(sidecar) = derived.take() else {
                     return Ok(index);
@@ -1907,7 +1897,6 @@ impl InMemoryVectorIndex {
         // A corrupt header-matching candidate may already have required one
         // derivation for read-only authentication above; that work is never
         // repeated here.
-        #[cfg(target_os = "linux")]
         let reserved_publication = {
             let Ok(candidate) = index.next_exact_residual_sidecar_cache_path(cache_dir) else {
                 return Ok(index);
@@ -1924,7 +1913,6 @@ impl InMemoryVectorIndex {
                 Err(_) => return Ok(index),
             },
         };
-        #[cfg(target_os = "linux")]
         match publish_exact_residual_sidecar_with_capability(reserved_publication, &sidecar) {
             Ok(ExactResidualPublication::Published) => {
                 let _ = index.exact_residual_sidecar.set(sidecar);
@@ -1936,7 +1924,6 @@ impl InMemoryVectorIndex {
             Ok(ExactResidualPublication::DestinationExists) => {}
             Err(_) => return Ok(index),
         }
-        #[cfg(target_os = "linux")]
         for _ in 0..EXACT_RESIDUAL_CACHE_ATTEMPTS {
             let Ok(candidate) = index.next_exact_residual_sidecar_cache_path(cache_dir) else {
                 break;
@@ -1953,8 +1940,6 @@ impl InMemoryVectorIndex {
                 Err(_) => break,
             }
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = sidecar;
         Ok(index)
     }
 
