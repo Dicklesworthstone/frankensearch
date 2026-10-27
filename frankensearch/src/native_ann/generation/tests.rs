@@ -976,7 +976,8 @@ mod qualified_rollback {
         AUTHORITY_PUBLISHER_LOCK_BYTES_V1, ExpectedAuthorityPairV1, PublicationOutcomeV1,
     };
     use frankensearch_index::generation_root::generation_reader::{
-        SnapshotOpenOutcomeV1, activation_manifest_path_v1, component_object_path_v1,
+        SnapshotOpenOutcomeV1, activation_manifest_path_v1, component_object_name_v1,
+        component_object_path_v1,
     };
     use frankensearch_index::generation_root::{
         GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout, QualifiedGenerationRoot,
@@ -2046,6 +2047,392 @@ mod qualified_rollback {
             assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
             assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
             assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock);
+        });
+    }
+
+    fn assert_selected_rollback_refused(
+        result: SearchResult<GenerationCandidateV1>,
+        expected_code: &str,
+    ) {
+        let Err(SearchError::InvalidConfig { field, value, .. }) = result else {
+            panic!("expected selected predecessor rollback refusal {expected_code}");
+        };
+        assert_eq!(field, "native_ann.generation.selected_rollback");
+        assert_eq!(value, expected_code);
+    }
+
+    #[test]
+    fn selected_predecessor_recovers_corrupt_current_components_without_serving_them() {
+        let parent = update_parent("damaged-current");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (name, tier, ann) in [
+                ("fast-exact", EmbedderTierTag::Fast, false),
+                ("quality-exact", EmbedderTierTag::Quality, false),
+                ("fast-ann", EmbedderTierTag::Fast, true),
+                ("quality-ann", EmbedderTierTag::Quality, true),
+            ] {
+                let retrieval = if ann {
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams {
+                            m: 4,
+                            m0: 8,
+                            ef_construction: 24,
+                            ef_search: 17,
+                        },
+                        seed: 59,
+                    }
+                } else {
+                    NativeBuildRetrieval::Exact
+                };
+                let original_provider = Arc::new(Provider::new());
+                let original = NativeIndexBuilder::new(
+                    parent.join(format!("{name}-original")),
+                    ArtifactGenerationIdentityV1::new(7, [0xb5; 16]).unwrap(),
+                    original_provider.clone(),
+                )
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+                .add_documents([
+                    IndexableDocument::new("original", "common intact predecessor")
+                        .with_title("Original healthy title")
+                        .with_metadata("version", "original"),
+                ])
+                .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 4 }, BUDGET)
+                .await
+                .unwrap();
+                let first = original
+                    .candidate(
+                        [0xb6; 16],
+                        None,
+                        GenerationAuthorityActionV1::Activate,
+                        [0xb7; 32],
+                    )
+                    .unwrap();
+                let mut changed_provider = Provider::new();
+                changed_provider.identity.producer.backend = "damaged-current-producer".to_owned();
+                changed_provider.identity.validate().unwrap();
+                let changed_provider = Arc::new(changed_provider);
+                let rebuilt = NativeIndexBuilder::new(
+                    parent.join(format!("{name}-successor")),
+                    ArtifactGenerationIdentityV1::new(8, [0xb8; 16]).unwrap(),
+                    changed_provider.clone(),
+                )
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+                .add_documents([
+                    IndexableDocument::new("successor", "common later generation")
+                        .with_metadata("version", "successor"),
+                ])
+                .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 9 }, BUDGET)
+                .await
+                .unwrap();
+                let second = rebuilt
+                    .candidate(
+                        [0xb9; 16],
+                        Some(first.authority()),
+                        GenerationAuthorityActionV1::Activate,
+                        [0xba; 32],
+                    )
+                    .unwrap();
+
+                for damaged_role in [
+                    GenerationComponentRole::Vector,
+                    GenerationComponentRole::Lexical,
+                    GenerationComponentRole::Metadata,
+                ]
+                .into_iter()
+                .chain(ann.then_some(GenerationComponentRole::Ann))
+                {
+                    let root_path = parent.join(format!("{name}-{damaged_role:?}-root"));
+                    let root = create_root(&root_path);
+                    stage(&root, &original, &first);
+                    let retained = publish(
+                        &cx,
+                        &root,
+                        &first,
+                        original.binding(),
+                        ExpectedAuthorityPairV1::default(),
+                        [0xbb; 16],
+                    );
+                    stage(&root, &rebuilt, &second);
+                    let current = publish(
+                        &cx,
+                        &root,
+                        &second,
+                        rebuilt.binding(),
+                        retained.retained_snapshot().authority_pair(),
+                        [0xbc; 16],
+                    );
+                    let expected_current_hits = current
+                        .search_text(&cx, changed_provider.as_ref(), "common", 1)
+                        .await
+                        .unwrap();
+                    for snapshot in [&retained, &current] {
+                        assert_selected_rollback_refused(
+                            snapshot.rollback_selected_predecessor_candidate(
+                                &cx, [0xbd; 16], [0xbe; 32],
+                            ),
+                            "missing-selection-provenance",
+                        );
+                    }
+                    let receipt = second
+                        .manifest()
+                        .components()
+                        .iter()
+                        .find(|(role, _)| *role == damaged_role)
+                        .unwrap()
+                        .1;
+                    let damaged_name = component_object_name_v1(damaged_role, receipt.sha256);
+                    let damaged_path = root_path.join(&damaged_name);
+                    let preserved_path = parent.join(format!("{name}-{damaged_role:?}-preserved"));
+                    // Fault injection affects only this test's generated file.
+                    // Preserve its healthy inode outside the qualified root;
+                    // create a corrupt replacement without overwriting it.
+                    fs::rename(&damaged_path, &preserved_path).unwrap();
+                    let mut damaged_bytes = rebuilt.component_bytes(damaged_role).unwrap().to_vec();
+                    damaged_bytes[0] ^= 0x80;
+                    let mut damaged_file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o400)
+                        .open(&damaged_path)
+                        .unwrap();
+                    damaged_file.write_all(&damaged_bytes).unwrap();
+                    damaged_file.sync_all().unwrap();
+                    drop(damaged_file);
+                    File::open(&root_path).unwrap().sync_all().unwrap();
+                    drop(root);
+                    let root = QualifiedGenerationRoot::admit(
+                        &root_path,
+                        GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1).unwrap(),
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        root.open_generation_snapshot_with_budget(
+                            ROOT_ID,
+                            PROFILE,
+                            None,
+                            BUDGET as u64
+                        )
+                        .unwrap(),
+                        SnapshotOpenOutcomeV1::Refused(_)
+                    ));
+                    let before_authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                    let before_lock = fs::read(root_path.join("LOCK")).unwrap();
+                    for (expected, generation, target) in [
+                        (
+                            first.authority(),
+                            original.binding().generation(),
+                            first.authority(),
+                        ),
+                        (
+                            second.authority(),
+                            rebuilt.binding().generation(),
+                            second.authority(),
+                        ),
+                        (
+                            first.authority(),
+                            original.binding().generation(),
+                            second.authority(),
+                        ),
+                        (
+                            second.authority(),
+                            original.binding().generation(),
+                            first.authority(),
+                        ),
+                    ] {
+                        assert!(matches!(
+                            root.open_predecessor_generation_for_recovery_with_budget(
+                                ROOT_ID,
+                                expected,
+                                generation,
+                                target,
+                                BUDGET as u64,
+                            )
+                            .unwrap(),
+                            SnapshotOpenOutcomeV1::Refused(_)
+                        ));
+                    }
+                    let SnapshotOpenOutcomeV1::Opened(opened) = root
+                        .open_predecessor_generation_for_recovery_with_budget(
+                            ROOT_ID,
+                            second.authority(),
+                            rebuilt.binding().generation(),
+                            first.authority(),
+                            BUDGET as u64,
+                        )
+                        .unwrap()
+                    else {
+                        panic!(
+                            "healthy predecessor must recover independently of {damaged_role:?}"
+                        );
+                    };
+                    assert_eq!(opened.head(), retained.retained_snapshot().head());
+                    assert_eq!(opened.selected_predecessor_of(), Some(second.authority()));
+                    assert_eq!(
+                        opened.authority_pair(),
+                        current.retained_snapshot().authority_pair()
+                    );
+                    assert!(!Arc::ptr_eq(&opened, retained.retained_snapshot()));
+                    assert!(
+                        NativeGenerationSnapshot::admit_exact(
+                            &cx,
+                            Arc::clone(&opened),
+                            rebuilt.binding(),
+                            DEFAULT_SCHEMA,
+                            config(),
+                            BUDGET,
+                        )
+                        .is_err()
+                    );
+                    let recovered = NativeGenerationSnapshot::admit_exact(
+                        &cx,
+                        opened,
+                        original.binding(),
+                        DEFAULT_SCHEMA,
+                        config(),
+                        BUDGET,
+                    )
+                    .unwrap();
+                    let calls = original_provider.calls.load(Ordering::SeqCst);
+                    assert_selected_rollback_refused(
+                        recovered.rollback_selected_predecessor_candidate(&cx, [0; 16], [0xbf; 32]),
+                        "invalid-candidate",
+                    );
+                    cx.set_cancel_requested(true);
+                    assert!(matches!(
+                        recovered
+                            .rollback_selected_predecessor_candidate(&cx, [0xc0; 16], [0xc1; 32]),
+                        Err(SearchError::Cancelled { .. })
+                    ));
+                    cx.set_cancel_requested(false);
+                    let rollback = recovered
+                        .rollback_selected_predecessor_candidate(&cx, [0xc2; 16], [0xc3; 32])
+                        .unwrap();
+                    let loser = recovered
+                        .rollback_selected_predecessor_candidate(&cx, [0xc4; 16], [0xc5; 32])
+                        .unwrap();
+                    assert_eq!(original_provider.calls.load(Ordering::SeqCst), calls);
+                    assert_eq!(rollback.authority().sequence, 3);
+                    assert_eq!(rollback.manifest().predecessor(), Some(second.authority()));
+                    assert_eq!(
+                        rollback.manifest().generation(),
+                        original.binding().generation()
+                    );
+                    assert_eq!(
+                        rollback.manifest().components(),
+                        first.manifest().components()
+                    );
+                    assert_eq!(
+                        rollback.manifest().source_checkpoint_sha256(),
+                        first.manifest().source_checkpoint_sha256()
+                    );
+                    assert_eq!(
+                        rollback.manifest().document_set_sha256(),
+                        first.manifest().document_set_sha256()
+                    );
+                    let ActivationManifest::V2(manifest) = rollback.manifest() else {
+                        panic!("selected rollback retains the v2 manifest contract");
+                    };
+                    assert_eq!(manifest.action, GenerationAuthorityActionV1::Rollback);
+                    let preview = recovered
+                        .search_text(&cx, original_provider.as_ref(), "common", 1)
+                        .await
+                        .unwrap();
+                    assert_eq!(preview[0].doc_id, "original");
+                    assert_eq!(
+                        fs::read(root_path.join("AUTHORITY")).unwrap(),
+                        before_authority
+                    );
+                    assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), before_lock);
+
+                    stage_manifest(&root, &rollback);
+                    stage_manifest(&root, &loser);
+                    let restored = publish(
+                        &cx,
+                        &root,
+                        &rollback,
+                        original.binding(),
+                        recovered.retained_snapshot().authority_pair(),
+                        [0xc6; 16],
+                    );
+                    assert_eq!(restored.authority().sequence, 3);
+                    assert_eq!(restored.retrieval_mode(), retained.retrieval_mode());
+                    assert_selected_rollback_refused(
+                        restored
+                            .rollback_selected_predecessor_candidate(&cx, [0xc7; 16], [0xc8; 32]),
+                        "missing-selection-provenance",
+                    );
+                    let mut publisher =
+                        GenerationPublisherV1::new(&root, ROOT_ID, [0xc9; 16], PROFILE).unwrap();
+                    let stale = publisher
+                        .prepare_attempt(
+                            &loser,
+                            recovered.retained_snapshot().authority_pair(),
+                            [0xca; 16],
+                            [0xcb; 16],
+                        )
+                        .unwrap();
+                    assert!(matches!(
+                        publisher.publish_prepared(&cx, &loser, &stale, None, BUDGET as u64),
+                        Err(crate::GenerationPublicationErrorV1::StaleExpectedAuthority)
+                            | Ok(crate::GenerationPublicationResultV1 {
+                                publication: PublicationOutcomeV1::NotCommitted(_),
+                                ..
+                            })
+                    ));
+                    for snapshot in [&retained, &recovered, &restored] {
+                        let hits = snapshot
+                            .search_text(&cx, original_provider.as_ref(), "common", 1)
+                            .await
+                            .unwrap();
+                        assert_same_scored_results(&hits, &preview);
+                        assert_eq!(hits[0].doc_id, "original");
+                        assert_eq!(hits[0].metadata.as_deref().unwrap()["version"], "original");
+                        let documents = snapshot.source_documents(&cx, BUDGET).unwrap();
+                        assert_eq!(documents[0].content, "common intact predecessor");
+                        assert_eq!(
+                            documents[0].title.as_deref(),
+                            Some("Original healthy title")
+                        );
+                    }
+                    let old_current_hits = current
+                        .search_text(&cx, changed_provider.as_ref(), "common", 1)
+                        .await
+                        .unwrap();
+                    assert_same_scored_results(&old_current_hits, &expected_current_hits);
+                    assert_eq!(old_current_hits[0].doc_id, "successor");
+                    assert!(matches!(
+                        root.open_generation_snapshot_with_budget(
+                            ROOT_ID,
+                            PROFILE,
+                            None,
+                            BUDGET as u64
+                        )
+                        .unwrap(),
+                        SnapshotOpenOutcomeV1::Opened(_)
+                    ));
+                    assert!(
+                        matches!(
+                            root.open_predecessor_generation_for_recovery_with_budget(
+                                ROOT_ID,
+                                restored.authority(),
+                                original.binding().generation(),
+                                second.authority(),
+                                BUDGET as u64,
+                            )
+                            .unwrap(),
+                            SnapshotOpenOutcomeV1::Refused(_)
+                        ),
+                        "the damaged generation cannot become a rollback target"
+                    );
+                    assert_eq!(fs::read(&damaged_path).unwrap(), damaged_bytes);
+                    assert_eq!(
+                        fs::read(&preserved_path).unwrap().as_slice(),
+                        rebuilt.component_bytes(damaged_role).unwrap().as_ref()
+                    );
+                }
+            }
         });
     }
 

@@ -80,7 +80,7 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N] [--batch-size N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
   authority-rollback --from-receipt CURRENT_JSON --target-receipt PREDECESSOR_JSON\n\
-      --receipt NEW_JSON [--max-image-bytes N]\n\n\
+      --receipt NEW_JSON [--allow-damaged-current] [--max-image-bytes N]\n\n\
 This explicit route builds one FSVI v2 tier plus a retained Quill image.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
@@ -121,6 +121,12 @@ target's original images, producer and source checkpoint, without inference.\n\
 Both receipts must name the same root, security profile and tier. The target\n\
 must still occupy the predecessor slot; arbitrary history is not discovered.\n\
 The new receipt is outside the root and supports authority-recover after a crash.\n\
+Rollback normally admits the complete current generation. Explicit\n\
+--allow-damaged-current instead authenticates its exact control state and\n\
+activation manifest, then fully admits the selected predecessor. This recovers\n\
+from damaged or missing current component images without serving them. Corrupt\n\
+control anchors, current manifests, unsafe root entries, or pending publication\n\
+still refuse. Its image budget covers both manifests and the target components.\n\
 Recovery reports commit knowledge separately from bounded reader admission.\n\
 Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
@@ -195,6 +201,7 @@ struct Options {
     retained_source: bool,
     allow_activation: bool,
     allow_updates: bool,
+    allow_damaged_current: bool,
 }
 
 pub fn is_command(command: &str) -> bool {
@@ -248,6 +255,7 @@ impl Options {
             retained_source: false,
             allow_activation: false,
             allow_updates: false,
+            allow_damaged_current: false,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -269,6 +277,9 @@ impl Options {
                 }
                 "--target-receipt" if command == Command::Rollback => {
                     options.target_receipt = Some(PathBuf::from(value(&mut args)?));
+                }
+                "--allow-damaged-current" if command == Command::Rollback => {
+                    options.allow_damaged_current = true;
                 }
                 "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
                 "--retained-source" if command == Command::Rebuild => {
@@ -1569,17 +1580,41 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     let receipt_path = new_path(&options.receipt)?;
     separate_destinations(&[&selected.root, &receipt_path])?;
     let root = admit_root(&selected.root)?;
-    // Admit the expected current selection once. The predecessor opener
-    // requires its exact physical pair and never follows a concurrent winner.
-    let current = selected.open_on_root(cx, &root, options.max_image_bytes)?;
-    current.authority().next_sequence()?;
+    let expected_current = selected.authority()?;
+    expected_current.next_sequence()?;
+    // The default route still requires a complete current reader. Recovery is
+    // an explicit alternative, never a fallback from a failed ordinary open.
+    let current = if options.allow_damaged_current {
+        None
+    } else {
+        Some(selected.open_on_root(cx, &root, options.max_image_bytes)?)
+    };
     checkpoint(cx)?;
     let target_budget = u64::try_from(options.max_image_bytes)?.min(target.image_bytes);
-    let opened = root.open_predecessor_generation_snapshot_with_budget(
-        current.retained_snapshot(),
-        target.authority()?,
-        target_budget,
-    )?;
+    let opened = match &current {
+        Some(current) => root.open_predecessor_generation_snapshot_with_budget(
+            current.retained_snapshot(),
+            target.authority()?,
+            target_budget,
+        )?,
+        None => {
+            // The recovery opener charges the current control manifest as well
+            // as the target's complete image set. Keep the target receipt's
+            // narrower bound without allowing either sum to exceed the CLI cap.
+            let recovery_budget = u64::try_from(options.max_image_bytes)?.min(
+                target
+                    .image_bytes
+                    .saturating_add(expected_current.manifest_len),
+            );
+            root.open_predecessor_generation_for_recovery_with_budget(
+                selected.root_id,
+                expected_current,
+                selected.generation,
+                target.authority()?,
+                recovery_budget,
+            )?
+        }
+    };
     checkpoint(cx)?;
     let SnapshotOpenOutcomeV1::Opened(opened) = opened else {
         return Err(bad(&format!(
@@ -1594,8 +1629,11 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     hasher.update(writer.writer_id);
     hasher.update(writer.nonce);
     hasher.update(object_id);
-    let candidate =
-        predecessor.rollback_candidate(cx, &current, object_id, hasher.finalize().into())?;
+    let fence = hasher.finalize().into();
+    let candidate = match &current {
+        Some(current) => predecessor.rollback_candidate(cx, current, object_id, fence)?,
+        None => predecessor.rollback_selected_predecessor_candidate(cx, object_id, fence)?,
+    };
     if candidate.owned_image_bytes() > u64::try_from(options.max_image_bytes)? {
         return Err(bad("rollback generation exceeds the encoded-image budget"));
     }
@@ -1603,7 +1641,9 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         GenerationPublisherV1::new(&root, selected.root_id, writer.writer_id, PROFILE)?;
     let attempt = publisher.prepare_attempt(
         &candidate,
-        current.retained_snapshot().authority_pair(),
+        // The target snapshot carries the actual current pair that authorized
+        // predecessor selection, even when current components were unreadable.
+        predecessor.retained_snapshot().authority_pair(),
         new_generation(1)?.nonce,
         new_generation(1)?.nonce,
     )?;
@@ -1647,6 +1687,11 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
             "schema": SCHEMA, "ok": true, "event": "rolled_back", "publication": "committed",
             "serving": "activated", "retrieval": retrieval_name(predecessor.retrieval_mode()),
             "receipt": receipt_path, "replaces": selected.authority, "restores": target.authority,
+            "current_admission": if options.allow_damaged_current {
+                "control_manifest_only"
+            } else {
+                "complete_generation"
+            },
             "selection": receipt,
         }),
     )

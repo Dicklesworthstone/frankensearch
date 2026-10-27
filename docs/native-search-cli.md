@@ -320,11 +320,12 @@ existing component images without loading a model or re-embedding documents:
 ```
 
 The current and target receipts must identify the same root, cooperative-local
-security profile, and semantic tier. Both complete generations must pass bounded
-admission. The target must be the current manifest's exact predecessor and must
-still occupy the other authenticated physical slot. A receipt for an arbitrary
-older generation is insufficient. This command requires a healthy current
-closure; it does not repair corrupt components or discover historical targets.
+security profile, and semantic tier. By default, both complete generations must
+pass bounded admission. The target must be the current manifest's exact
+predecessor and must still occupy the other authenticated physical slot. A
+receipt for an arbitrary older generation is insufficient. Ordinary rollback
+requires a healthy current closure; it does not repair corrupt component files
+or discover historical targets.
 
 Rollback publishes a new `Rollback` activation at the current authority sequence
 plus one. The target's artifact generation, source checkpoint, producer identity,
@@ -353,6 +354,48 @@ selects the higher authority sequence. Output failure after publication still
 reports the known committed state. An already running authority server keeps
 its retained generation until explicit activation; a producer-changing rollback
 requires restarting that server with the restored model.
+
+#### Recover when the current component images are damaged
+
+If the current vector, lexical, metadata, or ANN image is missing or corrupt,
+normal search and ordinary rollback refuse it. Explicit
+`--allow-damaged-current` restores the healthy immediate predecessor without
+opening or serving the current component images:
+
+```sh
+./target/release/frankensearch-native authority-rollback \
+  --from-receipt "$HOME/frankensearch-authority/g2.json" \
+  --target-receipt "$HOME/frankensearch-authority/g1.json" \
+  --receipt "$HOME/frankensearch-authority/recovered-g3.json" \
+  --allow-damaged-current
+```
+
+This mode still authenticates the exact current `LOCK`/`AUTHORITY` state and
+activation manifest. It checks both predecessor links, requires the target's
+actual other slot, and fully admits the target's vector, lexical, metadata, and
+optional ANN images. Two shared-lock resolutions must agree on the captured
+current pair. It never follows a new winner or creates a searchable handle for
+the damaged current generation.
+
+The mode does not bypass corrupt control anchors or a corrupt current activation
+manifest. Pending publication still requires reconciliation; a corrupt target,
+unretained ancestor, unsafe alias, WAL, or other invalid root entry still refuses
+recovery. If a damaged object is also used by the target, that target cannot pass
+complete admission. The command remains limited to the cooperative-local
+profile recorded in both receipts.
+
+The configured `--max-image-bytes` budget covers the current activation manifest
+plus the predecessor's manifest and component images. The target receipt's own
+image limit also remains enforced. No model loads, source scans, or document
+inference run. Only the new rollback activation manifest and external receipt are
+created; damaged objects remain untouched. Publication uses the captured pair
+and the existing durable attempt and `authority-recover` reconciliation path.
+
+Successful output includes `current_admission: "control_manifest_only"` for
+this explicit mode and `"complete_generation"` for ordinary rollback. This
+reports what was validated; it does not claim that skipped current components
+were examined or healthy. The restored generation always passes complete
+admission before the command reports `serving: "activated"`.
 
 ### Keep an authority generation warm across requests
 

@@ -11,8 +11,9 @@ use std::sync::Arc;
 use frankensearch_core::generation::{
     ActivationManifest, ArtifactGenerationIdentityV1, AuthorityRefV1, CanonicalDocsetV1,
     EmbedderTierTag, ExactComponentReceiptV1, ExactGenerationComponentsV1,
-    GenerationAuthorityActionV1, GenerationComponentRole, GenerationManifest, InvariantKind,
-    SourceCheckpointV1, validate_manifest,
+    GenerationAuthorityActionV1, GenerationComponentRole, GenerationManifest,
+    GenerationRootSecurityProfileV1, InvariantKind, SourceCheckpointV1, resolve_authority_slots_v1,
+    validate_manifest,
 };
 use frankensearch_index::exact_component_adapters::{
     ann_component_receipt, vector_component_receipt,
@@ -342,6 +343,90 @@ impl NativeGenerationSnapshot {
             &self.readers.components,
         )
         .map_err(|_| refused("rollback", "invalid-candidate"))
+    }
+
+    /// Propose a rollback from an explicitly admitted predecessor selection.
+    ///
+    /// The retained snapshot must carry opaque predecessor-selection provenance
+    /// from the qualified root. That admission authenticates the exact current
+    /// authority and activation manifest, plus this target's complete healthy
+    /// closure. The current generation's components may be unavailable; they
+    /// never become query-capable through this operation. Ordinary current-head
+    /// snapshots cannot use this route.
+    ///
+    /// This method derives the expected current authority from that provenance,
+    /// rechecks its consecutive predecessor link and actual two-slot pair, and
+    /// permits only the cooperative local profile without an external floor.
+    /// It retains the target's exact images, source checkpoint, producer and
+    /// artifact generation while proposing a higher authority sequence. It
+    /// performs no inference, file access, repair, or publication.
+    ///
+    /// Publish using this target's `retained_snapshot().authority_pair()`, which
+    /// captures the newer current head as well as the selected predecessor.
+    /// Persist the prepared attempt before publishing and reconcile unknown
+    /// outcomes through the ordinary publisher. A competing publication causes
+    /// the existing expected-pair fence to refuse this proposal; it never
+    /// authorizes rebasing onto a different current generation.
+    ///
+    /// # Errors
+    ///
+    /// Refuses cancellation, absent predecessor provenance, unsupported security
+    /// posture, inconsistent physical slots or predecessor links, authority
+    /// sequence exhaustion, and invalid candidate identities.
+    pub fn rollback_selected_predecessor_candidate(
+        &self,
+        cx: &Cx,
+        object_id: [u8; 16],
+        writer_fence_sha256: [u8; 32],
+    ) -> SearchResult<GenerationCandidateV1> {
+        checkpoint(cx, "native_ann.generation.selected_rollback")?;
+        let target = self.retained_snapshot();
+        let current = target
+            .selected_predecessor_of()
+            .ok_or_else(|| refused("selected_rollback", "missing-selection-provenance"))?;
+        if target.profile() != GenerationRootSecurityProfileV1::CooperativeLocal
+            || target.floor().is_some()
+            || target.health()
+                != (SnapshotHealthV1::Unanchored {
+                    profile: GenerationRootSecurityProfileV1::CooperativeLocal,
+                })
+        {
+            return Err(refused("selected_rollback", "security-profile"));
+        }
+        let pair = target.authority_pair();
+        let (Some(first), Some(second)) = (pair.first, pair.second) else {
+            return Err(refused("selected_rollback", "incomplete-authority-pair"));
+        };
+        if first.slot_index != 0
+            || second.slot_index != 1
+            || first.root_id != target.root_id()
+            || second.root_id != target.root_id()
+        {
+            return Err(refused("selected_rollback", "invalid-authority-pair"));
+        }
+        let head = resolve_authority_slots_v1(pair.first, pair.second)
+            .map_err(|_| refused("selected_rollback", "invalid-authority-pair"))?
+            .ok_or_else(|| refused("selected_rollback", "incomplete-authority-pair"))?;
+        if head.authority != current
+            || head.slot_index == target.head().slot_index
+            || ![first, second].contains(&target.head())
+            || self.authority().sequence.checked_add(1) != Some(current.sequence)
+            || current.predecessor != Some(self.authority().fingerprint())
+        {
+            return Err(refused("selected_rollback", "selection-pair-mismatch"));
+        }
+        current
+            .next_sequence()
+            .map_err(|_| refused("selected_rollback", "sequence-exhausted"))?;
+        GenerationCandidateV1::new(
+            object_id,
+            Some(current),
+            GenerationAuthorityActionV1::Rollback,
+            target.manifest().generation(),
+            writer_fence_sha256,
+            &self.readers.components,
+        )
+        .map_err(|_| refused("selected_rollback", "invalid-candidate"))
     }
 
     /// Search and hydrate against the selected vector and Quill images.

@@ -141,6 +141,7 @@ fn authority_rollback_requires_exact_receipts_and_rejects_build_or_model_options
     );
     assert!(options.models.is_none());
     assert!(options.work.is_none());
+    assert!(!options.allow_damaged_current);
     assert!(is_command("authority-rollback"));
     assert!(parse(&["authority-rollback", "--help"]).unwrap().is_none());
     for required in ["--from-receipt", "--target-receipt", "--receipt"] {
@@ -155,6 +156,11 @@ fn authority_rollback_requires_exact_receipts_and_rejects_build_or_model_options
     let mut bounded = arguments.clone();
     bounded.extend(["--max-image-bytes", "8192"]);
     assert_eq!(parse(&bounded).unwrap().unwrap().max_image_bytes, 8192);
+    let mut recovery = arguments.clone();
+    recovery.push("--allow-damaged-current");
+    assert!(parse(&recovery).unwrap().unwrap().allow_damaged_current);
+    recovery.push("--allow-damaged-current");
+    assert!(parse(&recovery).is_err());
     for extra in [
         vec!["--model-dir", "models"],
         vec!["--quality-model-dir", "models"],
@@ -199,6 +205,24 @@ fn authority_rollback_requires_exact_receipts_and_rejects_build_or_model_options
             ])
             .is_err()
         );
+    }
+    for mut rejected in [
+        index_arguments(),
+        rebuild_arguments(),
+        retained_rebuild_arguments(),
+        update_arguments(),
+        vec![
+            "authority-search",
+            "--receipt",
+            "selected.json",
+            "--query",
+            "retry",
+        ],
+        vec!["authority-serve", "--receipt", "selected.json"],
+        vec!["authority-recover", "--receipt", "selected.json"],
+    ] {
+        rejected.push("--allow-damaged-current");
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
     }
 }
 
@@ -1758,6 +1782,7 @@ mod warm_authority {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use frankensearch::IndexableDocument;
+    use frankensearch_core::generation::GenerationComponentRole;
 
     use super::*;
 
@@ -1894,6 +1919,20 @@ mod warm_authority {
             identity: identity().identity,
             calls: AtomicUsize::new(0),
         })
+    }
+
+    fn component_path(
+        root: &Path,
+        snapshot: &NativeGenerationSnapshot,
+        role: GenerationComponentRole,
+    ) -> PathBuf {
+        let receipt = snapshot
+            .retained_snapshot()
+            .manifest()
+            .components()
+            .get(role)
+            .unwrap();
+        root.join(component_object_path_v1(role, receipt.sha256).unwrap())
     }
 
     fn search_options(receipt: &Path, filter: Option<&str>) -> Options {
@@ -2407,6 +2446,7 @@ mod warm_authority {
                 assert_eq!(report["event"], "rolled_back");
                 assert_eq!(report["publication"], "committed");
                 assert_eq!(report["serving"], "activated");
+                assert_eq!(report["current_admission"], "complete_generation");
                 assert_eq!(report["retrieval"], if ann { "hnsw" } else { "exact" });
                 assert_eq!(report["replaces"], serde_json::json!(current.authority));
                 assert_eq!(report["restores"], serde_json::json!(old.authority));
@@ -2525,6 +2565,441 @@ mod warm_authority {
                 );
                 assert_eq!(fs::read(old.root.join("LOCK")).unwrap(), lock_after);
             }
+        });
+    }
+
+    #[test]
+    fn explicit_rollback_recovers_damaged_current_components_without_inference_or_rewriting_them() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann, damaged_role, missing) in [
+                (
+                    "recover-fast-exact-vector",
+                    EmbedderTierTag::Fast,
+                    false,
+                    GenerationComponentRole::Vector,
+                    false,
+                ),
+                (
+                    "recover-quality-exact-lexical",
+                    EmbedderTierTag::Quality,
+                    false,
+                    GenerationComponentRole::Lexical,
+                    true,
+                ),
+                (
+                    "recover-fast-hnsw-metadata",
+                    EmbedderTierTag::Fast,
+                    true,
+                    GenerationComponentRole::Metadata,
+                    false,
+                ),
+                (
+                    "recover-quality-hnsw-ann",
+                    EmbedderTierTag::Quality,
+                    true,
+                    GenerationComponentRole::Ann,
+                    false,
+                ),
+            ] {
+                let parent = private_parent(label);
+                let old_provider = provider();
+                let old = publish(&cx, &parent, None, &old_provider, tier, "old", ann).await;
+                let old_reader = old.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let current_provider = Arc::new(Provider {
+                    identity: {
+                        let mut identity = identity().identity;
+                        identity.producer.implementation_revision =
+                            "damaged-current-migrated-producer".to_owned();
+                        identity
+                    },
+                    calls: AtomicUsize::new(0),
+                });
+                let current = publish(
+                    &cx,
+                    &parent,
+                    Some(&old_reader),
+                    &current_provider,
+                    tier,
+                    "current",
+                    true,
+                )
+                .await;
+                let current_reader = current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let expected_pair = current_reader.retained_snapshot().authority_pair();
+                let damaged = component_path(&current.root, &current_reader, damaged_role);
+                assert_ne!(
+                    damaged,
+                    component_path(&old.root, &old_reader, damaged_role),
+                    "this fixture must damage only the current component"
+                );
+                let retained_original = parent.join("original-damaged-component");
+                let original_bytes = fs::read(&damaged).unwrap();
+                // Preserve the healthy inode and create the fault as a sealed
+                // replacement, so fault injection also works without root.
+                fs::rename(&damaged, &retained_original).unwrap();
+                if !missing {
+                    write_immutable(&cx, &damaged, b"damaged-current-component-evidence").unwrap();
+                }
+                let current_objects = current_reader
+                    .retained_snapshot()
+                    .manifest()
+                    .components()
+                    .iter()
+                    .map(|(role, _)| {
+                        let path = component_path(&current.root, &current_reader, role);
+                        let bytes = fs::read(&path).ok();
+                        (path, bytes)
+                    })
+                    .collect::<Vec<_>>();
+                let authority_before = fs::read(current.root.join("AUTHORITY")).unwrap();
+                let lock_before = fs::read(current.root.join("LOCK")).unwrap();
+                let old_receipt = fs::read(parent.join("old.json")).unwrap();
+                let current_receipt = fs::read(parent.join("current.json")).unwrap();
+                let old_calls = old_provider.calls.load(Ordering::Relaxed);
+                let current_calls = current_provider.calls.load(Ordering::Relaxed);
+                assert!(current.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                let search = search_options(&parent.join("current.json"), None);
+                let model_loads = AtomicUsize::new(0);
+                assert!(
+                    search_with_loader(&cx, &search, &mut Vec::new(), |_| {
+                        model_loads.fetch_add(1, Ordering::Relaxed);
+                        Err(bad("damaged current search must fail before model loading"))
+                    })
+                    .await
+                    .is_err()
+                );
+                assert_eq!(model_loads.load(Ordering::Relaxed), 0);
+                let mut options = parse(&rollback_arguments()).unwrap().unwrap();
+                options.from_receipt = Some(parent.join("current.json"));
+                options.target_receipt = Some(parent.join("old.json"));
+                options.receipt = parent.join("restored.json");
+                let mut output = Vec::new();
+                assert!(rollback(&cx, &options, &mut output).is_err());
+                assert!(output.is_empty());
+                assert!(!options.receipt.exists());
+                assert_eq!(
+                    fs::read(current.root.join("AUTHORITY")).unwrap(),
+                    authority_before
+                );
+                assert_eq!(fs::read(current.root.join("LOCK")).unwrap(), lock_before);
+
+                options.allow_damaged_current = true;
+                rollback(&cx, &options, &mut output).unwrap();
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["event"], "rolled_back");
+                assert_eq!(report["publication"], "committed");
+                assert_eq!(report["serving"], "activated");
+                assert_eq!(report["current_admission"], "control_manifest_only");
+                assert_eq!(report["retrieval"], if ann { "hnsw" } else { "exact" });
+                assert_eq!(report["replaces"], serde_json::json!(current.authority));
+                assert_eq!(report["restores"], serde_json::json!(old.authority));
+                assert_eq!(old_provider.calls.load(Ordering::Relaxed), old_calls);
+                assert_eq!(
+                    current_provider.calls.load(Ordering::Relaxed),
+                    current_calls
+                );
+                assert_eq!(fs::read(parent.join("old.json")).unwrap(), old_receipt);
+                assert_eq!(
+                    fs::read(parent.join("current.json")).unwrap(),
+                    current_receipt
+                );
+                for (path, bytes) in &current_objects {
+                    assert_eq!(fs::read(path).ok(), *bytes, "{}", path.display());
+                }
+                if missing {
+                    assert!(!damaged.exists());
+                }
+                assert_eq!(fs::read(&retained_original).unwrap(), original_bytes);
+                let restored = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(restored.generation, old.generation);
+                assert_eq!(restored.identity, old.identity);
+                assert_eq!(restored.tier, old.tier);
+                assert_eq!(restored.documents, old.documents);
+                assert_eq!(restored.authority().unwrap().sequence, 3);
+                assert_eq!(restored.recovery_attempt().unwrap().expected, expected_pair);
+                let reopened = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    reopened.retained_snapshot().manifest().predecessor(),
+                    Some(current.authority().unwrap())
+                );
+                assert_eq!(
+                    reopened.retained_snapshot().manifest().components(),
+                    old_reader.retained_snapshot().manifest().components()
+                );
+                assert_eq!(
+                    reopened.metadata().commit_range,
+                    old_reader.metadata().commit_range
+                );
+                assert_eq!(
+                    reopened
+                        .search_text(&cx, old_provider.as_ref(), "retry", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "retry-old"
+                );
+                assert!(
+                    reopened
+                        .search_text(&cx, current_provider.as_ref(), "retry", 1)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    current_provider.calls.load(Ordering::Relaxed),
+                    current_calls
+                );
+                assert_eq!(
+                    current_reader
+                        .search_text(&cx, current_provider.as_ref(), "retry", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "retry-current",
+                    "the previously admitted reader retains its original healthy bytes"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn damaged_current_recovery_refuses_untrusted_selection_and_preserves_a_lost_response_receipt()
+    {
+        struct ClosedOutput;
+        impl Write for ClosedOutput {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("damaged-recovery-refusal");
+            let provider = provider();
+            let ancient = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Fast,
+                "ancient",
+                false,
+            )
+            .await;
+            let ancient_reader = ancient.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let target = publish(
+                &cx,
+                &parent,
+                Some(&ancient_reader),
+                &provider,
+                EmbedderTierTag::Fast,
+                "old",
+                true,
+            )
+            .await;
+            let target_reader = target.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let current = publish(
+                &cx,
+                &parent,
+                Some(&target_reader),
+                &provider,
+                EmbedderTierTag::Fast,
+                "current",
+                true,
+            )
+            .await;
+            let current_reader = current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let damaged = component_path(
+                &current.root,
+                &current_reader,
+                GenerationComponentRole::Vector,
+            );
+            let damaged_bytes = b"preserved-current-vector-failure";
+            fs::rename(&damaged, parent.join("original-current-vector")).unwrap();
+            write_immutable(&cx, &damaged, damaged_bytes).unwrap();
+            let authority_before = fs::read(current.root.join("AUTHORITY")).unwrap();
+            let lock_before = fs::read(current.root.join("LOCK")).unwrap();
+            let target_receipt_before = fs::read(parent.join("old.json")).unwrap();
+            let current_receipt_before = fs::read(parent.join("current.json")).unwrap();
+            let calls = provider.calls.load(Ordering::Relaxed);
+            let mut options = parse(&rollback_arguments()).unwrap().unwrap();
+            options.allow_damaged_current = true;
+            options.from_receipt = Some(parent.join("current.json"));
+            options.target_receipt = Some(parent.join("old.json"));
+            let refuse = |options: &Options, label: &str| {
+                let mut output = Vec::new();
+                assert!(rollback(&cx, options, &mut output).is_err(), "{label}");
+                assert!(output.is_empty(), "{label}");
+                assert!(!options.receipt.exists(), "{label}");
+                assert_eq!(
+                    fs::read(current.root.join("AUTHORITY")).unwrap(),
+                    authority_before,
+                    "{label}"
+                );
+                assert_eq!(
+                    fs::read(current.root.join("LOCK")).unwrap(),
+                    lock_before,
+                    "{label}"
+                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), calls, "{label}");
+                assert_eq!(
+                    fs::read(parent.join("old.json")).unwrap(),
+                    target_receipt_before,
+                    "{label}"
+                );
+                assert_eq!(
+                    fs::read(parent.join("current.json")).unwrap(),
+                    current_receipt_before,
+                    "{label}"
+                );
+            };
+            for label in [
+                "not-immediate",
+                "same-head",
+                "stale-current",
+                "current-generation",
+                "target-producer",
+                "combined-budget",
+            ] {
+                options.from_receipt = Some(parent.join("current.json"));
+                options.target_receipt = Some(parent.join("old.json"));
+                options.max_image_bytes = DEFAULT_IMAGE_BYTES;
+                options.receipt = parent.join(format!("refused-{label}.json"));
+                match label {
+                    "not-immediate" => {
+                        options.target_receipt = Some(parent.join("ancient.json"));
+                    }
+                    "same-head" => options.target_receipt = Some(parent.join("current.json")),
+                    "stale-current" => {
+                        options.from_receipt = Some(parent.join("old.json"));
+                        options.target_receipt = Some(parent.join("ancient.json"));
+                    }
+                    "current-generation" => {
+                        let mut wrong = current.clone();
+                        wrong.generation.nonce[0] ^= 1;
+                        let path = parent.join("wrong-current-generation.json");
+                        fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+                        options.from_receipt = Some(path);
+                    }
+                    "target-producer" => {
+                        let mut wrong = target.clone();
+                        let mut identity = wrong.identity.identity.clone();
+                        identity.producer.implementation_revision =
+                            "wrong-damaged-recovery-target".to_owned();
+                        wrong.identity = identity.freeze().unwrap();
+                        let path = parent.join("wrong-target-producer.json");
+                        fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+                        options.target_receipt = Some(path);
+                    }
+                    "combined-budget" => {
+                        // The target itself fits exactly. Recovery must also
+                        // charge the independently authenticated current manifest.
+                        options.max_image_bytes = usize::try_from(target.image_bytes).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                refuse(&options, label);
+            }
+            options.from_receipt = Some(parent.join("current.json"));
+            options.target_receipt = Some(parent.join("old.json"));
+            options.max_image_bytes = DEFAULT_IMAGE_BYTES;
+
+            let current_manifest = current
+                .root
+                .join(activation_manifest_path_v1(current.authority().unwrap().object_id).unwrap());
+            let manifest_bytes = fs::read(&current_manifest).unwrap();
+            let preserved_manifest = parent.join("original-current-manifest");
+            fs::rename(&current_manifest, &preserved_manifest).unwrap();
+            write_immutable(&cx, &current_manifest, b"invalid-current-manifest-evidence").unwrap();
+            options.receipt = parent.join("refused-current-manifest.json");
+            refuse(&options, "current-manifest");
+            assert_eq!(
+                fs::read(&current_manifest).unwrap(),
+                b"invalid-current-manifest-evidence"
+            );
+            fs::rename(&current_manifest, parent.join("damaged-current-manifest")).unwrap();
+            fs::rename(&preserved_manifest, &current_manifest).unwrap();
+
+            // Skipping current component payload reads cannot waive the root's
+            // no-follow/no-alias contract. Keep both evidence and alias intact.
+            let saved_damage = parent.join("saved-current-vector");
+            fs::rename(&damaged, &saved_damage).unwrap();
+            std::os::unix::fs::symlink(&saved_damage, &damaged).unwrap();
+            options.receipt = parent.join("refused-current-alias.json");
+            refuse(&options, "current-component-alias");
+            assert!(
+                fs::symlink_metadata(&damaged)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            fs::rename(&damaged, parent.join("saved-current-vector-alias")).unwrap();
+            fs::rename(&saved_damage, &damaged).unwrap();
+            assert_eq!(fs::read(&damaged).unwrap(), damaged_bytes);
+
+            let target_metadata = component_path(
+                &target.root,
+                &target_reader,
+                GenerationComponentRole::Metadata,
+            );
+            let metadata_bytes = fs::read(&target_metadata).unwrap();
+            let preserved_metadata = parent.join("original-target-metadata");
+            fs::rename(&target_metadata, &preserved_metadata).unwrap();
+            write_immutable(&cx, &target_metadata, b"invalid-target-metadata-evidence").unwrap();
+            options.receipt = parent.join("refused-target-payload.json");
+            refuse(&options, "target-payload");
+            assert_eq!(
+                fs::read(&target_metadata).unwrap(),
+                b"invalid-target-metadata-evidence"
+            );
+            fs::rename(&target_metadata, parent.join("damaged-target-metadata")).unwrap();
+            fs::rename(&preserved_metadata, &target_metadata).unwrap();
+
+            options.receipt = parent.join("refused-cancelled.json");
+            cx.set_cancel_requested(true);
+            refuse(&options, "cancelled");
+            cx.set_cancel_requested(false);
+
+            // All preflight failures left the authentic predecessor usable.
+            // A broken output after the valid repair is committed, not a reason
+            // to republish; the saved attempt is sufficient for fresh recovery.
+            options.receipt = parent.join("committed-without-response.json");
+            let error = rollback(&cx, &options, &mut ClosedOutput).unwrap_err();
+            let failure = publication_failure(error.as_ref()).unwrap();
+            assert_eq!(failure["publication"], "committed");
+            assert_eq!(failure["serving"], "activated");
+            assert_eq!(failure["reason"], "result_delivery_failed");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+            let restored = Receipt::read(&options.receipt).unwrap();
+            assert_eq!(restored.generation, target.generation);
+            assert_eq!(restored.identity, target.identity);
+            assert_eq!(restored.authority().unwrap().sequence, 4);
+            assert_eq!(
+                restored.recovery_attempt().unwrap().expected,
+                current_reader.retained_snapshot().authority_pair()
+            );
+            let mut recovery = parse(&["authority-recover", "--receipt", "selected.json"])
+                .unwrap()
+                .unwrap();
+            recovery.receipt = options.receipt.clone();
+            let mut output = Vec::new();
+            recover(&cx, &recovery, &mut output).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["publication"], "committed");
+            assert_eq!(report["serving"], "activated");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+            assert_eq!(fs::read(&damaged).unwrap(), damaged_bytes);
+            assert_eq!(fs::read(&current_manifest).unwrap(), manifest_bytes);
+            assert_eq!(fs::read(&target_metadata).unwrap(), metadata_bytes);
+            let reopened = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(
+                reopened
+                    .search_text(&cx, provider.as_ref(), "retry", 1)
+                    .await
+                    .unwrap()[0]
+                    .doc_id,
+                "retry-old"
+            );
         });
     }
 
