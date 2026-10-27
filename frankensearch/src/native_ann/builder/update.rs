@@ -21,9 +21,15 @@ use frankensearch_index::native_hnsw::HnswParams;
 use frankensearch_index::{ValidatedFsviBytes, VectorIndexWriter};
 
 #[cfg(feature = "quill")]
-use super::NativeBuiltHybridIndex;
-#[cfg(feature = "quill")]
 use super::sharded::NativeBuiltShardedHybridIndex;
+#[cfg(feature = "quill")]
+use super::{NativeBuiltExactGeneration, NativeBuiltHybridIndex};
+#[cfg(feature = "quill")]
+use crate::native_ann::NativeGenerationSnapshot;
+#[cfg(feature = "quill")]
+use frankensearch_core::generation::{CommitRange, EmbedderTierTag};
+#[cfg(feature = "quill")]
+use frankensearch_index::generation_root::generation_reader::OpenedGenerationSnapshotV1;
 
 /// Pending upserts/deletes against one immutable source/vector cohort.
 ///
@@ -183,6 +189,8 @@ impl NativeIndexUpdate {
         }
         builder.reuse = Some(Arc::new(ReuseSource {
             partitions: retained,
+            #[cfg(feature = "quill")]
+            authority: None,
         }));
         checkpoint(cx, "native_ann.update.prepared")?;
         Ok(Self {
@@ -193,6 +201,78 @@ impl NativeIndexUpdate {
 }
 
 impl NativeIndexUpdate {
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn from_authority(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        provider: Arc<dyn crate::Embedder>,
+        snapshot: &NativeGenerationSnapshot,
+        max_source_bytes: usize,
+        index: Arc<NativeAnnIndex>,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.update.authority")?;
+        let predecessor = index.owner_witness().generation;
+        if generation.sequence <= predecessor.sequence {
+            return Err(invalid(
+                "update.generation",
+                "not-newer",
+                "an update requires a strictly higher generation sequence",
+            ));
+        }
+        let precision = match index.owner_witness().quantization {
+            frankensearch_index::Quantization::F32 => NativeBuildPrecision::F32,
+            frankensearch_index::Quantization::F16 => NativeBuildPrecision::F16,
+        };
+        let mut builder = NativeIndexBuilder::new(directory, generation, provider)?;
+        builder.fast.precision = precision;
+        builder.fast.retrieval = snapshot.retrieval_configuration();
+        builder.build_pool(cx)?;
+        let tier = snapshot.tier();
+        let key = match tier {
+            EmbedderTierTag::Fast => "fast",
+            EmbedderTierTag::Quality => "quality",
+        };
+        // The plan retains the actual provider output identity. Normalize only
+        // its persistence encoding, exactly as the original writer did, before
+        // comparing the COMPLETE authenticated identity, including storage.
+        let binding = builder.fast.binding(&predecessor)?;
+        if snapshot.metadata().embedders.get(key) != Some(binding.frozen_identity()) {
+            return Err(invalid(
+                "update.producer",
+                "changed",
+                "incremental reuse requires the original complete producer and storage identity",
+            ));
+        }
+        index.admit_identity(&builder.fast.identity)?;
+        let mut documents = snapshot.source_documents(cx, max_source_bytes)?;
+        documents.sort_by(|left, right| left.id.cmp(&right.id));
+        let fast = ReuseTier::from_owner(
+            cx,
+            index,
+            &documents,
+            builder.fast.identity.fingerprint(),
+            precision,
+        )?;
+        builder.reuse = Some(Arc::new(ReuseSource {
+            partitions: vec![ReusePartition {
+                documents: documents.into(),
+                fast,
+                quality: None,
+            }],
+            authority: Some(AuthorityReuse {
+                _snapshot: Arc::clone(snapshot.retained_snapshot()),
+                tier,
+                source: snapshot.metadata().commit_range.clone(),
+            }),
+        }));
+        checkpoint(cx, "native_ann.update.authority_prepared")?;
+        Ok(Self {
+            builder,
+            edits: BTreeMap::new(),
+        })
+    }
+
     /// Finalize successor vectors and graphs on this caller-owned pool.
     ///
     /// Overrides the pool inherited through the build Cx. The predecessor is
@@ -285,6 +365,66 @@ impl NativeIndexUpdate {
     /// A failed attempt never returns a partial successor or overwrites its leaf.
     pub async fn build(self, cx: &Cx) -> SearchResult<NativeBuiltIndex> {
         Box::pin(self.prepare(cx)?.build(cx)).await
+    }
+
+    /// Build complete authority-publishable components from these source edits.
+    ///
+    /// Unchanged content reuses its retained vector. Every successor vector,
+    /// lexical, metadata and optional graph image is rebuilt and admitted as one
+    /// complete cohort. This creates no authority selection and never changes
+    /// the predecessor. Use the ordinary publisher with its original expected
+    /// authority pair; a concurrent publication may still win that comparison.
+    ///
+    /// Updates begun from an authority snapshot preserve its tier label and may
+    /// not move either source-checkpoint boundary backward. As with
+    /// [`NativeIndexBuilder::build_exact_generation`], this route requires one
+    /// provider and a nonempty resulting source cohort. Finalization inherits
+    /// the configured/caller-context pool through the ordinary builder.
+    ///
+    /// # Errors
+    /// Includes edit/identity/inference/build errors and refuses an authority
+    /// tier change, backward source range, empty successor or invalid image budget.
+    #[cfg(feature = "quill")]
+    pub async fn build_exact_generation(
+        self,
+        cx: &Cx,
+        tier: EmbedderTierTag,
+        source: CommitRange,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.update.generation")?;
+        if let Some(authority) = self
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            && (tier != authority.tier
+                || source.low < authority.source.low
+                || source.high < authority.source.high)
+        {
+            return Err(invalid(
+                "update.authority_contract",
+                "changed",
+                "authority updates must preserve their tier and advance source boundaries monotonically",
+            ));
+        }
+        // The vector worker owns a reuse pin, but drops it before the composite
+        // builder exports and admits Quill. Keep this independent pin through
+        // that complete operation as well.
+        let authority_pin = self
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            .map(|authority| Arc::clone(&authority._snapshot));
+        let result =
+            Box::pin(
+                self.prepare(cx)?
+                    .build_exact_generation(cx, tier, source, max_image_bytes),
+            )
+            .await;
+        drop(authority_pin);
+        result
     }
 
     /// Repartition the edited source cohort without re-embedding unchanged rows.
@@ -427,6 +567,17 @@ pub(super) struct ReuseSource {
     // Shared by ALL successor children: no repeated source-body, vector-slab,
     // or physical-row-map copies when repartitioning the predecessor.
     partitions: Vec<ReusePartition>,
+    #[cfg(feature = "quill")]
+    authority: Option<AuthorityReuse>,
+}
+
+#[cfg(feature = "quill")]
+struct AuthorityReuse {
+    // Keep the original root/closure/reader pin even when only this prepared
+    // update remains alive, including while a blocking finalizer owns it.
+    _snapshot: Arc<OpenedGenerationSnapshotV1>,
+    tier: EmbedderTierTag,
+    source: CommitRange,
 }
 
 struct ReusePartition {
@@ -507,18 +658,48 @@ struct ReuseTier {
 
 impl ReuseTier {
     fn new(cx: &Cx, tier: &NativeBuiltTier, documents: &[IndexableDocument]) -> SearchResult<Self> {
-        let owner = Arc::clone(&tier.index.owner);
-        if owner.record_count() != documents.len() || owner.live_count() != documents.len() {
+        Self::from_owner(
+            cx,
+            Arc::clone(&tier.index),
+            documents,
+            tier.producer_identity.fingerprint(),
+            tier.precision,
+        )
+    }
+
+    fn from_owner(
+        cx: &Cx,
+        index: Arc<NativeAnnIndex>,
+        documents: &[IndexableDocument],
+        producer_fingerprint: String,
+        precision: NativeBuildPrecision,
+    ) -> SearchResult<Self> {
+        let owner = Arc::clone(&index.owner);
+        if owner.live_count() != documents.len() {
             return Err(invalid(
                 "update.source_join",
                 "cardinality",
                 "source/tier membership differs",
             ));
         }
+        for (position, document) in documents.iter().enumerate() {
+            checkpoint(cx, "native_ann.update.source_order")?;
+            if document.id.is_empty() || (position > 0 && documents[position - 1].id >= document.id)
+            {
+                return Err(invalid(
+                    "update.source_join",
+                    "order",
+                    "retained sources must have unique nonempty IDs in increasing order",
+                ));
+            }
+        }
         let mut physical_rows = vec![usize::MAX; documents.len()];
         for physical in 0..owner.record_count() {
             checkpoint(cx, "native_ann.update.row_map")?;
             let row = owner.row(physical)?;
+            if !row.flags().is_live() {
+                continue;
+            }
             let source = documents
                 .binary_search_by(|document| document.id.as_str().cmp(row.doc_id()))
                 .map_err(|_| {
@@ -528,22 +709,27 @@ impl ReuseTier {
                         "row has no source document",
                     )
                 })?;
-            if !row.flags().is_live()
-                || std::mem::replace(&mut physical_rows[source], physical) != usize::MAX
-            {
+            if std::mem::replace(&mut physical_rows[source], physical) != usize::MAX {
                 return Err(invalid(
                     "update.source_join",
-                    "duplicate-or-deleted",
+                    "duplicate",
                     "source rows must be live and unique",
                 ));
             }
         }
+        if physical_rows.contains(&usize::MAX) {
+            return Err(invalid(
+                "update.source_join",
+                "missing",
+                "every retained source must resolve to one live physical row",
+            ));
+        }
         Ok(Self {
-            index: Arc::clone(&tier.index),
+            index,
             owner,
             physical_rows,
-            producer_fingerprint: tier.producer_identity.fingerprint(),
-            precision: tier.precision,
+            producer_fingerprint,
+            precision,
         })
     }
 }

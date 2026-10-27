@@ -5,13 +5,14 @@
 //! change the bytes used by an already-admitted reader.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use frankensearch_core::generation::{
-    ActivationManifest, AuthorityRefV1, CanonicalDocsetV1, EmbedderTierTag,
-    ExactComponentReceiptV1, ExactGenerationComponentsV1, GenerationAuthorityActionV1,
-    GenerationComponentRole, GenerationManifest, InvariantKind, SourceCheckpointV1,
-    validate_manifest,
+    ActivationManifest, ArtifactGenerationIdentityV1, AuthorityRefV1, CanonicalDocsetV1,
+    EmbedderTierTag, ExactComponentReceiptV1, ExactGenerationComponentsV1,
+    GenerationAuthorityActionV1, GenerationComponentRole, GenerationManifest, InvariantKind,
+    SourceCheckpointV1, validate_manifest,
 };
 use frankensearch_index::exact_component_adapters::{
     ann_component_receipt, vector_component_receipt,
@@ -29,7 +30,7 @@ use frankensearch_quill::{
 };
 use sha2::Digest as _;
 
-use super::builder::NativeBuildRetrieval;
+use super::builder::{NativeBuildRetrieval, NativeIndexUpdate};
 use super::{NativeAnnIndex, NativeBackend, NativeRetrievalMode, checkpoint, invalid, lower_hex};
 use crate::{Cx, Embedder, GenerationCandidateV1, IndexableDocument, ScoredResult, SearchResult};
 
@@ -69,7 +70,7 @@ pub struct NativeGenerationSnapshot {
 }
 
 pub(super) struct CompositeReaders {
-    vector: NativeAnnIndex,
+    vector: Arc<NativeAnnIndex>,
     lexical: QuillSnapshotIndex,
     metadata: GenerationManifest,
     tier: EmbedderTierTag,
@@ -153,7 +154,12 @@ impl NativeGenerationSnapshot {
     /// The actual retrieval mode of this handle.
     #[must_use]
     pub const fn retrieval_mode(&self) -> NativeRetrievalMode {
-        self.readers.vector.retrieval_mode()
+        match self.readers.retrieval {
+            NativeBuildRetrieval::Exact => NativeRetrievalMode::Exact {
+                reason: super::NativeExactReason::Requested,
+            },
+            NativeBuildRetrieval::Hnsw { .. } => NativeRetrievalMode::Ann,
+        }
     }
 
     /// The authenticated construction/search policy retained by this generation.
@@ -201,6 +207,45 @@ impl NativeGenerationSnapshot {
         max_source_bytes: usize,
     ) -> SearchResult<Vec<IndexableDocument>> {
         self.readers.source_documents(cx, max_source_bytes)
+    }
+
+    /// Prepare incremental upserts and deletes against this exact retained cohort.
+    ///
+    /// The provider must reproduce the complete admitted embedding identity,
+    /// including its persisted storage contract. Precision and native graph
+    /// parameters/seed are inherited. Unchanged content reuses its exact stored
+    /// vector; title/metadata edits still replace the retained source document.
+    /// Models are never discovered or substituted, and no source/artifact path
+    /// is reopened. The update retains the original authority pin and vector
+    /// owner, including while a successor is finalized on a caller-owned pool.
+    ///
+    /// Source export uses [`Self::source_documents`]' payload budget. Preparation
+    /// is synchronous and belongs on the caller's blocking lane for large
+    /// cohorts. No directory, inference or publication starts during this call.
+    /// Finish with [`NativeIndexUpdate::build_exact_generation`] and publish its
+    /// complete result through the normal expected-authority publisher. The
+    /// original snapshot remains independently searchable throughout.
+    ///
+    /// # Errors
+    /// Refuses cancellation, non-newer artifact generations, changed producers,
+    /// unsupported storage, source-budget exhaustion or inconsistent live rows.
+    pub fn begin_update(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        provider: Arc<dyn Embedder>,
+        max_source_bytes: usize,
+    ) -> SearchResult<NativeIndexUpdate> {
+        NativeIndexUpdate::from_authority(
+            cx,
+            directory,
+            generation,
+            provider,
+            self,
+            max_source_bytes,
+            Arc::clone(&self.readers.vector),
+        )
     }
 
     /// Propose this retained generation as a rollback of `current`.
@@ -648,7 +693,7 @@ pub(super) fn admit_components(
     let lexical = lexical_result.map_err(|_| refused("lexical", "invalid-search-configuration"))?;
     let tier = metadata.vector_artifacts[0].embedder_tier;
     Ok(CompositeReaders {
-        vector,
+        vector: Arc::new(vector),
         lexical,
         metadata,
         tier,

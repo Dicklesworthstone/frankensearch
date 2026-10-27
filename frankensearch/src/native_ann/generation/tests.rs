@@ -1063,6 +1063,429 @@ mod qualified_rollback {
             .unwrap()
     }
 
+    fn update_parent(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+            ".frankensearch-native-update-{label}-{}-{stamp}",
+            std::process::id(),
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        parent
+    }
+
+    fn publish_fixture(
+        cx: &Cx,
+        root: &QualifiedGenerationRoot,
+        fixture: &Fixture,
+    ) -> NativeGenerationSnapshot {
+        let readers = fixture.admit(cx).unwrap();
+        let candidate = GenerationCandidateV1::new(
+            [0xa1; 16],
+            None,
+            GenerationAuthorityActionV1::Activate,
+            fixture.binding.generation(),
+            [0xa2; 32],
+            &readers.components,
+        )
+        .unwrap();
+        for (role, receipt) in candidate.manifest().components().iter() {
+            let bytes = match role {
+                GenerationComponentRole::Vector => &fixture.images[0],
+                GenerationComponentRole::Lexical => &fixture.images[1],
+                GenerationComponentRole::Metadata => &fixture.images[2],
+                GenerationComponentRole::Ann => fixture.ann.as_ref().unwrap(),
+            };
+            root.stage_immutable_file(
+                &component_object_path_v1(role, receipt.sha256).unwrap(),
+                bytes,
+            )
+            .unwrap();
+        }
+        stage_manifest(root, &candidate);
+        publish(
+            cx,
+            root,
+            &candidate,
+            &fixture.binding,
+            ExpectedAuthorityPairV1::default(),
+            [0xa3; 16],
+        )
+    }
+
+    fn stored_vector(readers: &CompositeReaders, id: &str) -> Vec<f32> {
+        let owner = &readers.vector.owner;
+        let physical = (0..owner.record_count())
+            .find(|physical| owner.row(*physical).unwrap().doc_id() == id)
+            .unwrap();
+        owner.vector_at_f32(physical).unwrap()
+    }
+
+    #[test]
+    fn authority_updates_reuse_live_rows_and_preserve_searchable_predecessors() {
+        let parent = update_parent("live-rows");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (name, tier, ann) in [
+                ("fast-exact", EmbedderTierTag::Fast, false),
+                ("quality-exact", EmbedderTierTag::Quality, false),
+                ("fast-ann", EmbedderTierTag::Fast, true),
+                ("quality-ann", EmbedderTierTag::Quality, true),
+            ] {
+                let provider = Arc::new(Provider::new());
+                let mut fixture = fixture(&cx, provider.as_ref(), tier).await;
+                // Physical FSVI order differs from the source-ID order used by
+                // incremental merging, and includes an additional dead row.
+                assert_eq!(source_ids(&fixture), ["beta", "alpha"]);
+                let params = HnswParams {
+                    m: 4,
+                    m0: 8,
+                    ef_construction: 24,
+                    ef_search: 17,
+                };
+                if ann {
+                    fixture = fixture.with_ann(&cx, params, 123);
+                }
+                let root_path = parent.join(format!("{name}-root"));
+                let root = create_root(&root_path);
+                let retained = publish_fixture(&cx, &root, &fixture);
+                let original_vector = stored_vector(&retained.readers, "beta");
+                assert_eq!(original_vector, [0.8, 0.6]);
+                let old_pair = retained.retained_snapshot().authority_pair();
+                let old_authority = retained.authority();
+                let authority_bytes = fs::read(root_path.join("AUTHORITY")).unwrap();
+                let lock_bytes = fs::read(root_path.join("LOCK")).unwrap();
+                let update = retained
+                    .begin_update(
+                        &cx,
+                        parent.join(format!("{name}-successor")),
+                        ArtifactGenerationIdentityV1::new(8, [0xa4; 16]).unwrap(),
+                        provider.clone(),
+                        BUDGET,
+                    )
+                    .unwrap()
+                    .delete_document("alpha")
+                    .upsert_document(
+                        IndexableDocument::new("beta", "common retained document")
+                            .with_title("Updated title")
+                            .with_metadata("version", "new"),
+                    )
+                    .upsert_document(IndexableDocument::new("gamma", "common inserted source"));
+                // The predecessor's paths no longer exist; every reused byte
+                // and full source payload must come from its retained handles.
+                fs::rename(
+                    fixture.directory.path().join("source"),
+                    fixture.directory.path().join("relocated"),
+                )
+                .unwrap();
+                let built = update
+                    .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 8 }, BUDGET)
+                    .await
+                    .unwrap();
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(built.metadata().total_documents, 2);
+                assert_eq!(built.metadata().vector_artifacts[0].vector_count, 2);
+                assert_eq!(
+                    built.binding().frozen_identity(),
+                    fixture.binding.frozen_identity()
+                );
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_bytes
+                );
+                assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_bytes);
+                let candidate = built
+                    .candidate(
+                        [0xa5; 16],
+                        Some(old_authority),
+                        GenerationAuthorityActionV1::Activate,
+                        [0xa6; 32],
+                    )
+                    .unwrap();
+                built.validate_candidate(&cx, &candidate).unwrap();
+                assert_eq!(candidate.manifest().components().ann.is_some(), ann);
+                stage(&root, &built, &candidate);
+                let current = publish(
+                    &cx,
+                    &root,
+                    &candidate,
+                    built.binding(),
+                    old_pair,
+                    [0xa7; 16],
+                );
+                assert_eq!(stored_vector(&current.readers, "beta"), original_vector);
+                assert_eq!(stored_vector(&current.readers, "gamma"), [1.0, 0.0]);
+                match current.retrieval_configuration() {
+                    NativeBuildRetrieval::Exact => assert!(!ann),
+                    NativeBuildRetrieval::Hnsw {
+                        params: actual,
+                        seed,
+                    } => {
+                        assert!(ann);
+                        assert_eq!(actual, params);
+                        assert_eq!(seed, 123);
+                    }
+                }
+                let documents = current.source_documents(&cx, BUDGET).unwrap();
+                assert_eq!(documents.len(), 2);
+                let beta = documents.iter().find(|doc| doc.id == "beta").unwrap();
+                assert_eq!(beta.content, "common retained document");
+                assert_eq!(beta.title.as_deref(), Some("Updated title"));
+                assert_eq!(beta.metadata["version"], "new");
+                assert!(
+                    !documents
+                        .iter()
+                        .any(|doc| doc.id == "alpha" || doc.id == "dead")
+                );
+
+                let calls = provider.calls.load(Ordering::SeqCst);
+                let changed = current
+                    .begin_update(
+                        &cx,
+                        parent.join(format!("{name}-changed")),
+                        ArtifactGenerationIdentityV1::new(9, [0xa8; 16]).unwrap(),
+                        provider.clone(),
+                        BUDGET,
+                    )
+                    .unwrap()
+                    .upsert_document(IndexableDocument::new("gamma", "changed complete source"))
+                    .build_exact_generation(&cx, tier, CommitRange { low: 2, high: 9 }, BUDGET)
+                    .await
+                    .unwrap();
+                assert_eq!(provider.calls.load(Ordering::SeqCst), calls + 1);
+                let changed_candidate = changed
+                    .candidate(
+                        [0xa9; 16],
+                        Some(current.authority()),
+                        GenerationAuthorityActionV1::Activate,
+                        [0xaa; 32],
+                    )
+                    .unwrap();
+                changed.validate_candidate(&cx, &changed_candidate).unwrap();
+                let changed_readers = admit_components(
+                    &cx,
+                    changed_candidate.manifest(),
+                    changed.binding(),
+                    DEFAULT_SCHEMA,
+                    config(),
+                    [
+                        GenerationComponentRole::Vector,
+                        GenerationComponentRole::Lexical,
+                        GenerationComponentRole::Metadata,
+                    ]
+                    .map(|role| changed.component_bytes(role).unwrap()),
+                    changed.component_bytes(GenerationComponentRole::Ann),
+                    BUDGET,
+                )
+                .unwrap();
+                assert_eq!(stored_vector(&changed_readers, "beta"), original_vector);
+                assert!(
+                    changed_readers
+                        .source_documents(&cx, BUDGET)
+                        .unwrap()
+                        .iter()
+                        .any(|doc| {
+                            doc.id == "gamma" && doc.content == "changed complete source"
+                        })
+                );
+                let old_hits = retained
+                    .search_text(&cx, provider.as_ref(), "common", 5)
+                    .await
+                    .unwrap();
+                let new_hits = current
+                    .search_text(&cx, provider.as_ref(), "common", 5)
+                    .await
+                    .unwrap();
+                assert!(old_hits.iter().any(|hit| hit.doc_id == "alpha"));
+                assert!(
+                    !old_hits
+                        .iter()
+                        .any(|hit| hit.doc_id == "gamma" || hit.doc_id == "dead")
+                );
+                assert!(new_hits.iter().any(|hit| hit.doc_id == "gamma"));
+                assert!(
+                    !new_hits
+                        .iter()
+                        .any(|hit| hit.doc_id == "alpha" || hit.doc_id == "dead")
+                );
+                assert_eq!(
+                    retained.metadata().commit_range,
+                    CommitRange { low: 1, high: 4 }
+                );
+                assert_eq!(
+                    current.metadata().commit_range,
+                    CommitRange { low: 1, high: 8 }
+                );
+
+                let pin = Arc::downgrade(retained.retained_snapshot());
+                let pending = retained
+                    .begin_update(
+                        &cx,
+                        parent.join(format!("{name}-held")),
+                        ArtifactGenerationIdentityV1::new(10, [0xab; 16]).unwrap(),
+                        provider.clone(),
+                        BUDGET,
+                    )
+                    .unwrap();
+                drop(retained);
+                assert!(
+                    pin.upgrade().is_some(),
+                    "pending updates retain the admitted authority"
+                );
+                drop(pending);
+                assert!(pin.upgrade().is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn authority_updates_refuse_invalid_contracts_before_inference_or_work() {
+        let parent = update_parent("refusals");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let provider = Arc::new(Provider::new());
+            let fixture = fixture(&cx, provider.as_ref(), EmbedderTierTag::Fast).await;
+            let root_path = parent.join("root");
+            let root = create_root(&root_path);
+            let retained = publish_fixture(&cx, &root, &fixture);
+            let work = parent.join("must-not-exist");
+            let newer = ArtifactGenerationIdentityV1::new(8, [0xac; 16]).unwrap();
+            let authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+            let lock = fs::read(root_path.join("LOCK")).unwrap();
+            for sequence in [1, 7] {
+                assert!(
+                    retained
+                        .begin_update(
+                            &cx,
+                            &work,
+                            ArtifactGenerationIdentityV1::new(sequence, [0xad; 16]).unwrap(),
+                            provider.clone(),
+                            BUDGET,
+                        )
+                        .is_err()
+                );
+            }
+            for changed in ["producer", "input", "storage"] {
+                let mut foreign = Provider::new();
+                match changed {
+                    "producer" => foreign.identity.producer.backend = "different".to_owned(),
+                    "input" => foreign.identity.input.content_selection = "different".to_owned(),
+                    _ => foreign.identity.storage.vector_normalization = "different".to_owned(),
+                }
+                // Each foreign bundle must be internally valid so the test
+                // reaches predecessor admission rather than identity parsing.
+                foreign.identity.space.input_contract_fingerprint =
+                    foreign.identity.input.fingerprint();
+                foreign.identity.space.output_normalization =
+                    foreign.identity.storage.vector_normalization.clone();
+                foreign.identity.producer.space_fingerprint = foreign.identity.space.fingerprint();
+                foreign.identity.validate().unwrap();
+                let foreign = Arc::new(foreign);
+                assert!(matches!(
+                    retained.begin_update(&cx, &work, newer, foreign.clone(), BUDGET),
+                    Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.update.producer"
+                ));
+                assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+            }
+            assert!(
+                retained
+                    .begin_update(&cx, &work, newer, provider.clone(), 0)
+                    .is_err()
+            );
+            for (tier, source, budget, empty) in [
+                (
+                    EmbedderTierTag::Quality,
+                    CommitRange { low: 1, high: 8 },
+                    BUDGET,
+                    false,
+                ),
+                (
+                    EmbedderTierTag::Fast,
+                    CommitRange { low: 0, high: 8 },
+                    BUDGET,
+                    false,
+                ),
+                (
+                    EmbedderTierTag::Fast,
+                    CommitRange { low: 1, high: 3 },
+                    BUDGET,
+                    false,
+                ),
+                (
+                    EmbedderTierTag::Fast,
+                    CommitRange { low: 9, high: 8 },
+                    BUDGET,
+                    false,
+                ),
+                (
+                    EmbedderTierTag::Fast,
+                    CommitRange { low: 1, high: 8 },
+                    BUDGET,
+                    true,
+                ),
+                (
+                    EmbedderTierTag::Fast,
+                    CommitRange { low: 1, high: 8 },
+                    0,
+                    false,
+                ),
+            ] {
+                let mut update = retained
+                    .begin_update(&cx, &work, newer, provider.clone(), BUDGET)
+                    .unwrap();
+                if empty {
+                    update = update.delete_document("alpha").delete_document("beta");
+                } else {
+                    update = update.upsert_document(IndexableDocument::new("gamma", "new source"));
+                }
+                assert!(
+                    update
+                        .build_exact_generation(&cx, tier, source, budget)
+                        .await
+                        .is_err()
+                );
+                assert!(!work.exists());
+                assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            }
+            let pending = retained
+                .begin_update(&cx, &work, newer, provider.clone(), BUDGET)
+                .unwrap()
+                .upsert_document(IndexableDocument::new("gamma", "new source"));
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                retained.begin_update(&cx, &work, newer, provider.clone(), BUDGET),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                pending
+                    .build_exact_generation(
+                        &cx,
+                        EmbedderTierTag::Fast,
+                        CommitRange { low: 1, high: 8 },
+                        BUDGET
+                    )
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            let stopped = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+            let handle = stopped.handle();
+            assert!(stopped.shutdown_and_wait(std::time::Duration::from_secs(10)));
+            let stopped_cx = cx.clone().with_blocking_pool_handle(Some(handle));
+            assert!(matches!(
+                retained.begin_update(&stopped_cx, &work, newer, provider.clone(), BUDGET),
+                Err(SearchError::SubsystemError {
+                    subsystem: "native_ann.build_worker",
+                    ..
+                })
+            ));
+            assert!(!work.exists());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), authority);
+            assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock);
+        });
+    }
+
     #[test]
     fn retained_rollback_advances_authority_preserves_producer_and_fences_stale_publishers() {
         // Do not weaken qualification or skip on overlay/tmpfs: this lifecycle
