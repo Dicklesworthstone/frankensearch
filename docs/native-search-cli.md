@@ -176,6 +176,53 @@ receipt to try a new replacement. Successful output has `event: "rebuilt"`,
 whether the model identity changed. A later output failure still reports the
 known commit.
 
+### Keep an authority generation warm across requests
+
+`authority-serve` opens one selected generation and loads its local producer once,
+then serves bounded JSONL requests from standard input:
+
+```sh
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --model-dir /absolute/path/to/installed/models --limit 10 --allow-activation
+```
+
+After the `ready` event, send requests such as:
+
+```json
+{"id":"first","query":"retry network requests","limit":10}
+{"id":"second","query":"connection pooling","limit":5}
+```
+
+Each request searches the retained vector, lexical and optional HNSW images with
+the warm producer. It does not reload models, rediscover component paths or follow
+the root's current authority implicitly. Publishing a newer generation elsewhere
+does not redirect an already running session. Results identify the authority,
+artifact generation, tier and actual retrieval mode used for that request.
+
+With `--allow-activation`, the stdin controller can explicitly install a newer
+receipt between requests. Send `op: "activate"`, `receipt` naming the new receipt,
+and `expected_authority` copied exactly from the session's last successful
+selection event. The new receipt must select a higher authority sequence in the
+same root, security profile and tier, with the same producer, embedding space and
+input contract. Intentional rollback can therefore install older artifact bytes
+under its new, higher authority sequence. A producer migration requires restarting
+the server with that generation's local model configuration.
+
+Activation admits the complete candidate through the root descriptor retained at
+startup and swaps readers only after all checks pass. A malformed, foreign,
+corrupt or stale activation reports a failed request and leaves the previous
+reader installed. Search requests cannot change activation permission, the image
+budget or the producer. Omitting `--allow-activation` keeps the session pinned to
+its startup generation.
+
+Input records are limited to 1 MiB. An oversized record stops the session without
+draining it; an ordinary invalid bounded request produces one failure response.
+Responses are completely encoded under the existing native CLI output bound
+before emission. Output failure stops the session. Send `quit`, `exit`, or EOF
+to finish. As with the existing native stdio server, input reads block on the
+owning lane, and cancellation is observed between reads and requests.
+
 ### Quality models, budgets, and publication recovery
 
 For quality-only native inference, build with `hybrid-native` as described below
@@ -305,7 +352,8 @@ rollback or failure. This is a retained-snapshot library API; it does not add
 historical discovery through paths or a rollback CLI command.
 
 The authority commands provide initial publication, full-cohort successor
-rebuilds, authority-selected exact or HNSW search, and publication recovery. The existing
+rebuilds, authority-selected exact or HNSW search, warm stdio serving with explicit
+activation, and publication recovery. The existing
 `update`, `rebuild`, and `serve` commands
 continue to use their own selected-snapshot receipts. Work files and staged
 candidates remain available after success or failure.

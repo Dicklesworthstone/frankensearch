@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,7 +34,8 @@ use frankensearch_index::generation_root::generation_reader::{
     SnapshotOpenOutcomeV1, activation_manifest_path_v1, component_object_path_v1,
 };
 use frankensearch_index::generation_root::{
-    GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout, QualifiedGenerationRoot,
+    GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout, GenerationRootObjectWitness,
+    QualifiedGenerationRoot,
 };
 use frankensearch_index::native_hnsw::HnswParams;
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
@@ -61,6 +62,9 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
+      [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
+      [--max-image-bytes N]\n\n\
+  authority-serve --receipt JSON [--limit N] [--allow-activation]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--max-image-bytes N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
@@ -91,6 +95,18 @@ Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
 by authority-index. Search refuses a head different from the receipt.\n\
 The default encoded-image budget is 256 MiB, checked before component reads.\n\
+authority-serve retains one admitted generation and its local model for bounded\n\
+JSONL requests: {\"id\":\"q1\",\"query\":\"text\",\"limit\":10}. It never follows a new\n\
+authority implicitly. With --allow-activation, an explicit request may select a\n\
+new receipt: {\"op\":\"activate\",\"receipt\":\"/absolute/new.json\",\n\
+\"expected_authority\":[...the current ready/results authority bytes...]}.\n\
+Activation keeps the same qualified root, tier, security profile and producer.\n\
+It admits the complete currently selected successor before swapping readers;\n\
+rejection retains the previous reader and returns a bounded failed response.\n\
+Authority sequence must advance, including rollback to older artifact generations.\n\
+Model migration requires restarting with the new receipt and local model options.\n\
+Requests are limited to 1 MiB; oversized input or output failure ends the session.\n\
+Send quit/exit or close stdin to stop. Reads block on the owning execution lane.\n\
 Work files remain available after completion or failure. Stdout is JSON.\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +114,7 @@ enum Command {
     Index,
     Rebuild,
     Search,
+    Serve,
     Recover,
 }
 
@@ -120,12 +137,17 @@ struct Options {
     max_image_bytes: usize,
     cooperative_local: bool,
     migrate_model: bool,
+    allow_activation: bool,
 }
 
 pub fn is_command(command: &str) -> bool {
     matches!(
         command,
-        "authority-index" | "authority-rebuild" | "authority-search" | "authority-recover"
+        "authority-index"
+            | "authority-rebuild"
+            | "authority-search"
+            | "authority-serve"
+            | "authority-recover"
     )
 }
 
@@ -136,6 +158,7 @@ impl Options {
             Some("authority-index") => Command::Index,
             Some("authority-rebuild") => Command::Rebuild,
             Some("authority-search") => Command::Search,
+            Some("authority-serve") => Command::Serve,
             Some("authority-recover") => Command::Recover,
             _ => return Err(bad("unknown authority command")),
         };
@@ -158,6 +181,7 @@ impl Options {
             max_image_bytes: DEFAULT_IMAGE_BYTES,
             cooperative_local: false,
             migrate_model: false,
+            allow_activation: false,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -173,6 +197,9 @@ impl Options {
                     options.from_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
+                "--allow-activation" if command == Command::Serve => {
+                    options.allow_activation = true
+                }
                 "--model-dir" if command != Command::Recover => {
                     options.models = Some(PathBuf::from(value(&mut args)?));
                 }
@@ -225,7 +252,7 @@ impl Options {
                     options.cooperative_local = true;
                 }
                 "--query" if command == Command::Search => options.query = Some(value(&mut args)?),
-                "--limit" if command == Command::Search => {
+                "--limit" if matches!(command, Command::Search | Command::Serve) => {
                     options.limit = number(&value(&mut args)?, 1_000)?;
                 }
                 _ => return Err(bad("unknown or inapplicable authority option")),
@@ -263,7 +290,7 @@ impl Options {
                 }
                 options.source_cut()?;
             }
-            Command::Recover => {}
+            Command::Serve | Command::Recover => {}
         }
         Ok(Some(options))
     }
@@ -1043,6 +1070,375 @@ async fn search(
     )
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthoritySearchRequest {
+    id: Option<String>,
+    query: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityActivateRequest {
+    op: String,
+    id: Option<String>,
+    receipt: PathBuf,
+    expected_authority: Vec<u8>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AuthorityRequest {
+    Search(AuthoritySearchRequest),
+    Activate(AuthorityActivateRequest),
+}
+
+#[derive(Debug)]
+struct AuthorityServeRefusal(&'static str);
+
+impl fmt::Display for AuthorityServeRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "authority serving refused: {}", self.0)
+    }
+}
+
+impl Error for AuthorityServeRefusal {}
+
+fn serve_refused(code: &'static str) -> Box<dyn Error + Send + Sync> {
+    Box::new(AuthorityServeRefusal(code))
+}
+
+fn same_security_object(
+    first: GenerationRootObjectWitness,
+    second: GenerationRootObjectWitness,
+) -> bool {
+    first.device() == second.device()
+        && first.inode() == second.inode()
+        && first.mode() == second.mode()
+        && first.uid() == second.uid()
+        && first.gid() == second.gid()
+        && first.mount_identity() == second.mount_identity()
+        && first.filesystem() == second.filesystem()
+}
+
+fn same_query_contract(
+    first: &FrozenEmbeddingIdentityBundleV1,
+    second: &FrozenEmbeddingIdentityBundleV1,
+) -> bool {
+    first.identity.space == second.identity.space
+        && first.identity.producer == second.identity.producer
+        && first.identity.input == second.identity.input
+}
+
+fn admit_serving_model(receipt: &Receipt, model: &dyn Embedder) -> Result<()> {
+    let identity = model
+        .identity()
+        .map_err(|_| serve_refused("producer_identity_unavailable"))?;
+    identity
+        .validate()
+        .map_err(|_| serve_refused("producer_identity_invalid"))?;
+    // Queries carry in-memory vectors. Persisted F16/F32 encoding may change
+    // between admitted generations without changing their query producer.
+    let expected = &receipt.identity.identity;
+    if identity.space != expected.space
+        || identity.producer != expected.producer
+        || identity.input != expected.input
+        || usize::try_from(identity.space.dimension).ok() != Some(model.dimension())
+    {
+        return Err(serve_refused("producer_identity_mismatch"));
+    }
+    Ok(())
+}
+
+/// One admitted search/model selection. Request execution owns this whole
+/// value; no selected component or model is rediscovered between query stages.
+struct AuthoritySession {
+    root: QualifiedGenerationRoot,
+    receipt: Receipt,
+    snapshot: NativeGenerationSnapshot,
+    model: Arc<dyn Embedder>,
+    default_limit: usize,
+    max_image_bytes: usize,
+    allow_activation: bool,
+}
+
+impl AuthoritySession {
+    fn new(
+        cx: &Cx,
+        root: QualifiedGenerationRoot,
+        receipt: Receipt,
+        snapshot: NativeGenerationSnapshot,
+        model: Arc<dyn Embedder>,
+        limits: (usize, usize),
+        allow_activation: bool,
+    ) -> Result<Self> {
+        checkpoint(cx)?;
+        receipt.validate()?;
+        let retained = snapshot.retained_snapshot();
+        let anchors = root.anchor_witnesses();
+        let old_anchors = retained.anchor_witnesses();
+        let budget = u64::try_from(limits.1)?;
+        let image_bytes = retained.manifest().components().iter().try_fold(
+            u64::try_from(retained.manifest_bytes().len())?,
+            |total, (_, component)| total.checked_add(component.byte_len),
+        );
+        let tier_name = match receipt.tier {
+            EmbedderTierTag::Fast => "fast",
+            EmbedderTierTag::Quality => "quality",
+        };
+        if limits.0 == 0
+            || limits.0 > 1_000
+            || limits.1 == 0
+            || image_bytes.is_none_or(|bytes| bytes > budget || bytes > receipt.image_bytes)
+            || retained.root_id() != receipt.root_id
+            || retained.profile().as_str() != receipt.profile
+            || snapshot.authority() != receipt.authority()?
+            || snapshot.tier() != receipt.tier
+            || snapshot.metadata().total_documents != receipt.documents
+            || snapshot.metadata().embedders.get(tier_name) != Some(&receipt.identity)
+            || !same_security_object(root.witness(), retained.root_witness())
+            || !same_security_object(anchors.lock(), old_anchors.lock())
+            || !same_security_object(anchors.authority(), old_anchors.authority())
+        {
+            return Err(serve_refused("session_selection_mismatch"));
+        }
+        admit_serving_model(&receipt, model.as_ref())?;
+        checkpoint(cx)?;
+        Ok(Self {
+            root,
+            receipt,
+            snapshot,
+            model,
+            default_limit: limits.0,
+            max_image_bytes: limits.1,
+            allow_activation,
+        })
+    }
+
+    fn response(
+        &self,
+        event: &'static str,
+        ok: bool,
+        request: Option<u64>,
+        id: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "schema": SCHEMA, "event": event, "ok": ok, "request": request, "id": id,
+            "authority": self.snapshot.authority().canonical_bytes().as_slice(),
+            "generation": self.receipt.generation, "profile": self.receipt.profile,
+            "tier": self.snapshot.tier(),
+            "retrieval": retrieval_name(self.snapshot.retrieval_mode()),
+        })
+    }
+
+    fn failure(
+        &self,
+        ordinal: u64,
+        id: Option<&str>,
+        error: &(dyn Error + 'static),
+        default_code: &'static str,
+    ) -> serde_json::Value {
+        let mut response = self.response("failed", false, Some(ordinal), id);
+        response["status"] = serde_json::json!("failed");
+        response["code"] = serde_json::json!(
+            error
+                .downcast_ref::<AuthorityServeRefusal>()
+                .map_or(default_code, |error| error.0)
+        );
+        // Never forward provider error bodies, model paths, receipt JSON, or
+        // unvalidated request IDs into the persistent protocol.
+        response
+    }
+
+    async fn query(
+        &self,
+        cx: &Cx,
+        request: &AuthoritySearchRequest,
+    ) -> Result<Vec<frankensearch::ScoredResult>> {
+        checkpoint(cx)?;
+        super::serve::validate_id(request.id.as_deref())
+            .map_err(|_| serve_refused("invalid_request_id"))?;
+        validate_query(&request.query).map_err(|_| serve_refused("invalid_query"))?;
+        let limit = request.limit.unwrap_or(self.default_limit);
+        if limit == 0 || limit > 1_000 {
+            return Err(serve_refused("invalid_limit"));
+        }
+        admit_serving_model(&self.receipt, self.model.as_ref())?;
+        // NativeGenerationSnapshot independently checks the producer before
+        // inference and the actual bound output afterward, including zero hits.
+        let results = self
+            .snapshot
+            .search_text(cx, self.model.as_ref(), &request.query, limit)
+            .await?;
+        checkpoint(cx)?;
+        Ok(results)
+    }
+
+    fn activate(&mut self, cx: &Cx, request: &AuthorityActivateRequest) -> Result<()> {
+        checkpoint(cx)?;
+        if !self.allow_activation {
+            return Err(serve_refused("activation_disabled"));
+        }
+        super::serve::validate_id(request.id.as_deref())
+            .map_err(|_| serve_refused("invalid_request_id"))?;
+        if request.op != "activate" || !request.receipt.is_absolute() {
+            return Err(serve_refused("invalid_activation_request"));
+        }
+        let expected = AuthorityRefV1::from_canonical_bytes(&request.expected_authority)
+            .map_err(|_| serve_refused("invalid_expected_authority"))?;
+        if expected != self.snapshot.authority() {
+            return Err(serve_refused("stale_expected_authority"));
+        }
+        let candidate = Receipt::read(&request.receipt)
+            .map_err(|_| serve_refused("invalid_activation_receipt"))?;
+        if candidate.root != self.receipt.root
+            || candidate.root_id != self.receipt.root_id
+            || candidate.profile != self.receipt.profile
+            || candidate.tier != self.receipt.tier
+        {
+            return Err(serve_refused("activation_root_or_tier_mismatch"));
+        }
+        if candidate.authority()?.sequence <= self.snapshot.authority().sequence {
+            return Err(serve_refused("activation_not_newer"));
+        }
+        if !same_query_contract(&candidate.identity, &self.receipt.identity) {
+            return Err(serve_refused("activation_producer_mismatch"));
+        }
+        admit_serving_model(&candidate, self.model.as_ref())?;
+        checkpoint(cx)?;
+        // The receipt selects an authority on the original qualified physical
+        // root. Never reopen the candidate's root pathname or adopt a copy.
+        let snapshot = candidate
+            .open_on_root(cx, &self.root, self.max_image_bytes)
+            .map_err(|_| serve_refused("activation_admission_failed"))?;
+        admit_serving_model(&candidate, self.model.as_ref())?;
+        checkpoint(cx)?;
+        // All fallible work is complete. The request loop owns both fields and
+        // cannot serve a query between these assignments.
+        self.snapshot = snapshot;
+        self.receipt = candidate;
+        Ok(())
+    }
+}
+
+async fn serve_session(
+    cx: &Cx,
+    session: &mut AuthoritySession,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
+    checkpoint(cx)?;
+    admit_serving_model(&session.receipt, session.model.as_ref())?;
+    let mut ready = session.response("ready", true, None, None);
+    ready["documents"] = serde_json::json!(session.receipt.documents);
+    ready["activation_enabled"] = serde_json::json!(session.allow_activation);
+    ready["default_limit"] = serde_json::json!(session.default_limit);
+    ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
+    emit(output, &ready)?;
+    let mut record = Vec::new();
+    let mut ordinal = 0_u64;
+    while super::serve::read_request(cx, input, &mut record)? {
+        ordinal = ordinal
+            .checked_add(1)
+            .ok_or_else(|| serve_refused("request_ordinal_exhausted"))?;
+        let request = match serde_json::from_slice::<AuthorityRequest>(record.trim_ascii()) {
+            Ok(request) => request,
+            Err(_) => {
+                emit(
+                    output,
+                    &session.failure(
+                        ordinal,
+                        None,
+                        serve_refused("invalid_request").as_ref(),
+                        "invalid_request",
+                    ),
+                )?;
+                continue;
+            }
+        };
+        let (id, result) = match &request {
+            AuthorityRequest::Search(request) => {
+                let id = request
+                    .id
+                    .as_deref()
+                    .filter(|id| super::serve::validate_id(Some(id)).is_ok());
+                let result = session.query(cx, request).await.map(|results| {
+                    let mut response = session.response("results", true, Some(ordinal), id);
+                    response["results"] = serde_json::json!(results);
+                    response
+                });
+                (id, result)
+            }
+            AuthorityRequest::Activate(request) => {
+                let id = request
+                    .id
+                    .as_deref()
+                    .filter(|id| super::serve::validate_id(Some(id)).is_ok());
+                let previous = session.snapshot.authority();
+                let result = session.activate(cx, request).map(|()| {
+                    let mut response = session.response("activated", true, Some(ordinal), id);
+                    response["previous_authority"] =
+                        serde_json::json!(previous.canonical_bytes().as_slice());
+                    response["documents"] = serde_json::json!(session.receipt.documents);
+                    response
+                });
+                (id, result)
+            }
+        };
+        checkpoint(cx)?;
+        match result {
+            Ok(response) => emit(output, &response)?,
+            Err(error) => {
+                if error
+                    .downcast_ref::<SearchError>()
+                    .is_some_and(|error| matches!(error, SearchError::Cancelled { .. }))
+                {
+                    return Err(error);
+                }
+                emit(
+                    output,
+                    &session.failure(ordinal, id, error.as_ref(), "query_or_activation_refused"),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn serve(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    pool: Option<BlockingPoolHandle>,
+) -> Result<()> {
+    let receipt = Receipt::read(&options.receipt)?;
+    options
+        .quality
+        .validate_usage(receipt.tier == EmbedderTierTag::Quality)?;
+    let root = admit_root(&receipt.root)?;
+    let snapshot = receipt.open_on_root(cx, &root, options.max_image_bytes)?;
+    // Admission precedes model loading and every subsequent query. The model
+    // and complete retained images remain warm until explicit activation/exit.
+    let model = models::load_single(
+        cx,
+        options.models.as_deref(),
+        receipt.tier,
+        &options.quality,
+        pool,
+    )?;
+    let mut session = AuthoritySession::new(
+        cx,
+        root,
+        receipt,
+        snapshot,
+        model,
+        (options.limit, options.max_image_bytes),
+        options.allow_activation,
+    )?;
+    serve_session(cx, &mut session, &mut io::stdin().lock(), output).await
+}
+
 fn reconciliation_report(
     receipt: &Receipt,
     permit: &AttemptPermitV1,
@@ -1156,6 +1552,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             Command::Index => Box::pin(index(&cx, &options, &mut output, pool)).await,
             Command::Rebuild => Box::pin(rebuild(&cx, &options, &mut output, pool)).await,
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,
+            Command::Serve => Box::pin(serve(&cx, &options, &mut output, pool)).await,
             Command::Recover => recover(&cx, &options, &mut output),
         }
     })

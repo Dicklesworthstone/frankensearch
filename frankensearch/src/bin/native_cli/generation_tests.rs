@@ -84,6 +84,46 @@ fn rebuild_arguments() -> Vec<&'static str> {
 }
 
 #[test]
+fn authority_serve_options_select_one_warm_receipt_and_explicit_activation_grant() {
+    let arguments = ["authority-serve", "--receipt", "selected.json"];
+    let options = parse(&arguments).unwrap().unwrap();
+    assert_eq!(options.command, Command::Serve);
+    assert!(!options.allow_activation);
+    assert_eq!(options.limit, 10);
+    assert!(is_command("authority-serve"));
+    assert!(parse(&["authority-serve", "--help"]).unwrap().is_none());
+    let mut configured = arguments.to_vec();
+    configured.extend([
+        "--allow-activation",
+        "--limit",
+        "2",
+        "--max-image-bytes",
+        "8192",
+    ]);
+    let options = parse(&configured).unwrap().unwrap();
+    assert!(options.allow_activation);
+    assert_eq!(options.limit, 2);
+    assert_eq!(options.max_image_bytes, 8192);
+    for extra in [
+        vec!["--query", "retry"],
+        vec!["--retrieval", "hnsw"],
+        vec!["--root", "other-root"],
+        vec!["--tier", "quality"],
+        vec!["--migrate-model"],
+        vec!["--cooperative-local"],
+        vec!["--limit", "0"],
+        vec!["--limit", "1001"],
+    ] {
+        let mut rejected = arguments.to_vec();
+        rejected.extend(extra);
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
+    for command in ["authority-search", "authority-recover"] {
+        assert!(parse(&[command, "--receipt", "r.json", "--allow-activation"]).is_err());
+    }
+}
+
+#[test]
 fn authority_retrieval_is_explicit_for_new_indexes_and_cannot_override_search() {
     let options = parse(&index_arguments()).unwrap().unwrap();
     assert!(options.retrieval.is_none());
@@ -1294,4 +1334,442 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
             );
         }
     });
+}
+
+#[cfg(target_os = "linux")]
+mod warm_authority {
+    use std::io::{BufRead, Cursor, Read};
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use frankensearch::IndexableDocument;
+
+    use super::*;
+
+    fn private_parent(label: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+            ".frankensearch-authority-serve-{label}-{}-{stamp}",
+            std::process::id()
+        ));
+        // Qualification uses the actual host filesystem. Unsupported roots
+        // remain test failures; no fixture bypass admits overlay/tmpfs.
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        parent
+    }
+
+    async fn publish(
+        cx: &Cx,
+        parent: &Path,
+        previous: Option<&NativeGenerationSnapshot>,
+        provider: &Arc<Provider>,
+        tier: EmbedderTierTag,
+        label: &str,
+        ann: bool,
+    ) -> Receipt {
+        let root_path = parent.join("root");
+        let root = if previous.is_some() {
+            admit_root(&root_path).unwrap()
+        } else {
+            create_root(&root_path).expect("qualified Linux root is required")
+        };
+        let sequence = previous.map_or(1, |snapshot| snapshot.authority().sequence + 1);
+        let model: Arc<dyn Embedder> = provider.clone();
+        let retrieval = if ann {
+            NativeBuildRetrieval::Hnsw {
+                params: HnswParams::default(),
+                seed: 17,
+            }
+        } else {
+            NativeBuildRetrieval::Exact
+        };
+        let built = NativeIndexBuilder::new(
+            parent.join(format!("{label}-work")),
+            new_generation(sequence).unwrap(),
+            model,
+        )
+        .unwrap()
+        .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+        .add_documents([
+            IndexableDocument::new(format!("retry-{label}"), "retry network requests")
+                .with_metadata("version", label),
+            IndexableDocument::new(format!("garden-{label}"), "garden flowers")
+                .with_metadata("version", label),
+        ])
+        .build_exact_generation(
+            cx,
+            tier,
+            CommitRange {
+                low: 1,
+                high: sequence + 4,
+            },
+            DEFAULT_IMAGE_BYTES,
+        )
+        .await
+        .unwrap();
+        stage_and_publish(
+            cx,
+            &root,
+            &root_path,
+            &parent.join(format!("{label}.json")),
+            &built,
+            previous,
+            DEFAULT_IMAGE_BYTES,
+        )
+        .unwrap()
+    }
+
+    fn open_session(
+        cx: &Cx,
+        selected: Receipt,
+        provider: &Arc<Provider>,
+        allow_activation: bool,
+    ) -> AuthoritySession {
+        let root = admit_root(&selected.root).unwrap();
+        let snapshot = selected
+            .open_on_root(cx, &root, DEFAULT_IMAGE_BYTES)
+            .unwrap();
+        let model: Arc<dyn Embedder> = provider.clone();
+        AuthoritySession::new(
+            cx,
+            root,
+            selected,
+            snapshot,
+            model,
+            (1, DEFAULT_IMAGE_BYTES),
+            allow_activation,
+        )
+        .unwrap()
+    }
+
+    fn frames(bytes: &[u8]) -> Vec<serde_json::Value> {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
+    async fn exchange(
+        cx: &Cx,
+        session: &mut AuthoritySession,
+        messages: &[serde_json::Value],
+    ) -> Vec<serde_json::Value> {
+        let mut input = Vec::new();
+        for message in messages {
+            serde_json::to_writer(&mut input, message).unwrap();
+            input.push(b'\n');
+        }
+        let mut output = Vec::new();
+        serve_session(cx, session, &mut Cursor::new(input), &mut output)
+            .await
+            .unwrap();
+        let frames = frames(&output);
+        assert_eq!(frames.len(), messages.len() + 1);
+        assert_eq!(frames[0]["event"], "ready");
+        frames
+    }
+
+    fn provider() -> Arc<Provider> {
+        Arc::new(Provider {
+            identity: identity().identity,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    #[test]
+    fn warm_queries_reuse_the_admitted_model_and_images_for_both_tiers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann) in [
+                ("fast-exact", EmbedderTierTag::Fast, false),
+                ("quality-exact", EmbedderTierTag::Quality, false),
+                ("fast-ann", EmbedderTierTag::Fast, true),
+                ("quality-ann", EmbedderTierTag::Quality, true),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let selected = publish(&cx, &parent, None, &provider, tier, "old", ann).await;
+                let mut session = open_session(&cx, selected.clone(), &provider, false);
+                let before = provider.calls.load(Ordering::Relaxed);
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        serde_json::json!({"id": "first", "query": "retry"}),
+                        serde_json::json!({"id": "second", "query": "garden", "limit": 2}),
+                    ],
+                )
+                .await;
+                assert_eq!(output[0]["retrieval"], if ann { "hnsw" } else { "exact" });
+                assert_eq!(output[1]["event"], "results");
+                assert_eq!(output[1]["id"], "first");
+                assert_eq!(output[1]["results"].as_array().unwrap().len(), 1);
+                assert_eq!(output[1]["results"][0]["doc_id"], "retry-old");
+                assert_eq!(output[2]["id"], "second");
+                assert_eq!(output[2]["results"].as_array().unwrap().len(), 2);
+                assert_eq!(output[2]["results"][0]["doc_id"], "garden-old");
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 2);
+
+                // The session keeps the complete admitted images. Neither a
+                // model reload nor a component pathname reopen is necessary.
+                fs::rename(&selected.root, parent.join("relocated-root")).unwrap();
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[serde_json::json!({"query": "retry", "limit": 2})],
+                )
+                .await;
+                assert_eq!(output[1]["results"][0]["doc_id"], "retry-old");
+                assert_eq!(
+                    output[1]["authority"],
+                    serde_json::json!(selected.authority)
+                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 3);
+            }
+        });
+    }
+
+    #[test]
+    fn explicit_activation_is_fenced_and_failures_keep_the_warm_predecessor() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier) in [
+                ("fast", EmbedderTierTag::Fast),
+                ("quality", EmbedderTierTag::Quality),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let old = publish(&cx, &parent, None, &provider, tier, "old", true).await;
+                let mut session = open_session(&cx, old.clone(), &provider, true);
+                let mut disabled = open_session(&cx, old.clone(), &provider, false);
+                let next = publish(
+                    &cx,
+                    &parent,
+                    Some(&session.snapshot),
+                    &provider,
+                    tier,
+                    "new",
+                    false,
+                )
+                .await;
+                let before = provider.calls.load(Ordering::Relaxed);
+                let activate = serde_json::json!({
+                    "op": "activate", "id": "switch", "receipt": parent.join("new.json"),
+                    "expected_authority": old.authority,
+                });
+                let output = exchange(
+                    &cx,
+                    &mut disabled,
+                    &[activate.clone(), serde_json::json!({"query": "retry"})],
+                )
+                .await;
+                assert_eq!(output[1]["event"], "failed");
+                assert_eq!(output[2]["results"][0]["doc_id"], "retry-old");
+                assert_eq!(disabled.receipt.authority, old.authority);
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+
+                let mut wrong = next.clone();
+                wrong.tier = if tier == EmbedderTierTag::Fast {
+                    EmbedderTierTag::Quality
+                } else {
+                    EmbedderTierTag::Fast
+                };
+                save_receipt(&wrong, &parent.join("wrong-tier.json")).unwrap();
+                let mut wrong_producer = next.clone();
+                let mut identity = wrong_producer.identity.identity.clone();
+                identity.producer.implementation_revision = "different-producer".to_owned();
+                wrong_producer.identity = identity.freeze().unwrap();
+                save_receipt(&wrong_producer, &parent.join("wrong-producer.json")).unwrap();
+                let mut stale = activate.clone();
+                stale["expected_authority"] = serde_json::json!(next.authority);
+                let mut wrong_tier = activate.clone();
+                wrong_tier["receipt"] = serde_json::json!(parent.join("wrong-tier.json"));
+                let mut wrong_identity = activate.clone();
+                wrong_identity["receipt"] = serde_json::json!(parent.join("wrong-producer.json"));
+                let mut missing = activate.clone();
+                missing["receipt"] = serde_json::json!(parent.join("absent.json"));
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        stale,
+                        wrong_tier,
+                        wrong_identity,
+                        missing,
+                        serde_json::json!({"query": "retry"}),
+                        activate.clone(),
+                        serde_json::json!({"id": "new-query", "query": "retry"}),
+                        activate,
+                        serde_json::json!({"query": "garden"}),
+                    ],
+                )
+                .await;
+                for frame in &output[1..5] {
+                    assert_eq!(frame["event"], "failed");
+                    assert_eq!(frame["authority"], serde_json::json!(old.authority));
+                }
+                assert_eq!(output[5]["results"][0]["doc_id"], "retry-old");
+                assert_eq!(output[6]["event"], "activated");
+                assert_eq!(output[6]["authority"], serde_json::json!(next.authority));
+                assert_eq!(output[6]["retrieval"], "exact");
+                assert_eq!(output[7]["results"][0]["doc_id"], "retry-new");
+                assert_eq!(output[8]["event"], "failed");
+                assert_eq!(output[9]["results"][0]["doc_id"], "garden-new");
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    before + 4,
+                    "only queries perform inference; rejected and accepted activations never do"
+                );
+                assert_eq!(session.receipt.authority, next.authority);
+                assert_eq!(disabled.receipt.authority, old.authority);
+            }
+        });
+    }
+
+    #[test]
+    fn request_failures_are_bounded_while_oversize_cancellation_and_output_end_the_session() {
+        struct FailAfterReady {
+            writes: usize,
+        }
+        impl Write for FailAfterReady {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.writes > 1 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        struct CancelOnRead<'a> {
+            cx: &'a Cx,
+            inner: Cursor<Vec<u8>>,
+        }
+        impl Read for CancelOnRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.inner.read(buffer)
+            }
+        }
+        impl BufRead for CancelOnRead<'_> {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                self.cx.set_cancel_requested(true);
+                self.inner.fill_buf()
+            }
+            fn consume(&mut self, amount: usize) {
+                self.inner.consume(amount);
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("protocol");
+            let provider = provider();
+            let selected = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Fast,
+                "old",
+                true,
+            )
+            .await;
+            let before = provider.calls.load(Ordering::Relaxed);
+            let wrong = Arc::new(Provider {
+                identity: {
+                    let mut identity = identity().identity;
+                    identity.producer.implementation_revision = "wrong-warm-producer".to_owned();
+                    identity
+                },
+                calls: AtomicUsize::new(0),
+            });
+            let root = admit_root(&selected.root).unwrap();
+            let snapshot = selected
+                .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                .unwrap();
+            let wrong_model: Arc<dyn Embedder> = wrong.clone();
+            assert!(
+                AuthoritySession::new(
+                    &cx,
+                    root,
+                    selected.clone(),
+                    snapshot,
+                    wrong_model,
+                    (1, DEFAULT_IMAGE_BYTES),
+                    false
+                )
+                .is_err()
+            );
+            assert_eq!(wrong.calls.load(Ordering::Relaxed), 0);
+
+            let mut session = open_session(&cx, selected.clone(), &provider, false);
+            let input = concat!(
+                "{invalid}\n",
+                "{\"query\":\"retry\",\"limit\":0}\n",
+                "{\"query\":\"retry\",\"limit\":1001}\n",
+                "{\"query\":\"retry\",\"retrieval\":\"exact\"}\n",
+                "{\"op\":\"unknown\",\"query\":\"retry\"}\n",
+                "{\"id\":\"valid\",\"query\":\"retry\",\"limit\":1}\n",
+            );
+            let mut output = Vec::new();
+            serve_session(&cx, &mut session, &mut Cursor::new(input), &mut output)
+                .await
+                .unwrap();
+            let output = frames(&output);
+            assert_eq!(output.len(), 7);
+            for frame in &output[1..6] {
+                assert_eq!(frame["event"], "failed");
+            }
+            assert_eq!(output[6]["event"], "results");
+            assert_eq!(output[6]["id"], "valid");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+
+            let mut oversized = vec![b'x'; crate::serve::MAX_REQUEST_BYTES + 2];
+            oversized.extend_from_slice(b"\n{\"query\":\"retry\"}\n");
+            let length = oversized.len();
+            let mut oversized = Cursor::new(oversized);
+            let mut output = Vec::new();
+            assert!(
+                serve_session(&cx, &mut session, &mut oversized, &mut output)
+                    .await
+                    .is_err()
+            );
+            assert!(usize::try_from(oversized.position()).unwrap() < length);
+            assert_eq!(
+                frames(&output).len(),
+                1,
+                "only readiness precedes a terminal frame refusal"
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+
+            let mut cancelled = CancelOnRead {
+                cx: &cx,
+                inner: Cursor::new(b"{\"query\":\"retry\"}\n".to_vec()),
+            };
+            assert!(
+                serve_session(&cx, &mut session, &mut cancelled, &mut Vec::new())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+            assert_eq!(session.receipt.authority, selected.authority);
+            cx.set_cancel_requested(false);
+
+            let mut output = FailAfterReady { writes: 0 };
+            let mut input = Cursor::new(b"{\"query\":\"retry\"}\n{\"query\":\"garden\"}\n");
+            assert!(
+                serve_session(&cx, &mut session, &mut input, &mut output)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                before + 2,
+                "delivery failure terminates before the next query"
+            );
+            assert_eq!(output.writes, 2);
+        });
+    }
 }

@@ -73,7 +73,8 @@ const MAX_DOCUMENTS: usize = 100_000;
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
-  authority-index / authority-rebuild / authority-search / authority-recover: fixed AUTHORITY generations\n\
+  authority-index / authority-rebuild / authority-search / authority-serve / authority-recover:\n\
+         fixed AUTHORITY generations with retained search and warm stdio serving\n\
          (use authority-index --help for the complete command contract)\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N] [--shard-size N]\n\
