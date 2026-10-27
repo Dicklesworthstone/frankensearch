@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use frankensearch::native_ann::builder::scope::NativeScopedGenerationSnapshot;
 use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
 };
@@ -47,8 +48,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Result, SCHEMA, bad, emit,
-    encode, execution_context, models, new_generation, new_path, positive as number,
-    read_documents, update as mutations, validate_query, value,
+    encode, execution_context, filter::Filter, models, new_generation, new_path,
+    positive as number, read_documents, update as mutations, validate_query, value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
@@ -72,10 +73,10 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--max-image-bytes N]\n\n\
+      [--filter JSON] [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-serve --receipt JSON [--limit N] [--allow-activation]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--max-image-bytes N]\n\n\
+      [--filter JSON] [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
   authority-rollback --from-receipt CURRENT_JSON --target-receipt PREDECESSOR_JSON\n\
       --receipt NEW_JSON [--max-image-bytes N]\n\n\
@@ -134,6 +135,14 @@ It admits the complete currently selected successor before swapping readers;\n\
 rejection retains the previous reader and returns a bounded failed response.\n\
 Authority sequence must advance, including rollback to older artifact generations.\n\
 Model migration requires restarting with the new receipt and local model options.\n\
+Search/serve --filter accepts exact IDs, a literal id_prefix, and string-valued\n\
+metadata. Every present constraint must match the retained source document.\n\
+Search requests may include a filter object; it intersects the server's fixed\n\
+filter and cannot widen it. Membership filters vector and lexical candidates\n\
+before fusion. An empty scope still requires the selected producer identity.\n\
+Filtered source export is bounded by --max-source-bytes (default 256 MiB).\n\
+The fixed server scope stays on its retained generation; activation prepares\n\
+the new scope before swapping readers. Unfiltered queries do not export source.\n\
 Requests are limited to 1 MiB; oversized input or output failure ends the session.\n\
 Send quit/exit or close stdin to stop. Reads block on the owning execution lane.\n\
 Work files remain available after completion or failure. Stdout is JSON.\n";
@@ -164,6 +173,7 @@ struct Options {
     source_low: Option<u64>,
     source_high: Option<u64>,
     query: Option<String>,
+    filter: Option<Filter>,
     limit: usize,
     batch_size: usize,
     max_image_bytes: usize,
@@ -215,6 +225,7 @@ impl Options {
             source_low: None,
             source_high: None,
             query: None,
+            filter: None,
             limit: 10,
             batch_size: 64,
             max_image_bytes: DEFAULT_IMAGE_BYTES,
@@ -249,8 +260,16 @@ impl Options {
                 "--retained-source" if command == Command::Rebuild => {
                     options.retained_source = true
                 }
-                "--max-source-bytes" if matches!(command, Command::Rebuild | Command::Update) => {
+                "--max-source-bytes"
+                    if matches!(
+                        command,
+                        Command::Rebuild | Command::Update | Command::Search | Command::Serve
+                    ) =>
+                {
                     options.max_source_bytes = number(&value(&mut args)?, usize::MAX)?;
+                }
+                "--filter" if matches!(command, Command::Search | Command::Serve) => {
+                    options.filter = Some(Filter::parse(&value(&mut args)?)?);
                 }
                 "--allow-activation" if command == Command::Serve => {
                     options.allow_activation = true
@@ -1446,39 +1465,97 @@ async fn search(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    let context = execution_context(cx, pool)?;
+    Box::pin(search_with_loader(&context, options, output, |tier| {
+        models::load_single(
+            &context,
+            options.models.as_deref(),
+            tier,
+            &options.quality,
+            context.blocking_pool_handle(),
+        )
+    }))
+    .await
+}
+
+async fn search_with_loader<F>(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    load_model: F,
+) -> Result<()>
+where
+    F: FnOnce(EmbedderTierTag) -> Result<Arc<dyn Embedder>>,
+{
+    checkpoint(cx)?;
+    let query = options
+        .query
+        .as_deref()
+        .ok_or_else(|| bad("missing query"))?;
+    validate_query(query)?;
     let receipt = Receipt::read(&options.receipt)?;
     options
         .quality
         .validate_usage(receipt.tier == EmbedderTierTag::Quality)?;
-    let snapshot = receipt.open(cx, options.max_image_bytes)?;
-    let model = models::load_single(
+    let snapshot = Arc::new(receipt.open(cx, options.max_image_bytes)?);
+    // Source bounds and filter admission precede model loading. The scope owns
+    // the same admitted generation that supplies every vector and lexical hit.
+    let scope = prepare_scope(
         cx,
-        options.models.as_deref(),
-        receipt.tier,
-        &options.quality,
-        pool,
+        &snapshot,
+        options.filter.as_ref(),
+        options.max_source_bytes,
     )?;
-    let results = snapshot
-        .search_text(
-            cx,
-            model.as_ref(),
-            options
-                .query
-                .as_deref()
-                .ok_or_else(|| bad("missing query"))?,
-            options.limit,
-        )
-        .await?;
-    emit(
-        output,
-        &serde_json::json!({
-            "schema": SCHEMA, "ok": true, "event": "results",
-            "retrieval": retrieval_name(snapshot.retrieval_mode()),
-            "tier": receipt.tier, "generation": receipt.generation,
-            "authority": snapshot.authority().canonical_bytes().as_slice(),
-            "profile": receipt.profile, "results": results,
-        }),
-    )
+    let model = load_model(receipt.tier)?;
+    let results = match &scope {
+        Some(scope) => {
+            scope
+                .search_text(cx, model.as_ref(), query, options.limit)
+                .await?
+        }
+        None => {
+            snapshot
+                .search_text(cx, model.as_ref(), query, options.limit)
+                .await?
+        }
+    };
+    let mut response = serde_json::json!({
+        "schema": SCHEMA, "ok": true, "event": "results",
+        "retrieval": retrieval_name(snapshot.retrieval_mode()),
+        "tier": receipt.tier, "generation": receipt.generation,
+        "authority": snapshot.authority().canonical_bytes().as_slice(),
+        "profile": receipt.profile, "results": results,
+    });
+    annotate_scope(
+        &mut response,
+        scope.as_ref().map(NativeScopedGenerationSnapshot::len),
+    );
+    emit(output, &response)
+}
+
+fn prepare_scope(
+    cx: &Cx,
+    snapshot: &Arc<NativeGenerationSnapshot>,
+    filter: Option<&Filter>,
+    max_source_bytes: usize,
+) -> Result<Option<NativeScopedGenerationSnapshot>> {
+    checkpoint(cx)?;
+    let Some(filter) = filter else {
+        // Keep the unfiltered path free of source scans or allocations.
+        return Ok(None);
+    };
+    filter.validate()?;
+    Ok(Some(snapshot.scope(cx, max_source_bytes, |document| {
+        Ok(filter.matches(document))
+    })?))
+}
+
+fn annotate_scope(response: &mut serde_json::Value, eligible_documents: Option<usize>) {
+    if let Some(eligible_documents) = eligible_documents {
+        response["scope"] = serde_json::json!({
+            "filtered": true, "eligible_documents": eligible_documents,
+        });
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -1487,6 +1564,7 @@ struct AuthoritySearchRequest {
     id: Option<String>,
     query: String,
     limit: Option<usize>,
+    filter: Option<Filter>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1567,10 +1645,13 @@ fn admit_serving_model(receipt: &Receipt, model: &dyn Embedder) -> Result<()> {
 struct AuthoritySession {
     root: QualifiedGenerationRoot,
     receipt: Receipt,
-    snapshot: NativeGenerationSnapshot,
+    snapshot: Arc<NativeGenerationSnapshot>,
     model: Arc<dyn Embedder>,
     default_limit: usize,
     max_image_bytes: usize,
+    max_source_bytes: usize,
+    fixed_filter: Option<Filter>,
+    scope: Option<NativeScopedGenerationSnapshot>,
     allow_activation: bool,
 }
 
@@ -1579,12 +1660,13 @@ impl AuthoritySession {
         cx: &Cx,
         root: QualifiedGenerationRoot,
         receipt: Receipt,
-        snapshot: NativeGenerationSnapshot,
+        snapshot: impl Into<Arc<NativeGenerationSnapshot>>,
         model: Arc<dyn Embedder>,
         limits: (usize, usize),
         allow_activation: bool,
     ) -> Result<Self> {
         checkpoint(cx)?;
+        let snapshot = snapshot.into();
         receipt.validate()?;
         let retained = snapshot.retained_snapshot();
         let anchors = root.anchor_witnesses();
@@ -1623,8 +1705,29 @@ impl AuthoritySession {
             model,
             default_limit: limits.0,
             max_image_bytes: limits.1,
+            max_source_bytes: MAX_INPUT_BYTES,
+            fixed_filter: None,
+            scope: None,
             allow_activation,
         })
+    }
+
+    #[cfg(test)]
+    fn with_filter(
+        mut self,
+        cx: &Cx,
+        filter: Option<Filter>,
+        max_source_bytes: usize,
+    ) -> Result<Self> {
+        if max_source_bytes == 0 {
+            return Err(serve_refused("invalid_source_budget"));
+        }
+        let scope = prepare_scope(cx, &self.snapshot, filter.as_ref(), max_source_bytes)?;
+        checkpoint(cx)?;
+        self.scope = scope;
+        self.fixed_filter = filter;
+        self.max_source_bytes = max_source_bytes;
+        Ok(self)
     }
 
     fn response(
@@ -1634,13 +1737,18 @@ impl AuthoritySession {
         request: Option<u64>,
         id: Option<&str>,
     ) -> serde_json::Value {
-        serde_json::json!({
+        let mut response = serde_json::json!({
             "schema": SCHEMA, "event": event, "ok": ok, "request": request, "id": id,
             "authority": self.snapshot.authority().canonical_bytes().as_slice(),
             "generation": self.receipt.generation, "profile": self.receipt.profile,
             "tier": self.snapshot.tier(),
             "retrieval": retrieval_name(self.snapshot.retrieval_mode()),
-        })
+        });
+        annotate_scope(
+            &mut response,
+            self.scope.as_ref().map(NativeScopedGenerationSnapshot::len),
+        );
+        response
     }
 
     fn failure(
@@ -1666,7 +1774,7 @@ impl AuthoritySession {
         &self,
         cx: &Cx,
         request: &AuthoritySearchRequest,
-    ) -> Result<Vec<frankensearch::ScoredResult>> {
+    ) -> Result<(Vec<frankensearch::ScoredResult>, Option<usize>)> {
         checkpoint(cx)?;
         super::serve::validate_id(request.id.as_deref())
             .map_err(|_| serve_refused("invalid_request_id"))?;
@@ -1675,15 +1783,41 @@ impl AuthoritySession {
         if limit == 0 || limit > 1_000 {
             return Err(serve_refused("invalid_limit"));
         }
+        if let Some(filter) = &request.filter {
+            filter
+                .validate()
+                .map_err(|_| serve_refused("invalid_filter"))?;
+        }
         admit_serving_model(&self.receipt, self.model.as_ref())?;
+        // Narrow the owner's frozen membership; never substitute a request
+        // scope for it. Without a fixed filter, only filtered requests export
+        // bounded source. No request can mutate the session's retained scope.
+        let narrowed = match (self.scope.as_ref(), request.filter.as_ref()) {
+            (Some(scope), Some(filter)) => {
+                Some(scope.narrow(cx, |document| Ok(filter.matches(document)))?)
+            }
+            (None, Some(filter)) => {
+                prepare_scope(cx, &self.snapshot, Some(filter), self.max_source_bytes)?
+            }
+            _ => None,
+        };
+        let scope = narrowed.as_ref().or(self.scope.as_ref());
         // NativeGenerationSnapshot independently checks the producer before
         // inference and the actual bound output afterward, including zero hits.
-        let results = self
-            .snapshot
-            .search_text(cx, self.model.as_ref(), &request.query, limit)
-            .await?;
+        let results = match scope {
+            Some(scope) => {
+                scope
+                    .search_text(cx, self.model.as_ref(), &request.query, limit)
+                    .await?
+            }
+            None => {
+                self.snapshot
+                    .search_text(cx, self.model.as_ref(), &request.query, limit)
+                    .await?
+            }
+        };
         checkpoint(cx)?;
-        Ok(results)
+        Ok((results, scope.map(NativeScopedGenerationSnapshot::len)))
     }
 
     fn activate(&mut self, cx: &Cx, request: &AuthorityActivateRequest) -> Result<()> {
@@ -1720,14 +1854,28 @@ impl AuthoritySession {
         checkpoint(cx)?;
         // The receipt selects an authority on the original qualified physical
         // root. Never reopen the candidate's root pathname or adopt a copy.
-        let snapshot = candidate
-            .open_on_root(cx, &self.root, self.max_image_bytes)
-            .map_err(|_| serve_refused("activation_admission_failed"))?;
+        let snapshot = Arc::new(
+            candidate
+                .open_on_root(cx, &self.root, self.max_image_bytes)
+                .map_err(|_| serve_refused("activation_admission_failed"))?,
+        );
         admit_serving_model(&candidate, self.model.as_ref())?;
+        // Re-evaluate the fixed policy against the new retained source before
+        // installing any part of the selection. A budget or source failure
+        // leaves both the old reader and its old membership intact.
+        let scope = prepare_scope(
+            cx,
+            &snapshot,
+            self.fixed_filter.as_ref(),
+            self.max_source_bytes,
+        );
+        checkpoint(cx)?;
+        let scope = scope.map_err(|_| serve_refused("activation_scope_failed"))?;
         checkpoint(cx)?;
         // All fallible work is complete. The request loop owns both fields and
         // cannot serve a query between these assignments.
         self.snapshot = snapshot;
+        self.scope = scope;
         self.receipt = candidate;
         Ok(())
     }
@@ -1745,6 +1893,7 @@ async fn serve_session(
     ready["documents"] = serde_json::json!(session.receipt.documents);
     ready["activation_enabled"] = serde_json::json!(session.allow_activation);
     ready["default_limit"] = serde_json::json!(session.default_limit);
+    ready["max_source_bytes"] = serde_json::json!(session.max_source_bytes);
     ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
     emit(output, &ready)?;
     let mut record = Vec::new();
@@ -1774,9 +1923,10 @@ async fn serve_session(
                     .id
                     .as_deref()
                     .filter(|id| super::serve::validate_id(Some(id)).is_ok());
-                let result = session.query(cx, request).await.map(|results| {
+                let result = session.query(cx, request).await.map(|(results, eligible)| {
                     let mut response = session.response("results", true, Some(ordinal), id);
                     response["results"] = serde_json::json!(results);
+                    annotate_scope(&mut response, eligible);
                     response
                 });
                 (id, result)
@@ -1828,9 +1978,15 @@ async fn serve(
         .quality
         .validate_usage(receipt.tier == EmbedderTierTag::Quality)?;
     let root = admit_root(&receipt.root)?;
-    let snapshot = receipt.open_on_root(cx, &root, options.max_image_bytes)?;
-    // Admission precedes model loading and every subsequent query. The model
-    // and complete retained images remain warm until explicit activation/exit.
+    let snapshot = Arc::new(receipt.open_on_root(cx, &root, options.max_image_bytes)?);
+    let scope = prepare_scope(
+        cx,
+        &snapshot,
+        options.filter.as_ref(),
+        options.max_source_bytes,
+    )?;
+    // Complete image and source-scope admission precede model loading. The
+    // model and retained images remain warm until explicit activation/exit.
     let model = models::load_single(
         cx,
         options.models.as_deref(),
@@ -1847,6 +2003,9 @@ async fn serve(
         (options.limit, options.max_image_bytes),
         options.allow_activation,
     )?;
+    session.scope = scope;
+    session.fixed_filter = options.filter.clone();
+    session.max_source_bytes = options.max_source_bytes;
     serve_session(cx, &mut session, &mut io::stdin().lock(), output).await
 }
 

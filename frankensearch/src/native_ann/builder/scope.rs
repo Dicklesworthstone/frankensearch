@@ -4,17 +4,20 @@
 //! hydration and reranking. Filtering a displayed page instead would both leak
 //! disallowed candidates to later stages and underfill selective queries.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
+use frankensearch_core::generation::EmbedderTierTag;
 
 use super::NativeBuiltHybridIndex;
 use super::sharded::NativeBuiltShardedHybridIndex;
-use crate::native_ann::{NativeProgressiveSearch, NativeSearchPhase, checkpoint, invalid};
+use crate::native_ann::{
+    NativeGenerationSnapshot, NativeProgressiveSearch, NativeSearchPhase, checkpoint, invalid,
+};
 use crate::{
-    Cx, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead, Reranker,
-    ScoreSource, ScoredResult, SearchFuture, SearchResult,
+    Cx, Embedder, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
+    Reranker, ScoreSource, ScoredResult, SearchFuture, SearchResult,
 };
 
 type ScopedText<'a> = dyn Fn(&str) -> Option<String> + Send + Sync + 'a;
@@ -45,6 +48,178 @@ pub struct NativeScopedHybridIndex<'a> {
     index: &'a NativeBuiltHybridIndex,
     lexical: ScopedLexical<'a>,
     text: Box<ScopedText<'a>>,
+}
+
+/// An owned source scope over one authority-admitted native generation.
+///
+/// The handle retains the admitted vector and lexical images, its complete
+/// bounded source inventory, and its selected document IDs. Later publication,
+/// activation, rollback or pathname changes cannot alter this scope. Narrowing
+/// shares those original images and source documents and can only remove IDs.
+///
+/// Candidates are restricted before fusion and winner hydration. Very selective
+/// lexical queries may examine the full matching corpus; native HNSW retrieval
+/// retains its existing approximate recall and physical-row semantics. This is
+/// query scoping, not revocation of a previously issued reader or scope.
+pub struct NativeScopedGenerationSnapshot {
+    snapshot: Arc<NativeGenerationSnapshot>,
+    lexical: ScopedLexical<'static>,
+}
+
+impl NativeGenerationSnapshot {
+    /// Freeze a source predicate over this exact retained authority generation.
+    ///
+    /// The complete source export must fit `max_source_bytes` before the first
+    /// predicate is invoked. The budget covers raw stored source fields, with
+    /// the same semantics as [`Self::source_documents`], not total process RSS.
+    /// No provider runs and no pathname is reopened. The predicate is evaluated
+    /// once per source document and is not retained; it need not be Send.
+    ///
+    /// # Errors
+    /// Rejects an unsupported source schema, budget exhaustion, invalid source
+    /// data, predicate errors and cancellation without returning a partial scope.
+    /// Predicate panics are not intercepted.
+    pub fn scope(
+        self: &Arc<Self>,
+        cx: &Cx,
+        max_source_bytes: usize,
+        mut accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<NativeScopedGenerationSnapshot> {
+        checkpoint(cx, "native_ann.generation_scope.start")?;
+        let source = self.source_documents(cx, max_source_bytes)?;
+        let mut documents = BTreeMap::new();
+        let mut allowed = BTreeSet::new();
+        for document in source {
+            checkpoint(cx, "native_ann.generation_scope.document")?;
+            let accepted = accept(&document);
+            checkpoint(cx, "native_ann.generation_scope.document_complete")?;
+            if accepted? {
+                allowed.insert(document.id.clone());
+            }
+            if documents.insert(document.id.clone(), document).is_some() {
+                return Err(invalid(
+                    "scope.source",
+                    "duplicate-id",
+                    "the retained source inventory must contain unique document IDs",
+                ));
+            }
+        }
+        checkpoint(cx, "native_ann.generation_scope.complete")?;
+        Ok(NativeScopedGenerationSnapshot {
+            snapshot: Arc::clone(self),
+            lexical: ScopedLexical {
+                index: ScopeSource::Authority {
+                    snapshot: Arc::clone(self),
+                    documents: Arc::new(documents),
+                },
+                allowed: Arc::new(allowed),
+            },
+        })
+    }
+}
+
+impl NativeScopedGenerationSnapshot {
+    /// Number of source documents eligible in this scope, not query matches.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lexical.allowed.len()
+    }
+
+    /// Whether no source document is eligible.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lexical.allowed.is_empty()
+    }
+
+    /// Resolve an eligible document from this scope's original source inventory.
+    #[must_use]
+    pub fn document(&self, id: &str) -> Option<&IndexableDocument> {
+        if self.lexical.allowed.contains(id) {
+            self.lexical.index.document(id)
+        } else {
+            None
+        }
+    }
+
+    /// Intersect this scope with another fallible source predicate.
+    ///
+    /// Only currently eligible documents are visited. The complete original
+    /// source inventory and immutable reader are shared without another export,
+    /// budget charge, pathname lookup or provider call. An empty scope never
+    /// invokes the predicate, and the original scope remains usable on failure.
+    ///
+    /// # Errors
+    /// Propagates predicate errors and cancellation without returning a partial
+    /// scope. Predicate panics are not intercepted.
+    pub fn narrow(
+        &self,
+        cx: &Cx,
+        mut accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.generation_scope.narrow")?;
+        let mut allowed = BTreeSet::new();
+        for id in self.lexical.allowed.iter() {
+            checkpoint(cx, "native_ann.generation_scope.narrow_document")?;
+            let document = self.lexical.index.document(id).ok_or_else(|| {
+                invalid(
+                    "scope.source",
+                    "missing-document",
+                    "scope membership must belong to its retained source inventory",
+                )
+            })?;
+            let accepted = accept(document);
+            checkpoint(cx, "native_ann.generation_scope.narrow_document_complete")?;
+            if accepted? {
+                allowed.insert(id.clone());
+            }
+        }
+        checkpoint(cx, "native_ann.generation_scope.narrow_complete")?;
+        Ok(Self {
+            snapshot: Arc::clone(&self.snapshot),
+            lexical: ScopedLexical {
+                index: self.lexical.index.clone(),
+                allowed: Arc::new(allowed),
+            },
+        })
+    }
+
+    /// Search the selected vector tier and lexical reader within this scope.
+    ///
+    /// The actual producer is admitted even for empty scopes and zero-result
+    /// requests; those requests skip inference. Quality generations retain
+    /// quality score provenance without requiring or executing a fast model.
+    /// No predicate is invoked during retrieval or hydration.
+    ///
+    /// # Errors
+    /// Propagates producer admission, retrieval, hydration and cancellation
+    /// errors. A failed semantic arm never becomes lexical-only success.
+    pub async fn search_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.snapshot.scoped_progressive(
+            cx,
+            embedder,
+            &self.lexical,
+            text,
+            k.min(self.len()),
+            Arc::clone(&self.lexical.allowed),
+        )?)
+        .await?;
+        if self.snapshot.tier() == EmbedderTierTag::Quality {
+            for result in &mut results {
+                checkpoint(cx, "native_ann.generation_scope.quality_result")?;
+                result.quality_score = result.fast_score.take();
+                if result.source == ScoreSource::SemanticFast {
+                    result.source = ScoreSource::SemanticQuality;
+                }
+            }
+        }
+        Ok(results)
+    }
 }
 
 impl NativeBuiltHybridIndex {
@@ -388,9 +563,14 @@ async fn collect(mut stream: NativeProgressiveSearch<'_>) -> SearchResult<Vec<Sc
 // This adapter can ONLY wrap the private unrefreshable reader belonging to a
 // complete built/reopened cohort. Do not generalize it to arbitrary LexicalRead:
 // repeated search_candidates calls on a mutable reader could mix generations.
+#[derive(Clone)]
 enum ScopeSource<'a> {
     Single(&'a NativeBuiltHybridIndex),
     Sharded(&'a NativeBuiltShardedHybridIndex),
+    Authority {
+        snapshot: Arc<NativeGenerationSnapshot>,
+        documents: Arc<BTreeMap<String, IndexableDocument>>,
+    },
 }
 
 impl ScopeSource<'_> {
@@ -398,6 +578,7 @@ impl ScopeSource<'_> {
         match self {
             Self::Single(index) => index.lexical(),
             Self::Sharded(index) => index.lexical(),
+            Self::Authority { snapshot, .. } => snapshot.scoped_lexical(),
         }
     }
 
@@ -405,6 +586,7 @@ impl ScopeSource<'_> {
         match self {
             Self::Single(index) => index.vectors().documents().len(),
             Self::Sharded(index) => index.vectors().document_count(),
+            Self::Authority { documents, .. } => documents.len(),
         }
     }
 
@@ -412,12 +594,13 @@ impl ScopeSource<'_> {
         match self {
             Self::Single(index) => index.vectors().document(id),
             Self::Sharded(index) => index.vectors().document(id),
+            Self::Authority { documents, .. } => documents.get(id),
         }
     }
 }
 
 // The closed source enum is intentional: arbitrary refreshable lexical readers
-// cannot enter this adapter. Both variants own an admitted, immutable cohort.
+// cannot enter this adapter. Every variant retains an admitted, immutable cohort.
 struct ScopedLexical<'a> {
     index: ScopeSource<'a>,
     allowed: Arc<BTreeSet<String>>,

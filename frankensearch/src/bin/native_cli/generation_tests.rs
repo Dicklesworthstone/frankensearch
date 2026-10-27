@@ -335,14 +335,119 @@ fn retained_rebuild_options_preserve_the_selected_cut_and_bound_source_export() 
         "authority-serve",
         "authority-recover",
     ] {
-        for extra in [
-            vec!["--retained-source"],
-            vec!["--max-source-bytes", "4096"],
+        let rejected = [command, "--receipt", "selected.json", "--retained-source"];
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
+    for command in ["authority-index", "authority-recover"] {
+        let rejected = [
+            command,
+            "--receipt",
+            "selected.json",
+            "--max-source-bytes",
+            "4096",
+        ];
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
+}
+
+#[test]
+fn authority_filters_are_bounded_and_only_apply_to_search_and_serve() {
+    let filter = r#"{"ids":["garden-old"],"id_prefix":"garden-","metadata":{"version":"old"}}"#;
+    for arguments in [
+        vec![
+            "authority-search",
+            "--receipt",
+            "selected.json",
+            "--query",
+            "retry",
+        ],
+        vec!["authority-serve", "--receipt", "selected.json"],
+    ] {
+        let options = parse(&arguments).unwrap().unwrap();
+        assert!(options.filter.is_none());
+        assert_eq!(options.max_source_bytes, crate::MAX_INPUT_BYTES);
+        let mut configured = arguments.clone();
+        configured.extend(["--filter", filter, "--max-source-bytes", "4096"]);
+        let options = parse(&configured).unwrap().unwrap();
+        let filter = options.filter.as_ref().unwrap();
+        assert_eq!(options.max_source_bytes, 4096);
+        assert!(filter.matches(
+            &IndexableDocument::new("garden-old", "garden flowers").with_metadata("version", "old")
+        ));
+        assert!(!filter.matches(
+            &IndexableDocument::new("retry-old", "retry requests").with_metadata("version", "old")
+        ));
+        assert!(!filter.matches(
+            &IndexableDocument::new("garden-old", "garden flowers").with_metadata("version", "new")
+        ));
+        let mut budget_only = arguments.clone();
+        budget_only.extend(["--max-source-bytes", "1"]);
+        let options = parse(&budget_only).unwrap().unwrap();
+        assert!(options.filter.is_none());
+        assert_eq!(options.max_source_bytes, 1);
+        for invalid in [
+            "null",
+            "[]",
+            r#"{"unknown":"private-filter-sentinel"}"#,
+            r#"{"metadata":{"version":7}}"#,
+            r#"{"ids":[" "]}"#,
+            r#"{"id_prefix":""}"#,
+            r#"{"ids":["invalid\u0000id"]}"#,
         ] {
-            let mut rejected = vec![command, "--receipt", "selected.json"];
+            let mut rejected = arguments.clone();
+            rejected.extend(["--filter", invalid]);
+            assert!(parse(&rejected).is_err(), "{rejected:?}");
+        }
+        for extra in [
+            vec!["--max-source-bytes", "0"],
+            vec!["--max-source-bytes", "-1"],
+            vec!["--filter", "{}", "--filter", "{}"],
+        ] {
+            let mut rejected = arguments.clone();
             rejected.extend(extra);
             assert!(parse(&rejected).is_err(), "{rejected:?}");
         }
+        for explicit in ["{}", r#"{"ids":[]}"#] {
+            let mut configured = arguments.clone();
+            configured.extend(["--filter", explicit]);
+            assert!(parse(&configured).unwrap().unwrap().filter.is_some());
+        }
+        let oversized = serde_json::json!({"id_prefix": "x".repeat(64 * 1024)}).to_string();
+        let mut rejected = arguments.clone();
+        rejected.extend(["--filter", &oversized]);
+        assert!(parse(&rejected).is_err());
+    }
+    for mut arguments in [
+        index_arguments(),
+        rebuild_arguments(),
+        retained_rebuild_arguments(),
+        update_arguments(),
+        rollback_arguments(),
+        vec!["authority-recover", "--receipt", "selected.json"],
+    ] {
+        arguments.extend(["--filter", "{}"]);
+        assert!(parse(&arguments).is_err(), "{arguments:?}");
+    }
+    for malformed in [
+        serde_json::json!({"query": "retry", "filter": {"unknown": true}}),
+        serde_json::json!({"query": "retry", "filter": {"metadata": {"tenant": 7}}}),
+        serde_json::json!({"query": "retry", "filter": []}),
+        serde_json::json!({
+            "op": "activate", "receipt": "/selected.json",
+            "expected_authority": [], "filter": {},
+        }),
+    ] {
+        assert!(serde_json::from_value::<AuthorityRequest>(malformed).is_err());
+    }
+    for filter in [serde_json::Value::Null, serde_json::json!({})] {
+        let request = serde_json::from_value::<AuthorityRequest>(
+            serde_json::json!({"query": "retry", "filter": filter}),
+        )
+        .unwrap();
+        let AuthorityRequest::Search(request) = request else {
+            panic!("a search request cannot become an activation");
+        };
+        assert_eq!(request.filter.is_none(), filter.is_null());
     }
 }
 
@@ -1741,6 +1846,469 @@ mod warm_authority {
             identity: identity().identity,
             calls: AtomicUsize::new(0),
         })
+    }
+
+    fn search_options(receipt: &Path, filter: Option<&str>) -> Options {
+        let mut options = parse(&[
+            "authority-search",
+            "--receipt",
+            "selected.json",
+            "--query",
+            "retry",
+            "--limit",
+            "1",
+        ])
+        .unwrap()
+        .unwrap();
+        options.receipt = receipt.to_path_buf();
+        options.filter = filter
+            .map(crate::filter::Filter::parse)
+            .transpose()
+            .unwrap();
+        options
+    }
+
+    #[test]
+    fn filtered_search_and_sessions_keep_the_owner_scope_on_retained_images() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann) in [
+                ("filtered-fast-exact", EmbedderTierTag::Fast, false),
+                ("filtered-quality-exact", EmbedderTierTag::Quality, false),
+                ("filtered-fast-hnsw", EmbedderTierTag::Fast, true),
+                ("filtered-quality-hnsw", EmbedderTierTag::Quality, true),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let selected = publish(&cx, &parent, None, &provider, tier, "old", ann).await;
+                let receipt_path = parent.join("old.json");
+                let options = search_options(&receipt_path, Some(r#"{"id_prefix":"garden-"}"#));
+                let before = provider.calls.load(Ordering::Relaxed);
+                let model: Arc<dyn Embedder> = provider.clone();
+                let mut output = Vec::new();
+                search_with_loader(&cx, &options, &mut output, |requested| {
+                    assert_eq!(requested, tier);
+                    Ok(model)
+                })
+                .await
+                .unwrap();
+                let filtered: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(filtered["event"], "results");
+                assert_eq!(filtered["scope"]["filtered"], true);
+                assert_eq!(filtered["scope"]["eligible_documents"], 1);
+                assert_eq!(filtered["results"].as_array().unwrap().len(), 1);
+                assert_eq!(filtered["results"][0]["doc_id"], "garden-old");
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+
+                let options = search_options(&receipt_path, None);
+                let model: Arc<dyn Embedder> = provider.clone();
+                output.clear();
+                search_with_loader(&cx, &options, &mut output, |_| Ok(model))
+                    .await
+                    .unwrap();
+                let unrestricted: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(unrestricted["results"][0]["doc_id"], "retry-old");
+                assert!(unrestricted.get("scope").is_none());
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 2);
+
+                let options = search_options(&receipt_path, Some(r#"{"ids":[]}"#));
+                let model: Arc<dyn Embedder> = provider.clone();
+                output.clear();
+                search_with_loader(&cx, &options, &mut output, |_| Ok(model))
+                    .await
+                    .unwrap();
+                let empty: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(empty["scope"]["eligible_documents"], 0);
+                assert!(empty["results"].as_array().unwrap().is_empty());
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    before + 2,
+                    "an admitted empty scope does not submit a query to the provider"
+                );
+
+                let fixed = crate::filter::Filter::parse(
+                    r#"{"id_prefix":"garden-","metadata":{"version":"old"}}"#,
+                )
+                .unwrap();
+                let mut session = open_session(&cx, selected.clone(), &provider, false)
+                    .with_filter(&cx, Some(fixed), crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                let before_queries = provider.calls.load(Ordering::Relaxed);
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        serde_json::json!({"id": "fixed", "query": "retry"}),
+                        serde_json::json!({"id": "null", "query": "retry", "filter": null}),
+                        serde_json::json!({"id": "broad", "query": "retry", "filter": {}}),
+                        serde_json::json!({
+                            "id": "excluded", "query": "retry",
+                            "filter": {"ids": ["retry-old"]},
+                        }),
+                        serde_json::json!({
+                            "id": "narrow", "query": "retry",
+                            "filter": {"ids": ["garden-old"], "metadata": {"version": "old"}},
+                        }),
+                        serde_json::json!({
+                            "id": "wrong-metadata", "query": "retry",
+                            "filter": {"metadata": {"version": "new"}},
+                        }),
+                    ],
+                )
+                .await;
+                for position in [1, 2, 3, 5] {
+                    assert_eq!(output[position]["event"], "results");
+                    assert_eq!(output[position]["scope"]["filtered"], true);
+                    assert_eq!(output[position]["scope"]["eligible_documents"], 1);
+                    assert_eq!(output[position]["results"][0]["doc_id"], "garden-old");
+                    assert_eq!(
+                        output[position]["authority"],
+                        serde_json::json!(selected.authority)
+                    );
+                }
+                for position in [4, 6] {
+                    assert_eq!(output[position]["event"], "results");
+                    assert_eq!(output[position]["scope"]["eligible_documents"], 0);
+                    assert!(output[position]["results"].as_array().unwrap().is_empty());
+                }
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before_queries + 4);
+                assert_eq!(session.receipt.authority, selected.authority);
+
+                fs::rename(parent.join("old-work"), parent.join("archived-work")).unwrap();
+                fs::rename(&selected.root, parent.join("relocated-root")).unwrap();
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[serde_json::json!({
+                        "query": "retry", "filter": {"ids": ["garden-old"]},
+                    })],
+                )
+                .await;
+                assert_eq!(output[1]["results"][0]["doc_id"], "garden-old");
+                assert_eq!(output[1]["scope"]["eligible_documents"], 1);
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before_queries + 5);
+            }
+        });
+    }
+
+    #[test]
+    fn authority_filter_source_budgets_are_lazy_and_fail_before_model_or_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("filter-source-budget");
+            let provider = provider();
+            let selected = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Fast,
+                "old",
+                true,
+            )
+            .await;
+            let receipt_path = parent.join("old.json");
+            let before = provider.calls.load(Ordering::Relaxed);
+            let mut options = search_options(&receipt_path, Some("{}"));
+            options.max_source_bytes = 1;
+            let loads = AtomicUsize::new(0);
+            let mut output = Vec::new();
+            let error = search_with_loader(&cx, &options, &mut output, |_| {
+                loads.fetch_add(1, Ordering::Relaxed);
+                Err(bad("source admission must precede local model loading"))
+            })
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("stored-payload-limit"));
+            assert_eq!(loads.load(Ordering::Relaxed), 0);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            assert!(output.is_empty());
+            assert!(
+                open_session(&cx, selected.clone(), &provider, false)
+                    .with_filter(&cx, Some(crate::filter::Filter::parse("{}").unwrap()), 1)
+                    .is_err()
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+
+            options.filter = None;
+            let model: Arc<dyn Embedder> = provider.clone();
+            search_with_loader(&cx, &options, &mut output, |_| Ok(model))
+                .await
+                .unwrap();
+            let page: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(page["results"][0]["doc_id"], "retry-old");
+            assert!(page.get("scope").is_none());
+            let mut session = open_session(&cx, selected.clone(), &provider, false)
+                .with_filter(&cx, None, 1)
+                .unwrap();
+            let before_queries = provider.calls.load(Ordering::Relaxed);
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[
+                    serde_json::json!({"id": "ordinary", "query": "retry"}),
+                    serde_json::json!({"id": "bounded", "query": "retry", "filter": {}}),
+                    serde_json::json!({"id": "still-ordinary", "query": "retry", "filter": null}),
+                ],
+            )
+            .await;
+            assert_eq!(output[1]["event"], "results");
+            assert_eq!(output[2]["event"], "failed");
+            assert_eq!(output[3]["event"], "results");
+            assert_eq!(output[3]["results"][0]["doc_id"], "retry-old");
+            assert!(output[1].get("scope").is_none());
+            assert!(output[3].get("scope").is_none());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before_queries + 2);
+            assert_eq!(session.receipt.authority, selected.authority);
+
+            // Empty membership still requires the selected query producer.
+            let wrong = Arc::new(Provider {
+                identity: {
+                    let mut identity = identity().identity;
+                    identity.producer.implementation_revision = "wrong-filter-producer".to_owned();
+                    identity
+                },
+                calls: AtomicUsize::new(0),
+            });
+            let options = search_options(&receipt_path, Some(r#"{"ids":[]}"#));
+            let model: Arc<dyn Embedder> = wrong.clone();
+            assert!(
+                search_with_loader(&cx, &options, &mut Vec::new(), |_| Ok(model))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(wrong.calls.load(Ordering::Relaxed), 0);
+        });
+    }
+
+    #[test]
+    fn bad_filter_requests_and_query_failures_leave_the_next_scoped_query_usable() {
+        struct QueryFailureProvider {
+            inner: Arc<Provider>,
+        }
+        impl Embedder for QueryFailureProvider {
+            fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                self.inner.identity()
+            }
+            fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                if text == "private-inference-failure" {
+                    self.inner.calls.fetch_add(1, Ordering::Relaxed);
+                    return Box::pin(async {
+                        Err(SearchError::SubsystemError {
+                            subsystem: "authority_filter_test",
+                            source: "private-provider-error-must-not-escape".into(),
+                        })
+                    });
+                }
+                self.inner.embed(cx, text)
+            }
+            fn dimension(&self) -> usize {
+                self.inner.dimension()
+            }
+            fn id(&self) -> &str {
+                self.inner.id()
+            }
+            fn model_name(&self) -> &str {
+                self.inner.model_name()
+            }
+            fn is_semantic(&self) -> bool {
+                true
+            }
+            fn category(&self) -> ModelCategory {
+                self.inner.category()
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("bad-filters");
+            let provider = provider();
+            let selected = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Quality,
+                "old",
+                true,
+            )
+            .await;
+            let root = admit_root(&selected.root).unwrap();
+            let snapshot = selected
+                .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                .unwrap();
+            let model: Arc<dyn Embedder> = Arc::new(QueryFailureProvider {
+                inner: provider.clone(),
+            });
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                selected.clone(),
+                snapshot,
+                model,
+                (1, DEFAULT_IMAGE_BYTES),
+                false,
+            )
+            .unwrap()
+            .with_filter(
+                &cx,
+                Some(crate::filter::Filter::parse(r#"{"metadata":{"version":"old"}}"#).unwrap()),
+                crate::MAX_INPUT_BYTES,
+            )
+            .unwrap();
+            let too_many_ids = (0..4097)
+                .map(|index| format!("doc-{index}"))
+                .collect::<Vec<_>>();
+            let too_many_metadata = (0..65)
+                .map(|index| (format!("field-{index}"), "value"))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let mut messages = vec![
+                serde_json::json!({"query": "retry", "filter": {"ids": too_many_ids}}),
+                serde_json::json!({"query": "retry", "filter": {"metadata": too_many_metadata}}),
+                serde_json::json!({"query": "retry", "filter": {"id_prefix": "x".repeat(65536)}}),
+                serde_json::json!({"query": "retry", "filter": {"ids": [" "]}}),
+                serde_json::json!({"query": "retry", "filter": {"ids": ["private\0id"]}}),
+                serde_json::json!({
+                    "query": "retry", "filter": {"unknown": "private-filter-sentinel"},
+                }),
+            ];
+            let invalid_count = messages.len();
+            messages.extend([
+                serde_json::json!({"id": "inference", "query": "private-inference-failure"}),
+                serde_json::json!({
+                    "id": "empty", "query": "private-inference-failure", "filter": {"ids": []},
+                }),
+                serde_json::json!({
+                    "id": "recovered", "query": "retry", "filter": {"ids": ["garden-old"]},
+                }),
+            ]);
+            let before = provider.calls.load(Ordering::Relaxed);
+            let output = exchange(&cx, &mut session, &messages).await;
+            for frame in &output[1..=invalid_count + 1] {
+                assert_eq!(frame["event"], "failed");
+                assert_eq!(frame["authority"], serde_json::json!(selected.authority));
+                assert!(serde_json::to_vec(frame).unwrap().len() < 2048);
+            }
+            let empty = &output[invalid_count + 2];
+            assert_eq!(empty["event"], "results");
+            assert_eq!(empty["scope"]["eligible_documents"], 0);
+            assert!(empty["results"].as_array().unwrap().is_empty());
+            let recovered = &output[invalid_count + 3];
+            assert_eq!(recovered["event"], "results");
+            assert_eq!(recovered["id"], "recovered");
+            assert_eq!(recovered["scope"]["eligible_documents"], 1);
+            assert_eq!(recovered["results"][0]["doc_id"], "garden-old");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before + 2);
+            assert_eq!(session.receipt.authority, selected.authority);
+            let encoded = serde_json::to_string(&output).unwrap();
+            assert!(!encoded.contains("private-provider-error-must-not-escape"));
+            assert!(!encoded.contains("private-filter-sentinel"));
+        });
+    }
+
+    #[test]
+    fn filtered_activation_refreshes_membership_and_budget_refusal_keeps_the_prior_scope() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier) in [
+                ("filtered-activation-fast", EmbedderTierTag::Fast),
+                ("filtered-activation-quality", EmbedderTierTag::Quality),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let old = publish(&cx, &parent, None, &provider, tier, "old", true).await;
+                let fixed =
+                    || crate::filter::Filter::parse(r#"{"metadata":{"version":"new"}}"#).unwrap();
+                let mut session = open_session(&cx, old.clone(), &provider, true)
+                    .with_filter(&cx, Some(fixed()), 256)
+                    .unwrap();
+                let mut retained = open_session(&cx, old.clone(), &provider, false)
+                    .with_filter(&cx, Some(fixed()), 256)
+                    .unwrap();
+                let next = publish(
+                    &cx,
+                    &parent,
+                    Some(&session.snapshot),
+                    &provider,
+                    tier,
+                    "new",
+                    false,
+                )
+                .await;
+                let before = provider.calls.load(Ordering::Relaxed);
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        serde_json::json!({"query": "retry"}),
+                        serde_json::json!({
+                            "op": "activate", "receipt": parent.join("new.json"),
+                            "expected_authority": old.authority,
+                        }),
+                        serde_json::json!({"query": "retry"}),
+                    ],
+                )
+                .await;
+                assert_eq!(output[1]["scope"]["eligible_documents"], 0);
+                assert!(output[1]["results"].as_array().unwrap().is_empty());
+                assert_eq!(output[2]["event"], "activated");
+                assert_eq!(output[2]["authority"], serde_json::json!(next.authority));
+                assert_eq!(output[3]["scope"]["eligible_documents"], 2);
+                assert_eq!(output[3]["results"][0]["doc_id"], "retry-new");
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+                let held = exchange(
+                    &cx,
+                    &mut retained,
+                    &[serde_json::json!({"query": "retry", "filter": {}})],
+                )
+                .await;
+                assert_eq!(held[1]["authority"], serde_json::json!(old.authority));
+                assert_eq!(held[1]["scope"]["eligible_documents"], 0);
+                assert!(held[1]["results"].as_array().unwrap().is_empty());
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+
+                // A valid successor can exceed the server's retained-source
+                // budget even when its fixed predicate would reject every row.
+                // That refusal must leave BOTH the reader and frozen scope intact.
+                let large_label = "oversized".repeat(20);
+                let oversized = publish(
+                    &cx,
+                    &parent,
+                    Some(&session.snapshot),
+                    &provider,
+                    tier,
+                    &large_label,
+                    true,
+                )
+                .await;
+                let authority_after = fs::read(old.root.join("AUTHORITY")).unwrap();
+                let before_refusal = provider.calls.load(Ordering::Relaxed);
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        serde_json::json!({
+                            "op": "activate", "receipt": parent.join(format!("{large_label}.json")),
+                            "expected_authority": next.authority,
+                        }),
+                        serde_json::json!({"query": "retry", "filter": {"ids": []}}),
+                        serde_json::json!({"query": "retry", "filter": {}}),
+                    ],
+                )
+                .await;
+                assert_eq!(output[1]["event"], "failed");
+                assert_eq!(output[1]["authority"], serde_json::json!(next.authority));
+                assert_ne!(
+                    output[1]["authority"],
+                    serde_json::json!(oversized.authority)
+                );
+                assert_eq!(output[2]["scope"]["eligible_documents"], 0);
+                assert!(output[2]["results"].as_array().unwrap().is_empty());
+                assert_eq!(output[3]["scope"]["eligible_documents"], 2);
+                assert_eq!(output[3]["results"][0]["doc_id"], "retry-new");
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before_refusal + 1);
+                assert_eq!(session.receipt.authority, next.authority);
+                assert_eq!(
+                    fs::read(old.root.join("AUTHORITY")).unwrap(),
+                    authority_after
+                );
+            }
+        });
     }
 
     #[test]

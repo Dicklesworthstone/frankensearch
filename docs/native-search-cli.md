@@ -401,6 +401,67 @@ before emission. Output failure stops the session. Send `quit`, `exit`, or EOF
 to finish. As with the existing native stdio server, input reads block on the
 owning lane, and cancellation is observed between reads and requests.
 
+### Filter fixed-authority search and warm requests
+
+`authority-search --filter JSON` and `authority-serve --filter JSON` use the
+same source predicate as ordinary native search: an optional exact `ids` set,
+a literal `id_prefix`, and exact string-valued `metadata`. All present
+constraints must match. Comparisons are case-sensitive; no glob, expression,
+or path interpretation is applied.
+
+```sh
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --query 'retry transient failures' --limit 10 \
+  --filter '{"id_prefix":"src/","metadata":{"language":"rust"}}'
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --model-dir /absolute/path/to/installed/models --allow-activation \
+  --filter '{"metadata":{"project":"client"}}' --max-source-bytes 134217728
+```
+
+The server's fixed filter is evaluated once against its retained source. Each
+search request may add a `filter` object. This narrows the fixed membership;
+it cannot widen or replace it:
+
+```jsonl
+{"id":"rust","query":"retry requests","filter":{"id_prefix":"src/","metadata":{"language":"rust"}}}
+{"id":"all-allowed","query":"retry requests","filter":{}}
+{"id":"none","query":"retry requests","filter":{"ids":[]}}
+```
+
+An absent or null request filter preserves the fixed scope. An empty object
+adds no restriction; `ids: []` selects no documents. Filtered result frames
+report `scope.filtered: true` and `scope.eligible_documents`, the number of
+eligible source documents before query matching. Empty scopes return no hits
+and perform no query inference, while still requiring the selected producer
+identity and local model.
+
+Both vector and lexical candidates are restricted before normalization,
+fusion, and winner hydration. Retrieval widens within the same immutable
+generation to find eligible candidates instead of discarding a completed
+top-k page. HNSW remains approximate, and lexical scoring retains whole-corpus
+statistics. A selective lexical query can examine the full matching cohort.
+
+`--max-source-bytes` bounds complete stored-source export using the raw-field
+accounting described for retained-source rebuilds, with a 256 MiB default. It
+does not bound total process memory. A fixed server scope retains that source
+once and reuses it for narrowed requests. Without a fixed scope, a filtered
+request exports its own bounded source; unfiltered searches export none.
+Requests cannot increase the configured budget. Filters retain the existing
+limits of 4096 IDs, 64 metadata fields, and 64 KiB of decoded filter text.
+Invalid filters fail the request without producing an unrestricted result.
+
+Explicit activation evaluates the fixed filter against the newly admitted
+generation before replacing any session state. Source validation, budget, or
+policy failure preserves the previous reader and its membership. Previously
+retained library scopes likewise keep their original source and authority
+across publication and rollback; they are not live revocation mechanisms.
+Library callers can retain an `Arc<NativeGenerationSnapshot>`, call
+`snapshot.scope(&cx, max_source_bytes, predicate)`, and use `narrow` to derive
+an intersected scope without exporting the source again.
+
 ### Quality models, budgets, and publication recovery
 
 For quality-only native inference, build with `hybrid-native` as described below

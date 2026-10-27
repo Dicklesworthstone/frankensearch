@@ -4,7 +4,7 @@
 //! rediscovered through a pathname, and a later authority activation cannot
 //! change the bytes used by an already-admitted reader.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -31,8 +31,13 @@ use frankensearch_quill::{
 use sha2::Digest as _;
 
 use super::builder::{NativeBuildRetrieval, NativeIndexUpdate};
-use super::{NativeAnnIndex, NativeBackend, NativeRetrievalMode, checkpoint, invalid, lower_hex};
-use crate::{Cx, Embedder, GenerationCandidateV1, IndexableDocument, ScoredResult, SearchResult};
+use super::{
+    NativeAnnIndex, NativeBackend, NativeProgressiveSearch, NativeRetrievalMode, checkpoint,
+    invalid, lower_hex,
+};
+use crate::{
+    Cx, Embedder, GenerationCandidateV1, IndexableDocument, LexicalRead, ScoredResult, SearchResult,
+};
 
 #[cfg(test)]
 mod tests;
@@ -357,6 +362,34 @@ impl NativeGenerationSnapshot {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         self.readers.search_text(cx, embedder, text, k).await
+    }
+
+    // Only the closed source-scope adapter may wrap this immutable lexical
+    // reader. Its source inventory is exported from these same admitted images.
+    pub(in crate::native_ann) fn scoped_lexical(&self) -> &dyn LexicalRead {
+        &self.readers.lexical
+    }
+
+    // Keep the raw vector owner private while using the ordinary phase engine's
+    // identity admission, filtered traversal and winner hydration. Clamp before
+    // candidate-budget multiplication, including for empty scopes and usize::MAX.
+    pub(in crate::native_ann) fn scoped_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        embedder: &'a dyn Embedder,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation.scoped_search")?;
+        let live_count =
+            usize::try_from(self.readers.vector.owner_witness().live_count).unwrap_or(usize::MAX);
+        let k = k.min(live_count).min(allowed.len());
+        self.readers
+            .vector
+            .search_hybrid_progressive(cx, embedder, None, lexical, text, k)?
+            .with_allowed_documents_arc(allowed)
     }
 }
 

@@ -970,7 +970,7 @@ mod qualified_rollback {
     use crate::native_ann::builder::{
         NativeBuildPrecision, NativeBuiltExactGeneration, NativeIndexBuilder,
     };
-    use crate::{GenerationActivationV1, GenerationPublisherV1};
+    use crate::{GenerationActivationV1, GenerationPublisherV1, LexicalRead};
     use frankensearch_core::generation::GenerationRootSecurityProfileV1;
     use frankensearch_index::generation_root::authority_publisher::{
         AUTHORITY_PUBLISHER_LOCK_BYTES_V1, ExpectedAuthorityPairV1, PublicationOutcomeV1,
@@ -1121,6 +1121,453 @@ mod qualified_rollback {
             .find(|physical| owner.row(*physical).unwrap().doc_id() == id)
             .unwrap();
         owner.vector_at_f32(physical).unwrap()
+    }
+
+    struct ScopeProvider(Provider);
+
+    impl Embedder for ScopeProvider {
+        fn embed<'a>(&'a self, _: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.0.calls.fetch_add(1, Ordering::SeqCst);
+            // A deterministic test provider makes excluded documents outrank
+            // eligible documents in the real retained vector owner.
+            let vector = if text.starts_with("kept ") {
+                vec![0.6, 0.8]
+            } else {
+                vec![1.0, 0.0]
+            };
+            Box::pin(async move { Ok(vector) })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.0.identity()
+        }
+
+        fn dimension(&self) -> usize {
+            self.0.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.0.id()
+        }
+
+        fn model_name(&self) -> &str {
+            self.0.model_name()
+        }
+
+        fn is_semantic(&self) -> bool {
+            self.0.is_semantic()
+        }
+
+        fn category(&self) -> ModelCategory {
+            self.0.category()
+        }
+    }
+
+    fn assert_same_scored_results(actual: &[ScoredResult], expected: &[ScoredResult]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert_eq!(actual.doc_id, expected.doc_id);
+            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+            assert_eq!(actual.source, expected.source);
+            assert_eq!(actual.index, expected.index);
+            assert_eq!(
+                actual.fast_score.map(f32::to_bits),
+                expected.fast_score.map(f32::to_bits)
+            );
+            assert_eq!(
+                actual.quality_score.map(f32::to_bits),
+                expected.quality_score.map(f32::to_bits)
+            );
+            assert_eq!(
+                actual.lexical_score.map(f32::to_bits),
+                expected.lexical_score.map(f32::to_bits)
+            );
+            assert_eq!(
+                actual.rerank_score.map(f32::to_bits),
+                expected.rerank_score.map(f32::to_bits)
+            );
+            assert_eq!(actual.metadata, expected.metadata);
+            assert!(actual.explanation.is_none() && expected.explanation.is_none());
+        }
+    }
+
+    #[test]
+    fn authority_scopes_refill_both_candidate_lanes_and_preserve_unfiltered_results() {
+        let parent = update_parent("scoped-refill");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (name, tier, ann) in [
+                ("fast-exact", EmbedderTierTag::Fast, false),
+                ("quality-exact", EmbedderTierTag::Quality, false),
+                ("fast-ann", EmbedderTierTag::Fast, true),
+                ("quality-ann", EmbedderTierTag::Quality, true),
+            ] {
+                let provider = Arc::new(ScopeProvider(Provider::new()));
+                let retrieval = if ann {
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams {
+                            m: 8,
+                            m0: 16,
+                            ef_construction: 24,
+                            ef_search: 3,
+                        },
+                        seed: 37,
+                    }
+                } else {
+                    NativeBuildRetrieval::Exact
+                };
+                let mut documents: Vec<_> = (0..8)
+                    .map(|index| {
+                        IndexableDocument::new(
+                            format!("excluded-{index}"),
+                            "needle needle needle needle",
+                        )
+                        .with_title("needle needle")
+                        .with_metadata("tenant", "red")
+                    })
+                    .collect();
+                for id in ["included-alpha", "included-beta"] {
+                    documents.push(
+                        IndexableDocument::new(
+                            id,
+                            format!("kept needle {}", "padding ".repeat(96)),
+                        )
+                        .with_title("Eligible retained title")
+                        .with_metadata("tenant", "blue")
+                        .with_metadata("version", "selected"),
+                    );
+                }
+                let built = NativeIndexBuilder::new(
+                    parent.join(format!("{name}-build")),
+                    ArtifactGenerationIdentityV1::new(1, [0xb1; 16]).unwrap(),
+                    provider.clone(),
+                )
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+                .add_documents(documents.clone())
+                .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 10 }, BUDGET)
+                .await
+                .unwrap();
+                let root = create_root(&parent.join(format!("{name}-root")));
+                let candidate = built
+                    .candidate(
+                        [0xb2; 16],
+                        None,
+                        GenerationAuthorityActionV1::Activate,
+                        [0xb3; 32],
+                    )
+                    .unwrap();
+                stage(&root, &built, &candidate);
+                let retained = Arc::new(publish(
+                    &cx,
+                    &root,
+                    &candidate,
+                    built.binding(),
+                    ExpectedAuthorityPairV1::default(),
+                    [0xb4; 16],
+                ));
+                assert_eq!(retained.retrieval_mode(), built.retrieval_mode());
+                let calls = provider.0.calls.load(Ordering::SeqCst);
+                let mut visited = Vec::new();
+                let scope = retained
+                    .scope(&cx, BUDGET, |document| {
+                        visited.push(document.id.clone());
+                        Ok(
+                            document.metadata.get("tenant").map(String::as_str) == Some("blue")
+                                && document.title.as_deref() == Some("Eligible retained title"),
+                        )
+                    })
+                    .unwrap();
+                assert_eq!(visited.len(), documents.len());
+                assert_eq!(scope.len(), 2);
+                assert!(!scope.is_empty());
+                assert_eq!(provider.0.calls.load(Ordering::SeqCst), calls);
+                assert!(scope.document("excluded-0").is_none());
+                for expected in documents
+                    .iter()
+                    .filter(|doc| doc.id.starts_with("included-"))
+                {
+                    let actual = scope.document(&expected.id).unwrap();
+                    assert_eq!(actual.content, expected.content);
+                    assert_eq!(actual.title, expected.title);
+                    assert_eq!(actual.metadata, expected.metadata);
+                }
+
+                // Neither ordinary source window contains an eligible row.
+                // Truncating then filtering either lane therefore loses data.
+                let vectors = retained
+                    .readers
+                    .vector
+                    .search_text(&cx, provider.as_ref(), "needle", 6, None)
+                    .await
+                    .unwrap();
+                assert_eq!(vectors.len(), 6);
+                assert!(
+                    vectors
+                        .iter()
+                        .all(|hit| hit.doc_id.starts_with("excluded-"))
+                );
+                let lexical = retained
+                    .readers
+                    .lexical
+                    .search_candidates(&cx, "needle", 6)
+                    .await
+                    .unwrap();
+                assert_eq!(lexical.results().len(), 6);
+                assert!(
+                    lexical
+                        .results()
+                        .iter()
+                        .all(|hit| hit.doc_id.starts_with("excluded-"))
+                );
+                let filtered = scope
+                    .search_text(&cx, provider.as_ref(), "needle", 2)
+                    .await
+                    .unwrap();
+                assert_eq!(filtered.len(), 2);
+                for hit in &filtered {
+                    assert!(hit.doc_id.starts_with("included-"));
+                    assert_eq!(hit.source, ScoreSource::Hybrid);
+                    assert!(hit.index.is_some() && hit.lexical_score.is_some());
+                    assert_eq!(hit.fast_score.is_some(), tier == EmbedderTierTag::Fast);
+                    assert_eq!(
+                        hit.quality_score.is_some(),
+                        tier == EmbedderTierTag::Quality
+                    );
+                    assert_eq!(hit.metadata.as_deref().unwrap()["tenant"], "blue");
+                    let row = retained
+                        .readers
+                        .vector
+                        .owner
+                        .row(usize::try_from(hit.index.unwrap()).unwrap())
+                        .unwrap();
+                    assert_eq!(row.doc_id(), hit.doc_id.as_str());
+                }
+                assert_same_scored_results(
+                    &scope
+                        .search_text(&cx, provider.as_ref(), "needle", usize::MAX)
+                        .await
+                        .unwrap(),
+                    &filtered,
+                );
+                let mut narrowed_ids = Vec::new();
+                let narrowed = scope
+                    .narrow(&cx, |document| {
+                        narrowed_ids.push(document.id.clone());
+                        Ok(document.id == "included-beta")
+                    })
+                    .unwrap();
+                assert_eq!(narrowed_ids.len(), 2);
+                assert!(narrowed_ids.iter().all(|id| id.starts_with("included-")));
+                assert_eq!(scope.len(), 2);
+                assert_eq!(narrowed.len(), 1);
+                assert!(narrowed.document("included-alpha").is_none());
+                assert_eq!(
+                    narrowed
+                        .narrow(&cx, |_| Ok(true))
+                        .unwrap()
+                        .search_text(&cx, provider.as_ref(), "needle", usize::MAX)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "included-beta"
+                );
+                let empty = narrowed
+                    .narrow(&cx, |document| Ok(document.id == "included-alpha"))
+                    .unwrap();
+                assert!(empty.is_empty());
+                assert!(
+                    empty
+                        .narrow(&cx, |_| panic!("empty membership cannot widen"))
+                        .unwrap()
+                        .is_empty()
+                );
+                let before_empty = provider.0.calls.load(Ordering::SeqCst);
+                assert!(
+                    empty
+                        .search_text(&cx, provider.as_ref(), "needle", 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(provider.0.calls.load(Ordering::SeqCst), before_empty);
+
+                let all = retained.scope(&cx, BUDGET, |_| Ok(true)).unwrap();
+                assert_eq!(all.len(), documents.len());
+                for text in ["needle", "absent-term"] {
+                    for k in [0, 1, 2, usize::MAX] {
+                        let expected = retained
+                            .search_text(&cx, provider.as_ref(), text, k)
+                            .await
+                            .unwrap();
+                        let actual = all
+                            .search_text(&cx, provider.as_ref(), text, k)
+                            .await
+                            .unwrap();
+                        assert_same_scored_results(&actual, &expected);
+                    }
+                }
+                let pin = Arc::downgrade(&retained);
+                drop(retained);
+                assert!(
+                    pin.upgrade().is_some(),
+                    "scoped readers retain the admitted generation"
+                );
+                drop(all);
+                drop(empty);
+                drop(narrowed);
+                drop(scope);
+                assert!(pin.upgrade().is_none());
+            }
+        });
+    }
+
+    #[test]
+    fn authority_scopes_refuse_partial_admission_and_validate_empty_queries() {
+        let parent = update_parent("scoped-refusals");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let provider = Provider::new();
+            let fixture = fixture(&cx, &provider, EmbedderTierTag::Fast).await;
+            let root = create_root(&parent.join("root"));
+            let retained = Arc::new(publish_fixture(&cx, &root, &fixture));
+            let documents = retained.source_documents(&cx, BUDGET).unwrap();
+            let payload_bytes: usize = documents
+                .iter()
+                .map(|document| {
+                    let metadata: BTreeMap<_, _> = document.metadata.iter().collect();
+                    document.id.len()
+                        + document.content.len()
+                        + document.title.as_deref().unwrap_or("").len()
+                        + serde_json::to_vec(&metadata).unwrap().len()
+                })
+                .sum();
+            let mut predicate_calls = 0;
+            let result = retained.scope(&cx, payload_bytes - 1, |_| {
+                predicate_calls += 1;
+                Ok(false)
+            });
+            assert!(matches!(
+                result,
+                Err(SearchError::InvalidConfig { value, .. }) if value == "stored-payload-limit"
+            ));
+            assert_eq!(
+                predicate_calls, 0,
+                "selection cannot bypass the whole-source budget"
+            );
+            let all = retained.scope(&cx, payload_bytes, |_| Ok(true)).unwrap();
+            assert_eq!(all.len(), 2);
+            assert!(all.document("dead").is_none());
+
+            let mut admitted = 0;
+            let result = retained.scope(&cx, payload_bytes, |_| {
+                admitted += 1;
+                if admitted == 2 {
+                    Err(refused("scope-test", "predicate-failed"))
+                } else {
+                    Ok(true)
+                }
+            });
+            assert!(matches!(
+                result,
+                Err(SearchError::InvalidConfig { value, .. }) if value == "predicate-failed"
+            ));
+            assert_eq!(admitted, 2);
+            let mut narrowed = 0;
+            let result = all.narrow(&cx, |_| {
+                narrowed += 1;
+                if narrowed == 2 {
+                    Err(refused("scope-test", "narrowing-failed"))
+                } else {
+                    Ok(true)
+                }
+            });
+            assert!(matches!(
+                result,
+                Err(SearchError::InvalidConfig { value, .. }) if value == "narrowing-failed"
+            ));
+            assert_eq!(narrowed, 2);
+            assert_eq!(
+                all.len(),
+                2,
+                "failed narrowing leaves the original view intact"
+            );
+
+            let empty = all.narrow(&cx, |_| Ok(false)).unwrap();
+            assert!(empty.is_empty());
+            let mut foreign = Provider::new();
+            foreign.identity.producer.backend = "foreign-scoped-producer".to_owned();
+            foreign.identity.validate().unwrap();
+            assert!(empty.search_text(&cx, &foreign, "common", 1).await.is_err());
+            assert!(all.search_text(&cx, &foreign, "common", 0).await.is_err());
+            assert!(
+                empty
+                    .search_text(&cx, &provider, "common", 1)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                all.search_text(&cx, &provider, "common", 0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                retained.scope(&cx, 0, |_| panic!(
+                    "cancelled scope must not call predicates"
+                )),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                all.narrow(&cx, |_| panic!(
+                    "cancelled narrowing must not call predicates"
+                )),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert!(matches!(
+                empty.search_text(&cx, &provider, "common", 0).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            let mut visited = 0;
+            assert!(matches!(
+                retained.scope(&cx, payload_bytes, |_| {
+                    visited += 1;
+                    if visited == documents.len() {
+                        cx.set_cancel_requested(true);
+                    }
+                    Ok(true)
+                }),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(visited, documents.len());
+            cx.set_cancel_requested(false);
+            let mut visited = 0;
+            assert!(matches!(
+                all.narrow(&cx, |_| {
+                    visited += 1;
+                    if visited == all.len() {
+                        cx.set_cancel_requested(true);
+                    }
+                    Ok(true)
+                }),
+                Err(SearchError::Cancelled { .. })
+            ));
+            assert_eq!(visited, all.len());
+            cx.set_cancel_requested(false);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(all.len(), 2);
+            let hits = all
+                .search_text(&cx, &provider, "common", usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            assert!(hits.iter().all(|hit| hit.doc_id != "dead"));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        });
     }
 
     #[test]
@@ -1553,14 +2000,14 @@ mod qualified_rollback {
                     )
                     .unwrap();
                 stage(&root, &original, &first);
-                let retained = publish(
+                let retained = Arc::new(publish(
                     &cx,
                     &root,
                     &first,
                     original.binding(),
                     ExpectedAuthorityPairV1::default(),
                     [0x85; 16],
-                );
+                ));
                 assert_eq!(retained.retrieval_mode(), original.retrieval_mode());
                 assert_eq!(first.manifest().components().ann.is_some(), ann);
                 assert!(
@@ -1568,6 +2015,23 @@ mod qualified_rollback {
                         .rollback_candidate(&cx, &retained, [0x86; 16], [0x87; 32])
                         .is_err()
                 );
+                let original_scope =
+                    retained
+                        .scope(&cx, BUDGET, |document| {
+                            Ok(document.metadata.get("version").map(String::as_str)
+                                == Some("original"))
+                        })
+                        .unwrap();
+                let absent_scope = retained
+                    .scope(&cx, BUDGET, |document| Ok(document.id == "successor"))
+                    .unwrap();
+                assert_eq!(original_scope.len(), 1);
+                assert!(absent_scope.is_empty());
+                fs::rename(
+                    parent.join(format!("{name}-original")),
+                    parent.join(format!("{name}-original-relocated")),
+                )
+                .unwrap();
 
                 let mut changed_provider = Provider::new();
                 changed_provider.identity.producer.backend = "successor-producer".to_owned();
@@ -1597,17 +2061,26 @@ mod qualified_rollback {
                     )
                     .unwrap();
                 stage(&root, &rebuilt, &second);
-                let current = publish(
+                let current = Arc::new(publish(
                     &cx,
                     &root,
                     &second,
                     rebuilt.binding(),
                     retained.retained_snapshot().authority_pair(),
                     [0x8b; 16],
-                );
+                ));
                 assert_eq!(current.retrieval_mode(), rebuilt.retrieval_mode());
                 assert_ne!(current.retrieval_mode(), retained.retrieval_mode());
                 assert_eq!(current.retained_snapshot().selected_predecessor_of(), None);
+                let successor_scope = current
+                    .scope(&cx, BUDGET, |document| {
+                        Ok(document.metadata.get("version").map(String::as_str)
+                            == Some("successor"))
+                    })
+                    .unwrap();
+                assert_eq!(successor_scope.len(), 1);
+                assert!(original_scope.document("successor").is_none());
+                assert!(successor_scope.document("original").is_none());
                 // Reopen through a new qualified root and fresh current-head
                 // admission. The target is recovered from its exact authority,
                 // without reusing the old reader's retained component bytes.
@@ -1775,14 +2248,14 @@ mod qualified_rollback {
 
                 stage_manifest(&root, &rollback);
                 stage_manifest(&root, &loser);
-                let restored = publish(
+                let restored = Arc::new(publish(
                     &cx,
                     &root,
                     &rollback,
                     original.binding(),
                     current.retained_snapshot().authority_pair(),
                     [0x97; 16],
-                );
+                ));
                 assert_eq!(restored.authority().sequence, 3);
                 assert_eq!(restored.retrieval_mode(), retained.retrieval_mode());
                 match (
@@ -1874,7 +2347,7 @@ mod qualified_rollback {
                     after_authority
                 );
                 assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), after_lock);
-                for snapshot in [&retained, &reopened_target, &restored] {
+                for snapshot in [retained.as_ref(), &reopened_target, restored.as_ref()] {
                     let documents = snapshot.source_documents(&cx, BUDGET).unwrap();
                     assert_eq!(documents.len(), 1);
                     assert_eq!(documents[0].id, "original");
@@ -1897,7 +2370,7 @@ mod qualified_rollback {
                             .is_err()
                     );
                 }
-                for snapshot in [&current, &reopened_current, &previous_current] {
+                for snapshot in [current.as_ref(), &reopened_current, &previous_current] {
                     let hits = snapshot
                         .search_text(&cx, changed_provider.as_ref(), "common", 5)
                         .await
@@ -1908,6 +2381,55 @@ mod qualified_rollback {
                         "successor"
                     );
                 }
+                let restored_scope = restored.scope(&cx, BUDGET, |_| Ok(true)).unwrap();
+                let original_hits = original_scope
+                    .search_text(&cx, original_provider.as_ref(), "common", usize::MAX)
+                    .await
+                    .unwrap();
+                let restored_hits = restored_scope
+                    .search_text(&cx, original_provider.as_ref(), "common", usize::MAX)
+                    .await
+                    .unwrap();
+                assert_same_scored_results(&original_hits, &restored_hits);
+                assert_eq!(original_hits[0].doc_id, "original");
+                let original_document = original_scope.document("original").unwrap();
+                assert_eq!(original_document.content, "common retained source");
+                assert_eq!(
+                    original_document.title.as_deref(),
+                    Some("Retained original title")
+                );
+                assert_eq!(original_document.metadata["version"], "original");
+                assert!(original_scope.document("successor").is_none());
+                assert!(
+                    original_scope
+                        .narrow(&cx, |document| Ok(document.id == "successor"))
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    absent_scope
+                        .narrow(&cx, |_| panic!("publication cannot add scoped members"))
+                        .unwrap()
+                        .is_empty()
+                );
+                let successor_hits = successor_scope
+                    .search_text(&cx, changed_provider.as_ref(), "common", usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(successor_hits[0].doc_id, "successor");
+                let successor_document = successor_scope.document("successor").unwrap();
+                assert_eq!(successor_document.content, "common replacement source");
+                assert_eq!(successor_document.metadata["version"], "successor");
+                assert!(successor_scope.document("original").is_none());
+                let calls = original_provider.calls.load(Ordering::SeqCst);
+                assert!(
+                    absent_scope
+                        .search_text(&cx, original_provider.as_ref(), "common", 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(original_provider.calls.load(Ordering::SeqCst), calls);
                 cx.set_cancel_requested(true);
                 assert!(matches!(
                     retained.rollback_candidate(&cx, &restored, [0x9b; 16], [0x9c; 32]),
