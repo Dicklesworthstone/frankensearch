@@ -533,6 +533,9 @@ impl FsfsRuntime {
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
         retained_search_checkpoint(cx)?;
+        if documents.values().any(Option::is_some) {
+            self.validate_content_upserts_allowed()?;
+        }
         if documents.is_empty() {
             return Ok(RetainedBatchResult {
                 publication: None,

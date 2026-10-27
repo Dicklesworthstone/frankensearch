@@ -3321,12 +3321,10 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
         DegradationOverrideMode::ForceEmbedDeferred => Some(
             "embedding is not deferred yet and search stays hybrid under force_embed_deferred, so this changes nothing",
         ),
-        DegradationOverrideMode::ForceMetadataOnly => Some(
-            "search is refused, but indexing still reads and embeds content: metadata-only indexing is not implemented yet",
-        ),
         DegradationOverrideMode::Auto
         | DegradationOverrideMode::ForceFull
         | DegradationOverrideMode::ForceLexicalOnly
+        | DegradationOverrideMode::ForceMetadataOnly
         | DegradationOverrideMode::ForcePaused => None,
     };
     if let Some(message) = unwired_indexing {
@@ -4260,7 +4258,7 @@ mod tests {
             ("force_full", false),
             ("force_embed_deferred", true),
             ("force_lexical_only", false),
-            ("force_metadata_only", true),
+            ("force_metadata_only", false),
             ("force_paused", false),
         ] {
             let file = format!("[pressure]\ndegradation_override = \"{value}\"\n");

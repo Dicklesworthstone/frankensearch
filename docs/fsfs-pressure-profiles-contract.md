@@ -92,10 +92,23 @@ watch updates and appends to those generations remain lexical-only. Appending to
 an existing semantic generation under that override is refused until `fsfs index`
 rebuilds it as lexical-only. On builds with semantic support, returning to ordinary
 indexing rebuilds the semantic tiers instead of reusing the lexical-only
-completion receipt. Indexing does not yet defer embedding or index metadata only,
-so `force_embed_deferred` changes
-nothing and `force_metadata_only` still embeds while indexing; each raises a
-`config.setting.no_effect` warning saying so. The same warning
+completion receipt.
+
+`force_metadata_only` indexes each file admitted by discovery using its path,
+file name and filesystem metadata. It does not read, hash or decode file bodies,
+load or provision semantic models, or create vector tiers. Existing discovery
+exclusions still apply. Metadata records contain no content snippets; their
+checkpoint evidence describes the path and metadata, not a content digest.
+Rebuilding under this override replaces existing content-bearing rows with
+metadata-only rows. Returning to ordinary indexing rebuilds the full text and
+eligible semantic tiers, even when the source file stamps have not changed;
+metadata-only completion receipts cannot stand in for completed content indexing.
+`append-batch` and retained content upserts are refused while this override is
+active, so a supplied body cannot bypass the metadata-only policy. Search remains
+refused under the override; status and doctor remain available.
+
+Indexing does not yet defer embedding, so `force_embed_deferred` changes nothing
+and raises a `config.setting.no_effect` warning saying so. The same warning
 covers a `strict` or `degraded` profile (its quality ceiling applies; its
 resolved concurrency and scheduler limits are not read yet) and non-default
 `cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and `load_ceiling_per_mille`,

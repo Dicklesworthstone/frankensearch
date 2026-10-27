@@ -3426,7 +3426,11 @@ async fn prefetch_watch_sources(
                 file_key,
                 ingestion_class,
                 ..
-            } if *ingestion_class != IngestionClass::Skip => {
+            } if !matches!(
+                ingestion_class,
+                IngestionClass::Skip | IngestionClass::MetadataOnly
+            ) =>
+            {
                 resolve_watched_paths(target_root, file_key)
                     .ok()
                     .map(|(abs_path, _)| (file_key.clone(), abs_path))
@@ -3459,6 +3463,43 @@ async fn prefetch_watch_sources(
         prefetched
     })
     .await
+}
+
+/// Metadata-only admission must never open the source payload, including on
+/// legacy watch and quarantine-repair paths. Stat still detects disappeared
+/// files and replacements with directories before their path row is published.
+async fn read_ingestion_source(
+    cx: &Cx,
+    path: &Path,
+    ingestion_class: IngestionClass,
+    prefetched: Option<PrefetchedSource>,
+) -> SearchResult<(std::io::Result<Vec<u8>>, Option<u64>)> {
+    retained_search_checkpoint(cx)?;
+    let source = if ingestion_class == IngestionClass::MetadataOnly {
+        let path = path.to_path_buf();
+        spawn_blocking(move || match fs::metadata(path) {
+            Ok(metadata) if metadata.is_file() => (
+                Ok(Vec::new()),
+                metadata.modified().ok().map(system_time_to_ms),
+            ),
+            Ok(_) => (
+                Err(std::io::Error::new(
+                    ErrorKind::IsADirectory,
+                    "metadata-only source is no longer a regular file",
+                )),
+                None,
+            ),
+            Err(error) => (Err(error), None),
+        })
+        .await
+    } else {
+        match prefetched {
+            Some(source) => (source.bytes, Some(source.modified_ms)),
+            None => (async_file_read(path).await, None),
+        }
+    };
+    retained_search_checkpoint(cx)?;
+    Ok(source)
 }
 
 /// The catalog of one watch batch, opened when an operation first needs it.
@@ -3628,7 +3669,13 @@ impl LexicalOnlyWatchIngest {
     }
 
     async fn apply_batch_inner(&self, cx: &Cx, batch: &[WatchIngestOp]) -> SearchResult<usize> {
-        let mut prefetched = prefetch_watch_sources(&self.target_root, batch).await;
+        let mut prefetched = if self.membership.runtime.config.pressure.degradation_override
+            == DegradationOverrideMode::ForceMetadataOnly
+        {
+            HashMap::new()
+        } else {
+            prefetch_watch_sources(&self.target_root, batch).await
+        };
         let mut count = 0_usize;
         for op in batch {
             let changed = match op {
@@ -3711,17 +3758,20 @@ impl LexicalOnlyWatchIngest {
         let (abs_path, rel_key) = resolve_watched_paths(&self.target_root, file_key)?;
         // Nothing is embedded here; a semantic file is indexed lexically.
         let ingestion_class = match ingestion_class {
-            IngestionClass::FullSemanticLexical => IngestionClass::LexicalOnly,
             IngestionClass::Skip => {
                 self.apply_delete(cx, rel_key).await?;
                 return Ok(true);
             }
+            _ if self.membership.runtime.config.pressure.degradation_override
+                == DegradationOverrideMode::ForceMetadataOnly =>
+            {
+                IngestionClass::MetadataOnly
+            }
+            IngestionClass::FullSemanticLexical => IngestionClass::LexicalOnly,
             other => other,
         };
-        let (read, modified_ms) = match prefetched {
-            Some(source) => (source.bytes, Some(source.modified_ms)),
-            None => (async_file_read(&abs_path).await, None),
-        };
+        let (read, modified_ms) =
+            read_ingestion_source(cx, &abs_path, ingestion_class, prefetched).await?;
         let bytes = match read {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -3739,7 +3789,9 @@ impl LexicalOnlyWatchIngest {
             Err(error) => return Err(error.into()),
         };
         let mut classification_metadata = None;
-        let text = if is_pdf_file(&abs_path) {
+        let text = if ingestion_class == IngestionClass::MetadataOnly {
+            Some(rel_key.clone())
+        } else if is_pdf_file(&abs_path) {
             try_extract_pdf_text(&bytes, &abs_path)
         } else {
             let classification = classify_file_for_ingest(&abs_path, &bytes);
@@ -4442,10 +4494,8 @@ impl LiveIngestPipeline {
             return Ok(true);
         }
 
-        let (read, modified_ms) = match prefetched {
-            Some(source) => (source.bytes, Some(source.modified_ms)),
-            None => (async_file_read(&abs_path).await, None),
-        };
+        let (read, modified_ms) =
+            read_ingestion_source(cx, &abs_path, ingestion_class, prefetched).await?;
         let bytes = match read {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -4467,7 +4517,9 @@ impl LiveIngestPipeline {
         // PDF files are binary but contain extractable text.
         // Try PDF extraction before the generic binary check.
         let mut classification_metadata = None;
-        let (canonical, lexical_text) = if is_pdf_file(&abs_path) {
+        let (canonical, lexical_text) = if ingestion_class == IngestionClass::MetadataOnly {
+            (self.canonicalizer.canonicalize(&rel_key), rel_key.clone())
+        } else if is_pdf_file(&abs_path) {
             match try_extract_pdf_text(&bytes, &abs_path) {
                 Some(pdf_text) => self
                     .canonicalizer
@@ -4541,7 +4593,12 @@ impl LiveIngestPipeline {
             )
             .await?;
             if let Some(ledger) = self.reuse.as_deref() {
-                ledger.indexed(&rel_key, content_sha256_hex(&bytes));
+                let digest = if ingestion_class == IngestionClass::MetadataOnly {
+                    String::new()
+                } else {
+                    content_sha256_hex(&bytes)
+                };
+                ledger.indexed(&rel_key, digest);
             }
             return Ok(true);
         }
@@ -4624,14 +4681,18 @@ impl LiveIngestPipeline {
         ingestion_class: IngestionClass,
     ) -> SearchResult<bool> {
         let (abs_path, rel_key) = self.resolve_paths(file_key)?;
-        let bytes = match async_file_read(&abs_path).await {
+        let (read, modified_ms) =
+            read_ingestion_source(cx, &abs_path, ingestion_class, None).await?;
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
 
         let mut classification_metadata = None;
-        let (canonical, lexical_text) = if is_pdf_file(&abs_path) {
+        let (canonical, lexical_text) = if ingestion_class == IngestionClass::MetadataOnly {
+            (self.canonicalizer.canonicalize(&rel_key), rel_key.clone())
+        } else if is_pdf_file(&abs_path) {
             let Some(pdf_text) = try_extract_pdf_text(&bytes, &abs_path) else {
                 return Ok(false);
             };
@@ -4657,7 +4718,7 @@ impl LiveIngestPipeline {
             &canonical,
             ingestion_class,
             classification_metadata.as_ref(),
-            None,
+            modified_ms,
         )
         .await;
         let window_text = self.windows.as_ref().map(|_| lexical_text.clone());
@@ -6364,8 +6425,8 @@ pub struct FsfsRuntime {
     /// store; a root that holds a legacy index keeps its layout (bd-z2nfa).
     complete_generations_for_new_roots: bool,
     /// Build generations with the lexical arm only: no embedder, no vector
-    /// tiers. Selected by `force_lexical_only`, and always set in a build
-    /// without semantic loaders (bd-636yz).
+    /// tiers. Selected by `force_lexical_only` or `force_metadata_only`, and
+    /// always set in a build without semantic loaders (bd-636yz).
     lexical_only_indexing: bool,
     /// Source files a complete-generation watch observed unchanged since the
     /// generation it extends: same inode, length, and modification and change
@@ -6401,8 +6462,11 @@ impl FsfsRuntime {
     #[must_use]
     pub fn new(config: FsfsConfig) -> Self {
         let lexical_only_indexing = !SEMANTIC_LOADERS_COMPILED
-            || config.pressure.degradation_override
-                == crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            || matches!(
+                config.pressure.degradation_override,
+                DegradationOverrideMode::ForceLexicalOnly
+                    | DegradationOverrideMode::ForceMetadataOnly
+            );
         Self {
             config,
             cli_input: CliInput::default(),
@@ -6833,7 +6897,15 @@ impl FsfsRuntime {
         &self,
         candidate: &DiscoveryCandidate<'_>,
     ) -> DiscoveryDecision {
-        self.config.discovery.evaluate_candidate(candidate)
+        let mut decision = self.config.discovery.evaluate_candidate(candidate);
+        // Pressure can reduce the work done for an included source; it must
+        // never admit a file excluded by privacy, scope, mount or size policy.
+        if self.config.pressure.degradation_override == DegradationOverrideMode::ForceMetadataOnly
+            && decision.ingestion_class.is_indexed()
+        {
+            decision.ingestion_class = IngestionClass::MetadataOnly;
+        }
+        decision
     }
 
     const TARGET_CHUNK_BYTES: u64 = 1_024;
@@ -14656,10 +14728,22 @@ impl FsfsRuntime {
 
     // ─── WAL-based incremental mutation commands ─────────────────────────
 
+    fn validate_content_upserts_allowed(&self) -> SearchResult<()> {
+        if self.config.pressure.degradation_override == DegradationOverrideMode::ForceMetadataOnly {
+            return Err(SearchError::InvalidConfig {
+                field: "pressure.degradation_override".to_owned(),
+                value: "force_metadata_only".to_owned(),
+                reason: "content upserts are disabled by metadata-only indexing; use `fsfs index` to record source paths and filesystem metadata".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Appending cannot change a generation's retrieval topology: dropping only
     /// the new vectors would leave a partially updated semantic generation.
     /// A forced lexical-only rebuild selects that topology before later appends.
     fn validate_append_indexing_mode(&self, index_root: &Path) -> SearchResult<()> {
+        self.validate_content_upserts_allowed()?;
         if self.config.pressure.degradation_override
             == crate::config::DegradationOverrideMode::ForceLexicalOnly
             && !Self::is_lexical_only_generation(index_root)
@@ -14772,6 +14856,7 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         retained_search_checkpoint(cx)?;
+        self.validate_content_upserts_allowed()?;
         let index_root = self.resolve_status_index_root()?;
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
@@ -19122,6 +19207,12 @@ impl FsfsRuntime {
         {
             for candidate in &candidates {
                 control.checkpoint(cx, "index.resume_validation", false)?;
+                // Metadata-only input has no source-content witness. Do not
+                // reread a payload to validate an old digest, or carry an old
+                // body-classification skip into this path-only generation.
+                if candidate.ingestion_class == IngestionClass::MetadataOnly {
+                    continue;
+                }
                 let revision = i64::try_from(candidate.modified_ms).unwrap_or(i64::MAX);
                 let Some(entry) = previous.files.get(&candidate.file_key) else {
                     // The seeded build skipped this file for its content; the
@@ -19383,8 +19474,9 @@ impl FsfsRuntime {
                 }
                 checkpoint.files.insert(candidate.file_key.clone(), entry);
                 carried_files = carried_files.saturating_add(1);
-            } else if (observed_unchanged(&candidate.file_path)
-                || unchanged_skips.contains(&candidate.file_key))
+            } else if candidate.ingestion_class != IngestionClass::MetadataOnly
+                && (observed_unchanged(&candidate.file_path)
+                    || unchanged_skips.contains(&candidate.file_key))
                 && let Some(skipped) = checkpoint_manifests
                     .as_ref()
                     .and(existing_checkpoint.as_ref())
@@ -19451,7 +19543,14 @@ impl FsfsRuntime {
                     remaining_reused_semantic = remaining_reused_semantic.saturating_sub(1);
                 }
 
-                let bytes = match async_file_read(&candidate.file_path).await {
+                let (read, _) = read_ingestion_source(
+                    cx,
+                    &candidate.file_path,
+                    candidate.ingestion_class,
+                    None,
+                )
+                .await?;
+                let bytes = match read {
                     Ok(bytes) => bytes,
                     Err(error) if is_ignorable_index_walk_error(&error) => {
                         if error.kind() == ErrorKind::PermissionDenied {
@@ -19464,7 +19563,15 @@ impl FsfsRuntime {
                     Err(error) => return Err(error.into()),
                 };
                 control.checkpoint(cx, "index.file_loaded", false)?;
-                let content_hash_hex = content_sha256_hex(&bytes);
+                // An empty digest explicitly carries no evidence about source
+                // bytes. Metadata-only paths are rebuilt from stat/path input;
+                // they never manufacture a digest of a filename as a body proof.
+                let content_hash_hex = if candidate.ingestion_class == IngestionClass::MetadataOnly
+                {
+                    String::new()
+                } else {
+                    content_sha256_hex(&bytes)
+                };
                 if validated_content_hashes
                     .get(&candidate.file_key)
                     .is_some_and(|validated| validated != &content_hash_hex)
@@ -19475,42 +19582,48 @@ impl FsfsRuntime {
                 // PDF files are binary but contain extractable text.
                 // Try PDF extraction before the generic binary check.
                 let mut classification_metadata = None;
-                let (canonical, lexical_text) = if is_pdf_file(&candidate.file_path) {
-                    match try_extract_pdf_text(&bytes, &candidate.file_path) {
-                        Some(pdf_text) => {
-                            canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &pdf_text)
+                let (canonical, lexical_text) =
+                    if candidate.ingestion_class == IngestionClass::MetadataOnly {
+                        (
+                            canonicalizer.canonicalize(&candidate.file_key),
+                            String::new(),
+                        )
+                    } else if is_pdf_file(&candidate.file_path) {
+                        match try_extract_pdf_text(&bytes, &candidate.file_path) {
+                            Some(pdf_text) => {
+                                canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &pdf_text)
+                            }
+                            None => {
+                                record_content_skip(
+                                    &mut checkpoint,
+                                    candidate,
+                                    None,
+                                    &content_hash_hex,
+                                );
+                                content_skipped_files = content_skipped_files.saturating_add(1);
+                                continue;
+                            }
                         }
-                        None => {
+                    } else {
+                        let path_for_contract = candidate.file_path.to_string_lossy();
+                        let classification = file_classification_contract
+                            .classify_bytes(path_for_contract.as_ref(), &bytes);
+                        observed_reason_codes.insert(classification.reason_code.clone());
+                        if !file_classification_allows_index(&classification) {
                             record_content_skip(
                                 &mut checkpoint,
                                 candidate,
-                                None,
+                                Some(&classification.reason_code),
                                 &content_hash_hex,
                             );
                             content_skipped_files = content_skipped_files.saturating_add(1);
                             continue;
                         }
-                    }
-                } else {
-                    let path_for_contract = candidate.file_path.to_string_lossy();
-                    let classification = file_classification_contract
-                        .classify_bytes(path_for_contract.as_ref(), &bytes);
-                    observed_reason_codes.insert(classification.reason_code.clone());
-                    if !file_classification_allows_index(&classification) {
-                        record_content_skip(
-                            &mut checkpoint,
-                            candidate,
-                            Some(&classification.reason_code),
-                            &content_hash_hex,
-                        );
-                        content_skipped_files = content_skipped_files.saturating_add(1);
-                        continue;
-                    }
 
-                    let raw_text = String::from_utf8_lossy(&bytes);
-                    classification_metadata = Some(classification);
-                    canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &raw_text)
-                };
+                        let raw_text = String::from_utf8_lossy(&bytes);
+                        classification_metadata = Some(classification);
+                        canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &raw_text)
+                    };
 
                 if canonical.trim().is_empty() {
                     observed_reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
@@ -22339,6 +22452,7 @@ impl FsfsRuntime {
         index_root: &Path,
         writer: &mut W,
     ) -> SearchResult<()> {
+        self.validate_content_upserts_allowed()?;
         let docs = retained_reuse::read_append_documents(cx, self).await?;
         if docs.is_empty() {
             return self.emit_append_batch_receipt(0, 0, false, writer);
@@ -23974,7 +24088,7 @@ impl FsfsRuntime {
             if let Some((mount_entry, _policy)) = mount_table.lookup(&entry_path) {
                 candidate = candidate.with_mount_category(mount_entry.category);
             }
-            let decision = self.config.discovery.evaluate_candidate(&candidate);
+            let decision = self.classify_discovery_candidate(&candidate);
             reason_codes.extend(decision.reason_codes.iter().cloned());
             if !matches!(decision.scope, DiscoveryScopeDecision::Include)
                 || !decision.ingestion_class.is_indexed()
@@ -26384,6 +26498,9 @@ fn resolve_manifest_file_path(
 struct HitLineLocator {
     index_root: PathBuf,
     sentinel: std::cell::OnceCell<Option<IndexSentinel>>,
+    // An unreadable manifest disables source decoration. Legacy indexes without
+    // a manifest keep the existing behavior with an empty exclusion set.
+    metadata_only_ids: std::cell::OnceCell<Option<HashSet<String>>>,
     lines: HashMap<String, Option<u32>>,
 }
 
@@ -26392,6 +26509,7 @@ impl HitLineLocator {
         Self {
             index_root: index_root.to_path_buf(),
             sentinel: std::cell::OnceCell::new(),
+            metadata_only_ids: std::cell::OnceCell::new(),
             lines: HashMap::new(),
         }
     }
@@ -26401,6 +26519,29 @@ impl HitLineLocator {
             let Some(snippet) = hit.snippet.as_deref() else {
                 continue;
             };
+            let metadata_only_ids = self.metadata_only_ids.get_or_init(|| {
+                match FsfsRuntime::read_index_manifest(&self.index_root) {
+                    Ok(manifest) => Some(
+                        manifest
+                            .into_iter()
+                            .flatten()
+                            .filter(|entry| entry.ingestion_class == "metadata_only")
+                            .map(|entry| entry.file_key)
+                            .collect(),
+                    ),
+                    Err(error) => {
+                        debug!(error = %error, "fsfs hit lines: source policy unreadable; omitting source decoration");
+                        None
+                    }
+                }
+            });
+            if metadata_only_ids
+                .as_ref()
+                .is_none_or(|ids| ids.contains(&hit.path))
+            {
+                hit.line = None;
+                continue;
+            }
             if let Some(line) = self.lines.get(&hit.path) {
                 hit.line = *line;
                 continue;
@@ -44735,6 +44876,220 @@ mod tests {
         });
     }
 
+    #[test]
+    fn forced_metadata_only_discovery_preserves_exclusions() {
+        let mut config = FsfsConfig::default();
+        config.pressure.degradation_override = DegradationOverrideMode::ForceMetadataOnly;
+        config
+            .discovery
+            .exclude_patterns
+            .push("private.md".to_owned());
+        let runtime = FsfsRuntime::new(config);
+        for candidate in [
+            DiscoveryCandidate::new(Path::new("project/alpha.md"), 2_048),
+            DiscoveryCandidate::new(Path::new("project/empty.md"), 0),
+        ] {
+            let decision = runtime.classify_discovery_candidate(&candidate);
+            assert_eq!(decision.scope, DiscoveryScopeDecision::Include);
+            assert_eq!(decision.ingestion_class, IngestionClass::MetadataOnly);
+        }
+        for candidate in [
+            DiscoveryCandidate::new(Path::new("project/private.md"), 2_048),
+            DiscoveryCandidate::new(Path::new("project/linked.md"), 2_048).with_symlink(true),
+        ] {
+            let decision = runtime.classify_discovery_candidate(&candidate);
+            assert_eq!(decision.scope, DiscoveryScopeDecision::Exclude);
+            assert_eq!(decision.ingestion_class, IngestionClass::Skip);
+        }
+    }
+
+    /// Observe real file opens, not only the resulting rows: a body discarded
+    /// after reading it still violates metadata-only indexing. Cover a cold
+    /// build, warm digest validation, and replacement of content-bearing rows.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forced_metadata_only_indexing_never_opens_bodies_or_loads_models() {
+        use notify::event::AccessKind;
+        use notify::{EventKind, RecursiveMode, Watcher};
+        use std::collections::BTreeSet;
+
+        run_test_with_cx(|cx| async move {
+            for complete in [false, true] {
+                let temp = tempfile::tempdir().expect("metadata-only fixture");
+                let project = temp.path().join("project");
+                let root = temp.path().join("index");
+                let models = temp.path().join("must-not-create-models");
+                fs::create_dir_all(project.join(".git")).unwrap();
+                fs::write(project.join("alpha.md"), "quokka private body").unwrap();
+                fs::write(project.join("empty.md"), "").unwrap();
+                fs::write(project.join("binary.md"), b"\0\0quokka binary\0").unwrap();
+                fs::write(project.join("inventory.pdf"), b"not a valid PDF\0").unwrap();
+                fs::write(project.join("private.md"), "excluded body").unwrap();
+                fs::write(project.join(".sentinel"), "").unwrap();
+                let mut config = FsfsConfig::default();
+                config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+                config.indexing.model_dir = models.display().to_string();
+                config.indexing.fast_model = "unused-unregistered-fast-model".to_owned();
+                config.indexing.quality_model = "unused-unregistered-quality-model".to_owned();
+                config
+                    .discovery
+                    .exclude_patterns
+                    .push("private.md".to_owned());
+                config.pressure.degradation_override = DegradationOverrideMode::ForceMetadataOnly;
+                config.search.rerank = false;
+                let input = CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    index_dir: Some(root.clone()),
+                    format: OutputFormat::Json,
+                    quiet: true,
+                    ..CliInput::default()
+                };
+                let runtime = FsfsRuntime::new(config.clone()).with_cli_input(input.clone());
+                let mut content_config = config.clone();
+                content_config.pressure.degradation_override =
+                    DegradationOverrideMode::ForceLexicalOnly;
+                let content_runtime = FsfsRuntime::new(content_config).with_cli_input(input);
+
+                for run in ["cold", "warm", "replace_content"] {
+                    if run == "replace_content" {
+                        content_runtime
+                            .run_mode_with_complete_generations(
+                                &cx,
+                                InterfaceMode::Cli,
+                                None,
+                                complete,
+                            )
+                            .await
+                            .expect("build ordinary content without changing source timestamps");
+                    }
+                    let (sender, events) = std::sync::mpsc::channel();
+                    let mut watcher = notify::recommended_watcher(sender).unwrap();
+                    watcher
+                        .watch(&project, RecursiveMode::NonRecursive)
+                        .unwrap();
+                    runtime
+                        .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, complete)
+                        .await
+                        .unwrap_or_else(|error| panic!("metadata indexing {run}: {error}"));
+                    fs::read(project.join(".sentinel")).unwrap();
+                    let mut opened = BTreeSet::new();
+                    loop {
+                        let event = events
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap()
+                            .unwrap();
+                        if !matches!(event.kind, EventKind::Access(AccessKind::Open(_))) {
+                            continue;
+                        }
+                        if event.paths.iter().any(|path| path.ends_with(".sentinel")) {
+                            break;
+                        }
+                        opened.extend(event.paths.into_iter().filter(|path| {
+                            path.extension()
+                                .is_some_and(|ext| ext == "md" || ext == "pdf")
+                        }));
+                    }
+                    assert!(opened.is_empty(), "{run}, complete={complete}: {opened:?}");
+                    let active = complete.then(|| {
+                        crate::generation_store::CompleteGenerationStore::open(&cx, &root)
+                            .unwrap()
+                            .active(&cx)
+                            .unwrap()
+                            .unwrap()
+                    });
+                    let selected = active
+                        .as_ref()
+                        .map_or(root.as_path(), |generation| generation.path());
+                    assert!(FsfsRuntime::is_lexical_only_generation(selected));
+                    assert!(!selected.join(super::FSFS_VECTOR_INDEX_FILE).exists());
+                    assert!(
+                        !selected
+                            .join(super::FSFS_VECTOR_QUALITY_INDEX_FILE)
+                            .exists()
+                    );
+                    let manifests = FsfsRuntime::read_matching_manifest_generation(selected)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(manifests.len(), 4, "{run}: {manifests:?}");
+                    assert!(
+                        manifests
+                            .values()
+                            .all(|entry| entry.ingestion_class == "metadata_only")
+                    );
+                    assert!(!manifests.contains_key("private.md"));
+                    let mut search = content_runtime.clone();
+                    search.cli_input.index_dir = Some(selected.to_path_buf());
+                    let resources = search
+                        .prepare_search_execution_resources(&cx, SearchExecutionMode::LexicalOnly)
+                        .await
+                        .unwrap();
+                    let lexical = resources.lexical_index.as_ref().unwrap();
+                    assert!(
+                        lexical
+                            .search_doc_ids(&cx, "quokka", 10)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert!(
+                        lexical
+                            .search_doc_ids(&cx, "alpha", 10)
+                            .unwrap()
+                            .iter()
+                            .any(|hit| hit.document_id == "alpha.md")
+                    );
+                    assert!(!models.exists());
+                }
+
+                // Refuse before opening the absent input file or acquiring a
+                // writer, including the legacy lexical-only append shortcut.
+                let mut append = runtime.clone();
+                append.cli_input.command = CliCommand::AppendBatch;
+                append.cli_input.input_file = Some(temp.path().join("must-not-read.jsonl"));
+                let error = append
+                    .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, SearchError::InvalidConfig { field, .. } if field == "pressure.degradation_override")
+                );
+
+                content_runtime
+                    .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, complete)
+                    .await
+                    .unwrap();
+                let active = complete.then(|| {
+                    crate::generation_store::CompleteGenerationStore::open(&cx, &root)
+                        .unwrap()
+                        .active(&cx)
+                        .unwrap()
+                        .unwrap()
+                });
+                let selected = active
+                    .as_ref()
+                    .map_or(root.as_path(), |generation| generation.path());
+                let mut search = content_runtime;
+                search.cli_input.index_dir = Some(selected.to_path_buf());
+                let resources = search
+                    .prepare_search_execution_resources(&cx, SearchExecutionMode::LexicalOnly)
+                    .await
+                    .unwrap();
+                let hits = resources
+                    .lexical_index
+                    .as_ref()
+                    .unwrap()
+                    .search_doc_ids(&cx, "quokka", 10)
+                    .unwrap();
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "ordinary indexing must restore content despite unchanged source stamps"
+                );
+                assert_eq!(hits[0].document_id, "alpha.md");
+            }
+        });
+    }
+
     #[cfg(unix)]
     #[test]
     fn forced_lexical_only_index_and_append_never_load_configured_models() {
@@ -51230,8 +51585,11 @@ mod tests {
             fs::create_dir(project.join(".git")).expect("fixture repository root");
             fs::write(project.join("guide.md"), "ordinary guide about badgers\n")
                 .expect("write guide");
-            fs::write(project.join("logs/server.log"), "quokka request served\n")
-                .expect("write log");
+            fs::write(
+                project.join("logs/server.log"),
+                "private log header\nlogs/server.log\nquokka request served\n",
+            )
+            .expect("write log");
             let mut config = FsfsConfig::default();
             config.storage.index_dir = ".frankensearch".to_owned();
             FsfsRuntime::new(config.clone())
@@ -51282,6 +51640,45 @@ mod tests {
                     None => assert!(!found.contains(&"logs/server.log"), "{query}: {found:?}"),
                 }
             }
+            let payloads = runtime
+                .execute_search_payloads_with_mode(
+                    &cx,
+                    "server",
+                    10,
+                    super::SearchExecutionMode::LexicalOnly,
+                )
+                .await
+                .expect("search metadata-only file");
+            let metadata_hit = payloads[0]
+                .hits
+                .iter()
+                .find(|hit| hit.path == "logs/server.log")
+                .expect("metadata-only path hit");
+            assert!(
+                metadata_hit
+                    .snippet
+                    .as_deref()
+                    .is_some_and(|text| text.contains("server"))
+            );
+            assert_eq!(
+                metadata_hit.line, None,
+                "persisted metadata-only policy forbids reading source for a line number"
+            );
+
+            let payloads = runtime
+                .execute_search_payloads_with_mode(
+                    &cx,
+                    "badgers",
+                    10,
+                    super::SearchExecutionMode::LexicalOnly,
+                )
+                .await
+                .expect("search content-indexed file");
+            assert_eq!(
+                payloads[0].hits[0].line,
+                Some(1),
+                "content-indexed files retain source line decoration"
+            );
         });
     }
 

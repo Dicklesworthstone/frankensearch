@@ -600,6 +600,7 @@ impl FsfsRuntime {
         use crate::generation_store::CompleteGenerationStore;
 
         retained_search_checkpoint(cx)?;
+        self.validate_content_upserts_allowed()?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
         let documents = retained_reuse::read_append_documents(cx, self).await?;
         if documents.is_empty() {

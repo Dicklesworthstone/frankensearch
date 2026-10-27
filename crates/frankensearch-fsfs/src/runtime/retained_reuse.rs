@@ -289,11 +289,14 @@ fn completed_receipt(
                     && entry.ingestion_class == manifest.ingestion_class
                     && entry.canonical_bytes == manifest.canonical_bytes
                     && entry.reason_code == manifest.reason_code
-                    && entry.content_hash_hex.len() == 64
-                    && entry
-                        .content_hash_hex
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit())
+                    && (hex_digest(&entry.content_hash_hex)
+                        // A metadata-only row records no source bytes. Keep it
+                        // in the receipt as an uncovered member requiring stat/
+                        // path recomputation, never as reusable content proof.
+                        || (entry.ingestion_class == "metadata_only"
+                            && entry.lexical_indexed
+                            && !entry.semantic_indexed
+                            && entry.content_hash_hex.is_empty()))
             })
         })
     {
