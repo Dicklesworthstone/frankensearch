@@ -13,11 +13,16 @@
 //! Only a successful returned handle represents a complete source/vector cohort.
 //! Explicit `NativeBuiltIndex::seal_for_reopen` persists that cohort under a
 //! caller-retained receipt; reopening never discovers or selects a generation.
-//! Filesystem and graph work is synchronous on the polling execution lane; use
-//! the caller's blocking lane for large builds. No task or runtime is spawned.
+//! A caller-owned blocking pool, explicitly configured or inherited through Cx,
+//! runs vector sealing, admission and native graph construction/persistence.
+//! Inference remains asynchronous on the caller's runtime. Without a pool the
+//! caller must provide a suitable synchronous execution lane. No pool or runtime
+//! is created and a worker cannot select or install the generation it builds.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +35,7 @@ use frankensearch_index::{
     FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex, VectorIndexWriter,
 };
 
-use super::{NativeAnnIndex, checkpoint, invalid};
+use super::{NativeAnnIndex, NativeWorker, checkpoint, invalid};
 use crate::{Cx, Embedder, IndexableDocument, SearchResult, VectorHit};
 
 mod batch;
@@ -220,6 +225,7 @@ pub struct NativeIndexBuilder {
     split_failed_batches: bool,
     documents: Vec<IndexableDocument>,
     reuse: Option<Arc<ReuseSource>>,
+    blocking_pool: Option<BlockingPoolHandle>,
 }
 
 impl NativeIndexBuilder {
@@ -250,7 +256,38 @@ impl NativeIndexBuilder {
             split_failed_batches: false,
             documents: Vec::new(),
             reuse: None,
+            blocking_pool: None,
         })
+    }
+
+    /// Run vector sealing, admission and graph construction on this caller's pool.
+    ///
+    /// Without an override, builds use the pool inherited through their Cx, when
+    /// present. Inference remains asynchronously polled on the caller runtime;
+    /// source validation, directory creation and in-memory row staging remain on
+    /// that lane. The pool owner must remain alive and drain its workers.
+    ///
+    /// A stopped pool is refused before build creates a directory or starts
+    /// inference. A pool stopping later is an error, never an inline retry.
+    /// Dropping a queued build prevents finalization from starting. Running
+    /// synchronous finalization can drain into the private, unselected directory,
+    /// but can never install a generation or publish a caller-visible receipt.
+    #[must_use]
+    pub fn with_blocking_pool(mut self, pool: BlockingPoolHandle) -> Self {
+        self.blocking_pool = Some(pool);
+        self
+    }
+
+    fn build_pool(&self, cx: &Cx) -> SearchResult<Option<BlockingPoolHandle>> {
+        checkpoint(cx, "native_ann.builder.pool_admission")?;
+        let pool = self
+            .blocking_pool
+            .clone()
+            .or_else(|| cx.blocking_pool_handle());
+        if let Some(pool) = &pool {
+            NativeWorker::BUILD.require_pool(cx, pool)?;
+        }
+        Ok(pool)
     }
 
     /// Add an independently dimensioned quality model; it may not change document
@@ -383,12 +420,16 @@ impl NativeIndexBuilder {
     /// receipt, or publish its exact witnesses through their own trusted selector.
     /// Failed directories are not
     /// automatically deleted and are never overwritten by a subsequent attempt.
+    /// Heavy vector finalization and graph work use the explicitly configured
+    /// or inherited caller pool. The complete result is joined and admitted
+    /// before delivery; no worker can publish a partial generation.
     ///
     /// # Errors
     /// Propagates source, identity, filesystem, provider, graph and cancellation
     /// errors. An already-existing destination is always refused.
     pub async fn build(mut self, cx: &Cx) -> SearchResult<NativeBuiltIndex> {
         checkpoint(cx, "native_ann.builder.start")?;
+        let pool = self.build_pool(cx)?;
         self.validate_documents(cx)?;
         let fast_binding = self.fast.binding(&self.generation)?;
         let quality_binding = self
@@ -442,48 +483,24 @@ impl NativeIndexBuilder {
             }
             batch_start = batch_end;
         }
-        checkpoint(cx, "native_ann.builder.finish_vectors")?;
-        fast_writer.finish()?;
-        if let Some(writer) = quality_writer {
-            writer.finish()?;
-        }
-        let fast = finish_tier(
-            cx,
-            self.fast,
-            fast_binding,
-            fast_path,
-            &self.documents,
-            self.reuse
-                .as_deref()
-                .map(|source| (source, ReuseRole::Fast)),
-        )?;
-        let quality = match (self.quality, quality_binding) {
-            (Some(tier), Some(binding)) => Some(finish_tier(
-                cx,
-                tier,
-                binding,
-                quality_path,
-                &self.documents,
-                self.reuse
-                    .as_deref()
-                    .map(|source| (source, ReuseRole::Quality)),
-            )?),
-            (None, None) => None,
-            _ => {
-                return Err(invalid(
-                    "builder.quality",
-                    "inconsistent",
-                    "quality plan and binding must travel together",
-                ));
-            }
-        };
-        checkpoint(cx, "native_ann.builder.complete")?;
-        Ok(NativeBuiltIndex {
+        let pending = PendingBuild {
+            builder: self,
             directory,
-            documents: self.documents.into(),
-            fast,
-            quality,
-        })
+            fast_binding,
+            quality_binding,
+            fast_path,
+            quality_path,
+            fast_writer,
+            quality_writer,
+        };
+        match pool {
+            Some(pool) => {
+                NativeWorker::BUILD
+                    .run(cx, pool, move |worker| pending.finish(worker))
+                    .await
+            }
+            None => pending.finish(cx),
+        }
     }
 
     // Shared preflight: a duplicate or oversized document in the LAST shard
@@ -502,6 +519,69 @@ impl NativeIndexBuilder {
             input_budget::validate_document_size(doc.content.len(), self.max_batch_input_bytes)?;
         }
         Ok(())
+    }
+}
+
+// All inputs move to the worker together. It has neither a live selection
+// handle nor authority to publish a completion receipt to the caller.
+struct PendingBuild {
+    builder: NativeIndexBuilder,
+    directory: PathBuf,
+    fast_binding: FsviV2IdentityBinding,
+    quality_binding: Option<FsviV2IdentityBinding>,
+    fast_path: PathBuf,
+    quality_path: PathBuf,
+    fast_writer: VectorIndexWriter,
+    quality_writer: Option<VectorIndexWriter>,
+}
+
+impl PendingBuild {
+    fn finish(self, cx: &Cx) -> SearchResult<NativeBuiltIndex> {
+        checkpoint(cx, "native_ann.builder.finish_vectors")?;
+        self.fast_writer.finish()?;
+        checkpoint(cx, "native_ann.builder.finish_quality_vectors")?;
+        if let Some(writer) = self.quality_writer {
+            writer.finish()?;
+        }
+        let fast = finish_tier(
+            cx,
+            self.builder.fast,
+            self.fast_binding,
+            self.fast_path,
+            &self.builder.documents,
+            self.builder
+                .reuse
+                .as_deref()
+                .map(|source| (source, ReuseRole::Fast)),
+        )?;
+        let quality = match (self.builder.quality, self.quality_binding) {
+            (Some(tier), Some(binding)) => Some(finish_tier(
+                cx,
+                tier,
+                binding,
+                self.quality_path,
+                &self.builder.documents,
+                self.builder
+                    .reuse
+                    .as_deref()
+                    .map(|source| (source, ReuseRole::Quality)),
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err(invalid(
+                    "builder.quality",
+                    "inconsistent",
+                    "quality plan and binding must travel together",
+                ));
+            }
+        };
+        checkpoint(cx, "native_ann.builder.complete")?;
+        Ok(NativeBuiltIndex {
+            directory: self.directory,
+            documents: self.builder.documents.into(),
+            fast,
+            quality,
+        })
     }
 }
 

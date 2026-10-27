@@ -12,8 +12,8 @@ use super::{
     BlockingPoolHandle, BufRead, BufReader, Cx, Deserialize, File, GenerationComponentReceiptV1,
     HashMap, IndexableDocument, MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECORD_BYTES, Models,
     NativeBuiltHybridIndex, Options, Path, Read, Result, SCHEMA, SELECTION_SCHEMA, Selection,
-    SnapshotReceipt, Write, bad, build_with_generation, cohort, emit, encode, fs, io, models,
-    new_generation, new_path, save_selection, sharded,
+    SnapshotReceipt, Write, bad, build_with_generation, cohort, emit, encode, execution_context,
+    fs, io, models, new_generation, new_path, save_selection, sharded,
 };
 
 pub type Edits = BTreeMap<String, Option<IndexableDocument>>;
@@ -317,6 +317,9 @@ pub async fn execute(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    let context = execution_context(cx, pool)?;
+    let cx = &context;
+    let pool = cx.blocking_pool_handle();
     execute_with_loader(cx, options, output, |root, quality| {
         models::load(cx, root, quality, &options.quality, pool)
     })
@@ -414,6 +417,9 @@ pub async fn rebuild(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    let context = execution_context(cx, pool)?;
+    let cx = &context;
+    let pool = cx.blocking_pool_handle();
     rebuild_with_loader(cx, options, output, |root, quality| {
         models::load(cx, root, quality, &options.quality, pool)
     })

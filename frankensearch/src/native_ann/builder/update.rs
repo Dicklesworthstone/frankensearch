@@ -193,6 +193,19 @@ impl NativeIndexUpdate {
 }
 
 impl NativeIndexUpdate {
+    /// Finalize successor vectors and graphs on this caller-owned pool.
+    ///
+    /// Overrides the pool inherited through the build Cx. The predecessor is
+    /// never changed by worker completion; installation remains a caller action.
+    #[must_use]
+    pub fn with_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        self.builder = self.builder.with_blocking_pool(pool);
+        self
+    }
+
     /// Insert a new document or replace the complete source document for this ID.
     /// Later edits for the same ID replace this edit. Empty IDs fail before build.
     #[must_use]
@@ -335,6 +348,7 @@ impl NativeIndexUpdate {
 
     fn prepare(mut self, cx: &Cx) -> SearchResult<NativeIndexBuilder> {
         checkpoint(cx, "native_ann.update.edits")?;
+        self.builder.build_pool(cx)?;
         if self.edits.contains_key("") {
             return Err(invalid(
                 "update.document_id",

@@ -6,14 +6,19 @@
 //! retained artifact's space, producer and input fingerprints before graph
 //! traversal, including zero-result requests.
 //!
-//! Graph operations are synchronous and belong on the caller's blocking/CPU lane.
-//! Graph construction and traversal check the caller's cancellation during
-//! their work. Synchronous loading and structural admission are bracketed by
-//! checkpoints. No runtime, task, fallback embedder or detached worker is
-//! created here.
+//! Graph kernels are synchronous and belong on the caller's blocking/CPU lane.
+//! Builders and pool query APIs place that work on a caller-owned pool and join
+//! the worker before delivery. Graph construction and traversal check the
+//! caller's cancellation during their work. Synchronous loading and structural
+//! admission are bracketed by checkpoints. No runtime, pool, fallback embedder
+//! or detached publication worker is created here.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use asupersync::runtime::JoinError;
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
 use frankensearch_core::BoundQueryEmbedding;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
@@ -501,6 +506,119 @@ fn checkpoint(cx: &Cx, phase: &str) -> SearchResult<()> {
         });
     }
     Ok(())
+}
+
+// Build and query jobs share the same ownership and cancellation protocol.
+// Keeping their labels separate preserves useful failure provenance without
+// allowing either path to acquire a different executor-fallback policy.
+#[derive(Clone, Copy)]
+struct NativeWorker {
+    kind: &'static str,
+    subsystem: &'static str,
+    admission: &'static str,
+    request: &'static str,
+    child: &'static str,
+    delivery: &'static str,
+}
+
+impl NativeWorker {
+    const QUERY: Self = Self {
+        kind: "query",
+        subsystem: "native_ann.query_worker",
+        admission: "native_ann.query_worker.admission",
+        request: "native_ann.query_worker.request",
+        child: "native_ann.query_worker.child",
+        delivery: "native_ann.query_worker.delivery",
+    };
+    const BUILD: Self = Self {
+        kind: "build",
+        subsystem: "native_ann.build_worker",
+        admission: "native_ann.build_worker.admission",
+        request: "native_ann.build_worker.request",
+        child: "native_ann.build_worker.child",
+        delivery: "native_ann.build_worker.delivery",
+    };
+
+    fn error(self, reason: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> SearchError {
+        SearchError::SubsystemError {
+            subsystem: self.subsystem,
+            source: reason.into(),
+        }
+    }
+
+    fn cancelled(self) -> SearchError {
+        SearchError::Cancelled {
+            phase: self.subsystem.to_owned(),
+            reason: format!("native {} work was abandoned or cancelled", self.kind),
+        }
+    }
+
+    fn require_pool(self, cx: &Cx, pool: &BlockingPoolHandle) -> SearchResult<()> {
+        checkpoint(cx, self.admission)?;
+        if pool.is_shutdown() {
+            return Err(self.error(format!("the caller-owned {} pool is shut down", self.kind)));
+        }
+        Ok(())
+    }
+
+    fn checkpoint(self, cx: &Cx, child: &Cx, abandoned: &AtomicBool) -> SearchResult<()> {
+        checkpoint(cx, self.request)?;
+        checkpoint(child, self.child)?;
+        if abandoned.load(Ordering::Acquire) {
+            return Err(self.cancelled());
+        }
+        Ok(())
+    }
+
+    async fn run<T, F>(self, cx: &Cx, pool: BlockingPoolHandle, work: F) -> SearchResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Cx) -> SearchResult<T> + Send + 'static,
+    {
+        self.require_pool(cx, &pool)?;
+        let awaiting = AwaitingNativeWorker(Arc::new(AtomicBool::new(false)));
+        let abandoned = Arc::clone(&awaiting.0);
+        let request = cx.clone();
+        let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool));
+        let mut worker = worker_cx
+            .spawn_blocking(move |child: Cx| {
+                self.checkpoint(&request, &child, &abandoned)?;
+                // Shutdown can race submission. Asupersync can recover rejected
+                // work on an executor task; never invoke native work there.
+                if Cx::is_active() {
+                    return Err(self.error(format!(
+                        "native {} work cannot run on the async executor",
+                        self.kind
+                    )));
+                }
+                let result = work(&request);
+                self.checkpoint(&request, &child, &abandoned)?;
+                result
+            })
+            .map_err(|_| self.error(format!("cannot admit native {} work", self.kind)))?;
+        // Join the owned worker even after a cancellation request. Racing this
+        // join with cancellation would leave an unobserved writer or traversal.
+        let result = worker.join(cx).await;
+        // Caller cancellation wins over ready work AND worker failure. Workers
+        // never own result-delivery callbacks or a live generation selection.
+        checkpoint(cx, self.delivery)?;
+        let result = result.map_err(|error| match error {
+            JoinError::Cancelled(_) => self.cancelled(),
+            _ => self.error(format!("native {} worker did not complete", self.kind)),
+        })?;
+        drop(awaiting);
+        result
+    }
+}
+
+// A queued closure can outlive its join future. Do not start expensive native
+// work when its receiver was dropped. This never cancels unrelated pool users.
+struct AwaitingNativeWorker(Arc<AtomicBool>);
+
+impl Drop for AwaitingNativeWorker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 fn invalid(field: &str, value: &str, reason: &str) -> SearchError {

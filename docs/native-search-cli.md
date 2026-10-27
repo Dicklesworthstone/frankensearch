@@ -35,6 +35,20 @@ present tier by default; `--exact` creates exact-scan tiers without graphs.
 Neither choice changes model identity. Storage is F32; inference batches default
 to 16 documents and may be selected with `--batch-size 1..256`.
 
+Vector sealing, FSVI admission, native graph construction or reuse, and graph
+persistence run on the command-owned blocking pool. The same placement applies
+to incremental updates, rebuilds, sharded cohorts, and authority builds. The
+command joins the complete worker result before it can return or publish that
+generation. A stopped pool refuses the operation; it cannot move graph work
+back onto the async executor. Cancellation can leave private candidate files,
+but those files do not select a generation or replace an existing receipt.
+
+Library callers can select a pool with `NativeIndexBuilder::with_blocking_pool`
+or `NativeIndexUpdate::with_blocking_pool`. Otherwise, construction inherits the
+pool attached to the supplied `Cx`. The caller owns the pool's lifetime and
+shutdown. With neither source of a pool, the existing synchronous execution
+contract applies. Provider inference retains its existing async API.
+
 `--input` may be omitted to consume standard input. Each record has required
 string `id` and `content`, optional string/null `title`, and optional string-valued
 `metadata`. Unknown fields, duplicate IDs, malformed records and invalid UTF-8

@@ -730,6 +730,16 @@ async fn execute(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    // Native builders inherit the same caller-owned lane used for model and
+    // query work, including warm updates and replacement-model builds. Refuse
+    // a stopped lane before opening input, creating paths or loading models.
+    let context = if options.lexical_only {
+        cx.clone()
+    } else {
+        execution_context(cx, pool)?
+    };
+    let cx = &context;
+    let pool = cx.blocking_pool_handle();
     match options.command {
         Command::Search if options.lexical_only => lexical::execute(cx, &options, output).await,
         Command::Serve if options.lexical_only => {
@@ -874,6 +884,25 @@ async fn execute(
             emit(output, &page)
         }
     }
+}
+
+fn execution_context(cx: &Cx, pool: Option<BlockingPoolHandle>) -> Result<Cx> {
+    if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+        return Err(frankensearch::SearchError::Cancelled {
+            phase: "native_cli.execution".to_owned(),
+            reason: "native command was cancelled before execution".to_owned(),
+        }
+        .into());
+    }
+    let pool = pool.or_else(|| cx.blocking_pool_handle());
+    if pool.as_ref().is_some_and(BlockingPoolHandle::is_shutdown) {
+        return Err(frankensearch::SearchError::SubsystemError {
+            subsystem: "native_cli.execution",
+            source: "the caller-owned native execution pool is shut down".into(),
+        }
+        .into());
+    }
+    Ok(cx.clone().with_blocking_pool_handle(pool))
 }
 
 struct LimitedBuffer {

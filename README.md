@@ -1081,7 +1081,13 @@ admission, bypassing native ANN and MRL candidate selection. Native retrieval is
 available through `ActivatedTierSearch` and `TwoTierSearcher`; the raw-vector
 `TwoTierIndex::search_fast` API keeps its existing path.
 
-Graph construction is synchronous. Generation replacement builds every requested
+Graph construction through these low-level index methods is synchronous.
+For document-to-index construction, `NativeIndexBuilder` uses the blocking pool
+carried by the caller's `Cx`, or an explicit `with_blocking_pool` override, for
+vector sealing, admission, graph construction and persistence. The caller owns
+and drains that pool; callers without one provide a suitable synchronous lane.
+
+Generation replacement builds every requested
 successor graph before installing new state; failure leaves the current index
 intact. The quality policy survives a successor that temporarily has no quality
 tier. To retain the graphs across process restarts, explicitly save both graphs

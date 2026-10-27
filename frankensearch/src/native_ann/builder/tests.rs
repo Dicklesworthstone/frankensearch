@@ -1,7 +1,12 @@
 use super::*;
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
+
+use asupersync::runtime::RuntimeBuilder;
+use asupersync::runtime::blocking_pool::BlockingPool;
 
 use crate::{ModelCategory, SearchError, SearchFuture};
 
@@ -143,6 +148,268 @@ fn builder(path: &Path, provider: &Arc<Provider>) -> NativeIndexBuilder {
     NativeIndexBuilder::new(path, generation(), provider.clone())
         .unwrap()
         .add_documents(documents())
+}
+
+fn run_with_pool<F, Fut, T>(body: F) -> T
+where
+    F: FnOnce(Cx, BlockingPoolHandle) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let runtime = RuntimeBuilder::current_thread().build().unwrap();
+    let pool = BlockingPool::new(0, 1);
+    let handle = pool.handle();
+    let result = runtime
+        .block_on(async move { body(Cx::current().expect("runtime context"), handle).await });
+    assert!(pool.shutdown_and_wait(Duration::from_secs(10)));
+    result
+}
+
+async fn wait_for_worker(entered: mpsc::Receiver<()>) {
+    let started = Instant::now();
+    std::future::poll_fn(move |task| match entered.try_recv() {
+        Ok(()) => Poll::Ready(()),
+        Err(mpsc::TryRecvError::Empty) => {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "worker did not start"
+            );
+            task.waker().wake_by_ref();
+            Poll::Pending
+        }
+        Err(mpsc::TryRecvError::Disconnected) => panic!("worker exited before starting"),
+    })
+    .await;
+}
+
+#[test]
+fn pooled_build_yields_before_sealing_and_roundtrips_both_native_tiers() {
+    run_with_pool(|cx, pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("generation");
+        let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let quality = Arc::new(Provider::new("quality", 3, Reply::Correct));
+        let graph = NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 7,
+        };
+        let (started, entered) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let mut blocker = Box::pin(NativeWorker::BUILD.run(&cx, pool.clone(), move |_| {
+            assert!(!Cx::is_active());
+            started.send(()).unwrap();
+            gate.recv_timeout(Duration::from_secs(10)).unwrap();
+            Ok(())
+        }));
+        assert!(
+            blocker
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        wait_for_worker(entered).await;
+        let mut pending = Box::pin(
+            builder(&path, &fast)
+                .with_quality_embedder(quality.clone())
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, graph)
+                .with_quality_storage(NativeBuildPrecision::F16, graph)
+                .unwrap()
+                .with_blocking_pool(pool)
+                .build(&cx),
+        );
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(path.is_dir());
+        assert_eq!(fast.batches.load(Ordering::SeqCst), 1);
+        assert_eq!(quality.batches.load(Ordering::SeqCst), 1);
+        assert!(!path.join("fast.fsvi").exists());
+        assert!(!path.join("quality.fsvi").exists());
+        // Finalization is queued on the real occupied pool, while unrelated
+        // work on this single-thread executor continues to make progress.
+        assert_eq!(std::future::ready(37_u8).await, 37);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        let built = pending.await.unwrap();
+        assert!(built.fast().graph_path().unwrap().is_file());
+        assert!(built.quality().unwrap().graph_path().unwrap().is_file());
+        let seal = built.seal_for_reopen(&cx).unwrap();
+        let reopened =
+            NativeBuiltIndex::open_selected(&cx, &path, &seal, fast, Some(quality)).unwrap();
+        for (before, after) in [
+            (built.fast(), reopened.fast()),
+            (built.quality().unwrap(), reopened.quality().unwrap()),
+        ] {
+            let hits = before.search(&cx, "vertical", 5).await.unwrap();
+            assert_eq!(hits[0].doc_id, "b");
+            assert_eq!(hits, after.search(&cx, "vertical", 5).await.unwrap());
+        }
+    });
+}
+
+#[test]
+fn stopped_build_pools_refuse_initial_sharded_and_update_work_before_side_effects() {
+    run_with_pool(|cx, _pool| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let original = builder(&dir.path().join("original"), &fast)
+            .build(&cx)
+            .await
+            .unwrap();
+        let calls = fast.batches.load(Ordering::SeqCst);
+        let stopped = BlockingPool::new(0, 1);
+        let handle = stopped.handle();
+        assert!(stopped.shutdown_and_wait(Duration::from_secs(10)));
+        let inherited = cx.clone().with_blocking_pool_handle(Some(handle.clone()));
+        let single = dir.path().join("single");
+        let shards = dir.path().join("shards");
+        let successor = dir.path().join("successor");
+        assert!(matches!(
+            builder(&single, &fast)
+                .with_blocking_pool(handle.clone())
+                .build(&cx)
+                .await,
+            Err(SearchError::SubsystemError {
+                subsystem: "native_ann.build_worker",
+                ..
+            })
+        ));
+        assert!(matches!(
+            builder(&shards, &fast).build_sharded(&inherited, 2).await,
+            Err(SearchError::SubsystemError {
+                subsystem: "native_ann.build_worker",
+                ..
+            })
+        ));
+        let mut newer = generation();
+        newer.sequence += 1;
+        assert!(matches!(
+            original
+                .begin_update(&cx, &successor, newer)
+                .unwrap()
+                .with_blocking_pool(handle)
+                .upsert_document(IndexableDocument::new("new", "vertical"))
+                .build(&cx)
+                .await,
+            Err(SearchError::SubsystemError {
+                subsystem: "native_ann.build_worker",
+                ..
+            })
+        ));
+        assert_eq!(fast.batches.load(Ordering::SeqCst), calls);
+        assert!(!single.exists());
+        assert!(!shards.exists());
+        assert!(!successor.exists());
+        assert_eq!(
+            original.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+            "b"
+        );
+    });
+}
+
+#[test]
+fn abandoned_or_cancelled_queued_builds_never_seal_or_deliver_a_generation() {
+    for cancel in [false, true] {
+        let (dir, path) = run_with_pool(|cx, pool| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("candidate");
+            let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+            let (started, entered) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let mut blocker = Box::pin(NativeWorker::BUILD.run(&cx, pool.clone(), move |_| {
+                started.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(10)).unwrap();
+                Ok(())
+            }));
+            assert!(
+                blocker
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            wait_for_worker(entered).await;
+            let mut queued = Box::pin(builder(&path, &fast).with_blocking_pool(pool).build(&cx));
+            assert!(
+                queued
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(fast.batches.load(Ordering::SeqCst), 1);
+            if cancel {
+                cx.set_cancel_requested(true);
+                // Cancellation must still join the owned queued worker.
+                assert!(
+                    queued
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                release.send(()).unwrap();
+                assert!(matches!(queued.await, Err(SearchError::Cancelled { .. })));
+                assert!(matches!(blocker.await, Err(SearchError::Cancelled { .. })));
+            } else {
+                drop(queued);
+                release.send(()).unwrap();
+                blocker.await.unwrap();
+                assert!(!cx.is_cancel_requested());
+            }
+            (dir, path)
+        });
+        // Observe after the pool has drained, so a late writer cannot escape
+        // the assertion merely because its awaiting future was dropped.
+        assert!(path.is_dir());
+        assert!(!path.join("fast.fsvi").exists());
+        assert!(!path.join("fast.fshnsw").exists());
+        drop(dir);
+    }
+}
+
+#[test]
+fn inherited_pool_builds_every_partition_and_incremental_successor() {
+    run_with_pool(|cx, pool| async move {
+        let cx = cx.with_blocking_pool_handle(Some(pool));
+        let dir = tempfile::tempdir().unwrap();
+        let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let original = builder(&dir.path().join("original"), &fast)
+            .with_fast_storage(
+                NativeBuildPrecision::F32,
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 7,
+                },
+            )
+            .build_sharded(&cx, 2)
+            .await
+            .unwrap();
+        assert_eq!(original.partitions().len(), 3);
+        let calls = fast.batches.load(Ordering::SeqCst);
+        let mut newer = generation();
+        newer.sequence += 1;
+        let successor = original
+            .begin_update(&cx, dir.path().join("successor"), newer)
+            .unwrap()
+            .delete_document("a")
+            .upsert_document(IndexableDocument::new("b", "horizontal"))
+            .upsert_document(IndexableDocument::new("new", "vertical"))
+            .build_sharded(&cx, 3)
+            .await
+            .unwrap();
+        assert_eq!(successor.document_count(), 5);
+        assert_eq!(successor.partitions().len(), 2);
+        assert!(fast.batches.load(Ordering::SeqCst) > calls);
+        for partition in successor.partitions() {
+            assert!(partition.fast().graph_path().unwrap().is_file());
+            assert_eq!(partition.fast().binding().generation(), newer);
+        }
+        assert_eq!(original.document("b").unwrap().content, "vertical");
+        assert_eq!(successor.document("b").unwrap().content, "horizontal");
+        assert!(successor.document("a").is_none());
+        assert_eq!(successor.document("new").unwrap().content, "vertical");
+    });
 }
 
 #[test]
