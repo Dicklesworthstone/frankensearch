@@ -51,7 +51,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -794,6 +794,21 @@ impl NativeHnswGenerationBindingV2 {
         graph_path: &Path,
         receipt_path: &Path,
     ) -> SearchResult<()> {
+        self.validate_owner_identity(receipt, receipt_path)?;
+        if receipt.graph_basename != canonical_graph_basename(graph_path)? {
+            return Err(native_hnsw_receipt_corrupted(
+                receipt_path,
+                "native HNSW receipt graph basename mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_owner_identity(
+        &self,
+        receipt: &NativeHnswGenerationReceiptV2,
+        receipt_path: &Path,
+    ) -> SearchResult<()> {
         let mismatch = |field: &str| {
             native_hnsw_receipt_corrupted(
                 receipt_path,
@@ -857,9 +872,6 @@ impl NativeHnswGenerationBindingV2 {
         }
         if receipt.fsvi_physical_row_count != self.fsvi_physical_row_count {
             return Err(mismatch("FSVI physical row count"));
-        }
-        if receipt.graph_basename != canonical_graph_basename(graph_path)? {
-            return Err(mismatch("graph basename"));
         }
         Ok(())
     }
@@ -1275,6 +1287,53 @@ impl ValidatedNativeHnsw {
             },
             receipt,
         ))
+    }
+
+    /// Admit an immutable graph image and its separately authenticated receipt.
+    ///
+    /// The caller must authenticate the complete receipt through its selected
+    /// generation authority, alongside the raw FSHNSW component bytes. A receipt
+    /// self-seal proves internal integrity; it does not select a generation.
+    /// Admission binds every receipt identity to `owner`, checks the image's
+    /// exact length and SHA-256, then applies the same version-aware parser,
+    /// CRC, seeded topology, complete source-map and receipt checks as [`Self::load`].
+    /// Versions 1 and 2 retain their respective topology-digest semantics.
+    ///
+    /// No pathname is opened, created or repaired. The canonical basename is
+    /// sealed receipt metadata, not a location to discover or reopen. The parsed
+    /// graph owns its adjacency and retains `owner`; it remains searchable when
+    /// the caller drops the image, receipt or authority's original filesystem
+    /// location. The caller bounds the encoded image before this call; decoded
+    /// adjacency has additional memory costs, as with pathname admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns invalid-receipt, owner-binding, graph-byte, format, checksum or
+    /// structural errors. No malformed or incompatible image triggers a rebuild
+    /// or a fallback to a different vector source.
+    pub fn from_bytes(
+        owner: Arc<ValidatedFsviBytes>,
+        graph_bytes: Arc<[u8]>,
+        receipt: &NativeHnswGenerationReceiptV2,
+    ) -> SearchResult<Self> {
+        let image_label = Path::new("<retained-native-hnsw>");
+        receipt.validate()?;
+        let binding = Self::binding_for_owner(owner.as_ref())?;
+        binding.validate_owner_identity(receipt, image_label)?;
+        NativeHnswGenerationBindingV2::validate_graph_bytes(receipt, image_label, &graph_bytes)?;
+        let (graph, metadata) = NativeHnsw::read_with_metadata(
+            image_label,
+            &mut Cursor::new(graph_bytes),
+            receipt.graph_byte_len,
+            owner.as_ref(),
+        )?;
+        NativeHnswGenerationBindingV2::validate_graph_identity(
+            receipt,
+            image_label,
+            &graph,
+            metadata,
+        )?;
+        Self::from_verified_graph(owner, binding, graph)
     }
 
     #[cfg(test)]
@@ -2457,16 +2516,16 @@ impl NativeHnswHeader {
     }
 }
 
-struct NativeHnswPayloadReader<'a> {
-    file: &'a mut File,
+struct NativeHnswPayloadReader<'a, R: Read> {
+    reader: &'a mut R,
     remaining: u64,
     hasher: crc32fast::Hasher,
 }
 
-impl<'a> NativeHnswPayloadReader<'a> {
-    fn new(file: &'a mut File, payload_len: u64) -> Self {
+impl<'a, R: Read> NativeHnswPayloadReader<'a, R> {
+    fn new(reader: &'a mut R, payload_len: u64) -> Self {
         Self {
-            file,
+            reader,
             remaining: payload_len,
             hasher: crc32fast::Hasher::new(),
         }
@@ -2481,7 +2540,7 @@ impl<'a> NativeHnswPayloadReader<'a> {
             ));
         }
         let mut bytes = [0_u8; 4];
-        self.file.read_exact(&mut bytes).map_err(|error| {
+        self.reader.read_exact(&mut bytes).map_err(|error| {
             native_hnsw_corrupted(path, format!("could not read native HNSW {field}: {error}"))
         })?;
         self.hasher.update(&bytes);
@@ -2810,6 +2869,16 @@ impl NativeHnsw {
     ) -> SearchResult<(Self, NativeHnswFileMetadata)> {
         let mut file = open_regular_file(path)?;
         let file_len = file.metadata().map_err(SearchError::Io)?.len();
+        Self::read_with_metadata(path, &mut file, file_len, store)
+    }
+
+    /// One bounded parser for opened files and immutable retained images.
+    fn read_with_metadata<D: VectorDistance, R: Read>(
+        path: &Path,
+        reader: &mut R,
+        file_len: u64,
+        store: &D,
+    ) -> SearchResult<(Self, NativeHnswFileMetadata)> {
         if file_len < NATIVE_HNSW_HEADER_LEN_U64 {
             return Err(native_hnsw_corrupted(
                 path,
@@ -2818,7 +2887,7 @@ impl NativeHnsw {
         }
 
         let mut header_bytes = [0_u8; NATIVE_HNSW_HEADER_LEN];
-        file.read_exact(&mut header_bytes).map_err(|error| {
+        reader.read_exact(&mut header_bytes).map_err(|error| {
             native_hnsw_corrupted(path, format!("could not read native HNSW header: {error}"))
         })?;
         // ubs:ignore — this decodes the owned graph header, not a JWT or authentication token.
@@ -2848,7 +2917,7 @@ impl NativeHnsw {
                 )
             })?;
         let sampler = LevelSampler::new(header.params.m, header.seed);
-        let mut payload = NativeHnswPayloadReader::new(&mut file, header.payload_len);
+        let mut payload = NativeHnswPayloadReader::new(reader, header.payload_len);
         let mut source_rows = Vec::new();
         source_rows
             .try_reserve_exact(header.point_count)
@@ -5470,6 +5539,261 @@ mod tests {
         assert!(weak_owner.upgrade().is_none());
     }
 
+    #[test]
+    fn retained_graph_admission_survives_path_scope_and_preserves_remapped_live_results() {
+        for quantization in [QuantizationFormat::F16, QuantizationFormat::F32] {
+            let (owner, bytes, receipt, source_rows, topology, graph_path) = {
+                let directory = tempfile::tempdir().expect("temporary retained graph directory");
+                let rows: Vec<_> = TestStore::synthetic(48, 8)
+                    .vectors
+                    .into_iter()
+                    .enumerate()
+                    .map(|(row, vector)| {
+                        (
+                            format!("document-{row:04}"),
+                            vector,
+                            if row % 5 == 0 {
+                                FsviRecordFlags::LIVE
+                            } else {
+                                FsviRecordFlags::TOMBSTONE
+                            },
+                        )
+                    })
+                    .collect();
+                let binding = fsvi_v2_binding_with_quantization(
+                    160,
+                    0x60,
+                    "retained-graph-image",
+                    8,
+                    quantization,
+                );
+                let initial_owner = admitted_fsvi_owner_with_flags(
+                    directory.path(),
+                    "initial.fsvi",
+                    &binding,
+                    &rows[..24],
+                );
+                let initial =
+                    ValidatedNativeHnsw::build(&Cx::for_testing(), initial_owner, params(), 93)
+                        .expect("build predecessor");
+                let successor_binding = fsvi_v2_binding_with_quantization(
+                    161,
+                    0x61,
+                    "retained-graph-image",
+                    8,
+                    quantization,
+                );
+                let owner = admitted_fsvi_owner_with_flags(
+                    directory.path(),
+                    "successor.fsvi",
+                    &successor_binding,
+                    &rows,
+                );
+                let successor = initial
+                    .try_reuse_for_owner(&Cx::for_testing(), Arc::clone(&owner))
+                    .expect("append successor")
+                    .expect("unchanged rows remain eligible");
+                assert!(
+                    successor
+                        .graph
+                        .source_rows
+                        .iter()
+                        .enumerate()
+                        .any(|(node, &row)| node != row as usize)
+                );
+                let graph_path = directory.path().join("retained.fshnsw");
+                let receipt = successor.save(&graph_path).expect("save mapped graph");
+                let bytes: Arc<[u8]> = std::fs::read(&graph_path)
+                    .expect("retain immutable graph image")
+                    .into();
+                (
+                    owner,
+                    bytes,
+                    receipt,
+                    successor.graph.source_rows.clone(),
+                    topology_snapshot(&successor.graph),
+                    graph_path,
+                )
+            };
+            assert!(
+                !graph_path.exists(),
+                "admission cannot reopen the original graph"
+            );
+            let queries: Vec<_> = (0..8).map(|query| TestStore::query(query, 8)).collect();
+            let expected: Vec<_> = queries
+                .iter()
+                .map(|query| {
+                    owner
+                        .search_top_k(query, 7, None)
+                        .expect("independent exact owner search")
+                })
+                .collect();
+            let weak_owner = Arc::downgrade(&owner);
+            let loaded =
+                ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), Arc::clone(&bytes), &receipt)
+                    .expect("admit retained graph after both source directories have gone");
+            assert_eq!(loaded.graph.source_rows, source_rows);
+            assert_eq!(topology_snapshot(&loaded.graph), topology);
+            drop(owner);
+            drop(bytes);
+            drop(receipt);
+            assert_eq!(weak_owner.strong_count(), 1);
+            for (query, exact) in queries.iter().zip(expected) {
+                let hits = loaded
+                    .search(&Cx::for_testing(), query, 7, Some(48))
+                    .expect("retained graph search");
+                assert_eq!(
+                    hits.iter()
+                        .map(ValidatedNativeHnswHit::doc_id)
+                        .collect::<Vec<_>>(),
+                    exact
+                        .iter()
+                        .map(|hit| hit.doc_id.as_str())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    hits.iter()
+                        .map(ValidatedNativeHnswHit::physical_row)
+                        .collect::<Vec<_>>(),
+                    exact.iter().map(|hit| hit.index).collect::<Vec<_>>()
+                );
+                assert!(hits.iter().all(|hit| hit.flags().is_live()));
+            }
+            drop(loaded);
+            assert!(weak_owner.upgrade().is_none());
+        }
+    }
+
+    #[test]
+    fn retained_graph_admission_rejects_authenticated_malformed_images() {
+        let directory = tempfile::tempdir().expect("temporary retained corruption directory");
+        let path = directory.path().join("graph.fshnsw");
+        let owner = generation_owner(162, 0x62, "retained-corruption", 8, 32);
+        let built =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 19)
+                .expect("build retained corruption fixture");
+        let receipt = built.save(&path).expect("save retained corruption fixture");
+        let original = std::fs::read(&path).expect("graph image");
+        let (edge_offset, edge_owner) = first_persisted_neighbour(&original).expect("graph edge");
+        for (offset, value, detail) in [
+            (NATIVE_HNSW_HEADER_LEN, 1, "more than one graph node"),
+            (NATIVE_HNSW_HEADER_LEN, 32, "outside"),
+            (edge_offset, edge_owner, "is its own neighbour"),
+        ] {
+            let mut malformed = original.clone();
+            put_u32(&mut malformed, offset, value);
+            reseal_persisted_checksums(&mut malformed);
+            let mut resealed = receipt.clone();
+            resealed.graph_sha256 = sha256_hex(&malformed);
+            resealed.payload_crc32 = get_u32(&malformed, 88);
+            resealed.header_crc32 = get_u32(&malformed, NATIVE_HNSW_HEADER_CRC_OFFSET);
+            resealed.seal().expect("seal structurally forged receipt");
+            resealed
+                .validate()
+                .expect("self-consistent integrity receipt");
+            let error =
+                ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), malformed.into(), &resealed)
+                    .expect_err("byte integrity must not bypass structural attestation");
+            assert!(
+                matches!(error, SearchError::IndexCorrupted { detail: ref actual, .. }
+                if actual.contains(detail)),
+                "unexpected structural refusal: {error}"
+            );
+        }
+
+        let mut bad_payload = original.clone();
+        // A source-row mutation does not affect parser lengths, so it reaches
+        // the payload checksum gate before structural row-map attestation.
+        bad_payload[NATIVE_HNSW_HEADER_LEN] ^= 0x80;
+        let mut bad_header = original.clone();
+        bad_header[NATIVE_HNSW_HEADER_CRC_OFFSET] ^= 1;
+        let mut trailing = original.clone();
+        trailing.push(0);
+        for (bytes, detail) in [
+            (
+                original[..original.len() - 1].to_vec(),
+                "header-declared length",
+            ),
+            (trailing, "header-declared length"),
+            (bad_payload, "payload CRC mismatch"),
+            (bad_header, "header CRC mismatch"),
+        ] {
+            let mut resealed = receipt.clone();
+            resealed.graph_byte_len = u64::try_from(bytes.len()).expect("image length fits");
+            resealed.graph_sha256 = sha256_hex(&bytes);
+            resealed.seal().expect("seal malformed image receipt");
+            let error =
+                ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), bytes.into(), &resealed)
+                    .expect_err("raw bytes must satisfy their format as well as the receipt SHA");
+            assert!(
+                matches!(error, SearchError::IndexCorrupted { detail: ref actual, .. }
+                if actual.contains(detail)),
+                "unexpected image refusal: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_graph_admission_rejects_same_identity_with_changed_vectors_or_visibility() {
+        let directory = tempfile::tempdir().expect("temporary owner drift directory");
+        let binding = fsvi_v2_binding(163, 0x63, "retained-owner-drift", 4);
+        let rows = fsvi_rows(8, 4);
+        let owner = admitted_fsvi_owner(directory.path(), "original.fsvi", &binding, &rows);
+        let graph =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 23)
+                .expect("build original graph");
+        let path = directory.path().join("graph.fshnsw");
+        let receipt = graph.save(&path).expect("save original graph");
+        let bytes: Arc<[u8]> = std::fs::read(&path).expect("retained graph bytes").into();
+        let mut changed_rows = rows.clone();
+        changed_rows[0].1.rotate_left(1);
+        let changed_vectors = admitted_fsvi_owner(
+            directory.path(),
+            "changed-vectors.fsvi",
+            &binding,
+            &changed_rows,
+        );
+        let changed_flags: Vec<_> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(row, (id, vector))| {
+                (
+                    id,
+                    vector,
+                    if row == 0 {
+                        FsviRecordFlags::TOMBSTONE
+                    } else {
+                        FsviRecordFlags::LIVE
+                    },
+                )
+            })
+            .collect();
+        let changed_visibility = admitted_fsvi_owner_with_flags(
+            directory.path(),
+            "changed-visibility.fsvi",
+            &binding,
+            &changed_flags,
+        );
+        for changed_owner in [changed_vectors, changed_visibility] {
+            assert_eq!(changed_owner.record_count(), owner.record_count());
+            for row in 0..owner.record_count() {
+                assert_eq!(
+                    changed_owner.doc_id_at(row).expect("changed owner doc ID"),
+                    owner.doc_id_at(row).expect("original owner doc ID")
+                );
+            }
+            let error = ValidatedNativeHnsw::from_bytes(
+                changed_owner,
+                Arc::clone(&bytes),
+                &receipt,
+            )
+            .expect_err(
+                "matching model, generation, count and doc IDs cannot admit changed owner bytes",
+            );
+            assert!(matches!(error, SearchError::IndexCorrupted { .. }));
+        }
+    }
+
     // ─── FSVI generation receipts ──────────────────────────────────────
 
     #[test]
@@ -7037,6 +7361,9 @@ mod tests {
             ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 0xfeed)
                 .expect("owner-bound graph");
         let original = bound.save(&graph_path).expect("owner-bound save");
+        let graph_bytes: Arc<[u8]> = std::fs::read(&graph_path)
+            .expect("retain image for the same admission matrix")
+            .into();
 
         macro_rules! rejects_resealed {
             ($label:literal, $change:expr) => {{
@@ -7051,6 +7378,23 @@ mod tests {
                         SearchError::IndexCorrupted { .. } | SearchError::InvalidConfig { .. }
                     ),
                     "{} drift returned an unexpected error: {error:?}",
+                    $label
+                );
+                let error = ValidatedNativeHnsw::from_bytes(
+                    Arc::clone(&owner),
+                    Arc::clone(&graph_bytes),
+                    &changed,
+                )
+                .expect_err(concat!(
+                    $label,
+                    " drift must also fail retained-image admission"
+                ));
+                assert!(
+                    matches!(
+                        error,
+                        SearchError::IndexCorrupted { .. } | SearchError::InvalidConfig { .. }
+                    ),
+                    "{} drift returned an unexpected retained-image error: {error:?}",
                     $label
                 );
             }};
@@ -7140,9 +7484,12 @@ mod tests {
                 r.fsvi_physical_row_count += 1;
             }
         );
-        rejects_resealed!("graph basename", |r: &mut NativeHnswGenerationReceiptV2| {
-            r.graph_basename = "other.fshnsw".to_owned();
-        });
+        rejects_resealed!(
+            "noncanonical graph basename",
+            |r: &mut NativeHnswGenerationReceiptV2| {
+                r.graph_basename = "../other.fshnsw".to_owned();
+            }
+        );
         rejects_resealed!(
             "graph byte length",
             |r: &mut NativeHnswGenerationReceiptV2| {
@@ -7202,6 +7549,29 @@ mod tests {
             }
         );
 
+        // Path admission compares the actual basename. Retained admission has
+        // no pathname authority: a canonical label is sealed metadata only.
+        let mut relocated = original.clone();
+        relocated.graph_basename = "other.fshnsw".to_owned();
+        write_resealed_receipt(&receipt_path, &mut relocated);
+        ValidatedNativeHnsw::load(Arc::clone(&owner), &graph_path)
+            .expect_err("path admission must still reject a different basename");
+        let retained = ValidatedNativeHnsw::from_bytes(
+            Arc::clone(&owner),
+            Arc::clone(&graph_bytes),
+            &relocated,
+        )
+        .expect("retained admission does not discover a pathname from sealed metadata");
+        assert_eq!(
+            topology_snapshot(&retained.graph),
+            topology_snapshot(&bound.graph)
+        );
+
+        let mut bad_seal = original.clone();
+        bad_seal.receipt_sha256 = "0".repeat(64);
+        ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), Arc::clone(&graph_bytes), &bad_seal)
+            .expect_err("retained admission validates the receipt self-seal");
+
         let mut receipt_seal_tamper = original.to_bytes().expect("canonical receipt");
         *receipt_seal_tamper.last_mut().expect("receipt seal byte") ^= 1;
         std::fs::write(&receipt_path, receipt_seal_tamper).expect("receipt seal tamper");
@@ -7220,11 +7590,15 @@ mod tests {
             ValidatedNativeHnsw::load(Arc::clone(&wrong_generation), &graph_path).is_err(),
             "caller-held generation drift must fail"
         );
+        ValidatedNativeHnsw::from_bytes(wrong_generation, Arc::clone(&graph_bytes), &original)
+            .expect_err("retained admission rejects a different owner generation");
         let wrong_identity = generation_owner(77, 0x77, "different-identity", 8, 48);
         assert!(
             ValidatedNativeHnsw::load(Arc::clone(&wrong_identity), &graph_path).is_err(),
             "caller-held frozen identity drift must fail"
         );
+        ValidatedNativeHnsw::from_bytes(wrong_identity, graph_bytes, &original)
+            .expect_err("retained admission rejects a different frozen model identity");
     }
 
     #[test]
@@ -7369,7 +7743,27 @@ mod tests {
         let (loaded, observed) = ValidatedNativeHnsw::load(Arc::clone(&owner), &path)
             .expect("valid original graph and original receipt must remain admissible");
         assert_eq!(observed, receipt);
+        let retained_bytes: Arc<[u8]> = V1_BYTES.as_slice().into();
+        let retained = ValidatedNativeHnsw::from_bytes(
+            Arc::clone(&owner),
+            Arc::clone(&retained_bytes),
+            &receipt,
+        )
+        .expect("retained original-format image admits against the authentic v1 receipt");
         assert_eq!(loaded.graph.source_rows, [0, 1]);
+        assert_eq!(retained.graph.source_rows, [0, 1]);
+        assert_eq!(
+            topology_snapshot(&retained.graph),
+            topology_snapshot(&loaded.graph)
+        );
+        assert_eq!(
+            retained
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 1, Some(2))
+                .expect("retained v1 search"),
+            loaded
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 1, Some(2))
+                .expect("path v1 search")
+        );
         assert_eq!(
             loaded
                 .graph
@@ -7399,6 +7793,10 @@ mod tests {
         write_resealed_receipt(&receipt_path, &mut receipt);
         let error = ValidatedNativeHnsw::load(Arc::clone(&owner), &path)
             .expect_err("v1 admission must validate its original topology digest");
+        assert!(matches!(error, SearchError::IndexCorrupted { detail, .. }
+            if detail.contains("topology")));
+        let error = ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), retained_bytes, &receipt)
+            .expect_err("retained v1 admission must validate the original topology digest");
         assert!(matches!(error, SearchError::IndexCorrupted { detail, .. }
             if detail.contains("topology")));
         let mut forged = V1_BYTES;
