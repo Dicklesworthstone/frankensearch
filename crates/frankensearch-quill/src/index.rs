@@ -192,6 +192,16 @@ pub enum QuillIndexError {
     /// A stored metadata column was malformed.
     #[error(transparent)]
     StoredMeta(#[from] StoredMetaCodecError),
+    /// A stored field exceeded its materialization limit before being copied.
+    #[error("stored field {field_ord} requires {required} bytes, exceeding limit {limit}")]
+    StoredFieldBudgetExceeded {
+        /// Schema ordinal of the selected stored column.
+        field_ord: u16,
+        /// Exact byte length in the retained source section.
+        required: usize,
+        /// Maximum source bytes the caller permits this field to copy.
+        limit: usize,
+    },
     /// Exhaustive scorer construction or collection failed.
     #[error(transparent)]
     Argus(ArgusError),
@@ -1066,6 +1076,25 @@ impl QuillSearchSnapshot {
         self.materialize_stored_value(field_ord, global_docid)
     }
 
+    /// Read one live stored column after checking its source-byte limit.
+    ///
+    /// The exact borrowed value is checked before reserving or copying its
+    /// output buffer. Missing documents/fields return `None`; a present empty
+    /// field fits a zero-byte limit. Immutable section-validation caches and
+    /// other reader structures are outside this field payload budget.
+    ///
+    /// # Errors
+    /// Returns [`QuillIndexError::StoredFieldBudgetExceeded`] before copying an
+    /// oversized field, or typed section-validation/allocation failures.
+    pub fn stored_field_value_bounded(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        self.materialize_stored_value_bounded(field_ord, global_docid, max_bytes)
+    }
+
     fn materialize_metadata(
         &self,
         global_docid: u32,
@@ -1091,11 +1120,20 @@ impl QuillSearchSnapshot {
         field_ord: u16,
         global_docid: u32,
     ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        self.materialize_stored_value_bounded(field_ord, global_docid, usize::MAX)
+    }
+
+    fn materialize_stored_value_bounded(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, QuillIndexError> {
         if let Some(delta) = self.delta_for_docid(global_docid) {
             match delta.materialize_stored_value(field_ord, global_docid) {
                 DeltaStoredMaterialization::NotLive => {}
                 DeltaStoredMaterialization::Live(stored) => {
-                    return Ok(stored.map(<[u8]>::to_vec));
+                    return copy_stored_field_bounded(field_ord, stored, max_bytes);
                 }
             }
         }
@@ -1105,10 +1143,13 @@ impl QuillSearchSnapshot {
         };
         let stored =
             segment.stored_meta_lookup(required_section(segment, SectionKind::STOREDMETA)?)?;
-        Ok(stored
-            .field(field_ord)
-            .and_then(|field| field.get(u64::from(global_docid)))
-            .map(<[u8]>::to_vec))
+        copy_stored_field_bounded(
+            field_ord,
+            stored
+                .field(field_ord)
+                .and_then(|field| field.get(u64::from(global_docid))),
+            max_bytes,
+        )
     }
 
     /// Clone the pinned immutable Keeper component.
@@ -1128,6 +1169,32 @@ impl QuillSearchSnapshot {
             .then(|| self.deltas.get(entry.delta_index))?
             .map(Arc::as_ref)
     }
+}
+
+fn copy_stored_field_bounded(
+    field_ord: u16,
+    stored: Option<&[u8]>,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, QuillIndexError> {
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    if stored.len() > max_bytes {
+        return Err(QuillIndexError::StoredFieldBudgetExceeded {
+            field_ord,
+            required: stored.len(),
+            limit: max_bytes,
+        });
+    }
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(stored.len())
+        .map_err(|_| StoredMetaCodecError::Allocation {
+            resource: "stored field materialization",
+            bytes: stored.len(),
+        })?;
+    value.extend_from_slice(stored);
+    Ok(Some(value))
 }
 
 fn build_delta_lease_lookup(
@@ -5539,6 +5606,24 @@ impl QuillSnapshotIndex {
         self.reader
             .checked_published_snapshot()?
             .stored_field_value(field_ord, global_docid)
+    }
+
+    /// Read a live stored column from this image within a source-byte limit.
+    ///
+    /// The retained field length is checked before its output buffer is
+    /// allocated or copied. See [`QuillSearchSnapshot::stored_field_value_bounded`].
+    ///
+    /// # Errors
+    /// Returns a typed field-budget, snapshot, section or allocation failure.
+    pub fn stored_field_value_bounded(
+        &self,
+        field_ord: u16,
+        global_docid: u32,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>, QuillIndexError> {
+        self.reader
+            .checked_published_snapshot()?
+            .stored_field_value_bounded(field_ord, global_docid, max_bytes)
     }
 }
 
@@ -22538,6 +22623,52 @@ mod tests {
                 "an exclusion-only conjunction must still match nothing"
             );
         });
+    }
+
+    #[test]
+    fn bounded_stored_fields_preserve_exact_empty_and_missing_values_on_both_residencies() {
+        let content = "bounded-source-payload";
+        let source = typed_delta_snapshot(0, 0, "bounded-source", content, 1);
+        for sealed in [false, true] {
+            let index = if sealed {
+                typed_residency_index(&[Arc::clone(&source)], &[], deterministic_config())
+            } else {
+                typed_residency_index(&[], &[Arc::clone(&source)], deterministic_config())
+            };
+            let snapshot = index
+                .search_snapshot()
+                .expect("pin bounded stored-field source");
+            assert_eq!(snapshot.delta_count(), usize::from(!sealed));
+            for limit in [0, content.len() - 1] {
+                assert!(matches!(
+                    snapshot.stored_field_value_bounded(1, 0, limit),
+                    Err(QuillIndexError::StoredFieldBudgetExceeded {
+                        field_ord: 1, required, limit: actual_limit,
+                    }) if required == content.len() && actual_limit == limit
+                ));
+            }
+            assert_eq!(
+                snapshot
+                    .stored_field_value_bounded(1, 0, content.len())
+                    .unwrap(),
+                Some(content.as_bytes().to_vec())
+            );
+            assert_eq!(
+                snapshot
+                    .stored_field_value_bounded(1, 0, content.len())
+                    .unwrap(),
+                snapshot.stored_field_value(1, 0).unwrap()
+            );
+            assert_eq!(
+                snapshot.stored_field_value_bounded(3, 0, 0).unwrap(),
+                Some(Vec::new())
+            );
+            assert_eq!(
+                snapshot.stored_field_value_bounded(u16::MAX, 0, 0).unwrap(),
+                None
+            );
+            assert_eq!(snapshot.stored_field_value_bounded(1, 1, 0).unwrap(), None);
+        }
     }
 
     #[test]

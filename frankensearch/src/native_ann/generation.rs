@@ -27,7 +27,8 @@ use frankensearch_index::native_hnsw::{
 };
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{
-    DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillSnapshotIndex, SchemaDescriptor,
+    DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillIndexError, QuillSnapshotIndex,
+    SchemaDescriptor,
 };
 use sha2::Digest as _;
 
@@ -200,11 +201,11 @@ impl NativeGenerationSnapshot {
     ///
     /// `max_source_bytes` bounds the sum of the raw stored UTF-8 byte lengths of
     /// `id`, `content`, `title` and `metadata_json` across all exported documents,
-    /// including JSON punctuation and escaping. Each field is charged before
-    /// decoding. This is a payload budget, not a bound on process RSS or peak
-    /// allocation: Quill materializes a field before its size can be checked,
-    /// and decoded documents require additional storage. Run large exports on
-    /// the caller's bounded blocking lane, as with admission.
+    /// including JSON punctuation and escaping. Each field is checked before
+    /// its source bytes are copied or decoded. This is a payload budget, not a
+    /// bound on process RSS: reader caches and decoded documents require
+    /// additional storage. Run large exports on the caller's bounded blocking
+    /// lane, as with admission.
     ///
     /// # Errors
     ///
@@ -217,6 +218,63 @@ impl NativeGenerationSnapshot {
         max_source_bytes: usize,
     ) -> SearchResult<Vec<IndexableDocument>> {
         self.readers.source_documents(cx, max_source_bytes)
+    }
+
+    /// Recover one exact live source document from the retained generation.
+    ///
+    /// Only the requested document's stored fields are copied. The full
+    /// identifier must belong to a live FSVI row and resolve to the same retained
+    /// Quill document; absent or tombstoned IDs return `None`. No corpus export,
+    /// pathname lookup, model load or inference is performed.
+    ///
+    /// The byte budget and lossless source checks match
+    /// [`Self::source_documents`]. Missing documents consume no source bytes.
+    /// This returns the complete document, so its full stored payload must fit
+    /// the budget even if a caller later displays only a content window.
+    ///
+    /// # Errors
+    /// Refuses cancellation, insufficient source budget, unsupported schemas,
+    /// invalid stored fields or disagreement between the retained live readers.
+    pub fn source_document(
+        &self,
+        cx: &Cx,
+        doc_id: &str,
+        max_source_bytes: usize,
+    ) -> SearchResult<Option<IndexableDocument>> {
+        Ok(self
+            .readers
+            .source_documents_by_ids(cx, &[doc_id], max_source_bytes)?
+            .pop()
+            .flatten())
+    }
+
+    /// Recover selected source documents without scanning or exporting the cohort.
+    ///
+    /// Results preserve input order and duplicate IDs; missing or tombstoned
+    /// identifiers occupy `None` slots. Every returned occurrence is independently
+    /// charged against the aggregate raw stored-field budget, including duplicate
+    /// occurrences. An empty request returns an empty collection after ordinary
+    /// schema/cancellation admission. The caller owns the request-count limit;
+    /// the payload budget does not bound output slots for absent documents.
+    ///
+    /// Exact live FSVI membership is resolved before Quill fields are read. Each
+    /// field's length is checked before copying, and the same strict decoder as
+    /// [`Self::source_documents`] preserves content, title and canonical metadata.
+    /// The selection stays on this retained reader throughout. No model or source
+    /// pathname is accessed, and unrelated documents are never materialized.
+    ///
+    /// # Errors
+    /// Refuses cancellation, insufficient aggregate budget, unsupported schemas,
+    /// invalid stored fields or inconsistent live identity. Failure returns no
+    /// partial collection, even when earlier requested documents were valid.
+    pub fn source_documents_by_ids(
+        &self,
+        cx: &Cx,
+        doc_ids: &[&str],
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<Option<IndexableDocument>>> {
+        self.readers
+            .source_documents_by_ids(cx, doc_ids, max_source_bytes)
     }
 
     /// Prepare incremental upserts and deletes against this exact retained cohort.
@@ -504,11 +562,7 @@ fn same_anchor_security_identity(
 }
 
 impl CompositeReaders {
-    pub(super) fn source_documents(
-        &self,
-        cx: &Cx,
-        max_source_bytes: usize,
-    ) -> SearchResult<Vec<IndexableDocument>> {
+    fn source_context(&self, cx: &Cx) -> SearchResult<(Arc<KeeperSnapshot>, usize, [u16; 4])> {
         checkpoint(cx, "native_ann.generation.source")?;
         let snapshot = self
             .lexical
@@ -523,15 +577,6 @@ impl CompositeReaders {
         }
         let live_count =
             usize::try_from(live_count).map_err(|_| refused("source", "live-count-overflow"))?;
-        // Every admitted FSVI identifier is nonempty. Reject an impossible
-        // budget before reserving the output collection.
-        if live_count > max_source_bytes {
-            return Err(refused("source", "stored-payload-limit"));
-        }
-        let mut documents = Vec::new();
-        documents
-            .try_reserve_exact(live_count)
-            .map_err(|_| refused("source", "allocation-failed"))?;
         let mut field_ids = [0; 4];
         for (field_id, name) in
             field_ids
@@ -545,7 +590,25 @@ impl CompositeReaders {
                 .ok_or_else(|| refused("source", "unsupported-schema"))?
                 .id;
         }
-        let mut source_bytes = 0usize;
+        Ok((snapshot, live_count, field_ids))
+    }
+
+    pub(super) fn source_documents(
+        &self,
+        cx: &Cx,
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<IndexableDocument>> {
+        let (snapshot, live_count, field_ids) = self.source_context(cx)?;
+        // Every admitted FSVI identifier is nonempty. Reject an impossible
+        // budget before reserving the output collection.
+        if live_count > max_source_bytes {
+            return Err(refused("source", "stored-payload-limit"));
+        }
+        let mut documents = Vec::new();
+        documents
+            .try_reserve_exact(live_count)
+            .map_err(|_| refused("source", "allocation-failed"))?;
+        let mut remaining_bytes = max_source_bytes;
         for physical_row in 0..self.vector.owner.record_count() {
             checkpoint(cx, "native_ann.generation.source_row")?;
             let row = self
@@ -556,56 +619,111 @@ impl CompositeReaders {
             if !row.flags().is_live() {
                 continue;
             }
-            let resolved = snapshot
-                .resolve_document_id(row.doc_id())
-                .map_err(|_| refused("source", "invalid-lexical-identity"))?
-                .ok_or_else(|| refused("source", "missing-live-document"))?;
-            let mut values: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::new());
-            for (value, field_id) in values.iter_mut().zip(field_ids) {
-                checkpoint(cx, "native_ann.generation.source_field")?;
-                let bytes = self
-                    .lexical
-                    .stored_field_value(field_id, resolved.global_docid)
-                    .map_err(|_| refused("source", "invalid-stored-field"))?
-                    .ok_or_else(|| refused("source", "missing-stored-field"))?;
-                source_bytes = source_bytes
-                    .checked_add(bytes.len())
-                    .filter(|total| *total <= max_source_bytes)
-                    .ok_or_else(|| refused("source", "stored-payload-limit"))?;
-                *value = bytes;
-            }
-            checkpoint(cx, "native_ann.generation.source_decode")?;
-            let [id, content, title, metadata_json] = values;
-            let id = String::from_utf8(id).map_err(|_| refused("source", "invalid-stored-utf8"))?;
-            if id != row.doc_id() {
-                return Err(refused("source", "stored-id-mismatch"));
-            }
-            let content =
-                String::from_utf8(content).map_err(|_| refused("source", "invalid-stored-utf8"))?;
-            let title =
-                String::from_utf8(title).map_err(|_| refused("source", "invalid-stored-utf8"))?;
-            let metadata: BTreeMap<String, String> = serde_json::from_slice(&metadata_json)
-                .map_err(|_| refused("source", "invalid-metadata"))?;
-            // The shipping writer emits sorted canonical string maps. Comparing
-            // their encoding also refuses duplicate JSON keys instead of
-            // silently discarding source values during deserialization.
-            if serde_json::to_vec(&metadata).map_err(|_| refused("source", "invalid-metadata"))?
-                != metadata_json
-            {
-                return Err(refused("source", "noncanonical-metadata"));
-            }
-            documents.push(IndexableDocument {
-                id,
-                content,
-                title: (!title.is_empty()).then_some(title),
-                metadata: metadata.into_iter().collect(),
-            });
+            documents.push(self.read_source_document(
+                cx,
+                &snapshot,
+                field_ids,
+                row.doc_id(),
+                &mut remaining_bytes,
+            )?);
         }
         if documents.len() != live_count {
             return Err(refused("source", "live-count-mismatch"));
         }
         checkpoint(cx, "native_ann.generation.source_complete")?;
         Ok(documents)
+    }
+
+    fn source_documents_by_ids(
+        &self,
+        cx: &Cx,
+        doc_ids: &[&str],
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<Option<IndexableDocument>>> {
+        let (snapshot, _, field_ids) = self.source_context(cx)?;
+        let mut documents = Vec::new();
+        documents
+            .try_reserve_exact(doc_ids.len())
+            .map_err(|_| refused("source", "allocation-failed"))?;
+        let mut remaining_bytes = max_source_bytes;
+        for doc_id in doc_ids {
+            checkpoint(cx, "native_ann.generation.source_row")?;
+            let Some(row) = self
+                .vector
+                .owner
+                .find_live_row_by_doc_id(doc_id)
+                .map_err(|_| refused("source", "invalid-vector-row"))?
+            else {
+                documents.push(None);
+                continue;
+            };
+            documents.push(Some(self.read_source_document(
+                cx,
+                &snapshot,
+                field_ids,
+                row.doc_id(),
+                &mut remaining_bytes,
+            )?));
+        }
+        checkpoint(cx, "native_ann.generation.source_complete")?;
+        Ok(documents)
+    }
+
+    fn read_source_document(
+        &self,
+        cx: &Cx,
+        snapshot: &KeeperSnapshot,
+        field_ids: [u16; 4],
+        doc_id: &str,
+        remaining_bytes: &mut usize,
+    ) -> SearchResult<IndexableDocument> {
+        let resolved = snapshot
+            .resolve_document_id(doc_id)
+            .map_err(|_| refused("source", "invalid-lexical-identity"))?
+            .ok_or_else(|| refused("source", "missing-live-document"))?;
+        let mut values: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::new());
+        for (value, field_id) in values.iter_mut().zip(field_ids) {
+            checkpoint(cx, "native_ann.generation.source_field")?;
+            let bytes = self
+                .lexical
+                .stored_field_value_bounded(field_id, resolved.global_docid, *remaining_bytes)
+                .map_err(|error| match error {
+                    QuillIndexError::StoredFieldBudgetExceeded { .. } => {
+                        refused("source", "stored-payload-limit")
+                    }
+                    _ => refused("source", "invalid-stored-field"),
+                })?
+                .ok_or_else(|| refused("source", "missing-stored-field"))?;
+            *remaining_bytes = remaining_bytes
+                .checked_sub(bytes.len())
+                .ok_or_else(|| refused("source", "stored-payload-limit"))?;
+            *value = bytes;
+        }
+        checkpoint(cx, "native_ann.generation.source_decode")?;
+        let [id, content, title, metadata_json] = values;
+        let id = String::from_utf8(id).map_err(|_| refused("source", "invalid-stored-utf8"))?;
+        if id != doc_id {
+            return Err(refused("source", "stored-id-mismatch"));
+        }
+        let content =
+            String::from_utf8(content).map_err(|_| refused("source", "invalid-stored-utf8"))?;
+        let title =
+            String::from_utf8(title).map_err(|_| refused("source", "invalid-stored-utf8"))?;
+        let metadata: BTreeMap<String, String> = serde_json::from_slice(&metadata_json)
+            .map_err(|_| refused("source", "invalid-metadata"))?;
+        // Compare the canonical encoding to reject duplicate keys, non-string
+        // values and any lossy interpretation of the retained metadata source.
+        if serde_json::to_vec(&metadata).map_err(|_| refused("source", "invalid-metadata"))?
+            != metadata_json
+        {
+            return Err(refused("source", "noncanonical-metadata"));
+        }
+        Ok(IndexableDocument {
+            id,
+            content,
+            title: (!title.is_empty()).then_some(title),
+            metadata: metadata.into_iter().collect(),
+        })
     }
 
     async fn search_text(

@@ -337,12 +337,119 @@ fn retained_lexical(cx: &Cx, snapshot: &KeeperSnapshot) -> QuillSnapshotIndex {
     QuillSnapshotIndex::new(cx, retained, config()).unwrap()
 }
 
-fn assert_source_refused(result: SearchResult<Vec<IndexableDocument>>, expected_code: &str) {
+fn assert_source_refused<T>(result: SearchResult<T>, expected_code: &str) {
     let Err(SearchError::InvalidConfig { field, value, .. }) = result else {
         panic!("expected bounded retained source refusal {expected_code}");
     };
     assert_eq!(field, "native_ann.generation.source");
     assert_eq!(value, expected_code);
+}
+
+#[test]
+fn selected_source_preserves_requested_order_duplicates_and_only_charges_selected_payload() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for tier in [EmbedderTierTag::Fast, EmbedderTierTag::Quality] {
+            let provider = Provider::new();
+            let mut fixture = fixture(&cx, &provider, tier).await;
+            let ids = source_ids(&fixture);
+            assert_eq!(ids, ["beta", "alpha"]);
+            let expected = vec![
+                IndexableDocument::new(&ids[0], "unrelated large source ".repeat(4096))
+                    .with_title("Unrelated title")
+                    .with_metadata("kind", "large"),
+                IndexableDocument::new(&ids[1], "  café🦀\n東京\u{0}\r\n")
+                    .with_title("Retained \"title\"")
+                    .with_metadata("escaped", "\"\n\\\t")
+                    .with_metadata("empty", ""),
+            ];
+            let bytes = |document: &IndexableDocument| {
+                let metadata: BTreeMap<_, _> = document.metadata.iter().collect();
+                document.id.len()
+                    + document.content.len()
+                    + document.title.as_deref().unwrap_or("").len()
+                    + serde_json::to_vec(&metadata).unwrap().len()
+            };
+            let large_bytes = bytes(&expected[0]);
+            let small_bytes = bytes(&expected[1]);
+            assert!(large_bytes > small_bytes * 100);
+            let writer = QuillIndex::in_memory(config()).unwrap();
+            writer.index_documents(&cx, &expected).await.unwrap();
+            writer.commit(&cx).await.unwrap();
+            replace_source_image(&cx, &mut fixture, &writer);
+            let exact = fixture.admit(&cx).unwrap();
+            let fixture = fixture.with_ann(&cx, HnswParams::default(), 47);
+            let ann = fixture.admit(&cx).unwrap();
+            drop(writer);
+            std::fs::rename(
+                fixture.directory.path().join("source"),
+                fixture.directory.path().join("relocated-source"),
+            )
+            .unwrap();
+            drop(fixture);
+            for readers in [exact, ann] {
+                // The full cohort cannot fit, but an exact selected document can.
+                assert_source_refused(
+                    readers.source_documents(&cx, small_bytes),
+                    "stored-payload-limit",
+                );
+                let selected = readers
+                    .source_documents_by_ids(&cx, &[&ids[1]], small_bytes)
+                    .unwrap();
+                let small = selected[0].as_ref().unwrap();
+                assert_eq!(small.id, expected[1].id);
+                assert_eq!(small.content, expected[1].content);
+                assert_eq!(small.title, expected[1].title);
+                assert_eq!(small.metadata, expected[1].metadata);
+                assert_source_refused(
+                    readers.source_documents_by_ids(&cx, &[&ids[1]], small_bytes - 1),
+                    "stored-payload-limit",
+                );
+                let selected = readers
+                    .source_documents_by_ids(
+                        &cx,
+                        &[&ids[1], "absent", "dead", &ids[0], &ids[1]],
+                        large_bytes + 2 * small_bytes,
+                    )
+                    .unwrap();
+                assert_eq!(selected.len(), 5);
+                assert!(selected[1].is_none() && selected[2].is_none());
+                for (position, expected_position) in [(0, 1), (3, 0), (4, 1)] {
+                    let actual = selected[position].as_ref().unwrap();
+                    let original = &expected[expected_position];
+                    assert_eq!(actual.id, original.id);
+                    assert_eq!(actual.content, original.content);
+                    assert_eq!(actual.title, original.title);
+                    assert_eq!(actual.metadata, original.metadata);
+                }
+                assert_source_refused(
+                    readers.source_documents_by_ids(&cx, &[&ids[1], &ids[1]], small_bytes),
+                    "stored-payload-limit",
+                );
+                assert_source_refused(
+                    readers.source_documents_by_ids(
+                        &cx,
+                        &[&ids[1], &ids[0]],
+                        small_bytes + large_bytes - 1,
+                    ),
+                    "stored-payload-limit",
+                );
+                assert!(
+                    readers
+                        .source_documents_by_ids(&cx, &[], 0)
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    readers
+                        .source_documents_by_ids(&cx, &["absent", "dead", "absent"], 0)
+                        .unwrap()
+                        .iter()
+                        .all(Option::is_none)
+                );
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        }
+    });
 }
 
 #[test]
@@ -463,6 +570,15 @@ fn retained_source_refuses_missing_fields_wrong_ids_and_lossy_metadata() {
             replace_source_image(&cx, &mut fixture, &writer);
             let readers = fixture.admit(&cx).unwrap();
             assert_source_refused(readers.source_documents(&cx, BUDGET), code);
+            // Corrupt source fields of an unrelated ID are never materialized.
+            let healthy = readers
+                .source_documents_by_ids(&cx, &[&ids[1]], BUDGET)
+                .unwrap();
+            assert_eq!(healthy[0].as_ref().unwrap().content, "complete source");
+            assert_source_refused(
+                readers.source_documents_by_ids(&cx, &[&ids[1], &ids[0]], BUDGET),
+                code,
+            );
         }
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     });
@@ -482,6 +598,10 @@ fn retained_source_checks_schema_and_complete_cohort_without_text_queries() {
             &KeeperSnapshot::in_memory(CASS_SEMANTIC_SCHEMA).unwrap(),
         );
         assert_source_refused(readers.source_documents(&cx, BUDGET), "unsupported-schema");
+        assert_source_refused(
+            readers.source_documents_by_ids(&cx, &[], 0),
+            "unsupported-schema",
+        );
         for foreign in [false, true] {
             let writer = QuillIndex::in_memory(config()).unwrap();
             let mut documents = vec![IndexableDocument::new(&ids[0], "")];
@@ -491,6 +611,24 @@ fn retained_source_checks_schema_and_complete_cohort_without_text_queries() {
             writer.index_documents(&cx, &documents).await.unwrap();
             writer.commit(&cx).await.unwrap();
             readers.lexical = retained_lexical(&cx, &writer.snapshot().unwrap());
+            if foreign {
+                assert!(
+                    readers
+                        .source_documents_by_ids(&cx, &["foreign", "dead"], 0)
+                        .unwrap()
+                        .iter()
+                        .all(Option::is_none)
+                );
+                assert_source_refused(
+                    readers.source_documents_by_ids(&cx, &[&ids[1]], BUDGET),
+                    "missing-live-document",
+                );
+            } else {
+                assert_source_refused(
+                    readers.source_documents_by_ids(&cx, &[], 0),
+                    "live-count-mismatch",
+                );
+            }
             assert_source_refused(
                 readers.source_documents(&cx, BUDGET),
                 if foreign {
@@ -952,6 +1090,14 @@ fn zero_k_admits_producer_without_inference_and_cancellation_is_terminal() {
         ));
         assert!(matches!(
             readers.source_documents(&cx, 0),
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            readers.source_documents_by_ids(&cx, &["alpha"], BUDGET),
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            readers.source_documents_by_ids(&cx, &[], 0),
             Err(SearchError::Cancelled { .. })
         ));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -3035,6 +3181,36 @@ mod qualified_rollback {
                     after_authority
                 );
                 assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), after_lock);
+                // Source reads retain their original component bytes even when
+                // the entire qualified root pathname moves after publication.
+                fs::rename(&root_path, parent.join(format!("{name}-root-relocated"))).unwrap();
+                let calls = original_provider.calls.load(Ordering::SeqCst);
+                for snapshot in [retained.as_ref(), &reopened_target, restored.as_ref()] {
+                    let source = snapshot
+                        .source_document(&cx, "original", BUDGET)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(source.content, "common retained source");
+                    assert_eq!(source.title.as_deref(), Some("Retained original title"));
+                    assert_eq!(source.metadata["version"], "original");
+                    assert!(
+                        snapshot
+                            .source_document(&cx, "successor", 0)
+                            .unwrap()
+                            .is_none()
+                    );
+                    let selected = snapshot
+                        .source_documents_by_ids(
+                            &cx,
+                            &["original", "successor", "original"],
+                            BUDGET,
+                        )
+                        .unwrap();
+                    assert!(selected[1].is_none());
+                    assert_eq!(selected[0].as_ref().unwrap().content, source.content);
+                    assert_eq!(selected[2].as_ref().unwrap().content, source.content);
+                }
+                assert_eq!(original_provider.calls.load(Ordering::SeqCst), calls);
             }
         });
     }

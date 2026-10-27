@@ -1624,6 +1624,26 @@ impl ValidatedFsviBytes {
         self.index.find_index_by_doc_hash(doc_id_hash)
     }
 
+    /// Resolve one exact live document identifier in the retained image.
+    ///
+    /// The sorted hash range is only a lookup accelerator: collisions are
+    /// checked against the complete identifier, and tombstones never resolve.
+    /// The returned row keeps its physical coordinate and borrows this owner.
+    /// No vector is decoded or copied, and no pathname is opened.
+    ///
+    /// # Errors
+    /// Returns a structural row or document-range error if the admitted image
+    /// cannot satisfy its validated lookup invariants.
+    pub fn find_live_row_by_doc_id(
+        &self,
+        doc_id: &str,
+    ) -> SearchResult<Option<ValidatedFsviRow<'_>>> {
+        self.index
+            .find_index_by_doc_id(doc_id)?
+            .map(|physical| self.row(physical))
+            .transpose()
+    }
+
     /// Borrow one validated physical row.
     ///
     /// # Errors
@@ -6747,6 +6767,27 @@ mod tests {
             .find_index_by_doc_hash(fnv1a_hash(b"doc-alpha"))
             .expect("find alpha");
         assert_eq!(index.doc_id_at(alpha).expect("alpha id"), "doc-alpha");
+        let exact_alpha = index
+            .find_live_row_by_doc_id("doc-alpha")
+            .expect("resolve full identifier")
+            .expect("alpha is live");
+        assert_eq!(exact_alpha.physical_index(), alpha);
+        assert_eq!(exact_alpha.doc_id(), "doc-alpha");
+        assert!(exact_alpha.flags().is_live());
+        assert!(std::ptr::eq(
+            exact_alpha.vector_bytes().as_ptr(),
+            index
+                .row(alpha)
+                .expect("same physical row")
+                .vector_bytes()
+                .as_ptr(),
+        ));
+        for missing in ["doc-alph", "doc-alpha-extra", "DOC-ALPHA", "", "absent"] {
+            assert!(
+                index.find_live_row_by_doc_id(missing).unwrap().is_none(),
+                "full identifiers must match exactly: {missing:?}",
+            );
+        }
         let vector = index.vector_at_f32(alpha).expect("alpha vector");
         assert!((vector[0] - 1.0).abs() < 0.002);
 
@@ -7329,6 +7370,23 @@ mod tests {
             .collect();
         assert!(states.contains(&("best-but-dead".to_owned(), FsviRecordFlags::TOMBSTONE)));
         assert!(states.contains(&("live-result".to_owned(), FsviRecordFlags::LIVE)));
+        assert!(
+            owner
+                .find_live_row_by_doc_id("best-but-dead")
+                .unwrap()
+                .is_none()
+        );
+        assert!(owner.find_live_row_by_doc_id("missing").unwrap().is_none());
+        let live = owner
+            .find_live_row_by_doc_id("live-result")
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.doc_id(), "live-result");
+        assert!(live.flags().is_live());
+        assert_eq!(
+            owner.doc_id_at(live.physical_index()).unwrap(),
+            "live-result"
+        );
 
         let hits = owner
             .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
