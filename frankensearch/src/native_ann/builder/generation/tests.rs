@@ -983,12 +983,13 @@ fn unpublished_candidate_previews_execute_every_tier_and_retain_original_images(
             if tier == EmbedderTierTag::Quality {
                 assert!(scoped[0].fast_score.is_none());
                 assert!(scoped[0].quality_score.is_some());
+                let quality_only = scope
+                    .search_quality_text(&cx, primary.as_ref(), "vertical", 10)
+                    .await
+                    .unwrap();
                 assert_eq!(
-                    scoped,
-                    scope
-                        .search_quality_text(&cx, primary.as_ref(), "vertical", 10)
-                        .await
-                        .unwrap()
+                    serde_json::to_value(&scoped).unwrap(),
+                    serde_json::to_value(&quality_only).unwrap()
                 );
             }
             if full {
@@ -1039,14 +1040,14 @@ fn candidate_preview_scopes_widen_before_fusion_and_never_accept_noop_validation
             let mut source: Vec<_> = (0..24)
                 .map(|index| {
                     IndexableDocument::new(format!("private-{index:02}"), "vertical")
-                        .with_metadata("visible", false)
+                        .with_metadata("visible", "false")
                 })
                 .collect();
             for id in ["public-a", "public-b"] {
                 source.push(
                     IndexableDocument::new(id, "vertical with enough padding to rank later")
                         .with_title("retained public source")
-                        .with_metadata("visible", true),
+                        .with_metadata("visible", "true"),
                 );
             }
             let built = NativeIndexBuilder::new(
@@ -1087,11 +1088,7 @@ fn candidate_preview_scopes_widen_before_fusion_and_never_accept_noop_validation
             let scope = preview
                 .scope(&cx, BUDGET, |document| {
                     predicates.fetch_add(1, Ordering::SeqCst);
-                    Ok(document
-                        .metadata
-                        .get("visible")
-                        .and_then(serde_json::Value::as_bool)
-                        == Some(true))
+                    Ok(document.metadata.get("visible").map(String::as_str) == Some("true"))
                 })
                 .unwrap();
             let hits = scope
@@ -1102,7 +1099,7 @@ fn candidate_preview_scopes_widen_before_fusion_and_never_accept_noop_validation
             assert!(hits.iter().all(|hit| hit.doc_id.starts_with("public-")));
             assert!(
                 hits.iter()
-                    .all(|hit| hit.metadata.as_ref().unwrap()["visible"] == true)
+                    .all(|hit| hit.metadata.as_ref().unwrap()["visible"] == "true")
             );
             assert_eq!(predicates.load(Ordering::SeqCst), 26);
             let before = provider.queries.load(Ordering::SeqCst);

@@ -4,11 +4,12 @@
 //! its narrower capability to actual admitted old images, local providers and
 //! one complete candidate, then uses the original authority pair exactly once.
 
+use frankensearch_core::RetrievalTopology;
 use frankensearch_core::recovery_plan::{
     BoundImmutableReindexPlan, ImmutableReindexAuthorization, ImmutableReindexBinding,
     ImmutableReindexSource, ImmutableReindexTierBinding, InteractionPolicy, NetworkPolicy,
-    RecoveryPolicy, RecoveryRequest, RequestMode, RetrievalTopology, SemanticReadiness,
-    TrustedRecoveryContext, VerifiedSemanticProvenance, plan,
+    RecoveryPolicy, RecoveryRequest, RequestMode, SemanticReadiness, TrustedRecoveryContext,
+    VerifiedSemanticProvenance, plan,
 };
 use sha2::Digest as _;
 

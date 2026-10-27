@@ -27,7 +27,9 @@ use super::{NativeBuiltExactGeneration, NativeBuiltHybridIndex};
 #[cfg(feature = "quill")]
 use crate::native_ann::NativeGenerationSnapshot;
 #[cfg(feature = "quill")]
-use frankensearch_core::generation::{CommitRange, EmbedderTierTag};
+use frankensearch_core::generation::{
+    CommitRange, EmbedderTierTag, FrozenEmbeddingIdentityBundleV1,
+};
 #[cfg(feature = "quill")]
 use frankensearch_index::generation_root::generation_reader::OpenedGenerationSnapshotV1;
 
@@ -40,10 +42,13 @@ use frankensearch_index::generation_root::generation_reader::OpenedGenerationSna
 /// just as in [`NativeIndexBuilder`]. A rename is a delete plus an upsert and
 /// deliberately re-embeds the new ID rather than assuming cross-ID equivalence.
 ///
-/// Producers and tier presence cannot change through this API. Precision and
-/// graph policies are inherited but may be explicitly overridden. A precision
-/// change re-embeds that entire tier: decoded F16 values are not original F32
-/// model outputs. Reuse does not skip producer admission, even for empty builds.
+/// Ordinary updates retain their producers and tier presence. An explicitly
+/// authorized authority model migration may replace producers independently;
+/// only tiers with an identical complete identity can reuse retained vectors.
+/// Precision and graph policies are inherited but may be explicitly overridden.
+/// A precision change re-embeds that entire tier: decoded F16 values are not
+/// original F32 model outputs. Reuse does not skip producer admission, even for
+/// empty builds.
 ///
 /// This stages a successor, not a CURRENT switch or a durable rollback floor.
 /// The predecessor remains searchable throughout a failed, cancelled or dropped
@@ -59,6 +64,13 @@ use frankensearch_index::generation_root::generation_reader::OpenedGenerationSna
 pub struct NativeIndexUpdate {
     builder: NativeIndexBuilder,
     edits: BTreeMap<String, Option<IndexableDocument>>,
+}
+
+#[cfg(feature = "quill")]
+#[derive(Clone, Copy)]
+enum AuthorityUpdateIntent {
+    RetainProducers,
+    MigrateModels,
 }
 
 impl NativeBuiltIndex {
@@ -213,6 +225,57 @@ impl NativeIndexUpdate {
         index: Arc<NativeAnnIndex>,
         quality: Option<(Arc<dyn crate::Embedder>, Arc<NativeAnnIndex>)>,
     ) -> SearchResult<Self> {
+        Self::from_authority_with_intent(
+            cx,
+            directory,
+            generation,
+            provider,
+            snapshot,
+            max_source_bytes,
+            index,
+            quality,
+            AuthorityUpdateIntent::RetainProducers,
+        )
+    }
+
+    #[cfg(feature = "quill")]
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn from_authority_model_migration(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        provider: Arc<dyn crate::Embedder>,
+        snapshot: &NativeGenerationSnapshot,
+        max_source_bytes: usize,
+        index: Arc<NativeAnnIndex>,
+        quality: Option<(Arc<dyn crate::Embedder>, Arc<NativeAnnIndex>)>,
+    ) -> SearchResult<Self> {
+        Self::from_authority_with_intent(
+            cx,
+            directory,
+            generation,
+            provider,
+            snapshot,
+            max_source_bytes,
+            index,
+            quality,
+            AuthorityUpdateIntent::MigrateModels,
+        )
+    }
+
+    #[cfg(feature = "quill")]
+    #[allow(clippy::too_many_arguments)]
+    fn from_authority_with_intent(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        provider: Arc<dyn crate::Embedder>,
+        snapshot: &NativeGenerationSnapshot,
+        max_source_bytes: usize,
+        index: Arc<NativeAnnIndex>,
+        quality: Option<(Arc<dyn crate::Embedder>, Arc<NativeAnnIndex>)>,
+        intent: AuthorityUpdateIntent,
+    ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.update.authority")?;
         // An explicitly reopened predecessor carries the newer selection's
         // physical slot pair. That pair cannot authorize incremental edits to
@@ -237,6 +300,15 @@ impl NativeIndexUpdate {
                 "an update requires a strictly higher generation sequence",
             ));
         }
+        if quality.is_some()
+            != (snapshot.topology() == crate::native_ann::NativeGenerationTopology::FullProgressive)
+        {
+            return Err(invalid(
+                "update.inventory",
+                "topology",
+                "retained update providers must match the complete selected topology",
+            ));
+        }
         let precision = match index.owner_witness().quantization {
             frankensearch_index::Quantization::F32 => NativeBuildPrecision::F32,
             frankensearch_index::Quantization::F16 => NativeBuildPrecision::F16,
@@ -253,15 +325,13 @@ impl NativeIndexUpdate {
         // The plan retains the actual provider output identity. Normalize only
         // its persistence encoding, exactly as the original writer did, before
         // comparing the COMPLETE authenticated identity, including storage.
-        let binding = builder.fast.binding(&predecessor)?;
-        if snapshot.metadata().embedders.get(key) != Some(binding.frozen_identity()) {
-            return Err(invalid(
-                "update.producer",
-                "changed",
-                "incremental reuse requires the original complete producer and storage identity",
-            ));
-        }
-        index.admit_identity(&builder.fast.identity)?;
+        let fast_fingerprint = authority_reuse_fingerprint(
+            &builder.fast,
+            snapshot.metadata().embedders.get(key),
+            predecessor,
+            &index,
+            intent,
+        )?;
         let quality = if let Some((provider, index)) = quality {
             if index.owner_witness().generation != predecessor {
                 return Err(invalid(
@@ -293,37 +363,20 @@ impl NativeIndexUpdate {
                     "an independently supplied quality provider is required",
                 )
             })?;
-            let binding = plan.binding(&predecessor)?;
-            if snapshot.metadata().embedders.get("quality") != Some(binding.frozen_identity()) {
-                return Err(invalid(
-                    "update.producer",
-                    "changed",
-                    "incremental reuse requires the original complete quality producer and storage identity",
-                ));
-            }
-            index.admit_identity(&plan.identity)?;
-            Some((index, plan.identity.fingerprint(), precision))
+            let fingerprint = authority_reuse_fingerprint(
+                plan,
+                snapshot.metadata().embedders.get("quality"),
+                predecessor,
+                &index,
+                intent,
+            )?;
+            Some((index, fingerprint, precision))
         } else {
             None
         };
-        if quality.is_some()
-            != (snapshot.topology() == crate::native_ann::NativeGenerationTopology::FullProgressive)
-        {
-            return Err(invalid(
-                "update.inventory",
-                "topology",
-                "retained update providers must match the complete selected topology",
-            ));
-        }
         let mut documents = snapshot.source_documents(cx, max_source_bytes)?;
         documents.sort_by(|left, right| left.id.cmp(&right.id));
-        let fast = ReuseTier::from_owner(
-            cx,
-            index,
-            &documents,
-            builder.fast.identity.fingerprint(),
-            precision,
-        )?;
+        let fast = ReuseTier::from_owner(cx, index, &documents, fast_fingerprint, precision)?;
         let quality = quality
             .map(|(index, fingerprint, precision)| {
                 ReuseTier::from_owner(cx, index, &documents, fingerprint, precision)
@@ -773,6 +826,9 @@ impl ReuseSource {
                     )
                 })?,
             };
+            if tier.producer_fingerprint.is_none() {
+                return Ok(None);
+            }
             return tier.index.try_reuse_for_owner(cx, owner, params, seed);
         }
         Ok(None)
@@ -783,7 +839,9 @@ struct ReuseTier {
     index: Arc<NativeAnnIndex>,
     owner: Arc<ValidatedFsviBytes>,
     physical_rows: Vec<usize>,
-    producer_fingerprint: String,
+    // None explicitly forbids vector AND graph reuse for a migrated producer.
+    // Source equality or coincidentally equal output values cannot admit it.
+    producer_fingerprint: Option<String>,
     precision: NativeBuildPrecision,
 }
 
@@ -793,7 +851,7 @@ impl ReuseTier {
             cx,
             Arc::clone(&tier.index),
             documents,
-            tier.producer_identity.fingerprint(),
+            Some(tier.producer_identity.fingerprint()),
             tier.precision,
         )
     }
@@ -802,7 +860,7 @@ impl ReuseTier {
         cx: &Cx,
         index: Arc<NativeAnnIndex>,
         documents: &[IndexableDocument],
-        producer_fingerprint: String,
+        producer_fingerprint: Option<String>,
         precision: NativeBuildPrecision,
     ) -> SearchResult<Self> {
         let owner = Arc::clone(&index.owner);
@@ -893,7 +951,11 @@ impl TierPlan {
                         )
                     })?,
                 };
-                if producer != tier.producer_fingerprint {
+                let Some(retained_producer) = &tier.producer_fingerprint else {
+                    changed.push(document.clone());
+                    continue;
+                };
+                if &producer != retained_producer {
                     return Err(invalid(
                         "update.producer",
                         "changed",
@@ -919,6 +981,46 @@ impl TierPlan {
         checkpoint(cx, "native_ann.update.after_batch")?;
         self.admit(self.embedder.identity()?)
     }
+}
+
+#[cfg(feature = "quill")]
+fn authority_reuse_fingerprint(
+    plan: &TierPlan,
+    expected: Option<&FrozenEmbeddingIdentityBundleV1>,
+    generation: ArtifactGenerationIdentityV1,
+    index: &NativeAnnIndex,
+    intent: AuthorityUpdateIntent,
+) -> SearchResult<Option<String>> {
+    let expected = expected.ok_or_else(|| {
+        invalid(
+            "update.producer",
+            "missing",
+            "the selected generation must retain the complete tier identity",
+        )
+    })?;
+    let binding = plan.binding(&generation)?;
+    let actual = binding.frozen_identity();
+    if actual == expected {
+        index.admit_identity(&plan.identity)?;
+        return Ok(Some(plan.identity.fingerprint()));
+    }
+    if matches!(intent, AuthorityUpdateIntent::RetainProducers) {
+        return Err(invalid(
+            "update.producer",
+            "changed",
+            "incremental reuse requires the original complete producer and storage identity",
+        ));
+    }
+    if actual.identity.input != expected.identity.input {
+        return Err(invalid(
+            "update.input",
+            "changed",
+            "retained source cannot migrate its prepared-input contract; supply freshly prepared documents",
+        ));
+    }
+    // Keep the original owner as a pin and source join witness, never as a
+    // provider of vectors under this new model's identity.
+    Ok(None)
 }
 
 fn admit_retained_policy(reference: &TierPlan, tier: &NativeBuiltTier) -> SearchResult<()> {
@@ -1006,7 +1108,13 @@ mod tests {
 
     impl Provider {
         fn new(name: &str, dimension: u32) -> Arc<Self> {
-            let identity = EmbeddingIdentityBundleV1::explicit_test_model(name, dimension);
+            Self::from_identity(EmbeddingIdentityBundleV1::explicit_test_model(
+                name, dimension,
+            ))
+        }
+
+        fn from_identity(identity: EmbeddingIdentityBundleV1) -> Arc<Self> {
+            identity.validate().unwrap();
             let mut foreign = identity.clone();
             "different-producer".clone_into(&mut foreign.producer.backend);
             Arc::new(Self {
@@ -2013,6 +2121,369 @@ mod tests {
             assert!(!path.join("lexical").exists());
             assert_eq!(old.lexical().doc_count().unwrap(), 5);
         });
+    }
+
+    #[cfg(feature = "quill")]
+    mod model_migrations {
+        use super::*;
+        use frankensearch_core::generation::{
+            GenerationAuthorityActionV1, GenerationComponentRole, QuantizationFormat,
+        };
+
+        const IMAGE_BUDGET: usize = 8 * 1024 * 1024;
+
+        fn replacement(provider: &Provider) -> Arc<Provider> {
+            let mut identity = provider.identity.clone();
+            identity
+                .producer
+                .implementation_revision
+                .push_str("-migrated");
+            Provider::from_identity(identity)
+        }
+
+        // Exercise the production identity admission and retained-owner reuse
+        // against real FSVI images without requiring a qualified filesystem.
+        // Selected-authority/source pinning is covered by the lifecycle tests.
+        fn migration(
+            cx: &Cx,
+            path: &Path,
+            old: &NativeBuiltIndex,
+            fast: &Arc<Provider>,
+            quality: &Arc<Provider>,
+        ) -> SearchResult<NativeIndexUpdate> {
+            let old_quality = old.quality().unwrap();
+            let mut builder = NativeIndexBuilder::new(path, generation(2), fast.clone())?
+                .with_fast_storage(old.fast.precision, retained_plan(&old.fast)?.retrieval)
+                .with_quality_embedder(quality.clone())?
+                .with_quality_storage(
+                    old_quality.precision,
+                    retained_plan(old_quality)?.retrieval,
+                )?;
+            let reuse_tier = |plan: &TierPlan, retained: &NativeBuiltTier| {
+                let fingerprint = authority_reuse_fingerprint(
+                    plan,
+                    Some(retained.binding().frozen_identity()),
+                    retained.binding().generation(),
+                    retained.index(),
+                    AuthorityUpdateIntent::MigrateModels,
+                )?;
+                ReuseTier::from_owner(
+                    cx,
+                    Arc::clone(&retained.index),
+                    old.documents(),
+                    fingerprint,
+                    retained.precision,
+                )
+            };
+            builder.reuse = Some(Arc::new(ReuseSource {
+                partitions: vec![ReusePartition {
+                    documents: Arc::clone(&old.documents),
+                    fast: reuse_tier(&builder.fast, &old.fast)?,
+                    quality: Some(reuse_tier(builder.quality.as_ref().unwrap(), old_quality)?),
+                }],
+                authority: None,
+            }));
+            Ok(NativeIndexUpdate {
+                builder,
+                edits: BTreeMap::new(),
+            })
+        }
+
+        #[test]
+        fn model_migration_reuses_only_the_identical_tier_and_matches_complete_cold_components() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for precision in [NativeBuildPrecision::F16, NativeBuildPrecision::F32] {
+                    for ann in [false, true] {
+                        for change_fast in [false, true] {
+                            let dir = tempfile::tempdir().unwrap();
+                            let fast = Provider::new("migration-fast", 2);
+                            let quality = Provider::new("migration-quality", 3);
+                            let quality_precision = if precision == NativeBuildPrecision::F16 {
+                                NativeBuildPrecision::F32
+                            } else {
+                                NativeBuildPrecision::F16
+                            };
+                            let old = Box::pin(
+                                builder(&dir.path().join("old"), &fast, &quality)
+                                    .with_fast_storage(precision, graph(ann))
+                                    .with_quality_storage(quality_precision, graph(!ann))
+                                    .unwrap()
+                                    .build(&cx),
+                            )
+                            .await
+                            .unwrap();
+                            let old_fast = std::fs::read(old.fast.vector_path()).unwrap();
+                            let old_quality =
+                                std::fs::read(old.quality().unwrap().vector_path()).unwrap();
+                            let new_fast = if change_fast {
+                                replacement(&fast)
+                            } else {
+                                fast.clone()
+                            };
+                            let new_quality = if change_fast {
+                                quality.clone()
+                            } else {
+                                replacement(&quality)
+                            };
+                            let revised = IndexableDocument::new("a", "fractional")
+                                .with_title("retained metadata updated");
+                            let next = migration(
+                                &cx,
+                                &dir.path().join("next"),
+                                &old,
+                                &new_fast,
+                                &new_quality,
+                            )
+                            .unwrap()
+                            .upsert_document(revised.clone())
+                            .with_batch_size(2)
+                            .unwrap()
+                            .build_progressive_generation(
+                                &cx,
+                                CommitRange { low: 1, high: 5 },
+                                IMAGE_BUDGET,
+                            )
+                            .await
+                            .unwrap();
+                            // Replacement models deliberately have the SAME ID,
+                            // dimension and output values. Revision alone must
+                            // force inference for the complete migrated tier.
+                            assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                            assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                            assert_eq!(new_fast.submitted.load(Ordering::SeqCst), 5);
+                            assert_eq!(new_quality.submitted.load(Ordering::SeqCst), 5);
+                            assert_eq!(next.retrieval_configuration(), graph(ann));
+                            assert_eq!(next.quality_retrieval_configuration(), Some(graph(!ann)));
+                            assert_eq!(next.metadata().total_documents, 5);
+                            assert_eq!(
+                                next.binding().frozen_identity()
+                                    == old.fast.binding().frozen_identity(),
+                                !change_fast
+                            );
+                            assert_eq!(
+                                next.quality_binding().unwrap().frozen_identity()
+                                    == old.quality().unwrap().binding().frozen_identity(),
+                                change_fast
+                            );
+                            let candidate = next
+                                .candidate(
+                                    [0x38; 16],
+                                    None,
+                                    GenerationAuthorityActionV1::Activate,
+                                    [0x39; 32],
+                                )
+                                .unwrap();
+                            let preview = next.preview_candidate(&cx, &candidate).unwrap();
+                            let hits = preview
+                                .search_refined_text(
+                                    &cx,
+                                    new_fast.as_ref(),
+                                    new_quality.as_ref(),
+                                    "vertical",
+                                    3,
+                                )
+                                .await
+                                .unwrap();
+                            assert!(hits.iter().any(|hit| hit.doc_id == "b"));
+                            let cold = NativeIndexBuilder::new(
+                                dir.path().join("cold"),
+                                generation(2),
+                                new_fast,
+                            )
+                            .unwrap()
+                            .with_quality_embedder(new_quality)
+                            .unwrap()
+                            .with_fast_storage(precision, graph(ann))
+                            .with_quality_storage(quality_precision, graph(!ann))
+                            .unwrap()
+                            .add_documents(documents().into_iter().map(|document| {
+                                if document.id == "a" {
+                                    revised.clone()
+                                } else {
+                                    document
+                                }
+                            }))
+                            .build_progressive_generation(
+                                &cx,
+                                CommitRange { low: 1, high: 5 },
+                                IMAGE_BUDGET,
+                            )
+                            .await
+                            .unwrap();
+                            for role in [
+                                GenerationComponentRole::Vector,
+                                GenerationComponentRole::Ann,
+                            ] {
+                                assert_eq!(next.component_bytes(role), cold.component_bytes(role));
+                            }
+                            assert_eq!(std::fs::read(old.fast.vector_path()).unwrap(), old_fast);
+                            assert_eq!(
+                                std::fs::read(old.quality().unwrap().vector_path()).unwrap(),
+                                old_quality
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        #[test]
+        fn model_migration_normalizes_storage_but_changed_source_still_requires_inference() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("migration-fast", 2);
+                let quality = Provider::new("migration-quality", 3);
+                let old = Box::pin(
+                    builder(&dir.path().join("old"), &fast, &quality)
+                        .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                        .with_quality_storage(NativeBuildPrecision::F32, graph(false))
+                        .unwrap()
+                        .build(&cx),
+                )
+                .await
+                .unwrap();
+                let mut identity = fast.identity.clone();
+                identity.storage.quantization = QuantizationFormat::F16;
+                identity.storage.format = "another-provider-output-label".to_owned();
+                let equivalent = Provider::from_identity(identity);
+                let unchanged =
+                    migration(&cx, &dir.path().join("same"), &old, &equivalent, &quality)
+                        .unwrap()
+                        .build(&cx)
+                        .await
+                        .unwrap();
+                assert_eq!(equivalent.submitted.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(
+                    unchanged.fast.binding().frozen_identity(),
+                    old.fast.binding().frozen_identity()
+                );
+                let changed = migration(
+                    &cx,
+                    &dir.path().join("changed"),
+                    &old,
+                    &equivalent,
+                    &quality,
+                )
+                .unwrap()
+                .upsert_document(IndexableDocument::new("a", "vertical"))
+                .build(&cx)
+                .await
+                .unwrap();
+                assert_eq!(equivalent.submitted.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 6);
+                assert_eq!(changed.document("a").unwrap().content, "vertical");
+                assert_eq!(old.document("a").unwrap().content, "fractional");
+            });
+        }
+
+        #[test]
+        fn model_migration_refuses_input_contract_changes_and_preserves_strict_normal_updates() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let dir = tempfile::tempdir().unwrap();
+                let fast = Provider::new("migration-fast", 2);
+                let quality = Provider::new("migration-quality", 3);
+                let old = Box::pin(builder(&dir.path().join("old"), &fast, &quality).build(&cx))
+                    .await
+                    .unwrap();
+                for change_fast in [false, true] {
+                    let original = if change_fast { &fast } else { &quality };
+                    let mut identity = original.identity.clone();
+                    identity.input.canonicalization.push_str("-new-preparation");
+                    identity.space.input_contract_fingerprint = identity.input.fingerprint();
+                    identity.producer.space_fingerprint = identity.space.fingerprint();
+                    let changed = Provider::from_identity(identity);
+                    let path = dir.path().join(format!("input-{change_fast}"));
+                    let result = migration(
+                        &cx,
+                        &path,
+                        &old,
+                        if change_fast { &changed } else { &fast },
+                        if change_fast { &quality } else { &changed },
+                    );
+                    assert!(
+                        matches!(result, Err(SearchError::InvalidConfig { field, .. }) if field == "native_ann.update.input")
+                    );
+                    assert!(!path.exists());
+                    assert_eq!(changed.submitted.load(Ordering::SeqCst), 0);
+                }
+                let changed = replacement(&fast);
+                let plan = TierPlan::new(changed.clone()).unwrap();
+                assert!(
+                    authority_reuse_fingerprint(
+                        &plan,
+                        Some(old.fast.binding().frozen_identity()),
+                        generation(1),
+                        old.fast.index(),
+                        AuthorityUpdateIntent::RetainProducers,
+                    )
+                    .is_err()
+                );
+                assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                assert_eq!(changed.submitted.load(Ordering::SeqCst), 0);
+            });
+        }
+
+        #[test]
+        fn model_migration_failure_cancellation_and_provider_drift_keep_the_predecessor_intact() {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                for fault in [FAIL, FOREIGN, CANCEL, IDENTITY_DRIFT] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let fast = Provider::new("migration-fast", 2);
+                    let quality = Provider::new("migration-quality", 3);
+                    let old = Box::pin(
+                        builder(&dir.path().join("old"), &fast, &quality)
+                            .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                            .build(&cx),
+                    )
+                    .await
+                    .unwrap();
+                    let old_fast = std::fs::read(old.fast.vector_path()).unwrap();
+                    let old_quality = std::fs::read(old.quality().unwrap().vector_path()).unwrap();
+                    let changed = replacement(&quality);
+                    let path = dir.path().join("failed");
+                    let prepared = migration(&cx, &path, &old, &fast, &changed).unwrap();
+                    changed.fault.store(fault, Ordering::SeqCst);
+                    let result = prepared
+                        .build_progressive_generation(
+                            &cx,
+                            CommitRange { low: 1, high: 5 },
+                            IMAGE_BUDGET,
+                        )
+                        .await;
+                    assert!(result.is_err());
+                    if fault == CANCEL {
+                        assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+                        cx.set_cancel_requested(false);
+                    }
+                    if fault == IDENTITY_DRIFT {
+                        assert!(!path.exists());
+                        assert_eq!(changed.submitted.load(Ordering::SeqCst), 0);
+                    }
+                    assert_eq!(fast.submitted.load(Ordering::SeqCst), 5);
+                    assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
+                    assert_eq!(std::fs::read(old.fast.vector_path()).unwrap(), old_fast);
+                    assert_eq!(
+                        std::fs::read(old.quality().unwrap().vector_path()).unwrap(),
+                        old_quality
+                    );
+                    assert_eq!(
+                        old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                        "b"
+                    );
+                    assert_eq!(
+                        old.quality()
+                            .unwrap()
+                            .search(&cx, "vertical", 1)
+                            .await
+                            .unwrap()[0]
+                            .doc_id,
+                        "b"
+                    );
+                }
+            });
+        }
     }
 
     mod sharded_updates {

@@ -1773,11 +1773,16 @@ fn rebuild_identity(
             "the rebuild provider dimension disagrees with its complete identity",
         ));
     }
-    // Match the builder's explicit F32 persistence encoding. Only storage
-    // encoding changes here; the space, producer, and input contracts remain
-    // exactly those independently supplied by the loaded provider.
+    // Retained migrations preserve each tier's persisted precision, including
+    // generations written through the library with F16. Fresh input rebuilds
+    // use the CLI's F32 encoding. The provider's raw storage label does not
+    // determine whether its mathematical/producer/input identity can be reused.
     "fsvi-v2".clone_into(&mut identity.storage.format);
-    identity.storage.quantization = QuantizationFormat::F32;
+    identity.storage.quantization = if retained_source && migrate_model {
+        expected.identity.storage.quantization
+    } else {
+        QuantizationFormat::F32
+    };
     "little-endian".clone_into(&mut identity.storage.endianness);
     let frozen = identity.freeze()?;
     if !migrate_model && &frozen != expected {
@@ -1791,6 +1796,16 @@ fn rebuild_identity(
         ));
     }
     Ok(frozen)
+}
+
+fn rebuild_precision(identity: &FrozenEmbeddingIdentityBundleV1) -> Result<NativeBuildPrecision> {
+    match identity.identity.storage.quantization {
+        QuantizationFormat::F32 => Ok(NativeBuildPrecision::F32),
+        QuantizationFormat::F16 => Ok(NativeBuildPrecision::F16),
+        _ => Err(bad(
+            "the rebuild requires an F32 or F16 persistence encoding",
+        )),
+    }
 }
 
 async fn rebuild(
@@ -1903,29 +1918,72 @@ where
             return Err(serve_refused("reindex_query_identity_change_required"));
         }
     }
-    let mut builder = NativeIndexBuilder::new(
-        &work_path,
-        new_generation(sequence)?,
-        Arc::clone(&loaded.fast),
-    )?
-    .with_batch_size(options.batch_size)?
-    .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-    .with_fast_storage(NativeBuildPrecision::F32, retrieval)
-    .add_documents(documents);
-    if let Some(quality) = &loaded.quality {
-        builder = builder
-            .with_quality_embedder(Arc::clone(quality))?
-            .with_quality_storage(
-                NativeBuildPrecision::F32,
+    let generation = new_generation(sequence)?;
+    let built = if options.retained_source && options.migrate_model {
+        // Source preflight above applies CLI record/ID bounds before loading
+        // models. The update exports from the same retained reader and keeps
+        // the original authority pair pinned through completion/publication.
+        drop(documents);
+        let mut migration = snapshot
+            .begin_model_migration(
+                cx,
+                &work_path,
+                generation,
+                Arc::clone(&loaded.fast),
+                loaded.quality.clone(),
+                options.max_source_bytes,
+            )?
+            .with_batch_size(options.batch_size)?
+            .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
+            .with_fast_storage(rebuild_precision(&expected_identity)?, retrieval);
+        if let Some(identity) = &expected_quality {
+            migration = migration.with_quality_storage(
+                rebuild_precision(identity)?,
                 quality_retrieval
                     .ok_or_else(|| bad("the full generation has no quality retrieval policy"))?,
             )?;
-    }
-    let built = if expected_quality.is_some() {
-        Box::pin(builder.build_progressive_generation(cx, source, options.max_image_bytes)).await?
-    } else {
-        Box::pin(builder.build_exact_generation(cx, selected.tier, source, options.max_image_bytes))
+        }
+        if expected_quality.is_some() {
+            Box::pin(migration.build_progressive_generation(cx, source, options.max_image_bytes))
+                .await?
+        } else {
+            Box::pin(migration.build_exact_generation(
+                cx,
+                selected.tier,
+                source,
+                options.max_image_bytes,
+            ))
             .await?
+        }
+    } else {
+        let mut builder =
+            NativeIndexBuilder::new(&work_path, generation, Arc::clone(&loaded.fast))?
+                .with_batch_size(options.batch_size)?
+                .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
+                .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+                .add_documents(documents);
+        if let Some(quality) = &loaded.quality {
+            builder = builder
+                .with_quality_embedder(Arc::clone(quality))?
+                .with_quality_storage(
+                    NativeBuildPrecision::F32,
+                    quality_retrieval.ok_or_else(|| {
+                        bad("the full generation has no quality retrieval policy")
+                    })?,
+                )?;
+        }
+        if expected_quality.is_some() {
+            Box::pin(builder.build_progressive_generation(cx, source, options.max_image_bytes))
+                .await?
+        } else {
+            Box::pin(builder.build_exact_generation(
+                cx,
+                selected.tier,
+                source,
+                options.max_image_bytes,
+            ))
+            .await?
+        }
     };
     if built.binding().frozen_identity() != &expected_identity
         || built

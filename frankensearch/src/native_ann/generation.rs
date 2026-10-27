@@ -612,6 +612,59 @@ impl NativeGenerationSnapshot {
         )
     }
 
+    /// Explicitly migrate the selected generation's models using retained source.
+    ///
+    /// Each supplied provider is compared with its own complete authenticated
+    /// identity after normalizing the inherited storage encoding. An unchanged
+    /// tier reuses its exact persisted vectors and compatible native graph;
+    /// a changed tier embeds every surviving document under its new identity.
+    /// Equal model names, dimensions or output values never authorize reuse.
+    /// The primary provider corresponds to [`Self::tier`], including a
+    /// quality-only generation. A full progressive generation requires both
+    /// providers, and a singleton generation forbids an additional quality tier.
+    ///
+    /// Retained documents already carry prepared embedding input, so neither
+    /// provider may change its input contract. Precision and graph policies
+    /// are inherited independently; explicit overrides on the returned update
+    /// retain the ordinary precision-change re-embedding rules. The selected
+    /// authority and all owners stay pinned through complete successor building.
+    /// Finish with [`NativeIndexUpdate::build_exact_generation`] or
+    /// [`NativeIndexUpdate::build_progressive_generation`] and publish using
+    /// this snapshot's expected authority pair. Preparation creates no files,
+    /// starts no inference, and applies [`Self::source_documents`]' source budget.
+    ///
+    /// # Errors
+    /// Refuses topology changes, changed prepared-input contracts, non-newer
+    /// generations, cancelled work, invalid or drifting providers, inconsistent
+    /// source membership, source-budget exhaustion or a reopened predecessor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_model_migration(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        primary_provider: Arc<dyn Embedder>,
+        quality_provider: Option<Arc<dyn Embedder>>,
+        max_source_bytes: usize,
+    ) -> SearchResult<NativeIndexUpdate> {
+        checkpoint(cx, "native_ann.generation.model_migration")?;
+        let quality = match (&self.readers.quality, quality_provider) {
+            (Some(quality), Some(provider)) => Some((provider, Arc::clone(quality))),
+            (None, None) => None,
+            _ => return Err(refused("model_migration", "topology-change")),
+        };
+        NativeIndexUpdate::from_authority_model_migration(
+            cx,
+            directory,
+            generation,
+            primary_provider,
+            self,
+            max_source_bytes,
+            Arc::clone(&self.readers.vector),
+            quality,
+        )
+    }
+
     /// Propose this retained generation as a rollback of `current`.
     ///
     /// Both handles must have been independently admitted from the same logical

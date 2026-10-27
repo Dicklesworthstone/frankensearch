@@ -223,6 +223,16 @@ impl ReindexFixture {
         options
     }
 
+    fn migration_options(&self) -> Options {
+        let mut arguments = retained_rebuild_arguments();
+        arguments.push("--migrate-model");
+        let mut options = parse(&arguments).unwrap().unwrap();
+        options.from_receipt = Some(self.parent.join("before.json"));
+        options.receipt = self.parent.join("after.json");
+        options.work = Some(self.parent.join("migration-work"));
+        options
+    }
+
     fn replacements(&self) -> (Arc<ReindexProvider>, Option<Arc<ReindexProvider>>, Models) {
         let primary = reindex_provider("replacement-primary");
         let quality = self
@@ -245,6 +255,228 @@ impl ReindexFixture {
         )
         .await
     }
+}
+
+#[test]
+fn retained_model_migration_reembeds_only_the_changed_tier_before_bound_replay() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for change_primary in [false, true] {
+            for ann in [false, true] {
+                let fixture =
+                    ReindexFixture::new(&cx, NativeGenerationTopology::FullProgressive, ann).await;
+                // Both providers share their ID, dimension and output vectors.
+                // Only complete producer identity can decide inference reuse.
+                let primary = reindex_provider(if change_primary {
+                    "replacement-primary"
+                } else {
+                    "original-primary"
+                });
+                let quality = reindex_provider(if change_primary {
+                    "original-quality"
+                } else {
+                    "replacement-quality"
+                });
+                let mut loaded = Some(reindex_models(&primary, Some(&quality)));
+                let options = fixture.options();
+                let mut output = Vec::new();
+                Box::pin(rebuild_with_loader(&cx, &options, &mut output, |mode| {
+                    assert_eq!(mode, QueryMode::Full);
+                    Ok(loaded.take().expect("migration models load only once"))
+                }))
+                .await
+                .unwrap();
+                assert_eq!(primary.queries.load(Ordering::SeqCst), 2);
+                assert_eq!(quality.queries.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    primary.inner.calls.load(Ordering::SeqCst),
+                    if change_primary { 5 } else { 2 },
+                    "only a changed primary embeds the three retained documents"
+                );
+                assert_eq!(
+                    quality.inner.calls.load(Ordering::SeqCst),
+                    if change_primary { 2 } else { 5 },
+                    "only a changed quality model embeds the three retained documents"
+                );
+                let after = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(after.identity == fixture.selected.identity, !change_primary);
+                assert_eq!(
+                    after.quality_identity == fixture.selected.quality_identity,
+                    change_primary
+                );
+                let active = after
+                    .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
+                    .unwrap();
+                assert_eq!(active.topology(), NativeGenerationTopology::FullProgressive);
+                assert_eq!(
+                    active.retrieval_configuration(),
+                    fixture.previous.retrieval_configuration()
+                );
+                assert_eq!(
+                    active.quality_retrieval_configuration(),
+                    fixture.previous.quality_retrieval_configuration()
+                );
+                assert_eq!(
+                    active.metadata().commit_range,
+                    fixture.previous.metadata().commit_range
+                );
+                assert_eq!(
+                    serde_json::to_value(active.source_documents(&cx, MAX_INPUT_BYTES).unwrap())
+                        .unwrap(),
+                    serde_json::to_value(
+                        fixture
+                            .previous
+                            .source_documents(&cx, MAX_INPUT_BYTES)
+                            .unwrap()
+                    )
+                    .unwrap()
+                );
+                let responses = frames(&output);
+                assert_eq!(responses.len(), 1);
+                assert_eq!(responses[0]["publication"], "committed");
+                assert_eq!(responses[0]["replay"], "complete");
+                assert_eq!(responses[0]["scope"]["eligible_documents"], 2);
+                assert!(!options.rollback_receipt.as_ref().unwrap().exists());
+                assert_eq!(fixture.primary.inner.calls.load(Ordering::SeqCst), 3);
+                assert_eq!(
+                    fixture
+                        .quality
+                        .as_ref()
+                        .unwrap()
+                        .inner
+                        .calls
+                        .load(Ordering::SeqCst),
+                    3
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn retained_model_migration_with_unchanged_models_publishes_without_inference() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for topology in [
+            NativeGenerationTopology::FastOnly,
+            NativeGenerationTopology::QualityOnly,
+            NativeGenerationTopology::FullProgressive,
+        ] {
+            for ann in [false, true] {
+                let fixture = ReindexFixture::new(&cx, topology, ann).await;
+                let primary = reindex_provider("original-primary");
+                let quality = fixture
+                    .quality
+                    .as_ref()
+                    .map(|_| reindex_provider("original-quality"));
+                let mut loaded = Some(reindex_models(&primary, quality.as_ref()));
+                let options = fixture.migration_options();
+                let mut output = Vec::new();
+                Box::pin(rebuild_with_loader(&cx, &options, &mut output, |mode| {
+                    assert_eq!(mode, fixture.selected.query_mode(None).unwrap());
+                    Ok(loaded.take().expect("migration models load only once"))
+                }))
+                .await
+                .unwrap();
+                assert_eq!(primary.inner.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(primary.queries.load(Ordering::SeqCst), 0);
+                if let Some(quality) = &quality {
+                    assert_eq!(quality.inner.calls.load(Ordering::SeqCst), 0);
+                    assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+                }
+                let after = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(after.identity, fixture.selected.identity);
+                assert_eq!(after.quality_identity, fixture.selected.quality_identity);
+                assert_eq!(
+                    after.generation.sequence,
+                    fixture.selected.generation.sequence + 1
+                );
+                let active = after
+                    .open_on_root(&cx, &fixture.root, DEFAULT_IMAGE_BYTES)
+                    .unwrap();
+                assert_eq!(active.topology(), topology);
+                assert_eq!(
+                    active.retrieval_configuration(),
+                    fixture.previous.retrieval_configuration()
+                );
+                assert_eq!(
+                    active.quality_retrieval_configuration(),
+                    fixture.previous.quality_retrieval_configuration()
+                );
+                assert_eq!(
+                    active.source_documents(&cx, MAX_INPUT_BYTES).unwrap().len(),
+                    3
+                );
+                let responses = frames(&output);
+                assert_eq!(responses.len(), 1);
+                assert_eq!(responses[0]["event"], "rebuilt");
+                assert_eq!(responses[0]["publication"], "committed");
+                assert_eq!(responses[0]["model_migrated"], false);
+            }
+        }
+    });
+}
+
+#[test]
+fn retained_model_migration_refuses_unauthorized_topology_and_input_changes_before_inference() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture =
+            ReindexFixture::new(&cx, NativeGenerationTopology::FullProgressive, true).await;
+        let before = fs::read(fixture.selected.root.join("AUTHORITY")).unwrap();
+        for refusal in [
+            "authorization",
+            "topology",
+            "primary-input",
+            "quality-input",
+        ] {
+            let mut primary = reindex_provider("original-primary");
+            let mut quality = reindex_provider("replacement-quality");
+            let mut options = fixture.migration_options();
+            options.work = Some(fixture.parent.join(format!("refused-{refusal}-work")));
+            options.receipt = fixture.parent.join(format!("refused-{refusal}.json"));
+            let reason = match refusal {
+                "authorization" => {
+                    options.migrate_model = false;
+                    "requires --migrate-model"
+                }
+                "topology" => "providers do not match the selected topology",
+                _ => {
+                    let provider = if refusal == "primary-input" {
+                        &mut primary
+                    } else {
+                        &mut quality
+                    };
+                    let identity = &mut Arc::get_mut(provider).unwrap().inner.identity;
+                    identity
+                        .input
+                        .canonicalization
+                        .push_str("-different-preparation");
+                    identity.space.input_contract_fingerprint = identity.input.fingerprint();
+                    identity.producer.space_fingerprint = identity.space.fingerprint();
+                    identity.validate().unwrap();
+                    "retained source cannot migrate its prepared-input contract"
+                }
+            };
+            let mut loaded = Some(reindex_models(
+                &primary,
+                (refusal != "topology").then_some(&quality),
+            ));
+            let mut output = Vec::new();
+            let error = Box::pin(rebuild_with_loader(&cx, &options, &mut output, |_| {
+                Ok(loaded.take().expect("migration models load only once"))
+            }))
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(reason), "{refusal}: {error}");
+            assert_eq!(primary.inner.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.inner.calls.load(Ordering::SeqCst), 0);
+            assert!(output.is_empty());
+            assert!(!options.work.as_ref().unwrap().exists());
+            assert!(!options.receipt.exists());
+            assert_eq!(
+                fs::read(fixture.selected.root.join("AUTHORITY")).unwrap(),
+                before
+            );
+        }
+    });
 }
 
 #[test]

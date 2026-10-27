@@ -225,16 +225,19 @@ Every loaded provider must match its selected complete identity before embedding
 begins. Full generations check both producers before either tier embeds source
 documents. To intentionally rebuild with another producer in either tier, add
 `--migrate-model` and select its local model using the usual model options. This
-re-embeds the whole cohort and records the new producer; it does not relabel or
-reuse the old vectors. The topology stays fixed, including direct quality-only
-inference. Both producer identities must remain stable throughout the build.
+records the new producer and re-embeds every document in each changed tier.
+Replacement JSONL rebuilds both tiers from that input. A migration using retained
+source can reuse an unchanged tier as described below. The topology stays fixed,
+including direct quality-only inference. Both producer identities must remain
+stable throughout the build; a changed tier never adopts its predecessor's vectors.
 
 To rebuild the selected generation's existing documents, supply
 `--retained-source`. This reads the complete stored cohort from its already
 admitted vector and Quill images, preserves the exact source checkpoint, and
-re-embeds every live document. Original JSONL files and build work directories
-are unnecessary. For example, this rebuild retains the documents while changing
-retrieval to HNSW:
+builds a complete successor. Ordinary retained-source rebuilds re-embed every
+live document; explicitly authorized model migrations can reuse unchanged tiers.
+Original JSONL files and build work directories are unnecessary. For example,
+this rebuild retains the documents while changing retrieval to HNSW:
 
 ```sh
 ./target/release/frankensearch-native authority-rebuild \
@@ -246,7 +249,25 @@ retrieval to HNSW:
 ```
 
 Combine `--retained-source` with `--migrate-model` and the new model's local
-options for a full-cohort model migration without resupplying the corpus.
+options for a model migration without resupplying the corpus. Each tier is
+evaluated independently against its authenticated predecessor identity, including
+the producer, vector space, prepared-input contract, and persisted storage.
+Changing only the quality model reuses the exact retained fast vectors while
+re-embedding every quality document; changing only the fast model does the
+reverse. If both identities match, neither tier performs document inference.
+An eligible unchanged native graph can retain its topology; changed vectors or
+graph construction parameters require a new graph. Every successor still has
+complete vector, lexical, metadata, and configured ANN images with fresh
+generation receipts. This avoids redundant inference without weakening complete
+generation admission or claiming that migration cost is independent of corpus size.
+
+Library callers use `NativeGenerationSnapshot::begin_model_migration` to prepare
+the same explicit operation, then finish through `NativeIndexUpdate`'s ordinary
+generation builders and expected-authority publication. Ordinary `begin_update`
+continues to reject changed producers. The predecessor remains pinned and
+searchable throughout; failed inference, cancellation, or a competing publisher
+does not replace it with a partial migration.
+
 Retained documents are already prepared input. This route may change producers
 and vector spaces, but must preserve each tier's complete input-preparation
 contract. To change canonicalization or document encoding, supply a complete
