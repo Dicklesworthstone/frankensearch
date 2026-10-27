@@ -16,11 +16,10 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
-use asupersync::Cx;
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::{
-    BoundQueryEmbedding, RetrievalTopology, SearchCoverageV1, SearchError, SearchResult,
+    BoundQueryEmbedding, Cx, RetrievalTopology, SearchCoverageV1, SearchError, SearchResult,
     SpaceIdentityAdmission, TierQueryCoverageV1, TieredQueryEmbeddings, TwoTierConfig, VectorHit,
 };
 use tracing::{debug, info, warn};
