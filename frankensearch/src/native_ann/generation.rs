@@ -15,6 +15,7 @@ use frankensearch_core::generation::{
     GenerationRootSecurityProfileV1, InvariantKind, SourceCheckpointV1, resolve_authority_slots_v1,
     validate_manifest,
 };
+use frankensearch_index::ann_cohort::NativeAnnCohortV1;
 use frankensearch_index::exact_component_adapters::{
     ann_component_receipt, vector_component_receipt,
 };
@@ -47,9 +48,10 @@ use crate::{
 mod tests;
 
 // The selected metadata image authenticates the full owner-bound native receipt.
-// The separately selected ANN component remains the raw graph image, so its
-// byte receipt has exactly the existing ann_component_receipt semantics.
+// Single-tier ANN components retain their raw graph image. Complete two-tier
+// generations pack the independently receipted graphs into one ANN component.
 pub(super) const NATIVE_ANN_RECEIPT_KEY: &str = "native_hnsw_receipt_v2";
+pub(super) const NATIVE_QUALITY_ANN_RECEIPT_KEY: &str = "native_quality_hnsw_receipt_v2";
 
 /// Independently admitted vector owners stored in a complete authority generation.
 /// This describes stored shape, not semantic readiness or a request's chosen mode.
@@ -76,8 +78,9 @@ pub enum NativeGenerationTopology {
 /// A declared ANN requires its raw graph image and full native receipt in the
 /// selected metadata; a missing or invalid accelerator is never replaced by
 /// exact search. Complete fast-plus-quality generations use two independently
-/// admitted exact owners in one packed Vector component. Partial/sharded and
-/// two-tier ANN descriptors remain unsupported. Metadata
+/// admitted owners in one packed Vector component. Each tier independently uses
+/// exact retrieval or an owner-bound graph in the packed ANN component.
+/// Partial/sharded descriptors remain unsupported. Metadata
 /// paths are descriptive names, never paths to open. Vector artifact
 /// counts describe physical rows, including tombstones; the common document set
 /// and metadata total count describe live documents. The existing metadata
@@ -103,6 +106,7 @@ pub(super) struct CompositeReaders {
     metadata: GenerationManifest,
     tier: EmbedderTierTag,
     retrieval: NativeBuildRetrieval,
+    quality_retrieval: Option<NativeBuildRetrieval>,
     components: ExactGenerationComponentsV1,
 }
 
@@ -161,7 +165,7 @@ impl NativeGenerationSnapshot {
         Ok(Self { authority, readers })
     }
 
-    /// Admit both independently selected exact tiers and their common Quill cohort.
+    /// Admit both independently selected tiers and their common Quill cohort.
     ///
     /// Both bindings come from the caller's trusted selection. Their complete
     /// document coverage, source checkpoint and artifact generation must agree;
@@ -201,6 +205,7 @@ impl NativeGenerationSnapshot {
                 component(GenerationComponentRole::Lexical)?,
                 component(GenerationComponentRole::Metadata)?,
             ],
+            authority.closure().bytes(GenerationComponentRole::Ann),
             max_image_bytes,
         )?;
         checkpoint(cx, "native_ann.generation.admitted")?;
@@ -232,7 +237,7 @@ impl NativeGenerationSnapshot {
         self.readers.topology()
     }
 
-    /// The actual retrieval mode of this handle.
+    /// The actual primary-tier retrieval mode of this handle.
     #[must_use]
     pub const fn retrieval_mode(&self) -> NativeRetrievalMode {
         match self.readers.retrieval {
@@ -243,11 +248,18 @@ impl NativeGenerationSnapshot {
         }
     }
 
-    /// The authenticated construction/search policy retained by this generation.
+    /// The authenticated primary-tier construction/search policy.
     /// Rebuilds can preserve its graph parameters and seed without reading paths.
     #[must_use]
     pub const fn retrieval_configuration(&self) -> NativeBuildRetrieval {
         self.readers.retrieval
+    }
+
+    /// Independent quality-tier policy in a complete fast/quality generation.
+    /// A single-tier generation returns `None`, including quality-only topology.
+    #[must_use]
+    pub const fn quality_retrieval_configuration(&self) -> Option<NativeBuildRetrieval> {
+        self.readers.quality_retrieval
     }
 
     /// The validated metadata image belonging to this exact authority.
@@ -1194,6 +1206,7 @@ pub(super) fn admit_progressive_components(
     schema: SchemaDescriptor,
     config: QuillConfig,
     images: [Arc<[u8]>; 3],
+    ann_image: Option<Arc<[u8]>>,
     max_image_bytes: usize,
 ) -> SearchResult<CompositeReaders> {
     admit_components_impl(
@@ -1204,7 +1217,7 @@ pub(super) fn admit_progressive_components(
         schema,
         config,
         images,
-        None,
+        ann_image,
         max_image_bytes,
     )
 }
@@ -1225,9 +1238,6 @@ fn admit_components_impl(
     let declared = activation.components();
     if declared.ann.is_some() != ann_image.is_some() {
         return Err(refused("ann", "component-presence-mismatch"));
-    }
-    if expected_quality.is_some() && declared.ann.is_some() {
-        return Err(refused("ann", "progressive-ann-unsupported"));
     }
     if activation.generation() != expected_vector.generation()
         || expected_quality.is_some_and(|quality| quality.generation() != activation.generation())
@@ -1277,14 +1287,23 @@ fn admit_components_impl(
     if !validate_manifest(&metadata).is_valid() {
         return Err(refused("metadata", "invalid-manifest"));
     }
-    let native_receipt = match (declared.ann, metadata.metadata.get(NATIVE_ANN_RECEIPT_KEY)) {
-        (Some(_), Some(encoded)) => Some(
-            serde_json::from_str::<NativeHnswGenerationReceiptV2>(encoded)
-                .map_err(|_| refused("ann", "invalid-native-receipt"))?,
-        ),
-        (None, None) => None,
-        _ => return Err(refused("ann", "native-receipt-presence-mismatch")),
+    let decode_receipt = |key: &str| {
+        metadata
+            .metadata
+            .get(key)
+            .map(|encoded| {
+                serde_json::from_str::<NativeHnswGenerationReceiptV2>(encoded)
+                    .map_err(|_| refused("ann", "invalid-native-receipt"))
+            })
+            .transpose()
     };
+    let native_receipt = decode_receipt(NATIVE_ANN_RECEIPT_KEY)?;
+    let quality_native_receipt = decode_receipt(NATIVE_QUALITY_ANN_RECEIPT_KEY)?;
+    if (expected_quality.is_none() && quality_native_receipt.is_some())
+        || declared.ann.is_some() != (native_receipt.is_some() || quality_native_receipt.is_some())
+    {
+        return Err(refused("ann", "native-receipt-presence-mismatch"));
+    }
     let checkpoint_value = SourceCheckpointV1::derive(&metadata.commit_range);
     if checkpoint_value.to_bytes() != activation.source_checkpoint_sha256() {
         return Err(refused("checkpoint", "source-mismatch"));
@@ -1334,17 +1353,35 @@ fn admit_components_impl(
     {
         return Err(refused("vector", "selected-document-set-mismatch"));
     }
-    let ann_receipt = native_receipt
+    let ann_cohort = cohort
         .as_ref()
-        .map(|receipt| {
-            ann_component_receipt(
-                receipt,
-                identifiers.iter().map(String::as_str),
-                checkpoint_value,
+        .zip(ann_image.as_ref())
+        .map(|(cohort, bytes)| {
+            NativeAnnCohortV1::admit(
+                cx,
+                Arc::clone(bytes),
+                cohort,
+                native_receipt.as_ref(),
+                quality_native_receipt.as_ref(),
+                max_image_bytes,
             )
-            .map_err(|_| refused("ann", "invalid-document-set"))
         })
         .transpose()?;
+    let ann_receipt = if let Some(cohort) = &ann_cohort {
+        Some(cohort.receipt().clone())
+    } else {
+        native_receipt
+            .as_ref()
+            .map(|receipt| {
+                ann_component_receipt(
+                    receipt,
+                    identifiers.iter().map(String::as_str),
+                    checkpoint_value,
+                )
+                .map_err(|_| refused("ann", "invalid-document-set"))
+            })
+            .transpose()?
+    };
     if ann_receipt.as_ref().map(|receipt| receipt.bytes) != declared.ann {
         return Err(refused("ann", "selected-receipt-mismatch"));
     }
@@ -1394,11 +1431,56 @@ fn admit_components_impl(
     )
     .map_err(|_| refused("components", "incoherent-generation"))?;
     checkpoint(cx, "native_ann.generation.readers")?;
-    let (vector, retrieval) = match (ann_image, native_receipt) {
-        (Some(bytes), Some(receipt)) => {
-            let graph = ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), bytes, &receipt)
-                .map_err(|_| refused("ann", "native-admission-failed"))?;
-            checkpoint(cx, "native_ann.generation.ann_admitted")?;
+    let (fast_graph, quality_graph) = if let Some(cohort) = ann_cohort {
+        cohort.into_graphs()
+    } else {
+        let graph = match (ann_image, native_receipt.as_ref()) {
+            (Some(bytes), Some(receipt)) => Some(
+                ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), bytes, receipt)
+                    .map_err(|_| refused("ann", "native-admission-failed"))?,
+            ),
+            (None, None) => None,
+            _ => return Err(refused("ann", "native-receipt-presence-mismatch")),
+        };
+        (graph, None)
+    };
+    let (vector, retrieval) = retained_tier(cx, owner, fast_graph, native_receipt.as_ref())?;
+    let (quality, quality_retrieval) = if let Some(cohort) = cohort {
+        let (index, policy) = retained_tier(
+            cx,
+            Arc::clone(cohort.quality()),
+            quality_graph,
+            quality_native_receipt.as_ref(),
+        )?;
+        (Some(Arc::new(index)), Some(policy))
+    } else {
+        (None, None)
+    };
+    let lexical_result = QuillSnapshotIndex::new(cx, lexical, config);
+    checkpoint(cx, "native_ann.generation.ready")?;
+    let lexical = lexical_result.map_err(|_| refused("lexical", "invalid-search-configuration"))?;
+    let tier = metadata.vector_artifacts[0].embedder_tier;
+    Ok(CompositeReaders {
+        vector: Arc::new(vector),
+        quality,
+        lexical,
+        metadata,
+        tier,
+        retrieval,
+        quality_retrieval,
+        components,
+    })
+}
+
+fn retained_tier(
+    cx: &Cx,
+    owner: Arc<ValidatedFsviBytes>,
+    graph: Option<ValidatedNativeHnsw>,
+    receipt: Option<&NativeHnswGenerationReceiptV2>,
+) -> SearchResult<(NativeAnnIndex, NativeBuildRetrieval)> {
+    checkpoint(cx, "native_ann.generation.ann_admitted")?;
+    match (graph, receipt) {
+        (Some(graph), Some(receipt)) => {
             let dimension =
                 |value| usize::try_from(value).map_err(|_| refused("ann", "invalid-parameters"));
             let params = HnswParams {
@@ -1407,42 +1489,24 @@ fn admit_components_impl(
                 ef_construction: dimension(receipt.params.ef_construction)?,
                 ef_search: dimension(receipt.params.ef_search)?,
             };
-            let vector = NativeAnnIndex {
-                owner,
-                graph: NativeBackend::Ann(Box::new(graph)),
-                default_ef_search: params.ef_search,
-            };
-            (
-                vector,
+            Ok((
+                NativeAnnIndex {
+                    owner,
+                    graph: NativeBackend::Ann(Box::new(graph)),
+                    default_ef_search: params.ef_search,
+                },
                 NativeBuildRetrieval::Hnsw {
                     params,
                     seed: receipt.seed,
                 },
-            )
+            ))
         }
-        (None, None) => (
+        (None, None) => Ok((
             NativeAnnIndex::exact(cx, owner)?,
             NativeBuildRetrieval::Exact,
-        ),
-        _ => return Err(refused("ann", "native-receipt-presence-mismatch")),
-    };
-    let lexical_result = QuillSnapshotIndex::new(cx, lexical, config);
-    checkpoint(cx, "native_ann.generation.ready")?;
-    let lexical = lexical_result.map_err(|_| refused("lexical", "invalid-search-configuration"))?;
-    let tier = metadata.vector_artifacts[0].embedder_tier;
-    let quality = cohort
-        .as_ref()
-        .map(|cohort| NativeAnnIndex::exact(cx, Arc::clone(cohort.quality())).map(Arc::new))
-        .transpose()?;
-    Ok(CompositeReaders {
-        vector: Arc::new(vector),
-        quality,
-        lexical,
-        metadata,
-        tier,
-        retrieval,
-        components,
-    })
+        )),
+        _ => Err(refused("ann", "native-receipt-presence-mismatch")),
+    }
 }
 
 fn validate_artifact_metadata(

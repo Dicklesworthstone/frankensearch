@@ -84,7 +84,7 @@ pub enum NativeBuildPrecision {
 }
 
 /// Explicit construction policy, independent of semantic versus control models.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum NativeBuildRetrieval {
     /// Do not allocate or persist a graph.
     #[default]

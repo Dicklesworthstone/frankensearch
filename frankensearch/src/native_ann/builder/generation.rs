@@ -17,6 +17,7 @@ use frankensearch_core::generation::{
 use frankensearch_fusion::generation_publication::{
     GenerationCandidateV1, GenerationPublicationErrorV1,
 };
+use frankensearch_index::ann_cohort::{ANN_COHORT_HEADER_BYTES_V1, NativeAnnCohortV1};
 use frankensearch_index::exact_component_adapters::{
     ann_component_receipt, vector_component_receipt,
 };
@@ -26,7 +27,7 @@ use frankensearch_index::vector_cohort::{ExactVectorCohortV1, VECTOR_COHORT_HEAD
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
 
-use super::super::generation::NATIVE_ANN_RECEIPT_KEY;
+use super::super::generation::{NATIVE_ANN_RECEIPT_KEY, NATIVE_QUALITY_ANN_RECEIPT_KEY};
 use super::super::{NativeRetrievalMode, checkpoint, invalid, lower_hex};
 use super::scope::PreparedNativeGenerationScope;
 use super::{NativeBuildRetrieval, NativeBuiltTier, NativeIndexBuilder, hybrid};
@@ -49,6 +50,7 @@ pub struct NativeBuiltExactGeneration {
     lexical: Arc<[u8]>,
     metadata_bytes: Arc<[u8]>,
     retrieval: NativeBuildRetrieval,
+    quality_retrieval: Option<NativeBuildRetrieval>,
     max_image_bytes: usize,
 }
 
@@ -99,17 +101,19 @@ impl NativeIndexBuilder {
 
     /// Build independently identified fast and quality tiers over one complete cohort.
     ///
-    /// Both providers must be explicitly supplied, and both retrieval plans must
-    /// be exact. Their dimensions may differ. Each FSVI image retains its own
+    /// Both providers must be explicitly supplied. Each retrieval plan may select
+    /// exact search or native HNSW independently. Their dimensions may differ.
+    /// Each FSVI image retains its own
     /// identity and receipt inside one canonical authority Vector component;
     /// Quill and metadata cover the same complete source checkpoint. Partial
-    /// coverage, shards and a two-tier ANN component are not inferred.
+    /// coverage and shards are not inferred. Configured graphs are independently
+    /// bound to their own FSVI owners and packed into one authority ANN component.
     ///
     /// The encoded-image budget and caller-owned execution policy are the same
     /// as [`Self::build_exact_generation`]. No authority is published here.
     ///
     /// # Errors
-    /// Refuses missing quality or a non-exact plan before inference or work-file
+    /// Refuses missing quality before inference or work-file
     /// creation, and propagates complete component, source, budget and cancellation errors.
     pub async fn build_progressive_generation(
         self,
@@ -118,16 +122,11 @@ impl NativeIndexBuilder {
         max_image_bytes: usize,
     ) -> SearchResult<NativeBuiltExactGeneration> {
         checkpoint(cx, "native_ann.builder.progressive_generation_start")?;
-        if !matches!(self.fast.retrieval, NativeBuildRetrieval::Exact)
-            || !self
-                .quality
-                .as_ref()
-                .is_some_and(|quality| matches!(quality.retrieval, NativeBuildRetrieval::Exact))
-        {
+        if self.quality.is_none() {
             return Err(invalid(
                 "builder.generation.plan",
                 "unsupported",
-                "complete progressive authority generations require independently supplied fast and quality exact tiers",
+                "complete progressive authority generations require independently supplied fast and quality providers",
             ));
         }
         Box::pin(self.build_composite_generation(
@@ -163,6 +162,7 @@ impl NativeIndexBuilder {
             remaining_budget(max_image_bytes, GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V2)?;
         let started = timestamp_millis()?;
         let retrieval = self.fast.retrieval;
+        let quality_retrieval = self.quality.as_ref().map(|quality| quality.retrieval);
         let vectors = Box::pin(self.build(cx)).await?;
         let (vector, owner) = capture_vector(cx, vectors.fast(), component_budget)?;
         let source_checkpoint = SourceCheckpointV1::derive(&source);
@@ -184,7 +184,27 @@ impl NativeIndexBuilder {
         };
         let vector = cohort.as_ref().map_or(vector, ExactVectorCohortV1::bytes);
         let after_vector = remaining_budget(component_budget, vector.len())?;
-        let native_ann = capture_ann(cx, vectors.fast(), Arc::clone(&owner), after_vector)?;
+        let has_graph = matches!(retrieval, NativeBuildRetrieval::Hnsw { .. })
+            || quality_retrieval
+                .is_some_and(|policy| matches!(policy, NativeBuildRetrieval::Hnsw { .. }));
+        let graph_budget = if cohort.is_some() && has_graph {
+            remaining_budget(after_vector, ANN_COHORT_HEADER_BYTES_V1)?
+        } else {
+            after_vector
+        };
+        let native_ann = capture_ann(cx, vectors.fast(), Arc::clone(&owner), graph_budget)?;
+        let quality_ann = match (vectors.quality(), cohort.as_ref()) {
+            (Some(quality), Some(cohort)) => capture_ann(
+                cx,
+                quality,
+                Arc::clone(cohort.quality()),
+                remaining_budget(
+                    graph_budget,
+                    native_ann.as_ref().map_or(0, |(bytes, _)| bytes.len()),
+                )?,
+            )?,
+            _ => None,
+        };
         let mut ordered = Vec::with_capacity(owner.live_count());
         for physical in 0..owner.record_count() {
             checkpoint(cx, "native_ann.builder.generation_document")?;
@@ -209,21 +229,42 @@ impl NativeIndexBuilder {
             ordered.iter().map(|document| document.id.as_str()),
         )
         .map_err(|error| invalid("builder.generation.docset", "invalid", &error.to_string()))?;
-        let ann_receipt = native_ann
-            .as_ref()
-            .map(|(_, receipt)| {
-                ann_component_receipt(
-                    receipt,
-                    ordered.iter().map(|document| document.id.as_str()),
-                    source_checkpoint,
-                )
-                .map_err(|error| invalid("builder.generation.ann", "receipt", &error.to_string()))
-            })
-            .transpose()?;
-        let lexical_budget = remaining_budget(
-            after_vector,
-            native_ann.as_ref().map_or(0, |(bytes, _)| bytes.len()),
-        )?;
+        let (ann, ann_receipt) = if let Some(cohort) = &cohort
+            && has_graph
+        {
+            let packed = NativeAnnCohortV1::build(
+                cx,
+                cohort,
+                native_ann
+                    .as_ref()
+                    .map(|(bytes, receipt)| (receipt, Arc::clone(bytes))),
+                quality_ann
+                    .as_ref()
+                    .map(|(bytes, receipt)| (receipt, Arc::clone(bytes))),
+                after_vector,
+            )?;
+            (Some(packed.bytes()), Some(packed.receipt().clone()))
+        } else {
+            let receipt = native_ann
+                .as_ref()
+                .map(|(_, receipt)| {
+                    ann_component_receipt(
+                        receipt,
+                        ordered.iter().map(|document| document.id.as_str()),
+                        source_checkpoint,
+                    )
+                    .map_err(|error| {
+                        invalid("builder.generation.ann", "receipt", &error.to_string())
+                    })
+                })
+                .transpose()?;
+            (
+                native_ann.as_ref().map(|(bytes, _)| Arc::clone(bytes)),
+                receipt,
+            )
+        };
+        let lexical_budget =
+            remaining_budget(after_vector, ann.as_ref().map_or(0, |bytes| bytes.len()))?;
         let (writer, reader, _seal) =
             hybrid::create_lexical(cx, &vectors.directory().join("lexical"), ordered).await?;
         hybrid::cohort::validate(cx, &reader, vectors.documents())?;
@@ -279,6 +320,18 @@ impl NativeIndexBuilder {
                         .clone_into(&mut invariant.description);
                 }
             }
+            if let Some((_, receipt)) = &quality_ann {
+                let encoded = serde_json::to_string(receipt).map_err(|error| {
+                    invalid(
+                        "builder.generation.ann",
+                        "serialization",
+                        &error.to_string(),
+                    )
+                })?;
+                metadata
+                    .metadata
+                    .insert(NATIVE_QUALITY_ANN_RECEIPT_KEY.to_owned(), encoded);
+            }
             metadata.manifest_hash = compute_manifest_hash(&metadata)?;
             require_valid(&validate_manifest(&metadata))?;
         }
@@ -316,10 +369,11 @@ impl NativeIndexBuilder {
             metadata,
             components,
             vector,
-            ann: native_ann.map(|(bytes, _)| bytes),
+            ann,
             lexical,
             metadata_bytes,
             retrieval,
+            quality_retrieval,
             max_image_bytes,
         })
     }
@@ -345,7 +399,7 @@ impl NativeBuiltExactGeneration {
         &self.metadata
     }
 
-    /// Actual retrieval mode whose complete component images are retained.
+    /// Actual primary-tier retrieval mode whose complete component images are retained.
     #[must_use]
     pub const fn retrieval_mode(&self) -> NativeRetrievalMode {
         match self.retrieval {
@@ -356,10 +410,17 @@ impl NativeBuiltExactGeneration {
         }
     }
 
-    /// Construction/search parameters preserved in the authenticated generation.
+    /// Primary-tier construction/search parameters in the authenticated generation.
     #[must_use]
     pub const fn retrieval_configuration(&self) -> NativeBuildRetrieval {
         self.retrieval
+    }
+
+    /// Independent quality-tier policy in a complete fast/quality generation.
+    /// A single-tier generation returns `None`, including quality-only topology.
+    #[must_use]
+    pub const fn quality_retrieval_configuration(&self) -> Option<NativeBuildRetrieval> {
+        self.quality_retrieval
     }
 
     /// Share immutable component bytes without reopening the build directory.
@@ -474,6 +535,7 @@ impl NativeBuiltExactGeneration {
                     Arc::clone(&self.lexical),
                     Arc::clone(&self.metadata_bytes),
                 ],
+                self.ann.as_ref().map(Arc::clone),
                 self.max_image_bytes,
             );
         }

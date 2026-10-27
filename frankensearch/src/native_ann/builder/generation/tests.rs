@@ -142,29 +142,20 @@ fn progressive_generation_retains_independent_tiers_and_one_complete_source_coho
 }
 
 #[test]
-fn progressive_generation_requires_two_exact_plans_before_inference_or_io() {
+fn progressive_generation_requires_both_providers_before_inference_or_io() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
-        for plan in 0..3 {
+        for retrieval in [
+            NativeBuildRetrieval::Exact,
+            NativeBuildRetrieval::Hnsw {
+                params: HnswParams::default(),
+                seed: 5,
+            },
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let work = directory.path().join("absent");
             let fast = Arc::new(Provider::new("fast", 2, Reply::Pending));
-            let mut configured = builder(&work, &fast);
-            if plan != 0 {
-                configured = configured
-                    .with_quality_embedder(Arc::new(Provider::new("quality", 3, Reply::Pending)))
-                    .unwrap();
-                let ann = NativeBuildRetrieval::Hnsw {
-                    params: HnswParams::default(),
-                    seed: 5,
-                };
-                configured = if plan == 1 {
-                    configured.with_fast_storage(NativeBuildPrecision::F32, ann)
-                } else {
-                    configured
-                        .with_quality_storage(NativeBuildPrecision::F32, ann)
-                        .unwrap()
-                };
-            }
+            let configured =
+                builder(&work, &fast).with_fast_storage(NativeBuildPrecision::F32, retrieval);
             let mut future = Box::pin(configured.build_progressive_generation(&cx, SOURCE, BUDGET));
             assert!(matches!(
                 future
@@ -173,6 +164,109 @@ fn progressive_generation_requires_two_exact_plans_before_inference_or_io() {
                 Poll::Ready(Err(SearchError::InvalidConfig { .. }))
             ));
             assert!(!work.exists());
+        }
+    });
+}
+
+#[test]
+fn progressive_generation_packs_independent_graphs_and_preserves_mixed_policies() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for (fast_ann, quality_ann) in [(true, false), (false, true), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let work = directory.path().join("work");
+            let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+            let quality = Arc::new(Provider::new("quality", 3, Reply::Correct));
+            let policy = |ann, seed| {
+                if ann {
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams::default(),
+                        seed,
+                    }
+                } else {
+                    NativeBuildRetrieval::Exact
+                }
+            };
+            let mut built = builder(&work, &fast)
+                .with_quality_embedder(quality)
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F16, policy(fast_ann, 17))
+                .with_quality_storage(NativeBuildPrecision::F32, policy(quality_ann, 29))
+                .unwrap()
+                .build_progressive_generation(&cx, SOURCE, BUDGET)
+                .await
+                .unwrap();
+            let candidate = candidate(&built);
+            built.validate_candidate(&cx, &candidate).unwrap();
+            built
+                .prepare_scope(&cx, &candidate, BUDGET, |document| Ok(document.id == "b"))
+                .unwrap();
+            assert_eq!(
+                matches!(
+                    built.retrieval_configuration(),
+                    NativeBuildRetrieval::Hnsw { .. }
+                ),
+                fast_ann
+            );
+            assert_eq!(
+                matches!(
+                    built.quality_retrieval_configuration(),
+                    Some(NativeBuildRetrieval::Hnsw { .. })
+                ),
+                quality_ann
+            );
+            let decode = |key: &str| {
+                built.metadata().metadata.get(key).map(|encoded| {
+                    serde_json::from_str::<NativeHnswGenerationReceiptV2>(encoded).unwrap()
+                })
+            };
+            let fast_receipt = decode(NATIVE_ANN_RECEIPT_KEY);
+            let quality_receipt = decode(NATIVE_QUALITY_ANN_RECEIPT_KEY);
+            assert_eq!(fast_receipt.is_some(), fast_ann);
+            assert_eq!(quality_receipt.is_some(), quality_ann);
+            if let Some(receipt) = &fast_receipt {
+                assert_eq!(receipt.seed, 17);
+            }
+            if let Some(receipt) = &quality_receipt {
+                assert_eq!(receipt.seed, 29);
+            }
+            let vectors = ExactVectorCohortV1::admit(
+                &cx,
+                built
+                    .component_bytes(GenerationComponentRole::Vector)
+                    .unwrap(),
+                built.binding(),
+                built.quality_binding().unwrap(),
+                SourceCheckpointV1::derive(&SOURCE),
+                BUDGET,
+            )
+            .unwrap();
+            let ann = built.component_bytes(GenerationComponentRole::Ann).unwrap();
+            let graphs = NativeAnnCohortV1::admit(
+                &cx,
+                Arc::clone(&ann),
+                &vectors,
+                fast_receipt.as_ref(),
+                quality_receipt.as_ref(),
+                BUDGET,
+            )
+            .unwrap();
+            assert_eq!(graphs.fast().is_some(), fast_ann);
+            assert_eq!(graphs.quality().is_some(), quality_ann);
+            assert_eq!(
+                Some(graphs.receipt().bytes),
+                candidate.manifest().components().ann
+            );
+            let owned = usize::try_from(candidate.owned_image_bytes()).unwrap();
+            built.max_image_bytes = owned - 1;
+            assert!(built.validate_candidate(&cx, &candidate).is_err());
+            built.max_image_bytes = BUDGET;
+            let mut corrupt = ann.to_vec();
+            *corrupt.last_mut().unwrap() ^= 1;
+            built.ann = Some(corrupt.into());
+            assert!(built.validate_candidate(&cx, &candidate).is_err());
+            built.ann = Some(ann);
+            std::fs::rename(&work, directory.path().join("relocated")).unwrap();
+            built.validate_candidate(&cx, &candidate).unwrap();
         }
     });
 }

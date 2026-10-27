@@ -276,7 +276,16 @@ impl NativeIndexUpdate {
             };
             builder = builder
                 .with_quality_embedder(provider)?
-                .with_quality_storage(precision, snapshot.retrieval_configuration())?;
+                .with_quality_storage(
+                    precision,
+                    snapshot.quality_retrieval_configuration().ok_or_else(|| {
+                        invalid(
+                            "update.inventory",
+                            "quality-policy",
+                            "the complete generation must retain its independent quality retrieval policy",
+                        )
+                    })?,
+                )?;
             let plan = builder.quality.as_ref().ok_or_else(|| {
                 invalid(
                     "update.producer",
@@ -498,7 +507,7 @@ impl NativeIndexUpdate {
 
     /// Build a complete fast-and-quality successor using per-tier retained reuse.
     ///
-    /// Both original providers and both exact storage plans remain explicit.
+    /// Both original providers and independent storage/retrieval plans remain explicit.
     /// Changed content is embedded independently in each tier, while unchanged
     /// vectors are copied only from their matching admitted owner. The original
     /// authority pin survives until all new components pass joint admission.
@@ -506,7 +515,7 @@ impl NativeIndexUpdate {
     ///
     /// # Errors
     /// Refuses a topology change, backward source boundaries, empty output,
-    /// unsupported ANN plans, identity drift, budget exhaustion or cancellation.
+    /// invalid ANN plans, identity drift, budget exhaustion or cancellation.
     #[cfg(feature = "quill")]
     pub async fn build_progressive_generation(
         self,
