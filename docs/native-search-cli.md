@@ -112,7 +112,7 @@ Rebuilds and updates inherit the recorded profile. It declares that the caller
 owns the local root and that this command supplies no external anti-rollback
 service. This choice is persisted in the receipt. Search cannot change the
 receipt's security profile, generation, authority, producer identities, or topology.
-A changed current authority is a refusal, even when its components are otherwise
+A changed current authority is a refusal by default, even when its components are otherwise
 valid. Already opened readers retain their original component bytes.
 Semantic search and recovery derive the stored vector retrieval mode from the
 admitted generation, not a query-time override or a separately discovered graph path. Successful
@@ -493,6 +493,65 @@ reports what was validated; it does not claim that skipped current components
 were examined or healthy. The restored generation always passes complete
 admission before the command reports `serving: "activated"`.
 
+### Read the authenticated predecessor without rolling back
+
+`authority-search`, `authority-fetch`, and `authority-serve` accept
+`--current-receipt CURRENT_JSON` to select the immediate retained predecessor
+named by `--receipt`. This lets you inspect or serve the preceding generation
+while leaving the live authority unchanged:
+
+```sh
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --current-receipt "$HOME/frankensearch-authority/g2.json" \
+  --lexical-only --query 'retry network requests' --limit 10
+./target/release/frankensearch-native authority-fetch \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --current-receipt "$HOME/frankensearch-authority/g2.json" \
+  --doc-id 'src/client.rs' --max-bytes 8192
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --current-receipt "$HOME/frankensearch-authority/g2.json" \
+  --lexical-only --filter '{"metadata":{"project":"client"}}'
+```
+
+Both receipts must name the same physical root, root ID, and security profile.
+The current receipt must select the actual current authority, and both complete
+generations must pass admission on the same qualified root capability. The
+target must still be the current manifest's immediate predecessor in the other
+authenticated authority slot. An old receipt alone, a matching artifact count,
+or an arbitrary older ancestor cannot authorize access. Current and target may
+have different producers, dimensions, or tier topologies; each is checked against
+its own complete identity. After a rollback, authority lineage still determines
+the predecessor, even if artifact-generation numbers run in the opposite order.
+
+For semantic search or serving, supply the target generation's matching local
+models and quality options. The current generation's models are never loaded.
+Lexical queries and source fetch remain model-free. Empty targets, full
+progressive search, independently configured HNSW tiers, source windows, and
+fixed/request filters use the same retained readers as ordinary current search.
+
+`--max-image-bytes` bounds the **combined encoded images** of current and target
+at startup: each activation manifest plus its declared vector, lexical, metadata,
+and optional ANN components. Shared images count in both independently admitted
+closures. The default is 256 MiB; increase it explicitly when the pair requires
+more. Source limits remain separate. Corrupt or missing current components,
+stale current receipts, and changed control anchors refuse the read. A change to
+the captured authority pair during predecessor admission also refuses the read.
+This route does not use damaged-current recovery admission.
+
+Historical responses keep the target in `authority` and `generation`, and add
+`selection_kind: "retained_predecessor"` plus `selected_predecessor_of`, the
+authority byte array that authenticated the target at admission. In warm fetch
+requests, `expected_authority` must match the target. A later publication does
+not change that retained reader, its source scope, or its recorded provenance.
+Fresh processes must authenticate the target against the then-current pair again.
+
+Historical sessions are read-only: `--allow-activation`, `--allow-model-activation`,
+and `--allow-updates` are rejected, and the corresponding requests are independently
+refused from the retained snapshot's provenance. No new receipt or authority is
+published. To change the live selection, use the explicit rollback command.
+
 ### Keep an authority generation warm across requests
 
 `authority-serve` opens one selected generation and loads its local producers once,
@@ -817,9 +876,10 @@ loading an embedding model or starting a warm server:
   --max-source-bytes 1048576
 ```
 
-The receipt must still select the exact current authority. A newer publication
-refuses this fresh open; use the matching retained server if you need text from
-an earlier selection. The command reads the admitted vector and Quill images,
+The receipt selects the exact current authority by default. A newer publication
+refuses that fresh open. To read the immediate authenticated predecessor, add
+`--current-receipt` as described above; an already running retained server also
+keeps its original selection. The command reads the admitted vector and Quill images,
 never the original document path. It rejects model, quality-backend, and writer
 options and leaves authority controls and receipts untouched.
 

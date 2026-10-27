@@ -80,13 +80,16 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N] [--lexical-only]\n\
+      [--current-receipt CURRENT_JSON]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--mode fast|quality|full|lexical] [--stream] [--filter JSON]\n\
       [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-fetch --receipt JSON --doc-id ID [--offset-bytes N] [--max-bytes N]\n\
+      [--current-receipt CURRENT_JSON]\n\
       [--include-metadata] [--filter JSON] [--max-source-bytes N]\n\
       [--max-image-bytes N]\n\n\
   authority-serve --receipt JSON [--limit N] [--allow-activation] [--allow-updates]\n\
+      [--current-receipt CURRENT_JSON]\n\
       [--allow-model-activation]\n\
       [--lexical-only]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
@@ -151,6 +154,14 @@ Recovery reports commit knowledge separately from bounded reader admission.\n\
 Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
 by authority-index. Search refuses a head different from the receipt.\n\
+Search/fetch/serve may explicitly read the immediate authenticated predecessor\n\
+with --receipt PREDECESSOR_JSON --current-receipt CURRENT_JSON. Both complete\n\
+generations are admitted on the same root within the combined image budget.\n\
+The target may have different producers or topology; semantic reads load its\n\
+models. Historical sessions are read-only and exclude every activation/update\n\
+grant. Responses identify the retained target and its authenticating current\n\
+authority. No publication, arbitrary history discovery or damaged-current\n\
+fallback occurs. A warm historical reader stays on that target after publication.\n\
 The default encoded-image budget is 256 MiB, checked before component reads.\n\
 authority-serve retains one admitted generation and its local models for bounded\n\
 JSONL requests: {\"id\":\"q1\",\"query\":\"text\",\"limit\":10}. Requests may select\n\
@@ -195,7 +206,8 @@ The fixed server scope stays on its retained generation. Activation and updates\
 prepare its successor membership before changing selection or publication.\n\
 Unfiltered queries do not export source.\n\
 authority-fetch reads one selected document window without loading a model.\n\
-Its receipt must still select the exact current authority. Offsets default to\n\
+Its receipt selects the exact current authority unless --current-receipt selects\n\
+its authenticated predecessor explicitly. Offsets default to\n\
 zero, max-bytes to 8192 (allowed 4..65536), and metadata is opt-in. The source\n\
 budget covers that document's full stored fields before copying, not the corpus.\n\
 Read-only source requests use op=fetch, expected_authority, and documents with\n\
@@ -246,6 +258,7 @@ struct Options {
     root: Option<PathBuf>,
     work: Option<PathBuf>,
     receipt: PathBuf,
+    current_receipt: Option<PathBuf>,
     from_receipt: Option<PathBuf>,
     target_receipt: Option<PathBuf>,
     input: Option<PathBuf>,
@@ -311,6 +324,7 @@ impl Options {
             root: None,
             work: None,
             receipt: PathBuf::new(),
+            current_receipt: None,
             from_receipt: None,
             target_receipt: None,
             input: None,
@@ -352,6 +366,11 @@ impl Options {
             }
             match flag.as_str() {
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
+                "--current-receipt"
+                    if matches!(command, Command::Search | Command::Fetch | Command::Serve) =>
+                {
+                    options.current_receipt = Some(PathBuf::from(value(&mut args)?));
+                }
                 "--from-receipt"
                     if matches!(
                         command,
@@ -517,6 +536,13 @@ impl Options {
         }
         if options.receipt.as_os_str().is_empty() {
             return Err(bad("authority commands require --receipt"));
+        }
+        if options.current_receipt.is_some()
+            && (options.allow_activation || options.allow_model_activation || options.allow_updates)
+        {
+            return Err(bad(
+                "--current-receipt selects a read-only predecessor and excludes activation and update grants",
+            ));
         }
         if options.lexical_only && options.mode.is_some_and(|mode| mode != QueryMode::Lexical) {
             return Err(bad("--lexical-only conflicts with a semantic --mode"));
@@ -980,6 +1006,71 @@ impl Receipt {
             ));
         }
         Ok(snapshot)
+    }
+}
+
+/// Admit one explicit read selection through a single qualified physical root.
+/// A historical target is authorized by the complete current closure and the
+/// fixed authority pair, never by possession of an old receipt alone.
+fn open_read_selection(
+    cx: &Cx,
+    receipt: &Receipt,
+    current_receipt: Option<&Path>,
+    max_image_bytes: usize,
+) -> Result<(QualifiedGenerationRoot, Arc<NativeGenerationSnapshot>)> {
+    checkpoint(cx)?;
+    receipt.validate()?;
+    let current = current_receipt.map(Receipt::read).transpose()?;
+    if let Some(current) = &current {
+        if current.root != receipt.root
+            || current.root_id != receipt.root_id
+            || current.profile != receipt.profile
+        {
+            return Err(serve_refused("historical_root_mismatch"));
+        }
+        if current.authority()? == receipt.authority()? {
+            return Err(serve_refused("historical_target_is_current"));
+        }
+    }
+    let root = admit_root(&receipt.root)?;
+    let Some(current) = current else {
+        let snapshot = receipt.open_on_root(cx, &root, max_image_bytes)?;
+        return Ok((root, Arc::new(snapshot)));
+    };
+    // Current and target are simultaneously retained during admission. Charge
+    // actual authenticated image lengths, not the receipt's upper bound, and
+    // count shared images in each independently admitted closure.
+    let current = current.open_on_root(cx, &root, max_image_bytes)?;
+    let retained = current.retained_snapshot();
+    let current_bytes = retained.manifest().components().iter().try_fold(
+        u64::try_from(retained.manifest_bytes().len())?,
+        |total, (_, component)| total.checked_add(component.byte_len),
+    );
+    let remaining = current_bytes
+        .and_then(|used| u64::try_from(max_image_bytes).ok()?.checked_sub(used))
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| serve_refused("historical_image_budget_exceeded"))?;
+    let target_budget = remaining.min(receipt.image_bytes);
+    checkpoint(cx)?;
+    let opened = root.open_predecessor_generation_snapshot_with_budget(
+        retained,
+        receipt.authority()?,
+        target_budget,
+    )?;
+    checkpoint(cx)?;
+    let SnapshotOpenOutcomeV1::Opened(opened) = opened else {
+        return Err(serve_refused("historical_predecessor_unavailable"));
+    };
+    let snapshot = receipt.admit_opened(cx, opened, usize::try_from(target_budget)?)?;
+    checkpoint(cx)?;
+    Ok((root, Arc::new(snapshot)))
+}
+
+fn annotate_selection(response: &mut serde_json::Value, snapshot: &NativeGenerationSnapshot) {
+    if let Some(current) = snapshot.retained_snapshot().selected_predecessor_of() {
+        response["selection_kind"] = serde_json::json!("retained_predecessor");
+        response["selected_predecessor_of"] =
+            serde_json::json!(current.canonical_bytes().as_slice());
     }
 }
 
@@ -2345,7 +2436,12 @@ where
     options
         .quality
         .validate_usage(matches!(mode, QueryMode::Quality | QueryMode::Full))?;
-    let snapshot = Arc::new(receipt.open(cx, options.max_image_bytes)?);
+    let (_, snapshot) = open_read_selection(
+        cx,
+        &receipt,
+        options.current_receipt.as_deref(),
+        options.max_image_bytes,
+    )?;
     // Source bounds and filter admission precede model loading. The scope owns
     // the same admitted generation that supplies every vector and lexical hit.
     let scope = prepare_scope(
@@ -2392,6 +2488,7 @@ where
                 "profile": receipt.profile, "results": results,
             });
             annotate_snapshot_retrieval(&mut response, &snapshot, Some(mode));
+            annotate_selection(&mut response, &snapshot);
             annotate_scope(
                 &mut response,
                 scope.as_ref().map(NativeScopedGenerationSnapshot::len),
@@ -2412,7 +2509,12 @@ fn fetch(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     let receipt = Receipt::read(&options.receipt)?;
     // Fresh-process admission must select this exact receipt. Never follow a
     // newer authority, load a model, or interpret the document ID as a path.
-    let snapshot = receipt.open(cx, options.max_image_bytes)?;
+    let (_, snapshot) = open_read_selection(
+        cx,
+        &receipt,
+        options.current_receipt.as_deref(),
+        options.max_image_bytes,
+    )?;
     let document = snapshot.source_document(cx, window.doc_id(), options.max_source_bytes)?;
     let mut response = serde_json::json!({
         "schema": SCHEMA, "event": "terminal", "operation": "fetch",
@@ -2424,6 +2526,7 @@ fn fetch(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         "source": "retained_snapshot",
     });
     annotate_snapshot_retrieval(&mut response, &snapshot, None);
+    annotate_selection(&mut response, &snapshot);
     if options.filter.is_some() {
         response["scope"] = serde_json::json!({ "filtered": true });
     }
@@ -2726,7 +2829,7 @@ impl AuthoritySession {
             || limits.1 == 0
             || image_bytes.is_none_or(|bytes| bytes > budget || bytes > receipt.image_bytes)
             || retained.root_id() != receipt.root_id
-            || retained.selected_predecessor_of().is_some()
+            || (retained.selected_predecessor_of().is_some() && allow_activation)
             || retained.profile().as_str() != receipt.profile
             || snapshot.authority() != receipt.authority()?
             || snapshot.topology() != receipt.topology()
@@ -2760,6 +2863,7 @@ impl AuthoritySession {
     }
 
     fn with_updates(mut self, batch_size: usize, max_source_bytes: usize) -> Result<Self> {
+        self.require_current_selection()?;
         self.models.models()?;
         if batch_size == 0 || batch_size > MAX_DOCUMENTS || max_source_bytes == 0 {
             return Err(serve_refused("invalid_update_limits"));
@@ -2769,6 +2873,18 @@ impl AuthoritySession {
             max_source_bytes,
         });
         Ok(self)
+    }
+
+    fn require_current_selection(&self) -> Result<()> {
+        if self
+            .snapshot
+            .retained_snapshot()
+            .selected_predecessor_of()
+            .is_some()
+        {
+            return Err(serve_refused("historical_selection_read_only"));
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2804,6 +2920,7 @@ impl AuthoritySession {
             "topology": self.receipt.topology_name(),
         });
         annotate_snapshot_retrieval(&mut response, &self.snapshot, None);
+        annotate_selection(&mut response, &self.snapshot);
         annotate_scope(
             &mut response,
             self.scope.as_ref().map(NativeScopedGenerationSnapshot::len),
@@ -3009,6 +3126,7 @@ impl AuthoritySession {
         request: AuthorityUpdateRequest,
     ) -> Result<serde_json::Value> {
         checkpoint(cx)?;
+        self.require_current_selection()?;
         let limits = self
             .update_limits
             .ok_or_else(|| serve_refused("updates_disabled"))?;
@@ -3112,6 +3230,7 @@ impl AuthoritySession {
 
     fn activate(&mut self, cx: &Cx, request: &AuthorityActivateRequest) -> Result<()> {
         checkpoint(cx)?;
+        self.require_current_selection()?;
         if !self.allow_activation {
             return Err(serve_refused("activation_disabled"));
         }
@@ -3391,8 +3510,12 @@ async fn serve(
     options.quality.validate_usage(
         receipt.tier == EmbedderTierTag::Quality || receipt.quality_identity.is_some(),
     )?;
-    let root = admit_root(&receipt.root)?;
-    let snapshot = Arc::new(receipt.open_on_root(cx, &root, options.max_image_bytes)?);
+    let (root, snapshot) = open_read_selection(
+        cx,
+        &receipt,
+        options.current_receipt.as_deref(),
+        options.max_image_bytes,
+    )?;
     let scope = prepare_scope(
         cx,
         &snapshot,
@@ -3419,6 +3542,7 @@ async fn serve(
         session = session.with_updates(options.batch_size, options.max_source_bytes)?;
     }
     if options.allow_model_activation {
+        session.require_current_selection()?;
         session.models.models()?;
         session.allow_model_activation = true;
     }

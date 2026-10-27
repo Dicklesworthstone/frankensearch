@@ -117,6 +117,7 @@ impl AuthoritySession {
         ) -> Result<Arc<dyn Embedder>>,
     {
         checkpoint(cx)?;
+        self.require_current_selection()?;
         if !self.allow_model_activation {
             return Err(serve_refused("model_activation_disabled"));
         }

@@ -127,6 +127,72 @@ fn rollback_arguments() -> Vec<&'static str> {
 }
 
 #[test]
+fn historical_selection_requires_explicit_read_commands_without_control_grants() {
+    for mut arguments in [
+        vec![
+            "authority-search",
+            "--receipt",
+            "old.json",
+            "--query",
+            "retry",
+        ],
+        vec![
+            "authority-fetch",
+            "--receipt",
+            "old.json",
+            "--doc-id",
+            "zeta",
+        ],
+        vec!["authority-serve", "--receipt", "old.json"],
+    ] {
+        assert!(
+            parse(&arguments)
+                .unwrap()
+                .unwrap()
+                .current_receipt
+                .is_none()
+        );
+        arguments.extend(["--current-receipt", "current.json"]);
+        let options = parse(&arguments).unwrap().unwrap();
+        assert_eq!(
+            options.current_receipt.as_deref(),
+            Some(Path::new("current.json"))
+        );
+        assert_eq!(options.receipt, Path::new("old.json"));
+        let mut duplicate = arguments.clone();
+        duplicate.extend(["--current-receipt", "another.json"]);
+        assert!(parse(&duplicate).is_err());
+        for grant in [
+            "--allow-activation",
+            "--allow-updates",
+            "--allow-model-activation",
+        ] {
+            let mut granted = arguments.clone();
+            granted.push(grant);
+            assert!(
+                parse(&granted).is_err(),
+                "historical reads cannot grant {grant}"
+            );
+        }
+    }
+    for mut arguments in [
+        index_arguments(),
+        rebuild_arguments(),
+        update_arguments(),
+        rollback_arguments(),
+        vec!["authority-recover", "--receipt", "selected.json"],
+    ] {
+        arguments.extend(["--current-receipt", "current.json"]);
+        assert!(parse(&arguments).is_err());
+    }
+    for suffix in [vec!["--current-receipt"], vec!["--current-receipt", ""]] {
+        let mut arguments = vec!["authority-serve", "--receipt", "old.json"];
+        arguments.extend(suffix);
+        assert!(parse(&arguments).is_err());
+    }
+}
+
+#[test]
 fn authority_lexical_options_require_explicit_read_only_execution() {
     for command in ["authority-search", "authority-serve"] {
         let mut arguments = vec![command, "--receipt", "selected.json", "--lexical-only"];
@@ -7262,6 +7328,674 @@ mod progressive_authority {
         options.source_low = Some(2);
         options.source_high = Some(7);
         options
+    }
+
+    async fn publish_history_successor(
+        cx: &Cx,
+        parent: &Path,
+        previous: &NativeGenerationSnapshot,
+        provider: &Arc<Provider>,
+        label: &str,
+    ) -> Receipt {
+        let root = admit_root(&parent.join("root")).unwrap();
+        let built = NativeIndexBuilder::new(
+            parent.join(format!("{label}-work")),
+            new_generation(previous.authority().sequence + 1).unwrap(),
+            provider.clone(),
+        )
+        .unwrap()
+        .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+        .add_documents([IndexableDocument::new(
+            format!("live-{label}"),
+            "retry current contents",
+        )])
+        .build_exact_generation(
+            cx,
+            EmbedderTierTag::Fast,
+            CommitRange {
+                low: 2,
+                high: previous.metadata().commit_range.high + 1,
+            },
+            DEFAULT_IMAGE_BYTES,
+        )
+        .await
+        .unwrap();
+        stage_and_publish(
+            cx,
+            &root,
+            &parent.join("root"),
+            &parent.join(format!("{label}.json")),
+            &built,
+            Some(previous),
+            PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+        )
+        .unwrap()
+        .receipt
+    }
+
+    struct HistoricalFixture {
+        parent: PathBuf,
+        fast: Arc<Provider>,
+        quality: Arc<Provider>,
+        current_model: Arc<Provider>,
+        target: Receipt,
+        current: Receipt,
+    }
+
+    async fn historical_fixture(cx: &Cx, mode: QueryMode, empty: bool) -> HistoricalFixture {
+        let parent = private_parent();
+        let fast = provider(false);
+        let quality = provider(true);
+        let input = parent.join("original.jsonl");
+        fs::write(&input, if empty { "\n" } else { concat!(
+            "{\"id\":\"zeta\",\"content\":\"retry café archived notes\",\"metadata\":{\"tenant\":\"A\"}}\n",
+            "{\"id\":\"alpha\",\"content\":\"retry private archive\",\"metadata\":{\"tenant\":\"B\"}}\n",
+        ) }).unwrap();
+        let options = empty_lifecycle_index_options(&parent, mode, true, &input);
+        index_with_loader(cx, &options, &mut Vec::new(), |requested| {
+            Ok(topology_models(requested, &fast, &quality))
+        })
+        .await
+        .unwrap();
+        let target = Receipt::read(&options.receipt).unwrap();
+        let mut identity = identity().identity;
+        identity.producer.implementation_revision = "historical-current-producer".to_owned();
+        let current_model = Arc::new(Provider {
+            identity,
+            calls: AtomicUsize::new(0),
+        });
+        let previous = target.open(cx, DEFAULT_IMAGE_BYTES).unwrap();
+        let current =
+            publish_history_successor(cx, &parent, &previous, &current_model, "current").await;
+        HistoricalFixture {
+            parent,
+            fast,
+            quality,
+            current_model,
+            target,
+            current,
+        }
+    }
+
+    fn root_file_bytes(root: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn historical_commands_read_only_the_explicit_predecessor_with_its_own_producers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (mode, empty) in [
+                (QueryMode::Fast, false),
+                (QueryMode::Quality, false),
+                (QueryMode::Full, false),
+                (QueryMode::Full, true),
+            ] {
+                let fixture = historical_fixture(&cx, mode, empty).await;
+                let target_path = fixture.parent.join("initial.json");
+                let current_path = fixture.parent.join("current.json");
+                let before = root_file_bytes(&fixture.target.root);
+                let receipts_before = [
+                    fs::read(&target_path).unwrap(),
+                    fs::read(&current_path).unwrap(),
+                ];
+                let current_calls = fixture.current_model.calls.load(Ordering::Relaxed);
+                assert_ne!(fixture.target.identity, fixture.current.identity);
+                if mode != QueryMode::Fast {
+                    assert_ne!(fixture.target.topology(), fixture.current.topology());
+                }
+                let combined =
+                    usize::try_from(fixture.target.image_bytes + fixture.current.image_bytes)
+                        .unwrap();
+                let mut options = parse(&[
+                    "authority-search",
+                    "--receipt",
+                    "unused",
+                    "--query",
+                    "retry",
+                ])
+                .unwrap()
+                .unwrap();
+                options.receipt = target_path.clone();
+                options.filter = Some(Filter::parse(r#"{"metadata":{"tenant":"A"}}"#).unwrap());
+                options.max_image_bytes = combined;
+                let mut output = Vec::new();
+                assert!(
+                    search_with_loader(&cx, &options, &mut output, |_| {
+                        panic!("a stale receipt alone cannot open its former generation")
+                    })
+                    .await
+                    .is_err()
+                );
+                assert!(output.is_empty());
+                options.current_receipt = Some(current_path.clone());
+                let mut modes = if mode == QueryMode::Full {
+                    vec![QueryMode::Fast, QueryMode::Quality, QueryMode::Full]
+                } else {
+                    vec![mode]
+                };
+                modes.push(QueryMode::Lexical);
+                for requested_mode in modes {
+                    options.mode = Some(requested_mode);
+                    options.lexical_only = requested_mode == QueryMode::Lexical;
+                    options.stream = true;
+                    output.clear();
+                    let mut requested = Vec::new();
+                    search_with_loader(&cx, &options, &mut output, |tier| {
+                        assert_ne!(requested_mode, QueryMode::Lexical);
+                        requested.push(tier);
+                        Ok(match tier {
+                            EmbedderTierTag::Fast => fixture.fast.clone(),
+                            EmbedderTierTag::Quality => fixture.quality.clone(),
+                        })
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        requested,
+                        match requested_mode {
+                            QueryMode::Fast => vec![EmbedderTierTag::Fast],
+                            QueryMode::Quality => vec![EmbedderTierTag::Quality],
+                            QueryMode::Full =>
+                                vec![EmbedderTierTag::Fast, EmbedderTierTag::Quality],
+                            QueryMode::Lexical => vec![],
+                        }
+                    );
+                    let responses = frames(&output);
+                    assert_eq!(
+                        responses.len(),
+                        if requested_mode == QueryMode::Full {
+                            2
+                        } else {
+                            1
+                        }
+                    );
+                    for response in responses {
+                        assert_eq!(response["event"], "results");
+                        assert_eq!(
+                            response["authority"],
+                            serde_json::json!(fixture.target.authority)
+                        );
+                        assert_eq!(
+                            response["generation"],
+                            serde_json::json!(fixture.target.generation)
+                        );
+                        assert_eq!(response["selection_kind"], "retained_predecessor");
+                        assert_eq!(
+                            response["selected_predecessor_of"],
+                            serde_json::json!(fixture.current.authority)
+                        );
+                        assert_eq!(response["scope"]["eligible_documents"], usize::from(!empty));
+                        let hits = response["results"].as_array().unwrap();
+                        assert_eq!(hits.len(), usize::from(!empty));
+                        if !empty {
+                            assert_eq!(hits[0]["doc_id"], "zeta");
+                        }
+                    }
+                }
+                assert_eq!(
+                    fixture.current_model.calls.load(Ordering::Relaxed),
+                    current_calls
+                );
+                if empty {
+                    assert_eq!(calls(&fixture.fast, &fixture.quality), (0, 0));
+                }
+
+                let mut source =
+                    parse(&["authority-fetch", "--receipt", "unused", "--doc-id", "zeta"])
+                        .unwrap()
+                        .unwrap();
+                source.receipt = target_path;
+                source.current_receipt = Some(current_path);
+                source.max_image_bytes = combined;
+                source.include_metadata = true;
+                output.clear();
+                let inference_before_fetch = calls(&fixture.fast, &fixture.quality);
+                fetch(&cx, &source, &mut output).unwrap();
+                let response = &frames(&output)[0];
+                assert_eq!(response["selection_kind"], "retained_predecessor");
+                assert_eq!(
+                    response["selected_predecessor_of"],
+                    serde_json::json!(fixture.current.authority)
+                );
+                assert_eq!(
+                    response["authority"],
+                    serde_json::json!(fixture.target.authority)
+                );
+                if empty {
+                    assert_eq!(
+                        response["documents"][0],
+                        serde_json::json!({"doc_id":"zeta", "status":"unavailable"})
+                    );
+                } else {
+                    assert_eq!(
+                        response["documents"][0]["content"],
+                        "retry café archived notes"
+                    );
+                    assert_eq!(response["documents"][0]["metadata"]["tenant"], "A");
+                }
+                assert_eq!(
+                    calls(&fixture.fast, &fixture.quality),
+                    inference_before_fetch
+                );
+                assert_eq!(
+                    fixture.current_model.calls.load(Ordering::Relaxed),
+                    current_calls
+                );
+                assert_eq!(root_file_bytes(&fixture.target.root), before);
+                assert_eq!(
+                    fs::read(fixture.parent.join("initial.json")).unwrap(),
+                    receipts_before[0]
+                );
+                assert_eq!(
+                    fs::read(fixture.parent.join("current.json")).unwrap(),
+                    receipts_before[1]
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn historical_admission_checks_both_receipts_and_the_combined_authenticated_budget() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = historical_fixture(&cx, QueryMode::Full, false).await;
+            let target_reader = fixture.current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let latest = publish_history_successor(
+                &cx,
+                &fixture.parent,
+                &target_reader,
+                &fixture.current_model,
+                "latest",
+            )
+            .await;
+            let latest_reader = latest.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let combined =
+                usize::try_from(fixture.current.image_bytes + latest.image_bytes).unwrap();
+            let before = root_file_bytes(&latest.root);
+            let calls_before = fixture.current_model.calls.load(Ordering::Relaxed);
+            for label in [
+                "stale-current",
+                "same-head",
+                "ancient-target",
+                "target-root",
+                "current-root-id",
+                "target-documents",
+                "current-documents",
+                "target-producer",
+                "target-topology",
+                "target-bound",
+                "current-bound",
+                "combined-budget",
+            ] {
+                let mut target = fixture.current.clone();
+                let mut current = latest.clone();
+                let mut budget = combined;
+                match label {
+                    "stale-current" => {
+                        target = fixture.target.clone();
+                        current = fixture.current.clone();
+                    }
+                    "same-head" => target = latest.clone(),
+                    "ancient-target" => target = fixture.target.clone(),
+                    "target-root" => target.root = fixture.parent.join("unrelated-root"),
+                    "current-root-id" => current.root_id[0] ^= 1,
+                    "target-documents" => target.documents = 0,
+                    "current-documents" => current.documents = 0,
+                    "target-producer" => {
+                        let mut identity = target.identity.identity.clone();
+                        identity.producer.implementation_revision =
+                            "forged-history-producer".to_owned();
+                        target.identity = identity.freeze().unwrap();
+                    }
+                    "target-topology" => {
+                        target.schema = PROGRESSIVE_RECEIPT_SCHEMA.to_owned();
+                        target.quality_identity = Some(target.identity.clone());
+                    }
+                    "target-bound" => target.image_bytes -= 1,
+                    "current-bound" => current.image_bytes -= 1,
+                    "combined-budget" => budget -= 1,
+                    _ => unreachable!(),
+                }
+                let target_path = fixture.parent.join(format!("{label}-target.json"));
+                let current_path = fixture.parent.join(format!("{label}-current.json"));
+                fs::write(&target_path, serde_json::to_vec(&target).unwrap()).unwrap();
+                fs::write(&current_path, serde_json::to_vec(&current).unwrap()).unwrap();
+                let mut options = parse(&[
+                    "authority-search",
+                    "--receipt",
+                    "unused",
+                    "--query",
+                    "retry",
+                ])
+                .unwrap()
+                .unwrap();
+                options.receipt = target_path.clone();
+                options.current_receipt = Some(current_path.clone());
+                options.max_image_bytes = budget;
+                let mut output = Vec::new();
+                let mut loads = 0;
+                assert!(
+                    search_with_loader(&cx, &options, &mut output, |_| {
+                        loads += 1;
+                        Err(bad("refused history must not load a producer"))
+                    })
+                    .await
+                    .is_err(),
+                    "{label}"
+                );
+                assert_eq!(loads, 0, "{label}");
+                assert!(output.is_empty(), "{label}");
+                let mut source = parse(&[
+                    "authority-fetch",
+                    "--receipt",
+                    "unused",
+                    "--doc-id",
+                    "live-current",
+                ])
+                .unwrap()
+                .unwrap();
+                source.receipt = target_path;
+                source.current_receipt = Some(current_path);
+                source.max_image_bytes = budget;
+                assert!(fetch(&cx, &source, &mut output).is_err(), "{label}");
+                assert!(output.is_empty(), "{label}");
+                assert_eq!(root_file_bytes(&latest.root), before, "{label}");
+            }
+
+            // A receipt's permitted maximum is not its authenticated allocation.
+            // Charge actual admitted current bytes, then the complete target.
+            let mut inflated = latest.clone();
+            inflated.image_bytes += 1_000_000;
+            let inflated_path = fixture.parent.join("inflated-current.json");
+            fs::write(&inflated_path, serde_json::to_vec(&inflated).unwrap()).unwrap();
+            let mut options = parse(&[
+                "authority-search",
+                "--receipt",
+                "unused",
+                "--query",
+                "retry",
+            ])
+            .unwrap()
+            .unwrap();
+            options.receipt = fixture.parent.join("current.json");
+            options.current_receipt = Some(inflated_path);
+            options.max_image_bytes = combined;
+            options.lexical_only = true;
+            let mut output = Vec::new();
+            search_with_loader(&cx, &options, &mut output, |_| {
+                panic!("lexical history does not load models")
+            })
+            .await
+            .unwrap();
+            assert_eq!(frames(&output)[0]["results"][0]["doc_id"], "live-current");
+            options.max_image_bytes = combined - 1;
+            output.clear();
+            assert!(
+                search_with_loader(&cx, &options, &mut output, |_| panic!(
+                    "budget refusal precedes models"
+                ))
+                .await
+                .is_err()
+            );
+            assert!(output.is_empty());
+            options.max_image_bytes = combined;
+
+            // Historical reads require healthy complete current admission;
+            // damaged-current rollback is a separate explicit operation.
+            let component = latest_reader
+                .retained_snapshot()
+                .manifest()
+                .components()
+                .get(GenerationComponentRole::Vector)
+                .unwrap();
+            let current_vector = latest.root.join(component_object_name_v1(
+                GenerationComponentRole::Vector,
+                component.sha256,
+            ));
+            let saved_vector = fixture.parent.join("healthy-current-vector");
+            fs::rename(&current_vector, &saved_vector).unwrap();
+            write_immutable(&cx, &current_vector, b"damaged-current-vector").unwrap();
+            let damaged = root_file_bytes(&latest.root);
+            options.lexical_only = false;
+            assert!(
+                search_with_loader(&cx, &options, &mut output, |_| panic!(
+                    "damaged current cannot authorize model loading"
+                ))
+                .await
+                .is_err()
+            );
+            assert!(output.is_empty());
+            assert_eq!(root_file_bytes(&latest.root), damaged);
+            fs::rename(
+                &current_vector,
+                fixture.parent.join("damaged-current-vector-evidence"),
+            )
+            .unwrap();
+            fs::rename(&saved_vector, &current_vector).unwrap();
+            assert_eq!(root_file_bytes(&latest.root), before);
+            cx.set_cancel_requested(true);
+            assert!(
+                search_with_loader(&cx, &options, &mut output, |_| panic!(
+                    "cancelled history cannot load models"
+                ))
+                .await
+                .is_err()
+            );
+            cx.set_cancel_requested(false);
+            assert!(output.is_empty());
+            assert_eq!(
+                fixture.current_model.calls.load(Ordering::Relaxed),
+                calls_before
+            );
+
+            // Authority sequence, not artifact sequence, defines history.
+            // A rollback can make the immediate predecessor's artifact newer.
+            let mut rollback_options = parse(&rollback_arguments()).unwrap().unwrap();
+            rollback_options.from_receipt = Some(fixture.parent.join("latest.json"));
+            rollback_options.target_receipt = Some(fixture.parent.join("current.json"));
+            rollback_options.receipt = fixture.parent.join("rollback.json");
+            rollback(&cx, &rollback_options, &mut Vec::new()).unwrap();
+            let rolled_back = Receipt::read(&rollback_options.receipt).unwrap();
+            assert!(latest.generation.sequence > rolled_back.generation.sequence);
+            assert!(
+                latest.authority().unwrap().sequence < rolled_back.authority().unwrap().sequence
+            );
+            options.receipt = fixture.parent.join("latest.json");
+            options.current_receipt = Some(rollback_options.receipt);
+            options.lexical_only = true;
+            options.max_image_bytes =
+                usize::try_from(latest.image_bytes + rolled_back.image_bytes).unwrap();
+            search_with_loader(&cx, &options, &mut output, |_| {
+                panic!("lexical history does not load models")
+            })
+            .await
+            .unwrap();
+            let response = &frames(&output)[0];
+            assert_eq!(response["results"][0]["doc_id"], "live-latest");
+            assert_eq!(response["authority"], serde_json::json!(latest.authority));
+            assert_eq!(
+                response["selected_predecessor_of"],
+                serde_json::json!(rolled_back.authority)
+            );
+        });
+    }
+
+    #[test]
+    fn historical_warm_sessions_pin_source_and_scopes_and_cannot_activate_or_publish() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = historical_fixture(&cx, QueryMode::Full, false).await;
+            let current_path = fixture.parent.join("current.json");
+            let combined =
+                usize::try_from(fixture.target.image_bytes + fixture.current.image_bytes).unwrap();
+            let (root, snapshot) =
+                open_read_selection(&cx, &fixture.target, Some(&current_path), combined).unwrap();
+            assert_eq!(
+                snapshot.retained_snapshot().selected_predecessor_of(),
+                Some(fixture.current.authority().unwrap())
+            );
+            assert!(
+                AuthoritySession::new(
+                    &cx,
+                    admit_root(&fixture.target.root).unwrap(),
+                    fixture.target.clone(),
+                    Arc::clone(&snapshot),
+                    models(&fixture.fast, &fixture.quality),
+                    (2, combined),
+                    true,
+                )
+                .is_err()
+            );
+            let no_updates = AuthoritySession::new(
+                &cx,
+                admit_root(&fixture.target.root).unwrap(),
+                fixture.target.clone(),
+                Arc::clone(&snapshot),
+                models(&fixture.fast, &fixture.quality),
+                (2, combined),
+                false,
+            )
+            .unwrap();
+            assert!(no_updates.with_updates(2, MAX_INPUT_BYTES).is_err());
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                fixture.target.clone(),
+                snapshot,
+                models(&fixture.fast, &fixture.quality),
+                (2, combined),
+                false,
+            )
+            .unwrap()
+            .with_filter(
+                &cx,
+                Some(Filter::parse(r#"{"metadata":{"tenant":"A"}}"#).unwrap()),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap();
+            let current_reader = fixture.current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let latest = publish_history_successor(
+                &cx,
+                &fixture.parent,
+                &current_reader,
+                &fixture.current_model,
+                "latest",
+            )
+            .await;
+            fs::rename(
+                fixture.parent.join("original.jsonl"),
+                fixture.parent.join("archived-input.jsonl"),
+            )
+            .unwrap();
+            fs::rename(
+                fixture.parent.join("initial-work"),
+                fixture.parent.join("archived-initial-work"),
+            )
+            .unwrap();
+            let root_before = root_file_bytes(&latest.root);
+            let before = calls(&fixture.fast, &fixture.quality);
+            let current_calls = fixture.current_model.calls.load(Ordering::Relaxed);
+            assert!(
+                open_read_selection(&cx, &fixture.target, Some(&current_path), combined).is_err()
+            );
+            let response = exchange(&cx, &mut session, &[
+                serde_json::json!({"query":"retry", "mode":"full", "stream":true, "filter":{}}),
+                serde_json::json!({"op":"fetch", "expected_authority":fixture.target.authority, "documents":[{"doc_id":"zeta"},{"doc_id":"alpha"},{"doc_id":"live-latest"}], "filter":{}}),
+                serde_json::json!({"query":"retry", "mode":"lexical", "filter":{"ids":["alpha"]}}),
+            ]).await;
+            assert_eq!(response.len(), 5);
+            for frame in &response {
+                assert_eq!(
+                    frame["authority"],
+                    serde_json::json!(fixture.target.authority)
+                );
+                assert_eq!(frame["selection_kind"], "retained_predecessor");
+                assert_eq!(
+                    frame["selected_predecessor_of"],
+                    serde_json::json!(fixture.current.authority)
+                );
+            }
+            assert_eq!(response[0]["event"], "ready");
+            for frame in &response[1..=2] {
+                assert_eq!(frame["scope"]["eligible_documents"], 1);
+                assert_eq!(frame["results"].as_array().unwrap().len(), 1);
+                assert_eq!(frame["results"][0]["doc_id"], "zeta");
+            }
+            assert_eq!(
+                response[3]["documents"][0]["content"],
+                "retry café archived notes"
+            );
+            assert_eq!(
+                response[3]["documents"][1],
+                serde_json::json!({"doc_id":"alpha", "status":"unavailable"})
+            );
+            assert_eq!(
+                response[3]["documents"][2],
+                serde_json::json!({"doc_id":"live-latest", "status":"unavailable"})
+            );
+            assert_eq!(response[4]["scope"]["eligible_documents"], 0);
+            assert!(response[4]["results"].as_array().unwrap().is_empty());
+            assert_eq!(
+                calls(&fixture.fast, &fixture.quality),
+                (before.0 + 1, before.1 + 1)
+            );
+
+            // Private callers cannot bypass the read-only marker by toggling
+            // grants after startup. Each operation independently checks it.
+            session.allow_activation = true;
+            session.allow_model_activation = true;
+            session.update_limits = Some(AuthorityUpdateLimits {
+                batch_size: 2,
+                max_source_bytes: MAX_INPUT_BYTES,
+            });
+            let before = calls(&fixture.fast, &fixture.quality);
+            let model_request = serde_json::json!({
+                "op":"activate_model", "receipt":fixture.parent.join("absent.json"),
+                "expected_authority":fixture.target.authority, "model_dir":fixture.parent.join("absent-models"),
+            });
+            let request: model_activation::Request =
+                serde_json::from_value(model_request.clone()).unwrap();
+            let mut loads = 0;
+            let error = session
+                .activate_model_with_loader(&cx, &request, |_, _, _, _| {
+                    loads += 1;
+                    Err(bad(
+                        "historical model activation must refuse before loading",
+                    ))
+                })
+                .unwrap_err();
+            assert!(error.to_string().contains("historical_selection_read_only"));
+            assert_eq!(loads, 0);
+            let response = exchange(&cx, &mut session, &[
+                serde_json::json!({"op":"activate", "receipt":fixture.parent.join("latest.json"), "expected_authority":fixture.target.authority}),
+                model_request,
+                serde_json::json!({"op":"update", "expected_authority":fixture.target.authority, "work_dir":fixture.parent.join("forbidden-work"), "new_receipt":fixture.parent.join("forbidden.json"), "source_low":2, "source_high":10, "changes":[{"op":"delete","id":"zeta"}]}),
+            ]).await;
+            for frame in &response[1..] {
+                assert_eq!(frame["event"], "failed");
+                assert_eq!(frame["code"], "historical_selection_read_only");
+                assert_eq!(
+                    frame["authority"],
+                    serde_json::json!(fixture.target.authority)
+                );
+                assert_eq!(
+                    frame["selected_predecessor_of"],
+                    serde_json::json!(fixture.current.authority)
+                );
+            }
+            assert_eq!(calls(&fixture.fast, &fixture.quality), before);
+            assert_eq!(
+                fixture.current_model.calls.load(Ordering::Relaxed),
+                current_calls
+            );
+            assert!(!fixture.parent.join("forbidden-work").exists());
+            assert!(!fixture.parent.join("forbidden.json").exists());
+            assert_eq!(root_file_bytes(&latest.root), root_before);
+        });
     }
 
     #[test]
