@@ -817,20 +817,20 @@ fn rebuild_requires_explicit_producer_migration_before_any_inference() {
         calls: AtomicUsize::new(0),
     };
     assert_eq!(
-        rebuild_identity(&selected, &provider, false).unwrap(),
+        rebuild_identity(&selected.identity, &provider, false).unwrap(),
         selected.identity
     );
     provider.identity.producer.implementation_revision =
         "changed-same-dimension-producer".to_owned();
     provider.identity.validate().unwrap();
-    assert!(rebuild_identity(&selected, &provider, false).is_err());
-    let migrated = rebuild_identity(&selected, &provider, true).unwrap();
+    assert!(rebuild_identity(&selected.identity, &provider, false).is_err());
+    let migrated = rebuild_identity(&selected.identity, &provider, true).unwrap();
     assert_ne!(migrated, selected.identity);
     assert_eq!(migrated.identity.producer, provider.identity.producer);
     assert_eq!(migrated.identity.space, provider.identity.space);
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
     provider.identity.space.dimension = 3;
-    assert!(rebuild_identity(&selected, &provider, true).is_err());
+    assert!(rebuild_identity(&selected.identity, &provider, true).is_err());
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
 }
 
@@ -983,10 +983,221 @@ fn receipt() -> Receipt {
         generation: ArtifactGenerationIdentityV1::new(1, [0x54; 16]).unwrap(),
         identity: identity(),
         tier: EmbedderTierTag::Fast,
+        quality_identity: None,
         documents: 2,
         image_bytes: 4096,
         attempt: Some(SavedAttempt::from_permit(&permit, false)),
     }
+}
+
+fn progressive_receipt() -> Receipt {
+    let mut selected = receipt();
+    selected.schema = PROGRESSIVE_RECEIPT_SCHEMA.to_owned();
+    let mut quality = identity().identity;
+    quality.producer.implementation_revision = "independent-quality-producer".to_owned();
+    selected.quality_identity = Some(quality.freeze().unwrap());
+    selected
+}
+
+#[test]
+fn full_options_require_complete_exact_tiers_and_explicit_query_modes() {
+    let mut arguments = index_arguments();
+    let tier = arguments.iter().position(|value| *value == "fast").unwrap();
+    arguments[tier] = "full";
+    arguments.extend([
+        "--quality-backend",
+        "native-int8",
+        "--quality-model-dir",
+        "verified-quality",
+    ]);
+    let full = parse(&arguments).unwrap().unwrap();
+    assert!(full.progressive);
+    assert_eq!(full.tier, Some(EmbedderTierTag::Fast));
+    assert!(!full.stream);
+    assert!(full.mode.is_none());
+    let mut duplicate = arguments.clone();
+    duplicate.extend(["--tier", "quality"]);
+    assert!(parse(&duplicate).is_err());
+    arguments.extend(["--retrieval", "hnsw"]);
+    assert!(parse(&arguments).is_err());
+
+    for (name, mode) in [
+        ("fast", QueryMode::Fast),
+        ("quality", QueryMode::Quality),
+        ("full", QueryMode::Full),
+    ] {
+        let options = parse(&[
+            "authority-search",
+            "--receipt",
+            "selected.json",
+            "--query",
+            "retry",
+            "--mode",
+            name,
+            "--stream",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(options.mode, Some(mode));
+        assert!(options.stream);
+        let request: AuthoritySearchRequest = serde_json::from_value(serde_json::json!({
+            "query":"retry", "mode":name, "stream":true,
+        }))
+        .unwrap();
+        assert_eq!(request.mode, Some(mode));
+        assert!(request.stream);
+    }
+    let default: AuthoritySearchRequest = serde_json::from_str(r#"{"query":"retry"}"#).unwrap();
+    assert!(default.mode.is_none());
+    assert!(!default.stream);
+    assert!(
+        serde_json::from_str::<AuthoritySearchRequest>(r#"{"query":"retry","mode":"automatic"}"#)
+            .is_err()
+    );
+    assert!(
+        parse(&[
+            "authority-search",
+            "--receipt",
+            "r",
+            "--query",
+            "retry",
+            "--mode",
+            "automatic",
+        ])
+        .is_err()
+    );
+    for mut arguments in [
+        index_arguments(),
+        rebuild_arguments(),
+        vec!["authority-recover", "--receipt", "r"],
+    ] {
+        arguments.push("--stream");
+        assert!(parse(&arguments).is_err());
+    }
+}
+
+#[test]
+fn progressive_receipt_preserves_both_bindings_and_refuses_ambiguous_schema() {
+    let selected = progressive_receipt();
+    selected.validate().unwrap();
+    let decoded: Receipt = serde_json::from_slice(&serde_json::to_vec(&selected).unwrap()).unwrap();
+    decoded.validate().unwrap();
+    assert_eq!(decoded.binding().unwrap(), selected.binding().unwrap());
+    assert_eq!(
+        decoded.quality_binding().unwrap(),
+        selected.quality_binding().unwrap()
+    );
+    assert_ne!(
+        decoded.binding().unwrap(),
+        decoded.quality_binding().unwrap().unwrap()
+    );
+    assert_eq!(
+        attempt_report(&decoded.recovery_attempt().unwrap()),
+        attempt_report(&selected.recovery_attempt().unwrap())
+    );
+    assert_eq!(
+        decoded.topology(),
+        NativeGenerationTopology::FullProgressive
+    );
+    for schema in [RECEIPT_SCHEMA, SELECTION_ONLY_RECEIPT_SCHEMA] {
+        let mut changed = selected.clone();
+        changed.schema = schema.to_owned();
+        assert!(changed.validate().is_err());
+    }
+    let mut changed = selected.clone();
+    changed.quality_identity = None;
+    assert!(changed.validate().is_err());
+    changed = selected.clone();
+    changed.tier = EmbedderTierTag::Quality;
+    assert!(changed.validate().is_err());
+    changed = selected.clone();
+    changed
+        .quality_identity
+        .as_mut()
+        .unwrap()
+        .identity
+        .producer
+        .implementation_revision
+        .push_str("-tampered");
+    assert!(changed.validate().is_err());
+    changed = selected;
+    changed.attempt = None;
+    assert!(changed.validate().is_err());
+}
+
+#[test]
+fn query_modes_cannot_invent_a_missing_authority_tier() {
+    let fast = receipt();
+    let mut quality = receipt();
+    quality.tier = EmbedderTierTag::Quality;
+    let full = progressive_receipt();
+    for (selected, default, allowed) in [
+        (fast, QueryMode::Fast, vec![QueryMode::Fast]),
+        (quality, QueryMode::Quality, vec![QueryMode::Quality]),
+        (
+            full,
+            QueryMode::Full,
+            vec![QueryMode::Fast, QueryMode::Quality, QueryMode::Full],
+        ),
+    ] {
+        selected.validate().unwrap();
+        assert_eq!(selected.query_mode(None).unwrap(), default);
+        for mode in [QueryMode::Fast, QueryMode::Quality, QueryMode::Full] {
+            assert_eq!(
+                selected.query_mode(Some(mode)).is_ok(),
+                allowed.contains(&mode)
+            );
+        }
+    }
+}
+
+#[test]
+fn full_serving_and_rebuild_admit_quality_independently_before_inference() {
+    let selected = progressive_receipt();
+    let fast = Arc::new(Provider {
+        identity: selected.identity.identity.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let quality = Arc::new(Provider {
+        identity: selected.quality_identity.as_ref().unwrap().identity.clone(),
+        calls: AtomicUsize::new(0),
+    });
+    let loaded = Models {
+        fast: fast.clone(),
+        quality: Some(quality.clone()),
+    };
+    admit_serving_models(&selected, &loaded).unwrap();
+    assert!(
+        admit_serving_models(
+            &selected,
+            &Models {
+                fast: fast.clone(),
+                quality: None
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        admit_serving_models(
+            &selected,
+            &Models {
+                fast: fast.clone(),
+                quality: Some(fast.clone())
+            }
+        )
+        .is_err()
+    );
+    assert!(admit_serving_models(&receipt(), &loaded).is_err());
+    let expected_quality = selected.quality_identity.as_ref().unwrap();
+    rebuild_identity(&selected.identity, fast.as_ref(), false).unwrap();
+    rebuild_identity(expected_quality, quality.as_ref(), false).unwrap();
+    assert!(rebuild_identity(expected_quality, fast.as_ref(), false).is_err());
+    let migrated = rebuild_identity(expected_quality, fast.as_ref(), true).unwrap();
+    assert_eq!(migrated, selected.identity);
+    assert_ne!(&migrated, expected_quality);
+    assert!(!same_query_contract(expected_quality, &migrated));
+    assert_eq!(fast.calls.load(Ordering::Relaxed), 0);
+    assert_eq!(quality.calls.load(Ordering::Relaxed), 0);
 }
 
 #[test]
@@ -1973,7 +2184,10 @@ mod warm_authority {
             root,
             selected,
             snapshot,
-            model,
+            Models {
+                fast: model,
+                quality: None,
+            },
             (1, DEFAULT_IMAGE_BYTES),
             allow_activation,
         )
@@ -3103,7 +3317,7 @@ mod warm_authority {
                 let mut output = Vec::new();
                 search_with_loader(&cx, &options, &mut output, |requested| {
                     assert_eq!(requested, tier);
-                    Ok(model)
+                    Ok(Arc::clone(&model))
                 })
                 .await
                 .unwrap();
@@ -3118,7 +3332,7 @@ mod warm_authority {
                 let options = search_options(&receipt_path, None);
                 let model: Arc<dyn Embedder> = provider.clone();
                 output.clear();
-                search_with_loader(&cx, &options, &mut output, |_| Ok(model))
+                search_with_loader(&cx, &options, &mut output, |_| Ok(Arc::clone(&model)))
                     .await
                     .unwrap();
                 let unrestricted: serde_json::Value = serde_json::from_slice(&output).unwrap();
@@ -3129,7 +3343,7 @@ mod warm_authority {
                 let options = search_options(&receipt_path, Some(r#"{"ids":[]}"#));
                 let model: Arc<dyn Embedder> = provider.clone();
                 output.clear();
-                search_with_loader(&cx, &options, &mut output, |_| Ok(model))
+                search_with_loader(&cx, &options, &mut output, |_| Ok(Arc::clone(&model)))
                     .await
                     .unwrap();
                 let empty: serde_json::Value = serde_json::from_slice(&output).unwrap();
@@ -3246,7 +3460,7 @@ mod warm_authority {
 
             options.filter = None;
             let model: Arc<dyn Embedder> = provider.clone();
-            search_with_loader(&cx, &options, &mut output, |_| Ok(model))
+            search_with_loader(&cx, &options, &mut output, |_| Ok(Arc::clone(&model)))
                 .await
                 .unwrap();
             let page: serde_json::Value = serde_json::from_slice(&output).unwrap();
@@ -3287,7 +3501,7 @@ mod warm_authority {
             let options = search_options(&receipt_path, Some(r#"{"ids":[]}"#));
             let model: Arc<dyn Embedder> = wrong.clone();
             assert!(
-                search_with_loader(&cx, &options, &mut Vec::new(), |_| Ok(model))
+                search_with_loader(&cx, &options, &mut Vec::new(), |_| Ok(Arc::clone(&model)))
                     .await
                     .is_err()
             );
@@ -3357,7 +3571,10 @@ mod warm_authority {
                 root,
                 selected.clone(),
                 snapshot,
-                model,
+                Models {
+                    fast: model,
+                    quality: None,
+                },
                 (1, DEFAULT_IMAGE_BYTES),
                 false,
             )
@@ -4399,7 +4616,7 @@ mod warm_authority {
                         &mut output,
                         |requested| {
                             assert_eq!(requested, tier);
-                            Ok(model)
+                            Ok(Arc::clone(&model))
                         },
                     )
                     .await
@@ -4451,7 +4668,7 @@ mod warm_authority {
                     output.clear();
                     update_generation_with_loader(&cx, &options, &mut output, |requested| {
                         assert_eq!(requested, tier);
-                        Ok(model)
+                        Ok(Arc::clone(&model))
                     })
                     .await
                     .unwrap();
@@ -4689,9 +4906,11 @@ mod warm_authority {
                 options.source_low = Some(1);
                 options.source_high = Some(6);
                 let model: Arc<dyn Embedder> = provider.clone();
-                update_generation_with_loader(&cx, &options, &mut Vec::new(), |_| Ok(model))
-                    .await
-                    .unwrap();
+                update_generation_with_loader(&cx, &options, &mut Vec::new(), |_| {
+                    Ok(Arc::clone(&model))
+                })
+                .await
+                .unwrap();
                 assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
                 let advanced = Receipt::read(&options.receipt).unwrap();
                 assert_eq!(advanced.identity, selected.identity);
@@ -4785,7 +5004,7 @@ mod warm_authority {
                             .receipt,
                         );
                         authority_after_winner = fs::read(root_path.join("AUTHORITY"))?;
-                        Ok(model)
+                        Ok(Arc::clone(&model))
                     })
                     .await
                     .unwrap_err();
@@ -4960,9 +5179,10 @@ mod warm_authority {
                     },
                     calls: AtomicUsize::new(0),
                 });
-                assert!(rebuild_identity(&selected, migrated.as_ref(), false).is_err());
+                assert!(rebuild_identity(&selected.identity, migrated.as_ref(), false).is_err());
                 assert_eq!(migrated.calls.load(Ordering::Relaxed), 0);
-                let admitted = rebuild_identity(&selected, migrated.as_ref(), true).unwrap();
+                let admitted =
+                    rebuild_identity(&selected.identity, migrated.as_ref(), true).unwrap();
                 let options = parse(&retained_rebuild_arguments()).unwrap().unwrap();
                 let source_cut = options
                     .rebuild_source_cut(&retained.metadata().commit_range)
@@ -5770,7 +5990,7 @@ mod warm_authority {
             let mut session = open_session(&cx, old.clone(), &provider, false)
                 .with_updates(2, crate::MAX_INPUT_BYTES)
                 .unwrap();
-            session.model = gated.clone();
+            session.models.fast = gated.clone();
             let request = update_message(
                 &parent,
                 "loser",
@@ -6332,7 +6552,10 @@ mod warm_authority {
                     root,
                     selected.clone(),
                     snapshot,
-                    wrong_model,
+                    Models {
+                        fast: wrong_model,
+                        quality: None
+                    },
                     (1, DEFAULT_IMAGE_BYTES),
                     false
                 )
@@ -6406,6 +6629,963 @@ mod warm_authority {
                 "delivery failure terminates before the next query"
             );
             assert_eq!(output.writes, 2);
+        });
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod progressive_authority {
+    use std::io::Cursor;
+    use std::os::unix::fs::DirBuilderExt as _;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use frankensearch_core::generation::GenerationComponentRole;
+    use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
+
+    use super::*;
+
+    fn private_parent() -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let parent = PathBuf::from(std::env::var_os("HOME").unwrap()).join(format!(
+            ".frankensearch-authority-full-{}-{stamp}",
+            std::process::id(),
+        ));
+        // These are real qualified-root lifecycle tests. Unsupported filesystems
+        // remain failures, without an overlay/tmpfs bypass or automatic skip.
+        fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
+        parent
+    }
+
+    fn provider(quality: bool) -> Arc<Provider> {
+        let mut identity = identity().identity;
+        if quality {
+            identity.producer.implementation_revision = "independent-complete-quality".to_owned();
+        }
+        identity.validate().unwrap();
+        Arc::new(Provider {
+            identity,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    struct FailingQuality {
+        inner: Arc<Provider>,
+    }
+
+    impl Embedder for FailingQuality {
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            self.inner.identity()
+        }
+
+        fn embed<'a>(&'a self, _: &'a Cx, _: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.inner.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Err(SearchError::SubsystemError {
+                    subsystem: "authority_progressive_test",
+                    source: "private-quality-inference-failure".into(),
+                })
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            self.inner.category()
+        }
+    }
+
+    fn models(fast: &Arc<Provider>, quality: &Arc<Provider>) -> Models {
+        Models {
+            fast: fast.clone(),
+            quality: Some(quality.clone()),
+        }
+    }
+
+    fn calls(fast: &Provider, quality: &Provider) -> (usize, usize) {
+        (
+            fast.calls.load(Ordering::Relaxed),
+            quality.calls.load(Ordering::Relaxed),
+        )
+    }
+
+    fn plan(mode: QueryMode, stream: bool) -> QueryPlan<'static> {
+        QueryPlan {
+            text: "how do I retry failed network requests",
+            limit: 2,
+            mode,
+            stream,
+        }
+    }
+
+    fn frames(bytes: &[u8]) -> Vec<serde_json::Value> {
+        bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect()
+    }
+
+    fn update_options(
+        parent: &Path,
+        predecessor: &Path,
+        label: &str,
+        input: &Path,
+        high: u64,
+    ) -> Options {
+        let mut options = parse(&update_arguments()).unwrap().unwrap();
+        options.from_receipt = Some(predecessor.to_path_buf());
+        options.work = Some(parent.join(format!("{label}-work")));
+        options.receipt = parent.join(format!("{label}.json"));
+        options.input = Some(input.to_path_buf());
+        options.source_low = Some(2);
+        options.source_high = Some(high);
+        options
+    }
+
+    async fn publish_full(
+        cx: &Cx,
+        parent: &Path,
+        fast: &Arc<Provider>,
+        quality: &Arc<Provider>,
+        documents: Vec<IndexableDocument>,
+    ) -> Receipt {
+        let root_path = parent.join("root");
+        let root = create_root(&root_path).expect("qualified Linux root is required");
+        let built = NativeIndexBuilder::new(
+            parent.join("initial-work"),
+            new_generation(1).unwrap(),
+            fast.clone(),
+        )
+        .unwrap()
+        .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+        .with_quality_embedder(quality.clone())
+        .unwrap()
+        .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+        .unwrap()
+        .add_documents(documents)
+        .build_progressive_generation(cx, CommitRange { low: 2, high: 7 }, DEFAULT_IMAGE_BYTES)
+        .await
+        .unwrap();
+        stage_and_publish(
+            cx,
+            &root,
+            &root_path,
+            &parent.join("initial.json"),
+            &built,
+            None,
+            PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+        )
+        .unwrap()
+        .receipt
+    }
+
+    async fn exchange(
+        cx: &Cx,
+        session: &mut AuthoritySession,
+        messages: &[serde_json::Value],
+    ) -> Vec<serde_json::Value> {
+        let mut input = Vec::new();
+        for message in messages {
+            serde_json::to_writer(&mut input, message).unwrap();
+            input.push(b'\n');
+        }
+        let mut output = Vec::new();
+        serve_session(cx, session, &mut Cursor::new(input), &mut output)
+            .await
+            .unwrap();
+        frames(&output)
+    }
+
+    #[test]
+    fn full_authority_queries_updates_activation_recovery_and_rollback_share_both_owners() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let root_path = parent.join("root");
+            let fast = provider(false);
+            let quality = provider(true);
+            let work = parent.join("initial-work");
+            let first = publish_full(
+                &cx,
+                &parent,
+                &fast,
+                &quality,
+                vec![
+                    IndexableDocument::new("zeta", "retry network requests")
+                        .with_metadata("version", "original"),
+                    IndexableDocument::new("alpha", "garden flowers"),
+                ],
+            )
+            .await;
+            assert_eq!(calls(&fast, &quality), (2, 2));
+            let first_path = parent.join("initial.json");
+            fs::rename(&work, parent.join("archived-initial-work")).unwrap();
+            assert_eq!(first.schema, PROGRESSIVE_RECEIPT_SCHEMA);
+            assert!(first.quality_identity.is_some());
+            assert_ne!(first.quality_identity.as_ref().unwrap(), &first.identity);
+            let old_reader = first.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(
+                old_reader.topology(),
+                NativeGenerationTopology::FullProgressive
+            );
+            assert_eq!(
+                calls(&fast, &quality),
+                (2, 2),
+                "reopen uses retained images without document inference"
+            );
+            let initial_receipt = fs::read(&first_path).unwrap();
+
+            let loaded = models(&fast, &quality);
+            let before = calls(&fast, &quality);
+            let mut options = parse(&[
+                "authority-search",
+                "--receipt",
+                "unused",
+                "--query",
+                "how do I retry failed network requests",
+                "--mode",
+                "quality",
+            ])
+            .unwrap()
+            .unwrap();
+            options.receipt = first_path.clone();
+            let mut requested = Vec::new();
+            let mut output = Vec::new();
+            search_with_loader(&cx, &options, &mut output, |tier| {
+                requested.push(tier);
+                assert_eq!(tier, EmbedderTierTag::Quality);
+                Ok(quality.clone())
+            })
+            .await
+            .unwrap();
+            let page: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(page["phase"], "quality");
+            assert_eq!(page["mode"], "quality");
+            assert_eq!(page["topology"], "full_progressive");
+            assert_eq!(page["results"][0]["doc_id"], "zeta");
+            assert_eq!(requested, [EmbedderTierTag::Quality]);
+            assert_eq!(calls(&fast, &quality), (before.0, before.1 + 1));
+
+            let before = calls(&fast, &quality);
+            let wrong_models = models(&fast, &fast);
+            assert!(
+                query_admitted(
+                    &cx,
+                    &old_reader,
+                    None,
+                    &wrong_models,
+                    plan(QueryMode::Full, true),
+                    |_, _| Ok(())
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "wrong quality is rejected before either inference"
+            );
+            let mut initial_deliveries = 0;
+            assert!(
+                query_admitted(
+                    &cx,
+                    &old_reader,
+                    None,
+                    &loaded,
+                    plan(QueryMode::Full, true),
+                    |phase, _| {
+                        assert_eq!(phase, "initial");
+                        initial_deliveries += 1;
+                        Err(bad("output is closed"))
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(initial_deliveries, 1);
+            assert_eq!(
+                calls(&fast, &quality),
+                (before.0 + 1, before.1),
+                "undelivered Initial must not start quality inference"
+            );
+
+            let before = calls(&fast, &quality);
+            let failed_quality = Models {
+                fast: fast.clone(),
+                quality: Some(Arc::new(FailingQuality {
+                    inner: Arc::clone(&quality),
+                })),
+            };
+            let mut phases = Vec::new();
+            assert!(
+                query_admitted(
+                    &cx,
+                    &old_reader,
+                    None,
+                    &failed_quality,
+                    plan(QueryMode::Full, true),
+                    |phase, _| {
+                        phases.push(phase);
+                        Ok(())
+                    }
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                phases,
+                ["initial"],
+                "failed refinement must not synthesize successful completion"
+            );
+            assert_eq!(calls(&fast, &quality), (before.0 + 1, before.1 + 1));
+
+            let root = admit_root(&root_path).unwrap();
+            let snapshot = first.open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES).unwrap();
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                first.clone(),
+                snapshot,
+                models(&fast, &quality),
+                (2, DEFAULT_IMAGE_BYTES),
+                true,
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            let request = b"{\"id\":\"progressive\",\"query\":\"how do I retry failed network requests\",\"stream\":true}\n";
+            serve_session(&cx, &mut session, &mut Cursor::new(request), &mut output)
+                .await
+                .unwrap();
+            let responses = frames(&output);
+            assert_eq!(responses.len(), 3);
+            assert_eq!(responses[0]["event"], "ready");
+            assert_eq!(responses[0]["default_mode"], "full");
+            assert_eq!(responses[0]["progressive_available"], true);
+            assert_eq!(responses[1]["phase"], "initial");
+            assert_eq!(responses[2]["phase"], "refined");
+            assert_eq!(responses[1]["authority"], responses[2]["authority"]);
+            assert_eq!(responses[1]["generation"], responses[2]["generation"]);
+            assert_eq!(responses[2]["topology"], "full_progressive");
+            for frame in &responses[1..] {
+                assert_eq!(frame["id"], "progressive");
+                assert_eq!(frame["request"], 1);
+                assert_eq!(frame["authority"], serde_json::json!(first.authority));
+            }
+
+            struct ClosedAfterReady {
+                writes: usize,
+            }
+            impl Write for ClosedAfterReady {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.writes += 1;
+                    if self.writes == 1 {
+                        Ok(bytes.len())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "closed",
+                        ))
+                    }
+                }
+
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let before = calls(&fast, &quality);
+            let mut closed = ClosedAfterReady { writes: 0 };
+            let input = [request.as_slice(), request.as_slice()].concat();
+            assert!(
+                serve_session(&cx, &mut session, &mut Cursor::new(input), &mut closed)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                closed.writes, 2,
+                "no failure frame is written after a broken result stream"
+            );
+            assert_eq!(
+                calls(&fast, &quality),
+                (before.0 + 1, before.1),
+                "failed initial delivery stops quality and the next request"
+            );
+
+            let metadata_input = parent.join("metadata.jsonl");
+            fs::write(
+                &metadata_input,
+                concat!(
+                    "{\"op\":\"upsert\",\"id\":\"zeta\",\"content\":\"retry network requests\",",
+                    "\"title\":\"Refreshed title\",\"metadata\":{\"version\":\"metadata-only\"}}\n",
+                ),
+            )
+            .unwrap();
+            let metadata_options =
+                update_options(&parent, &first_path, "metadata", &metadata_input, 7);
+            let before = calls(&fast, &quality);
+            let mut requested = Vec::new();
+            update_generation_with_loader(&cx, &metadata_options, &mut Vec::new(), |tier| {
+                requested.push(tier);
+                Ok(match tier {
+                    EmbedderTierTag::Fast => fast.clone(),
+                    EmbedderTierTag::Quality => quality.clone(),
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(requested, [EmbedderTierTag::Fast, EmbedderTierTag::Quality]);
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "metadata-only edit reuses both admitted vectors"
+            );
+            let second = Receipt::read(&metadata_options.receipt).unwrap();
+            assert_eq!(second.identity, first.identity);
+            assert_eq!(second.quality_identity, first.quality_identity);
+            let second_reader = second.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(
+                session.snapshot.authority(),
+                first.authority().unwrap(),
+                "warm serving never adopts a head implicitly"
+            );
+            session
+                .activate(
+                    &cx,
+                    &AuthorityActivateRequest {
+                        op: "activate".to_owned(),
+                        id: Some("adopt-metadata".to_owned()),
+                        receipt: metadata_options.receipt.clone(),
+                        expected_authority: first.authority.clone(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(session.snapshot.authority(), second.authority().unwrap());
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "activation requires no model inference"
+            );
+
+            let changed_input = parent.join("changed.jsonl");
+            fs::write(&changed_input, concat!(
+                "{\"op\":\"upsert\",\"id\":\"zeta\",\"content\":\"retry changed network requests\",\"metadata\":{\"version\":\"changed\"}}\n",
+                "{\"op\":\"delete\",\"id\":\"alpha\"}\n",
+            )).unwrap();
+            let changed_options = update_options(
+                &parent,
+                &metadata_options.receipt,
+                "changed",
+                &changed_input,
+                8,
+            );
+            update_generation_with_loader(&cx, &changed_options, &mut Vec::new(), |tier| {
+                Ok(match tier {
+                    EmbedderTierTag::Fast => fast.clone(),
+                    EmbedderTierTag::Quality => quality.clone(),
+                })
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                calls(&fast, &quality),
+                (before.0 + 1, before.1 + 1),
+                "only the changed document is embedded in each tier"
+            );
+            let third = Receipt::read(&changed_options.receipt).unwrap();
+            let third_reader = third.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(third.documents, 1);
+            assert_eq!(third.quality_identity, first.quality_identity);
+            assert_eq!(
+                third_reader.source_documents(&cx, MAX_INPUT_BYTES).unwrap()[0].content,
+                "retry changed network requests"
+            );
+            let original = old_reader.source_documents(&cx, MAX_INPUT_BYTES).unwrap();
+            assert_eq!(original.len(), 2);
+            assert_eq!(
+                original
+                    .iter()
+                    .find(|document| document.id == "zeta")
+                    .unwrap()
+                    .content,
+                "retry network requests"
+            );
+            assert_eq!(fs::read(&first_path).unwrap(), initial_receipt);
+            assert_eq!(session.snapshot.authority(), second.authority().unwrap());
+
+            let before = calls(&fast, &quality);
+            let mut recovery = parse(&["authority-recover", "--receipt", "unused"])
+                .unwrap()
+                .unwrap();
+            recovery.receipt = changed_options.receipt.clone();
+            let mut output = Vec::new();
+            recover(&cx, &recovery, &mut output).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["publication"], "committed");
+            assert_eq!(report["serving"], "activated");
+            assert_eq!(calls(&fast, &quality), before);
+
+            // Only the saved receipts cross this rollback command boundary.
+            let mut rollback_options = parse(&rollback_arguments()).unwrap().unwrap();
+            rollback_options.from_receipt = Some(changed_options.receipt.clone());
+            rollback_options.target_receipt = Some(metadata_options.receipt.clone());
+            rollback_options.receipt = parent.join("restored.json");
+            rollback(&cx, &rollback_options, &mut Vec::new()).unwrap();
+            assert_eq!(calls(&fast, &quality), before);
+            let restored = Receipt::read(&rollback_options.receipt).unwrap();
+            assert_eq!(restored.schema, PROGRESSIVE_RECEIPT_SCHEMA);
+            assert_eq!(restored.generation, second.generation);
+            assert_eq!(restored.identity, second.identity);
+            assert_eq!(restored.quality_identity, second.quality_identity);
+            assert_eq!(
+                restored.authority().unwrap().sequence,
+                third.authority().unwrap().sequence + 1
+            );
+            let restored_reader = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(
+                restored_reader.retained_snapshot().manifest().components(),
+                second_reader.retained_snapshot().manifest().components()
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    restored_reader
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(
+                    second_reader
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap()
+                )
+                .unwrap(),
+            );
+            assert_eq!(
+                third_reader
+                    .source_documents(&cx, MAX_INPUT_BYTES)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            session
+                .activate(
+                    &cx,
+                    &AuthorityActivateRequest {
+                        op: "activate".to_owned(),
+                        id: Some("adopt-rollback".to_owned()),
+                        receipt: rollback_options.receipt.clone(),
+                        expected_authority: second.authority.clone(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(session.snapshot.authority(), restored.authority().unwrap());
+            assert_eq!(calls(&fast, &quality), before);
+            recovery.receipt = rollback_options.receipt;
+            recover(&cx, &recovery, &mut Vec::new()).unwrap();
+            assert_eq!(calls(&fast, &quality), before);
+        });
+    }
+
+    #[test]
+    fn full_warm_updates_refresh_both_tiers_scopes_and_source_then_recover_a_damaged_cohort() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent();
+            let fast = provider(false);
+            let quality = provider(true);
+            let first = publish_full(
+                &cx,
+                &parent,
+                &fast,
+                &quality,
+                vec![
+                    IndexableDocument::new("zeta", "retry network requests")
+                        .with_metadata("tenant", "A"),
+                    IndexableDocument::new("alpha", "garden flowers").with_metadata("tenant", "B"),
+                ],
+            )
+            .await;
+            assert_eq!(calls(&fast, &quality), (2, 2));
+            let original_receipt = fs::read(parent.join("initial.json")).unwrap();
+            let retained = Arc::new(first.open(&cx, DEFAULT_IMAGE_BYTES).unwrap());
+            let root = admit_root(&first.root).unwrap();
+            let fixed = Filter::parse(r#"{"metadata":{"tenant":"A"}}"#).unwrap();
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                first.clone(),
+                Arc::clone(&retained),
+                models(&fast, &quality),
+                (2, DEFAULT_IMAGE_BYTES),
+                true,
+            )
+            .unwrap()
+            .with_filter(&cx, Some(fixed), MAX_INPUT_BYTES)
+            .unwrap()
+            .with_updates(2, MAX_INPUT_BYTES)
+            .unwrap();
+
+            let empty = retained.scope(&cx, MAX_INPUT_BYTES, |_| Ok(false)).unwrap();
+            let before = calls(&fast, &quality);
+            let wrong = models(&fast, &fast);
+            let mut phases = Vec::new();
+            assert!(
+                query_admitted(
+                    &cx,
+                    &retained,
+                    Some(&empty),
+                    &wrong,
+                    plan(QueryMode::Full, true),
+                    |phase, _| {
+                        phases.push(phase);
+                        Ok(())
+                    },
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                phases.is_empty(),
+                "empty scopes still admit both identities before delivery"
+            );
+            for cancel_after_initial in [false, true] {
+                let loaded = models(&fast, &quality);
+                let mut phases = Vec::new();
+                let outcome = query_admitted(
+                    &cx,
+                    &retained,
+                    Some(&empty),
+                    &loaded,
+                    plan(QueryMode::Full, true),
+                    |phase, hits| {
+                        phases.push(phase);
+                        assert!(hits.is_empty());
+                        if cancel_after_initial {
+                            cx.set_cancel_requested(true);
+                            Ok(())
+                        } else {
+                            Err(bad("empty Initial delivery failed"))
+                        }
+                    },
+                )
+                .await;
+                cx.set_cancel_requested(false);
+                assert!(outcome.is_err());
+                assert_eq!(
+                    phases,
+                    ["initial"],
+                    "cancellation or broken output must not synthesize Refined"
+                );
+            }
+            assert_eq!(calls(&fast, &quality), before);
+
+            let before = calls(&fast, &quality);
+            let response = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({
+                    "id":"quality", "query":"retry", "mode":"quality", "filter":{},
+                })],
+            )
+            .await;
+            assert_eq!(response.len(), 2);
+            assert_eq!(response[1]["phase"], "quality");
+            assert_eq!(response[1]["results"][0]["doc_id"], "zeta");
+            assert_eq!(calls(&fast, &quality), (before.0, before.1 + 1));
+
+            let before = calls(&fast, &quality);
+            let response = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({
+                    "id":"scoped-phases", "query":"retry", "stream":true,
+                    "filter":{"ids":["zeta"]},
+                })],
+            )
+            .await;
+            assert_eq!(response.len(), 3);
+            assert_eq!(response[1]["phase"], "initial");
+            assert_eq!(response[2]["phase"], "refined");
+            for frame in &response[1..] {
+                assert_eq!(frame["authority"], serde_json::json!(first.authority));
+                assert_eq!(frame["id"], "scoped-phases");
+                assert_eq!(frame["scope"]["eligible_documents"], 1);
+                assert_eq!(frame["results"].as_array().unwrap().len(), 1);
+                assert_eq!(frame["results"][0]["doc_id"], "zeta");
+            }
+            assert_eq!(calls(&fast, &quality), (before.0 + 1, before.1 + 1));
+            let before = calls(&fast, &quality);
+            let response = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({
+                    "id":"empty-phases", "query":"retry", "mode":"full", "stream":true,
+                    "filter":{"ids":["alpha"]},
+                })],
+            )
+            .await;
+            assert_eq!(response.len(), 3);
+            assert_eq!(response[1]["phase"], "initial");
+            assert_eq!(response[2]["phase"], "refined");
+            for frame in &response[1..] {
+                assert_eq!(frame["id"], "empty-phases");
+                assert_eq!(frame["request"], 1);
+                assert_eq!(frame["authority"], serde_json::json!(first.authority));
+                assert_eq!(frame["scope"]["eligible_documents"], 0);
+                assert!(frame["results"].as_array().unwrap().is_empty());
+            }
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "an empty intersection starts neither producer"
+            );
+            let response = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({
+                    "id":"after-empty", "query":"retry", "mode":"fast",
+                })],
+            )
+            .await;
+            assert_eq!(response.len(), 2);
+            assert_eq!(response[1]["event"], "results");
+            assert_eq!(response[1]["results"][0]["doc_id"], "zeta");
+            assert_eq!(calls(&fast, &quality), (before.0 + 1, before.1));
+
+            let before = calls(&fast, &quality);
+            let metadata_path = parent.join("metadata.json");
+            let response = exchange(&cx, &mut session, &[serde_json::json!({
+                "op":"update", "id":"metadata", "expected_authority":first.authority,
+                "work_dir":parent.join("metadata-work"), "new_receipt":metadata_path,
+                "source_low":2, "source_high":7, "changes":[
+                    {"op":"upsert", "id":"zeta", "content":"retry network requests", "metadata":{"tenant":"B"}},
+                    {"op":"upsert", "id":"alpha", "content":"garden flowers", "title":"Now allowed", "metadata":{"tenant":"A"}}
+                ],
+            })]).await;
+            assert_eq!(response[1]["event"], "updated");
+            assert_eq!(response[1]["publication"], "committed");
+            assert_eq!(response[1]["serving"], "activated");
+            assert_eq!(response[1]["scope"]["eligible_documents"], 1);
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "membership changes reuse each tier's unchanged content vectors"
+            );
+            let second = Receipt::read(&metadata_path).unwrap();
+            assert_eq!(second.identity, first.identity);
+            assert_eq!(second.quality_identity, first.quality_identity);
+            assert_eq!(session.receipt.authority, second.authority);
+            let metadata_reader = Arc::clone(&session.snapshot);
+
+            let windows = serde_json::json!([
+                {"doc_id":"zeta", "include_metadata":true},
+                {"doc_id":"alpha", "include_metadata":true},
+            ]);
+            let response = exchange(&cx, &mut session, &[
+                serde_json::json!({"op":"fetch", "expected_authority":first.authority, "documents":windows}),
+                serde_json::json!({"op":"fetch", "expected_authority":second.authority, "documents":windows}),
+                serde_json::json!({"query":"retry", "mode":"quality", "filter":{}}),
+            ]).await;
+            assert_eq!(response[1]["event"], "failed");
+            assert!(response[1].get("documents").is_none());
+            assert_eq!(response[2]["event"], "terminal");
+            assert_eq!(
+                response[2]["documents"][0],
+                serde_json::json!({"doc_id":"zeta", "status":"unavailable"})
+            );
+            assert_eq!(response[2]["documents"][1]["content"], "garden flowers");
+            assert_eq!(response[2]["documents"][1]["title"], "Now allowed");
+            assert_eq!(
+                response[2]["authority"],
+                serde_json::json!(second.authority)
+            );
+            assert_eq!(response[3]["results"].as_array().unwrap().len(), 1);
+            assert_eq!(response[3]["results"][0]["doc_id"], "alpha");
+            assert_eq!(
+                calls(&fast, &quality),
+                (before.0, before.1 + 1),
+                "source access does no inference and quality never invokes fast"
+            );
+
+            let before = calls(&fast, &quality);
+            let changed_path = parent.join("changed.json");
+            let response = exchange(&cx, &mut session, &[serde_json::json!({
+                "op":"update", "id":"changed", "expected_authority":second.authority,
+                "work_dir":parent.join("changed-work"), "new_receipt":changed_path,
+                "source_low":2, "source_high":8, "changes":[
+                    {"op":"upsert", "id":"alpha", "content":"discarded input"},
+                    {"op":"upsert", "id":"alpha", "content":"retry revised garden", "metadata":{"tenant":"A"}},
+                    {"op":"delete", "id":"zeta"},
+                    {"op":"upsert", "id":"private", "content":"PRIVATE_SOURCE", "metadata":{"tenant":"B"}}
+                ],
+            })]).await;
+            assert_eq!(response[1]["event"], "updated");
+            assert_eq!(response[1]["documents"], 2);
+            assert_eq!(response[1]["edited_ids"], 3);
+            assert_eq!(response[1]["scope"]["eligible_documents"], 1);
+            assert_eq!(
+                calls(&fast, &quality),
+                (before.0 + 2, before.1 + 2),
+                "only final changed and new content is inferred by each retained producer"
+            );
+            let third = Receipt::read(&changed_path).unwrap();
+            assert_eq!(third.identity, first.identity);
+            assert_eq!(third.quality_identity, first.quality_identity);
+            assert_eq!(session.snapshot.authority(), third.authority().unwrap());
+            let before = calls(&fast, &quality);
+            let response = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({
+                    "op":"fetch", "expected_authority":third.authority,
+                    "documents":[{"doc_id":"alpha"},{"doc_id":"private"},{"doc_id":"zeta"}],
+                })],
+            )
+            .await;
+            assert_eq!(
+                response[1]["documents"][0]["content"],
+                "retry revised garden"
+            );
+            for (row, id) in response[1]["documents"].as_array().unwrap()[1..]
+                .iter()
+                .zip(["private", "zeta"])
+            {
+                assert_eq!(
+                    *row,
+                    serde_json::json!({"doc_id":id, "status":"unavailable"})
+                );
+            }
+            assert_eq!(calls(&fast, &quality), before);
+            let old_source = retained.source_documents(&cx, MAX_INPUT_BYTES).unwrap();
+            assert_eq!(
+                old_source
+                    .iter()
+                    .find(|document| document.id == "alpha")
+                    .unwrap()
+                    .content,
+                "garden flowers"
+            );
+            assert_eq!(
+                old_source
+                    .iter()
+                    .find(|document| document.id == "alpha")
+                    .unwrap()
+                    .metadata["tenant"],
+                "B"
+            );
+            assert_eq!(
+                fs::read(parent.join("initial.json")).unwrap(),
+                original_receipt
+            );
+
+            let current_vector = session
+                .snapshot
+                .retained_snapshot()
+                .manifest()
+                .components()
+                .get(GenerationComponentRole::Vector)
+                .unwrap();
+            let damaged_path = third.root.join(component_object_name_v1(
+                GenerationComponentRole::Vector,
+                current_vector.sha256,
+            ));
+            assert_ne!(
+                current_vector.sha256,
+                metadata_reader
+                    .retained_snapshot()
+                    .manifest()
+                    .components()
+                    .get(GenerationComponentRole::Vector)
+                    .unwrap()
+                    .sha256,
+                "damage must affect only the current complete pair"
+            );
+            let healthy_image = parent.join("retained-current-vector");
+            fs::rename(&damaged_path, &healthy_image).unwrap();
+            write_immutable(&cx, &damaged_path, b"damaged-full-vector-evidence").unwrap();
+            assert!(third.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+            let mut options = parse(&rollback_arguments()).unwrap().unwrap();
+            options.from_receipt = Some(changed_path);
+            options.target_receipt = Some(metadata_path);
+            options.receipt = parent.join("restored.json");
+            assert!(rollback(&cx, &options, &mut Vec::new()).is_err());
+            assert!(!options.receipt.exists());
+            options.allow_damaged_current = true;
+            let mut output = Vec::new();
+            rollback(&cx, &options, &mut output).unwrap();
+            let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(report["current_admission"], "control_manifest_only");
+            assert_eq!(report["publication"], "committed");
+            assert_eq!(report["serving"], "activated");
+            let restored = Receipt::read(&options.receipt).unwrap();
+            assert_eq!(restored.schema, PROGRESSIVE_RECEIPT_SCHEMA);
+            assert_eq!(restored.generation, second.generation);
+            assert_eq!(restored.identity, second.identity);
+            assert_eq!(restored.quality_identity, second.quality_identity);
+            assert_eq!(
+                fs::read(&damaged_path).unwrap(),
+                b"damaged-full-vector-evidence"
+            );
+            assert!(healthy_image.exists());
+            assert_eq!(calls(&fast, &quality), before);
+
+            let response = exchange(&cx, &mut session, &[serde_json::json!({
+                "op":"fetch", "expected_authority":third.authority, "documents":[{"doc_id":"alpha"}],
+            })]).await;
+            assert_eq!(
+                response[1]["documents"][0]["content"],
+                "retry revised garden"
+            );
+            assert_eq!(response[1]["authority"], serde_json::json!(third.authority));
+            session
+                .activate(
+                    &cx,
+                    &AuthorityActivateRequest {
+                        op: "activate".to_owned(),
+                        id: None,
+                        receipt: options.receipt.clone(),
+                        expected_authority: third.authority.clone(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                session.snapshot.retained_snapshot().manifest().components(),
+                metadata_reader.retained_snapshot().manifest().components(),
+                "rollback reuses both exact vector images and the original lexical source"
+            );
+            let response = exchange(&cx, &mut session, &[
+                serde_json::json!({"op":"fetch", "expected_authority":third.authority, "documents":[{"doc_id":"alpha"}]}),
+                serde_json::json!({"op":"fetch", "expected_authority":restored.authority, "documents":[{"doc_id":"alpha", "include_metadata":true},{"doc_id":"zeta"}]}),
+            ]).await;
+            assert_eq!(response[1]["event"], "failed");
+            assert_eq!(response[2]["documents"][0]["content"], "garden flowers");
+            assert_eq!(response[2]["documents"][0]["title"], "Now allowed");
+            assert_eq!(
+                response[2]["documents"][1],
+                serde_json::json!({"doc_id":"zeta", "status":"unavailable"})
+            );
+            assert_eq!(
+                response[2]["authority"],
+                serde_json::json!(restored.authority)
+            );
+            assert_eq!(
+                calls(&fast, &quality),
+                before,
+                "rollback, activation and fetching retain both models without inference"
+            );
         });
     }
 }

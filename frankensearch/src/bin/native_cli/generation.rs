@@ -1,4 +1,4 @@
-//! Executable build, fixed-authority publication, and retained single-tier search.
+//! Executable build, fixed-authority publication, and retained hybrid search.
 //!
 //! Staging creates a fresh private root under a trusted parent. The existing
 //! qualified-root publisher independently admits and syncs every staged image
@@ -19,10 +19,12 @@ use frankensearch::native_ann::builder::scope::NativeScopedGenerationSnapshot;
 use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
 };
-use frankensearch::native_ann::{NativeGenerationSnapshot, NativeRetrievalMode};
+use frankensearch::native_ann::{
+    NativeGenerationSnapshot, NativeGenerationTopology, NativeRetrievalMode, NativeSearchPhase,
+};
 use frankensearch::{
     Cx, Embedder, GenerationActivationV1, GenerationCandidateV1, GenerationPublisherV1,
-    IndexableDocument, SearchError,
+    IndexableDocument, ScoredResult, SearchError,
 };
 use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1, CommitRange, EmbedderTierTag,
@@ -47,19 +49,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Result, SCHEMA, bad, emit,
-    encode, execution_context, filter::Filter, models, new_generation, new_path,
+    MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Models, Result, SCHEMA,
+    bad, emit, encode, execution_context, filter::Filter, models, new_generation, new_path,
     positive as number, read_documents, serve::source, update as mutations, validate_query, value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
+const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v3";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_AUTHORITY_MUTATIONS: usize = 1_000;
 const PROFILE: GenerationRootSecurityProfileV1 = GenerationRootSecurityProfileV1::CooperativeLocal;
-const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
+const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topology)\n\n\
   authority-index --root NEW_ROOT --work-dir NEW_DIR --receipt NEW_JSON\n\
-      --tier fast|quality --source-low N --source-high N --cooperative-local\n\
+      --tier fast|quality|full --source-low N --source-high N --cooperative-local\n\
       [--input JSONL] [--model-dir DIR] [--batch-size N]\n\
       [--quality-backend onnx|native-int8|native-f32|native-multilingual]\n\
       [--quality-model-dir DIR] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
@@ -74,7 +77,8 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--filter JSON] [--max-source-bytes N] [--max-image-bytes N]\n\n\
+      [--mode fast|quality|full] [--stream] [--filter JSON]\n\
+      [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-fetch --receipt JSON --doc-id ID [--offset-bytes N] [--max-bytes N]\n\
       [--include-metadata] [--filter JSON] [--max-source-bytes N]\n\
       [--max-image-bytes N]\n\n\
@@ -84,7 +88,13 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
   authority-rollback --from-receipt CURRENT_JSON --target-receipt PREDECESSOR_JSON\n\
       --receipt NEW_JSON [--allow-damaged-current] [--max-image-bytes N]\n\n\
-This explicit route builds one FSVI v2 tier plus a retained Quill image.\n\
+This route builds one or two FSVI v2 tiers plus a retained Quill image.\n\
+Full generations bind both producers and complete document coverage to one\n\
+authority. Full search independently retrieves quality candidates, including\n\
+documents absent from fast results. --stream emits Initial then Refined from\n\
+the same retained generation. --mode fast or quality loads only that producer.\n\
+Full generations currently support exact retrieval; partial/sharded cohorts\n\
+and two-tier HNSW are not accepted by this fixed-authority route.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
 missing or invalid graphs fail admission without substituting exact retrieval.\n\
@@ -92,9 +102,9 @@ Quality-only generations load and query their quality model directly. Models\n\
 are local-only; unavailable or mismatched models fail without substitution.\n\
 Source-low/high identify the inclusive source checkpoint supplied by the caller.\n\
 Roots, work directories and receipts must be new, separate locations.\n\
-Rebuild retains the selected root, tier and security profile, replaces the whole\n\
+Rebuild retains the selected root, topology and security profile, replaces the whole\n\
 source cohort, and requires a new work directory and receipt outside the root.\n\
-Source boundaries cannot regress. A different producer requires --migrate-model.\n\
+Source boundaries cannot regress. A change to either producer requires --migrate-model.\n\
 With --retained-source, rebuild reads complete stored documents from the admitted\n\
 generation and preserves its source checkpoint, without reading JSONL or stdin.\n\
 This excludes --input and --source-low/high. --max-source-bytes bounds retained\n\
@@ -106,7 +116,7 @@ Concurrent publication refuses the captured old selection; retry explicitly\n\
 from the winning receipt. Rebuild never edits the old generation's images.\n\
 Update applies bounded upsert/delete JSONL to the retained source, with the last\n\
 operation for each ID winning. It reuses unchanged content vectors and preserves\n\
-the selected producer, tier, precision, and retrieval policy. Only changed or new\n\
+the selected producers, topology, precision, and retrieval policy. Only changed or new\n\
 content is embedded; complete vector, graph, and Quill images are still produced.\n\
 The final cohort must be nonempty and satisfy the combined encoded-source limits.\n\
 Updates require nonbackward source checkpoints and a new work directory/receipt.\n\
@@ -121,7 +131,7 @@ authority-recover reconciles that attempt without republishing or loading models
 authority-rollback restores the immediate authenticated predecessor of a healthy\n\
 current generation. It publishes a new higher authority sequence using the\n\
 target's original images, producer and source checkpoint, without inference.\n\
-Both receipts must name the same root, security profile and tier. The target\n\
+Both receipts must name the same root, security profile and topology. The target\n\
 must still occupy the predecessor slot; arbitrary history is not discovered.\n\
 The new receipt is outside the root and supports authority-recover after a crash.\n\
 Rollback normally admits the complete current generation. Explicit\n\
@@ -135,12 +145,14 @@ Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
 by authority-index. Search refuses a head different from the receipt.\n\
 The default encoded-image budget is 256 MiB, checked before component reads.\n\
-authority-serve retains one admitted generation and its local model for bounded\n\
-JSONL requests: {\"id\":\"q1\",\"query\":\"text\",\"limit\":10}. It never follows a new\n\
+authority-serve retains one admitted generation and its local models for bounded\n\
+JSONL requests: {\"id\":\"q1\",\"query\":\"text\",\"limit\":10}. Requests may select\n\
+\"mode\":\"fast\"|\"quality\"|\"full\" and \"stream\":true. Full is the default for\n\
+a full generation. Streaming emits separate Initial and Refined frames. It never follows a new\n\
 authority implicitly. With --allow-activation, an explicit request may select a\n\
 new receipt: {\"op\":\"activate\",\"receipt\":\"/absolute/new.json\",\n\
 \"expected_authority\":[...the current ready/results authority bytes...]}.\n\
-Activation keeps the same qualified root, tier, security profile and producer.\n\
+Activation keeps the same qualified root, topology, security profile and producers.\n\
 It admits the complete currently selected successor before swapping readers;\n\
 rejection retains the previous reader and returns a bounded failed response.\n\
 Authority sequence must advance, including rollback to older artifact generations.\n\
@@ -191,6 +203,24 @@ enum Command {
     Rollback,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum QueryMode {
+    Fast,
+    Quality,
+    Full,
+}
+
+impl QueryMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Quality => "quality",
+            Self::Full => "full",
+        }
+    }
+}
+
 struct Options {
     command: Command,
     root: Option<PathBuf>,
@@ -202,6 +232,9 @@ struct Options {
     models: Option<PathBuf>,
     quality: models::QualityOptions,
     tier: Option<EmbedderTierTag>,
+    progressive: bool,
+    mode: Option<QueryMode>,
+    stream: bool,
     retrieval: Option<NativeBuildRetrieval>,
     source_low: Option<u64>,
     source_high: Option<u64>,
@@ -262,6 +295,9 @@ impl Options {
             models: None,
             quality: models::QualityOptions::default(),
             tier: None,
+            progressive: false,
+            mode: None,
+            stream: false,
             retrieval: None,
             source_low: None,
             source_high: None,
@@ -308,7 +344,7 @@ impl Options {
                 }
                 "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
                 "--retained-source" if command == Command::Rebuild => {
-                    options.retained_source = true
+                    options.retained_source = true;
                 }
                 "--max-source-bytes"
                     if matches!(
@@ -328,7 +364,7 @@ impl Options {
                     options.filter = Some(Filter::parse(&value(&mut args)?)?);
                 }
                 "--allow-activation" if command == Command::Serve => {
-                    options.allow_activation = true
+                    options.allow_activation = true;
                 }
                 "--allow-updates" if command == Command::Serve => options.allow_updates = true,
                 "--model-dir"
@@ -376,7 +412,11 @@ impl Options {
                     options.tier = Some(match value(&mut args)?.as_str() {
                         "fast" => EmbedderTierTag::Fast,
                         "quality" => EmbedderTierTag::Quality,
-                        _ => return Err(bad("authority tier must be fast or quality")),
+                        "full" => {
+                            options.progressive = true;
+                            EmbedderTierTag::Fast
+                        }
+                        _ => return Err(bad("authority tier must be fast, quality, or full")),
                     });
                 }
                 "--source-low"
@@ -428,6 +468,19 @@ impl Options {
                 "--limit" if matches!(command, Command::Search | Command::Serve) => {
                     options.limit = number(&value(&mut args)?, 1_000)?;
                 }
+                "--mode" if command == Command::Search => {
+                    options.mode = Some(match value(&mut args)?.as_str() {
+                        "fast" => QueryMode::Fast,
+                        "quality" => QueryMode::Quality,
+                        "full" => QueryMode::Full,
+                        _ => {
+                            return Err(bad(
+                                "authority search mode must be fast, quality, or full",
+                            ));
+                        }
+                    });
+                }
+                "--stream" if command == Command::Search => options.stream = true,
                 _ => return Err(bad("unknown or inapplicable authority option")),
             }
         }
@@ -446,7 +499,8 @@ impl Options {
                     .ok_or_else(|| bad("authority-index requires --tier"))?;
                 options
                     .quality
-                    .validate_usage(tier == EmbedderTierTag::Quality)?;
+                    .validate_usage(tier == EmbedderTierTag::Quality || options.progressive)?;
+                validate_full_retrieval(options.progressive, options.build_retrieval(None))?;
                 options.source_cut()?;
             }
             Command::Search => validate_query(
@@ -553,6 +607,15 @@ fn source_sequence(text: &str) -> Result<u64> {
         .map_err(|_| bad("source sequence must be an unsigned 64-bit integer"))
 }
 
+fn validate_full_retrieval(progressive: bool, retrieval: NativeBuildRetrieval) -> Result<()> {
+    if progressive && !matches!(retrieval, NativeBuildRetrieval::Exact) {
+        return Err(bad(
+            "full authority generations currently require exact retrieval for both tiers",
+        ));
+    }
+    Ok(())
+}
+
 fn retrieval_name(mode: NativeRetrievalMode) -> &'static str {
     match mode {
         NativeRetrievalMode::Ann => "hnsw",
@@ -628,6 +691,8 @@ struct Receipt {
     generation: ArtifactGenerationIdentityV1,
     identity: FrozenEmbeddingIdentityBundleV1,
     tier: EmbedderTierTag,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality_identity: Option<FrozenEmbeddingIdentityBundleV1>,
     documents: u64,
     image_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -665,8 +730,13 @@ impl Receipt {
             return Err(bad("invalid authority receipt contract"));
         }
         let authority = self.authority()?;
-        match (self.schema.as_str(), self.attempt.as_ref()) {
-            (RECEIPT_SCHEMA, Some(attempt)) => {
+        match (
+            self.schema.as_str(),
+            self.attempt.as_ref(),
+            self.quality_identity.as_ref(),
+        ) {
+            (RECEIPT_SCHEMA, Some(attempt), None)
+            | (PROGRESSIVE_RECEIPT_SCHEMA, Some(attempt), Some(_)) => {
                 // This CLI never supplies an external floor. A saved attempt
                 // requiring one cannot be downgraded during a process restart.
                 if attempt.requires_floor {
@@ -676,17 +746,23 @@ impl Receipt {
                 }
                 attempt.restore(self.root_id, authority)?;
             }
-            (SELECTION_ONLY_RECEIPT_SCHEMA, None) => {}
+            (SELECTION_ONLY_RECEIPT_SCHEMA, None, None) => {}
             _ => {
                 return Err(bad(
                     "authority receipt schema and prepared attempt disagree",
                 ));
             }
         }
+        if self.quality_identity.is_some() && self.tier != EmbedderTierTag::Fast {
+            return Err(bad(
+                "a full authority receipt must bind fast and quality independently",
+            ));
+        }
         if self.image_bytes < authority.manifest_len {
             return Err(bad("authority receipt image length is inconsistent"));
         }
         self.binding()?;
+        self.quality_binding()?;
         Ok(())
     }
 
@@ -704,6 +780,47 @@ impl Receipt {
 
     fn binding(&self) -> Result<FsviV2IdentityBinding> {
         FsviV2IdentityBinding::new(self.generation, self.identity.clone()).map_err(Into::into)
+    }
+
+    fn quality_binding(&self) -> Result<Option<FsviV2IdentityBinding>> {
+        self.quality_identity
+            .as_ref()
+            .map(|identity| {
+                FsviV2IdentityBinding::new(self.generation, identity.clone()).map_err(Into::into)
+            })
+            .transpose()
+    }
+
+    fn topology(&self) -> NativeGenerationTopology {
+        if self.quality_identity.is_some() {
+            NativeGenerationTopology::FullProgressive
+        } else if self.tier == EmbedderTierTag::Quality {
+            NativeGenerationTopology::QualityOnly
+        } else {
+            NativeGenerationTopology::FastOnly
+        }
+    }
+
+    fn topology_name(&self) -> &'static str {
+        match self.topology() {
+            NativeGenerationTopology::FastOnly => "fast_only",
+            NativeGenerationTopology::QualityOnly => "quality_only",
+            NativeGenerationTopology::FullProgressive => "full_progressive",
+        }
+    }
+
+    fn query_mode(&self, requested: Option<QueryMode>) -> Result<QueryMode> {
+        let default = match self.topology() {
+            NativeGenerationTopology::FastOnly => QueryMode::Fast,
+            NativeGenerationTopology::QualityOnly => QueryMode::Quality,
+            NativeGenerationTopology::FullProgressive => QueryMode::Full,
+        };
+        let mode = requested.unwrap_or(default);
+        if mode == default || self.quality_identity.is_some() {
+            Ok(mode)
+        } else {
+            Err(serve_refused("query_tier_unavailable"))
+        }
     }
 
     fn open(&self, cx: &Cx, max_image_bytes: usize) -> Result<NativeGenerationSnapshot> {
@@ -749,15 +866,29 @@ impl Receipt {
                 "the fixed authority head differs from the trusted receipt",
             ));
         }
-        let snapshot = NativeGenerationSnapshot::admit_exact(
-            cx,
-            opened,
-            &self.binding()?,
-            DEFAULT_SCHEMA,
-            QuillConfig::default(),
-            max_image_bytes,
-        )?;
-        if snapshot.tier() != self.tier || snapshot.metadata().total_documents != self.documents {
+        let snapshot = if let Some(quality) = self.quality_binding()? {
+            NativeGenerationSnapshot::admit_progressive(
+                cx,
+                opened,
+                &self.binding()?,
+                &quality,
+                DEFAULT_SCHEMA,
+                QuillConfig::default(),
+                max_image_bytes,
+            )?
+        } else {
+            NativeGenerationSnapshot::admit_exact(
+                cx,
+                opened,
+                &self.binding()?,
+                DEFAULT_SCHEMA,
+                QuillConfig::default(),
+                max_image_bytes,
+            )?
+        };
+        if snapshot.topology() != self.topology()
+            || snapshot.metadata().total_documents != self.documents
+        {
             return Err(bad(
                 "the retained generation differs from the selected tier or document count",
             ));
@@ -951,6 +1082,8 @@ fn stage_and_publish(
                     .generation()
                     .sequence
                 || built.metadata().vector_artifacts[0].embedder_tier != snapshot.tier()
+                || built.quality_binding().is_some()
+                    != (snapshot.topology() == NativeGenerationTopology::FullProgressive)
             {
                 return Err(bad(
                     "a rebuild must advance the artifact generation and preserve its tier",
@@ -1002,7 +1135,12 @@ fn stage_and_publish(
         new_generation(1)?.nonce,
     )?;
     let receipt = Receipt {
-        schema: RECEIPT_SCHEMA.to_owned(),
+        schema: if built.quality_binding().is_some() {
+            PROGRESSIVE_RECEIPT_SCHEMA
+        } else {
+            RECEIPT_SCHEMA
+        }
+        .to_owned(),
         root: root_path.to_path_buf(),
         root_id,
         profile: PROFILE.as_str().to_owned(),
@@ -1010,6 +1148,9 @@ fn stage_and_publish(
         generation: built.binding().generation(),
         identity: built.binding().frozen_identity().clone(),
         tier: built.metadata().vector_artifacts[0].embedder_tier,
+        quality_identity: built
+            .quality_binding()
+            .map(|binding| binding.frozen_identity().clone()),
         documents: built.metadata().total_documents,
         image_bytes: candidate.owned_image_bytes(),
         attempt: Some(SavedAttempt::from_permit(&attempt, false)),
@@ -1169,14 +1310,33 @@ async fn index(
         ));
     }
     let tier = options.tier.ok_or_else(|| bad("missing tier"))?;
-    let model = models::load_single(cx, options.models.as_deref(), tier, &options.quality, pool)?;
-    let built = NativeIndexBuilder::new(&work_path, new_generation(1)?, model)?
+    let mode = if options.progressive {
+        QueryMode::Full
+    } else if tier == EmbedderTierTag::Quality {
+        QueryMode::Quality
+    } else {
+        QueryMode::Fast
+    };
+    let loaded = load_authority_models(cx, options, mode, pool)?;
+    let mut builder = NativeIndexBuilder::new(&work_path, new_generation(1)?, loaded.fast)?
         .with_batch_size(options.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
         .with_fast_storage(NativeBuildPrecision::F32, options.build_retrieval(None))
-        .add_documents(documents)
-        .build_exact_generation(cx, tier, options.source_cut()?, options.max_image_bytes)
-        .await?;
+        .add_documents(documents);
+    if let Some(quality) = loaded.quality {
+        builder = builder
+            .with_quality_embedder(quality)?
+            .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)?;
+    }
+    let built = if options.progressive {
+        builder
+            .build_progressive_generation(cx, options.source_cut()?, options.max_image_bytes)
+            .await?
+    } else {
+        builder
+            .build_exact_generation(cx, tier, options.source_cut()?, options.max_image_bytes)
+            .await?
+    };
     let PublishedGeneration { receipt, .. } = stage_and_publish(
         cx,
         &root,
@@ -1255,7 +1415,7 @@ fn retained_rebuild_documents(
 }
 
 fn rebuild_identity(
-    selected: &Receipt,
+    expected: &FrozenEmbeddingIdentityBundleV1,
     model: &dyn Embedder,
     migrate_model: bool,
 ) -> Result<FrozenEmbeddingIdentityBundleV1> {
@@ -1273,7 +1433,7 @@ fn rebuild_identity(
     identity.storage.quantization = QuantizationFormat::F32;
     "little-endian".clone_into(&mut identity.storage.endianness);
     let frozen = identity.freeze()?;
-    if !migrate_model && frozen != selected.identity {
+    if !migrate_model && &frozen != expected {
         return Err(bad(
             "the rebuild producer differs from the selected generation; an intentional full-cohort migration requires --migrate-model",
         ));
@@ -1293,9 +1453,9 @@ async fn rebuild(
             .as_deref()
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
-    options
-        .quality
-        .validate_usage(selected.tier == EmbedderTierTag::Quality)?;
+    options.quality.validate_usage(
+        selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
+    )?;
     let work_path = new_path(
         options
             .work
@@ -1310,6 +1470,8 @@ async fn rebuild(
     // never substituted into this captured expected pair.
     let snapshot = selected.open_on_root(cx, &root, options.max_image_bytes)?;
     snapshot.authority().next_sequence()?;
+    let retrieval = options.build_retrieval(Some(snapshot.retrieval_configuration()));
+    validate_full_retrieval(selected.quality_identity.is_some(), retrieval)?;
     let source = options.rebuild_source_cut(&snapshot.metadata().commit_range)?;
     validate_successor_source(&snapshot.metadata().commit_range, &source)?;
     let sequence = selected
@@ -1330,25 +1492,50 @@ async fn rebuild(
             "the generation metadata contract requires a nonempty source cohort",
         ));
     }
-    let model = models::load_single(
-        cx,
-        options.models.as_deref(),
-        selected.tier,
-        &options.quality,
-        pool,
+    let loaded = load_authority_models(cx, options, selected.query_mode(None)?, pool)?;
+    let expected_identity = rebuild_identity(
+        &selected.identity,
+        loaded.fast.as_ref(),
+        options.migrate_model,
     )?;
-    let expected_identity = rebuild_identity(&selected, model.as_ref(), options.migrate_model)?;
-    let built = NativeIndexBuilder::new(&work_path, new_generation(sequence)?, model)?
+    let expected_quality = match (&selected.quality_identity, &loaded.quality) {
+        (Some(identity), Some(model)) => Some(rebuild_identity(
+            identity,
+            model.as_ref(),
+            options.migrate_model,
+        )?),
+        (None, None) => None,
+        _ => {
+            return Err(bad(
+                "the rebuild providers do not match the selected topology",
+            ));
+        }
+    };
+    let mut builder = NativeIndexBuilder::new(&work_path, new_generation(sequence)?, loaded.fast)?
         .with_batch_size(options.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-        .with_fast_storage(
-            NativeBuildPrecision::F32,
-            options.build_retrieval(Some(snapshot.retrieval_configuration())),
-        )
-        .add_documents(documents)
-        .build_exact_generation(cx, selected.tier, source, options.max_image_bytes)
-        .await?;
-    if built.binding().frozen_identity() != &expected_identity {
+        .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+        .add_documents(documents);
+    if let Some(quality) = loaded.quality {
+        builder = builder
+            .with_quality_embedder(quality)?
+            .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)?;
+    }
+    let built = if expected_quality.is_some() {
+        builder
+            .build_progressive_generation(cx, source, options.max_image_bytes)
+            .await?
+    } else {
+        builder
+            .build_exact_generation(cx, selected.tier, source, options.max_image_bytes)
+            .await?
+    };
+    if built.binding().frozen_identity() != &expected_identity
+        || built
+            .quality_binding()
+            .map(FsviV2IdentityBinding::frozen_identity)
+            != expected_quality.as_ref()
+    {
         return Err(bad("the provider changed after rebuild identity admission"));
     }
     let PublishedGeneration { receipt, .. } = stage_and_publish(
@@ -1367,7 +1554,8 @@ async fn rebuild(
             "serving": "activated", "retrieval": retrieval_name(built.retrieval_mode()),
             "receipt": receipt_path,
             "source": if options.retained_source { "retained_generation" } else { "input" },
-            "replaces": selected.authority, "model_migrated": receipt.identity != selected.identity,
+            "replaces": selected.authority,
+            "model_migrated": receipt.identity != selected.identity || receipt.quality_identity != selected.quality_identity,
             "selection": receipt,
         }),
     )
@@ -1394,11 +1582,18 @@ async fn update_generation(
         options,
         output,
         |tier| {
+            // A full update loads the two producers independently. Fast
+            // admission must not consume the quality backend's options.
+            let fast_options = models::QualityOptions::default();
             models::load_single(
                 &context,
                 options.models.as_deref(),
                 tier,
-                &options.quality,
+                if tier == EmbedderTierTag::Fast {
+                    &fast_options
+                } else {
+                    &options.quality
+                },
                 context.blocking_pool_handle(),
             )
         },
@@ -1496,7 +1691,7 @@ async fn build_and_publish_update(
     selected: &Receipt,
     snapshot: &NativeGenerationSnapshot,
     prepared: PreparedAuthorityUpdate,
-    model: Arc<dyn Embedder>,
+    loaded: &Models,
     scope: Option<(&Filter, usize)>,
 ) -> Result<PublishedGeneration> {
     let PreparedAuthorityUpdate {
@@ -1505,14 +1700,26 @@ async fn build_and_publish_update(
         edits,
         document_count,
     } = prepared;
-    let mut transaction = snapshot
-        .begin_update(
+    admit_serving_models(selected, loaded)?;
+    let transaction = if let Some(quality) = &loaded.quality {
+        snapshot.begin_progressive_update(
             cx,
             &spec.work,
             new_generation(sequence)?,
-            model,
+            Arc::clone(&loaded.fast),
+            Arc::clone(quality),
             spec.limits.max_source_bytes,
         )?
+    } else {
+        snapshot.begin_update(
+            cx,
+            &spec.work,
+            new_generation(sequence)?,
+            Arc::clone(&loaded.fast),
+            spec.limits.max_source_bytes,
+        )?
+    };
+    let mut transaction = transaction
         .with_batch_size(spec.limits.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
     for (id, document) in edits {
@@ -1522,14 +1729,24 @@ async fn build_and_publish_update(
             None => transaction.delete_document(id),
         };
     }
-    let built = Box::pin(transaction.build_exact_generation(
-        cx,
-        selected.tier,
-        spec.source,
-        spec.max_image_bytes,
-    ))
-    .await?;
-    if built.binding().frozen_identity() != &selected.identity {
+    let built = if selected.quality_identity.is_some() {
+        Box::pin(transaction.build_progressive_generation(cx, spec.source, spec.max_image_bytes))
+            .await?
+    } else {
+        Box::pin(transaction.build_exact_generation(
+            cx,
+            selected.tier,
+            spec.source,
+            spec.max_image_bytes,
+        ))
+        .await?
+    };
+    if built.binding().frozen_identity() != &selected.identity
+        || built
+            .quality_binding()
+            .map(FsviV2IdentityBinding::frozen_identity)
+            != selected.quality_identity.as_ref()
+    {
         return Err(bad("the provider changed after update identity admission"));
     }
     if built.metadata().total_documents != u64::try_from(document_count)? {
@@ -1555,10 +1772,10 @@ async fn update_generation_with_loader<F>(
     cx: &Cx,
     options: &Options,
     output: &mut impl Write,
-    load_model: F,
+    mut load_model: F,
 ) -> Result<()>
 where
-    F: FnOnce(EmbedderTierTag) -> Result<Arc<dyn Embedder>>,
+    F: FnMut(EmbedderTierTag) -> Result<Arc<dyn Embedder>>,
 {
     checkpoint(cx)?;
     let selected = Receipt::read(
@@ -1567,9 +1784,9 @@ where
             .as_deref()
             .ok_or_else(|| bad("missing predecessor receipt"))?,
     )?;
-    options
-        .quality
-        .validate_usage(selected.tier == EmbedderTierTag::Quality)?;
+    options.quality.validate_usage(
+        selected.tier == EmbedderTierTag::Quality || selected.quality_identity.is_some(),
+    )?;
     let root = admit_root(&selected.root)?;
     // Admit the receipt's exact current selection before reading input or
     // loading a model, and retain that expected authority through publication.
@@ -1600,9 +1817,16 @@ where
     let edit_count = prepared.edits.len();
     let receipt_path = prepared.spec.receipt.clone();
     checkpoint(cx)?;
-    let model = load_model(selected.tier)?;
+    let loaded = Models {
+        fast: load_model(selected.tier)?,
+        quality: if selected.quality_identity.is_some() {
+            Some(load_model(EmbedderTierTag::Quality)?)
+        } else {
+            None
+        },
+    };
     let published = Box::pin(build_and_publish_update(
-        cx, &root, &selected, &snapshot, prepared, model, None,
+        cx, &root, &selected, &snapshot, prepared, &loaded, None,
     ))
     .await?;
     let receipt = published.receipt;
@@ -1643,7 +1867,7 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     if selected.root != target.root
         || selected.root_id != target.root_id
         || selected.profile != target.profile
-        || selected.tier != target.tier
+        || selected.topology() != target.topology()
     {
         return Err(bad(
             "rollback receipts must select the same root, security profile, and tier",
@@ -1720,7 +1944,12 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         new_generation(1)?.nonce,
     )?;
     let receipt = Receipt {
-        schema: RECEIPT_SCHEMA.to_owned(),
+        schema: if target.quality_identity.is_some() {
+            PROGRESSIVE_RECEIPT_SCHEMA
+        } else {
+            RECEIPT_SCHEMA
+        }
+        .to_owned(),
         root: selected.root.clone(),
         root_id: selected.root_id,
         profile: selected.profile.clone(),
@@ -1728,6 +1957,7 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         generation: target.generation,
         identity: target.identity.clone(),
         tier: target.tier,
+        quality_identity: target.quality_identity.clone(),
         documents: target.documents,
         // The new activation manifest can be larger than the target's old
         // genesis manifest even though every component image is unchanged.
@@ -1778,6 +2008,164 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     })
 }
 
+fn load_authority_models(
+    cx: &Cx,
+    options: &Options,
+    mode: QueryMode,
+    pool: Option<BlockingPoolHandle>,
+) -> Result<Models> {
+    if mode == QueryMode::Full {
+        models::load(cx, options.models.as_deref(), true, &options.quality, pool)
+    } else {
+        let tier = if mode == QueryMode::Quality {
+            EmbedderTierTag::Quality
+        } else {
+            EmbedderTierTag::Fast
+        };
+        Ok(Models {
+            fast: models::load_single(cx, options.models.as_deref(), tier, &options.quality, pool)?,
+            quality: None,
+        })
+    }
+}
+
+struct QueryPlan<'a> {
+    text: &'a str,
+    limit: usize,
+    mode: QueryMode,
+    stream: bool,
+}
+
+/// Execute against one retained generation and deliver each completed phase
+/// before beginning the next. An output failure drops the lazy query immediately.
+async fn query_admitted<F>(
+    cx: &Cx,
+    snapshot: &NativeGenerationSnapshot,
+    scope: Option<&NativeScopedGenerationSnapshot>,
+    loaded: &Models,
+    plan: QueryPlan<'_>,
+    mut deliver: F,
+) -> Result<()>
+where
+    F: FnMut(&'static str, &[ScoredResult]) -> Result<()>,
+{
+    if plan.mode == QueryMode::Full {
+        let quality = loaded
+            .quality
+            .as_deref()
+            .ok_or_else(|| serve_refused("quality_provider_missing"))?;
+        if plan.stream {
+            let mut empty_initial_without_refinement = false;
+            let mut query = match scope {
+                Some(scope) => scope.search_progressive_with_quality(
+                    cx,
+                    loaded.fast.as_ref(),
+                    quality,
+                    plan.text,
+                    plan.limit,
+                )?,
+                None => snapshot.search_progressive_with_quality(
+                    cx,
+                    loaded.fast.as_ref(),
+                    quality,
+                    plan.text,
+                    plan.limit,
+                )?,
+            };
+            while let Some(phase) = query.next_phase().await? {
+                let (name, results) = match phase {
+                    NativeSearchPhase::Initial { results, .. } => {
+                        empty_initial_without_refinement = results.is_empty();
+                        ("initial", results)
+                    }
+                    NativeSearchPhase::Refined { results, .. } => {
+                        empty_initial_without_refinement = false;
+                        ("refined", results)
+                    }
+                    NativeSearchPhase::RefinementFailed { error, .. }
+                    | NativeSearchPhase::RerankFailed { error, .. } => return Err(error.into()),
+                    NativeSearchPhase::Reranked { .. } => {
+                        return Err(serve_refused("unexpected_reranking_phase"));
+                    }
+                };
+                deliver(name, &results)?;
+            }
+            if empty_initial_without_refinement {
+                // A zero-sized scope admits both identities, then the native
+                // iterator completes after empty Initial without inference.
+                // Finish the CLI's two-frame contract on a persistent stream.
+                checkpoint(cx)?;
+                deliver("refined", &[])?;
+            }
+        } else {
+            let results = match scope {
+                Some(scope) => {
+                    Box::pin(scope.search_refined_text(
+                        cx,
+                        loaded.fast.as_ref(),
+                        quality,
+                        plan.text,
+                        plan.limit,
+                    ))
+                    .await?
+                }
+                None => {
+                    Box::pin(snapshot.search_refined_text(
+                        cx,
+                        loaded.fast.as_ref(),
+                        quality,
+                        plan.text,
+                        plan.limit,
+                    ))
+                    .await?
+                }
+            };
+            deliver("refined", &results)?;
+        }
+    } else {
+        let (phase, results) = if plan.mode == QueryMode::Quality {
+            let quality = loaded
+                .quality
+                .as_deref()
+                .unwrap_or_else(|| loaded.fast.as_ref());
+            (
+                "quality",
+                match scope {
+                    Some(scope) => {
+                        Box::pin(scope.search_quality_text(cx, quality, plan.text, plan.limit))
+                            .await?
+                    }
+                    None => {
+                        Box::pin(snapshot.search_quality_text(cx, quality, plan.text, plan.limit))
+                            .await?
+                    }
+                },
+            )
+        } else {
+            (
+                "initial",
+                match scope {
+                    Some(scope) => {
+                        Box::pin(scope.search_text(cx, loaded.fast.as_ref(), plan.text, plan.limit))
+                            .await?
+                    }
+                    None => {
+                        Box::pin(snapshot.search_text(
+                            cx,
+                            loaded.fast.as_ref(),
+                            plan.text,
+                            plan.limit,
+                        ))
+                        .await?
+                    }
+                },
+            )
+        };
+        deliver(phase, &results)?;
+    }
+    Ok(())
+}
+
 async fn search(
     cx: &Cx,
     options: &Options,
@@ -1786,11 +2174,16 @@ async fn search(
 ) -> Result<()> {
     let context = execution_context(cx, pool)?;
     Box::pin(search_with_loader(&context, options, output, |tier| {
+        let fast_options = models::QualityOptions::default();
         models::load_single(
             &context,
             options.models.as_deref(),
             tier,
-            &options.quality,
+            if tier == EmbedderTierTag::Fast {
+                &fast_options
+            } else {
+                &options.quality
+            },
             context.blocking_pool_handle(),
         )
     }))
@@ -1801,10 +2194,10 @@ async fn search_with_loader<F>(
     cx: &Cx,
     options: &Options,
     output: &mut impl Write,
-    load_model: F,
+    mut load_model: F,
 ) -> Result<()>
 where
-    F: FnOnce(EmbedderTierTag) -> Result<Arc<dyn Embedder>>,
+    F: FnMut(EmbedderTierTag) -> Result<Arc<dyn Embedder>>,
 {
     checkpoint(cx)?;
     let query = options
@@ -1813,9 +2206,8 @@ where
         .ok_or_else(|| bad("missing query"))?;
     validate_query(query)?;
     let receipt = Receipt::read(&options.receipt)?;
-    options
-        .quality
-        .validate_usage(receipt.tier == EmbedderTierTag::Quality)?;
+    let mode = receipt.query_mode(options.mode)?;
+    options.quality.validate_usage(mode != QueryMode::Fast)?;
     let snapshot = Arc::new(receipt.open(cx, options.max_image_bytes)?);
     // Source bounds and filter admission precede model loading. The scope owns
     // the same admitted generation that supplies every vector and lexical hit.
@@ -1825,31 +2217,47 @@ where
         options.filter.as_ref(),
         options.max_source_bytes,
     )?;
-    let model = load_model(receipt.tier)?;
-    let results = match &scope {
-        Some(scope) => {
-            scope
-                .search_text(cx, model.as_ref(), query, options.limit)
-                .await?
-        }
-        None => {
-            snapshot
-                .search_text(cx, model.as_ref(), query, options.limit)
-                .await?
-        }
+    let loaded = Models {
+        fast: load_model(if mode == QueryMode::Quality {
+            EmbedderTierTag::Quality
+        } else {
+            EmbedderTierTag::Fast
+        })?,
+        quality: if mode == QueryMode::Full {
+            Some(load_model(EmbedderTierTag::Quality)?)
+        } else {
+            None
+        },
     };
-    let mut response = serde_json::json!({
-        "schema": SCHEMA, "ok": true, "event": "results",
-        "retrieval": retrieval_name(snapshot.retrieval_mode()),
-        "tier": receipt.tier, "generation": receipt.generation,
-        "authority": snapshot.authority().canonical_bytes().as_slice(),
-        "profile": receipt.profile, "results": results,
-    });
-    annotate_scope(
-        &mut response,
-        scope.as_ref().map(NativeScopedGenerationSnapshot::len),
-    );
-    emit(output, &response)
+    let plan = QueryPlan {
+        text: query,
+        limit: options.limit,
+        mode,
+        stream: options.stream,
+    };
+    query_admitted(
+        cx,
+        &snapshot,
+        scope.as_ref(),
+        &loaded,
+        plan,
+        |phase, results| {
+            let mut response = serde_json::json!({
+                "schema": SCHEMA, "ok": true, "event": "results",
+                "retrieval": retrieval_name(snapshot.retrieval_mode()),
+                "tier": mode.as_str(), "mode": mode.as_str(), "topology": receipt.topology_name(),
+                "phase": phase, "generation": receipt.generation,
+                "authority": snapshot.authority().canonical_bytes().as_slice(),
+                "profile": receipt.profile, "results": results,
+            });
+            annotate_scope(
+                &mut response,
+                scope.as_ref().map(NativeScopedGenerationSnapshot::len),
+            );
+            emit(output, &response)
+        },
+    )
+    .await
 }
 
 fn fetch(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
@@ -1924,6 +2332,9 @@ struct AuthoritySearchRequest {
     id: Option<String>,
     query: String,
     limit: Option<usize>,
+    mode: Option<QueryMode>,
+    #[serde(default)]
+    stream: bool,
     filter: Option<Filter>,
 }
 
@@ -2005,7 +2416,10 @@ fn same_query_contract(
         && first.identity.input == second.identity.input
 }
 
-fn admit_serving_model(receipt: &Receipt, model: &dyn Embedder) -> Result<()> {
+fn admit_serving_model(
+    expected: &FrozenEmbeddingIdentityBundleV1,
+    model: &dyn Embedder,
+) -> Result<()> {
     let identity = model
         .identity()
         .map_err(|_| serve_refused("producer_identity_unavailable"))?;
@@ -2014,7 +2428,7 @@ fn admit_serving_model(receipt: &Receipt, model: &dyn Embedder) -> Result<()> {
         .map_err(|_| serve_refused("producer_identity_invalid"))?;
     // Queries carry in-memory vectors. Persisted F16/F32 encoding may change
     // between admitted generations without changing their query producer.
-    let expected = &receipt.identity.identity;
+    let expected = &expected.identity;
     if identity.space != expected.space
         || identity.producer != expected.producer
         || identity.input != expected.input
@@ -2025,13 +2439,22 @@ fn admit_serving_model(receipt: &Receipt, model: &dyn Embedder) -> Result<()> {
     Ok(())
 }
 
+fn admit_serving_models(receipt: &Receipt, loaded: &Models) -> Result<()> {
+    admit_serving_model(&receipt.identity, loaded.fast.as_ref())?;
+    match (&receipt.quality_identity, &loaded.quality) {
+        (Some(identity), Some(model)) => admit_serving_model(identity, model.as_ref()),
+        (None, None) => Ok(()),
+        _ => Err(serve_refused("session_provider_topology_mismatch")),
+    }
+}
+
 /// One admitted search/model selection. Request execution owns this whole
 /// value; no selected component or model is rediscovered between query stages.
 struct AuthoritySession {
     root: QualifiedGenerationRoot,
     receipt: Receipt,
     snapshot: Arc<NativeGenerationSnapshot>,
-    model: Arc<dyn Embedder>,
+    models: Models,
     default_limit: usize,
     max_image_bytes: usize,
     max_source_bytes: usize,
@@ -2047,7 +2470,7 @@ impl AuthoritySession {
         root: QualifiedGenerationRoot,
         receipt: Receipt,
         snapshot: impl Into<Arc<NativeGenerationSnapshot>>,
-        model: Arc<dyn Embedder>,
+        models: Models,
         limits: (usize, usize),
         allow_activation: bool,
     ) -> Result<Self> {
@@ -2074,22 +2497,25 @@ impl AuthoritySession {
             || retained.selected_predecessor_of().is_some()
             || retained.profile().as_str() != receipt.profile
             || snapshot.authority() != receipt.authority()?
-            || snapshot.tier() != receipt.tier
+            || snapshot.topology() != receipt.topology()
             || snapshot.metadata().total_documents != receipt.documents
             || snapshot.metadata().embedders.get(tier_name) != Some(&receipt.identity)
+            || receipt.quality_identity.as_ref().is_some_and(|quality| {
+                snapshot.metadata().embedders.get("quality") != Some(quality)
+            })
             || !same_security_object(root.witness(), retained.root_witness())
             || !same_security_object(anchors.lock(), old_anchors.lock())
             || !same_security_object(anchors.authority(), old_anchors.authority())
         {
             return Err(serve_refused("session_selection_mismatch"));
         }
-        admit_serving_model(&receipt, model.as_ref())?;
+        admit_serving_models(&receipt, &models)?;
         checkpoint(cx)?;
         Ok(Self {
             root,
             receipt,
             snapshot,
-            model,
+            models,
             default_limit: limits.0,
             max_image_bytes: limits.1,
             max_source_bytes: MAX_INPUT_BYTES,
@@ -2141,6 +2567,7 @@ impl AuthoritySession {
             "authority": self.snapshot.authority().canonical_bytes().as_slice(),
             "generation": self.receipt.generation, "profile": self.receipt.profile,
             "tier": self.snapshot.tier(),
+            "topology": self.receipt.topology_name(),
             "retrieval": retrieval_name(self.snapshot.retrieval_mode()),
         });
         annotate_scope(
@@ -2199,7 +2626,9 @@ impl AuthoritySession {
         &self,
         cx: &Cx,
         request: &AuthoritySearchRequest,
-    ) -> Result<(Vec<frankensearch::ScoredResult>, Option<usize>)> {
+        ordinal: u64,
+        output: &mut impl Write,
+    ) -> Result<()> {
         checkpoint(cx)?;
         super::serve::validate_id(request.id.as_deref())
             .map_err(|_| serve_refused("invalid_request_id"))?;
@@ -2208,12 +2637,13 @@ impl AuthoritySession {
         if limit == 0 || limit > 1_000 {
             return Err(serve_refused("invalid_limit"));
         }
+        let mode = self.receipt.query_mode(request.mode)?;
+        admit_serving_models(&self.receipt, &self.models)?;
         if let Some(filter) = &request.filter {
             filter
                 .validate()
                 .map_err(|_| serve_refused("invalid_filter"))?;
         }
-        admit_serving_model(&self.receipt, self.model.as_ref())?;
         // Narrow the owner's frozen membership; never substitute a request
         // scope for it. Without a fixed filter, only filtered requests export
         // bounded source. No request can mutate the session's retained scope.
@@ -2229,20 +2659,32 @@ impl AuthoritySession {
         let scope = narrowed.as_ref().or(self.scope.as_ref());
         // NativeGenerationSnapshot independently checks the producer before
         // inference and the actual bound output afterward, including zero hits.
-        let results = match scope {
-            Some(scope) => {
-                scope
-                    .search_text(cx, self.model.as_ref(), &request.query, limit)
-                    .await?
-            }
-            None => {
-                self.snapshot
-                    .search_text(cx, self.model.as_ref(), &request.query, limit)
-                    .await?
-            }
-        };
-        checkpoint(cx)?;
-        Ok((results, scope.map(NativeScopedGenerationSnapshot::len)))
+        query_admitted(
+            cx,
+            &self.snapshot,
+            scope,
+            &self.models,
+            QueryPlan {
+                text: &request.query,
+                limit,
+                mode,
+                stream: request.stream,
+            },
+            |phase, results| {
+                let mut response =
+                    self.response("results", true, Some(ordinal), request.id.as_deref());
+                response["results"] = serde_json::json!(results);
+                response["mode"] = serde_json::json!(mode.as_str());
+                response["phase"] = serde_json::json!(phase);
+                annotate_scope(
+                    &mut response,
+                    scope.map(NativeScopedGenerationSnapshot::len),
+                );
+                emit(output, &response).map_err(|_| serve_refused("result_delivery_failed"))
+            },
+        )
+        .await?;
+        checkpoint(cx)
     }
 
     fn fetch(&self, cx: &Cx, request: &AuthorityFetchRequest, ordinal: u64) -> Result<Vec<u8>> {
@@ -2404,7 +2846,7 @@ impl AuthoritySession {
             &self.receipt,
             &self.snapshot,
             prepared,
-            Arc::clone(&self.model),
+            &self.models,
             self.fixed_filter
                 .as_ref()
                 .map(|filter| (filter, self.max_source_bytes)),
@@ -2447,17 +2889,22 @@ impl AuthoritySession {
         if candidate.root != self.receipt.root
             || candidate.root_id != self.receipt.root_id
             || candidate.profile != self.receipt.profile
-            || candidate.tier != self.receipt.tier
+            || candidate.topology() != self.receipt.topology()
         {
             return Err(serve_refused("activation_root_or_tier_mismatch"));
         }
         if candidate.authority()?.sequence <= self.snapshot.authority().sequence {
             return Err(serve_refused("activation_not_newer"));
         }
-        if !same_query_contract(&candidate.identity, &self.receipt.identity) {
+        let same_quality = match (&candidate.quality_identity, &self.receipt.quality_identity) {
+            (Some(first), Some(second)) => same_query_contract(first, second),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same_query_contract(&candidate.identity, &self.receipt.identity) || !same_quality {
             return Err(serve_refused("activation_producer_mismatch"));
         }
-        admit_serving_model(&candidate, self.model.as_ref())?;
+        admit_serving_models(&candidate, &self.models)?;
         checkpoint(cx)?;
         // The receipt selects an authority on the original qualified physical
         // root. Never reopen the candidate's root pathname or adopt a copy.
@@ -2466,7 +2913,7 @@ impl AuthoritySession {
                 .open_on_root(cx, &self.root, self.max_image_bytes)
                 .map_err(|_| serve_refused("activation_admission_failed"))?,
         );
-        admit_serving_model(&candidate, self.model.as_ref())?;
+        admit_serving_models(&candidate, &self.models)?;
         // Re-evaluate the fixed policy against the new retained source before
         // installing any part of the selection. A budget or source failure
         // leaves both the old reader and its old membership intact.
@@ -2510,7 +2957,7 @@ async fn serve_session(
     output: &mut impl Write,
 ) -> Result<()> {
     checkpoint(cx)?;
-    admit_serving_model(&session.receipt, session.model.as_ref())?;
+    admit_serving_models(&session.receipt, &session.models)?;
     let mut ready = session.response("ready", true, None, None);
     ready["documents"] = serde_json::json!(session.receipt.documents);
     ready["activation_enabled"] = serde_json::json!(session.allow_activation);
@@ -2527,6 +2974,8 @@ async fn serve_session(
     ready["default_limit"] = serde_json::json!(session.default_limit);
     ready["max_source_bytes"] = serde_json::json!(session.max_source_bytes);
     ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
+    ready["default_mode"] = serde_json::json!(session.receipt.query_mode(None)?.as_str());
+    ready["progressive_available"] = serde_json::json!(session.receipt.quality_identity.is_some());
     emit(output, &ready)?;
     let mut record = Vec::new();
     let mut ordinal = 0_u64;
@@ -2534,20 +2983,17 @@ async fn serve_session(
         ordinal = ordinal
             .checked_add(1)
             .ok_or_else(|| serve_refused("request_ordinal_exhausted"))?;
-        let request = match serde_json::from_slice::<AuthorityRequest>(record.trim_ascii()) {
-            Ok(request) => request,
-            Err(_) => {
-                emit(
-                    output,
-                    &session.failure(
-                        ordinal,
-                        None,
-                        serve_refused("invalid_request").as_ref(),
-                        "invalid_request",
-                    ),
-                )?;
-                continue;
-            }
+        let Ok(request) = serde_json::from_slice::<AuthorityRequest>(record.trim_ascii()) else {
+            emit(
+                output,
+                &session.failure(
+                    ordinal,
+                    None,
+                    serve_refused("invalid_request").as_ref(),
+                    "invalid_request",
+                ),
+            )?;
+            continue;
         };
         let (id, result, is_update) = match request {
             AuthorityRequest::Search(request) => {
@@ -2556,15 +3002,9 @@ async fn serve_session(
                     .clone()
                     .filter(|id| super::serve::validate_id(Some(id)).is_ok());
                 let result = session
-                    .query(cx, &request)
+                    .query(cx, &request, ordinal, output)
                     .await
-                    .map(|(results, eligible)| {
-                        let mut response =
-                            session.response("results", true, Some(ordinal), id.as_deref());
-                        response["results"] = serde_json::json!(results);
-                        annotate_scope(&mut response, eligible);
-                        response
-                    });
+                    .map(|()| None);
                 (id, result, false)
             }
             AuthorityRequest::Activate(request) => {
@@ -2579,7 +3019,7 @@ async fn serve_session(
                     response["previous_authority"] =
                         serde_json::json!(previous.canonical_bytes().as_slice());
                     response["documents"] = serde_json::json!(session.receipt.documents);
-                    response
+                    Some(response)
                 });
                 (id, result, false)
             }
@@ -2592,7 +3032,7 @@ async fn serve_session(
                     .await
                     .map(|mut response| {
                         response["request"] = serde_json::json!(ordinal);
-                        response
+                        Some(response)
                     });
                 (id, result, true)
             }
@@ -2634,11 +3074,15 @@ async fn serve_session(
             checkpoint(cx)?;
         }
         match result {
-            Ok(response) => emit_authority_response(output, &response)?,
+            Ok(Some(response)) => emit_authority_response(output, &response)?,
+            Ok(None) => {}
             Err(error) => {
                 if error
                     .downcast_ref::<SearchError>()
                     .is_some_and(|error| matches!(error, SearchError::Cancelled { .. }))
+                    || error
+                        .downcast_ref::<AuthorityServeRefusal>()
+                        .is_some_and(|error| error.0 == "result_delivery_failed")
                 {
                     return Err(error);
                 }
@@ -2666,9 +3110,9 @@ async fn serve(
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
     let receipt = Receipt::read(&options.receipt)?;
-    options
-        .quality
-        .validate_usage(receipt.tier == EmbedderTierTag::Quality)?;
+    options.quality.validate_usage(
+        receipt.tier == EmbedderTierTag::Quality || receipt.quality_identity.is_some(),
+    )?;
     let root = admit_root(&receipt.root)?;
     let snapshot = Arc::new(receipt.open_on_root(cx, &root, options.max_image_bytes)?);
     let scope = prepare_scope(
@@ -2677,21 +3121,15 @@ async fn serve(
         options.filter.as_ref(),
         options.max_source_bytes,
     )?;
-    // Complete image and source-scope admission precede model loading. The
-    // model and retained images remain warm until explicit activation/exit.
-    let model = models::load_single(
-        cx,
-        options.models.as_deref(),
-        receipt.tier,
-        &options.quality,
-        pool,
-    )?;
+    // Complete image and source-scope admission precede model loading. Both
+    // producers and retained images remain warm until explicit activation/exit.
+    let loaded = load_authority_models(cx, options, receipt.query_mode(None)?, pool)?;
     let mut session = AuthoritySession::new(
         cx,
         root,
         receipt,
         snapshot,
-        model,
+        loaded,
         (options.limit, options.max_image_bytes),
         options.allow_activation,
     )?;

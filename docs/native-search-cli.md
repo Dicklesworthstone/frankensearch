@@ -62,14 +62,15 @@ and 100,000 documents. These bound input, not model scratch space or total RSS.
 ## Fixed-authority generations with retained search
 
 `authority-index` builds and publishes a complete generation through the fixed
-`LOCK` and `AUTHORITY` protocol. Its immutable components are one FSVI v2 vector
-tier, a sealed Quill image, the generation metadata, and an optional native HNSW
-graph. `authority-search`
+`LOCK` and `AUTHORITY` protocol. Its immutable components contain one or two
+independently identified FSVI v2 vector tiers, a sealed Quill image, the generation
+metadata, and, for a single-tier generation, an optional native HNSW graph. `authority-search`
 reopens the exact authority named by the saved receipt and searches the retained
 vector and lexical images together, including deferred result metadata.
 
-Choose either `--tier fast` or `--tier quality`. `--retrieval exact|hnsw` selects
-the vector search policy independently of the tier; new indexes default to
+Choose `--tier fast`, `--tier quality`, or `--tier full`. Full generations contain
+both complete tiers and currently require exact retrieval. For a single tier,
+`--retrieval exact|hnsw` selects the vector search policy; new indexes default to
 `exact`. HNSW uses the native engine's default parameters and deterministic seed
 42. The graph is published as a fourth immutable component. Its complete native
 receipt is authenticated inside the metadata and binds the graph to the exact
@@ -109,12 +110,62 @@ mkdir -m 700 "$HOME/frankensearch-authority"
 Rebuilds and updates inherit the recorded profile. It declares that the caller
 owns the local root and that this command supplies no external anti-rollback
 service. This choice is persisted in the receipt. Search cannot change the
-receipt's security profile, generation, authority, producer identity, or tier.
+receipt's security profile, generation, authority, producer identities, or topology.
 A changed current authority is a refusal, even when its components are otherwise
 valid. Already opened readers retain their original component bytes.
 Search and recovery derive the retrieval mode from the admitted generation, not
 from a command-line override or a separately discovered graph path. Successful
 responses report `retrieval: "exact"` or `retrieval: "hnsw"` for the actual reader.
+
+### Complete two-tier generations and progressive queries
+
+Use `--tier full` to bind the fast and quality providers, their complete vector
+images, one lexical image, and the shared source checkpoint to one authority:
+
+```sh
+./target/release/frankensearch-native authority-index \
+  --root "$HOME/frankensearch-authority/full-g1" \
+  --work-dir "$HOME/frankensearch-authority/full-g1-work" \
+  --receipt "$HOME/frankensearch-authority/full-g1.json" \
+  --tier full --source-low 1 --source-high 42 --cooperative-local \
+  --input ./documents.jsonl --model-dir /absolute/path/to/installed/models
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/full-g1.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --query 'retry network requests' --limit 10 --stream
+```
+
+The two producers may use different dimensions. Each is independently admitted
+against its own complete identity; sharing a dimension or display name does not
+establish compatibility. Both images must contain the same ordered live document
+set and artifact generation. Incomplete quality coverage, cross-generation
+images, and mixed semantic/control provenance are refused.
+
+Full search independently retrieves quality candidates and merges the candidate
+sets, so refinement can discover documents absent from the fast candidate window.
+The default full query returns the refined result. `--stream` emits and flushes an
+`initial` frame before beginning quality inference, then a `refined` frame. Both
+frames name the same retained authority and artifact generation. A refinement
+failure remains a failing request after the initial frame; it is not reported as
+successful full retrieval. Failure to deliver the first frame stops refinement.
+
+`--mode fast` and `--mode quality` query the chosen tier plus Quill. One-shot
+search loads only that tier's model. `--mode full` requires both. The default for
+a single-tier receipt is its sole tier; requesting a missing tier is refused
+before loading models. Results include `mode`, `phase`, and `topology` alongside
+the selected authority. Topology describes stored tiers, not a latency guarantee
+or proof of semantic model availability.
+
+Library callers build with
+`NativeIndexBuilder::build_progressive_generation(&cx, source, max_image_bytes)`
+and admit with `NativeGenerationSnapshot::admit_progressive`, supplying both
+bindings independently. `search_refined_text`, `search_quality_text`, and
+`search_progressive_with_quality` retain those owners throughout retrieval and
+hydration. The `frankensearch_index::vector_cohort` module documents the canonical
+FSVC v1 envelope containing the two original FSVI v2 images. Its aggregate byte
+receipt occupies the existing Vector component; metadata records each inner
+image's identity, dimension, size, hash, and physical row count. Live documents
+are counted once. No new authority pointer or publication protocol is introduced.
 
 ### Rebuild an existing authority generation
 
@@ -139,7 +190,7 @@ its original documents and metadata.
   --query 'retry network requests' --limit 10
 ```
 
-The selected receipt fixes the root, tier, and cooperative-local security
+The selected receipt fixes the root, topology, and cooperative-local security
 profile. The work directory and output receipt must be new, separate paths
 outside the root. Both source boundaries must be at least their previous values;
 an unchanged source cut is allowed. Empty corpora remain unsupported by this
@@ -152,13 +203,16 @@ full HNSW parameter set and seed authenticated by its native receipt. Supply
 or `--retrieval hnsw` to select the default HNSW configuration explicitly.
 The replacement graph is built from the new complete cohort; the retained
 previous reader keeps its own original graph and vectors.
+Full generations keep both exact tiers; requesting HNSW for that topology is
+refused before source export or model inference.
 
-The loaded provider must match the selected generation's complete identity
-before embedding begins. To intentionally rebuild with another producer, add
+Every loaded provider must match its selected complete identity before embedding
+begins. Full generations check both producers before either tier embeds source
+documents. To intentionally rebuild with another producer in either tier, add
 `--migrate-model` and select its local model using the usual model options. This
 re-embeds the whole cohort and records the new producer; it does not relabel or
-reuse the old vectors. The tier stays fixed, including direct quality-only
-inference. Provider identity must remain stable throughout the build.
+reuse the old vectors. The topology stays fixed, including direct quality-only
+inference. Both producer identities must remain stable throughout the build.
 
 To rebuild the selected generation's existing documents, supply
 `--retained-source`. This reads the complete stored cohort from its already
@@ -262,11 +316,13 @@ that deletes the entire cohort is refused before model loading or creation of
 the new work directory because this generation metadata contract requires a
 nonempty cohort.
 
-The selected generation fixes the root, security profile, tier, complete
-producer identity, F16/F32 vector encoding, and retrieval policy, including all
-HNSW parameters and the seed. The matching local model is required even for
+The selected generation fixes the root, security profile, topology, complete
+producer identities, F16/F32 vector encodings, and retrieval policy, including all
+HNSW parameters and the seed. The matching local models are required even for
 metadata-only updates; quality-only generations load their quality model
-directly. Use `authority-rebuild` for an intentional producer migration or
+directly. Full generations independently reuse each tier's unchanged vectors;
+metadata-only edits perform no document inference in either tier. New or changed
+content is embedded by both producers. Use `authority-rebuild` for an intentional producer migration or
 retrieval-policy change. Original input files and original build work
 directories are unnecessary.
 
@@ -301,6 +357,9 @@ apply `upsert_document` / `delete_document`, and call
 `NativeIndexUpdate::build_exact_generation(&cx, tier, source, max_image_bytes)`.
 The returned complete generation is ready for the ordinary expected-authority
 publisher; building it does not itself select a new authority.
+For a full generation, use `begin_progressive_update` with both providers and
+finish with `NativeIndexUpdate::build_progressive_generation`. The existing
+single-provider update method refuses a full snapshot before inference.
 
 ### Roll back the most recent authority publication
 
@@ -320,18 +379,19 @@ existing component images without loading a model or re-embedding documents:
 ```
 
 The current and target receipts must identify the same root, cooperative-local
-security profile, and semantic tier. By default, both complete generations must
-pass bounded admission. The target must be the current manifest's exact
-predecessor and must still occupy the other authenticated physical slot. A
-receipt for an arbitrary older generation is insufficient. Ordinary rollback
-requires a healthy current closure; it does not repair corrupt component files
-or discover historical targets.
+security profile, and topology. By default, both complete generations must pass
+bounded admission. The target must be the current manifest's exact predecessor
+and must still occupy the other authenticated physical slot. A receipt for an
+arbitrary older generation is insufficient. Ordinary rollback requires a healthy
+current closure; it does not repair corrupt component files or discover
+historical targets.
 
 Rollback publishes a new `Rollback` activation at the current authority sequence
-plus one. The target's artifact generation, source checkpoint, producer identity,
+plus one. The target's artifact generation, source checkpoint, producer identities,
 document set, and vector/lexical/ANN/metadata images remain unchanged. Its
 retrieval mode is restored with those images. This can reverse a model migration;
-subsequent search requires the target producer's local model. No model, source,
+subsequent search requires the target producers' local models. Full rollback
+restores both original vector images and their independent identities. No model, source,
 input, retrieval, or work-directory options are accepted by the rollback command.
 
 Predecessor admission is pinned to the captured current authority pair. A
@@ -399,7 +459,7 @@ admission before the command reports `serving: "activated"`.
 
 ### Keep an authority generation warm across requests
 
-`authority-serve` opens one selected generation and loads its local producer once,
+`authority-serve` opens one selected generation and loads its local producers once,
 then serves bounded JSONL requests from standard input:
 
 ```sh
@@ -415,8 +475,16 @@ After the `ready` event, send requests such as:
 {"id":"second","query":"connection pooling","limit":5}
 ```
 
+For a full generation, requests may use `"mode":"fast"`, `"mode":"quality"`,
+or `"mode":"full"` (the default). Add `"stream":true` to deliver separate
+`initial` and `refined` result frames for a full query. Each frame preserves the
+request ordinal and ID and uses the same retained authority. Single-tier query
+modes emit one result frame. The ready event declares `default_mode` and
+`progressive_available`. A full warm session loads both models at startup;
+one-shot selective search can load only the requested tier.
+
 Each query searches the retained vector, lexical and optional HNSW images with
-the warm producer. It does not reload models, rediscover component paths or follow
+the warm producers. It does not reload models, rediscover component paths or follow
 the root's current authority implicitly. Publishing a newer generation elsewhere
 does not redirect an already running session. Results identify the authority,
 artifact generation, tier and actual retrieval mode used for that request.
@@ -425,8 +493,9 @@ With `--allow-activation`, the stdin controller can explicitly install a newer
 receipt between requests. Send `op: "activate"`, `receipt` naming the new receipt,
 and `expected_authority` copied exactly from the session's last successful
 selection event. The new receipt must select a higher authority sequence in the
-same root, security profile and tier, with the same producer, embedding space and
-input contract. Intentional rollback can therefore install older artifact bytes
+same root, security profile and topology, with the same producers, embedding
+spaces and input contracts. Both identities are checked for full generations.
+Intentional rollback can therefore install older artifact bytes
 under its new, higher authority sequence. A producer migration requires restarting
 the server with that generation's local model configuration.
 
@@ -448,7 +517,7 @@ owning lane, and cancellation is observed between reads and requests.
 ### Publish edits through the warm authority server
 
 Add `--allow-updates` to let the stdin controller apply durable incremental
-updates using the already loaded model:
+updates using the already loaded producers:
 
 ```sh
 ./target/release/frankensearch-native authority-serve \
@@ -483,17 +552,19 @@ and selected source retrieval when writes are disabled.
 
 The server verifies that its retained authority pair is still current before
 source export or inference. It preserves that exact pair throughout the build.
-The original model, tier, F16/F32 encoding, retrieval policy and graph parameters
-remain fixed. Unchanged content, including metadata-only edits, reuses its stored
-vector. Complete successor images are built and admitted through the same path
-as `authority-update`.
+The original topology, producer identities, F16/F32 encodings, retrieval policy
+and graph parameters remain fixed. Full sessions retain both producers and reuse
+each tier's stored vector for unchanged content. Metadata-only edits therefore
+perform no document inference in either tier; each final changed document is
+embedded once by each producer. Complete successor images are built and admitted
+through the same path as `authority-update`.
 
 The new recovery receipt is synced before publication. A successful update
 installs the exact admitted reader returned by the publisher, then acknowledges
 `event: "updated"`, `publication: "committed"`, and `serving: "activated"`.
 The response includes the new `authority`, `selection`, `receipt`, final
 `documents` count, `edited_ids` count and `previous_authority`. Subsequent
-queries use that selection without reloading the model. Update requests are
+queries use that selection without reloading the models. Update requests are
 serialized with queries, so a long build occupies the request loop.
 
 When the session has a fixed filter, the complete successor source and its
@@ -557,14 +628,20 @@ An absent or null request filter preserves the fixed scope. An empty object
 adds no restriction; `ids: []` selects no documents. Filtered result frames
 report `scope.filtered: true` and `scope.eligible_documents`, the number of
 eligible source documents before query matching. Empty scopes return no hits
-and perform no query inference, while still requiring the selected producer
+and perform no query inference, while still requiring each selected producer's
 identity and local model.
+An empty full stream emits both empty `initial` and `refined` frames to complete
+the request. Cancellation, inference failure, or a failed output write cannot
+produce a successful completion frame.
 
 Both vector and lexical candidates are restricted before normalization,
-fusion, and winner hydration. Retrieval widens within the same immutable
-generation to find eligible candidates instead of discarding a completed
-top-k page. HNSW remains approximate, and lexical scoring retains whole-corpus
-statistics. A selective lexical query can examine the full matching cohort.
+fusion, and winner hydration. Full queries apply the same eligible membership
+to both independently retrieved vector tiers; initial and refined frames retain
+that membership and the same authority. Retrieval widens within the same
+immutable generation to find eligible candidates instead of discarding a
+completed top-k page. HNSW remains approximate, and lexical scoring retains
+whole-corpus statistics. A selective lexical query can examine the full matching
+cohort.
 
 `--max-source-bytes` bounds complete stored-source export using the raw-field
 accounting described for retained-source rebuilds, with a 256 MiB default. It
@@ -730,9 +807,12 @@ refuses it before component reads and keeps the prior installed reader. The
 original publication remains a known commit; a reader-admission refusal does
 not authorize another publication attempt.
 
-New receipts use schema `frankensearch.native.authority-selection.v2` and are
+Single-tier receipts use `frankensearch.native.authority-selection.v2`. Full
+receipts use `frankensearch.native.authority-selection.v3` and preserve the fast
+identity plus an independent `quality_identity`. A v3 receipt missing either
+tier, or a v1/v2 receipt claiming a second tier, is refused. All new receipts are
 written durably before publication. In addition to the selected authority and
-producer, each receipt preserves the original writer, exact attempt identity,
+producers, each receipt preserves the original writer, exact attempt identity,
 complete expected slot pair, floor requirement, and floor idempotency key. The
 publisher uses that exact prepared attempt. A process crash before any success
 or error output therefore leaves the inputs needed for reconciliation.
@@ -757,7 +837,9 @@ Successful indexing reports `publication: "committed"` and
 ```
 
 Recovery reconciles only the exact saved attempt. It does not republish the
-candidate or load embedding models. The exclusive publisher also refuses to
+candidate or load embedding models. For a full generation it admits both vector
+owners, their joined coverage, Quill, and metadata before reporting serving
+activation. The exclusive publisher also refuses to
 overwrite an unresolved persisted attempt, including from a different process.
 Recovery reports one of the following verdicts:
 
@@ -828,9 +910,9 @@ The library entry points retain their existing names:
 `NativeGenerationSnapshot::admit_exact`. Here, "exact" describes the complete
 component authority contract. Select `NativeBuildRetrieval::Hnsw` on the builder
 to include a native graph, and use `retrieval_configuration()` on a built or
-admitted generation to preserve its validated policy. This route still admits
-one vector tier per generation; combined fast/quality and sharded authority
-descriptors remain outside its supported shape.
+admitted generation to preserve its validated policy. This route admits a
+single exact or HNSW tier, or a complete fast/quality exact pair. Partial or
+sharded authority descriptors and two-tier HNSW remain unsupported.
 
 ## Native quality without the ONNX feature bundle
 
