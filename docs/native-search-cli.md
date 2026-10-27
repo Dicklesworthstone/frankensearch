@@ -265,7 +265,8 @@ bytes; nonempty titles and content are preserved exactly. Embeddings consume
 document content. Missing or malformed fields refuse the whole rebuild before
 model loading, inference, or creation of the new work directory.
 
-`--max-source-bytes N` on rebuild is available only with `--retained-source` and defaults to
+`--max-source-bytes N` on rebuild is available with `--retained-source` or recovery
+`--query` and defaults to
 256 MiB. It bounds the sum of raw stored `id`, `content`, `title`, and
 `metadata_json` bytes, including JSON punctuation and escaping in the metadata
 field, checked before copying or decoding each field. The budget does not bound process
@@ -293,6 +294,69 @@ receipt to try a new replacement. Successful output has `event: "rebuilt"`,
 whether the model identity changed. The `source` field is `"retained_generation"`
 for retained-source rebuilding and `"input"` for replacement JSONL. A later
 output failure still reports the known commit.
+
+### Rebuild a changed model and retry one exact query
+
+Add `--query` and a new `--rollback-receipt` to an explicitly authorized model
+migration to execute the offline identity-mismatch recovery path:
+
+```sh
+./target/release/frankensearch-native authority-rebuild \
+  --from-receipt /absolute/path/to/g1.json \
+  --work-dir /absolute/path/to/new-rebuild-work \
+  --receipt /absolute/path/to/g2.json \
+  --rollback-receipt /absolute/path/to/g2-rollback.json \
+  --retained-source --migrate-model \
+  --model-dir /absolute/path/to/replacement/models \
+  --query 'retry network requests' --limit 10
+```
+
+This is a production consumer of the core `RecoveryPlan` for a verified local
+producer identity change. The existing complete authority must still be
+admissible. It supports fast-only, quality-only and complete two-tier generations,
+including independently configured native ANN tiers. All required producers are
+loaded locally; this operation does not acquire models or execute plans supplied
+as JSON. Unchanged identities, hash-control generations, empty replacement
+cohorts and unsupported recovery states are refused.
+
+The command freezes one exact candidate and binds authorization to its authority
+reference, the original authority and artifact generation, both independent
+producer identities, source checkpoint, document counts and digests of the query
+and its complete policy. Retained-source migration preserves both preparation
+contracts. A freshly prepared complete `--input` cohort with explicit source
+boundaries remains available when preparation must change.
+
+Before any authority publication, a candidate preview opens the actual completed
+component images and executes the requested semantic query. A full generation
+must complete both fast and quality phases. `--filter JSON` fixes source
+membership before retrieval and fusion; `--max-source-bytes` bounds source
+materialization for that scope. Blank queries, zero limits and empty scopes
+cannot substitute for semantic validation. Preview failure or cancellation leaves
+the old authority selected.
+
+Publication uses the original expected authority pair. An unknown outcome is
+reconciled once before any replay; unresolved or superseded attempts retain their
+actual status and saved receipt. The command never repeats publication or changes
+its expectation to a competing publisher's head. After proven publication, it
+replays the same query, filter and limit exactly once. Results are buffered until
+the complete replay succeeds; `--stream` then preserves separate Initial and
+Refined frames for a full query.
+
+An ordinary replay failure attempts one higher-sequence rollback to the retained
+predecessor, using the just-published authority as its expected pair. The rollback
+receipt is saved before changing authority, and every artifact image remains
+intact. Cancellation can prevent this compensation; the failure then reports the
+known committed selection and that rollback is deferred. An unknown rollback
+keeps its own exact attempt for `authority-recover`. A competing publication is
+never overwritten. Output delivery failure after a successful replay preserves
+the known commit rather than treating broken output as failed semantic retrieval.
+
+The generic planner remains capability-blocked for other recovery operations,
+including model acquisition, daemon alignment, ANN-only repair and rebuilding a
+corrupt current generation. Library integrations can use
+`NativeBuiltExactGeneration::preview_candidate` and the core
+`BoundImmutableReindexPlan` with their own authorized executor; a serialized
+report cannot recreate that process-local execution capability.
 
 ### Incremental authority upserts and deletes
 

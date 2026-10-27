@@ -33,9 +33,11 @@
 //!   [`RecoveryPlan`] rather than promoting payload fields.
 //! - A recovery action exposes argv only when the current product command
 //!   enforces the complete authorization and semantic identity contract.
-//!   Model acquisition, daemon/ANN repair, and all semantic index mutations
-//!   are capability-blocked in this core-only tranche because current generic
-//!   commands do not provide that binding.
+//!   Model acquisition, daemon/ANN repair, and generic semantic index mutations
+//!   remain capability-blocked because those commands do not provide that
+//!   binding. [`BoundImmutableReindexPlan`] is a separate, narrow capability
+//!   for explicitly authorized offline identity migrations of an admitted
+//!   immutable authority; it never unblocks a generic command.
 //!
 //! # Why schema v4
 //!
@@ -74,6 +76,12 @@ use crate::{
     generation::{EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1},
     traits::ModelTier,
     types::{RetrievalTopology, retrieval_topology_fits_request},
+};
+
+mod immutable_reindex;
+pub use immutable_reindex::{
+    BoundImmutableReindexPlan, ImmutableReindexAuthorization, ImmutableReindexBinding,
+    ImmutableReindexSource, ImmutableReindexTierBinding,
 };
 
 mod recovery_model_tier_wire {
@@ -1132,6 +1140,14 @@ pub enum RecoveryContractError {
     UnexpectedDegradationReason,
     #[error("recovery plan field `{field}` is inconsistent with the typed decision")]
     InconsistentRecoveryPlan { field: &'static str },
+    #[error("immutable reindex binding field `{field}` is invalid")]
+    InvalidImmutableReindexBinding { field: &'static str },
+    #[error("recovery plan field `{field}` is unsupported for immutable reindex execution")]
+    UnsupportedImmutableReindexPlan { field: &'static str },
+    #[error("immutable reindex authorization does not match the exact candidate scope")]
+    MismatchedImmutableReindexAuthorization,
+    #[error("immutable reindex execution facts changed after authorization")]
+    ImmutableReindexBindingChanged,
 }
 
 /// Whether retrying the original request can succeed, and under what
@@ -1209,8 +1225,9 @@ impl RecoveryAction {
         &self.explanation
     }
 
-    /// Parser-executable argv, or an empty slice when prerequisites make the
-    /// action unavailable.
+    /// Parser-executable argv, or an empty slice when no generic command
+    /// enforces the complete scope. A [`BoundImmutableReindexPlan`] executes
+    /// through its typed executor contract and also has no generic argv.
     #[must_use]
     pub fn argv(&self) -> &[String] {
         &self.argv

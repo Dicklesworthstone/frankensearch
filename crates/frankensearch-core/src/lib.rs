@@ -163,7 +163,9 @@ pub use observability_lint::{
 };
 pub use parsed_query::ParsedQuery;
 pub use recovery_plan::{
-    ARG_INDEX_DIR, ARG_MODEL_BUNDLE, ARG_SOURCE_DIR, COMPLETE_COVERAGE_PPM, InteractionPolicy,
+    ARG_INDEX_DIR, ARG_MODEL_BUNDLE, ARG_SOURCE_DIR, BoundImmutableReindexPlan,
+    COMPLETE_COVERAGE_PPM, ImmutableReindexAuthorization, ImmutableReindexBinding,
+    ImmutableReindexSource, ImmutableReindexTierBinding, InteractionPolicy,
     MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS,
     MODEL_ACQUISITION_AUTHORIZATION_SCHEMA_VERSION, ModelAcquisitionAuthorization,
     ModelAcquisitionAuthorizationSchemaVersion, ModelAcquisitionSource, ModelAcquisitionTarget,

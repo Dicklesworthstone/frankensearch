@@ -954,6 +954,87 @@ fn rebuild_parser_selects_an_existing_receipt_without_overriding_its_root_or_tie
 }
 
 #[test]
+fn rebuild_query_requires_explicit_migration_and_a_distinct_compensation_receipt() {
+    for base in [rebuild_arguments(), retained_rebuild_arguments()] {
+        for extra in [
+            vec!["--query", "retry requests"],
+            vec!["--query", "retry requests", "--migrate-model"],
+            vec![
+                "--query",
+                "retry requests",
+                "--rollback-receipt",
+                "undo.json",
+            ],
+            vec!["--rollback-receipt", "undo.json"],
+            vec!["--limit", "4"],
+            vec!["--stream"],
+            vec!["--filter", "{\"ids\":[\"a\"]}"],
+        ] {
+            let mut arguments = base.clone();
+            arguments.extend(extra);
+            assert!(parse(&arguments).is_err(), "{arguments:?}");
+        }
+        let mut arguments = base;
+        arguments.extend([
+            "--query",
+            "retry requests",
+            "--migrate-model",
+            "--rollback-receipt",
+            "undo.json",
+            "--filter",
+            "{\"ids\":[\"a\"]}",
+            "--limit",
+            "4",
+            "--stream",
+            "--max-source-bytes",
+            "4096",
+        ]);
+        let options = parse(&arguments).unwrap().unwrap();
+        assert_eq!(options.query.as_deref(), Some("retry requests"));
+        assert_eq!(
+            options.rollback_receipt.as_deref(),
+            Some(Path::new("undo.json"))
+        );
+        assert!(options.filter.is_some());
+        assert!(options.migrate_model && options.stream);
+        assert_eq!(options.limit, 4);
+        assert_eq!(options.max_source_bytes, 4096);
+        assert!(options.mode.is_none());
+        for extra in [
+            vec!["--mode", "lexical"],
+            vec!["--query", "second request"],
+            vec!["--rollback-receipt", "other.json"],
+            vec!["--allow-model-activation"],
+        ] {
+            let mut duplicate = arguments.clone();
+            duplicate.extend(extra);
+            assert!(parse(&duplicate).is_err(), "{duplicate:?}");
+        }
+    }
+    for command in ["authority-search", "authority-serve", "authority-recover"] {
+        assert!(
+            parse(&[
+                command,
+                "--receipt",
+                "current.json",
+                "--rollback-receipt",
+                "undo.json"
+            ])
+            .is_err()
+        );
+    }
+    let mut blank = retained_rebuild_arguments();
+    blank.extend([
+        "--query",
+        " \t\n",
+        "--migrate-model",
+        "--rollback-receipt",
+        "undo.json",
+    ]);
+    assert!(parse(&blank).is_err());
+}
+
+#[test]
 fn rebuild_source_boundaries_are_monotone_and_allow_an_unchanged_cut() {
     let previous = CommitRange { low: 2, high: 7 };
     for source in [
@@ -2319,6 +2400,10 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
 mod warm_authority {
     mod model_activation_tests {
         include!("authority_model_activation_tests.rs");
+    }
+
+    mod reindex_tests {
+        include!("authority_reindex_tests.rs");
     }
 
     use std::io::{BufRead, Cursor, Read};

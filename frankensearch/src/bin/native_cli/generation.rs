@@ -59,6 +59,9 @@ const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
 #[path = "authority_model_activation.rs"]
 mod model_activation;
 
+#[path = "authority_reindex.rs"]
+mod reindex;
+
 const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v3";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
@@ -74,7 +77,8 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       (--source-low N --source-high N [--input JSONL] | --retained-source)\n\
       [--max-source-bytes N] [--batch-size N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
+      [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\
+      [--query TEXT --rollback-receipt NEW_JSON [--filter JSON] [--limit N] [--stream]]\n\n\
   authority-update --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       --source-low N --source-high N [--input EDITS_JSONL]\n\
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
@@ -151,6 +155,12 @@ from damaged or missing current component images without serving them. Corrupt\n
 control anchors, current manifests, unsafe root entries, or pending publication\n\
 still refuse. Its image budget covers both manifests and the target components.\n\
 Recovery reports commit knowledge separately from bounded reader admission.\n\
+Rebuild --query requires --migrate-model and --rollback-receipt. This offline\n\
+identity-recovery path binds a typed RecoveryPlan to the exact old/candidate\n\
+authorities, source, producers and request. It previews a nonempty semantic\n\
+query before publication, replays it once after publication, and attempts one\n\
+higher-sequence rollback on replay failure. Cancellation or uncertain publication\n\
+keeps its actual outcome and receipts; neither grants permission to republish.\n\
 Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
 by authority-index. Search refuses a head different from the receipt.\n\
@@ -261,6 +271,7 @@ struct Options {
     current_receipt: Option<PathBuf>,
     from_receipt: Option<PathBuf>,
     target_receipt: Option<PathBuf>,
+    rollback_receipt: Option<PathBuf>,
     input: Option<PathBuf>,
     models: Option<PathBuf>,
     quality: models::QualityOptions,
@@ -327,6 +338,7 @@ impl Options {
             current_receipt: None,
             from_receipt: None,
             target_receipt: None,
+            rollback_receipt: None,
             input: None,
             models: None,
             quality: models::QualityOptions::default(),
@@ -382,6 +394,9 @@ impl Options {
                 "--target-receipt" if command == Command::Rollback => {
                     options.target_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
+                "--rollback-receipt" if command == Command::Rebuild => {
+                    options.rollback_receipt = Some(PathBuf::from(value(&mut args)?));
+                }
                 "--allow-damaged-current" if command == Command::Rollback => {
                     options.allow_damaged_current = true;
                 }
@@ -402,7 +417,10 @@ impl Options {
                     options.max_source_bytes = number(&value(&mut args)?, usize::MAX)?;
                 }
                 "--filter"
-                    if matches!(command, Command::Search | Command::Fetch | Command::Serve) =>
+                    if matches!(
+                        command,
+                        Command::Search | Command::Fetch | Command::Serve | Command::Rebuild
+                    ) =>
                 {
                     options.filter = Some(Filter::parse(&value(&mut args)?)?);
                 }
@@ -499,7 +517,9 @@ impl Options {
                 "--cooperative-local" if command == Command::Index => {
                     options.cooperative_local = true;
                 }
-                "--query" if command == Command::Search => options.query = Some(value(&mut args)?),
+                "--query" if matches!(command, Command::Search | Command::Rebuild) => {
+                    options.query = Some(value(&mut args)?);
+                }
                 "--doc-id" if command == Command::Fetch => {
                     options.doc_id = Some(value(&mut args)?);
                 }
@@ -514,7 +534,9 @@ impl Options {
                 "--include-metadata" if command == Command::Fetch => {
                     options.include_metadata = true;
                 }
-                "--limit" if matches!(command, Command::Search | Command::Serve) => {
+                "--limit"
+                    if matches!(command, Command::Search | Command::Serve | Command::Rebuild) =>
+                {
                     options.limit = number(&value(&mut args)?, 1_000)?;
                 }
                 "--mode" if command == Command::Search => {
@@ -530,7 +552,9 @@ impl Options {
                         }
                     });
                 }
-                "--stream" if command == Command::Search => options.stream = true,
+                "--stream" if matches!(command, Command::Search | Command::Rebuild) => {
+                    options.stream = true;
+                }
                 _ => return Err(bad("unknown or inapplicable authority option")),
             }
         }
@@ -589,6 +613,22 @@ impl Options {
                         "authority-rebuild requires --from-receipt and --work-dir",
                     ));
                 }
+                if let Some(query) = &options.query {
+                    validate_query(query)?;
+                    if !options.migrate_model || options.rollback_receipt.is_none() {
+                        return Err(bad(
+                            "authority-rebuild --query requires --migrate-model and --rollback-receipt",
+                        ));
+                    }
+                } else if options.rollback_receipt.is_some()
+                    || options.filter.is_some()
+                    || options.stream
+                    || seen.contains("--limit")
+                {
+                    return Err(bad(
+                        "rebuild query, filter, limit, stream and rollback options require --query",
+                    ));
+                }
                 if options.retained_source {
                     if options.input.is_some()
                         || options.source_low.is_some()
@@ -599,8 +639,10 @@ impl Options {
                         ));
                     }
                 } else {
-                    if seen.contains("--max-source-bytes") {
-                        return Err(bad("--max-source-bytes requires --retained-source"));
+                    if seen.contains("--max-source-bytes") && options.query.is_none() {
+                        return Err(bad(
+                            "--max-source-bytes requires --retained-source or --query",
+                        ));
                     }
                     options.source_cut()?;
                 }
@@ -1218,6 +1260,14 @@ struct PublishedGeneration {
 struct PublicationOptions<'a> {
     max_image_bytes: usize,
     scope: Option<(&'a Filter, usize)>,
+    reconcile_unknown: bool,
+}
+
+struct PreparedPublication {
+    candidate: GenerationCandidateV1,
+    root_id: [u8; 16],
+    expected: ExpectedAuthorityPairV1,
+    writer: WriterIdentityV1,
 }
 
 impl PublicationOptions<'_> {
@@ -1225,6 +1275,7 @@ impl PublicationOptions<'_> {
         Self {
             max_image_bytes,
             scope: None,
+            reconcile_unknown: false,
         }
     }
 }
@@ -1238,7 +1289,15 @@ fn stage_and_publish(
     predecessor: Option<&NativeGenerationSnapshot>,
     options: PublicationOptions<'_>,
 ) -> Result<PublishedGeneration> {
-    let max_image_bytes = options.max_image_bytes;
+    let prepared = prepare_publication(built, predecessor, options.max_image_bytes)?;
+    stage_prepared_and_publish(cx, root, root_path, receipt_path, built, prepared, options)
+}
+
+fn prepare_publication(
+    built: &NativeBuiltExactGeneration,
+    predecessor: Option<&NativeGenerationSnapshot>,
+    max_image_bytes: usize,
+) -> Result<PreparedPublication> {
     let (root_id, expected, previous) = match predecessor {
         Some(snapshot) => {
             if snapshot
@@ -1294,6 +1353,30 @@ fn stage_and_publish(
     if candidate.owned_image_bytes() > u64::try_from(max_image_bytes)? {
         return Err(bad("complete generation exceeds the encoded-image budget"));
     }
+    Ok(PreparedPublication {
+        candidate,
+        root_id,
+        expected,
+        writer,
+    })
+}
+
+fn stage_prepared_and_publish(
+    cx: &Cx,
+    root: &QualifiedGenerationRoot,
+    root_path: &Path,
+    receipt_path: &Path,
+    built: &NativeBuiltExactGeneration,
+    prepared: PreparedPublication,
+    options: PublicationOptions<'_>,
+) -> Result<PublishedGeneration> {
+    let max_image_bytes = options.max_image_bytes;
+    let PreparedPublication {
+        candidate,
+        root_id,
+        expected,
+        writer,
+    } = prepared;
     // Scope preparation uses the actual completed images, including stored
     // metadata encoding. Any budget or predicate refusal precedes publication.
     let prepared_scope = if let Some((filter, budget)) = options.scope {
@@ -1350,13 +1433,14 @@ fn stage_and_publish(
     )?;
     root.revalidate()?;
     save_receipt(&receipt, receipt_path)?;
-    let snapshot = publish_and_admit(
+    let snapshot = publish_and_admit_with_reconciliation(
         cx,
         &mut publisher,
         &candidate,
         &attempt,
         &receipt,
         max_image_bytes,
+        options.reconcile_unknown,
     )
     .map_err(|mut error| {
         // Only this boundary follows a successfully synced recovery receipt.
@@ -1400,6 +1484,26 @@ fn publish_and_admit(
     receipt: &Receipt,
     max_image_bytes: usize,
 ) -> Result<NativeGenerationSnapshot> {
+    publish_and_admit_with_reconciliation(
+        cx,
+        publisher,
+        candidate,
+        attempt,
+        receipt,
+        max_image_bytes,
+        false,
+    )
+}
+
+fn publish_and_admit_with_reconciliation(
+    cx: &Cx,
+    publisher: &mut GenerationPublisherV1<'_>,
+    candidate: &GenerationCandidateV1,
+    attempt: &AttemptPermitV1,
+    receipt: &Receipt,
+    max_image_bytes: usize,
+    reconcile_unknown: bool,
+) -> Result<NativeGenerationSnapshot> {
     let result = publisher
         .publish_prepared(
             cx,
@@ -1409,23 +1513,67 @@ fn publish_and_admit(
             u64::try_from(max_image_bytes)?,
         )
         .map_err(|error| {
-            publication_error(
-                receipt,
-                "not_committed",
-                "not_activated",
-                &error.to_string(),
-                None,
-            )
+            let reason = if reconcile_unknown {
+                "publication_preflight_refused".to_owned()
+            } else {
+                error.to_string()
+            };
+            publication_error(receipt, "not_committed", "not_activated", &reason, None)
         })?;
-    match result.publication {
+    let activation = match result.publication {
         PublicationOutcomeV1::NotCommitted(reason) => {
+            let reason = if reconcile_unknown {
+                "publication_not_committed".to_owned()
+            } else {
+                format!("{reason:?}")
+            };
             return Err(publication_error(
                 receipt,
                 "not_committed",
                 "not_activated",
-                &format!("{reason:?}"),
+                &reason,
                 None,
             ));
+        }
+        PublicationOutcomeV1::CommitOutcomeUnknown(permit) if reconcile_unknown => {
+            // Exactly one reconciliation of this pending attempt. Never publish
+            // again, follow a successor, or replay against an unresolved head.
+            let reconciled = publisher
+                .reconcile_pending_with_budget(cx, None, u64::try_from(max_image_bytes)?)
+                .map_err(|_| {
+                    publication_error(
+                        receipt,
+                        "unknown",
+                        "not_activated",
+                        "reconciliation_required",
+                        Some(&permit),
+                    )
+                })?
+                .ok_or_else(|| {
+                    publication_error(
+                        receipt,
+                        "unknown",
+                        "not_activated",
+                        "reconciliation_required",
+                        Some(&permit),
+                    )
+                })?;
+            if matches!(
+                reconciled.reconciliation,
+                ReconcileOutcomeV1::Committed { .. }
+            ) {
+                reconciled.activation
+            } else {
+                let mut report =
+                    reconciliation_report(receipt, &permit, &reconciled.reconciliation);
+                report["ok"] = serde_json::json!(false);
+                // The typed reconciliation code is sufficient. An infrastructure
+                // error's Display body is not part of the recovery protocol.
+                if let Some(fields) = report.as_object_mut() {
+                    fields.remove("reason");
+                }
+                return Err(Box::new(PublicationFailure(report)));
+            }
         }
         PublicationOutcomeV1::CommitOutcomeUnknown(permit) => {
             return Err(publication_error(
@@ -1436,9 +1584,9 @@ fn publish_and_admit(
                 Some(&permit),
             ));
         }
-        PublicationOutcomeV1::Committed { .. } => {}
-    }
-    let Some(GenerationActivationV1::Installed(opened)) = result.activation else {
+        PublicationOutcomeV1::Committed { .. } => result.activation,
+    };
+    let Some(GenerationActivationV1::Installed(opened)) = activation else {
         return Err(publication_error(
             receipt,
             "committed",
@@ -1684,7 +1832,20 @@ where
             .ok_or_else(|| bad("missing work directory"))?,
     )?;
     let receipt_path = new_path(&options.receipt)?;
-    separate_destinations(&[&selected.root, &work_path, &receipt_path])?;
+    let rollback_path = options
+        .rollback_receipt
+        .as_deref()
+        .map(new_path)
+        .transpose()?;
+    let mut destinations = vec![
+        selected.root.as_path(),
+        work_path.as_path(),
+        receipt_path.as_path(),
+    ];
+    if let Some(path) = &rollback_path {
+        destinations.push(path.as_path());
+    }
+    separate_destinations(&destinations)?;
     let root = admit_root(&selected.root)?;
     // Select once, before input or model work, and keep that reader alive until
     // publication finishes. A competitor can win while we build; its head is
@@ -1731,14 +1892,29 @@ where
             ));
         }
     };
-    let mut builder = NativeIndexBuilder::new(&work_path, new_generation(sequence)?, loaded.fast)?
-        .with_batch_size(options.batch_size)?
-        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-        .with_fast_storage(NativeBuildPrecision::F32, retrieval)
-        .add_documents(documents);
-    if let Some(quality) = loaded.quality {
+    if options.query.is_some() {
+        if !options.migrate_model || rollback_path.is_none() {
+            return Err(serve_refused("reindex_query_authorization_required"));
+        }
+        if documents.is_empty() {
+            return Err(serve_refused("reindex_query_nonempty_source_required"));
+        }
+        if expected_identity == selected.identity && expected_quality == selected.quality_identity {
+            return Err(serve_refused("reindex_query_identity_change_required"));
+        }
+    }
+    let mut builder = NativeIndexBuilder::new(
+        &work_path,
+        new_generation(sequence)?,
+        Arc::clone(&loaded.fast),
+    )?
+    .with_batch_size(options.batch_size)?
+    .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
+    .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+    .add_documents(documents);
+    if let Some(quality) = &loaded.quality {
         builder = builder
-            .with_quality_embedder(quality)?
+            .with_quality_embedder(Arc::clone(quality))?
             .with_quality_storage(
                 NativeBuildPrecision::F32,
                 quality_retrieval
@@ -1758,6 +1934,12 @@ where
             != expected_quality.as_ref()
     {
         return Err(bad("the provider changed after rebuild identity admission"));
+    }
+    if options.query.is_some() {
+        return Box::pin(reindex::execute(
+            cx, options, &root, &selected, &snapshot, &built, &loaded, output,
+        ))
+        .await;
     }
     let PublishedGeneration { receipt, .. } = stage_and_publish(
         cx,
@@ -1985,6 +2167,7 @@ async fn build_and_publish_update(
         PublicationOptions {
             max_image_bytes: spec.max_image_bytes,
             scope,
+            reconcile_unknown: false,
         },
     )
 }
