@@ -75,6 +75,9 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N]\n\n\
+  authority-fetch --receipt JSON --doc-id ID [--offset-bytes N] [--max-bytes N]\n\
+      [--include-metadata] [--filter JSON] [--max-source-bytes N]\n\
+      [--max-image-bytes N]\n\n\
   authority-serve --receipt JSON [--limit N] [--allow-activation] [--allow-updates]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N] [--batch-size N]\n\n\
@@ -152,7 +155,7 @@ receipt before publication, compare the original authority pair, and install the
 exact admitted successor. They report publication separately from reader activation.\n\
 Queries retain the old selection after refusal or unresolved publication; further\n\
 writes require the retained authority to remain current with no unresolved attempt.\n\
-Search/serve --filter accepts exact IDs, a literal id_prefix, and string-valued\n\
+Search/fetch/serve --filter accepts exact IDs, a literal id_prefix, and string-valued\n\
 metadata. Every present constraint must match the retained source document.\n\
 Search requests may include a filter object; it intersects the server's fixed\n\
 filter and cannot widen it. Membership filters vector and lexical candidates\n\
@@ -161,6 +164,10 @@ Filtered source export is bounded by --max-source-bytes (default 256 MiB).\n\
 The fixed server scope stays on its retained generation. Activation and updates\n\
 prepare its successor membership before changing selection or publication.\n\
 Unfiltered queries do not export source.\n\
+authority-fetch reads one selected document window without loading a model.\n\
+Its receipt must still select the exact current authority. Offsets default to\n\
+zero, max-bytes to 8192 (allowed 4..65536), and metadata is opt-in. The source\n\
+budget covers that document's full stored fields before copying, not the corpus.\n\
 Read-only source requests use op=fetch, expected_authority, and documents with\n\
 doc_id, offset_bytes, max_bytes and include_metadata. The exact retained authority\n\
 must match before source lookup. Requests allow up to 32 UTF-8 windows, at most\n\
@@ -178,6 +185,7 @@ enum Command {
     Rebuild,
     Update,
     Search,
+    Fetch,
     Serve,
     Recover,
     Rollback,
@@ -198,6 +206,10 @@ struct Options {
     source_low: Option<u64>,
     source_high: Option<u64>,
     query: Option<String>,
+    doc_id: Option<String>,
+    offset_bytes: usize,
+    max_bytes: usize,
+    include_metadata: bool,
     filter: Option<Filter>,
     limit: usize,
     batch_size: usize,
@@ -218,6 +230,7 @@ pub fn is_command(command: &str) -> bool {
             | "authority-rebuild"
             | "authority-update"
             | "authority-search"
+            | "authority-fetch"
             | "authority-serve"
             | "authority-recover"
             | "authority-rollback"
@@ -232,6 +245,7 @@ impl Options {
             Some("authority-rebuild") => Command::Rebuild,
             Some("authority-update") => Command::Update,
             Some("authority-search") => Command::Search,
+            Some("authority-fetch") => Command::Fetch,
             Some("authority-serve") => Command::Serve,
             Some("authority-recover") => Command::Recover,
             Some("authority-rollback") => Command::Rollback,
@@ -252,6 +266,10 @@ impl Options {
             source_low: None,
             source_high: None,
             query: None,
+            doc_id: None,
+            offset_bytes: 0,
+            max_bytes: 8 * 1024,
+            include_metadata: false,
             filter: None,
             limit: 10,
             batch_size: 64,
@@ -295,27 +313,46 @@ impl Options {
                 "--max-source-bytes"
                     if matches!(
                         command,
-                        Command::Rebuild | Command::Update | Command::Search | Command::Serve
+                        Command::Rebuild
+                            | Command::Update
+                            | Command::Search
+                            | Command::Fetch
+                            | Command::Serve
                     ) =>
                 {
                     options.max_source_bytes = number(&value(&mut args)?, usize::MAX)?;
                 }
-                "--filter" if matches!(command, Command::Search | Command::Serve) => {
+                "--filter"
+                    if matches!(command, Command::Search | Command::Fetch | Command::Serve) =>
+                {
                     options.filter = Some(Filter::parse(&value(&mut args)?)?);
                 }
                 "--allow-activation" if command == Command::Serve => {
                     options.allow_activation = true
                 }
                 "--allow-updates" if command == Command::Serve => options.allow_updates = true,
-                "--model-dir" if !matches!(command, Command::Recover | Command::Rollback) => {
+                "--model-dir"
+                    if !matches!(
+                        command,
+                        Command::Fetch | Command::Recover | Command::Rollback
+                    ) =>
+                {
                     options.models = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--quality-backend" if !matches!(command, Command::Recover | Command::Rollback) => {
+                "--quality-backend"
+                    if !matches!(
+                        command,
+                        Command::Fetch | Command::Recover | Command::Rollback
+                    ) =>
+                {
                     options.quality.backend =
                         Some(models::QualityBackend::parse(&value(&mut args)?)?);
                 }
                 "--quality-model-dir"
-                    if !matches!(command, Command::Recover | Command::Rollback) =>
+                    if !matches!(
+                        command,
+                        Command::Fetch | Command::Recover | Command::Rollback
+                    ) =>
                 {
                     options.quality.directory = Some(PathBuf::from(value(&mut args)?));
                 }
@@ -374,6 +411,20 @@ impl Options {
                     options.cooperative_local = true;
                 }
                 "--query" if command == Command::Search => options.query = Some(value(&mut args)?),
+                "--doc-id" if command == Command::Fetch => {
+                    options.doc_id = Some(value(&mut args)?);
+                }
+                "--offset-bytes" if command == Command::Fetch => {
+                    options.offset_bytes = value(&mut args)?
+                        .parse()
+                        .map_err(|_| bad("fetch offset must be an unsigned byte count"))?;
+                }
+                "--max-bytes" if command == Command::Fetch => {
+                    options.max_bytes = number(&value(&mut args)?, source::MAX_CONTENT_BYTES)?;
+                }
+                "--include-metadata" if command == Command::Fetch => {
+                    options.include_metadata = true;
+                }
                 "--limit" if matches!(command, Command::Search | Command::Serve) => {
                     options.limit = number(&value(&mut args)?, 1_000)?;
                 }
@@ -404,6 +455,9 @@ impl Options {
                     .as_deref()
                     .ok_or_else(|| bad("authority-search requires --query"))?,
             )?,
+            Command::Fetch => {
+                options.fetch_document()?;
+            }
             Command::Rebuild => {
                 if options.from_receipt.is_none() || options.work.is_none() {
                     return Err(bad(
@@ -449,6 +503,17 @@ impl Options {
             Command::Recover => {}
         }
         Ok(Some(options))
+    }
+
+    fn fetch_document(&self) -> Result<source::DocumentRequest> {
+        source::DocumentRequest::new(
+            self.doc_id
+                .clone()
+                .ok_or_else(|| bad("authority-fetch requires --doc-id"))?,
+            self.offset_bytes,
+            self.max_bytes,
+            self.include_metadata,
+        )
     }
 
     fn build_retrieval(&self, previous: Option<NativeBuildRetrieval>) -> NativeBuildRetrieval {
@@ -1787,6 +1852,47 @@ where
     emit(output, &response)
 }
 
+fn fetch(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
+    checkpoint(cx)?;
+    let window = options.fetch_document()?;
+    if let Some(filter) = &options.filter {
+        filter.validate()?;
+    }
+    let receipt = Receipt::read(&options.receipt)?;
+    // Fresh-process admission must select this exact receipt. Never follow a
+    // newer authority, load a model, or interpret the document ID as a path.
+    let snapshot = receipt.open(cx, options.max_image_bytes)?;
+    let document = snapshot.source_document(cx, window.doc_id(), options.max_source_bytes)?;
+    let mut response = serde_json::json!({
+        "schema": SCHEMA, "event": "terminal", "operation": "fetch",
+        "status": "complete", "ok": true, "partial_results": false,
+        "request": 1, "id": null, "seq": 0,
+        "authority": snapshot.authority().canonical_bytes().as_slice(),
+        "generation": snapshot.retained_snapshot().manifest().generation(),
+        "tier": snapshot.tier(), "profile": receipt.profile,
+        "retrieval": retrieval_name(snapshot.retrieval_mode()),
+        "source": "retained_snapshot",
+    });
+    if options.filter.is_some() {
+        response["scope"] = serde_json::json!({ "filtered": true });
+    }
+    // Borrow only this selected document's fields into the shared UTF-8 window
+    // renderer. The source budget bounds its complete stored fields before
+    // copying; the response bound includes metadata, authority and escaping.
+    let bytes = source::render_documents(
+        cx,
+        std::slice::from_ref(&window),
+        options.filter.as_ref(),
+        None,
+        |_| document.as_ref(),
+        &response,
+    )?;
+    checkpoint(cx)?;
+    output.write_all(&bytes)?;
+    output.flush()?;
+    Ok(())
+}
+
 fn prepare_scope(
     cx: &Cx,
     snapshot: &Arc<NativeGenerationSnapshot>,
@@ -2713,6 +2819,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             Command::Rebuild => Box::pin(rebuild(&cx, &options, &mut output, pool)).await,
             Command::Update => Box::pin(update_generation(&cx, &options, &mut output, pool)).await,
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,
+            Command::Fetch => fetch(&cx, &options, &mut output),
             Command::Serve => Box::pin(serve(&cx, &options, &mut output, pool)).await,
             Command::Recover => recover(&cx, &options, &mut output),
             Command::Rollback => rollback(&cx, &options, &mut output),

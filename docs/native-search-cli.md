@@ -586,6 +586,33 @@ an intersected scope without exporting the source again.
 
 ### Fetch document text from the selected authority
 
+Use `authority-fetch` to retrieve one document window in a fresh process without
+loading an embedding model or starting a warm server:
+
+```sh
+./target/release/frankensearch-native authority-fetch \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --doc-id 'src/client.rs' --offset-bytes 0 --max-bytes 8192 \
+  --include-metadata --filter '{"metadata":{"project":"client"}}' \
+  --max-source-bytes 1048576
+```
+
+The receipt must still select the exact current authority. A newer publication
+refuses this fresh open; use the matching retained server if you need text from
+an earlier selection. The command reads the admitted vector and Quill images,
+never the original document path. It rejects model, quality-backend, and writer
+options and leaves authority controls and receipts untouched.
+
+The same window, filter, metadata, and response contracts described below apply.
+Only the requested live document is materialized. `--max-source-bytes` bounds
+its complete stored ID, content, title, and metadata fields before copying, even
+when only a small excerpt is requested. Unrelated documents consume no source
+budget; a missing or deleted ID consumes none. The default source and encoded
+image budgets are both 256 MiB and can be lowered independently. A successful
+one-shot response has `request: 1` and a null request `id`. Validation, source,
+or encoding failure emits no partial document frame; a write or flush failure
+does not trigger another stdout response.
+
 Every `authority-serve` session accepts read-only `fetch` requests, including
 sessions without activation or update permission. This retrieves the stored text
 behind a search hit from the exact retained authority. It uses no inference,

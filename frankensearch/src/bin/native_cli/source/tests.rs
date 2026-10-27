@@ -95,6 +95,33 @@ fn fetch_protocol_is_explicit_strict_and_bounded() {
 }
 
 #[test]
+fn constructed_windows_enforce_protocol_limits_and_preserve_render_fields() {
+    assert!(DocumentRequest::new("a".to_owned(), 0, 3, false).is_err());
+    assert!(DocumentRequest::new("a".to_owned(), 0, MAX_CONTENT_BYTES + 1, false).is_err());
+    let window = DocumentRequest::new("a".to_owned(), 4, 4, true).unwrap();
+    assert_eq!(window.doc_id(), "a");
+    let source = IndexableDocument::new("a", "lead🦀tail")
+        .with_title("selected title")
+        .with_metadata("tenant", "A");
+    let bytes = render_documents(
+        &Cx::for_testing(),
+        std::slice::from_ref(&window),
+        None,
+        None,
+        |_| Some(&source),
+        &serde_json::json!({"ok":true}),
+    )
+    .unwrap();
+    let row = &frames(&bytes)[0]["documents"][0];
+    assert_eq!(row["content"], "🦀");
+    assert_eq!(row["offset_bytes"], 4);
+    assert_eq!(row["end_offset_bytes"], 8);
+    assert_eq!(row["next_offset_bytes"], 8);
+    assert_eq!(row["title"], "selected title");
+    assert_eq!(row["metadata"]["tenant"], "A");
+}
+
+#[test]
 fn utf8_windows_reconstruct_exact_source_without_gaps_or_normalization() {
     let cx = Cx::for_testing();
     let source = IndexableDocument::new("a", "  café🦀\n東京\u{0}<script>&\r\n");

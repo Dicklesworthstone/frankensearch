@@ -35,6 +35,23 @@ pub struct DocumentRequest {
 }
 
 impl DocumentRequest {
+    /// Construct one window using the same limits as the JSON protocol.
+    pub(crate) fn new(
+        doc_id: String,
+        offset_bytes: usize,
+        max_bytes: usize,
+        include_metadata: bool,
+    ) -> Result<Self> {
+        let window = Self {
+            doc_id,
+            offset_bytes,
+            max_bytes,
+            include_metadata,
+        };
+        validate_windows(std::slice::from_ref(&window))?;
+        Ok(window)
+    }
+
     pub(crate) fn doc_id(&self) -> &str {
         &self.doc_id
     }

@@ -127,6 +127,97 @@ fn rollback_arguments() -> Vec<&'static str> {
 }
 
 #[test]
+fn authority_fetch_options_select_windows_without_model_or_writer_grants() {
+    let base = [
+        "authority-fetch",
+        "--receipt",
+        "selected.json",
+        "--doc-id",
+        "notes/../retained",
+    ];
+    let options = parse(&base).unwrap().unwrap();
+    assert_eq!(options.command, Command::Fetch);
+    assert_eq!(options.doc_id.as_deref(), Some("notes/../retained"));
+    assert_eq!(options.offset_bytes, 0);
+    assert_eq!(options.max_bytes, 8192);
+    assert!(!options.include_metadata);
+    assert!(options.models.is_none());
+    assert!(options.work.is_none());
+    assert!(is_command("authority-fetch"));
+    assert!(parse(&["authority-fetch", "--help"]).unwrap().is_none());
+    assert!(parse(&["authority-fetch", "--receipt", "selected.json"]).is_err());
+    assert!(parse(&["authority-fetch", "--doc-id", "retained"]).is_err());
+    for doc_id in ["", " ", "invalid\0id"] {
+        assert!(
+            parse(&[
+                "authority-fetch",
+                "--receipt",
+                "selected.json",
+                "--doc-id",
+                doc_id
+            ])
+            .is_err()
+        );
+    }
+    let mut bounded = base.to_vec();
+    bounded.extend([
+        "--offset-bytes",
+        "0",
+        "--max-bytes",
+        "4",
+        "--include-metadata",
+        "--filter",
+        r#"{"metadata":{"tenant":"blue"}}"#,
+        "--max-source-bytes",
+        "4096",
+        "--max-image-bytes",
+        "8192",
+    ]);
+    let options = parse(&bounded).unwrap().unwrap();
+    assert_eq!(options.offset_bytes, 0);
+    assert_eq!(options.max_bytes, 4);
+    assert!(options.include_metadata);
+    assert!(options.filter.is_some());
+    assert_eq!(options.max_source_bytes, 4096);
+    assert_eq!(options.max_image_bytes, 8192);
+    for extra in [
+        vec!["--max-bytes", "0"],
+        vec!["--max-bytes", "3"],
+        vec!["--max-bytes", "65537"],
+        vec!["--offset-bytes", "-1"],
+        vec!["--max-source-bytes", "0"],
+        vec!["--max-image-bytes", "0"],
+        vec!["--include-metadata", "--include-metadata"],
+        vec!["--doc-id", "duplicate"],
+        vec!["--model-dir", "models"],
+        vec!["--quality-model-dir", "models"],
+        vec!["--quality-backend", "native-f32"],
+        vec!["--query", "retry"],
+        vec!["--limit", "1"],
+        vec!["--batch-size", "1"],
+        vec!["--work-dir", "new-work"],
+        vec!["--input", "source.jsonl"],
+        vec!["--root", "root"],
+        vec!["--from-receipt", "old.json"],
+        vec!["--target-receipt", "old.json"],
+        vec!["--source-low", "1"],
+        vec!["--tier", "fast"],
+        vec!["--retrieval", "exact"],
+        vec!["--retained-source"],
+        vec!["--allow-activation"],
+        vec!["--allow-updates"],
+        vec!["--allow-damaged-current"],
+    ] {
+        let mut rejected = base.to_vec();
+        rejected.extend(extra);
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
+    for command in ["authority-search", "authority-serve", "authority-recover"] {
+        assert!(parse(&[command, "--receipt", "selected.json", "--doc-id", "id"]).is_err());
+    }
+}
+
+#[test]
 fn authority_rollback_requires_exact_receipts_and_rejects_build_or_model_options() {
     let arguments = rollback_arguments();
     let options = parse(&arguments).unwrap().unwrap();
@@ -2700,6 +2791,262 @@ mod warm_authority {
                 "the next query cannot execute after a fetch delivery failure"
             );
             assert_eq!(session.receipt.authority, selected.authority);
+        });
+    }
+
+    fn fetch_options(receipt: &Path, doc_id: &str) -> Options {
+        parse(&[
+            "authority-fetch",
+            "--receipt",
+            receipt.to_str().unwrap(),
+            "--doc-id",
+            doc_id,
+        ])
+        .unwrap()
+        .unwrap()
+    }
+
+    #[test]
+    fn one_shot_fetch_reads_selected_utf8_source_with_independent_payload_and_window_limits() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann) in [
+                ("one-shot-fetch-fast-exact", EmbedderTierTag::Fast, false),
+                (
+                    "one-shot-fetch-quality-exact",
+                    EmbedderTierTag::Quality,
+                    false,
+                ),
+                ("one-shot-fetch-fast-hnsw", EmbedderTierTag::Fast, true),
+                (
+                    "one-shot-fetch-quality-hnsw",
+                    EmbedderTierTag::Quality,
+                    true,
+                ),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let doc_id = "notes/../🦀";
+                let content = "retry 🙂éZ\noriginal";
+                let requested = IndexableDocument::new(doc_id, content)
+                    .with_title("Source \"title\"")
+                    .with_metadata("tenant", "blue")
+                    .with_metadata("escaped", "\"\n\\\t");
+                let source_bytes = requested.id.len()
+                    + requested.content.len()
+                    + requested.title.as_deref().map_or(0, str::len)
+                    + serde_json::to_vec(&requested.metadata).unwrap().len();
+                let selected = publish_source_fixture(
+                    &cx,
+                    &parent,
+                    &provider,
+                    tier,
+                    ann,
+                    vec![
+                        requested,
+                        IndexableDocument::new("unrequested", "garden ".repeat(2048)),
+                    ],
+                )
+                .await;
+                let authority_before = fs::read(selected.root.join("AUTHORITY")).unwrap();
+                let lock_before = fs::read(selected.root.join("LOCK")).unwrap();
+                let receipt_path = parent.join("source.json");
+                let receipt_before = fs::read(&receipt_path).unwrap();
+                let before = provider.calls.load(Ordering::Relaxed);
+                let mut options = fetch_options(&receipt_path, doc_id);
+                // Only this complete source fits. Exporting the unrelated
+                // large document would fail even though the output is tiny.
+                options.max_source_bytes = source_bytes;
+                options.offset_bytes = 6;
+                options.max_bytes = 5;
+                let mut output = Vec::new();
+                fetch(&cx, &options, &mut output).unwrap();
+                assert!(output.len() <= source::MAX_RESPONSE_BYTES);
+                let responses = frames(&output);
+                assert_eq!(responses.len(), 1);
+                let response = &responses[0];
+                assert_eq!(response["event"], "terminal");
+                assert_eq!(response["operation"], "fetch");
+                assert_eq!(response["status"], "complete");
+                assert_eq!(response["ok"], true);
+                assert_eq!(response["partial_results"], false);
+                assert_eq!(response["authority"], serde_json::json!(selected.authority));
+                assert_eq!(
+                    response["generation"],
+                    serde_json::json!(selected.generation)
+                );
+                assert_eq!(response["source"], "retained_snapshot");
+                let document = &response["documents"][0];
+                assert_eq!(document["doc_id"], doc_id);
+                assert_eq!(document["status"], "found");
+                assert_eq!(document["content"], "🙂");
+                assert_eq!(document["offset_bytes"], 6);
+                assert_eq!(document["end_offset_bytes"], 10);
+                assert_eq!(document["next_offset_bytes"], 10);
+                assert_eq!(document["total_bytes"], content.len());
+                assert!(document.get("title").is_none());
+                assert!(document.get("metadata").is_none());
+
+                options.offset_bytes = 10;
+                options.max_bytes = 64;
+                options.include_metadata = true;
+                output.clear();
+                fetch(&cx, &options, &mut output).unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(response["documents"][0]["content"], "éZ\noriginal");
+                assert!(response["documents"][0]["next_offset_bytes"].is_null());
+                assert_eq!(response["documents"][0]["title"], "Source \"title\"");
+                assert_eq!(response["documents"][0]["metadata"]["escaped"], "\"\n\\\t");
+
+                options.filter = Some(Filter::parse(r#"{"metadata":{"tenant":"red"}}"#).unwrap());
+                output.clear();
+                fetch(&cx, &options, &mut output).unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(
+                    response["documents"][0],
+                    serde_json::json!({"status":"unavailable", "doc_id":doc_id})
+                );
+                options.doc_id = Some("absent".to_owned());
+                options.max_source_bytes = 1;
+                output.clear();
+                fetch(&cx, &options, &mut output).unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(
+                    response["documents"][0],
+                    serde_json::json!({"status":"unavailable", "doc_id":"absent"})
+                );
+
+                options.doc_id = Some(doc_id.to_owned());
+                options.filter = None;
+                options.offset_bytes = 0;
+                options.max_bytes = 4;
+                options.include_metadata = false;
+                options.max_source_bytes = source_bytes - 1;
+                output.clear();
+                assert!(
+                    fetch(&cx, &options, &mut output).is_err(),
+                    "a small output window still requires the complete selected stored payload"
+                );
+                assert!(output.is_empty());
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+                assert_eq!(
+                    fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                    authority_before
+                );
+                assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock_before);
+                assert_eq!(fs::read(receipt_path).unwrap(), receipt_before);
+            }
+        });
+    }
+
+    #[test]
+    fn one_shot_fetch_refuses_stale_cancelled_and_invalid_windows_without_partial_output() {
+        struct PartialOutput {
+            writes: usize,
+            prefix: Vec<u8>,
+        }
+        impl Write for PartialOutput {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                match self.writes {
+                    1 => {
+                        let count = bytes.len().min(7);
+                        self.prefix.extend_from_slice(&bytes[..count]);
+                        Ok(count)
+                    }
+                    2 => Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "interrupted fetch",
+                    )),
+                    _ => panic!("source delivery failure cannot emit another frame"),
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("an incomplete source frame cannot reach flush")
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("one-shot-fetch-refusal");
+            let provider = provider();
+            let selected = publish_source_fixture(
+                &cx,
+                &parent,
+                &provider,
+                EmbedderTierTag::Fast,
+                true,
+                vec![IndexableDocument::new("unicode", "🦀retained source")],
+            )
+            .await;
+            let authority_before = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            let lock_before = fs::read(selected.root.join("LOCK")).unwrap();
+            let before = provider.calls.load(Ordering::Relaxed);
+            let mut options = fetch_options(&parent.join("source.json"), "unicode");
+            let mut output = Vec::new();
+            cx.set_cancel_requested(true);
+            assert!(fetch(&cx, &options, &mut output).is_err());
+            cx.set_cancel_requested(false);
+            assert!(output.is_empty());
+            for offset in [1, usize::MAX] {
+                options.offset_bytes = offset;
+                assert!(fetch(&cx, &options, &mut output).is_err());
+                assert!(output.is_empty());
+            }
+            options.offset_bytes = 0;
+            let mut partial = PartialOutput {
+                writes: 0,
+                prefix: Vec::new(),
+            };
+            let error = fetch(&cx, &options, &mut partial).unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::BrokenPipe
+            );
+            assert!(publication_failure(error.as_ref()).is_none());
+            assert_eq!(partial.writes, 2);
+            assert_eq!(partial.prefix.len(), 7);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority_before
+            );
+            assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock_before);
+
+            let retained = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let successor = publish(
+                &cx,
+                &parent,
+                Some(&retained),
+                &provider,
+                EmbedderTierTag::Fast,
+                "new",
+                false,
+            )
+            .await;
+            let before = provider.calls.load(Ordering::Relaxed);
+            let authority_after = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            let lock_after = fs::read(selected.root.join("LOCK")).unwrap();
+            assert!(
+                fetch(&cx, &options, &mut output).is_err(),
+                "an old receipt cannot follow a newer authority"
+            );
+            assert!(output.is_empty());
+            options.receipt = parent.join("new.json");
+            options.doc_id = Some("retry-new".to_owned());
+            fetch(&cx, &options, &mut output).unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(
+                response["authority"],
+                serde_json::json!(successor.authority)
+            );
+            assert_eq!(
+                response["documents"][0]["content"],
+                "retry network requests"
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority_after
+            );
+            assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock_after);
         });
     }
 
