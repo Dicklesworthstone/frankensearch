@@ -49,11 +49,20 @@ and 100,000 documents. These bound input, not model scratch space or total RSS.
 
 `authority-index` builds and publishes a complete generation through the fixed
 `LOCK` and `AUTHORITY` protocol. Its immutable components are one FSVI v2 vector
-tier, a sealed Quill image, and the generation metadata. `authority-search`
+tier, a sealed Quill image, the generation metadata, and an optional native HNSW
+graph. `authority-search`
 reopens the exact authority named by the saved receipt and searches the retained
 vector and lexical images together, including deferred result metadata.
 
-Choose either `--tier fast` or `--tier quality`. Both use exact vector retrieval.
+Choose either `--tier fast` or `--tier quality`. `--retrieval exact|hnsw` selects
+the vector search policy independently of the tier; new indexes default to
+`exact`. HNSW uses the native engine's default parameters and deterministic seed
+42. The graph is published as a fourth immutable component. Its complete native
+receipt is authenticated inside the metadata and binds the graph to the exact
+FSVI image, artifact generation, producer, storage identity, and live document
+set. Admission also checks its structure, checksums, topology and parameters.
+Missing or corrupt declared graphs cause refusal; they never silently change
+the retrieval mode.
 A quality generation loads its quality producer directly; it does not require
 a fast model. The source checkpoint is explicit: `--source-low` and
 `--source-high` are the inclusive source sequence boundaries that produced this
@@ -74,7 +83,7 @@ mkdir -m 700 "$HOME/frankensearch-authority"
   --root "$HOME/frankensearch-authority/g1" \
   --work-dir "$HOME/frankensearch-authority/g1-work" \
   --receipt "$HOME/frankensearch-authority/g1.json" \
-  --tier fast --source-low 1 --source-high 42 --cooperative-local \
+  --tier fast --retrieval hnsw --source-low 1 --source-high 42 --cooperative-local \
   --input ./documents.jsonl --model-dir /absolute/path/to/installed/models
 ./target/release/frankensearch-native authority-search \
   --receipt "$HOME/frankensearch-authority/g1.json" \
@@ -88,6 +97,9 @@ service. This choice is persisted in the receipt. Search cannot change the
 receipt's security profile, generation, authority, producer identity, or tier.
 A changed current authority is a refusal, even when its components are otherwise
 valid. Already opened readers retain their original component bytes.
+Search and recovery derive the retrieval mode from the admitted generation, not
+from a command-line override or a separately discovered graph path. Successful
+responses report `retrieval: "exact"` or `retrieval: "hnsw"` for the actual reader.
 
 ### Rebuild an existing authority generation
 
@@ -118,6 +130,13 @@ outside the root. Both source boundaries must be at least their previous values;
 an unchanged source cut is allowed. Empty corpora remain unsupported by this
 route's metadata contract. Rebuild advances both the artifact generation and
 authority sequence, refusing exhausted counters before inference.
+
+Rebuild preserves the selected generation's retrieval policy, including the
+full HNSW parameter set and seed authenticated by its native receipt. Supply
+`--retrieval exact` to deliberately replace it with an exact-scan generation,
+or `--retrieval hnsw` to select the default HNSW configuration explicitly.
+The replacement graph is built from the new complete cohort; the retained
+previous reader keeps its own original graph and vectors.
 
 The loaded provider must match the selected generation's complete identity
 before embedding begins. To intentionally rebuild with another producer, add
@@ -176,6 +195,8 @@ exceed the image size recorded by the trusted receipt. This bounds encoded
 images, not model memory, query scratch space, page cache, or other retained
 readers. Indexing inference batches default to 64 documents on this route and
 can be selected with `--batch-size`.
+HNSW graph bytes count toward this same aggregate budget during building,
+staging, selected-reader admission, and recovery.
 
 The publication budget also applies when activating a reader after the commit.
 If another publisher selects a larger generation in that interval, admission
@@ -261,6 +282,8 @@ using `QualifiedGenerationRoot::stage_immutable_file`, prepare an attempt agains
 publish it through `GenerationPublisherV1::publish_prepared`. The normal publisher
 re-admits the retained objects and applies the configured anti-rollback floor.
 Use the target's original vector binding when admitting the resulting reader.
+For an HNSW target, those receipts retain its graph and native owner binding;
+rollback preserves its retrieval mode, parameters and seed as well as its vectors.
 
 An intervening publication causes the stale rollback attempt to lose its exact
 comparison. Existing readers keep their original bytes throughout successful
@@ -268,10 +291,19 @@ rollback or failure. This is a retained-snapshot library API; it does not add
 historical discovery through paths or a rollback CLI command.
 
 The authority commands provide initial publication, full-cohort successor
-rebuilds, exact selected search, and publication recovery. The existing
+rebuilds, authority-selected exact or HNSW search, and publication recovery. The existing
 `update`, `rebuild`, and `serve` commands
 continue to use their own selected-snapshot receipts. Work files and staged
 candidates remain available after success or failure.
+
+The library entry points retain their existing names:
+`NativeIndexBuilder::build_exact_generation` and
+`NativeGenerationSnapshot::admit_exact`. Here, "exact" describes the complete
+component authority contract. Select `NativeBuildRetrieval::Hnsw` on the builder
+to include a native graph, and use `retrieval_configuration()` on a built or
+admitted generation to preserve its validated policy. This route still admits
+one vector tier per generation; combined fast/quality and sharded authority
+descriptors remain outside its supported shape.
 
 ## Native quality without the ONNX feature bundle
 

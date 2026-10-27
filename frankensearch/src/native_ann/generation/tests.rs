@@ -118,6 +118,7 @@ struct Fixture {
     metadata: GenerationManifest,
     activation: ActivationManifest,
     images: [Arc<[u8]>; 3],
+    ann: Option<Arc<[u8]>>,
 }
 
 impl Fixture {
@@ -129,6 +130,7 @@ impl Fixture {
             DEFAULT_SCHEMA,
             config(),
             self.images.clone(),
+            self.ann.clone(),
             BUDGET,
         )
     }
@@ -138,7 +140,7 @@ impl Fixture {
             &self.binding,
             &images,
             self.activation.document_set_sha256(),
-            None,
+            self.ann.as_deref().map(raw_receipt),
         );
         admit_components(
             cx,
@@ -147,8 +149,36 @@ impl Fixture {
             DEFAULT_SCHEMA,
             config(),
             images,
+            self.ann.clone(),
             BUDGET,
         )
+    }
+
+    fn reseal_metadata(&mut self) {
+        self.metadata.manifest_hash = compute_manifest_hash(&self.metadata).unwrap();
+        self.images[2] = serde_json::to_vec(&self.metadata).unwrap().into();
+        self.activation = activation(
+            &self.binding,
+            &self.images,
+            self.activation.document_set_sha256(),
+            self.ann.as_deref().map(raw_receipt),
+        );
+    }
+
+    fn with_ann(mut self, cx: &Cx, params: HnswParams, seed: u64) -> Self {
+        let owner = Arc::new(
+            ValidatedFsviBytes::from_arc(Arc::clone(&self.images[0]), &self.binding).unwrap(),
+        );
+        let graph = ValidatedNativeHnsw::build(cx, owner, params, seed).unwrap();
+        let path = self.directory.path().join("source/native.fshnsw");
+        let receipt = graph.save(&path).unwrap();
+        self.ann = Some(std::fs::read(path).unwrap().into());
+        self.metadata.metadata.insert(
+            NATIVE_ANN_RECEIPT_KEY.to_owned(),
+            serde_json::to_string(&receipt).unwrap(),
+        );
+        self.reseal_metadata();
+        self
     }
 }
 
@@ -264,6 +294,7 @@ async fn fixture(cx: &Cx, provider: &Provider, tier: EmbedderTierTag) -> Fixture
         metadata,
         activation,
         images,
+        ann: None,
     }
 }
 
@@ -298,6 +329,217 @@ fn actual_components_search_and_hydrate_fast_and_quality_with_tombstones() {
             }
             assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         }
+    });
+}
+
+fn assert_admission_refused(
+    result: SearchResult<CompositeReaders>,
+    expected_field: &str,
+    expected_code: &str,
+) {
+    let Err(SearchError::InvalidConfig { field, value, .. }) = result else {
+        panic!("expected bounded admission refusal {expected_field}/{expected_code}");
+    };
+    assert_eq!(field, format!("native_ann.generation.{expected_field}"));
+    assert_eq!(value, expected_code);
+}
+
+#[test]
+fn authenticated_ann_searches_both_tiers_and_retains_images_after_relocation() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let params = HnswParams {
+            m: 4,
+            m0: 8,
+            ef_construction: 24,
+            ef_search: 12,
+        };
+        for tier in [EmbedderTierTag::Fast, EmbedderTierTag::Quality] {
+            let provider = Provider::new();
+            let fixture = fixture(&cx, &provider, tier).await;
+            let exact = fixture.admit(&cx).unwrap();
+            let expected = exact
+                .search_text(&cx, &provider, "common", usize::MAX)
+                .await
+                .unwrap();
+            let fixture = fixture.with_ann(&cx, params, 9876);
+            let readers = fixture.admit(&cx).unwrap();
+            assert_eq!(readers.vector.retrieval_mode(), NativeRetrievalMode::Ann);
+            let NativeBuildRetrieval::Hnsw {
+                params: admitted,
+                seed,
+            } = readers.retrieval
+            else {
+                panic!("declared HNSW cannot become exact retrieval");
+            };
+            assert_eq!(admitted, params);
+            assert_eq!(seed, 9876);
+            assert!(readers.components.ann().is_some());
+            let mut foreign = Provider::new();
+            foreign.identity.producer.backend = "foreign-ann-producer".to_owned();
+            assert!(
+                readers
+                    .search_text(&cx, &foreign, "common", 0)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+
+            std::fs::rename(
+                fixture.directory.path().join("source"),
+                fixture.directory.path().join("relocated"),
+            )
+            .unwrap();
+            let readmitted = fixture.admit(&cx).unwrap();
+            drop(fixture);
+            for readers in [readers, readmitted] {
+                let hits = readers
+                    .search_text(&cx, &provider, "common", usize::MAX)
+                    .await
+                    .unwrap();
+                assert_eq!(hits.len(), 2);
+                for (hit, oracle) in hits.iter().zip(&expected) {
+                    assert_eq!(hit.doc_id, oracle.doc_id);
+                    assert_eq!(hit.score.to_bits(), oracle.score.to_bits());
+                    assert_eq!(hit.source, ScoreSource::Hybrid);
+                    assert_ne!(hit.doc_id, "dead");
+                    assert_eq!(hit.metadata.as_deref().unwrap()["version"], "old");
+                    assert_eq!(hit.fast_score.is_some(), tier == EmbedderTierTag::Fast);
+                    assert_eq!(
+                        hit.quality_score.is_some(),
+                        tier == EmbedderTierTag::Quality
+                    );
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn declared_ann_requires_the_authenticated_image_and_receipt_without_fallback() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let provider = Provider::new();
+        let mut fixture = fixture(&cx, &provider, EmbedderTierTag::Fast)
+            .await
+            .with_ann(&cx, HnswParams::default(), 42);
+        let ann = fixture.ann.as_ref().unwrap().clone();
+        assert!(fixture.admit(&cx).is_ok());
+        assert_admission_refused(
+            admit_components(
+                &cx,
+                &fixture.activation,
+                &fixture.binding,
+                DEFAULT_SCHEMA,
+                config(),
+                fixture.images.clone(),
+                None,
+                BUDGET,
+            ),
+            "ann",
+            "component-presence-mismatch",
+        );
+        let mut corrupt = ann.to_vec();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert_admission_refused(
+            admit_components(
+                &cx,
+                &fixture.activation,
+                &fixture.binding,
+                DEFAULT_SCHEMA,
+                config(),
+                fixture.images.clone(),
+                Some(corrupt.into()),
+                BUDGET,
+            ),
+            "component",
+            "image-mismatch",
+        );
+        let exact_budget = fixture.activation.canonical_bytes().len()
+            + fixture
+                .images
+                .iter()
+                .map(|image| image.len())
+                .sum::<usize>()
+            + ann.len();
+        for (budget, accepted) in [(exact_budget, true), (exact_budget - 1, false)] {
+            let result = admit_components(
+                &cx,
+                &fixture.activation,
+                &fixture.binding,
+                DEFAULT_SCHEMA,
+                config(),
+                fixture.images.clone(),
+                Some(Arc::clone(&ann)),
+                budget,
+            );
+            if accepted {
+                assert!(result.is_ok());
+            } else {
+                assert_admission_refused(result, "budget", "encoded-image-limit");
+            }
+        }
+        let original_receipt = fixture.metadata.metadata[NATIVE_ANN_RECEIPT_KEY].clone();
+        fixture.metadata.metadata.remove(NATIVE_ANN_RECEIPT_KEY);
+        fixture.reseal_metadata();
+        assert_admission_refused(
+            fixture.admit(&cx),
+            "ann",
+            "native-receipt-presence-mismatch",
+        );
+        fixture
+            .metadata
+            .metadata
+            .insert(NATIVE_ANN_RECEIPT_KEY.to_owned(), "{".to_owned());
+        fixture.reseal_metadata();
+        assert_admission_refused(fixture.admit(&cx), "ann", "invalid-native-receipt");
+        fixture
+            .metadata
+            .metadata
+            .insert(NATIVE_ANN_RECEIPT_KEY.to_owned(), original_receipt);
+        fixture.ann = None;
+        fixture.reseal_metadata();
+        assert_admission_refused(
+            fixture.admit(&cx),
+            "ann",
+            "native-receipt-presence-mismatch",
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn resealed_foreign_ann_receipt_cannot_substitute_same_identity_and_document_ids() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let provider = Provider::new();
+        let mut fixture = fixture(&cx, &provider, EmbedderTierTag::Fast)
+            .await
+            .with_ann(&cx, HnswParams::default(), 42);
+        let path = fixture.directory.path().join("foreign.fsvi");
+        let mut writer = VectorIndex::create_v2(&path, fixture.binding.clone()).unwrap();
+        writer.write_record("alpha", &[0.0, 1.0]).unwrap();
+        writer.write_record("beta", &[1.0, 0.0]).unwrap();
+        writer.write_tombstone_record("dead", &[1.0, 0.0]).unwrap();
+        writer.finish().unwrap();
+        let foreign_bytes: Arc<[u8]> = std::fs::read(path).unwrap().into();
+        assert_ne!(raw_receipt(&foreign_bytes), raw_receipt(&fixture.images[0]));
+        let owner =
+            Arc::new(ValidatedFsviBytes::from_arc(foreign_bytes, &fixture.binding).unwrap());
+        let graph =
+            ValidatedNativeHnsw::build(&cx, Arc::clone(&owner), HnswParams::default(), 42).unwrap();
+        let path = fixture.directory.path().join("foreign.fshnsw");
+        let receipt = graph.save(&path).unwrap();
+        let bytes: Arc<[u8]> = std::fs::read(path).unwrap().into();
+        assert!(ValidatedNativeHnsw::from_bytes(owner, Arc::clone(&bytes), &receipt).is_ok());
+        fixture.ann = Some(bytes);
+        fixture.metadata.metadata.insert(
+            NATIVE_ANN_RECEIPT_KEY.to_owned(),
+            serde_json::to_string(&receipt).unwrap(),
+        );
+        // Recompute every outer metadata and authority byte receipt. Only the
+        // receipt's independently validated owner binding distinguishes this
+        // otherwise valid graph with the same generation, model, IDs and counts.
+        fixture.reseal_metadata();
+        assert_admission_refused(fixture.admit(&cx), "ann", "native-admission-failed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     });
 }
 
@@ -362,6 +604,7 @@ fn component_admission_rejects_raw_and_resealed_metadata_drift() {
                     DEFAULT_SCHEMA,
                     config(),
                     images,
+                    None,
                     BUDGET
                 )
                 .is_err(),
@@ -398,6 +641,7 @@ fn component_admission_rejects_raw_and_resealed_metadata_drift() {
                 DEFAULT_SCHEMA,
                 config(),
                 fixture.images.clone(),
+                None,
                 BUDGET
             )
             .is_err(),
@@ -411,6 +655,7 @@ fn component_admission_rejects_raw_and_resealed_metadata_drift() {
                 DEFAULT_SCHEMA,
                 config(),
                 fixture.images.clone(),
+                None,
                 0
             )
             .is_err()
@@ -501,7 +746,9 @@ mod qualified_rollback {
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::native_ann::builder::{NativeBuiltExactGeneration, NativeIndexBuilder};
+    use crate::native_ann::builder::{
+        NativeBuildPrecision, NativeBuiltExactGeneration, NativeIndexBuilder,
+    };
     use crate::{GenerationActivationV1, GenerationPublisherV1};
     use frankensearch_core::generation::GenerationRootSecurityProfileV1;
     use frankensearch_index::generation_root::authority_publisher::{
@@ -609,10 +856,31 @@ mod qualified_rollback {
         ));
         fs::DirBuilder::new().mode(0o700).create(&parent).unwrap();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            for (name, tier) in [
-                ("fast", EmbedderTierTag::Fast),
-                ("quality", EmbedderTierTag::Quality),
+            for (name, tier, ann) in [
+                ("fast-exact", EmbedderTierTag::Fast, false),
+                ("quality-exact", EmbedderTierTag::Quality, false),
+                ("fast-ann", EmbedderTierTag::Fast, true),
+                ("quality-ann", EmbedderTierTag::Quality, true),
             ] {
+                let hnsw = NativeBuildRetrieval::Hnsw {
+                    params: HnswParams {
+                        m: 4,
+                        m0: 8,
+                        ef_construction: 24,
+                        ef_search: 17,
+                    },
+                    seed: 123,
+                };
+                let original_retrieval = if ann {
+                    hnsw
+                } else {
+                    NativeBuildRetrieval::Exact
+                };
+                let successor_retrieval = if ann {
+                    NativeBuildRetrieval::Exact
+                } else {
+                    hnsw
+                };
                 let root_path = parent.join(format!("{name}-root"));
                 let root = create_root(&root_path);
                 let original_provider = Arc::new(Provider::new());
@@ -623,6 +891,7 @@ mod qualified_rollback {
                     provider,
                 )
                 .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, original_retrieval)
                 .add_documents(
                     [IndexableDocument::new("original", "common retained source")
                         .with_metadata("version", "original")],
@@ -647,6 +916,8 @@ mod qualified_rollback {
                     ExpectedAuthorityPairV1::default(),
                     [0x85; 16],
                 );
+                assert_eq!(retained.retrieval_mode(), original.retrieval_mode());
+                assert_eq!(first.manifest().components().ann.is_some(), ann);
                 assert!(
                     retained
                         .rollback_candidate(&cx, &retained, [0x86; 16], [0x87; 32])
@@ -664,6 +935,7 @@ mod qualified_rollback {
                     provider,
                 )
                 .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, successor_retrieval)
                 .add_documents([
                     IndexableDocument::new("successor", "common replacement source")
                         .with_metadata("version", "successor"),
@@ -688,6 +960,8 @@ mod qualified_rollback {
                     retained.retained_snapshot().authority_pair(),
                     [0x8b; 16],
                 );
+                assert_eq!(current.retrieval_mode(), rebuilt.retrieval_mode());
+                assert_ne!(current.retrieval_mode(), retained.retrieval_mode());
                 assert!(
                     current
                         .rollback_candidate(&cx, &retained, [0x8c; 16], [0x8d; 32])
@@ -798,6 +1072,30 @@ mod qualified_rollback {
                     [0x97; 16],
                 );
                 assert_eq!(restored.authority().sequence, 3);
+                assert_eq!(restored.retrieval_mode(), retained.retrieval_mode());
+                match (
+                    retained.retrieval_configuration(),
+                    restored.retrieval_configuration(),
+                ) {
+                    (
+                        NativeBuildRetrieval::Hnsw { params, seed },
+                        NativeBuildRetrieval::Hnsw {
+                            params: restored_params,
+                            seed: restored_seed,
+                        },
+                    ) => {
+                        assert!(ann);
+                        assert_eq!(params.ef_search, 17);
+                        assert_eq!(seed, 123);
+                        assert_eq!(restored_params, params);
+                        assert_eq!(restored_seed, seed);
+                    }
+                    (NativeBuildRetrieval::Exact, NativeBuildRetrieval::Exact) => {
+                        assert!(!ann);
+                    }
+                    _ => panic!("rollback must restore the target's full retrieval policy"),
+                }
+                assert_eq!(rollback.manifest().components().ann.is_some(), ann);
                 assert_eq!(
                     restored.metadata().commit_range,
                     CommitRange { low: 1, high: 4 }

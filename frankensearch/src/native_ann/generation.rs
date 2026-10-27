@@ -1,4 +1,4 @@
-//! Exact retrieval over one authority-admitted composite generation.
+//! Native retrieval over one authority-admitted composite generation.
 //!
 //! All engine readers consume the retained component images. No component is
 //! rediscovered through a pathname, and a later authority activation cannot
@@ -12,22 +12,33 @@ use frankensearch_core::generation::{
     GenerationComponentRole, GenerationManifest, InvariantKind, SourceCheckpointV1,
     validate_manifest,
 };
-use frankensearch_index::exact_component_adapters::vector_component_receipt;
+use frankensearch_index::exact_component_adapters::{
+    ann_component_receipt, vector_component_receipt,
+};
 use frankensearch_index::generation_root::GenerationRootObjectWitness;
 use frankensearch_index::generation_root::generation_reader::{
     OpenedGenerationSnapshotV1, SnapshotHealthV1,
+};
+use frankensearch_index::native_hnsw::{
+    HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
 };
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{KeeperSnapshot, QuillConfig, QuillSnapshotIndex, SchemaDescriptor};
 use sha2::Digest as _;
 
-use super::{NativeAnnIndex, NativeRetrievalMode, checkpoint, invalid, lower_hex};
+use super::builder::NativeBuildRetrieval;
+use super::{NativeAnnIndex, NativeBackend, NativeRetrievalMode, checkpoint, invalid, lower_hex};
 use crate::{Cx, Embedder, GenerationCandidateV1, ScoredResult, SearchResult};
 
 #[cfg(test)]
 mod tests;
 
-/// Query-capable readers for one fixed-authority, single-tier exact generation.
+// The selected metadata image authenticates the full owner-bound native receipt.
+// The separately selected ANN component remains the raw graph image, so its
+// byte receipt has exactly the existing ann_component_receipt semantics.
+pub(super) const NATIVE_ANN_RECEIPT_KEY: &str = "native_hnsw_receipt_v2";
+
+/// Query-capable readers for one fixed-authority, single-tier native generation.
 ///
 /// The authority-selected vector, lexical and metadata images are parsed and
 /// joined before the handle becomes usable. The full FSVI generation and frozen
@@ -35,11 +46,12 @@ mod tests;
 /// checkpoint must agree. Query-time producer admission is delegated to the
 /// existing typed native retrieval path, including zero-result requests.
 ///
-/// This first composite route supports one independently identified vector tier
-/// (fast or quality) and an explicitly absent ANN component. Multi-tier/sharded
-/// descriptors and declared ANN are refused, never silently reduced to a
-/// different topology. The metadata artifact list describes exactly the two
-/// retained search images; it is not a source of paths to open. Vector artifact
+/// This composite route supports one independently identified vector tier
+/// (fast or quality), with exact search or an authenticated native HNSW component.
+/// A declared ANN requires its raw graph image and full native receipt in the
+/// selected metadata; a missing or invalid accelerator is never replaced by
+/// exact search. Multi-tier/sharded descriptors remain unsupported. Metadata
+/// paths are descriptive names, never paths to open. Vector artifact
 /// counts describe physical rows, including tombstones; the common document set
 /// and metadata total count describe live documents. The existing metadata
 /// readiness policy requires at least one live document in this route.
@@ -58,6 +70,7 @@ pub(super) struct CompositeReaders {
     lexical: QuillSnapshotIndex,
     metadata: GenerationManifest,
     tier: EmbedderTierTag,
+    retrieval: NativeBuildRetrieval,
     components: ExactGenerationComponentsV1,
 }
 
@@ -109,6 +122,7 @@ impl NativeGenerationSnapshot {
                 component(GenerationComponentRole::Lexical)?,
                 component(GenerationComponentRole::Metadata)?,
             ],
+            authority.closure().bytes(GenerationComponentRole::Ann),
             max_image_bytes,
         )?;
         checkpoint(cx, "native_ann.generation.admitted")?;
@@ -137,6 +151,13 @@ impl NativeGenerationSnapshot {
     #[must_use]
     pub const fn retrieval_mode(&self) -> NativeRetrievalMode {
         self.readers.vector.retrieval_mode()
+    }
+
+    /// The authenticated construction/search policy retained by this generation.
+    /// Rebuilds can preserve its graph parameters and seed without reading paths.
+    #[must_use]
+    pub const fn retrieval_configuration(&self) -> NativeBuildRetrieval {
+        self.readers.retrieval
     }
 
     /// The validated metadata image belonging to this exact authority.
@@ -304,18 +325,20 @@ pub(super) fn admit_components(
     schema: SchemaDescriptor,
     config: QuillConfig,
     images: [Arc<[u8]>; 3],
+    ann_image: Option<Arc<[u8]>>,
     max_image_bytes: usize,
 ) -> SearchResult<CompositeReaders> {
     checkpoint(cx, "native_ann.generation.components")?;
     let declared = activation.components();
-    if declared.ann.is_some() {
-        return Err(refused("ann", "declared-accelerator"));
+    if declared.ann.is_some() != ann_image.is_some() {
+        return Err(refused("ann", "component-presence-mismatch"));
     }
     if activation.generation() != expected_vector.generation() {
         return Err(refused("generation", "binding-mismatch"));
     }
     let image_bytes = images
         .iter()
+        .chain(ann_image.iter())
         .try_fold(activation.canonical_bytes().len(), |total, image| {
             total.checked_add(image.len())
         });
@@ -327,7 +350,10 @@ pub(super) fn admit_components(
         (&vector_bytes, declared.vector),
         (&lexical_bytes, declared.lexical),
         (&metadata_bytes, declared.metadata),
-    ] {
+    ]
+    .into_iter()
+    .chain(ann_image.as_ref().zip(declared.ann))
+    {
         let mut hasher = sha2::Sha256::new();
         for chunk in image.chunks(1024 * 1024) {
             checkpoint(cx, "native_ann.generation.component_hash")?;
@@ -352,6 +378,14 @@ pub(super) fn admit_components(
     if !validate_manifest(&metadata).is_valid() {
         return Err(refused("metadata", "invalid-manifest"));
     }
+    let native_receipt = match (declared.ann, metadata.metadata.get(NATIVE_ANN_RECEIPT_KEY)) {
+        (Some(_), Some(encoded)) => Some(
+            serde_json::from_str::<NativeHnswGenerationReceiptV2>(encoded)
+                .map_err(|_| refused("ann", "invalid-native-receipt"))?,
+        ),
+        (None, None) => None,
+        _ => return Err(refused("ann", "native-receipt-presence-mismatch")),
+    };
     let checkpoint_value = SourceCheckpointV1::derive(&metadata.commit_range);
     if checkpoint_value.to_bytes() != activation.source_checkpoint_sha256() {
         return Err(refused("checkpoint", "source-mismatch"));
@@ -380,6 +414,20 @@ pub(super) fn admit_components(
         || vector_receipt.docset_digest != activation.document_set_sha256()
     {
         return Err(refused("vector", "selected-document-set-mismatch"));
+    }
+    let ann_receipt = native_receipt
+        .as_ref()
+        .map(|receipt| {
+            ann_component_receipt(
+                receipt,
+                identifiers.iter().map(String::as_str),
+                checkpoint_value,
+            )
+            .map_err(|_| refused("ann", "invalid-document-set"))
+        })
+        .transpose()?;
+    if ann_receipt.as_ref().map(|receipt| receipt.bytes) != declared.ann {
+        return Err(refused("ann", "selected-receipt-mismatch"));
     }
     let documents = CanonicalDocsetV1::from_ordered_live_documents(identifiers)
         .map_err(|_| refused("metadata", "invalid-document-set"))?;
@@ -414,11 +462,46 @@ pub(super) fn admit_components(
     );
     checkpoint(cx, "native_ann.generation.lexical_complete")?;
     let lexical = lexical_result.map_err(|_| refused("lexical", "admission-failed"))?;
-    let components =
-        ExactGenerationComponentsV1::admit(vector_receipt, lexical_receipt, None, metadata_receipt)
-            .map_err(|_| refused("components", "incoherent-generation"))?;
+    let components = ExactGenerationComponentsV1::admit(
+        vector_receipt,
+        lexical_receipt,
+        ann_receipt,
+        metadata_receipt,
+    )
+    .map_err(|_| refused("components", "incoherent-generation"))?;
     checkpoint(cx, "native_ann.generation.readers")?;
-    let vector = NativeAnnIndex::exact(cx, owner)?;
+    let (vector, retrieval) = match (ann_image, native_receipt) {
+        (Some(bytes), Some(receipt)) => {
+            let graph = ValidatedNativeHnsw::from_bytes(Arc::clone(&owner), bytes, &receipt)
+                .map_err(|_| refused("ann", "native-admission-failed"))?;
+            checkpoint(cx, "native_ann.generation.ann_admitted")?;
+            let dimension =
+                |value| usize::try_from(value).map_err(|_| refused("ann", "invalid-parameters"));
+            let params = HnswParams {
+                m: dimension(receipt.params.m)?,
+                m0: dimension(receipt.params.m0)?,
+                ef_construction: dimension(receipt.params.ef_construction)?,
+                ef_search: dimension(receipt.params.ef_search)?,
+            };
+            let vector = NativeAnnIndex {
+                owner,
+                graph: NativeBackend::Ann(Box::new(graph)),
+                default_ef_search: params.ef_search,
+            };
+            (
+                vector,
+                NativeBuildRetrieval::Hnsw {
+                    params,
+                    seed: receipt.seed,
+                },
+            )
+        }
+        (None, None) => (
+            NativeAnnIndex::exact(cx, owner)?,
+            NativeBuildRetrieval::Exact,
+        ),
+        _ => return Err(refused("ann", "native-receipt-presence-mismatch")),
+    };
     let lexical_result = QuillSnapshotIndex::new(cx, lexical, config);
     checkpoint(cx, "native_ann.generation.ready")?;
     let lexical = lexical_result.map_err(|_| refused("lexical", "invalid-search-configuration"))?;
@@ -428,6 +511,7 @@ pub(super) fn admit_components(
         lexical,
         metadata,
         tier,
+        retrieval,
         components,
     })
 }

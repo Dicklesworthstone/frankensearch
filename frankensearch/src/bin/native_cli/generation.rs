@@ -1,4 +1,4 @@
-//! Executable build, fixed-authority publication, and retained exact search.
+//! Executable build, fixed-authority publication, and retained single-tier search.
 //!
 //! Staging creates a fresh private root under a trusted parent. The existing
 //! qualified-root publisher independently admits and syncs every staged image
@@ -15,10 +15,10 @@ use std::sync::Arc;
 
 use asupersync::runtime::RuntimeBuilder;
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
-use frankensearch::native_ann::NativeGenerationSnapshot;
 use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
 };
+use frankensearch::native_ann::{NativeGenerationSnapshot, NativeRetrievalMode};
 use frankensearch::{Cx, Embedder, GenerationActivationV1, GenerationPublisherV1, SearchError};
 use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1, CommitRange, EmbedderTierTag,
@@ -36,6 +36,7 @@ use frankensearch_index::generation_root::generation_reader::{
 use frankensearch_index::generation_root::{
     GENERATION_ROOT_AUTHORITY_FILE_BYTES, GenerationRootAnchorLayout, QualifiedGenerationRoot,
 };
+use frankensearch_index::native_hnsw::HnswParams;
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -49,21 +50,24 @@ const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 const PROFILE: GenerationRootSecurityProfileV1 = GenerationRootSecurityProfileV1::CooperativeLocal;
-const HELP: &str = "Fixed AUTHORITY exact search (one explicit semantic tier)\n\n\
+const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
   authority-index --root NEW_ROOT --work-dir NEW_DIR --receipt NEW_JSON\n\
       --tier fast|quality --source-low N --source-high N --cooperative-local\n\
       [--input JSONL] [--model-dir DIR] [--batch-size N]\n\
       [--quality-backend onnx|native-int8|native-f32|native-multilingual]\n\
-      [--quality-model-dir DIR] [--max-image-bytes N]\n\n\
+      [--quality-model-dir DIR] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
   authority-rebuild --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       --source-low N --source-high N [--input JSONL] [--batch-size N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--migrate-model] [--max-image-bytes N]\n\n\
+      [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--max-image-bytes N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
-This explicit route builds one exact FSVI v2 tier plus a retained Quill image.\n\
+This explicit route builds one FSVI v2 tier plus a retained Quill image.\n\
+New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
+The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
+missing or invalid graphs fail admission without substituting exact retrieval.\n\
 Quality-only generations load and query their quality model directly. Models\n\
 are local-only; unavailable or mismatched models fail without substitution.\n\
 Source-low/high identify the inclusive source checkpoint supplied by the caller.\n\
@@ -71,6 +75,8 @@ Roots, work directories and receipts must be new, separate locations.\n\
 Rebuild retains the selected root, tier and security profile, replaces the whole\n\
 source cohort, and requires a new work directory and receipt outside the root.\n\
 Source boundaries cannot regress. A different producer requires --migrate-model.\n\
+Rebuild inherits the admitted retrieval policy, including HNSW parameters and\n\
+seed, unless --retrieval explicitly selects exact or the default HNSW policy.\n\
 Concurrent publication refuses the captured old selection; retry explicitly\n\
 from the winning receipt. Rebuild never edits the old generation's images.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
@@ -105,6 +111,7 @@ struct Options {
     models: Option<PathBuf>,
     quality: models::QualityOptions,
     tier: Option<EmbedderTierTag>,
+    retrieval: Option<NativeBuildRetrieval>,
     source_low: Option<u64>,
     source_high: Option<u64>,
     query: Option<String>,
@@ -142,6 +149,7 @@ impl Options {
             models: None,
             quality: models::QualityOptions::default(),
             tier: None,
+            retrieval: None,
             source_low: None,
             source_high: None,
             query: None,
@@ -203,6 +211,16 @@ impl Options {
                 "--batch-size" if matches!(command, Command::Index | Command::Rebuild) => {
                     options.batch_size = number(&value(&mut args)?, MAX_DOCUMENTS)?;
                 }
+                "--retrieval" if matches!(command, Command::Index | Command::Rebuild) => {
+                    options.retrieval = Some(match value(&mut args)?.as_str() {
+                        "exact" => NativeBuildRetrieval::Exact,
+                        "hnsw" => NativeBuildRetrieval::Hnsw {
+                            params: HnswParams::default(),
+                            seed: 42,
+                        },
+                        _ => return Err(bad("authority retrieval must be exact or hnsw")),
+                    });
+                }
                 "--cooperative-local" if command == Command::Index => {
                     options.cooperative_local = true;
                 }
@@ -250,6 +268,10 @@ impl Options {
         Ok(Some(options))
     }
 
+    fn build_retrieval(&self, previous: Option<NativeBuildRetrieval>) -> NativeBuildRetrieval {
+        self.retrieval.or(previous).unwrap_or_default()
+    }
+
     fn source_cut(&self) -> Result<CommitRange> {
         let low = self
             .source_low
@@ -273,6 +295,13 @@ impl Options {
 fn source_sequence(text: &str) -> Result<u64> {
     text.parse()
         .map_err(|_| bad("source sequence must be an unsigned 64-bit integer"))
+}
+
+fn retrieval_name(mode: NativeRetrievalMode) -> &'static str {
+    match mode {
+        NativeRetrievalMode::Ann => "hnsw",
+        NativeRetrievalMode::Exact { .. } => "exact",
+    }
 }
 
 /// Inputs recorded before publication, never an assertion about its outcome.
@@ -700,7 +729,7 @@ fn stage_and_publish(
         checkpoint(cx)?;
         let bytes = built
             .component_bytes(role)
-            .ok_or_else(|| bad("the exact builder omitted a declared component"))?;
+            .ok_or_else(|| bad("the generation builder omitted a declared component"))?;
         root.stage_immutable_file(&component_object_path_v1(role, component.sha256)?, &bytes)?;
     }
     checkpoint(cx)?;
@@ -792,7 +821,7 @@ async fn index(
     };
     if documents.is_empty() {
         return Err(bad(
-            "the exact generation metadata contract requires a nonempty source cohort",
+            "the generation metadata contract requires a nonempty source cohort",
         ));
     }
     let tier = options.tier.ok_or_else(|| bad("missing tier"))?;
@@ -800,7 +829,7 @@ async fn index(
     let built = NativeIndexBuilder::new(&work_path, new_generation(1)?, model)?
         .with_batch_size(options.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-        .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+        .with_fast_storage(NativeBuildPrecision::F32, options.build_retrieval(None))
         .add_documents(documents)
         .build_exact_generation(cx, tier, options.source_cut()?, options.max_image_bytes)
         .await?;
@@ -813,15 +842,20 @@ async fn index(
         None,
         options.max_image_bytes,
     )?;
-    emit_indexed(output, &receipt, &receipt_path)
+    emit_indexed(output, &receipt, &receipt_path, built.retrieval_mode())
 }
 
-fn emit_indexed(output: &mut impl Write, receipt: &Receipt, receipt_path: &Path) -> Result<()> {
+fn emit_indexed(
+    output: &mut impl Write,
+    receipt: &Receipt,
+    receipt_path: &Path,
+    retrieval: NativeRetrievalMode,
+) -> Result<()> {
     emit(
         output,
         &serde_json::json!({
             "schema": SCHEMA, "ok": true, "event": "indexed", "publication": "committed",
-            "serving": "activated", "retrieval": "exact", "receipt": receipt_path,
+            "serving": "activated", "retrieval": retrieval_name(retrieval), "receipt": receipt_path,
             "selection": receipt,
         }),
     )
@@ -914,7 +948,7 @@ async fn rebuild(
     };
     if documents.is_empty() {
         return Err(bad(
-            "the exact generation metadata contract requires a nonempty source cohort",
+            "the generation metadata contract requires a nonempty source cohort",
         ));
     }
     let model = models::load_single(
@@ -928,7 +962,10 @@ async fn rebuild(
     let built = NativeIndexBuilder::new(&work_path, new_generation(sequence)?, model)?
         .with_batch_size(options.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
-        .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+        .with_fast_storage(
+            NativeBuildPrecision::F32,
+            options.build_retrieval(Some(snapshot.retrieval_configuration())),
+        )
         .add_documents(documents)
         .build_exact_generation(cx, selected.tier, source, options.max_image_bytes)
         .await?;
@@ -948,7 +985,8 @@ async fn rebuild(
         output,
         &serde_json::json!({
             "schema": SCHEMA, "ok": true, "event": "rebuilt", "publication": "committed",
-            "serving": "activated", "retrieval": "exact", "receipt": receipt_path,
+            "serving": "activated", "retrieval": retrieval_name(built.retrieval_mode()),
+            "receipt": receipt_path,
             "replaces": selected.authority, "model_migrated": receipt.identity != selected.identity,
             "selection": receipt,
         }),
@@ -996,7 +1034,8 @@ async fn search(
     emit(
         output,
         &serde_json::json!({
-            "schema": SCHEMA, "ok": true, "event": "results", "retrieval": "exact",
+            "schema": SCHEMA, "ok": true, "event": "results",
+            "retrieval": retrieval_name(snapshot.retrieval_mode()),
             "tier": receipt.tier, "generation": receipt.generation,
             "authority": snapshot.authority().canonical_bytes().as_slice(),
             "profile": receipt.profile, "results": results,
@@ -1082,7 +1121,10 @@ fn recover(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     let mut report = reconciliation_report(&receipt, &permit, &outcome);
     if matches!(outcome, ReconcileOutcomeV1::Committed { .. }) {
         match receipt.open(cx, options.max_image_bytes) {
-            Ok(_snapshot) => report["serving"] = serde_json::json!("activated"),
+            Ok(snapshot) => {
+                report["serving"] = serde_json::json!("activated");
+                report["retrieval"] = serde_json::json!(retrieval_name(snapshot.retrieval_mode()));
+            }
             Err(error) => {
                 report["ok"] = serde_json::json!(false);
                 report["reason"] = serde_json::json!("snapshot_activation_deferred_or_refused");

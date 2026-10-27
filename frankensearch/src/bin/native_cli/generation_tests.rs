@@ -1,4 +1,5 @@
 use super::*;
+use frankensearch::native_ann::NativeExactReason;
 use frankensearch_core::generation::{
     EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1,
     QuantizationFormat,
@@ -80,6 +81,93 @@ fn rebuild_arguments() -> Vec<&'static str> {
         "--source-high",
         "9",
     ]
+}
+
+#[test]
+fn authority_retrieval_is_explicit_for_new_indexes_and_cannot_override_search() {
+    let options = parse(&index_arguments()).unwrap().unwrap();
+    assert!(options.retrieval.is_none());
+    assert!(matches!(
+        options.build_retrieval(None),
+        NativeBuildRetrieval::Exact
+    ));
+    for mut arguments in [index_arguments(), rebuild_arguments()] {
+        arguments.extend(["--retrieval", "hnsw"]);
+        let options = parse(&arguments).unwrap().unwrap();
+        let NativeBuildRetrieval::Hnsw { params, seed } = options.build_retrieval(None) else {
+            panic!("explicit HNSW must select a graph");
+        };
+        assert_eq!(params, HnswParams::default());
+        assert_eq!(seed, 42);
+        arguments.extend(["--retrieval", "exact"]);
+        assert!(parse(&arguments).is_err(), "duplicate retrieval selection");
+    }
+    for retrieval in ["auto", "ann", "", "EXACT"] {
+        let mut arguments = index_arguments();
+        arguments.extend(["--retrieval", retrieval]);
+        assert!(parse(&arguments).is_err(), "accepted {retrieval:?}");
+    }
+    for arguments in [
+        vec![
+            "authority-search",
+            "--receipt",
+            "selected.json",
+            "--query",
+            "retry",
+            "--retrieval",
+            "exact",
+        ],
+        vec![
+            "authority-recover",
+            "--receipt",
+            "selected.json",
+            "--retrieval",
+            "hnsw",
+        ],
+    ] {
+        assert!(parse(&arguments).is_err());
+    }
+}
+
+#[test]
+fn rebuild_inherits_full_authenticated_retrieval_policy_unless_explicitly_changed() {
+    let inherited_params = HnswParams {
+        m: 4,
+        m0: 8,
+        ef_construction: 24,
+        ef_search: 12,
+    };
+    let inherited = NativeBuildRetrieval::Hnsw {
+        params: inherited_params,
+        seed: 9876,
+    };
+    let options = parse(&rebuild_arguments()).unwrap().unwrap();
+    let NativeBuildRetrieval::Hnsw { params, seed } = options.build_retrieval(Some(inherited))
+    else {
+        panic!("a rebuild must preserve its admitted graph policy");
+    };
+    assert_eq!(params, inherited_params);
+    assert_eq!(seed, 9876);
+    assert!(matches!(
+        options.build_retrieval(Some(NativeBuildRetrieval::Exact)),
+        NativeBuildRetrieval::Exact
+    ));
+
+    let mut arguments = rebuild_arguments();
+    arguments.extend(["--retrieval", "exact"]);
+    let options = parse(&arguments).unwrap().unwrap();
+    assert!(matches!(
+        options.build_retrieval(Some(inherited)),
+        NativeBuildRetrieval::Exact
+    ));
+    *arguments.last_mut().unwrap() = "hnsw";
+    let options = parse(&arguments).unwrap().unwrap();
+    let NativeBuildRetrieval::Hnsw { params, seed } = options.build_retrieval(Some(inherited))
+    else {
+        panic!("explicit HNSW must select the default graph policy");
+    };
+    assert_eq!(params, HnswParams::default());
+    assert_eq!(seed, 42);
 }
 
 #[test]
@@ -650,12 +738,38 @@ fn failed_result_delivery_preserves_known_commit_and_activation() {
         &mut BrokenOutput,
         &receipt(),
         Path::new("/private/receipt.json"),
+        NativeRetrievalMode::Ann,
     )
     .unwrap_err();
     let payload = publication_failure(error.as_ref()).unwrap();
     assert_eq!(payload["publication"], "committed");
     assert_eq!(payload["serving"], "activated");
     assert_eq!(payload["reason"], "result_delivery_failed");
+}
+
+#[test]
+fn indexed_report_exposes_the_realized_retrieval_without_changing_the_receipt() {
+    let selected = receipt();
+    for (mode, label) in [
+        (NativeRetrievalMode::Ann, "hnsw"),
+        (
+            NativeRetrievalMode::Exact {
+                reason: NativeExactReason::Requested,
+            },
+            "exact",
+        ),
+    ] {
+        let mut output = Vec::new();
+        emit_indexed(&mut output, &selected, Path::new("/receipt.json"), mode).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["retrieval"], label);
+        assert_eq!(
+            report["selection"],
+            serde_json::to_value(&selected).unwrap()
+        );
+        assert_eq!(report["publication"], "committed");
+        assert_eq!(report["serving"], "activated");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -704,10 +818,27 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
         );
         assert_eq!(fs::read(unissued_path.join("LOCK")).unwrap(), vec![0; 8192]);
 
-        for (name, tier) in [
-            ("fast", EmbedderTierTag::Fast),
-            ("quality", EmbedderTierTag::Quality),
+        for (name, tier, ann) in [
+            ("fast-exact", EmbedderTierTag::Fast, false),
+            ("quality-exact", EmbedderTierTag::Quality, false),
+            ("fast-hnsw", EmbedderTierTag::Fast, true),
+            ("quality-hnsw", EmbedderTierTag::Quality, true),
         ] {
+            let retrieval = if ann {
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 42,
+                }
+            } else {
+                NativeBuildRetrieval::Exact
+            };
+            let mode = if ann {
+                NativeRetrievalMode::Ann
+            } else {
+                NativeRetrievalMode::Exact {
+                    reason: NativeExactReason::Requested,
+                }
+            };
             let root_path = parent.join(format!("{name}-root"));
             let root = create_root(&root_path).expect("qualified Linux root is required");
             let work = parent.join(format!("{name}-work"));
@@ -719,7 +850,7 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             let model: Arc<dyn Embedder> = provider.clone();
             let built = NativeIndexBuilder::new(&work, new_generation(1).unwrap(), model)
                 .unwrap()
-                .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                .with_fast_storage(NativeBuildPrecision::F32, retrieval)
                 .add_documents([
                     IndexableDocument::new("zeta", "retry network requests")
                         .with_metadata("version", "original"),
@@ -733,6 +864,7 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
                 )
                 .await
                 .unwrap();
+            assert_eq!(built.retrieval_mode(), mode);
             let published = stage_and_publish(
                 &cx,
                 &root,
@@ -800,6 +932,7 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             assert_eq!(recovered["publication"], "committed");
             assert_eq!(recovered["reconciliation"], "committed");
             assert_eq!(recovered["serving"], "activated");
+            assert_eq!(recovered["retrieval"], retrieval_name(mode));
             assert_eq!(recovered["attempt"], attempt_report(&recorded));
             assert_eq!(
                 provider.calls.load(Ordering::Relaxed),
@@ -833,6 +966,7 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             assert!(selected.open(&cx, 1).is_err());
             let before = provider.calls.load(Ordering::Relaxed);
             let snapshot = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(snapshot.retrieval_mode(), mode);
             assert_eq!(
                 provider.calls.load(Ordering::Relaxed),
                 before,
