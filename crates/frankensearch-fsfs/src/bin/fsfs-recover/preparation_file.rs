@@ -229,6 +229,7 @@ mod tests {
             selection_write_performed: false,
             durability_confirmed: false,
             producer_admission_checked: true,
+            source_rebuild_performed: false,
             repaired_from: Some(RepairSource {
                 generation_id: format!("g-{}-{}-{}", "1".repeat(32), "2".repeat(8), "3".repeat(16)),
                 manifest_sha256: "e".repeat(64),

@@ -18,10 +18,10 @@ use sha2::{Digest, Sha256};
 
 use super::{
     BundleManifest, COMPLETE_GENERATION_MANIFEST, COMPLETE_GENERATION_POINTER,
-    CompleteGenerationStore, GENERATIONS, GenerationPublication, MAX_MANIFEST_BYTES,
-    MAX_POINTER_BYTES, NEXT_GENERATION, POINTER_MAGIC, PublicationLease, PublishedGeneration,
-    checkpoint, decode_pointer, digest, hex, invalid, inventory, open_regular, pin_generation,
-    read_bounded_regular, require_directory, sync_tree, write_new_synced,
+    CompleteGenerationStore, GENERATIONS, GenerationBuild, GenerationPublication,
+    MAX_MANIFEST_BYTES, MAX_POINTER_BYTES, NEXT_GENERATION, POINTER_MAGIC, PublicationLease,
+    PublishedGeneration, checkpoint, decode_pointer, digest, hex, invalid, inventory, open_regular,
+    pin_generation, read_bounded_regular, require_directory, sync_tree, write_new_synced,
 };
 
 #[cfg(unix)]
@@ -40,6 +40,41 @@ pub struct PreparedGenerationRestore {
     expected_selection: Option<Vec<u8>>,
 }
 
+impl GenerationBuild {
+    /// Seal a new bundle without changing the active generation.
+    ///
+    /// Runs the same consumer admission, complete inventory and durability
+    /// barriers as [`Self::publish`]. The returned preparation pins the sealed
+    /// candidate and retains the predecessor captured when the build began.
+    /// Publication ownership is released before returning, so preview/model
+    /// work cannot block another publisher; its victory makes this preparation
+    /// stale instead of being overwritten. No temporary selection is written.
+    /// All writers must be quiescent before calling this method.
+    ///
+    /// # Errors
+    /// Returns admission, integrity, changed-predecessor, I/O or cancellation
+    /// errors while leaving the selected predecessor unchanged. Unselected
+    /// candidate bytes are retained on failure.
+    pub fn prepare<F>(self, cx: &Cx, validate: F) -> SearchResult<PreparedGenerationRestore>
+    where
+        F: FnOnce(&Cx, &Path) -> SearchResult<()>,
+    {
+        let manifest_sha256 = self.seal(cx, validate)?;
+        ensure_selection(&self.store.root, self.predecessor.as_deref())?;
+        let target = self.store.open_retained(cx, &self.id, &manifest_sha256)?;
+        checkpoint(cx)?;
+        self.lease.fence("complete-generation rebuild prepared")?;
+        ensure_selection(&self.store.root, self.predecessor.as_deref())?;
+        let plan = PreparedGenerationRestore {
+            store: self.store,
+            target,
+            expected_selection: self.predecessor,
+        };
+        drop(self.lease);
+        Ok(plan)
+    }
+}
+
 impl fmt::Debug for PreparedGenerationRestore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -52,6 +87,33 @@ impl fmt::Debug for PreparedGenerationRestore {
 }
 
 impl CompleteGenerationStore {
+    /// Begin an explicit independent rebuild when the current selection is damaged.
+    ///
+    /// Unlike [`Self::begin`], this does not admit or decode the old selection.
+    /// Its bounded, regular-file bytes (or absence) are captured under the same
+    /// publisher lease and used only as the expected-old publication guard.
+    /// The caller must rebuild all engine data from authoritative source inputs;
+    /// no old generation is selected for copying or fallback. Sealing refuses
+    /// shared files, so a repair cannot carry an unvalidated predecessor inode
+    /// into the new bundle. Old payloads and descriptors stay untouched until
+    /// explicit, guarded selection of the admitted new bundle.
+    ///
+    /// This is a cooperative-store recovery capability, not an authorization
+    /// to ignore a changed selection or to mutate sealed generation contents.
+    ///
+    /// # Errors
+    /// Returns contention, cancellation, unsafe/oversized selection evidence,
+    /// inadmissible security profile or filesystem errors. Malformed bounded
+    /// descriptor text and corrupt old artifacts do not prevent recovery.
+    pub fn begin_recovery_rebuild(&self, cx: &Cx) -> SearchResult<GenerationBuild> {
+        checkpoint(cx)?;
+        self.require_mutation_authorized()?;
+        let lease = PublicationLease::acquire(&self.root)?;
+        lease.fence("complete-generation recovery rebuild entry")?;
+        let predecessor = selection_evidence(&self.root)?;
+        self.allocate_build(cx, lease, predecessor, false)
+    }
+
     /// Reopen an explicitly named retained generation without changing selection.
     ///
     /// `manifest_sha256` must come from a trusted publication receipt, not be

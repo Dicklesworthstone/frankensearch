@@ -83,6 +83,52 @@ reason to scan for another generation or fall back to the legacy mutable index.
 Setting the opt-in variable to false does not override that protection. Do not
 point mutation commands at a sealed generation subdirectory.
 
+## Preview a source rebuild before publishing it
+
+The workspace `fsfs-recover` binary can rebuild a source directory into a sealed,
+inactive generation, execute a query against that exact snapshot, and leave the
+current generation selected until you explicitly apply the preparation:
+
+```sh
+fsfs-recover --index-dir /work/search-store \
+  --config /work/fsfs.toml --rebuild-source /work/source \
+  --query "connection pooling" --limit 10 --prepare \
+  --save-preparation /work/prepared-search.json
+
+fsfs-recover --index-dir /work/search-store \
+  --config /work/fsfs.toml --resume-file /work/prepared-search.json \
+  --query "connection pooling" --limit 10 --apply
+```
+
+Use `--apply` with `--rebuild-source` for one invocation that rebuilds, previews
+and publishes. Source rebuilding always requires `--query` and an explicit
+`--prepare` or `--apply`. It recomputes source embeddings with the configured,
+already available models; it never downloads a model. A lexical-only build or
+explicit `force_lexical_only` configuration prepares a lexical-only generation.
+The store must be outside the source tree and the catalog generation-local.
+Unlike ordinary indexing, this explicit recovery can start with a damaged
+selected bundle or malformed bounded selection descriptor. It captures the
+original descriptor under publication ownership, rebuilds independently from
+sources, refuses inherited hardlinked artifacts, and retains the damaged bytes.
+Unsafe selection objects (such as symlinks) and oversized descriptors still fail.
+
+Failed indexing, producer admission, cancellation or a failed preview leaves
+the previous generation selected. A successful preview is required before
+exporting its selection guard or publishing. Preview releases publication
+ownership, so another indexer can proceed; if it publishes first, applying the
+old preparation fails instead of replacing its work. Existing readers keep
+their pinned generation after a successful publication.
+
+The saved preparation names the sealed snapshot and its original selection
+guard. Resuming does not rescan the source, and source changes after preparation
+do not alter the target. Keep the preparation in trusted storage outside the
+store; it is not a retention pin. The response names the new generation and
+reports `source_rebuild_performed` only for the invocation that rebuilt it.
+Use the receipt-directed durability confirmation command after an uncertain
+publication rather than rebuilding again. This capability uses the cooperative
+complete-store protocol; it does not execute the core recovery planner's
+model-acquisition or fixed-authority actions.
+
 ## Warm standard-input serving
 
 A long-lived process can reuse admitted models and indexes while following

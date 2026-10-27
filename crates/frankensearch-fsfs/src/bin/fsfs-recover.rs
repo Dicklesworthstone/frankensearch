@@ -1,6 +1,7 @@
 //! Receipt-directed complete-store recovery, without normal CLI root discovery.
 //! Inspection is the default; only an explicit --apply can change selection.
 //! Vector reconstruction additionally requires --repair-vectors; originals stay intact.
+//! --rebuild-source explicitly prepares a fresh source snapshot and requires a query preview.
 
 #![recursion_limit = "512"]
 #![deny(unsafe_code)]
@@ -37,17 +38,19 @@ const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_REPAIR_COPY_BYTES: u64 = 1024 * 1024 * 1024;
 const HELP: &str =
     "fsfs-recover --index-dir STORE --generation ID --manifest-sha256 SHA256 [OPTIONS]
+fsfs-recover --index-dir STORE --rebuild-source SOURCE --query TEXT --prepare|--apply [OPTIONS]
 fsfs-recover --index-dir STORE --resume-file FILE --apply [OPTIONS]
 fsfs-recover --index-dir STORE --resume-file FILE --confirm-durability
 
 Inspect an explicitly receipted complete generation, even if FSFS-CURRENT is damaged.
-No directory scan, source rebuild, model download or automatic fallback is performed.
+No directory scan chooses a recovery target. Models are never downloaded.
 
   --config FILE       Use the normal fsfs configuration loader and model selection
   --query TEXT        Preview a query against the target before any restoration
   --limit N           Preview results per phase (1..=100; default 10)
   --prepare           Admit a target and export a resume guard WITHOUT changing selection
   --apply             Explicitly restore the admitted target; default is read-only inspection
+  --rebuild-source DIR Reindex this source into a NEW sealed generation before preview
   --expected-selection-sha256 HASH
                       With --apply, resume a previously prepared target under its saved guard
   --save-preparation FILE
@@ -73,6 +76,12 @@ To resume, use that target receipt and --apply --expected-selection-sha256 HASH,
 Keep all three fields in trusted storage; the guard is not a signature or a retention pin.
 A removed target or changed selection is refused, not rebuilt or automatically rebased.
 Any requested preview must succeed before a prepare report is emitted or selection changes.
+--rebuild-source requires --query and --prepare or --apply; all input is reindexed offline.
+It cannot mix with target receipts, resume/guard fields or vector-repair options.
+It can replace a damaged selected bundle or malformed bounded descriptor, without reusing old artifacts.
+Its preview must finish successfully before export or publication; the old selection remains usable.
+The store must be outside SOURCE. Source changes after preparation do not change the sealed target.
+Save the prepared receipt to resume without rescanning sources; a competing publication is refused.
 --save-preparation requires --prepare or --apply and an existing trusted parent outside STORE.
 It never overwrites a path. Failure prevents selection; an incomplete file may remain.
 The file is flushed before selection; on Unix it is created private (0600) and its parent is synced.
@@ -95,10 +104,15 @@ enum RecoveryAction {
 }
 
 #[derive(Clone, Debug)]
+enum RecoveryTarget {
+    Retained { generation: String, digest: String },
+    Source(PathBuf),
+}
+
+#[derive(Clone, Debug)]
 struct Options {
     root: PathBuf,
-    generation: String,
-    digest: String,
+    target: RecoveryTarget,
     config: Option<PathBuf>,
     query: Option<String>,
     limit: usize,
@@ -130,6 +144,7 @@ impl Options {
         let mut root = None;
         let mut generation = None;
         let mut digest = None;
+        let mut rebuild_source = None;
         let mut config = None;
         let mut query = None;
         let mut limit = 10;
@@ -149,6 +164,7 @@ impl Options {
                 "--index-dir"
                     | "--generation"
                     | "--manifest-sha256"
+                    | "--rebuild-source"
                     | "--config"
                     | "--query"
                     | "--limit"
@@ -197,6 +213,7 @@ impl Options {
                 "--config" => config = Some(PathBuf::from(value)),
                 "--generation" => generation = Some(text(value)?),
                 "--manifest-sha256" => digest = Some(text(value)?),
+                "--rebuild-source" => rebuild_source = Some(PathBuf::from(value)),
                 "--expected-selection-sha256" => expected_selection_sha256 = Some(text(value)?),
                 "--save-preparation" => save_preparation = Some(PathBuf::from(value)),
                 "--resume-file" => resume_file = Some(PathBuf::from(value)),
@@ -242,6 +259,7 @@ impl Options {
             ) || generation.is_some()
                 || digest.is_some()
                 || expected_selection_sha256.is_some()
+                || rebuild_source.is_some()
                 || repair_vectors
                 || seen.contains("--max-copy-bytes")
             {
@@ -261,10 +279,29 @@ impl Options {
         } else {
             None
         };
+        let target = if let Some(source) = rebuild_source {
+            if !matches!(action, RecoveryAction::Prepare | RecoveryAction::Apply)
+                || generation.is_some()
+                || digest.is_some()
+                || expected_selection_sha256.is_some()
+                || repair_vectors
+                || seen.contains("--max-copy-bytes")
+                || query.is_none()
+            {
+                return Err(invalid(
+                    "--rebuild-source requires --query and --prepare or --apply without target receipts, resume/guard fields or repair options",
+                ));
+            }
+            RecoveryTarget::Source(source)
+        } else {
+            RecoveryTarget::Retained {
+                generation: generation.ok_or_else(|| invalid("--generation is required"))?,
+                digest: digest.ok_or_else(|| invalid("--manifest-sha256 is required"))?,
+            }
+        };
         Self {
             root,
-            generation: generation.ok_or_else(|| invalid("--generation is required"))?,
-            digest: digest.ok_or_else(|| invalid("--manifest-sha256 is required"))?,
+            target,
             config,
             query,
             limit,
@@ -287,20 +324,22 @@ impl Options {
         }
         // Bound identity text here; the store's canonical pointer decoder owns
         // the exact generation grammar. Do not accept a pathname as an identity.
-        if self.generation.len() != 60
-            || self
-                .generation
-                .bytes()
-                .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
-        {
-            return Err(invalid(
-                "invalid generation ID; use the trusted publication receipt",
-            ));
-        }
-        if self.digest.len() != 64 || !self.digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(invalid(
-                "manifest SHA-256 must be exactly 64 hexadecimal characters",
-            ));
+        if let RecoveryTarget::Retained { generation, digest } = &mut self.target {
+            if generation.len() != 60
+                || generation
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
+            {
+                return Err(invalid(
+                    "invalid generation ID; use the trusted publication receipt",
+                ));
+            }
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(invalid(
+                    "manifest SHA-256 must be exactly 64 hexadecimal characters",
+                ));
+            }
+            digest.make_ascii_lowercase();
         }
         if self
             .query
@@ -358,8 +397,14 @@ impl Options {
                 "--confirm-durability cannot be combined with configuration, preview, repair or resume options",
             ));
         }
-        self.digest.make_ascii_lowercase();
         Ok(self)
+    }
+
+    fn receipt(&self) -> SearchResult<(&str, &str)> {
+        match &self.target {
+            RecoveryTarget::Retained { generation, digest } => Ok((generation, digest)),
+            RecoveryTarget::Source(_) => Err(invalid("this action requires a retained receipt")),
+        }
     }
 }
 
@@ -381,6 +426,8 @@ struct RepairSource {
     manifest_sha256: String,
 }
 
+// These are independent operation/durability/admission facts in the report.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Serialize)]
 struct Report {
     schema_version: u16,
@@ -390,6 +437,7 @@ struct Report {
     selection_write_performed: bool,
     durability_confirmed: bool,
     producer_admission_checked: bool,
+    source_rebuild_performed: bool,
     // The output generation is the new copy, not the damaged original. Keep
     // its original trusted receipt separate, including uncertain publication.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -412,6 +460,7 @@ impl Report {
             selection_write_performed: false,
             durability_confirmed: false,
             producer_admission_checked: true,
+            source_rebuild_performed: false,
             repaired_from: None,
             expected_selection_sha256: None,
             sync_error_kind: None,
@@ -574,7 +623,8 @@ async fn execute(
 ) -> SearchResult<Report> {
     if options.action == RecoveryAction::ConfirmDurability {
         let store = CompleteGenerationStore::open(cx, &options.root)?;
-        let expected = store.open_retained(cx, &options.generation, &options.digest)?;
+        let (generation, digest) = options.receipt()?;
+        let expected = store.open_retained(cx, generation, digest)?;
         let mut report = Report::inspected(&expected);
         report.repaired_from.clone_from(&options.resume_origin);
         // The API rechecks this exact target under the publication lease.
@@ -587,25 +637,23 @@ async fn execute(
         options.action,
         RecoveryAction::Prepare | RecoveryAction::Apply
     ) {
-        let mut plan = if let Some(expected) = &options.expected_selection_sha256 {
+        let mut plan = if matches!(options.target, RecoveryTarget::Source(_)) {
+            runtime.prepare_retained_rebuild(cx, &options.root).await?
+        } else if let Some(expected) = &options.expected_selection_sha256 {
+            let (generation, digest) = options.receipt()?;
             runtime
-                .resume_retained_recovery(
-                    cx,
-                    &options.root,
-                    &options.generation,
-                    &options.digest,
-                    expected,
-                )
+                .resume_retained_recovery(cx, &options.root, generation, digest, expected)
                 .await?
         } else if options.repair_vectors {
             #[cfg(unix)]
             {
+                let (generation, digest) = options.receipt()?;
                 runtime
                     .prepare_retained_vector_repair(
                         cx,
                         &options.root,
-                        &options.generation,
-                        &options.digest,
+                        generation,
+                        digest,
                         options.max_copy_bytes,
                     )
                     .await?
@@ -615,16 +663,19 @@ async fn execute(
                 "vector repair requires Unix directory durability support",
             ));
         } else {
+            let (generation, digest) = options.receipt()?;
             runtime
-                .prepare_retained_recovery(cx, &options.root, &options.generation, &options.digest)
+                .prepare_retained_recovery(cx, &options.root, generation, digest)
                 .await?
         };
         let mut report = Report::inspected(plan.generation());
+        report.source_rebuild_performed = matches!(options.target, RecoveryTarget::Source(_));
         report.repaired_from.clone_from(&options.resume_origin);
         if options.repair_vectors {
+            let (generation, digest) = options.receipt()?;
             report.repaired_from = Some(RepairSource {
-                generation_id: options.generation.clone(),
-                manifest_sha256: options.digest.clone(),
+                generation_id: generation.to_owned(),
+                manifest_sha256: digest.to_owned(),
             });
         }
         if let Some(query) = &options.query {
@@ -650,13 +701,9 @@ async fn execute(
     } else {
         // Inspection never takes publication ownership and never replaces a
         // corrupt descriptor. The caller must separately authorize --apply.
+        let (generation, digest) = options.receipt()?;
         let mut reader = runtime
-            .open_retained_search_from_receipt(
-                cx,
-                &options.root,
-                &options.generation,
-                &options.digest,
-            )
+            .open_retained_search_from_receipt(cx, &options.root, generation, digest)
             .await?;
         let mut report = Report::inspected(reader.generation());
         if let Some(query) = &options.query {
@@ -682,13 +729,17 @@ fn configured_runtime(options: &Options) -> SearchResult<FsfsRuntime> {
         load_from_layered_sources(Some(&project), Some(&user), &env, &overrides, &home)?
     };
     let mut config = loaded.config;
-    // Recovery uses already available producers. It is not a download,
-    // indexing, automatic fallback, update check or watch-mode entrypoint.
+    // Recovery uses already available producers. Source rebuilding is explicit;
+    // receipt-directed operations never rescan, download or start a watcher.
     config.indexing.offline = true;
     config.indexing.watch_mode = false;
     Ok(FsfsRuntime::new(config).with_cli_input(CliInput {
         command: CliCommand::Doctor,
         index_dir: Some(options.root.clone()),
+        target_path: match &options.target {
+            RecoveryTarget::Source(source) => Some(source.clone()),
+            RecoveryTarget::Retained { .. } => None,
+        },
         quiet: true,
         no_color: true,
         format: options.format,
@@ -744,6 +795,12 @@ fn render(response: &Response, format: OutputFormat) -> SearchResult<Vec<u8>> {
         .or(response.recovery.as_ref())
     {
         writeln!(output, "Recovery state: {:?}", report.state)?;
+        if report.source_rebuild_performed {
+            writeln!(
+                output,
+                "Source rebuilt into a new sealed generation; preview succeeded."
+            )?;
+        }
         writeln!(
             output,
             "Generation: {}\nManifest SHA-256: {}",
@@ -868,6 +925,51 @@ mod tests {
         let mut input = args();
         input.push("--apply".into());
         assert_eq!(Options::parse(input).unwrap().action, RecoveryAction::Apply);
+    }
+
+    #[test]
+    fn source_rebuild_requires_explicit_action_and_query_without_competing_target() {
+        let base = ["--index-dir", "store", "--rebuild-source", "source"];
+        for action in ["--prepare", "--apply"] {
+            let input = base
+                .into_iter()
+                .chain([action, "--query", "recovery marker", "--limit", "3"])
+                .map(OsString::from)
+                .collect();
+            let options = Options::parse(input).unwrap();
+            assert!(
+                matches!(options.target, RecoveryTarget::Source(ref path) if path == std::path::Path::new("source"))
+            );
+            assert_eq!(options.query.as_deref(), Some("recovery marker"));
+            assert_eq!(options.limit, 3);
+            assert!(options.receipt().is_err());
+        }
+        for suffix in [
+            vec![],
+            vec!["--prepare"],
+            vec!["--query", "marker"],
+            vec!["--confirm-durability", "--query", "marker"],
+            vec!["--apply", "--query", "marker", "--repair-vectors"],
+            vec!["--apply", "--query", "marker", "--generation", "receipt"],
+            vec![
+                "--apply",
+                "--query",
+                "marker",
+                "--manifest-sha256",
+                "digest",
+            ],
+            vec![
+                "--apply",
+                "--query",
+                "marker",
+                "--expected-selection-sha256",
+                "guard",
+            ],
+            vec!["--apply", "--query", "marker", "--resume-file", "missing"],
+        ] {
+            let input = base.into_iter().chain(suffix).map(OsString::from).collect();
+            assert!(Options::parse(input).is_err());
+        }
     }
 
     #[test]
@@ -996,7 +1098,7 @@ mod tests {
             assert_eq!(options.max_copy_bytes, budget.parse::<u64>().unwrap());
             assert_eq!(options.query.as_deref(), Some("sharedtoken"));
             assert_eq!(options.limit, 3);
-            assert_eq!(options.digest, "a".repeat(64));
+            assert_eq!(options.receipt().unwrap().1, "a".repeat(64));
         }
         let mut input = args();
         input.extend(["--apply", "--repair-vectors"].map(OsString::from));
@@ -1100,6 +1202,7 @@ mod tests {
                 state,
                 RecoveryState::DurabilityConfirmed | RecoveryState::DurabilityStillUncertain
             ),
+            source_rebuild_performed: false,
             repaired_from: None,
             expected_selection_sha256: None,
             sync_error_kind: None,
