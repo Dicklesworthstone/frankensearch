@@ -64,16 +64,17 @@ and 100,000 documents. These bound input, not model scratch space or total RSS.
 `authority-index` builds and publishes a complete generation through the fixed
 `LOCK` and `AUTHORITY` protocol. Its immutable components contain one or two
 independently identified FSVI v2 vector tiers, a sealed Quill image, the generation
-metadata, and, for a single-tier generation, an optional native HNSW graph. `authority-search`
+metadata, and optional native HNSW graphs. `authority-search`
 reopens the exact authority named by the saved receipt and searches the retained
 vector and lexical images together, including deferred result metadata.
 
 Choose `--tier fast`, `--tier quality`, or `--tier full`. Full generations contain
-both complete tiers and currently require exact retrieval. For a single tier,
-`--retrieval exact|hnsw` selects the vector search policy; new indexes default to
-`exact`. HNSW uses the native engine's default parameters and deterministic seed
-42. The graph is published as a fourth immutable component. Its complete native
-receipt is authenticated inside the metadata and binds the graph to the exact
+both complete tiers. `--retrieval exact|hnsw` selects the vector search policy for
+every stored tier; new indexes default to `exact`. HNSW uses the native engine's
+default parameters and deterministic seed 42. Graphs are published through the
+optional ANN component. For a full generation, a versioned image contains each
+selected tier's graph. Each graph's complete native receipt is authenticated
+inside the metadata and binds the graph to its exact
 FSVI image, artifact generation, producer, storage identity, and live document
 set. Admission also checks its structure, checksums, topology and parameters.
 Missing or corrupt declared graphs cause refusal; they never silently change
@@ -113,9 +114,14 @@ service. This choice is persisted in the receipt. Search cannot change the
 receipt's security profile, generation, authority, producer identities, or topology.
 A changed current authority is a refusal, even when its components are otherwise
 valid. Already opened readers retain their original component bytes.
-Search and recovery derive the retrieval mode from the admitted generation, not
-from a command-line override or a separately discovered graph path. Successful
-responses report `retrieval: "exact"` or `retrieval: "hnsw"` for the actual reader.
+Semantic search and recovery derive the stored vector retrieval mode from the
+admitted generation, not a query-time override or a separately discovered graph path. Successful
+responses report `retrieval: "exact"` or `retrieval: "hnsw"` for a uniform policy,
+or `retrieval: "mixed"` when a full generation's tiers differ. The
+`retrieval_by_tier` object names each stored tier's actual policy. A selective
+fast or quality query reports that tier's policy in `retrieval`; a full query
+reports the complete pair. These labels describe the admitted implementation,
+not latency or recall guarantees.
 
 ### Complete two-tier generations and progressive queries
 
@@ -127,7 +133,7 @@ images, one lexical image, and the shared source checkpoint to one authority:
   --root "$HOME/frankensearch-authority/full-g1" \
   --work-dir "$HOME/frankensearch-authority/full-g1-work" \
   --receipt "$HOME/frankensearch-authority/full-g1.json" \
-  --tier full --source-low 1 --source-high 42 --cooperative-local \
+  --tier full --retrieval hnsw --source-low 1 --source-high 42 --cooperative-local \
   --input ./documents.jsonl --model-dir /absolute/path/to/installed/models
 ./target/release/frankensearch-native authority-search \
   --receipt "$HOME/frankensearch-authority/full-g1.json" \
@@ -140,6 +146,13 @@ against its own complete identity; sharing a dimension or display name does not
 establish compatibility. Both images must contain the same ordered live document
 set and artifact generation. Incomplete quality coverage, cross-generation
 images, and mixed semantic/control provenance are refused.
+
+Both exact scans and native HNSW are supported in each full tier. The CLI's
+explicit retrieval choice applies to both, while library builders can select
+each tier's policy, HNSW parameters, and seed independently. Admission validates
+every declared graph against its own retained vector owner before model loading
+or search. A missing, damaged, or swapped graph refuses the generation, including
+queries selecting the other tier; there is no automatic exact-scan fallback.
 
 Full search independently retrieves quality candidates and merges the candidate
 sets, so refinement can discover documents absent from the fast candidate window.
@@ -166,6 +179,9 @@ FSVC v1 envelope containing the two original FSVI v2 images. Its aggregate byte
 receipt occupies the existing Vector component; metadata records each inner
 image's identity, dimension, size, hash, and physical row count. Live documents
 are counted once. No new authority pointer or publication protocol is introduced.
+The optional full ANN image similarly retains each tier's original native graph
+with an independent metadata receipt. A graph for one tier cannot be reinterpreted
+as the other tier's graph, even when the dimensions agree.
 
 ### Rebuild an existing authority generation
 
@@ -197,14 +213,13 @@ an unchanged source cut is allowed. Empty corpora remain unsupported by this
 route's metadata contract. Rebuild advances both the artifact generation and
 authority sequence, refusing exhausted counters before inference.
 
-Rebuild preserves the selected generation's retrieval policy, including the
-full HNSW parameter set and seed authenticated by its native receipt. Supply
-`--retrieval exact` to deliberately replace it with an exact-scan generation,
-or `--retrieval hnsw` to select the default HNSW configuration explicitly.
-The replacement graph is built from the new complete cohort; the retained
-previous reader keeps its own original graph and vectors.
-Full generations keep both exact tiers; requesting HNSW for that topology is
-refused before source export or model inference.
+Rebuild preserves each stored tier's retrieval policy independently, including
+its full HNSW parameter set and seed authenticated by its native receipt. A full
+generation with exact fast retrieval and HNSW quality retrieval keeps that pair
+when no override is supplied. Supply `--retrieval exact` to deliberately select
+exact scans for every tier, or `--retrieval hnsw` to select the default HNSW
+configuration for every tier. Replacement graphs are built from the new complete
+cohort; retained previous readers keep their original graphs and vectors.
 
 Every loaded provider must match its selected complete identity before embedding
 begins. Full generations check both producers before either tier embeds source
@@ -322,8 +337,8 @@ the new work directory because this generation metadata contract requires a
 nonempty cohort.
 
 The selected generation fixes the root, security profile, topology, complete
-producer identities, F16/F32 vector encodings, and retrieval policy, including all
-HNSW parameters and the seed. The matching local models are required even for
+producer identities, F16/F32 vector encodings, and each tier's retrieval policy,
+including all HNSW parameters and seeds. The matching local models are required even for
 metadata-only updates; quality-only generations load their quality model
 directly. Full generations independently reuse each tier's unchanged vectors;
 metadata-only edits perform no document inference in either tier. New or changed
@@ -365,6 +380,9 @@ publisher; building it does not itself select a new authority.
 For a full generation, use `begin_progressive_update` with both providers and
 finish with `NativeIndexUpdate::build_progressive_generation`. The existing
 single-provider update method refuses a full snapshot before inference.
+Both tiers retain their independent exact/HNSW configuration. Declared graphs
+are rebuilt against the successor vector owners even when unchanged document
+vectors can be reused without inference.
 
 ### Roll back the most recent authority publication
 
@@ -676,7 +694,9 @@ not a partial-component recovery path. An old receipt still refuses a fresh open
 after the root advances, while an existing session keeps its retained reader.
 
 Results report `mode: "lexical"`, `retrieval: "lexical"`,
-`semantic_used: false`, and `semantic_components_verified: true`. Scores are raw
+`semantic_used: false`, and `semantic_components_verified: true`. The
+`retrieval_by_tier` map still describes the admitted vector policies; it does
+not imply vector execution for this query. Scores are raw
 Quill BM25 with lexical provenance; vector addresses and fast, quality and rerank
 scores are absent. Metadata hydration uses the same retained lexical snapshot.
 Fixed and request filters apply before the result cutoff and use the existing
@@ -1000,8 +1020,9 @@ using `QualifiedGenerationRoot::stage_immutable_file`, prepare an attempt agains
 publish it through `GenerationPublisherV1::publish_prepared`. The normal publisher
 re-admits the retained objects and applies the configured anti-rollback floor.
 Use the target's original vector binding when admitting the resulting reader.
-For an HNSW target, those receipts retain its graph and native owner binding;
-rollback preserves its retrieval mode, parameters and seed as well as its vectors.
+For an HNSW target, those receipts retain every declared graph and native owner
+binding; rollback preserves each tier's retrieval mode, parameters, and seed as
+well as its vectors.
 
 An intervening publication causes the stale rollback attempt to lose its exact
 comparison. Existing readers keep their original bytes throughout successful
@@ -1020,9 +1041,12 @@ The library entry points retain their existing names:
 `NativeGenerationSnapshot::admit_exact`. Here, "exact" describes the complete
 component authority contract. Select `NativeBuildRetrieval::Hnsw` on the builder
 to include a native graph, and use `retrieval_configuration()` on a built or
-admitted generation to preserve its validated policy. This route admits a
-single exact or HNSW tier, or a complete fast/quality exact pair. Partial or
-sharded authority descriptors and two-tier HNSW remain unsupported.
+admitted generation to preserve its validated primary policy. Full generations
+expose the independent quality policy through `quality_retrieval_configuration()`;
+this returns `Some(NativeBuildRetrieval::Exact)` for an exact quality tier and
+`None` for a single-tier generation. This route admits a single exact or HNSW
+tier, or a complete fast/quality pair with either policy chosen independently.
+Partial or sharded authority descriptors remain unsupported.
 
 ## Native quality without the ONNX feature bundle
 

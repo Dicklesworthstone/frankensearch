@@ -1,5 +1,5 @@
 use super::*;
-use frankensearch::native_ann::NativeExactReason;
+use frankensearch::native_ann::{NativeExactReason, NativeRetrievalMode};
 use frankensearch_core::generation::{
     EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1,
     QuantizationFormat,
@@ -1138,7 +1138,7 @@ fn progressive_receipt() -> Receipt {
 }
 
 #[test]
-fn full_options_require_complete_exact_tiers_and_explicit_query_modes() {
+fn full_options_accept_exact_or_hnsw_and_require_explicit_query_modes() {
     let mut arguments = index_arguments();
     let tier = arguments.iter().position(|value| *value == "fast").unwrap();
     arguments[tier] = "full";
@@ -1153,11 +1153,18 @@ fn full_options_require_complete_exact_tiers_and_explicit_query_modes() {
     assert_eq!(full.tier, Some(EmbedderTierTag::Fast));
     assert!(!full.stream);
     assert!(full.mode.is_none());
+    assert_eq!(full.build_retrieval(None), NativeBuildRetrieval::Exact);
     let mut duplicate = arguments.clone();
     duplicate.extend(["--tier", "quality"]);
     assert!(parse(&duplicate).is_err());
     arguments.extend(["--retrieval", "hnsw"]);
-    assert!(parse(&arguments).is_err());
+    assert_eq!(
+        parse(&arguments).unwrap().unwrap().build_retrieval(None),
+        NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 42
+        },
+    );
 
     for (name, mode) in [
         ("fast", QueryMode::Fast),
@@ -1652,7 +1659,11 @@ fn failed_result_delivery_preserves_known_commit_and_activation() {
         &mut BrokenOutput,
         &receipt(),
         Path::new("/private/receipt.json"),
-        NativeRetrievalMode::Ann,
+        NativeBuildRetrieval::Hnsw {
+            params: HnswParams::default(),
+            seed: 42,
+        },
+        None,
     )
     .unwrap_err();
     let payload = publication_failure(error.as_ref()).unwrap();
@@ -1663,20 +1674,43 @@ fn failed_result_delivery_preserves_known_commit_and_activation() {
 
 #[test]
 fn indexed_report_exposes_the_realized_retrieval_without_changing_the_receipt() {
-    let selected = receipt();
-    for (mode, label) in [
-        (NativeRetrievalMode::Ann, "hnsw"),
-        (
-            NativeRetrievalMode::Exact {
-                reason: NativeExactReason::Requested,
-            },
-            "exact",
-        ),
+    let ann = NativeBuildRetrieval::Hnsw {
+        params: HnswParams::default(),
+        seed: 42,
+    };
+    let exact = NativeBuildRetrieval::Exact;
+    for (primary, quality, label) in [
+        (ann, None, "hnsw"),
+        (exact, None, "exact"),
+        (exact, Some(ann), "mixed"),
+        (ann, Some(exact), "mixed"),
+        (ann, Some(ann), "hnsw"),
     ] {
+        let selected = if quality.is_some() {
+            progressive_receipt()
+        } else {
+            receipt()
+        };
         let mut output = Vec::new();
-        emit_indexed(&mut output, &selected, Path::new("/receipt.json"), mode).unwrap();
+        emit_indexed(
+            &mut output,
+            &selected,
+            Path::new("/receipt.json"),
+            primary,
+            quality,
+        )
+        .unwrap();
         let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(report["retrieval"], label);
+        assert_eq!(report["retrieval_by_tier"]["fast"], retrieval_name(primary));
+        if let Some(quality) = quality {
+            assert_eq!(
+                report["retrieval_by_tier"]["quality"],
+                retrieval_name(quality)
+            );
+        } else {
+            assert!(report["retrieval_by_tier"].get("quality").is_none());
+        }
         assert_eq!(
             report["selection"],
             serde_json::to_value(&selected).unwrap()
@@ -1847,7 +1881,7 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             assert_eq!(recovered["publication"], "committed");
             assert_eq!(recovered["reconciliation"], "committed");
             assert_eq!(recovered["serving"], "activated");
-            assert_eq!(recovered["retrieval"], retrieval_name(mode));
+            assert_eq!(recovered["retrieval"], retrieval_name(retrieval));
             assert_eq!(recovered["attempt"], attempt_report(&recorded));
             assert_eq!(
                 provider.calls.load(Ordering::Relaxed),
@@ -7141,6 +7175,7 @@ mod progressive_authority {
         fast: &Arc<Provider>,
         quality: &Arc<Provider>,
         documents: Vec<IndexableDocument>,
+        retrieval: [NativeBuildRetrieval; 2],
     ) -> Receipt {
         let root_path = parent.join("root");
         let root = create_root(&root_path).expect("qualified Linux root is required");
@@ -7150,10 +7185,10 @@ mod progressive_authority {
             fast.clone(),
         )
         .unwrap()
-        .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+        .with_fast_storage(NativeBuildPrecision::F32, retrieval[0])
         .with_quality_embedder(quality.clone())
         .unwrap()
-        .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+        .with_quality_storage(NativeBuildPrecision::F32, retrieval[1])
         .unwrap()
         .add_documents(documents)
         .build_progressive_generation(cx, CommitRange { low: 2, high: 7 }, DEFAULT_IMAGE_BYTES)
@@ -7207,6 +7242,7 @@ mod progressive_authority {
                         .with_metadata("version", "original"),
                     IndexableDocument::new("alpha", "garden flowers"),
                 ],
+                [NativeBuildRetrieval::Exact; 2],
             )
             .await;
             assert_eq!(calls(&fast, &quality), (2, 2));
@@ -7577,6 +7613,396 @@ mod progressive_authority {
     }
 
     #[test]
+    fn full_ann_policies_survive_queries_rebuilds_warm_updates_and_rollback() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast_ann = NativeBuildRetrieval::Hnsw {
+                params: HnswParams {
+                    m: 4,
+                    m0: 8,
+                    ef_construction: 24,
+                    ef_search: 12,
+                },
+                seed: 11,
+            };
+            let quality_ann = NativeBuildRetrieval::Hnsw {
+                params: HnswParams {
+                    m: 6,
+                    m0: 12,
+                    ef_construction: 48,
+                    ef_search: 40,
+                },
+                seed: 29,
+            };
+            for (policies, aggregate, names) in [
+                ([fast_ann, quality_ann], "hnsw", ["hnsw", "hnsw"]),
+                (
+                    [NativeBuildRetrieval::Exact, quality_ann],
+                    "mixed",
+                    ["exact", "hnsw"],
+                ),
+                (
+                    [fast_ann, NativeBuildRetrieval::Exact],
+                    "mixed",
+                    ["hnsw", "exact"],
+                ),
+            ] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let first = publish_full(
+                    &cx,
+                    &parent,
+                    &fast,
+                    &quality,
+                    vec![
+                        IndexableDocument::new("zeta", "retry network requests")
+                            .with_metadata("tenant", "A"),
+                        IndexableDocument::new("alpha", "garden flowers")
+                            .with_metadata("tenant", "B"),
+                    ],
+                    policies,
+                )
+                .await;
+                let original = first.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(original.retrieval_configuration(), policies[0]);
+                assert_eq!(
+                    original.quality_retrieval_configuration(),
+                    Some(policies[1])
+                );
+                assert!(
+                    original
+                        .retained_snapshot()
+                        .manifest()
+                        .components()
+                        .ann
+                        .is_some()
+                );
+                let tiers = serde_json::json!({"fast":names[0], "quality":names[1]});
+
+                // The selected mode must report and execute its own graph, even
+                // when the other stored tier uses a different retrieval policy.
+                for (mode, expected, requested) in [
+                    (QueryMode::Fast, names[0], vec![EmbedderTierTag::Fast]),
+                    (QueryMode::Quality, names[1], vec![EmbedderTierTag::Quality]),
+                    (QueryMode::Lexical, "lexical", vec![]),
+                    (
+                        QueryMode::Full,
+                        aggregate,
+                        vec![EmbedderTierTag::Fast, EmbedderTierTag::Quality],
+                    ),
+                ] {
+                    let mut options = parse(&[
+                        "authority-search",
+                        "--receipt",
+                        "unused",
+                        "--query",
+                        "retry",
+                        "--mode",
+                        mode.as_str(),
+                        "--stream",
+                        "--filter",
+                        r#"{"metadata":{"tenant":"A"}}"#,
+                    ])
+                    .unwrap()
+                    .unwrap();
+                    options.receipt = parent.join("initial.json");
+                    let mut loaded = Vec::new();
+                    let mut output = Vec::new();
+                    search_with_loader(&cx, &options, &mut output, |tier| {
+                        loaded.push(tier);
+                        Ok(match tier {
+                            EmbedderTierTag::Fast => fast.clone(),
+                            EmbedderTierTag::Quality => quality.clone(),
+                        })
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(loaded, requested);
+                    let results = frames(&output);
+                    assert_eq!(results.len(), if mode == QueryMode::Full { 2 } else { 1 });
+                    for frame in &results {
+                        assert_eq!(frame["retrieval"], expected);
+                        assert_eq!(frame["retrieval_by_tier"], tiers);
+                        if mode == QueryMode::Lexical {
+                            assert_eq!(frame["semantic_used"], false);
+                            assert_eq!(frame["semantic_components_verified"], true);
+                        }
+                        assert_eq!(frame["authority"], serde_json::json!(first.authority));
+                        assert_eq!(frame["scope"]["eligible_documents"], 1);
+                        assert_eq!(frame["results"].as_array().unwrap().len(), 1);
+                        assert_eq!(frame["results"][0]["doc_id"], "zeta");
+                    }
+                }
+
+                let mut rebuild_options = parse(&[
+                    "authority-rebuild",
+                    "--from-receipt",
+                    "unused",
+                    "--receipt",
+                    "unused",
+                    "--work-dir",
+                    "unused",
+                    "--retained-source",
+                ])
+                .unwrap()
+                .unwrap();
+                rebuild_options.from_receipt = Some(parent.join("initial.json"));
+                rebuild_options.receipt = parent.join("inherited.json");
+                rebuild_options.work = Some(parent.join("inherited-work"));
+                let mut requested = Vec::new();
+                let mut output = Vec::new();
+                Box::pin(rebuild_with_loader(
+                    &cx,
+                    &rebuild_options,
+                    &mut output,
+                    |mode| {
+                        requested.push(mode);
+                        Ok(models(&fast, &quality))
+                    },
+                ))
+                .await
+                .unwrap();
+                assert_eq!(requested, [QueryMode::Full]);
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["retrieval"], aggregate);
+                assert_eq!(report["retrieval_by_tier"], tiers);
+                assert_eq!(report["source"], "retained_generation");
+                assert_eq!(report["model_migrated"], false);
+                let inherited = Receipt::read(&rebuild_options.receipt).unwrap();
+                let root = admit_root(&inherited.root).unwrap();
+                let inherited_reader = Arc::new(
+                    inherited
+                        .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                        .unwrap(),
+                );
+                assert_eq!(inherited_reader.retrieval_configuration(), policies[0]);
+                assert_eq!(
+                    inherited_reader.quality_retrieval_configuration(),
+                    Some(policies[1])
+                );
+                assert_eq!(
+                    inherited_reader.metadata().commit_range,
+                    original.metadata().commit_range
+                );
+                let mut session = AuthoritySession::new(
+                    &cx,
+                    root,
+                    inherited.clone(),
+                    Arc::clone(&inherited_reader),
+                    models(&fast, &quality),
+                    (2, DEFAULT_IMAGE_BYTES),
+                    true,
+                )
+                .unwrap()
+                .with_updates(2, MAX_INPUT_BYTES)
+                .unwrap()
+                .with_filter(
+                    &cx,
+                    Some(Filter::parse(r#"{"metadata":{"tenant":"A"}}"#).unwrap()),
+                    MAX_INPUT_BYTES,
+                )
+                .unwrap();
+
+                let before = calls(&fast, &quality);
+                let updated_path = parent.join("warm.json");
+                let response = exchange(
+                    &cx,
+                    &mut session,
+                    &[serde_json::json!({
+                        "op":"update", "id":"metadata", "expected_authority":inherited.authority,
+                        "work_dir":parent.join("warm-work"), "new_receipt":updated_path,
+                        "source_low":2, "source_high":8,
+                        "changes":[{"op":"upsert", "id":"zeta", "content":"retry network requests",
+                            "title":"Metadata update", "metadata":{"tenant":"A"}}],
+                    })],
+                )
+                .await;
+                assert_eq!(response[0]["retrieval"], aggregate);
+                assert_eq!(response[1]["event"], "updated");
+                assert_eq!(response[1]["retrieval_by_tier"], tiers);
+                assert_eq!(
+                    calls(&fast, &quality),
+                    before,
+                    "both tier vectors are reused without inference"
+                );
+                assert_eq!(session.snapshot.retrieval_configuration(), policies[0]);
+                assert_eq!(
+                    session.snapshot.quality_retrieval_configuration(),
+                    Some(policies[1])
+                );
+                let updated = Receipt::read(&updated_path).unwrap();
+                let response = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        serde_json::json!({"query":"retry", "mode":"quality"}),
+                        serde_json::json!({"query":"retry", "mode":"lexical"}),
+                        serde_json::json!({"op":"fetch", "expected_authority":updated.authority,
+                        "documents":[{"doc_id":"zeta", "include_metadata":true}]}),
+                    ],
+                )
+                .await;
+                assert_eq!(response[1]["retrieval"], names[1]);
+                assert_eq!(response[1]["retrieval_by_tier"], tiers);
+                assert_eq!(response[2]["retrieval"], "lexical");
+                assert_eq!(response[2]["retrieval_by_tier"], tiers);
+                assert_eq!(response[2]["semantic_used"], false);
+                assert_eq!(response[3]["retrieval"], aggregate);
+                assert_eq!(response[3]["documents"][0]["title"], "Metadata update");
+                assert_eq!(calls(&fast, &quality), (before.0, before.1 + 1));
+
+                let mut rollback_options = parse(&rollback_arguments()).unwrap().unwrap();
+                rollback_options.from_receipt = Some(updated_path);
+                rollback_options.target_receipt = Some(rebuild_options.receipt.clone());
+                rollback_options.receipt = parent.join("restored.json");
+                let before = calls(&fast, &quality);
+                let mut output = Vec::new();
+                rollback(&cx, &rollback_options, &mut output).unwrap();
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["retrieval"], aggregate);
+                assert_eq!(report["retrieval_by_tier"], tiers);
+                let restored = Receipt::read(&rollback_options.receipt).unwrap();
+                let restored_reader = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(restored_reader.retrieval_configuration(), policies[0]);
+                assert_eq!(
+                    restored_reader.quality_retrieval_configuration(),
+                    Some(policies[1])
+                );
+                assert_eq!(
+                    restored_reader.retained_snapshot().manifest().components(),
+                    inherited_reader.retained_snapshot().manifest().components()
+                );
+                assert_eq!(calls(&fast, &quality), before);
+                let mut recovery = parse(&["authority-recover", "--receipt", "unused"])
+                    .unwrap()
+                    .unwrap();
+                recovery.receipt = rollback_options.receipt.clone();
+                let mut output = Vec::new();
+                recover(&cx, &recovery, &mut output).unwrap();
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["retrieval_by_tier"], tiers);
+                assert_eq!(calls(&fast, &quality), before);
+
+                // Explicit CLI retrieval changes every stored tier. Without
+                // this override, the custom graph parameters above survived.
+                let mut previous_path = rollback_options.receipt;
+                for (label, requested) in [
+                    ("all-exact", NativeBuildRetrieval::Exact),
+                    (
+                        "all-hnsw",
+                        NativeBuildRetrieval::Hnsw {
+                            params: HnswParams::default(),
+                            seed: 42,
+                        },
+                    ),
+                ] {
+                    rebuild_options.from_receipt = Some(previous_path);
+                    rebuild_options.receipt = parent.join(format!("{label}.json"));
+                    rebuild_options.work = Some(parent.join(format!("{label}-work")));
+                    rebuild_options.retrieval = Some(requested);
+                    let mut output = Vec::new();
+                    Box::pin(rebuild_with_loader(
+                        &cx,
+                        &rebuild_options,
+                        &mut output,
+                        |mode| {
+                            assert_eq!(mode, QueryMode::Full);
+                            Ok(models(&fast, &quality))
+                        },
+                    ))
+                    .await
+                    .unwrap();
+                    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    let name = if label == "all-exact" {
+                        "exact"
+                    } else {
+                        "hnsw"
+                    };
+                    assert_eq!(report["retrieval"], name);
+                    assert_eq!(
+                        report["retrieval_by_tier"],
+                        serde_json::json!({"fast":name, "quality":name})
+                    );
+                    let selected = Receipt::read(&rebuild_options.receipt).unwrap();
+                    let reader = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(reader.retrieval_configuration(), requested);
+                    assert_eq!(reader.quality_retrieval_configuration(), Some(requested));
+                    assert_eq!(
+                        reader
+                            .retained_snapshot()
+                            .manifest()
+                            .components()
+                            .ann
+                            .is_some(),
+                        label == "all-hnsw"
+                    );
+                    previous_path = rebuild_options.receipt.clone();
+                }
+
+                let selected = Receipt::read(&previous_path).unwrap();
+                let retained = selected.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let ann = retained
+                    .retained_snapshot()
+                    .manifest()
+                    .components()
+                    .ann
+                    .unwrap();
+                let ann_path = selected.root.join(component_object_name_v1(
+                    GenerationComponentRole::Ann,
+                    ann.sha256,
+                ));
+                fs::rename(&ann_path, parent.join("saved-ann-image")).unwrap();
+                write_immutable(&cx, &ann_path, b"corrupt-declared-ann-cohort").unwrap();
+                let mut query_options = parse(&[
+                    "authority-search",
+                    "--receipt",
+                    "unused",
+                    "--query",
+                    "retry",
+                    "--mode",
+                    "quality",
+                ])
+                .unwrap()
+                .unwrap();
+                query_options.receipt = previous_path;
+                let before = calls(&fast, &quality);
+                for mode in [QueryMode::Quality, QueryMode::Lexical] {
+                    query_options.mode = Some(mode);
+                    query_options.lexical_only = mode == QueryMode::Lexical;
+                    let mut loaded = false;
+                    let mut output = Vec::new();
+                    assert!(
+                        search_with_loader(&cx, &query_options, &mut output, |_| {
+                            loaded = true;
+                            Ok(quality.clone())
+                        })
+                        .await
+                        .is_err()
+                    );
+                    assert!(
+                        !loaded,
+                        "declared ANN damage refuses before any model loading"
+                    );
+                    assert!(output.is_empty());
+                }
+                assert_eq!(calls(&fast, &quality), before);
+                let results =
+                    Box::pin(retained.search_quality_text(&cx, quality.as_ref(), "retry", 1))
+                        .await
+                        .unwrap();
+                assert_eq!(results[0].doc_id, "zeta");
+                assert_eq!(
+                    original
+                        .source_documents(&cx, MAX_INPUT_BYTES)
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+        });
+    }
+
+    #[test]
     fn full_warm_updates_refresh_both_tiers_scopes_and_source_then_recover_a_damaged_cohort() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let parent = private_parent();
@@ -7592,6 +8018,7 @@ mod progressive_authority {
                         .with_metadata("tenant", "A"),
                     IndexableDocument::new("alpha", "garden flowers").with_metadata("tenant", "B"),
                 ],
+                [NativeBuildRetrieval::Exact; 2],
             )
             .await;
             assert_eq!(calls(&fast, &quality), (2, 2));

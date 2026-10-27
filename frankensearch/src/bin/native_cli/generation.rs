@@ -20,7 +20,7 @@ use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
 };
 use frankensearch::native_ann::{
-    NativeGenerationSnapshot, NativeGenerationTopology, NativeRetrievalMode, NativeSearchPhase,
+    NativeGenerationSnapshot, NativeGenerationTopology, NativeSearchPhase,
 };
 use frankensearch::{
     Cx, Embedder, GenerationActivationV1, GenerationCandidateV1, GenerationPublisherV1,
@@ -99,8 +99,8 @@ Full generations bind both producers and complete document coverage to one\n\
 authority. Full search independently retrieves quality candidates, including\n\
 documents absent from fast results. --stream emits Initial then Refined from\n\
 the same retained generation. --mode fast or quality loads only that producer.\n\
-Full generations currently support exact retrieval; partial/sharded cohorts\n\
-and two-tier HNSW are not accepted by this fixed-authority route.\n\
+Full generations support independently bound exact or native HNSW tiers.\n\
+--retrieval selects both full tiers; partial/sharded cohorts remain unsupported.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
 missing or invalid graphs fail admission without substituting exact retrieval.\n\
@@ -116,8 +116,8 @@ generation and preserves its source checkpoint, without reading JSONL or stdin.\
 This excludes --input and --source-low/high. --max-source-bytes bounds retained\n\
 source for this mode and updates, defaulting to 256 MiB of raw stored source bytes.\n\
 The existing 100000-document and 16 MiB encoded-record limits still apply.\n\
-Rebuild inherits the admitted retrieval policy, including HNSW parameters and\n\
-seed, unless --retrieval explicitly selects exact or the default HNSW policy.\n\
+Rebuild inherits each tier's admitted retrieval policy, HNSW parameters and seed.\n\
+An explicit --retrieval selects exact or default HNSW for every stored tier.\n\
 Concurrent publication refuses the captured old selection; retry explicitly\n\
 from the winning receipt. Rebuild never edits the old generation's images.\n\
 Update applies bounded upsert/delete JSONL to the retained source, with the last\n\
@@ -545,7 +545,6 @@ impl Options {
                 options
                     .quality
                     .validate_usage(tier == EmbedderTierTag::Quality || options.progressive)?;
-                validate_full_retrieval(options.progressive, options.build_retrieval(None))?;
                 options.source_cut()?;
             }
             Command::Search => validate_query(
@@ -652,20 +651,62 @@ fn source_sequence(text: &str) -> Result<u64> {
         .map_err(|_| bad("source sequence must be an unsigned 64-bit integer"))
 }
 
-fn validate_full_retrieval(progressive: bool, retrieval: NativeBuildRetrieval) -> Result<()> {
-    if progressive && !matches!(retrieval, NativeBuildRetrieval::Exact) {
-        return Err(bad(
-            "full authority generations currently require exact retrieval for both tiers",
-        ));
+fn retrieval_name(configuration: NativeBuildRetrieval) -> &'static str {
+    match configuration {
+        NativeBuildRetrieval::Hnsw { .. } => "hnsw",
+        NativeBuildRetrieval::Exact => "exact",
     }
-    Ok(())
 }
 
-fn retrieval_name(mode: NativeRetrievalMode) -> &'static str {
-    match mode {
-        NativeRetrievalMode::Ann => "hnsw",
-        NativeRetrievalMode::Exact { .. } => "exact",
+fn annotate_retrieval(
+    response: &mut serde_json::Value,
+    primary_tier: EmbedderTierTag,
+    primary: NativeBuildRetrieval,
+    quality: Option<NativeBuildRetrieval>,
+    query_mode: Option<QueryMode>,
+) {
+    let primary = retrieval_name(primary);
+    let quality = quality.map(retrieval_name);
+    let selected = match query_mode {
+        Some(QueryMode::Lexical) => "lexical",
+        Some(QueryMode::Fast) => primary,
+        Some(QueryMode::Quality) => quality.unwrap_or(primary),
+        Some(QueryMode::Full) | None => {
+            if quality.is_some_and(|quality| quality != primary) {
+                "mixed"
+            } else {
+                primary
+            }
+        }
+    };
+    response["retrieval"] = serde_json::json!(selected);
+    let mut tiers = serde_json::Map::new();
+    tiers.insert(
+        match primary_tier {
+            EmbedderTierTag::Fast => "fast",
+            EmbedderTierTag::Quality => "quality",
+        }
+        .to_owned(),
+        serde_json::json!(primary),
+    );
+    if let Some(quality) = quality {
+        tiers.insert("quality".to_owned(), serde_json::json!(quality));
     }
+    response["retrieval_by_tier"] = serde_json::Value::Object(tiers);
+}
+
+fn annotate_snapshot_retrieval(
+    response: &mut serde_json::Value,
+    snapshot: &NativeGenerationSnapshot,
+    query_mode: Option<QueryMode>,
+) {
+    annotate_retrieval(
+        response,
+        snapshot.tier(),
+        snapshot.retrieval_configuration(),
+        snapshot.quality_retrieval_configuration(),
+        query_mode,
+    );
 }
 
 /// Inputs recorded before publication, never an assertion about its outcome.
@@ -1371,7 +1412,7 @@ async fn index(
     if let Some(quality) = loaded.quality {
         builder = builder
             .with_quality_embedder(quality)?
-            .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)?;
+            .with_quality_storage(NativeBuildPrecision::F32, options.build_retrieval(None))?;
     }
     let built = if options.progressive {
         builder
@@ -1391,24 +1432,34 @@ async fn index(
         None,
         PublicationOptions::unscoped(options.max_image_bytes),
     )?;
-    emit_indexed(output, &receipt, &receipt_path, built.retrieval_mode())
+    emit_indexed(
+        output,
+        &receipt,
+        &receipt_path,
+        built.retrieval_configuration(),
+        built.quality_retrieval_configuration(),
+    )
 }
 
 fn emit_indexed(
     output: &mut impl Write,
     receipt: &Receipt,
     receipt_path: &Path,
-    retrieval: NativeRetrievalMode,
+    retrieval: NativeBuildRetrieval,
+    quality_retrieval: Option<NativeBuildRetrieval>,
 ) -> Result<()> {
-    emit(
-        output,
-        &serde_json::json!({
-            "schema": SCHEMA, "ok": true, "event": "indexed", "publication": "committed",
-            "serving": "activated", "retrieval": retrieval_name(retrieval), "receipt": receipt_path,
-            "selection": receipt,
-        }),
-    )
-    .map_err(|_| {
+    let mut report = serde_json::json!({
+        "schema": SCHEMA, "ok": true, "event": "indexed", "publication": "committed",
+        "serving": "activated", "receipt": receipt_path, "selection": receipt,
+    });
+    annotate_retrieval(
+        &mut report,
+        receipt.tier,
+        retrieval,
+        quality_retrieval,
+        None,
+    );
+    emit(output, &report).map_err(|_| {
         publication_error(
             receipt,
             "committed",
@@ -1498,6 +1549,22 @@ async fn rebuild(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    let context = execution_context(cx, pool)?;
+    Box::pin(rebuild_with_loader(&context, options, output, |mode| {
+        load_authority_models(&context, options, mode, context.blocking_pool_handle())
+    }))
+    .await
+}
+
+async fn rebuild_with_loader<F>(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    mut load_models: F,
+) -> Result<()>
+where
+    F: FnMut(QueryMode) -> Result<Models>,
+{
     let selected = Receipt::read(
         options
             .from_receipt
@@ -1522,7 +1589,9 @@ async fn rebuild(
     let snapshot = selected.open_on_root(cx, &root, options.max_image_bytes)?;
     snapshot.authority().next_sequence()?;
     let retrieval = options.build_retrieval(Some(snapshot.retrieval_configuration()));
-    validate_full_retrieval(selected.quality_identity.is_some(), retrieval)?;
+    let quality_retrieval = snapshot
+        .quality_retrieval_configuration()
+        .map(|previous| options.build_retrieval(Some(previous)));
     let source = options.rebuild_source_cut(&snapshot.metadata().commit_range)?;
     validate_successor_source(&snapshot.metadata().commit_range, &source)?;
     let sequence = selected
@@ -1543,7 +1612,7 @@ async fn rebuild(
             "the generation metadata contract requires a nonempty source cohort",
         ));
     }
-    let loaded = load_authority_models(cx, options, selected.query_mode(None)?, pool)?;
+    let loaded = load_models(selected.query_mode(None)?)?;
     let expected_identity = rebuild_identity(
         &selected.identity,
         loaded.fast.as_ref(),
@@ -1572,15 +1641,16 @@ async fn rebuild(
     if let Some(quality) = loaded.quality {
         builder = builder
             .with_quality_embedder(quality)?
-            .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)?;
+            .with_quality_storage(
+                NativeBuildPrecision::F32,
+                quality_retrieval
+                    .ok_or_else(|| bad("the full generation has no quality retrieval policy"))?,
+            )?;
     }
     let built = if expected_quality.is_some() {
-        builder
-            .build_progressive_generation(cx, source, options.max_image_bytes)
-            .await?
+        Box::pin(builder.build_progressive_generation(cx, source, options.max_image_bytes)).await?
     } else {
-        builder
-            .build_exact_generation(cx, selected.tier, source, options.max_image_bytes)
+        Box::pin(builder.build_exact_generation(cx, selected.tier, source, options.max_image_bytes))
             .await?
     };
     if built.binding().frozen_identity() != &expected_identity
@@ -1600,19 +1670,22 @@ async fn rebuild(
         Some(&snapshot),
         PublicationOptions::unscoped(options.max_image_bytes),
     )?;
-    emit(
-        output,
-        &serde_json::json!({
-            "schema": SCHEMA, "ok": true, "event": "rebuilt", "publication": "committed",
-            "serving": "activated", "retrieval": retrieval_name(built.retrieval_mode()),
-            "receipt": receipt_path,
-            "source": if options.retained_source { "retained_generation" } else { "input" },
-            "replaces": selected.authority,
-            "model_migrated": receipt.identity != selected.identity || receipt.quality_identity != selected.quality_identity,
-            "selection": receipt,
-        }),
-    )
-    .map_err(|_| {
+    let mut report = serde_json::json!({
+        "schema": SCHEMA, "ok": true, "event": "rebuilt", "publication": "committed",
+        "serving": "activated", "receipt": receipt_path,
+        "source": if options.retained_source { "retained_generation" } else { "input" },
+        "replaces": selected.authority,
+        "model_migrated": receipt.identity != selected.identity || receipt.quality_identity != selected.quality_identity,
+        "selection": receipt,
+    });
+    annotate_retrieval(
+        &mut report,
+        receipt.tier,
+        built.retrieval_configuration(),
+        built.quality_retrieval_configuration(),
+        None,
+    );
+    emit(output, &report).map_err(|_| {
         publication_error(
             &receipt,
             "committed",
@@ -1883,16 +1956,13 @@ where
     ))
     .await?;
     let receipt = published.receipt;
-    emit(
-        output,
-        &serde_json::json!({
-            "schema": SCHEMA, "ok": true, "event": "updated", "publication": "committed",
-            "serving": "activated", "retrieval": retrieval_name(published.snapshot.retrieval_mode()),
-            "receipt": receipt_path, "replaces": selected.authority,
-            "documents": document_count, "edited_ids": edit_count, "selection": receipt,
-        }),
-    )
-    .map_err(|_| {
+    let mut report = serde_json::json!({
+        "schema": SCHEMA, "ok": true, "event": "updated", "publication": "committed",
+        "serving": "activated", "receipt": receipt_path, "replaces": selected.authority,
+        "documents": document_count, "edited_ids": edit_count, "selection": receipt,
+    });
+    annotate_snapshot_retrieval(&mut report, &published.snapshot, None);
+    emit(output, &report).map_err(|_| {
         publication_error(
             &receipt,
             "committed",
@@ -2036,21 +2106,19 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         &receipt,
         options.max_image_bytes,
     )?;
-    emit(
-        output,
-        &serde_json::json!({
-            "schema": SCHEMA, "ok": true, "event": "rolled_back", "publication": "committed",
-            "serving": "activated", "retrieval": retrieval_name(predecessor.retrieval_mode()),
-            "receipt": receipt_path, "replaces": selected.authority, "restores": target.authority,
-            "current_admission": if options.allow_damaged_current {
-                "control_manifest_only"
-            } else {
-                "complete_generation"
-            },
-            "selection": receipt,
-        }),
-    )
-    .map_err(|_| {
+    let mut report = serde_json::json!({
+        "schema": SCHEMA, "ok": true, "event": "rolled_back", "publication": "committed",
+        "serving": "activated", "receipt": receipt_path, "replaces": selected.authority,
+        "restores": target.authority,
+        "current_admission": if options.allow_damaged_current {
+            "control_manifest_only"
+        } else {
+            "complete_generation"
+        },
+        "selection": receipt,
+    });
+    annotate_snapshot_retrieval(&mut report, &predecessor, None);
+    emit(output, &report).map_err(|_| {
         publication_error(
             &receipt,
             "committed",
@@ -2314,12 +2382,12 @@ where
         |phase, results| {
             let mut response = serde_json::json!({
                 "schema": SCHEMA, "ok": true, "event": "results",
-                "retrieval": retrieval_name(snapshot.retrieval_mode()),
                 "tier": mode.as_str(), "mode": mode.as_str(), "topology": receipt.topology_name(),
                 "phase": phase, "generation": receipt.generation,
                 "authority": snapshot.authority().canonical_bytes().as_slice(),
                 "profile": receipt.profile, "results": results,
             });
+            annotate_snapshot_retrieval(&mut response, &snapshot, Some(mode));
             annotate_scope(
                 &mut response,
                 scope.as_ref().map(NativeScopedGenerationSnapshot::len),
@@ -2349,9 +2417,9 @@ fn fetch(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         "authority": snapshot.authority().canonical_bytes().as_slice(),
         "generation": snapshot.retained_snapshot().manifest().generation(),
         "tier": snapshot.tier(), "profile": receipt.profile,
-        "retrieval": retrieval_name(snapshot.retrieval_mode()),
         "source": "retained_snapshot",
     });
+    annotate_snapshot_retrieval(&mut response, &snapshot, None);
     if options.filter.is_some() {
         response["scope"] = serde_json::json!({ "filtered": true });
     }
@@ -2730,8 +2798,8 @@ impl AuthoritySession {
             "generation": self.receipt.generation, "profile": self.receipt.profile,
             "tier": self.snapshot.tier(),
             "topology": self.receipt.topology_name(),
-            "retrieval": retrieval_name(self.snapshot.retrieval_mode()),
         });
+        annotate_snapshot_retrieval(&mut response, &self.snapshot, None);
         annotate_scope(
             &mut response,
             self.scope.as_ref().map(NativeScopedGenerationSnapshot::len),
@@ -2843,6 +2911,7 @@ impl AuthoritySession {
                 response["results"] = serde_json::json!(results);
                 response["mode"] = serde_json::json!(mode.as_str());
                 response["phase"] = serde_json::json!(phase);
+                annotate_snapshot_retrieval(&mut response, &self.snapshot, Some(mode));
                 annotate_execution(&mut response, mode);
                 annotate_scope(
                     &mut response,
@@ -3435,7 +3504,7 @@ fn recover(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
         match receipt.open(cx, options.max_image_bytes) {
             Ok(snapshot) => {
                 report["serving"] = serde_json::json!("activated");
-                report["retrieval"] = serde_json::json!(retrieval_name(snapshot.retrieval_mode()));
+                annotate_snapshot_retrieval(&mut report, &snapshot, None);
             }
             Err(error) => {
                 report["ok"] = serde_json::json!(false);
