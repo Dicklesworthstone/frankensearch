@@ -65,6 +65,7 @@ mod repro_wal_truncation;
 pub mod search;
 pub mod simd;
 pub mod two_tier;
+pub mod vector_cohort;
 pub mod wal;
 pub mod warmup;
 
