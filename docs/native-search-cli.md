@@ -302,6 +302,58 @@ apply `upsert_document` / `delete_document`, and call
 The returned complete generation is ready for the ordinary expected-authority
 publisher; building it does not itself select a new authority.
 
+### Roll back the most recent authority publication
+
+`authority-rollback` restores the immediate predecessor still held by the
+authenticated authority slots. It works after a process restart and uses the
+existing component images without loading a model or re-embedding documents:
+
+```sh
+./target/release/frankensearch-native authority-rollback \
+  --from-receipt "$HOME/frankensearch-authority/g2.json" \
+  --target-receipt "$HOME/frankensearch-authority/g1.json" \
+  --receipt "$HOME/frankensearch-authority/rollback-g3.json"
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/rollback-g3.json" \
+  --model-dir /absolute/path/to/g1/models \
+  --query 'retry network requests' --limit 10
+```
+
+The current and target receipts must identify the same root, cooperative-local
+security profile, and semantic tier. Both complete generations must pass bounded
+admission. The target must be the current manifest's exact predecessor and must
+still occupy the other authenticated physical slot. A receipt for an arbitrary
+older generation is insufficient. This command requires a healthy current
+closure; it does not repair corrupt components or discover historical targets.
+
+Rollback publishes a new `Rollback` activation at the current authority sequence
+plus one. The target's artifact generation, source checkpoint, producer identity,
+document set, and vector/lexical/ANN/metadata images remain unchanged. Its
+retrieval mode is restored with those images. This can reverse a model migration;
+subsequent search requires the target producer's local model. No model, source,
+input, retrieval, or work-directory options are accepted by the rollback command.
+
+Predecessor admission is pinned to the captured current authority pair. A
+concurrent publication refuses admission or loses the normal exclusive
+publication fence. It never selects the winner as a replacement expectation.
+Only a fresh activation manifest is staged, and the new receipt must be outside
+the root. Existing components and receipts are preserved. The receipt records
+the complete prepared attempt before publication, so an interrupted result can
+be reconciled with:
+
+```sh
+./target/release/frankensearch-native authority-recover \
+  --receipt "$HOME/frankensearch-authority/rollback-g3.json"
+```
+
+Successful output reports `event: "rolled_back"`, `publication: "committed"`,
+`serving: "activated"`, the restored retrieval mode, `replaces` for the old
+current authority, and `restores` for the selected predecessor. The new receipt
+selects the higher authority sequence. Output failure after publication still
+reports the known committed state. An already running authority server keeps
+its retained generation until explicit activation; a producer-changing rollback
+requires restarting that server with the restored model.
+
 ### Keep an authority generation warm across requests
 
 `authority-serve` opens one selected generation and loads its local producer once,

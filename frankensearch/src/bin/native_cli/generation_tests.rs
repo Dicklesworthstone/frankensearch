@@ -114,6 +114,94 @@ fn retained_rebuild_arguments() -> Vec<&'static str> {
     ]
 }
 
+fn rollback_arguments() -> Vec<&'static str> {
+    vec![
+        "authority-rollback",
+        "--from-receipt",
+        "current.json",
+        "--target-receipt",
+        "predecessor.json",
+        "--receipt",
+        "rolled-back.json",
+    ]
+}
+
+#[test]
+fn authority_rollback_requires_exact_receipts_and_rejects_build_or_model_options() {
+    let arguments = rollback_arguments();
+    let options = parse(&arguments).unwrap().unwrap();
+    assert_eq!(options.command, Command::Rollback);
+    assert_eq!(
+        options.from_receipt.as_deref(),
+        Some(Path::new("current.json"))
+    );
+    assert_eq!(
+        options.target_receipt.as_deref(),
+        Some(Path::new("predecessor.json"))
+    );
+    assert!(options.models.is_none());
+    assert!(options.work.is_none());
+    assert!(is_command("authority-rollback"));
+    assert!(parse(&["authority-rollback", "--help"]).unwrap().is_none());
+    for required in ["--from-receipt", "--target-receipt", "--receipt"] {
+        let mut missing = arguments.clone();
+        let position = missing
+            .iter()
+            .position(|argument| *argument == required)
+            .unwrap();
+        missing.drain(position..position + 2);
+        assert!(parse(&missing).is_err(), "{required}");
+    }
+    let mut bounded = arguments.clone();
+    bounded.extend(["--max-image-bytes", "8192"]);
+    assert_eq!(parse(&bounded).unwrap().unwrap().max_image_bytes, 8192);
+    for extra in [
+        vec!["--model-dir", "models"],
+        vec!["--quality-model-dir", "models"],
+        vec!["--quality-backend", "native-f32"],
+        vec!["--work-dir", "new-work"],
+        vec!["--input", "source.jsonl"],
+        vec!["--source-low", "1"],
+        vec!["--source-high", "9"],
+        vec!["--query", "retry"],
+        vec!["--limit", "1"],
+        vec!["--batch-size", "1"],
+        vec!["--root", "root"],
+        vec!["--tier", "fast"],
+        vec!["--retrieval", "exact"],
+        vec!["--retained-source"],
+        vec!["--max-source-bytes", "4096"],
+        vec!["--migrate-model"],
+        vec!["--allow-activation"],
+        vec!["--cooperative-local"],
+        vec!["--max-image-bytes", "0"],
+    ] {
+        let mut rejected = arguments.clone();
+        rejected.extend(extra);
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
+    for mut rejected in [
+        index_arguments(),
+        rebuild_arguments(),
+        retained_rebuild_arguments(),
+    ] {
+        rejected.extend(["--target-receipt", "predecessor.json"]);
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
+    for command in ["authority-search", "authority-serve", "authority-recover"] {
+        assert!(
+            parse(&[
+                command,
+                "--receipt",
+                "r.json",
+                "--target-receipt",
+                "old.json"
+            ])
+            .is_err()
+        );
+    }
+}
+
 #[test]
 fn authority_update_requires_an_explicit_checkpoint_and_inherits_selected_policy() {
     let arguments = update_arguments();
@@ -1653,6 +1741,321 @@ mod warm_authority {
             identity: identity().identity,
             calls: AtomicUsize::new(0),
         })
+    }
+
+    #[test]
+    fn rollback_reopens_the_explicit_predecessor_without_models_or_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann) in [
+                ("rollback-fast-exact", EmbedderTierTag::Fast, false),
+                ("rollback-quality-exact", EmbedderTierTag::Quality, false),
+                ("rollback-fast-hnsw", EmbedderTierTag::Fast, true),
+                ("rollback-quality-hnsw", EmbedderTierTag::Quality, true),
+            ] {
+                let parent = private_parent(label);
+                let old_provider = provider();
+                let old = publish(&cx, &parent, None, &old_provider, tier, "old", ann).await;
+                let old_reader = old.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let changed_provider = Arc::new(Provider {
+                    identity: {
+                        let mut identity = identity().identity;
+                        identity.producer.implementation_revision =
+                            "before-rollback-migration".to_owned();
+                        identity
+                    },
+                    calls: AtomicUsize::new(0),
+                });
+                let current = publish(
+                    &cx,
+                    &parent,
+                    Some(&old_reader),
+                    &changed_provider,
+                    tier,
+                    "current",
+                    !ann,
+                )
+                .await;
+                let current_reader = current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_ne!(old.identity, current.identity);
+                let original_receipt = fs::read(parent.join("old.json")).unwrap();
+                let current_receipt = fs::read(parent.join("current.json")).unwrap();
+                let old_calls = old_provider.calls.load(Ordering::Relaxed);
+                let current_calls = changed_provider.calls.load(Ordering::Relaxed);
+                let mut options = parse(&rollback_arguments()).unwrap().unwrap();
+                options.from_receipt = Some(parent.join("current.json"));
+                options.target_receipt = Some(parent.join("old.json"));
+                options.receipt = parent.join("rolled-back.json");
+                let mut output = Vec::new();
+                rollback(&cx, &options, &mut output).unwrap();
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["event"], "rolled_back");
+                assert_eq!(report["publication"], "committed");
+                assert_eq!(report["serving"], "activated");
+                assert_eq!(report["retrieval"], if ann { "hnsw" } else { "exact" });
+                assert_eq!(report["replaces"], serde_json::json!(current.authority));
+                assert_eq!(report["restores"], serde_json::json!(old.authority));
+                assert_eq!(old_provider.calls.load(Ordering::Relaxed), old_calls);
+                assert_eq!(
+                    changed_provider.calls.load(Ordering::Relaxed),
+                    current_calls
+                );
+                assert_eq!(fs::read(parent.join("old.json")).unwrap(), original_receipt);
+                assert_eq!(
+                    fs::read(parent.join("current.json")).unwrap(),
+                    current_receipt
+                );
+
+                // Only receipt paths cross the command boundary. No retained
+                // predecessor handle or provider is passed into rollback.
+                let restored = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(
+                    report["selection"],
+                    serde_json::to_value(&restored).unwrap()
+                );
+                assert_eq!(
+                    restored.authority().unwrap().sequence,
+                    current.authority().unwrap().sequence + 1
+                );
+                assert_eq!(restored.generation, old.generation);
+                assert_eq!(restored.identity, old.identity);
+                assert_eq!(restored.documents, old.documents);
+                assert_eq!(restored.tier, tier);
+                assert_eq!(restored.root_id, old.root_id);
+                assert_eq!(
+                    restored.recovery_attempt().unwrap().expected,
+                    current_reader.retained_snapshot().authority_pair()
+                );
+                let reopened = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let manifest = reopened.retained_snapshot().manifest();
+                assert_eq!(manifest.predecessor(), Some(current.authority().unwrap()));
+                assert_eq!(
+                    manifest.components(),
+                    old_reader.retained_snapshot().manifest().components()
+                );
+                assert_eq!(
+                    reopened.metadata().commit_range,
+                    old_reader.metadata().commit_range
+                );
+                match manifest {
+                    frankensearch_core::generation::ActivationManifest::V1(manifest) => {
+                        assert_eq!(manifest.action, GenerationAuthorityActionV1::Rollback);
+                    }
+                    frankensearch_core::generation::ActivationManifest::V2(manifest) => {
+                        assert_eq!(manifest.action, GenerationAuthorityActionV1::Rollback);
+                    }
+                }
+
+                let mut recovery = parse(&["authority-recover", "--receipt", "r.json"])
+                    .unwrap()
+                    .unwrap();
+                recovery.receipt = options.receipt.clone();
+                let mut recovered_output = Vec::new();
+                recover(&cx, &recovery, &mut recovered_output).unwrap();
+                let recovered: serde_json::Value =
+                    serde_json::from_slice(&recovered_output).unwrap();
+                assert_eq!(recovered["publication"], "committed");
+                assert_eq!(recovered["serving"], "activated");
+                assert_eq!(old_provider.calls.load(Ordering::Relaxed), old_calls);
+                assert_eq!(
+                    changed_provider.calls.load(Ordering::Relaxed),
+                    current_calls
+                );
+                assert!(
+                    reopened
+                        .search_text(&cx, changed_provider.as_ref(), "retry", 1)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    changed_provider.calls.load(Ordering::Relaxed),
+                    current_calls
+                );
+                assert_eq!(
+                    reopened
+                        .search_text(&cx, old_provider.as_ref(), "retry", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "retry-old"
+                );
+                assert_eq!(
+                    old_reader
+                        .search_text(&cx, old_provider.as_ref(), "retry", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "retry-old"
+                );
+                assert_eq!(
+                    current_reader
+                        .search_text(&cx, changed_provider.as_ref(), "retry", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "retry-current"
+                );
+
+                // The original authority is no longer an immediate physical
+                // predecessor after rollback, although its old reader lives.
+                let authority_after = fs::read(old.root.join("AUTHORITY")).unwrap();
+                let lock_after = fs::read(old.root.join("LOCK")).unwrap();
+                options.from_receipt = Some(options.receipt.clone());
+                options.receipt = parent.join("out-of-window.json");
+                assert!(rollback(&cx, &options, &mut Vec::new()).is_err());
+                assert!(!options.receipt.exists());
+                assert_eq!(
+                    fs::read(old.root.join("AUTHORITY")).unwrap(),
+                    authority_after
+                );
+                assert_eq!(fs::read(old.root.join("LOCK")).unwrap(), lock_after);
+            }
+        });
+    }
+
+    #[test]
+    fn rollback_preflight_refuses_wrong_receipts_and_limits_before_publication() {
+        struct ClosedOutput;
+        impl Write for ClosedOutput {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("rollback-refusal");
+            let provider = provider();
+            let old = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Fast,
+                "old",
+                true,
+            )
+            .await;
+            let old_reader = old.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            let current = publish(
+                &cx,
+                &parent,
+                Some(&old_reader),
+                &provider,
+                EmbedderTierTag::Fast,
+                "current",
+                false,
+            )
+            .await;
+            let authority_before = fs::read(old.root.join("AUTHORITY")).unwrap();
+            let lock_before = fs::read(old.root.join("LOCK")).unwrap();
+            let calls = provider.calls.load(Ordering::Relaxed);
+            let mut options = parse(&rollback_arguments()).unwrap().unwrap();
+            options.from_receipt = Some(parent.join("current.json"));
+            options.target_receipt = Some(parent.join("old.json"));
+            for label in [
+                "same-head",
+                "stale-current",
+                "budget",
+                "tier",
+                "root",
+                "root-id",
+                "identity",
+                "documents",
+                "profile",
+            ] {
+                options.from_receipt = Some(parent.join("current.json"));
+                options.target_receipt = Some(parent.join("old.json"));
+                options.max_image_bytes = DEFAULT_IMAGE_BYTES;
+                options.receipt = parent.join(format!("refused-{label}.json"));
+                match label {
+                    "same-head" => options.target_receipt = Some(parent.join("current.json")),
+                    "stale-current" => options.from_receipt = Some(parent.join("old.json")),
+                    "budget" => options.max_image_bytes = 1,
+                    _ => {
+                        let mut wrong = old.clone();
+                        match label {
+                            "tier" => wrong.tier = EmbedderTierTag::Quality,
+                            "root" => wrong.root = parent.join("foreign-root"),
+                            "root-id" => wrong.root_id[0] ^= 1,
+                            "identity" => {
+                                let mut identity = wrong.identity.identity.clone();
+                                identity.producer.implementation_revision =
+                                    "wrong-rollback-producer".to_owned();
+                                wrong.identity = identity.freeze().unwrap();
+                            }
+                            "documents" => wrong.documents = 1,
+                            "profile" => wrong.profile = "unadmitted-profile".to_owned(),
+                            _ => unreachable!(),
+                        }
+                        let path = parent.join(format!("wrong-{label}.json"));
+                        fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+                        options.target_receipt = Some(path);
+                    }
+                }
+                let mut output = Vec::new();
+                assert!(rollback(&cx, &options, &mut output).is_err(), "{label}");
+                assert!(output.is_empty(), "{label}");
+                assert!(!options.receipt.exists(), "{label}");
+                assert_eq!(
+                    fs::read(old.root.join("AUTHORITY")).unwrap(),
+                    authority_before,
+                    "{label}"
+                );
+                assert_eq!(
+                    fs::read(old.root.join("LOCK")).unwrap(),
+                    lock_before,
+                    "{label}"
+                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), calls, "{label}");
+            }
+            options.from_receipt = Some(parent.join("current.json"));
+            options.target_receipt = Some(parent.join("old.json"));
+            options.max_image_bytes = DEFAULT_IMAGE_BYTES;
+            options.receipt = parent.join("cancelled.json");
+            cx.set_cancel_requested(true);
+            assert!(rollback(&cx, &options, &mut Vec::new()).is_err());
+            cx.set_cancel_requested(false);
+            assert!(!options.receipt.exists());
+            options.receipt = parent.join("old.json");
+            let saved = fs::read(&options.receipt).unwrap();
+            assert!(rollback(&cx, &options, &mut Vec::new()).is_err());
+            assert_eq!(fs::read(&options.receipt).unwrap(), saved);
+            assert_eq!(
+                fs::read(old.root.join("AUTHORITY")).unwrap(),
+                authority_before
+            );
+            assert_eq!(fs::read(old.root.join("LOCK")).unwrap(), lock_before);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+            let selected = current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(
+                selected
+                    .search_text(&cx, provider.as_ref(), "retry", 1)
+                    .await
+                    .unwrap()[0]
+                    .doc_id,
+                "retry-current"
+            );
+            assert_eq!(
+                old_reader
+                    .search_text(&cx, provider.as_ref(), "retry", 1)
+                    .await
+                    .unwrap()[0]
+                    .doc_id,
+                "retry-old"
+            );
+            let calls = provider.calls.load(Ordering::Relaxed);
+            options.receipt = parent.join("lost-response.json");
+            let error = rollback(&cx, &options, &mut ClosedOutput).unwrap_err();
+            let failure = publication_failure(error.as_ref()).unwrap();
+            assert_eq!(failure["publication"], "committed");
+            assert_eq!(failure["serving"], "activated");
+            let restored = Receipt::read(&options.receipt).unwrap();
+            assert_eq!(restored.generation, old.generation);
+            assert_eq!(restored.authority().unwrap().sequence, 3);
+            assert!(restored.open(&cx, DEFAULT_IMAGE_BYTES).is_ok());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+        });
     }
 
     fn update_options(parent: &Path, previous: &Path, label: &str, input: &Path) -> Options {

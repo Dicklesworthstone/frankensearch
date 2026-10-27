@@ -64,6 +64,10 @@ pub(super) const NATIVE_ANN_RECEIPT_KEY: &str = "native_hnsw_receipt_v2";
 /// bytes. Publishing or rolling back another generation does not change an
 /// in-flight or intentionally retained old reader. Obtain a fresh admitted root
 /// snapshot and construct another handle to observe a new generation.
+/// Explicit predecessor selection also admits a queryable handle, carrying the
+/// current authority that authorized that selection as separate provenance. Such
+/// a handle may be a rollback target, but cannot act as the current head when
+/// proposing a rollback.
 pub struct NativeGenerationSnapshot {
     authority: Arc<OpenedGenerationSnapshotV1>,
     readers: CompositeReaders,
@@ -257,6 +261,11 @@ impl NativeGenerationSnapshot {
     /// rollback. The caller supplies a fresh manifest object id and writer
     /// fence, just as for a newly built candidate.
     ///
+    /// `current` must come from ordinary current-head admission. An explicitly
+    /// selected predecessor is usable as `self`, including after the process
+    /// that originally selected it has exited, but its selection provenance is
+    /// not authority to act as the current head.
+    ///
     /// The proposal advances the authority sequence beyond `current` while
     /// retaining this handle's exact artifact generation, producer identity,
     /// source checkpoint, document set and component receipts. It never copies
@@ -274,8 +283,9 @@ impl NativeGenerationSnapshot {
     /// # Errors
     ///
     /// Refuses cancellation, a foreign or replaced root/anchor, a security
-    /// profile change, read-only or pending authority, a target that is not
-    /// older than `current`, sequence exhaustion, or invalid candidate ids.
+    /// profile change, read-only or pending authority, an explicitly selected
+    /// predecessor used as `current`, a target that is not older than `current`,
+    /// sequence exhaustion, or invalid candidate ids.
     pub fn rollback_candidate(
         &self,
         cx: &Cx,
@@ -286,6 +296,9 @@ impl NativeGenerationSnapshot {
         checkpoint(cx, "native_ann.generation.rollback")?;
         let target = self.retained_snapshot();
         let expected = current.retained_snapshot();
+        if expected.selected_predecessor_of().is_some() {
+            return Err(refused("rollback", "current-is-selected-predecessor"));
+        }
         if target.root_id() != expected.root_id()
             || !same_root_security_identity(target.root_witness(), expected.root_witness())
             || !same_anchor_security_identity(

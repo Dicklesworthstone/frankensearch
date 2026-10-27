@@ -20,7 +20,8 @@ use frankensearch::native_ann::builder::{
 };
 use frankensearch::native_ann::{NativeGenerationSnapshot, NativeRetrievalMode};
 use frankensearch::{
-    Cx, Embedder, GenerationActivationV1, GenerationPublisherV1, IndexableDocument, SearchError,
+    Cx, Embedder, GenerationActivationV1, GenerationCandidateV1, GenerationPublisherV1,
+    IndexableDocument, SearchError,
 };
 use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1, CommitRange, EmbedderTierTag,
@@ -76,6 +77,8 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--max-image-bytes N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
+  authority-rollback --from-receipt CURRENT_JSON --target-receipt PREDECESSOR_JSON\n\
+      --receipt NEW_JSON [--max-image-bytes N]\n\n\
 This explicit route builds one FSVI v2 tier plus a retained Quill image.\n\
 New indexes use exact retrieval unless --retrieval hnsw explicitly selects ANN.\n\
 The selected ANN graph and its source identity are authenticated by AUTHORITY;\n\
@@ -110,6 +113,12 @@ The receipt is durably written before publication and selects exactly one\n\
 authority; its existence alone is not proof that publication committed.\n\
 It also preserves the complete original attempt for recovery after a crash.\n\
 authority-recover reconciles that attempt without republishing or loading models.\n\
+authority-rollback restores the immediate authenticated predecessor of a healthy\n\
+current generation. It publishes a new higher authority sequence using the\n\
+target's original images, producer and source checkpoint, without inference.\n\
+Both receipts must name the same root, security profile and tier. The target\n\
+must still occupy the predecessor slot; arbitrary history is not discovered.\n\
+The new receipt is outside the root and supports authority-recover after a crash.\n\
 Recovery reports commit knowledge separately from bounded reader admission.\n\
 Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
@@ -137,6 +146,7 @@ enum Command {
     Search,
     Serve,
     Recover,
+    Rollback,
 }
 
 struct Options {
@@ -145,6 +155,7 @@ struct Options {
     work: Option<PathBuf>,
     receipt: PathBuf,
     from_receipt: Option<PathBuf>,
+    target_receipt: Option<PathBuf>,
     input: Option<PathBuf>,
     models: Option<PathBuf>,
     quality: models::QualityOptions,
@@ -172,6 +183,7 @@ pub fn is_command(command: &str) -> bool {
             | "authority-search"
             | "authority-serve"
             | "authority-recover"
+            | "authority-rollback"
     )
 }
 
@@ -185,6 +197,7 @@ impl Options {
             Some("authority-search") => Command::Search,
             Some("authority-serve") => Command::Serve,
             Some("authority-recover") => Command::Recover,
+            Some("authority-rollback") => Command::Rollback,
             _ => return Err(bad("unknown authority command")),
         };
         let mut options = Self {
@@ -193,6 +206,7 @@ impl Options {
             work: None,
             receipt: PathBuf::new(),
             from_receipt: None,
+            target_receipt: None,
             input: None,
             models: None,
             quality: models::QualityOptions::default(),
@@ -220,8 +234,16 @@ impl Options {
             }
             match flag.as_str() {
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
-                "--from-receipt" if matches!(command, Command::Rebuild | Command::Update) => {
+                "--from-receipt"
+                    if matches!(
+                        command,
+                        Command::Rebuild | Command::Update | Command::Rollback
+                    ) =>
+                {
                     options.from_receipt = Some(PathBuf::from(value(&mut args)?));
+                }
+                "--target-receipt" if command == Command::Rollback => {
+                    options.target_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
                 "--retained-source" if command == Command::Rebuild => {
@@ -233,14 +255,16 @@ impl Options {
                 "--allow-activation" if command == Command::Serve => {
                     options.allow_activation = true
                 }
-                "--model-dir" if command != Command::Recover => {
+                "--model-dir" if !matches!(command, Command::Recover | Command::Rollback) => {
                     options.models = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--quality-backend" if command != Command::Recover => {
+                "--quality-backend" if !matches!(command, Command::Recover | Command::Rollback) => {
                     options.quality.backend =
                         Some(models::QualityBackend::parse(&value(&mut args)?)?);
                 }
-                "--quality-model-dir" if command != Command::Recover => {
+                "--quality-model-dir"
+                    if !matches!(command, Command::Recover | Command::Rollback) =>
+                {
                     options.quality.directory = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--max-image-bytes" => {
@@ -354,6 +378,13 @@ impl Options {
                     ));
                 }
                 options.source_cut()?;
+            }
+            Command::Rollback => {
+                if options.from_receipt.is_none() || options.target_receipt.is_none() {
+                    return Err(bad(
+                        "authority-rollback requires --from-receipt and --target-receipt",
+                    ));
+                }
             }
             Command::Serve | Command::Recover => {}
         }
@@ -839,17 +870,36 @@ fn stage_and_publish(
     )?;
     root.revalidate()?;
     save_receipt(&receipt, receipt_path)?;
+    publish_and_admit(
+        cx,
+        &mut publisher,
+        &candidate,
+        &attempt,
+        &receipt,
+        max_image_bytes,
+    )?;
+    Ok(receipt)
+}
+
+fn publish_and_admit(
+    cx: &Cx,
+    publisher: &mut GenerationPublisherV1<'_>,
+    candidate: &GenerationCandidateV1,
+    attempt: &AttemptPermitV1,
+    receipt: &Receipt,
+    max_image_bytes: usize,
+) -> Result<()> {
     let result = publisher
         .publish_prepared(
             cx,
-            &candidate,
-            &attempt,
+            candidate,
+            attempt,
             None,
             u64::try_from(max_image_bytes)?,
         )
         .map_err(|error| {
             publication_error(
-                &receipt,
+                receipt,
                 "not_committed",
                 "not_activated",
                 &error.to_string(),
@@ -859,7 +909,7 @@ fn stage_and_publish(
     match result.publication {
         PublicationOutcomeV1::NotCommitted(reason) => {
             return Err(publication_error(
-                &receipt,
+                receipt,
                 "not_committed",
                 "not_activated",
                 &format!("{reason:?}"),
@@ -868,7 +918,7 @@ fn stage_and_publish(
         }
         PublicationOutcomeV1::CommitOutcomeUnknown(permit) => {
             return Err(publication_error(
-                &receipt,
+                receipt,
                 "unknown",
                 "not_activated",
                 "reconciliation_required",
@@ -879,7 +929,7 @@ fn stage_and_publish(
     }
     let Some(GenerationActivationV1::Installed(opened)) = result.activation else {
         return Err(publication_error(
-            &receipt,
+            receipt,
             "committed",
             "not_activated",
             "snapshot_activation_deferred_or_refused",
@@ -888,14 +938,14 @@ fn stage_and_publish(
     };
     if receipt.admit_opened(cx, opened, max_image_bytes).is_err() {
         return Err(publication_error(
-            &receipt,
+            receipt,
             "committed",
             "not_activated",
             "engine_admission_refused",
             None,
         ));
     }
-    Ok(receipt)
+    Ok(())
 }
 
 async fn index(
@@ -1259,6 +1309,124 @@ where
             "serving": "activated", "retrieval": retrieval_name(built.retrieval_mode()),
             "receipt": receipt_path, "replaces": selected.authority,
             "documents": document_count, "edited_ids": edit_count, "selection": receipt,
+        }),
+    )
+    .map_err(|_| {
+        publication_error(
+            &receipt,
+            "committed",
+            "activated",
+            "result_delivery_failed",
+            None,
+        )
+    })
+}
+
+fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
+    checkpoint(cx)?;
+    let selected = Receipt::read(
+        options
+            .from_receipt
+            .as_deref()
+            .ok_or_else(|| bad("missing current receipt"))?,
+    )?;
+    let target = Receipt::read(
+        options
+            .target_receipt
+            .as_deref()
+            .ok_or_else(|| bad("missing rollback target receipt"))?,
+    )?;
+    if selected.root != target.root
+        || selected.root_id != target.root_id
+        || selected.profile != target.profile
+        || selected.tier != target.tier
+    {
+        return Err(bad(
+            "rollback receipts must select the same root, security profile, and tier",
+        ));
+    }
+    let receipt_path = new_path(&options.receipt)?;
+    separate_destinations(&[&selected.root, &receipt_path])?;
+    let root = admit_root(&selected.root)?;
+    // Admit the expected current selection once. The predecessor opener
+    // requires its exact physical pair and never follows a concurrent winner.
+    let current = selected.open_on_root(cx, &root, options.max_image_bytes)?;
+    current.authority().next_sequence()?;
+    checkpoint(cx)?;
+    let target_budget = u64::try_from(options.max_image_bytes)?.min(target.image_bytes);
+    let opened = root.open_predecessor_generation_snapshot_with_budget(
+        current.retained_snapshot(),
+        target.authority()?,
+        target_budget,
+    )?;
+    checkpoint(cx)?;
+    let SnapshotOpenOutcomeV1::Opened(opened) = opened else {
+        return Err(bad(&format!(
+            "rollback predecessor admission refused: {opened:?}"
+        )));
+    };
+    let predecessor = target.admit_opened(cx, opened, usize::try_from(target_budget)?)?;
+    let writer = WriterIdentityV1::for_current_process()?;
+    let object_id = new_generation(1)?.nonce;
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch.native.authority-rollback.v1");
+    hasher.update(writer.writer_id);
+    hasher.update(writer.nonce);
+    hasher.update(object_id);
+    let candidate =
+        predecessor.rollback_candidate(cx, &current, object_id, hasher.finalize().into())?;
+    if candidate.owned_image_bytes() > u64::try_from(options.max_image_bytes)? {
+        return Err(bad("rollback generation exceeds the encoded-image budget"));
+    }
+    let mut publisher =
+        GenerationPublisherV1::new(&root, selected.root_id, writer.writer_id, PROFILE)?;
+    let attempt = publisher.prepare_attempt(
+        &candidate,
+        current.retained_snapshot().authority_pair(),
+        new_generation(1)?.nonce,
+        new_generation(1)?.nonce,
+    )?;
+    let receipt = Receipt {
+        schema: RECEIPT_SCHEMA.to_owned(),
+        root: selected.root.clone(),
+        root_id: selected.root_id,
+        profile: selected.profile.clone(),
+        authority: candidate.authority().canonical_bytes().to_vec(),
+        generation: target.generation,
+        identity: target.identity.clone(),
+        tier: target.tier,
+        documents: target.documents,
+        // The new activation manifest can be larger than the target's old
+        // genesis manifest even though every component image is unchanged.
+        image_bytes: candidate.owned_image_bytes(),
+        attempt: Some(SavedAttempt::from_permit(&attempt, false)),
+    };
+    receipt.validate()?;
+    encode(&receipt, MAX_RECEIPT_BYTES)?;
+    checkpoint(cx)?;
+    // The target's exact component objects were independently admitted above.
+    // Only this new activation manifest is staged; no component is rewritten.
+    root.stage_immutable_file(
+        &activation_manifest_path_v1(candidate.authority().object_id)?,
+        candidate.manifest_bytes(),
+    )?;
+    root.revalidate()?;
+    save_receipt(&receipt, &receipt_path)?;
+    publish_and_admit(
+        cx,
+        &mut publisher,
+        &candidate,
+        &attempt,
+        &receipt,
+        options.max_image_bytes,
+    )?;
+    emit(
+        output,
+        &serde_json::json!({
+            "schema": SCHEMA, "ok": true, "event": "rolled_back", "publication": "committed",
+            "serving": "activated", "retrieval": retrieval_name(predecessor.retrieval_mode()),
+            "receipt": receipt_path, "replaces": selected.authority, "restores": target.authority,
+            "selection": receipt,
         }),
     )
     .map_err(|_| {
@@ -1799,6 +1967,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,
             Command::Serve => Box::pin(serve(&cx, &options, &mut output, pool)).await,
             Command::Recover => recover(&cx, &options, &mut output),
+            Command::Rollback => rollback(&cx, &options, &mut output),
         }
     })
 }

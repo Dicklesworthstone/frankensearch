@@ -1607,6 +1607,73 @@ mod qualified_rollback {
                 );
                 assert_eq!(current.retrieval_mode(), rebuilt.retrieval_mode());
                 assert_ne!(current.retrieval_mode(), retained.retrieval_mode());
+                assert_eq!(current.retained_snapshot().selected_predecessor_of(), None);
+                // Reopen through a new qualified root and fresh current-head
+                // admission. The target is recovered from its exact authority,
+                // without reusing the old reader's retained component bytes.
+                let reopened_root = QualifiedGenerationRoot::admit(
+                    &root_path,
+                    GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1).unwrap(),
+                )
+                .unwrap();
+                let SnapshotOpenOutcomeV1::Opened(reopened_current) = reopened_root
+                    .open_generation_snapshot_with_budget(ROOT_ID, PROFILE, None, BUDGET as u64)
+                    .unwrap()
+                else {
+                    panic!("fresh current generation must admit before predecessor selection");
+                };
+                assert!(!Arc::ptr_eq(&reopened_current, current.retained_snapshot()));
+                let reopened_current = NativeGenerationSnapshot::admit_exact(
+                    &cx,
+                    reopened_current,
+                    rebuilt.binding(),
+                    DEFAULT_SCHEMA,
+                    config(),
+                    BUDGET,
+                )
+                .unwrap();
+                let SnapshotOpenOutcomeV1::Opened(reopened_target) = reopened_root
+                    .open_predecessor_generation_snapshot_with_budget(
+                        reopened_current.retained_snapshot(),
+                        first.authority(),
+                        BUDGET as u64,
+                    )
+                    .unwrap()
+                else {
+                    panic!("the authenticated previous slot must reopen its complete generation");
+                };
+                assert!(!Arc::ptr_eq(&reopened_target, retained.retained_snapshot()));
+                assert_eq!(
+                    reopened_target.selected_predecessor_of(),
+                    Some(current.authority())
+                );
+                assert_eq!(reopened_target.head(), retained.retained_snapshot().head());
+                assert_eq!(
+                    reopened_target.authority_pair(),
+                    current.retained_snapshot().authority_pair()
+                );
+                assert!(
+                    NativeGenerationSnapshot::admit_exact(
+                        &cx,
+                        Arc::clone(&reopened_target),
+                        rebuilt.binding(),
+                        DEFAULT_SCHEMA,
+                        config(),
+                        BUDGET,
+                    )
+                    .is_err()
+                );
+                let reopened_target = NativeGenerationSnapshot::admit_exact(
+                    &cx,
+                    reopened_target,
+                    original.binding(),
+                    DEFAULT_SCHEMA,
+                    config(),
+                    BUDGET,
+                )
+                .unwrap();
+                assert_eq!(reopened_target.retrieval_mode(), retained.retrieval_mode());
+                assert_eq!(reopened_target.tier(), tier);
                 assert!(
                     current
                         .rollback_candidate(&cx, &retained, [0x8c; 16], [0x8d; 32])
@@ -1666,8 +1733,8 @@ mod qualified_rollback {
                 let before_inventory = fs::read_dir(&root_path).unwrap().count();
                 let original_calls = original_provider.calls.load(Ordering::SeqCst);
                 let changed_calls = changed_provider.calls.load(Ordering::SeqCst);
-                let rollback = retained
-                    .rollback_candidate(&cx, &current, [0x93; 16], [0x94; 32])
+                let rollback = reopened_target
+                    .rollback_candidate(&cx, &reopened_current, [0x93; 16], [0x94; 32])
                     .unwrap();
                 let loser = retained
                     .rollback_candidate(&cx, &current, [0x95; 16], [0x96; 32])
@@ -1747,6 +1814,42 @@ mod qualified_rollback {
                 );
                 let after_authority = fs::read(root_path.join("AUTHORITY")).unwrap();
                 let after_lock = fs::read(root_path.join("LOCK")).unwrap();
+                let SnapshotOpenOutcomeV1::Opened(previous_current) = root
+                    .open_predecessor_generation_snapshot_with_budget(
+                        restored.retained_snapshot(),
+                        current.authority(),
+                        BUDGET as u64,
+                    )
+                    .unwrap()
+                else {
+                    panic!("the displaced successor remains a selectable previous slot");
+                };
+                let previous_current = NativeGenerationSnapshot::admit_exact(
+                    &cx,
+                    previous_current,
+                    rebuilt.binding(),
+                    DEFAULT_SCHEMA,
+                    config(),
+                    BUDGET,
+                )
+                .unwrap();
+                assert_eq!(
+                    previous_current
+                        .retained_snapshot()
+                        .selected_predecessor_of(),
+                    Some(restored.authority())
+                );
+                assert!(retained.authority().sequence < previous_current.authority().sequence);
+                // The target really is older, so an age check alone would
+                // allow this proposal. Explicit predecessor provenance cannot
+                // authorize acting as the current head.
+                let Err(SearchError::InvalidConfig { field, value, .. }) =
+                    retained.rollback_candidate(&cx, &previous_current, [0xa1; 16], [0xa2; 32])
+                else {
+                    panic!("a selected predecessor cannot be used as current authority");
+                };
+                assert_eq!(field, "native_ann.generation.rollback");
+                assert_eq!(value, "current-is-selected-predecessor");
                 let mut publisher =
                     GenerationPublisherV1::new(&root, ROOT_ID, [0x98; 16], PROFILE).unwrap();
                 let stale = publisher
@@ -1771,7 +1874,7 @@ mod qualified_rollback {
                     after_authority
                 );
                 assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), after_lock);
-                for snapshot in [&retained, &restored] {
+                for snapshot in [&retained, &reopened_target, &restored] {
                     let documents = snapshot.source_documents(&cx, BUDGET).unwrap();
                     assert_eq!(documents.len(), 1);
                     assert_eq!(documents[0].id, "original");
@@ -1794,15 +1897,17 @@ mod qualified_rollback {
                             .is_err()
                     );
                 }
-                let hits = current
-                    .search_text(&cx, changed_provider.as_ref(), "common", 5)
-                    .await
-                    .unwrap();
-                assert_eq!(hits[0].doc_id, "successor");
-                assert_eq!(
-                    current.source_documents(&cx, BUDGET).unwrap()[0].id,
-                    "successor"
-                );
+                for snapshot in [&current, &reopened_current, &previous_current] {
+                    let hits = snapshot
+                        .search_text(&cx, changed_provider.as_ref(), "common", 5)
+                        .await
+                        .unwrap();
+                    assert_eq!(hits[0].doc_id, "successor");
+                    assert_eq!(
+                        snapshot.source_documents(&cx, BUDGET).unwrap()[0].id,
+                        "successor"
+                    );
+                }
                 cx.set_cancel_requested(true);
                 assert!(matches!(
                     retained.rollback_candidate(&cx, &restored, [0x9b; 16], [0x9c; 32]),

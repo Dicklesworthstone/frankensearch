@@ -74,7 +74,7 @@ const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
   authority-index / authority-rebuild / authority-update / authority-search /\n\
-  authority-serve / authority-recover:\n\
+  authority-serve / authority-recover / authority-rollback:\n\
          fixed AUTHORITY generations with incremental updates and warm stdio serving\n\
          (use authority-index --help for the complete command contract)\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\

@@ -509,12 +509,10 @@ impl GenerationRootObjectWitness {
         self.filesystem
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn same_object(self, other: Self) -> bool {
         self.device == other.device && self.inode == other.inode
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn same_directory_security_identity(self, other: Self) -> bool {
         self.same_object(other)
             && self.mode == other.mode
@@ -524,12 +522,10 @@ impl GenerationRootObjectWitness {
             && self.filesystem == other.filesystem
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn same_file_security_identity(self, other: Self) -> bool {
         self.same_directory_security_identity(other) && self.hard_links == other.hard_links
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn same_control_anchor_identity(self, other: Self) -> bool {
         self.same_file_security_identity(other) && self.byte_len == other.byte_len
     }
@@ -5523,6 +5519,13 @@ pub mod generation_reader {
             /// Rounds attempted before giving up.
             attempts: usize,
         },
+        /// Explicit predecessor admission observed a different current head
+        /// or physical slot pair from the caller's admitted selection. The
+        /// caller must select again; no newer head is followed implicitly.
+        ExpectedCurrentChanged,
+        /// The explicitly requested target is not the current manifest's
+        /// immediate predecessor retained in the other authenticated slot.
+        PredecessorNotRetained,
         /// A persisted publication attempt has no completing owner frame; the
         /// outcome must be reconciled by the publisher before any read.
         PendingReconciliation,
@@ -5587,6 +5590,7 @@ pub mod generation_reader {
         manifest: ActivationManifest,
         closure: GenerationClosureV1,
         health: SnapshotHealthV1,
+        selected_predecessor_of: Option<AuthorityRefV1>,
     }
 
     impl OpenedGenerationSnapshotV1 {
@@ -5626,10 +5630,26 @@ pub mod generation_reader {
             self.pair
         }
 
-        /// The served head: the slot whose manifest this snapshot retains.
+        /// The selected slot whose manifest this snapshot retains.
+        ///
+        /// Ordinary opening selects the current head. Explicit predecessor
+        /// opening selects its actual older physical slot; consult
+        /// [`Self::selected_predecessor_of`] for that admission provenance.
         #[must_use]
         pub const fn head(&self) -> AuthoritySlotV1 {
             self.head
+        }
+
+        /// Current authority against which this predecessor was admitted.
+        ///
+        /// `None` identifies an ordinary current-head open. `Some(current)`
+        /// identifies an explicit predecessor selection, admitted while the
+        /// exact [`Self::authority_pair`] still selected `current`. It is a
+        /// retained rollback target, not proof that its older authority is
+        /// current or an authorization to publish after that older authority.
+        #[must_use]
+        pub const fn selected_predecessor_of(&self) -> Option<AuthorityRefV1> {
+            self.selected_predecessor_of
         }
 
         /// External floor record observed at admission, when a provider was given.
@@ -5676,6 +5696,7 @@ pub mod generation_reader {
                     &self.floor.map(|record| record.cas_version),
                 )
                 .field("health", &self.health)
+                .field("selected_predecessor_of", &self.selected_predecessor_of)
                 .finish_non_exhaustive()
         }
     }
@@ -5860,6 +5881,50 @@ pub mod generation_reader {
         }
     }
 
+    fn same_snapshot_anchors(
+        first: GenerationRootAnchorWitness,
+        second: GenerationRootAnchorWitness,
+    ) -> bool {
+        first.root().same_directory_security_identity(second.root())
+            && first.lock().same_control_anchor_identity(second.lock())
+            && first
+                .authority()
+                .same_control_anchor_identity(second.authority())
+    }
+
+    fn selected_predecessor_slot(
+        current: &OpenedGenerationSnapshotV1,
+        selected: AuthorityRefV1,
+        resolution: Resolution,
+        anchors: GenerationRootAnchorWitness,
+    ) -> Result<AuthoritySlotV1, SnapshotRefusalV1> {
+        if resolution.pair != current.authority_pair()
+            || resolution.head != current.head()
+            || resolution.floor != current.floor()
+            || resolution.health != current.health()
+        {
+            return Err(SnapshotRefusalV1::ExpectedCurrentChanged);
+        }
+        if !same_snapshot_anchors(anchors, current.anchor_witnesses()) {
+            return Err(SnapshotRefusalV1::Closure(
+                GenerationRootErrorKind::ObjectChanged,
+            ));
+        }
+        if selected.sequence.checked_add(1) != Some(resolution.head.authority.sequence)
+            || current.manifest().predecessor() != Some(selected)
+            || resolution.head.authority.predecessor != Some(selected.fingerprint())
+        {
+            return Err(SnapshotRefusalV1::PredecessorNotRetained);
+        }
+        [resolution.pair.first, resolution.pair.second]
+            .into_iter()
+            .flatten()
+            .find(|slot| {
+                slot.authority == selected && slot.slot_index != resolution.head.slot_index
+            })
+            .ok_or(SnapshotRefusalV1::PredecessorNotRetained)
+    }
+
     impl QualifiedGenerationRoot {
         fn resolution_round(
             &self,
@@ -5948,6 +6013,102 @@ pub mod generation_reader {
             floor: Option<&dyn AntiRollbackFloorProviderV1>,
             max_owned_image_bytes: u64,
         ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            self.open_selected_generation_snapshot_with_budget(
+                root_id,
+                profile,
+                floor,
+                max_owned_image_bytes,
+                None,
+            )
+        }
+
+        /// Admit the explicitly selected predecessor still in the other slot.
+        ///
+        /// `current` must be an ordinary current-head snapshot from this exact
+        /// qualified root and its retained control anchors, admitted under
+        /// [`GenerationRootSecurityProfileV1::CooperativeLocal`] without an
+        /// external floor. Both shared-lock resolutions must still select its
+        /// complete physical slot pair and head. The selected target must be
+        /// that head's exact immediate predecessor in the other authenticated
+        /// slot, with the same link in the retained current manifest.
+        ///
+        /// The target's complete immutable closure passes the same bounded,
+        /// descriptor-relative admission as a current open. The returned
+        /// snapshot retains the actual older slot and the actual current pair;
+        /// [`OpenedGenerationSnapshotV1::selected_predecessor_of`] records the
+        /// current authority that admitted this selection. No slot is invented,
+        /// no history path is discovered, and no authority is published. Use the
+        /// current snapshot's pair when publishing a new higher-sequence rollback.
+        ///
+        /// This operation never follows a different current head on retry and
+        /// never supplies an automatic fallback after a failed current open.
+        /// Older ancestors and externally anchored history require a separate
+        /// explicit admission contract. The image budget covers this target's
+        /// manifest and declared components, not the already retained current
+        /// snapshot, parsed structures, or process RSS.
+        ///
+        /// # Errors
+        ///
+        /// Returns the infrastructure errors and typed refusals of current
+        /// opening, plus an invalid selection/profile, changed expected current,
+        /// foreign root/anchor identity, or an unavailable immediate predecessor.
+        pub fn open_predecessor_generation_snapshot_with_budget(
+            &self,
+            current: &OpenedGenerationSnapshotV1,
+            selected_predecessor: AuthorityRefV1,
+            max_owned_image_bytes: u64,
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            if current.profile() != GenerationRootSecurityProfileV1::CooperativeLocal
+                || current.floor().is_some()
+                || current.health()
+                    != (SnapshotHealthV1::Unanchored {
+                        profile: GenerationRootSecurityProfileV1::CooperativeLocal,
+                    })
+            {
+                return Ok(SnapshotOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::InvalidField {
+                        field: "generation_reader.predecessor.profile",
+                    }),
+                ));
+            }
+            if current.selected_predecessor_of().is_some() {
+                return Ok(SnapshotOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::InvalidField {
+                        field: "generation_reader.predecessor.current_selection",
+                    }),
+                ));
+            }
+            if !self
+                .witness()
+                .same_directory_security_identity(current.root_witness())
+                || !same_snapshot_anchors(self.anchor_witnesses(), current.anchor_witnesses())
+            {
+                return Ok(SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(
+                    GenerationRootErrorKind::ObjectChanged,
+                )));
+            }
+            if let Err(error) = selected_predecessor.validate() {
+                return Ok(SnapshotOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::Authority(error),
+                ));
+            }
+            self.open_selected_generation_snapshot_with_budget(
+                current.root_id(),
+                current.profile(),
+                None,
+                max_owned_image_bytes,
+                Some((current, selected_predecessor)),
+            )
+        }
+
+        fn open_selected_generation_snapshot_with_budget(
+            &self,
+            root_id: [u8; 16],
+            profile: GenerationRootSecurityProfileV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
+            max_owned_image_bytes: u64,
+            predecessor: Option<(&OpenedGenerationSnapshotV1, AuthorityRefV1)>,
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
             if root_id == [0; 16] {
                 return Ok(SnapshotOpenOutcomeV1::Refused(
                     SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::InvalidField {
@@ -5956,15 +6117,25 @@ pub mod generation_reader {
                 ));
             }
             for _ in 0..SNAPSHOT_OPEN_MAX_ATTEMPTS_V1 {
-                let (first, _, _) = match self.resolution_round(root_id, profile, floor)? {
+                let (first, first_anchors, _) = match self
+                    .resolution_round(root_id, profile, floor)?
+                {
                     Round::Resolved(resolved) => *resolved,
                     Round::Retry => continue,
                     Round::Refused(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
                 };
+                let selected = if let Some((current, target)) = predecessor {
+                    match selected_predecessor_slot(current, target, first, first_anchors) {
+                        Ok(slot) => slot,
+                        Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
+                    }
+                } else {
+                    first.head
+                };
 
                 // Open the immutable closure outside the lock: exact length
                 // and digest from the authority, descriptor-relative route.
-                let authority = first.head.authority;
+                let authority = selected.authority;
                 if let Err(refusal) =
                     check_image_budget(authority.manifest_len, [], max_owned_image_bytes)
                 {
@@ -6049,7 +6220,18 @@ pub mod generation_reader {
                         }
                     };
                 if second != first {
+                    if predecessor.is_some() {
+                        return Ok(SnapshotOpenOutcomeV1::Refused(
+                            SnapshotRefusalV1::ExpectedCurrentChanged,
+                        ));
+                    }
                     continue;
+                }
+                if let Some((current, target)) = predecessor
+                    && let Err(refusal) =
+                        selected_predecessor_slot(current, target, second, anchors)
+                {
+                    return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
                 }
 
                 // Closure over the retained root as it was under that lock.
@@ -6081,12 +6263,14 @@ pub mod generation_reader {
                         root_id,
                         profile,
                         pair: second.pair,
-                        head: second.head,
+                        head: selected,
                         floor: second.floor,
                         manifest_file,
                         manifest,
                         closure,
                         health: second.health,
+                        selected_predecessor_of: predecessor
+                            .map(|(current, _)| current.head().authority),
                     },
                 )));
             }
@@ -6647,6 +6831,479 @@ pub mod generation_reader {
                     panic!("expected an admitted snapshot, got {refusal:?}")
                 }
             }
+        }
+
+        fn predecessor_root(
+            label: &str,
+            with_ann: bool,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
+        ) -> (
+            PathBuf,
+            QualifiedGenerationRoot,
+            Arc<OpenedGenerationSnapshotV1>,
+            AuthoritySlotV1,
+        ) {
+            let path = fixture_root(label);
+            let predecessor = {
+                let root = admit(&path);
+                let writer = publisher(&root);
+                let (first, first_slot) = publish_manifest(
+                    &path,
+                    &writer,
+                    &manifest_v2(1, None, with_ann),
+                    ExpectedAuthorityPairV1::default(),
+                    floor,
+                );
+                publish_manifest(
+                    &path,
+                    &writer,
+                    &manifest_v2(2, Some(first), with_ann),
+                    ExpectedAuthorityPairV1 {
+                        first: None,
+                        second: Some(first_slot),
+                    },
+                    floor,
+                );
+                first_slot
+            };
+            // No predecessor snapshot or original root capability survives.
+            let root = admit(&path);
+            let current = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            (path, root, current, predecessor)
+        }
+
+        #[test]
+        fn explicit_predecessor_retains_actual_slots_and_complete_images_after_restart() {
+            for with_ann in [false, true] {
+                let (path, root, current, previous_slot) =
+                    predecessor_root("predecessor-restart", with_ann, None);
+                let authority_before = fs::read(path.join("AUTHORITY")).expect("authority bytes");
+                let lock_before = fs::read(path.join("LOCK")).expect("lock bytes");
+                assert_eq!(current.selected_predecessor_of(), None);
+                let previous = opened(
+                    root.open_predecessor_generation_snapshot_with_budget(
+                        &current,
+                        previous_slot.authority,
+                        u64::MAX,
+                    )
+                    .expect("explicit predecessor open"),
+                );
+                assert_eq!(previous.head(), previous_slot);
+                assert_eq!(previous.authority_pair(), current.authority_pair());
+                assert_eq!(
+                    previous.selected_predecessor_of(),
+                    Some(current.head().authority)
+                );
+                assert_eq!(previous.manifest(), &manifest_v2(1, None, with_ann));
+                assert_eq!(previous.health(), current.health());
+                assert_eq!(previous.floor(), None);
+                assert_eq!(
+                    previous
+                        .closure()
+                        .bytes(GenerationComponentRole::Ann)
+                        .is_some(),
+                    with_ann
+                );
+                for (role, receipt) in previous.manifest().components().iter() {
+                    let file = previous.closure().file(role).expect("complete component");
+                    assert_eq!(file.as_bytes(), component_bytes(role, 1));
+                    assert_eq!(file.sha256(), receipt.sha256);
+                    assert_eq!(file.witness().byte_len(), receipt.byte_len);
+                }
+                assert_eq!(fs::read(path.join("AUTHORITY")).unwrap(), authority_before);
+                assert_eq!(fs::read(path.join("LOCK")).unwrap(), lock_before);
+                let previous_bytes = previous.manifest_bytes();
+                let current_bytes = current.manifest_bytes();
+
+                publish_manifest(
+                    &path,
+                    &publisher(&root),
+                    &manifest_v2(3, Some(current.head().authority), !with_ann),
+                    current.authority_pair(),
+                    None,
+                );
+                assert_eq!(&*previous.manifest_bytes(), &*previous_bytes);
+                assert_eq!(&*current.manifest_bytes(), &*current_bytes);
+                assert_eq!(
+                    refused(
+                        root.open_predecessor_generation_snapshot_with_budget(
+                            &current,
+                            previous_slot.authority,
+                            u64::MAX,
+                        )
+                        .expect("stale selection refusal")
+                    ),
+                    SnapshotRefusalV1::ExpectedCurrentChanged,
+                );
+                let newest = opened(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                ));
+                assert_eq!(
+                    refused(
+                        root.open_predecessor_generation_snapshot_with_budget(
+                            &newest,
+                            previous_slot.authority,
+                            u64::MAX,
+                        )
+                        .expect("older history is not rediscovered")
+                    ),
+                    SnapshotRefusalV1::PredecessorNotRetained,
+                );
+                let displaced = opened(
+                    root.open_predecessor_generation_snapshot_with_budget(
+                        &newest,
+                        current.head().authority,
+                        u64::MAX,
+                    )
+                    .expect("new immediate predecessor"),
+                );
+                assert_eq!(&*displaced.manifest_bytes(), &*current_bytes);
+                assert_eq!(
+                    displaced.selected_predecessor_of(),
+                    Some(newest.head().authority)
+                );
+            }
+        }
+
+        #[test]
+        fn predecessor_requires_an_explicit_immediate_target_and_ordinary_local_current() {
+            let floor = InMemoryAntiRollbackFloorStoreV1::new();
+            let (_, root, current, previous_slot) =
+                predecessor_root("predecessor-selection", false, Some(&floor));
+            let mut different = previous_slot.authority;
+            different.object_id = [0xe4; 16];
+            for target in [current.head().authority, different] {
+                assert_eq!(
+                    refused(
+                        root.open_predecessor_generation_snapshot_with_budget(
+                            &current,
+                            target,
+                            u64::MAX,
+                        )
+                        .expect("wrong target refusal")
+                    ),
+                    SnapshotRefusalV1::PredecessorNotRetained,
+                );
+            }
+            for profile in [
+                GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+            ] {
+                let selected = opened(open(&root, profile, Some(&floor)));
+                assert_eq!(
+                    refused(
+                        root.open_predecessor_generation_snapshot_with_budget(
+                            &selected,
+                            previous_slot.authority,
+                            u64::MAX,
+                        )
+                        .expect("profile or floor refusal")
+                    ),
+                    SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::InvalidField {
+                        field: "generation_reader.predecessor.profile",
+                    }),
+                );
+            }
+            let previous = opened(
+                root.open_predecessor_generation_snapshot_with_budget(
+                    &current,
+                    previous_slot.authority,
+                    u64::MAX,
+                )
+                .expect("selected predecessor"),
+            );
+            assert_eq!(
+                refused(
+                    root.open_predecessor_generation_snapshot_with_budget(
+                        &previous,
+                        previous_slot.authority,
+                        u64::MAX,
+                    )
+                    .expect("a predecessor is not current")
+                ),
+                SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::InvalidField {
+                    field: "generation_reader.predecessor.current_selection",
+                }),
+            );
+            let (_, genesis, slot) = genesis_root("predecessor-genesis");
+            let first = opened(open(
+                &genesis,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            assert_eq!(
+                refused(
+                    genesis
+                        .open_predecessor_generation_snapshot_with_budget(
+                            &first,
+                            slot.authority,
+                            u64::MAX,
+                        )
+                        .expect("genesis has no predecessor")
+                ),
+                SnapshotRefusalV1::PredecessorNotRetained,
+            );
+        }
+
+        #[test]
+        fn predecessor_rejects_foreign_roots_and_replaced_control_anchors() {
+            for anchor in ["LOCK", "AUTHORITY"] {
+                let (path, root, current, previous) =
+                    predecessor_root("predecessor-physical-identity", false, None);
+                let (_, foreign, _) = genesis_root("predecessor-foreign");
+                assert_eq!(
+                    refused(
+                        foreign
+                            .open_predecessor_generation_snapshot_with_budget(
+                                &current,
+                                previous.authority,
+                                u64::MAX,
+                            )
+                            .expect("foreign root refuses before selection")
+                    ),
+                    SnapshotRefusalV1::Closure(GenerationRootErrorKind::ObjectChanged),
+                );
+                let bytes = fs::read(path.join(anchor)).unwrap();
+                fs::rename(path.join(anchor), path.with_extension(anchor)).unwrap();
+                let mut replacement = OpenOptions::new()
+                    .create_new(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(path.join(anchor))
+                    .unwrap();
+                replacement.write_all(&bytes).unwrap();
+                replacement.sync_all().unwrap();
+                drop(replacement);
+                let replaced = admit(&path);
+                assert_eq!(
+                    refused(
+                        replaced
+                            .open_predecessor_generation_snapshot_with_budget(
+                                &current,
+                                previous.authority,
+                                u64::MAX,
+                            )
+                            .expect("copied anchor bytes do not restore identity")
+                    ),
+                    SnapshotRefusalV1::Closure(GenerationRootErrorKind::ObjectChanged),
+                );
+                assert_eq!(fs::read(path.join(anchor)).unwrap(), bytes);
+                assert_eq!(current.selected_predecessor_of(), None);
+                assert_ne!(root.anchor_witnesses(), replaced.anchor_witnesses());
+            }
+        }
+
+        #[test]
+        fn predecessor_budget_precedes_component_reads_and_bad_targets_never_fall_back() {
+            for with_ann in [false, true] {
+                for missing in [false, true] {
+                    let (path, root, current, previous_slot) =
+                        predecessor_root("predecessor-budget", with_ann, None);
+                    let target = manifest_v2(1, None, with_ann);
+                    let required = target.components().iter().fold(
+                        previous_slot.authority.manifest_len,
+                        |total, (_, component)| total + component.byte_len,
+                    );
+                    let retained = opened(
+                        root.open_predecessor_generation_snapshot_with_budget(
+                            &current,
+                            previous_slot.authority,
+                            required,
+                        )
+                        .expect("exact target budget"),
+                    );
+                    let vector = retained
+                        .closure()
+                        .bytes(GenerationComponentRole::Vector)
+                        .unwrap();
+                    let vector_path = path.join(component_object_name_v1(
+                        GenerationComponentRole::Vector,
+                        target.components().vector.sha256,
+                    ));
+                    if missing {
+                        fs::rename(&vector_path, path.with_extension("retained-vector")).unwrap();
+                    } else {
+                        fs::set_permissions(&vector_path, fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                        let mut file = OpenOptions::new().write(true).open(&vector_path).unwrap();
+                        file.write_all(&[0xff]).unwrap();
+                        file.sync_all().unwrap();
+                        drop(file);
+                        fs::set_permissions(&vector_path, fs::Permissions::from_mode(0o400))
+                            .unwrap();
+                    }
+                    for (limit, required) in [
+                        (
+                            previous_slot.authority.manifest_len - 1,
+                            previous_slot.authority.manifest_len,
+                        ),
+                        (required - 1, required),
+                    ] {
+                        assert_eq!(
+                            refused(
+                                root.open_predecessor_generation_snapshot_with_budget(
+                                    &current,
+                                    previous_slot.authority,
+                                    limit,
+                                )
+                                .expect("budget refusal before missing or corrupt component")
+                            ),
+                            SnapshotRefusalV1::ImageBudget { required, limit },
+                        );
+                    }
+                    let failed = refused(
+                        root.open_predecessor_generation_snapshot_with_budget(
+                            &current,
+                            previous_slot.authority,
+                            required,
+                        )
+                        .expect("target closure refusal"),
+                    );
+                    if missing {
+                        assert!(matches!(failed, SnapshotRefusalV1::Closure(_)));
+                    } else {
+                        assert_eq!(
+                            failed,
+                            SnapshotRefusalV1::Closure(GenerationRootErrorKind::HashMismatch)
+                        );
+                    }
+                    assert_eq!(
+                        &*vector,
+                        &component_bytes(GenerationComponentRole::Vector, 1)
+                    );
+                    assert_eq!(retained.head(), previous_slot);
+                    assert_eq!(current.head().authority.sequence, 2);
+                }
+            }
+        }
+
+        #[test]
+        fn predecessor_refuses_a_publication_between_its_two_resolution_rounds() {
+            let (path, root, current, previous) =
+                predecessor_root("predecessor-concurrent", true, None);
+            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let root = &root;
+                let current = &current;
+                let reader = scope.spawn(move || {
+                    let mut locks = 0;
+                    let _hook = platform::install_test_hook(move |boundary| {
+                        if boundary == platform::TestBoundary::BeforeLock {
+                            locks += 1;
+                            if locks == 2 {
+                                observed_tx.send(()).expect("target closure admitted");
+                                resume_rx
+                                    .recv_timeout(std::time::Duration::from_secs(30))
+                                    .expect("competing publication completed");
+                            }
+                        }
+                        Ok(())
+                    });
+                    root.open_predecessor_generation_snapshot_with_budget(
+                        current,
+                        previous.authority,
+                        u64::MAX,
+                    )
+                    .expect("racing predecessor open")
+                });
+                observed_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("reader reached the second resolution");
+                publish_manifest(
+                    &path,
+                    &publisher(root),
+                    &manifest_v2(3, Some(current.head().authority), false),
+                    current.authority_pair(),
+                    None,
+                );
+                resume_tx.send(()).unwrap();
+                assert_eq!(
+                    refused(reader.join().expect("reader joined")),
+                    SnapshotRefusalV1::ExpectedCurrentChanged,
+                );
+            });
+            assert_eq!(current.head().authority.sequence, 2);
+            assert_eq!(
+                opened(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                ))
+                .head()
+                .authority
+                .sequence,
+                3,
+            );
+        }
+
+        #[test]
+        fn predecessor_waits_for_uncertain_publication_reconciliation() {
+            let (path, root, current, previous) =
+                predecessor_root("predecessor-pending", true, None);
+            let next = manifest_v2(3, Some(current.head().authority), true);
+            let (len, sha256) = next.object_receipt();
+            write_component_objects(&path, 3);
+            write_manifest_object(&path, object_id(3), &next.canonical_bytes());
+            let authority = AuthorityRefV1::new(
+                3,
+                object_id(3),
+                len,
+                sha256,
+                Some(current.head().authority.fingerprint()),
+            )
+            .unwrap();
+            let writer = publisher(&root);
+            let permit = {
+                let _hook = platform::install_test_hook(|boundary| {
+                    if boundary == platform::TestBoundary::AfterPublishAttemptFrame {
+                        Err(GenerationRootError::new(
+                            GenerationRootErrorKind::Io,
+                            GenerationRootStage::SyncRegularFile,
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                });
+                match writer
+                    .publish(authority, current.authority_pair(), None, [0xe7; 16])
+                    .unwrap()
+                {
+                    PublicationOutcomeV1::CommitOutcomeUnknown(permit) => permit,
+                    other => panic!("the injected failure must remain unknown: {other:?}"),
+                }
+            };
+            assert_eq!(
+                refused(
+                    root.open_predecessor_generation_snapshot_with_budget(
+                        &current,
+                        previous.authority,
+                        u64::MAX,
+                    )
+                    .expect("uncertainty freezes predecessor admission")
+                ),
+                SnapshotRefusalV1::PendingReconciliation,
+            );
+            assert_eq!(
+                writer.reconcile(&permit, None).unwrap(),
+                ReconcileOutcomeV1::NotCommitted
+            );
+            let target = opened(
+                root.open_predecessor_generation_snapshot_with_budget(
+                    &current,
+                    previous.authority,
+                    u64::MAX,
+                )
+                .expect("reconciled exact selection"),
+            );
+            assert_eq!(target.head(), previous);
         }
 
         #[test]
