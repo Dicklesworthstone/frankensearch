@@ -57,6 +57,7 @@ use std::sync::Arc;
 
 use crate::ValidatedFsviBytes;
 use frankensearch_core::{
+    Cx,
     error::{SearchError, SearchResult},
     generation::ArtifactGenerationIdentityV1,
     sha256_checksum,
@@ -65,7 +66,13 @@ use serde::{Deserialize, Serialize};
 
 const NATIVE_HNSW_MAGIC: [u8; 8] = *b"FSHNSW\0\0";
 /// Current owned native-HNSW graph format.
-pub const NATIVE_HNSW_FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 records each graph node's physical FSVI row before its adjacency.
+/// Stable node identities let an append preserve the seeded graph topology
+/// even when the successor FSVI sorts new documents between existing rows.
+/// Version 1 graphs retain their original identity row map and their original
+/// topology-digest validation on load. Every new save uses version 2.
+pub const NATIVE_HNSW_FORMAT_VERSION: u32 = 2;
 const NATIVE_HNSW_HEADER_LEN: usize = 96;
 const NATIVE_HNSW_HEADER_LEN_U64: u64 = 96;
 const NATIVE_HNSW_HEADER_CRC_OFFSET: usize = NATIVE_HNSW_HEADER_LEN - 4;
@@ -97,6 +104,19 @@ enum GraphDefect {
         /// Rows exposed by the vector store.
         store_rows: usize,
     },
+    /// The graph does not assign exactly one physical row to every node.
+    SourceMapCardinalityMismatch {
+        graph_points: usize,
+        source_rows: usize,
+    },
+    /// A graph node refers to a physical row outside its admitted owner.
+    SourceRowOutOfRange {
+        node: usize,
+        physical_row: u32,
+        row_count: usize,
+    },
+    /// Two graph nodes refer to the same physical row, omitting another row.
+    DuplicateSourceRow { physical_row: u32 },
     /// A graph with no points nonetheless names an entry point.
     EntryPointInEmptyGraph {
         /// The spurious entry point id.
@@ -241,6 +261,24 @@ impl fmt::Display for GraphDefect {
                 f,
                 "graph indexes {graph_points} points but the vector store exposes {store_rows} rows"
             ),
+            Self::SourceMapCardinalityMismatch {
+                graph_points,
+                source_rows,
+            } => write!(
+                f,
+                "graph indexes {graph_points} points but its source map contains {source_rows} rows"
+            ),
+            Self::SourceRowOutOfRange {
+                node,
+                physical_row,
+                row_count,
+            } => write!(
+                f,
+                "graph node {node} maps to physical row {physical_row} outside {row_count} rows"
+            ),
+            Self::DuplicateSourceRow { physical_row } => {
+                write!(f, "graph source map repeats physical row {physical_row}")
+            }
             Self::EntryPointInEmptyGraph { entry } => {
                 write!(f, "empty graph names entry point {entry}")
             }
@@ -892,7 +930,9 @@ impl NativeHnswGenerationBindingV2 {
             return Err(mismatch("maximum level"));
         }
         // ubs:ignore — the topology SHA-256 is public integrity metadata.
-        if graph.topology_sha256()? != receipt.topology_sha256 {
+        if graph.topology_sha256_for_version(receipt.native_format_version)?
+            != receipt.topology_sha256
+        {
             return Err(mismatch("topology SHA-256"));
         }
         Ok(())
@@ -1054,6 +1094,136 @@ impl ValidatedNativeHnsw {
         Self::from_verified_graph(owner, binding, graph)
     }
 
+    /// Reuse this graph for an unchanged or append-only successor owner.
+    ///
+    /// The successor must have a strictly newer generation and the same full
+    /// embedding, producer, input and storage identities. Every old document
+    /// must still occur exactly once with the same persisted vector bytes and
+    /// LIVE/TOMBSTONE state. Physical rows may move: graph node IDs stay stable
+    /// and a validated permutation binds them to the successor's exact rows.
+    /// Only new documents run graph insertion; unchanged membership copies the
+    /// existing topology without rebuilding its neighborhoods.
+    ///
+    /// `Ok(None)` means changed identities, edited/deleted rows or smaller
+    /// membership require an explicit full rebuild. It does not mean a failed
+    /// or cancelled attempt may silently fall back. No files are touched, the
+    /// predecessor stays unchanged, and the returned handle owns the successor.
+    /// A later save produces a new graph/receipt bound to that generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-newer generations, duplicate document IDs, invalid graph
+    /// state and cancellation. Propagates owner decoding and insertion errors.
+    pub fn try_reuse_for_owner(
+        &self,
+        cx: &Cx,
+        owner: Arc<ValidatedFsviBytes>,
+    ) -> SearchResult<Option<Self>> {
+        native_reuse_checkpoint(cx)?;
+        let binding = Self::binding_for_owner(owner.as_ref())?;
+        if binding.artifact_generation.sequence <= self.binding.artifact_generation.sequence {
+            return Err(native_hnsw_receipt_config_error(
+                "reuse.generation",
+                "not-newer",
+                "graph reuse requires a strictly newer successor generation",
+            ));
+        }
+        if binding.embedding_identity_fingerprint != self.binding.embedding_identity_fingerprint
+            || binding.embedding_space_fingerprint != self.binding.embedding_space_fingerprint
+            || binding.embedding_producer_fingerprint != self.binding.embedding_producer_fingerprint
+            || binding.embedding_input_fingerprint != self.binding.embedding_input_fingerprint
+            || binding.vector_storage_fingerprint != self.binding.vector_storage_fingerprint
+            || owner.record_count() < self.owner.record_count()
+        {
+            native_reuse_checkpoint(cx)?;
+            return Ok(None);
+        }
+
+        let mut by_id = BTreeMap::new();
+        for physical in 0..owner.record_count() {
+            native_reuse_checkpoint(cx)?;
+            let physical_row = u32::try_from(physical).map_err(|_| {
+                native_hnsw_receipt_config_error(
+                    "reuse.physical_row",
+                    "out-of-range",
+                    "successor physical rows must fit u32",
+                )
+            })?;
+            if by_id
+                .insert(owner.doc_id_at(physical)?, physical_row)
+                .is_some()
+            {
+                return Err(native_hnsw_receipt_config_error(
+                    "reuse.document_ids",
+                    "duplicate",
+                    "graph reuse requires unique physical document identifiers",
+                ));
+            }
+        }
+        let mut source_rows = Vec::with_capacity(owner.record_count());
+        let mut retained = vec![false; owner.record_count()];
+        for &previous_physical in &self.graph.source_rows {
+            native_reuse_checkpoint(cx)?;
+            let previous = self.owner.row(previous_physical as usize)?;
+            let Some(next_physical) = by_id.remove(previous.doc_id()) else {
+                native_reuse_checkpoint(cx)?;
+                return Ok(None);
+            };
+            let next = owner.row(next_physical as usize)?;
+            if previous.flags() != next.flags() || previous.vector_bytes() != next.vector_bytes() {
+                native_reuse_checkpoint(cx)?;
+                return Ok(None);
+            }
+            retained[next_physical as usize] = true;
+            source_rows.push(next_physical);
+        }
+        drop(by_id);
+        // Append new graph nodes in successor physical order. Never renumber
+        // old nodes: their sampled levels and protected predecessor edges are
+        // defined over logical insertion order, not current FSVI row positions.
+        for (physical, was_retained) in retained.into_iter().enumerate() {
+            native_reuse_checkpoint(cx)?;
+            if !was_retained {
+                source_rows.push(u32::try_from(physical).map_err(|_| {
+                    native_hnsw_receipt_config_error(
+                        "reuse.physical_row",
+                        "out-of-range",
+                        "successor physical rows must fit u32",
+                    )
+                })?);
+            }
+        }
+        let mut graph = NativeHnsw::new(self.graph.params(), self.graph.seed())?;
+        graph.entry = self.graph.entry;
+        graph.max_level = self.graph.max_level;
+        graph.source_rows.clone_from(&self.graph.source_rows);
+        for point in &self.graph.adjacency {
+            native_reuse_checkpoint(cx)?;
+            graph.adjacency.push(point.clone());
+        }
+        let store = MappedFsviStore {
+            owner: owner.as_ref(),
+            source_rows: &source_rows,
+            cancellation: Some(cx),
+        };
+        for ordinal in graph.len()..source_rows.len() {
+            native_reuse_checkpoint(cx)?;
+            let node = u32::try_from(ordinal).map_err(|_| {
+                native_hnsw_receipt_config_error(
+                    "reuse.node",
+                    "out-of-range",
+                    "successor graph nodes must fit u32",
+                )
+            })?;
+            graph.insert(node, &store)?;
+        }
+        graph.source_rows = source_rows;
+        native_reuse_checkpoint(cx)?;
+        let successor = Self::from_verified_graph(owner, binding, graph)?;
+        native_reuse_checkpoint(cx)?;
+        Ok(Some(successor))
+    }
+
     /// Load a graph only after its receipt matches the exact admitted owner.
     ///
     /// The supplied [`Arc`] is retained by the returned handle. Receipt
@@ -1167,6 +1337,11 @@ impl ValidatedNativeHnsw {
         }
 
         let physical_rows = owner.record_count();
+        let store = MappedFsviStore {
+            owner,
+            source_rows: &self.graph.source_rows,
+            cancellation: None,
+        };
         let mut candidate_count = expected_live_hits.min(physical_rows);
         let mut search_ef = ef
             .unwrap_or_else(|| self.graph.params().ef_search)
@@ -1176,9 +1351,10 @@ impl ValidatedNativeHnsw {
         loop {
             let candidates = self
                 .graph
-                .search(query, candidate_count, Some(search_ef), owner)?;
+                .search(query, candidate_count, Some(search_ef), &store)?;
             let mut live_hits = Vec::with_capacity(expected_live_hits);
-            for (physical_row, distance) in candidates {
+            for (node, distance) in candidates {
+                let physical_row = store.physical_row(node)?;
                 let physical_index =
                     usize::try_from(physical_row).map_err(|_| SearchError::InvalidConfig {
                         field: "native_hnsw.physical_row".to_owned(),
@@ -1236,6 +1412,12 @@ impl ValidatedNativeHnsw {
     #[must_use]
     pub fn owner_witness(&self) -> &crate::FsviV2Witness {
         self.owner.witness()
+    }
+
+    /// Whether reuse preserves every requested graph construction/search knob.
+    #[must_use]
+    pub fn matches_build_policy(&self, params: HnswParams, seed: u64) -> bool {
+        self.graph.params() == params && self.graph.seed() == seed
     }
 }
 
@@ -1311,7 +1493,7 @@ impl NativeHnswGenerationReceiptV2 {
                 "must include the complete fixed FSHNSW header",
             ));
         }
-        if self.native_format_version != NATIVE_HNSW_FORMAT_VERSION {
+        if !matches!(self.native_format_version, 1 | NATIVE_HNSW_FORMAT_VERSION) {
             return Err(native_hnsw_receipt_config_error(
                 "native_format_version",
                 &self.native_format_version.to_string(),
@@ -1891,6 +2073,60 @@ impl VectorDistance for ValidatedFsviBytes {
     }
 }
 
+fn native_reuse_checkpoint(cx: &Cx) -> SearchResult<()> {
+    if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+        return Err(SearchError::Cancelled {
+            phase: "native_hnsw.reuse".to_owned(),
+            reason: "operation cancelled".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Graph nodes retain insertion identity across FSVI's physical-row sorting.
+/// Only the bound graph controls this complete, validated row permutation.
+struct MappedFsviStore<'a> {
+    owner: &'a ValidatedFsviBytes,
+    source_rows: &'a [u32],
+    cancellation: Option<&'a Cx>,
+}
+
+impl MappedFsviStore<'_> {
+    fn physical_row(&self, node: u32) -> SearchResult<u32> {
+        self.source_rows.get(node as usize).copied().ok_or_else(|| {
+            native_hnsw_receipt_config_error(
+                "source_map.node",
+                "out-of-range",
+                "graph node has no admitted physical row",
+            )
+        })
+    }
+
+    fn checkpoint(&self) -> SearchResult<()> {
+        if let Some(cx) = self.cancellation {
+            native_reuse_checkpoint(cx)?;
+        }
+        Ok(())
+    }
+}
+
+impl VectorDistance for MappedFsviStore<'_> {
+    fn distance_to_query(&self, id: u32, query: &[f32]) -> SearchResult<f32> {
+        self.checkpoint()?;
+        self.owner.distance_to_query(self.physical_row(id)?, query)
+    }
+
+    fn distance_between(&self, a: u32, b: u32) -> SearchResult<f32> {
+        self.checkpoint()?;
+        self.owner
+            .distance_between(self.physical_row(a)?, self.physical_row(b)?)
+    }
+
+    fn len(&self) -> usize {
+        self.source_rows.len()
+    }
+}
+
 /// Per-point adjacency: one neighbour list per layer the point occupies.
 #[derive(Debug, Clone, Default)]
 struct Adjacency {
@@ -1975,6 +2211,7 @@ impl MutationJournal {
 
 #[derive(Debug, Clone, Copy)]
 struct NativeHnswHeader {
+    format_version: u32,
     params: HnswParams,
     seed: u64,
     point_count: usize,
@@ -1989,7 +2226,7 @@ impl NativeHnswHeader {
     fn encode(self) -> SearchResult<[u8; NATIVE_HNSW_HEADER_LEN]> {
         let mut bytes = [0_u8; NATIVE_HNSW_HEADER_LEN];
         bytes[..NATIVE_HNSW_MAGIC.len()].copy_from_slice(&NATIVE_HNSW_MAGIC);
-        put_u32(&mut bytes, 8, NATIVE_HNSW_FORMAT_VERSION);
+        put_u32(&mut bytes, 8, self.format_version);
         put_u32(
             &mut bytes,
             12,
@@ -2040,11 +2277,11 @@ impl NativeHnswHeader {
             return Err(native_hnsw_corrupted(path, "bad native HNSW magic"));
         }
         let version = get_u32(bytes, 8);
-        if version != NATIVE_HNSW_FORMAT_VERSION {
+        if !matches!(version, 1 | NATIVE_HNSW_FORMAT_VERSION) {
             return Err(native_hnsw_corrupted(
                 path,
                 format!(
-                    "unsupported native HNSW format version {version}; expected \
+                    "unsupported native HNSW format version {version}; expected 1 or \
                      {NATIVE_HNSW_FORMAT_VERSION}"
                 ),
             ));
@@ -2119,7 +2356,7 @@ impl NativeHnswHeader {
             ));
         }
         let minimum_payload = usize_to_u64(point_count, "point_count")?
-            .checked_mul(8)
+            .checked_mul(if version == 1 { 8 } else { 12 })
             .ok_or_else(|| native_hnsw_corrupted(path, "minimum payload length overflow"))?;
         if payload_len < minimum_payload {
             return Err(native_hnsw_corrupted(
@@ -2129,6 +2366,7 @@ impl NativeHnswHeader {
         }
 
         Ok(Self {
+            format_version: version,
             params,
             seed: get_u64(bytes, 48),
             point_count,
@@ -2142,7 +2380,7 @@ impl NativeHnswHeader {
 
     fn metadata(self) -> SearchResult<NativeHnswFileMetadata> {
         Ok(NativeHnswFileMetadata {
-            format_version: NATIVE_HNSW_FORMAT_VERSION,
+            format_version: self.format_version,
             byte_len: NATIVE_HNSW_HEADER_LEN_U64
                 .checked_add(self.payload_len)
                 .ok_or_else(|| SearchError::InvalidConfig {
@@ -2216,6 +2454,9 @@ struct NativeHnsw {
     params: HnswParams,
     sampler: LevelSampler,
     adjacency: Vec<Adjacency>,
+    /// Logical node ordinal -> physical row of the bound FSVI generation.
+    /// A permutation of every owner row; identity on a fresh or v1 graph.
+    source_rows: Vec<u32>,
     /// Entry point: the id of a point at the current maximum level.
     entry: Option<u32>,
     max_level: usize,
@@ -2236,6 +2477,7 @@ impl NativeHnsw {
             sampler: LevelSampler::new(params.m, seed),
             params,
             adjacency: Vec::new(),
+            source_rows: Vec::new(),
             entry: None,
             max_level: 0,
             scratch: VisitedSet::default(),
@@ -2290,11 +2532,33 @@ impl NativeHnsw {
     /// invalid and [`SearchError::InvalidConfig`] when a count cannot be
     /// represented canonically.
     fn topology_sha256(&self) -> SearchResult<String> {
+        self.topology_sha256_for_version(NATIVE_HNSW_FORMAT_VERSION)
+    }
+
+    fn topology_sha256_for_version(&self, version: u32) -> SearchResult<String> {
         self.verify()
             .map_err(|defect| native_hnsw_corrupted(Path::new("<memory>"), defect.to_string()))?;
         let mut bytes = Vec::new();
-        append_canonical_bytes(&mut bytes, b"frankensearch.native-hnsw.topology.v1")?;
-        bytes.extend_from_slice(&NATIVE_HNSW_FORMAT_VERSION.to_be_bytes());
+        let domain = match version {
+            1 if self
+                .source_rows
+                .iter()
+                .enumerate()
+                .all(|(node, &row)| node == row as usize) =>
+            {
+                b"frankensearch.native-hnsw.topology.v1"
+            }
+            NATIVE_HNSW_FORMAT_VERSION => b"frankensearch.native-hnsw.topology.v2",
+            _ => {
+                return Err(native_hnsw_receipt_config_error(
+                    "topology.version",
+                    "unsupported",
+                    "version 1 requires an identity row map; version 2 binds the full permutation",
+                ));
+            }
+        };
+        append_canonical_bytes(&mut bytes, domain)?;
+        bytes.extend_from_slice(&version.to_be_bytes());
         for value in [
             usize_to_u64(self.params.m, "topology.params.m")?,
             usize_to_u64(self.params.m0, "topology.params.m0")?,
@@ -2310,7 +2574,10 @@ impl NativeHnsw {
         ] {
             bytes.extend_from_slice(&value.to_be_bytes());
         }
-        for point in &self.adjacency {
+        for (point, physical_row) in self.adjacency.iter().zip(&self.source_rows) {
+            if version >= 2 {
+                bytes.extend_from_slice(&physical_row.to_be_bytes());
+            }
             bytes.extend_from_slice(
                 &u32::try_from(point.layers.len())
                     .map_err(|_| {
@@ -2371,7 +2638,13 @@ impl NativeHnsw {
 
         let mut payload_hasher = crc32fast::Hasher::new();
         let mut payload_len = 0_u64;
-        for point in &self.adjacency {
+        for (point, &physical_row) in self.adjacency.iter().zip(&self.source_rows) {
+            write_payload_u32(
+                temporary.as_file_mut(),
+                &mut payload_hasher,
+                &mut payload_len,
+                physical_row,
+            )?;
             write_payload_u32(
                 temporary.as_file_mut(),
                 &mut payload_hasher,
@@ -2406,6 +2679,7 @@ impl NativeHnsw {
 
         let payload_crc32 = payload_hasher.finalize();
         let header = NativeHnswHeader {
+            format_version: NATIVE_HNSW_FORMAT_VERSION,
             params: self.params,
             seed: self.sampler.seed,
             point_count: self.adjacency.len(),
@@ -2513,9 +2787,23 @@ impl NativeHnsw {
             })?;
         let sampler = LevelSampler::new(header.params.m, header.seed);
         let mut payload = NativeHnswPayloadReader::new(&mut file, header.payload_len);
+        let mut source_rows = Vec::new();
+        source_rows
+            .try_reserve_exact(header.point_count)
+            .map_err(|error| {
+                native_hnsw_corrupted(
+                    path,
+                    format!("could not allocate native HNSW row map: {error}"),
+                )
+            })?;
         for point_index in 0..header.point_count {
             let point_id = u32::try_from(point_index)
                 .map_err(|_| native_hnsw_corrupted(path, "native HNSW point id exceeds u32"))?;
+            source_rows.push(if header.format_version == 1 {
+                point_id
+            } else {
+                payload.read_u32(path, "physical source row")?
+            });
             let layer_count = persisted_usize(
                 path,
                 u64::from(payload.read_u32(path, "point layer count")?),
@@ -2606,6 +2894,7 @@ impl NativeHnsw {
             params: header.params,
             sampler,
             adjacency,
+            source_rows,
             entry: header.entry,
             max_level: header.max_level,
             scratch: VisitedSet::default(),
@@ -2743,7 +3032,7 @@ impl NativeHnsw {
                 // that pruning cannot remove. Equal vectors otherwise make
                 // every neighbor evict the same older row when the newest
                 // row arrives, disconnecting valid data. Spend an existing
-                // layer-zero slot on the physical predecessor; no additional
+                // layer-zero slot on the logical predecessor; no additional
                 // edges or vector storage are allocated beyond the budget.
                 if layer == 0 {
                     let predecessor = id - 1; // The first row returned above.
@@ -2785,6 +3074,7 @@ impl NativeHnsw {
             self.max_level = original_max_level;
             return Err(error);
         }
+        self.source_rows.push(id);
         Ok(())
     }
 
@@ -3178,6 +3468,26 @@ impl NativeHnsw {
     /// Returns the first [`GraphDefect`] found.
     fn verify(&self) -> Result<(), GraphDefect> {
         let count = self.adjacency.len();
+        if self.source_rows.len() != count {
+            return Err(GraphDefect::SourceMapCardinalityMismatch {
+                graph_points: count,
+                source_rows: self.source_rows.len(),
+            });
+        }
+        let mut seen_rows = vec![false; count];
+        for (node, &physical_row) in self.source_rows.iter().enumerate() {
+            let Some(seen) = seen_rows.get_mut(physical_row as usize) else {
+                return Err(GraphDefect::SourceRowOutOfRange {
+                    node,
+                    physical_row,
+                    row_count: count,
+                });
+            };
+            if std::mem::replace(seen, true) {
+                return Err(GraphDefect::DuplicateSourceRow { physical_row });
+            }
+        }
+        drop(seen_rows);
 
         if count == 0 {
             if let Some(entry) = self.entry {
@@ -4065,6 +4375,9 @@ mod tests {
         let point_count = usize::try_from(get_u64(bytes, 56)).expect("test point count");
         let mut offset = NATIVE_HNSW_HEADER_LEN;
         for point in 0..point_count {
+            if get_u32(bytes, 8) >= 2 {
+                offset += 4;
+            }
             let layer_count =
                 usize::try_from(get_u32(bytes, offset)).expect("test layer count fits usize");
             offset += 4;
@@ -4291,6 +4604,366 @@ mod tests {
                     .is_tombstone()
             })
             .expect("find deterministic seed whose entry point is tombstoned")
+    }
+
+    #[test]
+    fn successor_reuses_unchanged_topology_and_binds_the_new_owner() {
+        let directory = tempfile::tempdir().expect("temporary successor directory");
+        let previous_owner = generation_owner(100, 0x10, "unchanged-successor", 8, 32);
+        let next_owner = generation_owner(101, 0x11, "unchanged-successor", 8, 32);
+        let previous = ValidatedNativeHnsw::build(Arc::clone(&previous_owner), params(), 42)
+            .expect("build predecessor");
+        let next = previous
+            .try_reuse_for_owner(&Cx::for_testing(), Arc::clone(&next_owner))
+            .expect("reuse unchanged membership")
+            .expect("unchanged rows are eligible");
+
+        assert_eq!(
+            topology_snapshot(&next.graph),
+            topology_snapshot(&previous.graph)
+        );
+        assert_eq!(next.graph.source_rows, previous.graph.source_rows);
+        assert_eq!(next.owner_witness(), next_owner.witness());
+        assert_ne!(next.owner_witness(), previous.owner_witness());
+        let previous_path = directory.path().join("previous.fshnsw");
+        let next_path = directory.path().join("next.fshnsw");
+        let previous_receipt = previous.save(&previous_path).expect("save predecessor");
+        let next_receipt = next.save(&next_path).expect("save successor");
+        assert_eq!(
+            std::fs::read(&previous_path).expect("previous graph bytes"),
+            std::fs::read(&next_path).expect("successor graph bytes")
+        );
+        assert_eq!(
+            previous_receipt.topology_sha256,
+            next_receipt.topology_sha256
+        );
+        assert_ne!(previous_receipt.receipt_sha256, next_receipt.receipt_sha256);
+        ValidatedNativeHnsw::load(Arc::clone(&next_owner), &next_path)
+            .expect("new receipt reopens with the new owner");
+        assert!(
+            ValidatedNativeHnsw::load(previous_owner, &next_path).is_err(),
+            "even identical graph bytes cannot carry an old generation receipt"
+        );
+
+        assert!(next.matches_build_policy(params(), 42));
+        assert!(!next.matches_build_policy(params(), 43));
+        for policy in [
+            HnswParams { m: 7, ..params() },
+            HnswParams { m0: 15, ..params() },
+            HnswParams {
+                ef_construction: 63,
+                ..params()
+            },
+            HnswParams {
+                ef_search: 63,
+                ..params()
+            },
+        ] {
+            assert!(!next.matches_build_policy(policy, 42));
+        }
+    }
+
+    #[test]
+    fn empty_predecessor_can_reuse_or_insert_its_first_successor_nodes() {
+        let previous = ValidatedNativeHnsw::build(
+            generation_owner(105, 0x15, "empty-successor", 4, 0),
+            params(),
+            42,
+        )
+        .expect("build empty predecessor");
+        for count in [0, 1, 2, 9] {
+            let owner = generation_owner(106, 0x16, "empty-successor", 4, count);
+            let next = previous
+                .try_reuse_for_owner(&Cx::for_testing(), Arc::clone(&owner))
+                .expect("reuse empty predecessor")
+                .expect("empty membership is an append prefix");
+            assert_eq!(next.len(), count);
+            assert_eq!(
+                next.graph.source_rows,
+                (0..u32::try_from(count).unwrap()).collect::<Vec<_>>()
+            );
+            next.graph
+                .verify()
+                .expect("first insertion populates the source map");
+            assert_eq!(
+                next.search(&[1.0, 0.0, 0.0, 0.0], count, Some(count))
+                    .expect("search empty or newly populated successor")
+                    .len(),
+                count
+            );
+        }
+        assert!(previous.is_empty());
+        assert!(previous.graph.source_rows.is_empty());
+    }
+
+    #[test]
+    fn append_successors_preserve_node_identity_across_row_reordering_and_restart() {
+        let directory = tempfile::tempdir().expect("temporary append directory");
+        let rows: Vec<_> = TestStore::synthetic(96, 8)
+            .vectors
+            .into_iter()
+            .enumerate()
+            .map(|(index, vector)| (format!("document-{index:04}"), vector))
+            .collect();
+        for quantization in [QuantizationFormat::F16, QuantizationFormat::F32] {
+            let binding =
+                fsvi_v2_binding_with_quantization(110, 0x10, "append-successor", 8, quantization);
+            let owner =
+                admitted_fsvi_owner(directory.path(), "initial.fsvi", &binding, &rows[..32]);
+            let mut previous =
+                ValidatedNativeHnsw::build(owner, params(), 93).expect("build initial graph");
+            for (sequence, count) in [(111, 64), (112, 96), (113, 96)] {
+                let next_binding = fsvi_v2_binding_with_quantization(
+                    sequence,
+                    0x11,
+                    "append-successor",
+                    8,
+                    quantization,
+                );
+                let next_owner = admitted_fsvi_owner(
+                    directory.path(),
+                    "next.fsvi",
+                    &next_binding,
+                    &rows[..count],
+                );
+                let previous_topology = topology_snapshot(&previous.graph);
+                let previous_mapping = previous.graph.source_rows.clone();
+                let next = previous
+                    .try_reuse_for_owner(&Cx::for_testing(), Arc::clone(&next_owner))
+                    .expect("append successor")
+                    .expect("unchanged old vectors and new documents are eligible");
+                assert_eq!(topology_snapshot(&previous.graph), previous_topology);
+                assert_eq!(previous.graph.source_rows, previous_mapping);
+                for (node, &physical_row) in previous_mapping.iter().enumerate() {
+                    assert_eq!(
+                        previous
+                            .owner
+                            .doc_id_at(physical_row as usize)
+                            .expect("old doc id"),
+                        next.owner
+                            .doc_id_at(next.graph.source_rows[node] as usize)
+                            .expect("remapped old doc id"),
+                        "a retained logical node must still address its original document"
+                    );
+                    assert_eq!(
+                        previous.graph.adjacency[node].level(),
+                        next.graph.adjacency[node].level(),
+                        "insertion levels belong to stable nodes, not sorted physical rows"
+                    );
+                }
+                assert!(
+                    next.graph
+                        .source_rows
+                        .iter()
+                        .enumerate()
+                        .any(|(node, &physical_row)| node != physical_row as usize),
+                    "fixture must move existing physical rows when the new rows are sorted"
+                );
+                if count == previous.len() {
+                    assert_eq!(topology_snapshot(&next.graph), previous_topology);
+                    assert_eq!(next.graph.source_rows, previous_mapping);
+                }
+                for query_id in 0..8 {
+                    let query = TestStore::query(query_id, 8);
+                    let expected = next_owner
+                        .search_top_k(&query, 7, None)
+                        .expect("exact successor search");
+                    let actual = next
+                        .search(&query, 7, Some(count))
+                        .expect("full-width remapped graph search");
+                    assert_eq!(
+                        actual
+                            .iter()
+                            .map(ValidatedNativeHnswHit::doc_id)
+                            .collect::<Vec<_>>(),
+                        expected
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    for hit in actual {
+                        assert_eq!(
+                            hit.doc_id(),
+                            next_owner
+                                .doc_id_at(hit.physical_row() as usize)
+                                .expect("returned physical row resolves through new owner")
+                        );
+                    }
+                }
+
+                let path = directory.path().join("successor.fshnsw");
+                let saved = next.save(&path).expect("seal remapped successor");
+                assert_eq!(saved.native_format_version, 2);
+                assert_eq!(saved.artifact_generation.sequence, sequence);
+                let (reopened, observed) = ValidatedNativeHnsw::load(next_owner, &path)
+                    .expect("reopen successor with persisted row permutation");
+                assert_eq!(saved, observed);
+                assert_eq!(
+                    topology_snapshot(&reopened.graph),
+                    topology_snapshot(&next.graph)
+                );
+                assert_eq!(reopened.graph.source_rows, next.graph.source_rows);
+                previous = reopened;
+            }
+        }
+    }
+
+    #[test]
+    fn append_successor_keeps_tombstones_as_routes_without_returning_them() {
+        let directory = tempfile::tempdir().expect("temporary tombstone append directory");
+        let rows: Vec<_> = fsvi_rows(48, 8)
+            .into_iter()
+            .enumerate()
+            .map(|(row, (doc_id, vector))| {
+                (
+                    doc_id,
+                    vector,
+                    if row % 8 == 0 {
+                        FsviRecordFlags::LIVE
+                    } else {
+                        FsviRecordFlags::TOMBSTONE
+                    },
+                )
+            })
+            .collect();
+        let initial_binding = fsvi_v2_binding(120, 0x20, "tombstone-successor", 8);
+        let owner = admitted_fsvi_owner_with_flags(
+            directory.path(),
+            "initial.fsvi",
+            &initial_binding,
+            &rows[..24],
+        );
+        let seed = seed_with_tombstoned_entry(&owner);
+        let previous =
+            ValidatedNativeHnsw::build(owner, params(), seed).expect("build predecessor");
+        let next_binding = fsvi_v2_binding(121, 0x21, "tombstone-successor", 8);
+        let next_owner =
+            admitted_fsvi_owner_with_flags(directory.path(), "next.fsvi", &next_binding, &rows);
+        let next = previous
+            .try_reuse_for_owner(&Cx::for_testing(), Arc::clone(&next_owner))
+            .expect("append tombstone successor")
+            .expect("eligible unchanged tombstone layout");
+        let hits = next
+            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 48, Some(1))
+            .expect("widen through remapped tombstone routes");
+        assert_eq!(next.len(), 48);
+        assert_eq!(hits.len(), next_owner.live_count());
+        assert!(hits.iter().all(|hit| hit.flags().is_live()));
+        let mut actual: Vec<_> = hits.iter().map(ValidatedNativeHnswHit::doc_id).collect();
+        let mut expected: Vec<_> = rows
+            .iter()
+            .filter(|row| row.2.is_live())
+            .map(|row| row.0.as_str())
+            .collect();
+        actual.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn successor_reuse_refuses_membership_vector_and_identity_drift() {
+        let directory = tempfile::tempdir().expect("temporary incompatible successor directory");
+        let rows = fsvi_rows(8, 4);
+        let previous_owner = generation_owner(130, 0x30, "incompatible-successor", 4, 8);
+        let previous =
+            ValidatedNativeHnsw::build(previous_owner, params(), 5).expect("build predecessor");
+        let binding = fsvi_v2_binding(131, 0x31, "incompatible-successor", 4);
+        let mut edited = rows.clone();
+        edited[2].1 = vec![0.5; 4];
+        let mut replacement = rows.clone();
+        replacement[2].0 = "replacement-doc".to_owned();
+        for changed in [edited, replacement, rows[..7].to_vec()] {
+            let owner = admitted_fsvi_owner(directory.path(), "next.fsvi", &binding, &changed);
+            assert!(
+                previous
+                    .try_reuse_for_owner(&Cx::for_testing(), owner)
+                    .expect("incompatible membership is not an operational error")
+                    .is_none()
+            );
+        }
+        let mut duplicated = rows.clone();
+        duplicated.push(rows[2].clone());
+        let owner = admitted_fsvi_owner(directory.path(), "duplicate.fsvi", &binding, &duplicated);
+        assert!(matches!(
+            previous.try_reuse_for_owner(&Cx::for_testing(), owner),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "native_hnsw_receipt.reuse.document_ids"
+        ));
+        let flagged: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .map(|(row, (doc_id, vector))| {
+                (
+                    doc_id.clone(),
+                    vector.clone(),
+                    if row == 2 {
+                        FsviRecordFlags::TOMBSTONE
+                    } else {
+                        FsviRecordFlags::LIVE
+                    },
+                )
+            })
+            .collect();
+        let owner =
+            admitted_fsvi_owner_with_flags(directory.path(), "flags.fsvi", &binding, &flagged);
+        assert!(
+            previous
+                .try_reuse_for_owner(&Cx::for_testing(), owner)
+                .expect("changed LIVE state requires rebuilding")
+                .is_none()
+        );
+
+        for drift in 0..4 {
+            let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(
+                if drift == 0 {
+                    "different-space"
+                } else {
+                    "incompatible-successor"
+                },
+                4,
+            );
+            identity.storage.format = "fsvi-v2".to_owned();
+            identity.storage.quantization = QuantizationFormat::F16;
+            identity.storage.endianness = "little-endian".to_owned();
+            match drift {
+                1 => identity.producer.implementation_revision = "different-producer".to_owned(),
+                2 => identity.input.chunking = "different-input-chunking".to_owned(),
+                3 => identity.storage.quantization = QuantizationFormat::F32,
+                _ => {}
+            }
+            let drift_binding = FsviV2IdentityBinding::new(
+                binding.generation,
+                identity.freeze().expect("valid changed identity"),
+            )
+            .expect("changed identity binding");
+            let owner =
+                admitted_fsvi_owner(directory.path(), "identity.fsvi", &drift_binding, &rows);
+            assert!(
+                previous
+                    .try_reuse_for_owner(&Cx::for_testing(), owner)
+                    .expect("identity drift requires rebuilding")
+                    .is_none()
+            );
+        }
+        for sequence in [129, 130] {
+            let owner = generation_owner(sequence, 0x33, "incompatible-successor", 4, 8);
+            assert!(matches!(
+                previous.try_reuse_for_owner(&Cx::for_testing(), owner),
+                Err(SearchError::InvalidConfig { field, .. })
+                    if field == "native_hnsw_receipt.reuse.generation"
+            ));
+        }
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let owner = generation_owner(131, 0x31, "incompatible-successor", 4, 9);
+        assert!(matches!(
+            previous.try_reuse_for_owner(&cx, owner),
+            Err(SearchError::Cancelled { .. })
+        ));
+        previous
+            .graph
+            .verify()
+            .expect("all refused successors preserve predecessor");
     }
 
     #[test]
@@ -6383,6 +7056,134 @@ mod tests {
     // ─── Owned persistence ──────────────────────────────────────────────
 
     #[test]
+    fn version_one_graph_and_original_topology_receipt_still_admit_and_upgrade() {
+        // Frozen v1 graph: params (8,16,64,64), seed 17, two level-zero
+        // points with reciprocal edges, entry 0. This predates the source-row
+        // field and uses the original v1 domain and semantic byte encoding.
+        const V1_BYTES: [u8; 120] = [
+            0x46, 0x53, 0x48, 0x4e, 0x53, 0x57, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x60, 0x00,
+            0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x21, 0x49, 0xe4, 0xbe, 0x91, 0xa8, 0x20, 0x49, 0x01, 0x00,
+            0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        const V1_GRAPH_SHA256: &str =
+            "9720dad060c7e4a9c8429cd1b66dd02f8a9949c0371cefa179512d9b076b7c9d";
+        const V1_TOPOLOGY_SHA256: &str =
+            "82bf97e00ff8ad72aa8fabd99b10389855397c3ce116eb0d006915b59aee0b23";
+        let directory = tempfile::tempdir().expect("temporary v1 directory");
+        let path = directory.path().join("original-v1.fshnsw");
+        let owner = generation_owner(140, 0x40, "version-one-owner", 4, 2);
+        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 17)
+            .expect("build owner binding for original graph");
+        let mut receipt = bound.save(&path).expect("owner receipt");
+        assert_eq!(sha256_hex(&V1_BYTES), V1_GRAPH_SHA256);
+        std::fs::write(&path, V1_BYTES).expect("write frozen original-format graph");
+        receipt.graph_byte_len = 120;
+        receipt.graph_sha256 = V1_GRAPH_SHA256.to_owned();
+        receipt.native_format_version = 1;
+        receipt.payload_crc32 = 0xbee4_4921;
+        receipt.header_crc32 = 0x4920_a891;
+        receipt.topology_sha256 = V1_TOPOLOGY_SHA256.to_owned();
+        let receipt_path = native_hnsw_generation_receipt_path(&path).expect("receipt path");
+        write_resealed_receipt(&receipt_path, &mut receipt);
+
+        let (loaded, observed) = ValidatedNativeHnsw::load(Arc::clone(&owner), &path)
+            .expect("valid original graph and original receipt must remain admissible");
+        assert_eq!(observed, receipt);
+        assert_eq!(loaded.graph.source_rows, [0, 1]);
+        assert_eq!(
+            loaded
+                .graph
+                .topology_sha256_for_version(1)
+                .expect("v1 semantic digest"),
+            V1_TOPOLOGY_SHA256
+        );
+        assert_eq!(
+            loaded
+                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(2))
+                .expect("v1 owner search")[0]
+                .doc_id(),
+            "doc-0000"
+        );
+        let upgraded_path = directory.path().join("upgraded.fshnsw");
+        let upgraded_receipt = loaded.save(&upgraded_path).expect("save as current format");
+        assert_eq!(upgraded_receipt.native_format_version, 2);
+        ValidatedNativeHnsw::load(Arc::clone(&owner), &upgraded_path)
+            .expect("upgraded receipt verifies the current topology digest");
+        let successor_owner = generation_owner(141, 0x41, "version-one-owner", 4, 8);
+        loaded
+            .try_reuse_for_owner(&Cx::for_testing(), successor_owner)
+            .expect("original v1 graph can append")
+            .expect("v1 graph remains eligible");
+
+        receipt.topology_sha256 = "00".repeat(SHA256_BYTES);
+        write_resealed_receipt(&receipt_path, &mut receipt);
+        let error = ValidatedNativeHnsw::load(Arc::clone(&owner), &path)
+            .expect_err("v1 admission must validate its original topology digest");
+        assert!(matches!(error, SearchError::IndexCorrupted { detail, .. }
+            if detail.contains("topology")));
+        let mut forged = V1_BYTES;
+        put_u64(&mut forged, 48, 0);
+        reseal_persisted_checksums(&mut forged);
+        std::fs::write(&path, forged).expect("write resealed v1 seed forgery");
+        let error = NativeHnsw::load(&path, owner.as_ref())
+            .expect_err("v1 retains seeded-level structural verification");
+        assert!(matches!(error, SearchError::IndexCorrupted { detail, .. }
+            if detail.contains("seed and parameters sample level")));
+    }
+
+    #[test]
+    fn source_row_mapping_rejects_missing_duplicate_and_out_of_range_members() {
+        let directory = tempfile::tempdir().expect("temporary source-map directory");
+        let path = directory.path().join("graph.fshnsw");
+        let owner = generation_owner(150, 0x50, "source-map-owner", 4, 8);
+        let bound =
+            ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 11).expect("build graph");
+        bound.save(&path).expect("save v2 graph");
+        let bytes = std::fs::read(&path).expect("v2 bytes");
+        for (physical_row, expected_detail) in [(1, "more than one graph node"), (8, "outside")] {
+            let mut malformed = bytes.clone();
+            put_u32(&mut malformed, NATIVE_HNSW_HEADER_LEN, physical_row);
+            reseal_persisted_checksums(&mut malformed);
+            std::fs::write(&path, malformed).expect("write resealed invalid source map");
+            let error = NativeHnsw::load(&path, owner.as_ref())
+                .expect_err("source map must cover every physical row exactly once");
+            assert!(
+                matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains(expected_detail)),
+                "unexpected source map error: {error}"
+            );
+        }
+        let mut missing = bound.graph.clone();
+        missing.source_rows.pop();
+        assert_eq!(
+            missing.verify(),
+            Err(GraphDefect::SourceMapCardinalityMismatch {
+                graph_points: 8,
+                source_rows: 7,
+            })
+        );
+        let mut remapped = bound.graph.clone();
+        remapped.source_rows.swap(0, 1);
+        remapped
+            .verify()
+            .expect("a complete permutation is structurally valid");
+        assert_ne!(
+            remapped.topology_sha256().expect("mapped digest"),
+            bound.graph.topology_sha256().expect("original digest")
+        );
+        assert!(
+            remapped.topology_sha256_for_version(1).is_err(),
+            "v1 digest cannot silently omit a nonidentity mapping"
+        );
+    }
+
+    #[test]
     fn owned_empty_graph_round_trip_preserves_empty_identity() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("empty.fshnsw");
@@ -6744,12 +7545,14 @@ mod tests {
         let first_level = graph.sampler.level_for(0);
         assert_eq!(first_level, 1);
         graph.adjacency.push(Adjacency::with_level(first_level));
+        graph.source_rows.push(0);
         graph.entry = Some(0);
         graph.max_level = first_level;
         // Points 1 and 2 arrive at level 1 and level 0 respectively.
         for id in [1_u32, 2] {
             let level = graph.sampler.level_for(id);
             graph.adjacency.push(Adjacency::with_level(level));
+            graph.source_rows.push(id);
             let selected = (0..id).collect::<Vec<_>>();
             for layer in 0..=level.min(graph.max_level) {
                 let mut journal = MutationJournal::new(id as usize);
