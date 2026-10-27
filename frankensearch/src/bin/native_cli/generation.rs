@@ -55,6 +55,10 @@ use super::{
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
+
+#[path = "authority_model_activation.rs"]
+mod model_activation;
+
 const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v3";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
@@ -83,6 +87,7 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       [--include-metadata] [--filter JSON] [--max-source-bytes N]\n\
       [--max-image-bytes N]\n\n\
   authority-serve --receipt JSON [--limit N] [--allow-activation] [--allow-updates]\n\
+      [--allow-model-activation]\n\
       [--lexical-only]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N] [--batch-size N]\n\n\
@@ -158,7 +163,11 @@ sessions also require the same producers; lexical sessions have no loaded models
 It admits the complete currently selected successor before swapping readers;\n\
 rejection retains the previous reader and returns a bounded failed response.\n\
 Authority sequence must advance, including rollback to older artifact generations.\n\
-Model migration requires restarting with the new receipt and local model options.\n\
+With --allow-model-activation, op=activate_model can install a published model\n\
+migration using an exact receipt, expected_authority and explicit local model\n\
+paths. All selected producers, images and fixed scope are validated before the\n\
+swap; failure retains the old complete selection. Topology and prepared-input\n\
+contracts stay fixed. No model is downloaded and no new authority is published.\n\
 Explicit --lexical-only on authority-search/serve runs retained Quill keyword\n\
 search without loading or invoking a model. It excludes model options and\n\
 --allow-updates, but permits source fetch and granted activation. The complete\n\
@@ -263,6 +272,7 @@ struct Options {
     migrate_model: bool,
     retained_source: bool,
     allow_activation: bool,
+    allow_model_activation: bool,
     allow_updates: bool,
     allow_damaged_current: bool,
 }
@@ -327,6 +337,7 @@ impl Options {
             migrate_model: false,
             retained_source: false,
             allow_activation: false,
+            allow_model_activation: false,
             allow_updates: false,
             allow_damaged_current: false,
         };
@@ -379,6 +390,9 @@ impl Options {
                     options.allow_activation = true;
                 }
                 "--allow-updates" if command == Command::Serve => options.allow_updates = true,
+                "--allow-model-activation" if command == Command::Serve => {
+                    options.allow_model_activation = true;
+                }
                 "--lexical-only" if matches!(command, Command::Search | Command::Serve) => {
                     options.lexical_only = true;
                 }
@@ -511,10 +525,11 @@ impl Options {
             && (options.models.is_some()
                 || options.quality.backend.is_some()
                 || options.quality.directory.is_some()
-                || options.allow_updates)
+                || options.allow_updates
+                || options.allow_model_activation)
         {
             return Err(bad(
-                "--lexical-only excludes model options and --allow-updates",
+                "--lexical-only excludes model options, updates, and model activation",
             ));
         }
         match command {
@@ -1448,6 +1463,7 @@ fn rebuild_identity(
     expected: &FrozenEmbeddingIdentityBundleV1,
     model: &dyn Embedder,
     migrate_model: bool,
+    retained_source: bool,
 ) -> Result<FrozenEmbeddingIdentityBundleV1> {
     let mut identity = model.identity()?.clone();
     identity.validate()?;
@@ -1466,6 +1482,11 @@ fn rebuild_identity(
     if !migrate_model && &frozen != expected {
         return Err(bad(
             "the rebuild producer differs from the selected generation; an intentional full-cohort migration requires --migrate-model",
+        ));
+    }
+    if retained_source && frozen.identity.input != expected.identity.input {
+        return Err(bad(
+            "retained source cannot migrate its prepared-input contract; supply a complete freshly prepared source cohort",
         ));
     }
     Ok(frozen)
@@ -1527,12 +1548,14 @@ async fn rebuild(
         &selected.identity,
         loaded.fast.as_ref(),
         options.migrate_model,
+        options.retained_source,
     )?;
     let expected_quality = match (&selected.quality_identity, &loaded.quality) {
         (Some(identity), Some(model)) => Some(rebuild_identity(
             identity,
             model.as_ref(),
             options.migrate_model,
+            options.retained_source,
         )?),
         (None, None) => None,
         _ => {
@@ -2508,6 +2531,7 @@ struct AuthorityFetchRequest {
 #[serde(untagged)]
 enum AuthorityRequest {
     Search(AuthoritySearchRequest),
+    ModelActivation(model_activation::Request),
     Activate(AuthorityActivateRequest),
     Update(AuthorityUpdateRequest),
     Fetch(AuthorityFetchRequest),
@@ -2595,6 +2619,7 @@ struct AuthoritySession {
     fixed_filter: Option<Filter>,
     scope: Option<NativeScopedGenerationSnapshot>,
     allow_activation: bool,
+    allow_model_activation: bool,
     update_limits: Option<AuthorityUpdateLimits>,
 }
 
@@ -2657,6 +2682,7 @@ impl AuthoritySession {
             fixed_filter: None,
             scope: None,
             allow_activation,
+            allow_model_activation: false,
             update_limits: None,
         })
     }
@@ -3105,6 +3131,7 @@ async fn serve_session(
     let mut ready = session.response("ready", true, None, None);
     ready["documents"] = serde_json::json!(session.receipt.documents);
     ready["activation_enabled"] = serde_json::json!(session.allow_activation);
+    ready["model_activation_enabled"] = serde_json::json!(session.allow_model_activation);
     ready["updates_enabled"] = serde_json::json!(session.update_limits.is_some());
     ready["fetch_enabled"] = serde_json::json!(true);
     ready["query_modes"] = if session.models.is_lexical() {
@@ -3159,6 +3186,30 @@ async fn serve_session(
                     .query(cx, &request, ordinal, output)
                     .await
                     .map(|()| None);
+                (id, result, false)
+            }
+            AuthorityRequest::ModelActivation(request) => {
+                let id = request
+                    .id
+                    .clone()
+                    .filter(|id| super::serve::validate_id(Some(id)).is_ok());
+                let previous = session.snapshot.authority();
+                let result = session.activate_model(cx, &request).map(|()| {
+                    let mut response =
+                        session.response("model_activated", true, Some(ordinal), id.as_deref());
+                    response["operation"] = serde_json::json!("activate_model");
+                    response["serving"] = serde_json::json!("activated");
+                    response["previous_authority"] =
+                        serde_json::json!(previous.canonical_bytes().as_slice());
+                    response["documents"] = serde_json::json!(session.receipt.documents);
+                    response["models_loaded"] =
+                        serde_json::json!(if session.receipt.quality_identity.is_some() {
+                            2
+                        } else {
+                            1
+                        });
+                    Some(response)
+                });
                 (id, result, false)
             }
             AuthorityRequest::Activate(request) => {
@@ -3293,6 +3344,10 @@ async fn serve(
     )?;
     if options.allow_updates {
         session = session.with_updates(options.batch_size, options.max_source_bytes)?;
+    }
+    if options.allow_model_activation {
+        session.models.models()?;
+        session.allow_model_activation = true;
     }
     session.scope = scope;
     session.fixed_filter = options.filter.clone();

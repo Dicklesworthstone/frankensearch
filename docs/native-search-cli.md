@@ -232,6 +232,11 @@ retrieval to HNSW:
 
 Combine `--retained-source` with `--migrate-model` and the new model's local
 options for a full-cohort model migration without resupplying the corpus.
+Retained documents are already prepared input. This route may change producers
+and vector spaces, but must preserve each tier's complete input-preparation
+contract. To change canonicalization or document encoding, supply a complete
+freshly prepared corpus with `--input` instead. Both tiers are checked before
+either begins inference or creates the new work directory.
 `--input`, `--source-low`, and `--source-high` are excluded in retained-source
 mode; it neither reads standard input nor assigns a new source checkpoint.
 An ordinary rebuild with replacement JSONL still requires explicit source
@@ -496,8 +501,8 @@ selection event. The new receipt must select a higher authority sequence in the
 same root, security profile and topology, with the same producers, embedding
 spaces and input contracts. Both identities are checked for full generations.
 Intentional rollback can therefore install older artifact bytes
-under its new, higher authority sequence. A producer migration requires restarting
-the server with that generation's local model configuration.
+under its new, higher authority sequence. A producer migration uses the separate
+model-activation grant and operation described below.
 
 Activation admits the complete candidate through the root descriptor retained at
 startup and swaps readers only after all checks pass. A malformed, foreign,
@@ -513,6 +518,60 @@ before emission; source-fetch responses have a stricter 1 MiB bound. Output
 failure stops the session. Send `quit`, `exit`, or EOF
 to finish. As with the existing native stdio server, input reads block on the
 owning lane, and cancellation is observed between reads and requests.
+
+### Activate a rebuilt model generation without restarting
+
+Start a semantic authority server with `--allow-model-activation` to permit
+replacement of its local producer or both producers in a complete two-tier
+generation:
+
+```sh
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --model-dir /absolute/path/to/current/models --allow-model-activation
+```
+
+Build and publish the replacement separately using `authority-rebuild
+--migrate-model`, then send an `activate_model` request. The ready frame reports
+`model_activation_enabled`. The grant is independent of `--allow-activation`
+and `--allow-updates`; neither of those grants permission to load another model.
+Lexical-only startup rejects the model-activation grant.
+
+| Request field | Meaning |
+|---|---|
+| `op` | `"activate_model"` |
+| `id` | Optional request identifier |
+| `expected_authority` | Exact authority byte array from the session's last successful selection event |
+| `receipt` | Absolute path to the already published candidate's receipt |
+| `model_dir` | Explicit local model root for fast or ONNX quality; required for a full generation's fast tier |
+| `quality_backend` | Optional explicit quality backend: `onnx`, `native-int8`, `native-f32`, or `native-multilingual` |
+| `quality_model_dir` | Exact verified native-quality model directory when choosing a native backend |
+
+Receipt and model paths must be absolute, UTF-8, NUL-free, and at most 4096 bytes.
+Model selection never inherits an unspecified process default and never downloads
+or acquires artifacts. Quality-only activation loads only its quality provider;
+a full generation loads and validates fast and quality independently.
+
+The candidate must belong to the original qualified root, security profile and
+topology, and must advance the authority sequence. Each tier's prepared-input
+contract stays unchanged. Both complete images and the server's fixed filter
+membership are admitted before loading replacement models. Each new producer
+must then match its selected embedding space, producer and input identities.
+After loading, the server reopens that exact authority on its retained root to
+detect an intervening publication. It never follows a different head.
+
+Only after all checks pass does the request loop install the receipt, reader,
+fixed scope and complete model set together. The response reports
+`event: "model_activated"`, `operation: "activate_model"`,
+`serving: "activated"`, `previous_authority`, and `models_loaded` (one or two).
+Subsequent queries and authorized updates use the installed producers. Library
+readers already retaining the old generation remain usable.
+
+Wrong or stale receipts, input-contract changes, missing models, either provider's
+identity drift, source-budget failure, cancellation and concurrent publication
+all preserve the previous complete serving selection. Loading is serialized with
+requests, so a slow activation occupies this server's request loop. The operation
+does not build, publish, modify authority controls or write a receipt.
 
 ### Publish edits through the warm authority server
 

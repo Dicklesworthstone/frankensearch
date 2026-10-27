@@ -178,6 +178,52 @@ fn authority_lexical_options_require_explicit_read_only_execution() {
 }
 
 #[test]
+fn authority_model_activation_is_an_independent_explicit_startup_grant() {
+    let arguments = [
+        "authority-serve",
+        "--receipt",
+        "selected.json",
+        "--allow-model-activation",
+    ];
+    let options = parse(&arguments).unwrap().unwrap();
+    assert!(options.allow_model_activation);
+    assert!(!options.allow_activation);
+    assert!(!options.allow_updates);
+    for extra in ["--lexical-only", "--allow-model-activation"] {
+        let mut rejected = arguments.to_vec();
+        rejected.push(extra);
+        assert!(parse(&rejected).is_err());
+    }
+    for command in [
+        "authority-search",
+        "authority-index",
+        "authority-rebuild",
+        "authority-update",
+        "authority-fetch",
+        "authority-recover",
+        "authority-rollback",
+    ] {
+        assert!(
+            parse(&[
+                command,
+                "--receipt",
+                "selected.json",
+                "--allow-model-activation"
+            ])
+            .is_err()
+        );
+    }
+    let request = serde_json::from_value::<AuthorityRequest>(serde_json::json!({
+        "op":"activate_model", "receipt":"/absolute/candidate.json", "expected_authority":[],
+    }))
+    .unwrap();
+    assert!(
+        matches!(request, AuthorityRequest::ModelActivation(_)),
+        "missing model paths must reach the model activation validator, not generic activation"
+    );
+}
+
+#[test]
 fn authority_fetch_options_select_windows_without_model_or_writer_grants() {
     let base = [
         "authority-fetch",
@@ -868,21 +914,62 @@ fn rebuild_requires_explicit_producer_migration_before_any_inference() {
         calls: AtomicUsize::new(0),
     };
     assert_eq!(
-        rebuild_identity(&selected.identity, &provider, false).unwrap(),
+        rebuild_identity(&selected.identity, &provider, false, false).unwrap(),
         selected.identity
     );
     provider.identity.producer.implementation_revision =
         "changed-same-dimension-producer".to_owned();
     provider.identity.validate().unwrap();
-    assert!(rebuild_identity(&selected.identity, &provider, false).is_err());
-    let migrated = rebuild_identity(&selected.identity, &provider, true).unwrap();
+    assert!(rebuild_identity(&selected.identity, &provider, false, false).is_err());
+    let migrated = rebuild_identity(&selected.identity, &provider, true, false).unwrap();
     assert_ne!(migrated, selected.identity);
     assert_eq!(migrated.identity.producer, provider.identity.producer);
     assert_eq!(migrated.identity.space, provider.identity.space);
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
     provider.identity.space.dimension = 3;
-    assert!(rebuild_identity(&selected.identity, &provider, true).is_err());
+    assert!(rebuild_identity(&selected.identity, &provider, true, false).is_err());
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn retained_rebuild_migrates_producers_and_spaces_without_relabeling_prepared_input() {
+    let expected = identity();
+    let mut provider = Provider {
+        identity: expected.identity.clone(),
+        calls: AtomicUsize::new(0),
+    };
+    provider.identity.producer.implementation_revision = "replacement-producer".to_owned();
+    provider.identity.space.immutable_revision = "replacement-weights".to_owned();
+    provider.identity.space.artifacts[0].sha256 = "c".repeat(64);
+    provider.identity.producer.space_fingerprint = provider.identity.space.fingerprint();
+    provider.identity.validate().unwrap();
+    let migrated = rebuild_identity(&expected, &provider, true, true).unwrap();
+    assert_eq!(migrated.identity.input, expected.identity.input);
+    assert_ne!(migrated.identity.space, expected.identity.space);
+    assert_ne!(migrated.identity.producer, expected.identity.producer);
+
+    provider
+        .identity
+        .input
+        .canonicalization
+        .push_str("-new-preparation");
+    provider.identity.space.input_contract_fingerprint = provider.identity.input.fingerprint();
+    provider.identity.producer.space_fingerprint = provider.identity.space.fingerprint();
+    provider.identity.validate().unwrap();
+    assert!(
+        rebuild_identity(&expected, &provider, true, true)
+            .unwrap_err()
+            .to_string()
+            .contains("retained source cannot migrate its prepared-input contract")
+    );
+    let fresh = rebuild_identity(&expected, &provider, true, false).unwrap();
+    assert_eq!(fresh.identity.input, provider.identity.input);
+    assert!(rebuild_identity(&expected, &provider, false, false).is_err());
+    assert_eq!(
+        provider.calls.load(Ordering::Relaxed),
+        0,
+        "the complete input contract is admitted before any document inference"
+    );
 }
 
 #[test]
@@ -1240,10 +1327,10 @@ fn full_serving_and_rebuild_admit_quality_independently_before_inference() {
     );
     assert!(admit_serving_models(&receipt(), &loaded).is_err());
     let expected_quality = selected.quality_identity.as_ref().unwrap();
-    rebuild_identity(&selected.identity, fast.as_ref(), false).unwrap();
-    rebuild_identity(expected_quality, quality.as_ref(), false).unwrap();
-    assert!(rebuild_identity(expected_quality, fast.as_ref(), false).is_err());
-    let migrated = rebuild_identity(expected_quality, fast.as_ref(), true).unwrap();
+    rebuild_identity(&selected.identity, fast.as_ref(), false, false).unwrap();
+    rebuild_identity(expected_quality, quality.as_ref(), false, false).unwrap();
+    assert!(rebuild_identity(expected_quality, fast.as_ref(), false, false).is_err());
+    let migrated = rebuild_identity(expected_quality, fast.as_ref(), true, false).unwrap();
     assert_eq!(migrated, selected.identity);
     assert_ne!(&migrated, expected_quality);
     assert!(!same_query_contract(expected_quality, &migrated));
@@ -2130,6 +2217,10 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
 
 #[cfg(target_os = "linux")]
 mod warm_authority {
+    mod model_activation_tests {
+        include!("authority_model_activation_tests.rs");
+    }
+
     use std::io::{BufRead, Cursor, Read};
     use std::os::unix::fs::DirBuilderExt as _;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5458,10 +5549,12 @@ mod warm_authority {
                     },
                     calls: AtomicUsize::new(0),
                 });
-                assert!(rebuild_identity(&selected.identity, migrated.as_ref(), false).is_err());
+                assert!(
+                    rebuild_identity(&selected.identity, migrated.as_ref(), false, true).is_err()
+                );
                 assert_eq!(migrated.calls.load(Ordering::Relaxed), 0);
                 let admitted =
-                    rebuild_identity(&selected.identity, migrated.as_ref(), true).unwrap();
+                    rebuild_identity(&selected.identity, migrated.as_ref(), true, true).unwrap();
                 let options = parse(&retained_rebuild_arguments()).unwrap().unwrap();
                 let source_cut = options
                     .rebuild_source_cut(&retained.metadata().commit_range)
