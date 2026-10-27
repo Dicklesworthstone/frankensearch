@@ -48,7 +48,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 12: the search policy travels with each request (`SearchPolicy`).
 // 13: shared buffered/progressive cache and configured search delivery budgets.
 // 14: checked registered model selection; no implicit quality-producer substitution.
-const VERSION: u32 = 14;
+// 15: explicit quality-only retrieval travels with each request.
+const VERSION: u32 = 15;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -67,6 +68,7 @@ struct ForwardedSearch {
 struct SearchRequest {
     query: String,
     limit: usize,
+    quality_only: bool,
     filter: Option<String>,
     explain: bool,
     store_root: PathBuf,
@@ -234,6 +236,12 @@ fn decode_request(bytes: &[u8]) -> SearchResult<ForwardedSearch> {
             "forward the resolved positive search limit, not the CLI's zero/unlimited spelling",
         ));
     }
+    if request.search.quality_only && request.search.policy.fast_only {
+        return Err(complete_cli_error(
+            "daemon_mode",
+            "quality-only and fast-only search are mutually exclusive",
+        ));
+    }
     Ok(request)
 }
 
@@ -265,7 +273,7 @@ fn make_request(
 ) -> SearchResult<ForwardedSearch> {
     let mode = degraded_search_mode(
         runtime.config.pressure.degradation_override,
-        SearchExecutionMode::Full,
+        runtime.requested_search_mode(),
     )?;
     runtime.validate_semantic_model_selection(mode)?;
     if runtime
@@ -299,6 +307,7 @@ fn make_request(
         search: SearchRequest {
             query: query.to_owned(),
             limit,
+            quality_only: runtime.cli_input.quality_only,
             filter: runtime.cli_input.filter.clone(),
             explain: runtime.config.search.explain,
             store_root: std::fs::canonicalize(root)?,
@@ -458,6 +467,7 @@ fn query_runtime(
         session.reader.generation(),
     )?;
     query_runtime.cli_input.command = CliCommand::Search;
+    query_runtime.cli_input.quality_only = request.quality_only;
     query_runtime.cli_input.query = Some(request.query.clone());
     query_runtime.cli_input.filter.clone_from(&request.filter);
     query_runtime.cli_input.daemon = false;
@@ -494,7 +504,10 @@ async fn execute(
     let query_runtime = query_runtime(session, &request.search, false)?;
     // The daemon applies its own degradation override to every client, as
     // the legacy query daemon does.
-    let mode = session.reader.search_mode()?;
+    let mode = degraded_search_mode(
+        query_runtime.config.pressure.degradation_override,
+        query_runtime.requested_search_mode(),
+    )?;
     if !request.search.explain {
         // Use the ordinary daemon executor so both transports share complete
         // phase payloads, producer checks, cache keys, bounded admission and
@@ -733,12 +746,38 @@ mod tests {
         assert_eq!(decoded.search.filter.as_deref(), Some("ext:rs"));
         assert_eq!(decoded.search.limit, usize::MAX);
         assert_eq!(decoded.search.query, "query\nwith newline");
+        assert!(!decoded.search.quality_only);
         validate_request(
             &runtime,
             &std::fs::canonicalize(root.path()).unwrap(),
             &decoded,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn forwarded_quality_only_mode_is_explicit_and_cannot_conflict_with_fast_only() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, mut request) = request(root.path());
+        request.search.quality_only = true;
+        let bytes = serde_json::to_vec(&request).unwrap();
+        let decoded = decode_request(&bytes).expect("quality-only transport request");
+        assert!(decoded.search.quality_only);
+        let serve = decoded
+            .search
+            .as_serve_request(SearchExecutionMode::QualityOnly);
+        assert_eq!(serve.mode.as_deref(), Some("quality_only"));
+        assert_eq!(serve.query, request.search.query);
+        assert_eq!(serve.limit, Some(request.search.limit));
+
+        let mut missing_mode = serde_json::to_value(&request).unwrap();
+        missing_mode["search"]
+            .as_object_mut()
+            .unwrap()
+            .remove("quality_only");
+        assert!(decode_request(&serde_json::to_vec(&missing_mode).unwrap()).is_err());
+        request.search.policy.fast_only = true;
+        assert!(decode_request(&serde_json::to_vec(&request).unwrap()).is_err());
     }
 
     #[cfg(feature = "semantic-support")]
@@ -781,7 +820,11 @@ mod tests {
                     refused(
                         requested
                             .stream_complete_generation_daemon(
-                                &cx, &absent_root, "query", 10, &mut output,
+                                &cx,
+                                &absent_root,
+                                "query",
+                                10,
+                                &mut output,
                             )
                             .await
                             .unwrap_err(),
@@ -789,7 +832,9 @@ mod tests {
                 }
                 refused(
                     Box::pin(requested.run_complete_generation_search_with_writer(
-                        &cx, &absent_root, &mut output,
+                        &cx,
+                        &absent_root,
+                        &mut output,
                     ))
                     .await
                     .unwrap_err(),
@@ -1604,6 +1649,7 @@ mod buffered_transport_tests {
             search: SearchRequest {
                 query: "transport query".to_owned(),
                 limit: 3,
+                quality_only: false,
                 filter: Some("ext:rs".to_owned()),
                 explain: false,
                 store_root: PathBuf::from("/transport-fixture"),
@@ -1614,7 +1660,12 @@ mod buffered_transport_tests {
     }
 
     fn payload(query: String) -> SearchPayload {
-        SearchPayload::new(query, crate::output_schema::SearchOutputPhase::Initial, 0, Vec::new())
+        SearchPayload::new(
+            query,
+            crate::output_schema::SearchOutputPhase::Initial,
+            0,
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -1624,12 +1675,19 @@ mod buffered_transport_tests {
             let bytes = serde_json::to_vec(&request()).unwrap();
             let calls = AtomicUsize::new(0);
             drop(client);
-            let result = serve_buffered(&cx, &mut server, &bytes, Duration::from_secs(1), |request| {
-                // This is outside the returned future: even closure setup must
-                // be behind peer admission, not just model polling.
-                calls.fetch_add(1, Ordering::SeqCst);
-                async move { Ok(payload(request.search.query)) }
-            }).await;
+            let result = serve_buffered(
+                &cx,
+                &mut server,
+                &bytes,
+                Duration::from_secs(1),
+                |request| {
+                    // This is outside the returned future: even closure setup must
+                    // be behind peer admission, not just model polling.
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move { Ok(payload(request.search.query)) }
+                },
+            )
+            .await;
             assert!(matches!(result, Err(SearchError::Io(error))
                 if error.kind() == ErrorKind::BrokenPipe));
             assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1646,7 +1704,11 @@ mod buffered_transport_tests {
             let released = Arc::new(AtomicBool::new(false));
             let owned = Released(Arc::clone(&released));
             let mut future = Box::pin(serve_buffered(
-                &cx, &mut server, &bytes, Duration::from_secs(1), |_| async move {
+                &cx,
+                &mut server,
+                &bytes,
+                Duration::from_secs(1),
+                |_| async move {
                     let _owned = owned;
                     std::future::pending().await
                 },
@@ -1654,7 +1716,10 @@ mod buffered_transport_tests {
             let mut task = Context::from_waker(Waker::noop());
             assert!(future.as_mut().poll(&mut task).is_pending());
             // No Started frame, ready probe, progress record or partial reply.
-            assert_eq!(client.read(&mut [0; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+            assert_eq!(
+                client.read(&mut [0; 1]).unwrap_err().kind(),
+                ErrorKind::WouldBlock
+            );
             drop(client);
             assert!(matches!(future.as_mut().poll(&mut task),
                 Poll::Ready(Err(SearchError::Io(error))) if error.kind() == ErrorKind::BrokenPipe));
@@ -1666,11 +1731,18 @@ mod buffered_transport_tests {
             let request = request();
             let expected = payload(request.search.query.clone());
             let bytes = serde_json::to_vec(&request).unwrap();
-            assert_eq!(serve_buffered(
-                &cx, &mut server, &bytes, Duration::from_secs(1), |request| async move {
-                    Ok(payload(request.search.query))
-                },
-            ).await.unwrap(), PeerOutcome::Search);
+            assert_eq!(
+                serve_buffered(
+                    &cx,
+                    &mut server,
+                    &bytes,
+                    Duration::from_secs(1),
+                    |request| async move { Ok(payload(request.search.query)) },
+                )
+                .await
+                .unwrap(),
+                PeerOutcome::Search
+            );
             drop(server);
             let mut reply = Vec::new();
             client.read_to_end(&mut reply).unwrap();
@@ -1687,15 +1759,23 @@ mod buffered_transport_tests {
                 let request = request();
                 let bytes = serde_json::to_vec(&request).unwrap();
                 let expected = payload(request.search.query.clone());
-                serve_buffered(&cx, &mut server, &bytes, Duration::from_secs(1), |request| async move {
-                    assert_eq!(request.search.filter.as_deref(), Some("ext:rs"));
-                    assert_eq!(request.search.limit, 3);
-                    if fail {
-                        Err(complete_cli_error("fixture", "original executor refusal"))
-                    } else {
-                        Ok(payload(request.search.query))
-                    }
-                }).await.unwrap();
+                serve_buffered(
+                    &cx,
+                    &mut server,
+                    &bytes,
+                    Duration::from_secs(1),
+                    |request| async move {
+                        assert_eq!(request.search.filter.as_deref(), Some("ext:rs"));
+                        assert_eq!(request.search.limit, 3);
+                        if fail {
+                            Err(complete_cli_error("fixture", "original executor refusal"))
+                        } else {
+                            Ok(payload(request.search.query))
+                        }
+                    },
+                )
+                .await
+                .unwrap();
                 drop(server);
                 let mut reply = Vec::new();
                 client.read_to_end(&mut reply).unwrap();
@@ -1707,7 +1787,10 @@ mod buffered_transport_tests {
                 if fail {
                     let error = decode_reply(&reply, &request).unwrap_err();
                     let original = FsfsRuntime::forwarded_search_error(&error).unwrap();
-                    assert_eq!(original.field.as_deref(), Some("complete_generation.fixture"));
+                    assert_eq!(
+                        original.field.as_deref(),
+                        Some("complete_generation.fixture")
+                    );
                     assert!(original.message.contains("original executor refusal"));
                 } else {
                     assert_eq!(decode_reply(&reply, &request).unwrap(), expected);
@@ -1727,19 +1810,31 @@ mod buffered_transport_tests {
                 let released = Arc::new(AtomicBool::new(false));
                 let owned = Released(Arc::clone(&released));
                 let mut future = Box::pin(serve_buffered(
-                    &cx, &mut server, &bytes, Duration::from_secs(1), |_| async {
+                    &cx,
+                    &mut server,
+                    &bytes,
+                    Duration::from_secs(1),
+                    |_| async {
                         let _owned = owned;
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::future::pending().await
                     },
                 ));
                 if polled {
-                    assert!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+                    assert!(
+                        future
+                            .as_mut()
+                            .poll(&mut Context::from_waker(Waker::noop()))
+                            .is_pending()
+                    );
                 }
                 drop(future);
                 assert_eq!(calls.load(Ordering::SeqCst), usize::from(polled));
                 assert!(released.load(Ordering::SeqCst));
-                assert_eq!(client.read(&mut [0; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+                assert_eq!(
+                    client.read(&mut [0; 1]).unwrap_err().kind(),
+                    ErrorKind::WouldBlock
+                );
                 retained_search_checkpoint(&cx).unwrap();
             }
         });
@@ -1753,7 +1848,11 @@ mod buffered_transport_tests {
                 client.set_nonblocking(true).unwrap();
                 let bytes = serde_json::to_vec(&request()).unwrap();
                 let result = serve_buffered(
-                    &cx, &mut server, &bytes, Duration::from_secs(1), |request| async {
+                    &cx,
+                    &mut server,
+                    &bytes,
+                    Duration::from_secs(1),
+                    |request| async {
                         cx.set_cancel_requested(true);
                         if fail {
                             Err(complete_cli_error("fixture", "original refusal"))
@@ -1761,10 +1860,14 @@ mod buffered_transport_tests {
                             Ok(payload(request.search.query))
                         }
                     },
-                ).await;
+                )
+                .await;
                 cx.set_cancel_requested(false);
                 assert!(matches!(result, Err(SearchError::Cancelled { .. })));
-                assert_eq!(client.read(&mut [0; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+                assert_eq!(
+                    client.read(&mut [0; 1]).unwrap_err().kind(),
+                    ErrorKind::WouldBlock
+                );
             }
         });
     }

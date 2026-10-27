@@ -923,7 +923,7 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )?;
         self.validate_semantic_model_selection(mode)?;
         let query = self
@@ -1237,6 +1237,7 @@ impl FsfsRuntime {
             .runtime
             .execute_expanded_query_variants(
                 cx,
+                query,
                 queries,
                 limit.saturating_mul(2).max(20),
                 &mut reader.resources,
@@ -4001,7 +4002,12 @@ mod tests {
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
             assert_eq!(sealed_inventory(predecessor.path()), before_inventory);
 
-            for command in [CliCommand::Index, CliCommand::Delete, CliCommand::Compact, CliCommand::Flush] {
+            for command in [
+                CliCommand::Index,
+                CliCommand::Delete,
+                CliCommand::Compact,
+                CliCommand::Flush,
+            ] {
                 let mut paused = runtime.clone();
                 paused.config.pressure.degradation_override =
                     crate::config::DegradationOverrideMode::ForcePaused;

@@ -140,7 +140,7 @@ fsfs serve --index-dir /work/search-store --config /work/fsfs.toml --format json
 
 Send the existing JSON request shape, for example
 `{"query":"connection pooling","limit":10}`, or a plain query line. Each
-request uses the buffered `fsfs.search.serve.v15` response shape, after
+request uses the buffered `fsfs.search.serve.v16` response shape, after
 one ready event. Send `quit` or close stdin to stop. This is not the progressive
 socket transport: use direct `search --stream` for immediate phase delivery.
 
@@ -195,6 +195,11 @@ filters, limits and the search policy (`quality_weight`, `rrf_k`,
 `quality_timeout_ms`, `fast_only`, `rerank`, `rerank_timeout_ms`, and so
 `--fast-only` and `--rerank`) apply to the individual request, so one daemon
 serves clients that differ only there. Use the same configuration otherwise.
+`--quality-only` also travels with each request and selects direct quality-tier
+retrieval, preserving filters and limits without requiring the fast model.
+It requires a compatible quality index and ordinarily returns one `Initial` phase; an
+unavailable quality tier or a quality timeout fails the request. The daemon
+keeps quality-only cache entries separate from hybrid and fast-only results.
 Buffered and progressive forwarded searches share the daemon's in-memory result
 cache with raw buffered requests that resolve to the same query, limit, mode,
 filter and policy, as on the legacy layout; searches with inline explanations

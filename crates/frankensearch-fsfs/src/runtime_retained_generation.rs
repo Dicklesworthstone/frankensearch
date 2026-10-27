@@ -113,7 +113,7 @@ impl RetainedSearchReader {
     fn search_mode(&self) -> SearchResult<SearchExecutionMode> {
         degraded_search_mode(
             self.runtime.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.runtime.requested_search_mode(),
         )
     }
 }
@@ -397,7 +397,7 @@ impl FsfsRuntime {
         // refuses search opens the least; each search then reports the refusal.
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )
         .unwrap_or(SearchExecutionMode::LexicalOnly);
         let resources = Box::pin(
