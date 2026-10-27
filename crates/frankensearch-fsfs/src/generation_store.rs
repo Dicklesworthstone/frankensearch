@@ -163,13 +163,28 @@ pub enum GenerationPublication {
 
 /// Owns the publisher lease for an entire rebuild, including suspended futures.
 /// A dropped value releases the lease and leaves its inert directory untouched.
-#[derive(Debug)]
 pub struct GenerationBuild {
     store: CompleteGenerationStore,
     path: PathBuf,
     id: String,
     predecessor: Option<Vec<u8>>,
+    // Recovery treats predecessor bytes as an opaque compare guard only.
+    // It may never inherit an artifact from an unadmitted generation.
+    allow_inherited_files: bool,
     lease: PublicationLease,
+}
+
+impl std::fmt::Debug for GenerationBuild {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GenerationBuild")
+            .field("id", &self.id)
+            .field("selection_present", &self.predecessor.is_some())
+            .field("allow_inherited_files", &self.allow_inherited_files)
+            // Recovery may retain arbitrary malformed descriptor bytes. They
+            // are comparison evidence, never a diagnostic payload.
+            .finish_non_exhaustive()
+    }
 }
 
 impl CompleteGenerationStore {
@@ -389,6 +404,16 @@ impl CompleteGenerationStore {
         // overwritten just because a new rebuild could be started.
         let _active = self.active(cx)?;
         let predecessor = read_pointer(&self.root)?;
+        self.allocate_build(cx, lease, predecessor, true)
+    }
+
+    fn allocate_build(
+        &self,
+        cx: &Cx,
+        lease: PublicationLease,
+        predecessor: Option<Vec<u8>>,
+        allow_inherited_files: bool,
+    ) -> SearchResult<GenerationBuild> {
         let parent = self.root.join(GENERATIONS);
         reject_symlink_if_present(&parent)?;
         fs::create_dir_all(&parent)?;
@@ -413,6 +438,7 @@ impl CompleteGenerationStore {
                         path,
                         id,
                         predecessor,
+                        allow_inherited_files,
                         lease,
                     });
                 }
@@ -468,38 +494,7 @@ impl GenerationBuild {
         F: FnOnce(&Cx, &Path) -> SearchResult<()>,
         G: FnOnce(&Cx) -> SearchResult<()>,
     {
-        checkpoint(cx)?;
-        self.lease.fence("complete-generation validation")?;
-        reject_published_write(&self.path)?;
-        validate(cx, &self.path)?;
-        checkpoint(cx)?;
-        let files = inventory(cx, &self.path, false)?;
-        if files.is_empty() {
-            return Err(invalid(&self.path, "cannot publish an empty bundle"));
-        }
-        self.require_shared_files_unchanged(cx, &files)?;
-        let manifest = BundleManifest {
-            schema_version: 1,
-            generation: self.id.clone(),
-            files,
-        };
-        let bytes = serde_json::to_vec(&manifest)
-            .map_err(|error| invalid(&self.path, &format!("cannot encode inventory: {error}")))?;
-        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
-            return Err(invalid(
-                &self.path,
-                "bundle inventory exceeds its size bound",
-            ));
-        }
-        let manifest_sha256 = digest(&bytes);
-        write_new_synced(&self.path.join(COMPLETE_GENERATION_MANIFEST), &bytes)?;
-        sync_tree(cx, &self.path, 0)?;
-        File::open(self.store.root.join(GENERATIONS))?.sync_all()?;
-        // Detect modifications during validation/sealing before any selection
-        // change. Published readers also recheck this inventory on admission.
-        if inventory(cx, &self.path, true)? != manifest.files {
-            return Err(invalid(&self.path, "bundle changed while being sealed"));
-        }
+        let manifest_sha256 = self.seal(cx, validate)?;
         let pointer = format!("{POINTER_MAGIC}\n{}\n{manifest_sha256}\n", self.id).into_bytes();
         let temporary = self.store.root.join(format!(".FSFS-CURRENT-{}", self.id));
         write_new_synced(&temporary, &pointer)?;
@@ -534,6 +529,48 @@ impl GenerationBuild {
         }
     }
 
+    // Both immediate publication and explicit prepare/preview admission use
+    // this exact inventory seal. A prepared rebuild never writes a selection
+    // pointer merely to obtain a receipted, immutable target.
+    fn seal<F>(&self, cx: &Cx, validate: F) -> SearchResult<String>
+    where
+        F: FnOnce(&Cx, &Path) -> SearchResult<()>,
+    {
+        checkpoint(cx)?;
+        self.lease.fence("complete-generation validation")?;
+        reject_published_write(&self.path)?;
+        validate(cx, &self.path)?;
+        checkpoint(cx)?;
+        let files = inventory(cx, &self.path, false)?;
+        if files.is_empty() {
+            return Err(invalid(&self.path, "cannot publish an empty bundle"));
+        }
+        self.require_shared_files_unchanged(cx, &files)?;
+        let manifest = BundleManifest {
+            schema_version: 1,
+            generation: self.id.clone(),
+            files,
+        };
+        let bytes = serde_json::to_vec(&manifest)
+            .map_err(|error| invalid(&self.path, &format!("cannot encode inventory: {error}")))?;
+        if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err(invalid(
+                &self.path,
+                "bundle inventory exceeds its size bound",
+            ));
+        }
+        let manifest_sha256 = digest(&bytes);
+        write_new_synced(&self.path.join(COMPLETE_GENERATION_MANIFEST), &bytes)?;
+        sync_tree(cx, &self.path, 0)?;
+        File::open(self.store.root.join(GENERATIONS))?.sync_all()?;
+        // Detect modifications during validation/sealing before any selection
+        // change. Published readers also recheck this inventory on admission.
+        if inventory(cx, &self.path, true)? != manifest.files {
+            return Err(invalid(&self.path, "bundle changed while being sealed"));
+        }
+        Ok(manifest_sha256)
+    }
+
     /// Refuse a file that shares its inode with the predecessor's file at the
     /// same path (a linked Quill segment) but no longer hashes to the
     /// predecessor's sealed digest: those bytes decayed or were rewritten in
@@ -541,6 +578,19 @@ impl GenerationBuild {
     /// seeded by links needs no earlier pass over the shared files.
     #[cfg(unix)]
     fn require_shared_files_unchanged(&self, cx: &Cx, files: &[Artifact]) -> SearchResult<()> {
+        if !self.allow_inherited_files {
+            for artifact in files {
+                checkpoint(cx)?;
+                let path = self.path.join(&artifact.path);
+                if fs::symlink_metadata(&path)?.nlink() != 1 {
+                    return Err(invalid(
+                        &path,
+                        "recovery rebuild must own every artifact; shared files cannot inherit unadmitted predecessor bytes",
+                    ));
+                }
+            }
+            return Ok(());
+        }
         let Some(pointer) = self.predecessor.as_deref() else {
             return Ok(());
         };

@@ -41,7 +41,7 @@ fn write_vectors(path: &Path, binding: &FsviV2IdentityBinding, ids: &[&str], axi
     fs::rename(staged, path).unwrap();
 }
 
-fn persist(index: &mut TwoTierIndex, policy: &NativeCachePolicy, fast: bool) {
+fn persist(cx: &Cx, index: &mut TwoTierIndex, policy: &NativeCachePolicy, fast: bool) {
     let tier = if fast { &policy.fast } else { &policy.quality };
     let Some(tier) = tier else { return };
     // The receipt binds the graph's basename (canonical `.fshnsw`), so stage
@@ -54,12 +54,12 @@ fn persist(index: &mut TwoTierIndex, policy: &NativeCachePolicy, fast: bool) {
     let staged = stage_dir.join(tier.graph_path.file_name().unwrap());
     if fast {
         index
-            .enable_native_fast_hnsw(tier.params, tier.seed)
+            .enable_native_fast_hnsw(cx, tier.params, tier.seed)
             .unwrap();
         index.save_native_fast_hnsw(&staged).unwrap();
     } else {
         index
-            .enable_native_quality_hnsw(tier.params, tier.seed)
+            .enable_native_quality_hnsw(cx, tier.params, tier.seed)
             .unwrap();
         index.save_native_quality_hnsw(&staged).unwrap();
     }
@@ -103,8 +103,9 @@ impl Fixture {
         };
         let mut index =
             open_exact(&paths, TwoTierConfig::default(), &fast, quality.as_ref()).unwrap();
-        persist(&mut index, &policy, true);
-        persist(&mut index, &policy, false);
+        let cx = Cx::for_testing();
+        persist(&cx, &mut index, &policy, true);
+        persist(&cx, &mut index, &policy, false);
         Self {
             directory,
             paths,
@@ -156,7 +157,7 @@ fn image(directory: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         .collect()
 }
 
-fn fast_ids(index: &TwoTierIndex) -> Vec<String> {
+fn fast_ids(cx: &Cx, index: &TwoTierIndex) -> Vec<String> {
     let query = TieredQueryEmbeddings::fast_only(
         BoundQueryEmbedding::new(
             vec![0.0, 1.0],
@@ -165,7 +166,7 @@ fn fast_ids(index: &TwoTierIndex) -> Vec<String> {
         .unwrap(),
     );
     index
-        .activate_owner_backed_search(&query)
+        .activate_owner_backed_search(cx, &query)
         .unwrap()
         .search_fast(10)
         .unwrap()
@@ -177,7 +178,7 @@ fn fast_ids(index: &TwoTierIndex) -> Vec<String> {
 // Owner-backed activation, as the searcher reads an admitted v2 quality tier;
 // `search_quality_with_producer` is the legacy v1 path and compares the
 // stored revision with the query fingerprint, which a v2 index never stores.
-fn quality_ids(index: &TwoTierIndex) -> Vec<String> {
+fn quality_ids(cx: &Cx, index: &TwoTierIndex) -> Vec<String> {
     let query = TieredQueryEmbeddings::quality_only(
         BoundQueryEmbedding::new(
             vec![0.0, 1.0, 0.0],
@@ -186,7 +187,7 @@ fn quality_ids(index: &TwoTierIndex) -> Vec<String> {
         .unwrap(),
     );
     index
-        .activate_owner_backed_search(&query)
+        .activate_owner_backed_search(cx, &query)
         .unwrap()
         .search_quality(10)
         .unwrap()
@@ -208,22 +209,22 @@ fn persisted_native_cache_reopens_every_tier_policy_without_writes() {
             let before = image(fixture.directory.path());
             let cache = fixture.open(&cx);
             let old = cache.current();
-            assert_eq!(fast_ids(&old), ["old"]);
+            assert_eq!(fast_ids(&cx, &old), ["old"]);
             for _ in 0..2 {
                 cache.reload().unwrap();
                 let current = cache.current();
                 assert!(!Arc::ptr_eq(&old, &current));
                 assert_eq!(current.has_native_fast_hnsw(), fast_graph);
                 assert_eq!(current.has_native_quality_hnsw(), quality_graph);
-                assert_eq!(fast_ids(&current), ["old"]);
+                assert_eq!(fast_ids(&cx, &current), ["old"]);
                 if quality_vectors {
-                    assert_eq!(quality_ids(&current), ["old"]);
+                    assert_eq!(quality_ids(&cx, &current), ["old"]);
                 }
                 assert_eq!(cache.native_cache_policy(), Some(&fixture.policy));
             }
             drop(cache);
             let restarted = fixture.open(&cx);
-            assert_eq!(fast_ids(&restarted.current()), fast_ids(&old));
+            assert_eq!(fast_ids(&cx, &restarted.current()), fast_ids(&cx, &old));
             assert_eq!(image(fixture.directory.path()), before);
             assert!(!fixture.directory.path().join(SENTINEL_FILENAME).exists());
         }
@@ -239,7 +240,7 @@ fn selected_native_reload_waits_for_both_graphs_and_preserves_old_readers() {
         let (fast, quality) = fixture.stage_vectors(6, 8);
         let mut builder =
             open_exact(&fixture.paths, cache.config.clone(), &fast, Some(&quality)).unwrap();
-        persist(&mut builder, &fixture.policy, true);
+        persist(&cx, &mut builder, &fixture.policy, true);
         let incomplete = image(fixture.directory.path());
         assert!(
             cache.reload().is_err(),
@@ -252,10 +253,10 @@ fn selected_native_reload_waits_for_both_graphs_and_preserves_old_readers() {
         );
         assert!(Arc::ptr_eq(&old, &cache.current()));
         assert_eq!(image(fixture.directory.path()), incomplete);
-        assert_eq!(fast_ids(&old), ["old"]);
-        assert_eq!(quality_ids(&old), ["old"]);
+        assert_eq!(fast_ids(&cx, &old), ["old"]);
+        assert_eq!(quality_ids(&cx, &old), ["old"]);
 
-        persist(&mut builder, &fixture.policy, false);
+        persist(&cx, &mut builder, &fixture.policy, false);
         let complete = image(fixture.directory.path());
         assert!(
             cache
@@ -266,12 +267,12 @@ fn selected_native_reload_waits_for_both_graphs_and_preserves_old_readers() {
         assert_eq!(current.fast_admitted_binding(), Some(&fast));
         assert_eq!(current.quality_admitted_binding(), Some(&quality));
         assert!(current.has_native_fast_hnsw() && current.has_native_quality_hnsw());
-        assert_eq!(fast_ids(&current), ["new", "second"]);
-        assert_eq!(quality_ids(&current), ["new", "second"]);
+        assert_eq!(fast_ids(&cx, &current), ["new", "second"]);
+        assert_eq!(quality_ids(&cx, &current), ["new", "second"]);
         cache.reload().unwrap();
         assert_eq!(cache.current().fast_admitted_binding(), Some(&fast));
-        assert_eq!(fast_ids(&old), ["old"]);
-        assert_eq!(quality_ids(&old), ["old"]);
+        assert_eq!(fast_ids(&cx, &old), ["old"]);
+        assert_eq!(quality_ids(&cx, &old), ["old"]);
         assert_eq!(image(fixture.directory.path()), complete);
     });
 }
@@ -294,10 +295,10 @@ fn native_cache_refuses_prebuilt_policy_substitution_through_all_replace_entries
                 if native_candidate {
                     // Even a graph with the right owner is not the cache's recipe.
                     index
-                        .enable_native_fast_hnsw(HnswParams::default(), 99)
+                        .enable_native_fast_hnsw(&cx, HnswParams::default(), 99)
                         .unwrap();
                     index
-                        .enable_native_quality_hnsw(HnswParams::default(), 100)
+                        .enable_native_quality_hnsw(&cx, HnswParams::default(), 100)
                         .unwrap();
                 }
                 index
@@ -314,7 +315,7 @@ fn native_cache_refuses_prebuilt_policy_substitution_through_all_replace_entries
         cache.reload().unwrap();
         assert!(cache.current().has_native_fast_hnsw());
         assert!(cache.current().has_native_quality_hnsw());
-        assert_eq!(fast_ids(&old), ["old"]);
+        assert_eq!(fast_ids(&cx, &old), ["old"]);
     });
 }
 
@@ -364,7 +365,7 @@ fn native_reload_refuses_corrupt_missing_and_wrong_policy_sidecars_without_fallb
                             fixture.quality.as_ref(),
                         )
                         .unwrap();
-                        persist(&mut builder, &wrong, !quality_fault);
+                        persist(&cx, &mut builder, &wrong, !quality_fault);
                     }
                 }
                 let before = image(fixture.directory.path());
@@ -380,8 +381,8 @@ fn native_reload_refuses_corrupt_missing_and_wrong_policy_sidecars_without_fallb
                         .is_err()
                 );
                 assert!(Arc::ptr_eq(&old, &cache.current()));
-                assert_eq!(fast_ids(&old), ["old"]);
-                assert_eq!(quality_ids(&old), ["old"]);
+                assert_eq!(fast_ids(&cx, &old), ["old"]);
+                assert_eq!(quality_ids(&cx, &old), ["old"]);
                 assert_eq!(image(fixture.directory.path()), before);
             }
         }
@@ -397,8 +398,8 @@ fn native_same_generation_vector_rebinding_remains_forbidden_even_with_valid_new
         let (fast, quality) = fixture.stage_vectors(5, 7);
         let mut builder =
             open_exact(&fixture.paths, cache.config.clone(), &fast, Some(&quality)).unwrap();
-        persist(&mut builder, &fixture.policy, true);
-        persist(&mut builder, &fixture.policy, false);
+        persist(&cx, &mut builder, &fixture.policy, true);
+        persist(&cx, &mut builder, &fixture.policy, false);
         assert!(cache.reload().is_err());
         assert!(
             cache
@@ -406,8 +407,8 @@ fn native_same_generation_vector_rebinding_remains_forbidden_even_with_valid_new
                 .is_err()
         );
         assert!(Arc::ptr_eq(&old, &cache.current()));
-        assert_eq!(fast_ids(&old), ["old"]);
-        assert_eq!(quality_ids(&old), ["old"]);
+        assert_eq!(fast_ids(&cx, &old), ["old"]);
+        assert_eq!(quality_ids(&cx, &old), ["old"]);
     });
 }
 
@@ -430,8 +431,8 @@ fn native_slow_reload_cannot_overwrite_a_concurrent_successful_reload() {
             matches!(error, SearchError::InvalidConfig { ref value, .. } if value == "superseded")
         );
         assert!(Arc::ptr_eq(&winner.unwrap(), &cache.current()));
-        assert_eq!(fast_ids(&old), ["old"]);
-        assert_eq!(quality_ids(&old), ["old"]);
+        assert_eq!(fast_ids(&cx, &old), ["old"]);
+        assert_eq!(quality_ids(&cx, &old), ["old"]);
         // A stale selection is refused before opening now-damaged disk artifacts.
         fs::write(
             &fixture.policy.fast.as_ref().unwrap().graph_path,
@@ -443,7 +444,7 @@ fn native_slow_reload_cannot_overwrite_a_concurrent_successful_reload() {
                 .reload_admitted_v2_if_current(&cx, &old, &fixture.fast, fixture.quality.as_ref())
                 .unwrap()
         );
-        assert_eq!(fast_ids(&cache.current()), ["old"]);
+        assert_eq!(fast_ids(&cx, &cache.current()), ["old"]);
     });
 }
 
@@ -487,8 +488,8 @@ fn native_cancelled_and_competing_selected_reloads_keep_one_complete_snapshot() 
         );
         let current = cache.current();
         assert!(current.has_native_fast_hnsw() && current.has_native_quality_hnsw());
-        assert_eq!(fast_ids(&current), fast_ids(&old));
-        assert_eq!(quality_ids(&current), quality_ids(&old));
+        assert_eq!(fast_ids(&cx, &current), fast_ids(&cx, &old));
+        assert_eq!(quality_ids(&cx, &current), quality_ids(&cx, &old));
     });
 }
 

@@ -203,6 +203,8 @@ pub struct CliInput {
     pub format_explicit: bool,
     /// Search query text (for search command).
     pub query: Option<String>,
+    /// Search only the independently admitted quality vector tier.
+    pub quality_only: bool,
     /// Optional target path for index/watch.
     pub target_path: Option<PathBuf>,
     /// Optional explicit index directory override for index/status commands.
@@ -469,6 +471,17 @@ where
             }
             "--no-fast-only" => {
                 input.overrides.fast_only = Some(false);
+                idx += 1;
+            }
+            "--quality-only" => {
+                if command != CliCommand::Search {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.quality_only".into(),
+                        value: flag.into(),
+                        reason: "--quality-only is only valid for the search command".into(),
+                    });
+                }
+                input.quality_only = true;
                 idx += 1;
             }
             "--rerank" => {
@@ -861,6 +874,13 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
 }
 
 fn validate_required_args(input: &CliInput) -> SearchResult<()> {
+    if input.quality_only && input.overrides.fast_only == Some(true) {
+        return Err(SearchError::InvalidConfig {
+            field: "cli.quality_only".into(),
+            value: "--quality-only --fast-only".into(),
+            reason: "quality-only and fast-only search are mutually exclusive".into(),
+        });
+    }
     if input.command == CliCommand::Search && input.query.is_none() {
         return Err(SearchError::InvalidConfig {
             field: "cli.search_query".into(),
@@ -1113,6 +1133,7 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "-f"
             | "--fast-only"
             | "--no-fast-only"
+            | "--quality-only"
             | "--rerank"
             | "--no-rerank"
             | "--offline"
@@ -1196,6 +1217,65 @@ mod tests {
             input.overrides.roots.expect("roots"),
             vec!["/repo".to_string(), "/notes".to_string()]
         );
+    }
+
+    #[test]
+    fn quality_only_search_preserves_query_and_delivery_flags() {
+        for args in [
+            vec!["search", "quality query", "--quality-only", "--no-daemon"],
+            vec![
+                "search",
+                "--quality-only",
+                "--no-daemon",
+                "--",
+                "quality query",
+            ],
+        ] {
+            let input = parse_cli_args(args).expect("quality-only search");
+            assert!(input.quality_only);
+            assert!(!input.daemon);
+            assert_eq!(input.query.as_deref(), Some("quality query"));
+            assert_eq!(input.overrides.fast_only, None);
+        }
+        let input = parse_cli_args([
+            "search",
+            "--quality-only",
+            "--no-fast-only",
+            "--filter",
+            "lang:rust",
+            "--limit",
+            "7",
+            "--stream",
+            "--",
+            "-excluded quality query",
+        ])
+        .expect("quality-only streaming search");
+        assert!(input.quality_only);
+        assert!(input.stream);
+        assert_eq!(input.format, OutputFormat::Jsonl);
+        assert_eq!(input.overrides.fast_only, Some(false));
+        assert_eq!(input.overrides.limit, Some(7));
+        assert_eq!(input.filter.as_deref(), Some("lang:rust"));
+        assert_eq!(input.query.as_deref(), Some("-excluded quality query"));
+    }
+
+    #[test]
+    fn quality_only_refuses_conflicting_tiers_and_non_search_commands() {
+        for args in [
+            vec!["search", "query", "--quality-only", "--fast-only"],
+            vec!["search", "query", "--fast-only", "--quality-only"],
+            vec!["index", "--quality-only"],
+            vec!["serve", "--quality-only"],
+            vec!["doctor", "--quality-only"],
+        ] {
+            let error = parse_cli_args(args).expect_err("invalid quality-only request");
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "cli.quality_only"));
+        }
+        let input = parse_cli_args(["search", "--", "--quality-only"])
+            .expect("literal query after separator");
+        assert!(!input.quality_only);
+        assert_eq!(input.query.as_deref(), Some("--quality-only"));
     }
 
     #[test]

@@ -1578,9 +1578,13 @@ mod four_engine_generation_receipts {
         let vector = vector_component_receipt(owner.witness(), order.clone(), checkpoint)
             .expect("vector receipt from the real FSVI witness");
 
-        let graph =
-            ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
-                .expect("native HNSW graph over the admitted owner");
+        let graph = ValidatedNativeHnsw::build(
+            &asupersync::Cx::for_testing(),
+            Arc::clone(&owner),
+            HnswParams::default(),
+            0x7b_5eed,
+        )
+        .expect("native HNSW graph over the admitted owner");
         let graph_receipt = graph
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");
@@ -1642,9 +1646,13 @@ mod four_engine_generation_receipts {
 
         let vector = vector_component_receipt(owner.witness(), order.clone(), checkpoint)
             .expect("vector receipt from the real FSVI witness");
-        let graph =
-            ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
-                .expect("native HNSW graph over the admitted owner");
+        let graph = ValidatedNativeHnsw::build(
+            &asupersync::Cx::for_testing(),
+            Arc::clone(&owner),
+            HnswParams::default(),
+            0x7b_5eed,
+        )
+        .expect("native HNSW graph over the admitted owner");
         let graph_receipt = graph
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");
@@ -1745,9 +1753,13 @@ mod four_engine_generation_receipts {
 
         let vector = vector_component_receipt(owner.witness(), order.clone(), checkpoint)
             .expect("anchor receipt");
-        let graph =
-            ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
-                .expect("native HNSW graph over the admitted owner");
+        let graph = ValidatedNativeHnsw::build(
+            &asupersync::Cx::for_testing(),
+            Arc::clone(&owner),
+            HnswParams::default(),
+            0x7b_5eed,
+        )
+        .expect("native HNSW graph over the admitted owner");
         let graph_receipt = graph
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");
@@ -1894,9 +1906,13 @@ mod four_engine_generation_receipts {
             vector_component_receipt(owner.witness(), order.clone(), checkpoint).expect("anchor");
         let drifted_vector = vector_component_receipt(owner.witness(), order.clone(), moved_anchor)
             .expect("anchor receipt on a different checkpoint");
-        let graph =
-            ValidatedNativeHnsw::build(Arc::clone(&owner), HnswParams::default(), 0x7b_5eed)
-                .expect("native HNSW graph over the admitted owner");
+        let graph = ValidatedNativeHnsw::build(
+            &asupersync::Cx::for_testing(),
+            Arc::clone(&owner),
+            HnswParams::default(),
+            0x7b_5eed,
+        )
+        .expect("native HNSW graph over the admitted owner");
         let graph_receipt = graph
             .save(&directory.path().join("current.fshnsw"))
             .expect("save the graph and mint its receipt");

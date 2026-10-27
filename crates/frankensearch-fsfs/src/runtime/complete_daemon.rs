@@ -22,7 +22,9 @@ use serde::Serialize;
 use super::super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_CONNECT_MAX_ATTEMPTS,
     FSFS_DAEMON_CONNECT_RETRY_DELAY_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES,
-    SearchExecutionFlags, SearchServeRequest, daemon_socket_path_capacity,
+    SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
+    SearchStreamResources, daemon_socket_path_capacity, degraded_search_mode,
+    parse_search_execution_mode,
 };
 use super::{
     FsfsRuntime, complete_cli_error, emit_complete_serve_line, pressure_timestamp_ms,
@@ -416,9 +418,10 @@ impl FsfsRuntime {
             if shutdown {
                 // An acknowledged stop must not subsequently be relabelled by
                 // a driver checkpoint. Only the strict decoder mints this flag.
-                let result = write_response(cx, &mut peer, control::SHUTDOWN_RESPONSE, peer_timeout)
-                    .await
-                    .map(|()| PeerOutcome::Shutdown);
+                let result =
+                    write_response(cx, &mut peer, control::SHUTDOWN_RESPONSE, peer_timeout)
+                        .await
+                        .map(|()| PeerOutcome::Shutdown);
                 if stop_after_peer(cx, result)? {
                     return Ok(());
                 }
@@ -466,40 +469,14 @@ impl FsfsRuntime {
                             cache.clear();
                         }
                         if let Some(mut output) = output {
-                            // Reuse direct streaming, including its producer
-                            // annotations, phase ordering and terminal frames.
-                            let mut runtime = session
+                            session
                                 .reader
                                 .runtime
-                                .with_search_serve_request_policy(&request)?;
-                            runtime.prepare_search_reranker(cx).await?;
-                            runtime.cli_input.command = crate::CliCommand::Search;
-                            runtime.cli_input.format = crate::OutputFormat::Jsonl;
-                            runtime.cli_input.stream = true;
-                            runtime.cli_input.daemon = false;
-                            runtime.cli_input.daemon_socket = None;
-                            runtime.cli_input.query = Some(request.query.clone());
-                            let limit = request.limit.unwrap_or(runtime.config.search.default_limit);
-                            let stream_id = format!(
-                                "complete-{}-{}-{}",
-                                pressure_timestamp_ms(),
-                                std::process::id(),
-                                STREAM_SEQUENCE.fetch_add(1, Ordering::Relaxed),
-                            );
-                            runtime
-                                .run_search_stream_command_with_writer(
+                                .stream_complete_search_request(
                                     cx,
-                                    &request.query,
-                                    limit,
-                                    &stream_id,
+                                    request,
+                                    &mut session.reader.resources,
                                     &mut output,
-                                    Some((
-                                        &mut session.reader.resources,
-                                        SearchExecutionFlags {
-                                            include_snippets: true,
-                                            persist_explain_session: false,
-                                        },
-                                    )),
                                 )
                                 .await?;
                             return Ok(None);
@@ -543,6 +520,64 @@ impl FsfsRuntime {
             }
             intake.completed();
         }
+    }
+
+    /// Raw streams use the same typed request mode as buffered searches. Admit
+    /// its required primary before exposing Started; a rejected quality request
+    /// cannot turn into a lexical answer or advertise a fast-tier producer.
+    async fn stream_complete_search_request(
+        &self,
+        cx: &Cx,
+        request: SearchServeRequest,
+        resources: &mut SearchExecutionResources,
+        output: &mut streaming::PhaseWriter,
+    ) -> SearchResult<()> {
+        let requested_mode = parse_search_execution_mode(request.mode.as_deref())?;
+        let mut runtime = self.with_search_serve_request_policy(&request)?;
+        runtime.quality_budget_started_at = None;
+        let mode =
+            degraded_search_mode(runtime.config.pressure.degradation_override, requested_mode)?;
+        runtime.validate_semantic_model_selection(mode)?;
+        runtime
+            .rebind_search_resources_if_generation_changed(cx, mode, resources)
+            .await?;
+        runtime.prepare_search_reranker(cx).await?;
+        if matches!(mode, SearchExecutionMode::QualityOnly) {
+            runtime.quality_budget_started_at = Some(cx.now());
+            runtime
+                .with_quality_deadline(cx, runtime.admit_required_quality(cx, resources))
+                .await?;
+        }
+        runtime.cli_input.command = crate::CliCommand::Search;
+        runtime.cli_input.format = crate::OutputFormat::Jsonl;
+        runtime.cli_input.stream = true;
+        runtime.cli_input.daemon = false;
+        runtime.cli_input.daemon_socket = None;
+        runtime.cli_input.query = Some(request.query.clone());
+        let limit = request.limit.unwrap_or(runtime.config.search.default_limit);
+        let stream_id = format!(
+            "complete-{}-{}-{}",
+            pressure_timestamp_ms(),
+            std::process::id(),
+            STREAM_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+        );
+        runtime
+            .run_search_stream_command_with_writer(
+                cx,
+                &request.query,
+                limit,
+                &stream_id,
+                output,
+                Some(SearchStreamResources {
+                    resources,
+                    flags: SearchExecutionFlags {
+                        include_snippets: true,
+                        persist_explain_session: false,
+                    },
+                    requested_mode,
+                }),
+            )
+            .await
     }
 
     fn complete_request_delivery_budget(&self, request: &SearchServeRequest) -> Duration {
@@ -1479,7 +1514,7 @@ mod tests {
             for raw in [
                 b"\xff\n".as_slice(),
                 b"{invalid\n",
-                b"{\"query\":\"x\",\"stream\":true,\"mode\":\"fast\"}\n",
+                b"{\"query\":\"x\",\"stream\":true,\"mode\":\"unknown\"}\n",
                 b"{\"query\":\"x\",\"stream\":\"true\"}\n",
                 b"{\"query\":\"x\",\"stream\":null}\n",
             ] {
@@ -1601,7 +1636,9 @@ mod tests {
                     },
                 ));
                 assert!(matches!(
-                    request.as_mut().poll(&mut Context::from_waker(Waker::noop())),
+                    request
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
                     Poll::Ready(Err(SearchError::Io(_)))
                 ));
                 drop(request);
@@ -1684,7 +1721,9 @@ mod tests {
 
                 let (client, mut server) = pair(b"{\"query\":\"still serving\"}\n");
                 let result = serve_peer(&cx, &mut server, Duration::from_secs(1), |_, _| async {
-                    Ok(Some(serde_json::json!({"ok": true, "query": "still serving"})))
+                    Ok(Some(
+                        serde_json::json!({"ok": true, "query": "still serving"}),
+                    ))
                 })
                 .await;
                 assert!(!stop_after_peer(&cx, result).unwrap());
@@ -1717,7 +1756,10 @@ mod tests {
                 let stopped = stop_after_peer(&cx, result);
                 cx.set_cancel_requested(false);
                 assert!(matches!(stopped, Err(SearchError::Cancelled { .. })));
-                assert_eq!(client.read(&mut [0; 1]).unwrap_err().kind(), ErrorKind::WouldBlock);
+                assert_eq!(
+                    client.read(&mut [0; 1]).unwrap_err().kind(),
+                    ErrorKind::WouldBlock
+                );
             }
         });
     }
@@ -1771,10 +1813,15 @@ mod tests {
             retained_search_checkpoint(&cx).unwrap();
 
             let (client, mut server) = pair(b"{\"query\":\"healthy\"}\n");
-            serve_peer(&cx, &mut server, Duration::from_secs(1), |_, output| async move {
-                assert!(output.is_none());
-                Ok(Some(serde_json::json!({"ok": true, "query": "healthy"})))
-            })
+            serve_peer(
+                &cx,
+                &mut server,
+                Duration::from_secs(1),
+                |_, output| async move {
+                    assert!(output.is_none());
+                    Ok(Some(serde_json::json!({"ok": true, "query": "healthy"})))
+                },
+            )
             .await
             .unwrap();
             assert_eq!(response(client)["query"], "healthy");
@@ -1795,7 +1842,9 @@ mod tests {
                         if fail {
                             Err(complete_cli_error("test_refusal", "original refusal"))
                         } else {
-                            Ok(Some(serde_json::json!({"ok": true, "query": request.query})))
+                            Ok(Some(
+                                serde_json::json!({"ok": true, "query": request.query}),
+                            ))
                         }
                     },
                 )
@@ -1875,6 +1924,8 @@ mod generation_tests {
     use crate::{CliCommand, CliInput, FsfsConfig, InterfaceMode};
     use asupersync::test_utils::run_test_with_cx;
     use std::io::BufRead;
+    #[cfg(feature = "semantic-support")]
+    use std::sync::Arc;
 
     struct CancelOnDrop(Cx);
 
@@ -2176,6 +2227,404 @@ mod generation_tests {
         });
     }
 
+    /// Execute the production raw stream path over a real Unix socket. Retained
+    /// resource fixtures supply actual FSVI/Quill readers, never result payloads.
+    #[cfg(feature = "semantic-support")]
+    async fn raw_stream_exchange(
+        cx: &Cx,
+        runtime: &FsfsRuntime,
+        resources: &mut SearchExecutionResources,
+        request: serde_json::Value,
+    ) -> Vec<serde_json::Value> {
+        let bytes = format!("{request}\n");
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client.write_all(bytes.as_bytes()).unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        server.set_nonblocking(true).unwrap();
+        serve_peer::<serde_json::Value, _, _>(
+            cx,
+            &mut server,
+            Duration::from_secs(10),
+            |request, output| async move {
+                let mut output = output.expect("raw streaming writer");
+                runtime
+                    .stream_complete_search_request(cx, request, resources, &mut output)
+                    .await?;
+                Ok(None)
+            },
+        )
+        .await
+        .unwrap();
+        drop(server);
+        std::io::BufReader::new(client)
+            .lines()
+            .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+            .collect()
+    }
+
+    fn assert_completed_stream(frames: &[serde_json::Value]) {
+        assert_eq!(frames.first().unwrap()["event"], "started", "{frames:?}");
+        assert_eq!(frames.last().unwrap()["event"], "terminal", "{frames:?}");
+        assert_eq!(
+            frames.last().unwrap()["payload"]["status"],
+            "completed",
+            "{frames:?}"
+        );
+        for (sequence, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                frame["seq"].as_u64(),
+                Some(u64::try_from(sequence).unwrap())
+            );
+            assert_eq!(frame["stream_id"], frames[0]["stream_id"]);
+            let typed: crate::stream_protocol::StreamFrame<crate::output_schema::SearchHitPayload> =
+                serde_json::from_value(frame.clone()).unwrap();
+            assert!(crate::stream_protocol::validate_stream_frame(&typed).valid);
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    struct CountingStreamEmbedder {
+        inner: Arc<dyn frankensearch_core::Embedder>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(feature = "semantic-support")]
+    impl frankensearch_core::Embedder for CountingStreamEmbedder {
+        fn embed<'a>(
+            &'a self,
+            cx: &'a Cx,
+            text: &'a str,
+        ) -> frankensearch_core::SearchFuture<'a, Vec<f32>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.embed(cx, text)
+        }
+
+        fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+            self.inner.identity()
+        }
+
+        fn dimension(&self) -> usize {
+            self.inner.dimension()
+        }
+
+        fn id(&self) -> &str {
+            self.inner.id()
+        }
+
+        fn model_name(&self) -> &str {
+            self.inner.model_name()
+        }
+
+        fn is_semantic(&self) -> bool {
+            self.inner.is_semantic()
+        }
+
+        fn category(&self) -> frankensearch_core::ModelCategory {
+            self.inner.category()
+        }
+    }
+
+    #[cfg(feature = "semantic-support")]
+    fn count_stream_embeddings(
+        cx: &Cx,
+        slot: &mut Option<crate::runtime::AdmittedEmbedder>,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let inner = slot.take().expect("admitted fixture producer").embedder;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        *slot = Some(
+            crate::runtime::AdmittedEmbedder::admit(
+                cx,
+                Arc::new(CountingStreamEmbedder {
+                    inner,
+                    calls: Arc::clone(&calls),
+                }),
+            )
+            .unwrap(),
+        );
+        calls
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn raw_stream_modes_select_their_own_primary_and_preserve_cached_full_answers() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let mut resources = crate::runtime::tests::published_blend_resources(directory.path());
+            let fast_calls = count_stream_embeddings(&cx, &mut resources.fast_embedder);
+            let quality_calls = count_stream_embeddings(&cx, &mut resources.quality_embedder);
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 5_000;
+            config.search.rerank = false;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(directory.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request = |mode: &str| {
+                serde_json::json!({
+                    "query": "how to recover network requests",
+                    "stream": true,
+                    "limit": 10,
+                    "mode": mode,
+                    "rerank": false,
+                })
+            };
+            let buffered =
+                FsfsRuntime::parse_search_serve_request(&request("full").to_string()).unwrap();
+            let mut cache = HashMap::new();
+            let cold = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    buffered.clone(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(!cold.cached);
+            assert_eq!(cold.payloads.len(), 2, "fixture must refine full search");
+            let cached_full = cold.payloads;
+            assert_eq!(cache.len(), 1);
+
+            for mode in ["fast", "fast_only"] {
+                let fast_before = fast_calls.load(Ordering::SeqCst);
+                let quality_before = quality_calls.load(Ordering::SeqCst);
+                let frames =
+                    raw_stream_exchange(&cx, &runtime, &mut resources, request(mode)).await;
+                assert_completed_stream(&frames);
+                assert!(fast_calls.load(Ordering::SeqCst) > fast_before);
+                assert_eq!(quality_calls.load(Ordering::SeqCst), quality_before);
+                assert_eq!(frames[0]["payload"]["skip_reason"], "fast_only");
+                let winner = frames
+                    .iter()
+                    .find(|frame| frame["event"] == "result")
+                    .unwrap();
+                assert_eq!(winner["payload"]["item"]["path"], "a.rs");
+                assert_eq!(
+                    frames
+                        .iter()
+                        .filter(
+                            |frame| frame["payload"]["reason_code"] == "query.stream.initial_ready"
+                        )
+                        .count(),
+                    1
+                );
+                assert!(
+                    !frames.iter().any(
+                        |frame| frame["payload"]["reason_code"] == "query.stream.refined_ready"
+                    )
+                );
+            }
+
+            // Quality-only must remain usable even when the configured fast
+            // producer cannot be resolved; its independent winner is b.rs.
+            let mut quality_runtime = runtime.clone();
+            quality_runtime.config.indexing.fast_model = "unregistered-fast-producer".to_owned();
+            for mode in ["quality", "quality_only"] {
+                let fast_before = fast_calls.load(Ordering::SeqCst);
+                let quality_before = quality_calls.load(Ordering::SeqCst);
+                let frames =
+                    raw_stream_exchange(&cx, &quality_runtime, &mut resources, request(mode)).await;
+                assert_completed_stream(&frames);
+                assert_eq!(fast_calls.load(Ordering::SeqCst), fast_before);
+                assert!(quality_calls.load(Ordering::SeqCst) > quality_before);
+                assert_eq!(
+                    frames[0]["payload"]["vector_generation_id"],
+                    "blend-quality-2"
+                );
+                assert_eq!(frames[0]["payload"]["skip_reason"], "quality_only");
+                let winner = frames
+                    .iter()
+                    .find(|frame| frame["event"] == "result")
+                    .unwrap();
+                assert_eq!(winner["payload"]["item"]["path"], "b.rs");
+                assert_eq!(
+                    frames
+                        .iter()
+                        .filter(
+                            |frame| frame["payload"]["reason_code"] == "query.stream.initial_ready"
+                        )
+                        .count(),
+                    1
+                );
+                assert!(
+                    !frames.iter().any(
+                        |frame| frame["payload"]["reason_code"] == "query.stream.refined_ready"
+                    )
+                );
+            }
+
+            // Raw modes neither fill nor relabel the shared full-mode entry.
+            assert_eq!(cache.len(), 1);
+            let warm = runtime
+                .execute_search_serve_request(&cx, buffered, &mut resources, &mut cache, true)
+                .await
+                .unwrap();
+            assert!(warm.cached);
+            assert_eq!(warm.payloads, cached_full);
+            let full = raw_stream_exchange(&cx, &runtime, &mut resources, request("full")).await;
+            assert_completed_stream(&full);
+            let phases = full
+                .iter()
+                .filter_map(|frame| {
+                    frame["payload"]["reason_code"].as_str().filter(|code| {
+                        *code == "query.stream.initial_ready"
+                            || *code == "query.stream.refined_ready"
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                phases,
+                ["query.stream.initial_ready", "query.stream.refined_ready"]
+            );
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn raw_quality_stream_refuses_conflicts_and_pressure_before_started_or_inference() {
+        use crate::config::DegradationOverrideMode;
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let mut resources = crate::runtime::tests::published_blend_resources(directory.path());
+            let fast_calls = count_stream_embeddings(&cx, &mut resources.fast_embedder);
+            let quality_calls = count_stream_embeddings(&cx, &mut resources.quality_embedder);
+            let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                index_dir: Some(directory.path().to_path_buf()),
+                ..CliInput::default()
+            });
+            let request = serde_json::json!({
+                "query": "quality query", "mode": "quality_only", "stream": true,
+                "rerank": false,
+            });
+            let mut conflict = request.clone();
+            conflict["fast_only"] = serde_json::json!(true);
+            let refused = raw_stream_exchange(&cx, &runtime, &mut resources, conflict).await;
+            assert_eq!(refused.len(), 1);
+            assert_eq!(refused[0]["ok"], false);
+            assert!(refused[0]["error"].to_string().contains("search.fast_only"));
+            assert!(refused[0].get("event").is_none());
+
+            for pressure in [
+                DegradationOverrideMode::ForceLexicalOnly,
+                DegradationOverrideMode::ForceMetadataOnly,
+                DegradationOverrideMode::ForcePaused,
+            ] {
+                let mut pressured = runtime.clone();
+                pressured.config.pressure.degradation_override = pressure;
+                let refused =
+                    raw_stream_exchange(&cx, &pressured, &mut resources, request.clone()).await;
+                assert_eq!(refused.len(), 1, "{pressure:?}: {refused:?}");
+                assert_eq!(refused[0]["ok"], false, "{refused:?}");
+                assert!(
+                    refused[0]["error"]
+                        .to_string()
+                        .contains("pressure.degradation_override")
+                );
+                assert!(refused[0].get("event").is_none());
+            }
+            assert_eq!(fast_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(quality_calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn complete_daemon_streams_explicit_lexical_modes_without_semantic_models() {
+        use crate::config::DegradationOverrideMode;
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("source");
+            let root = directory.path().join("store");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("alpha.md"), "sharedtoken alpha document").unwrap();
+            let mut config = FsfsConfig::default();
+            "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+            config.indexing.offline = true;
+            config.indexing.model_dir =
+                directory.path().join("absent-models").display().to_string();
+            config.search.rerank = false;
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Daemon,
+                target_path: Some(source),
+                index_dir: Some(root.clone()),
+                quiet: true,
+                ..CliInput::default()
+            });
+            assert!(matches!(
+                runtime
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+                GenerationPublication::Durable(_)
+            ));
+            // Selection is now per request, not forced by service pressure.
+            runtime.config.pressure.degradation_override = DegradationOverrideMode::Auto;
+            let endpoint = root.join(FSFS_DAEMON_SOCKET_FILE);
+            let cancel = CancelOnDrop(cx.clone());
+            let worker = std::thread::spawn(move || {
+                let _cancel = cancel;
+                let exchange = |mode: &str| {
+                    let mut stream = connect_daemon(&endpoint);
+                    writeln!(stream, "{{\"query\":\"sharedtoken\",\"stream\":true,\"mode\":\"{mode}\",\"rerank\":false,\"fast_only\":false}}").unwrap();
+                    std::io::BufReader::new(stream)
+                        .lines()
+                        .map(|line| {
+                            serde_json::from_str::<serde_json::Value>(&line.unwrap()).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for mode in ["lexical", "lexical_only"] {
+                    let frames = exchange(mode);
+                    assert_completed_stream(&frames);
+                    assert_eq!(frames[0]["payload"]["skip_reason"], "lexical_only");
+                    assert!(
+                        !frames[0]["payload"]["semantic_admitted"]
+                            .as_bool()
+                            .unwrap_or(false)
+                    );
+                    assert!(frames[0]["payload"]["vector_generation_id"].is_null());
+                    let hits = frames
+                        .iter()
+                        .filter(|frame| frame["event"] == "result")
+                        .collect::<Vec<_>>();
+                    assert_eq!(hits.len(), 1);
+                    assert!(
+                        hits[0]["payload"]["item"]["path"]
+                            .as_str()
+                            .unwrap()
+                            .ends_with("alpha.md")
+                    );
+                }
+                let refused = exchange("quality_only");
+                assert_eq!(refused.len(), 1, "{refused:?}");
+                assert_eq!(refused[0]["ok"], false, "{refused:?}");
+                assert!(refused[0].get("event").is_none(), "{refused:?}");
+                assert!(
+                    !refused[0]
+                        .to_string()
+                        .contains("unsupported streaming option")
+                );
+                // A refused required tier does not poison the next request.
+                assert_completed_stream(&exchange("lexical_only"));
+            });
+            let result = runtime
+                .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, false)
+                .await;
+            worker.join().unwrap();
+            assert!(
+                matches!(result, Err(SearchError::Cancelled { .. })),
+                "{result:?}"
+            );
+            cx.set_cancel_requested(false);
+        });
+    }
+
     #[test]
     fn complete_daemon_streams_apply_the_requests_search_policy() {
         run_test_with_cx(|cx| async move {
@@ -2263,7 +2712,9 @@ mod generation_tests {
                     let mut client = connect_daemon(&client_endpoint);
                     client.write_all(request).unwrap();
                     let mut line = String::new();
-                    std::io::BufReader::new(client).read_line(&mut line).unwrap();
+                    std::io::BufReader::new(client)
+                        .read_line(&mut line)
+                        .unwrap();
                     serde_json::from_str(&line).unwrap()
                 };
                 assert_eq!(exchange(b"ready\n")["event"], "ready");
@@ -2271,7 +2722,9 @@ mod generation_tests {
                 assert_eq!(reply["ok"], true);
                 assert_eq!(
                     reply["payloads"].as_array().unwrap().last().unwrap()["hits"]
-                        .as_array().unwrap().len(),
+                        .as_array()
+                        .unwrap()
+                        .len(),
                     1
                 );
                 // Merely waiting for the first peer's timeout cannot pass:
@@ -2280,7 +2733,9 @@ mod generation_tests {
                     .write_all(b"\"query\":\"sharedtoken\",\"limit\":10}\n")
                     .unwrap();
                 let mut line = String::new();
-                std::io::BufReader::new(stalled).read_line(&mut line).unwrap();
+                std::io::BufReader::new(stalled)
+                    .read_line(&mut line)
+                    .unwrap();
                 let reply: serde_json::Value = serde_json::from_str(&line).unwrap();
                 assert_eq!(reply["ok"], true);
                 assert_eq!(

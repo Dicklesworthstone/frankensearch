@@ -6,94 +6,12 @@
 //! this is not a fan-out of one task or one embedding request per partition.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
-use asupersync::runtime::JoinError;
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 use frankensearch_core::BoundQueryEmbedding;
 
-use crate::native_ann::{NativeAnnIndex, NativeShardHit, NativeShardSet, checkpoint};
-use crate::{Cx, SearchError, SearchResult, VectorHit};
-
-fn worker_error(reason: &'static str) -> SearchError {
-    SearchError::SubsystemError {
-        subsystem: "native_ann.query_worker",
-        source: reason.into(),
-    }
-}
-
-fn cancelled() -> SearchError {
-    SearchError::Cancelled {
-        phase: "native_ann.query_worker".to_owned(),
-        reason: "native query work was abandoned or cancelled".to_owned(),
-    }
-}
-
-fn require_pool(cx: &Cx, pool: &BlockingPoolHandle) -> SearchResult<()> {
-    checkpoint(cx, "native_ann.query_worker.admission")?;
-    if pool.is_shutdown() {
-        return Err(worker_error("the caller-owned query pool is shut down"));
-    }
-    Ok(())
-}
-
-// A queued closure can outlive its join future. Do not run expensive graph or
-// caller predicate work when the receiver has already abandoned the request.
-// This flag never cancels the caller's Cx or other requests sharing the pool.
-struct Awaiting(Arc<AtomicBool>);
-
-impl Drop for Awaiting {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
-    }
-}
-
-fn worker_checkpoint(cx: &Cx, child: &Cx, abandoned: &AtomicBool) -> SearchResult<()> {
-    checkpoint(cx, "native_ann.query_worker.request")?;
-    checkpoint(child, "native_ann.query_worker.child")?;
-    if abandoned.load(Ordering::Acquire) {
-        return Err(cancelled());
-    }
-    Ok(())
-}
-
-async fn on_pool<T, F>(cx: &Cx, pool: BlockingPoolHandle, search: F) -> SearchResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce(&Cx) -> SearchResult<T> + Send + 'static,
-{
-    require_pool(cx, &pool)?;
-    let awaiting = Awaiting(Arc::new(AtomicBool::new(false)));
-    let abandoned = Arc::clone(&awaiting.0);
-    let request = cx.clone();
-    let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool));
-    let mut worker = worker_cx
-        .spawn_blocking(move |child: Cx| {
-            worker_checkpoint(&request, &child, &abandoned)?;
-            // Shutdown can race submission. Asupersync can recover rejected
-            // work on an executor task; this API must not silently run a graph
-            // on that lane. Refuse before invoking search or its predicate.
-            if Cx::is_active() {
-                return Err(worker_error(
-                    "native query work cannot run on the async executor",
-                ));
-            }
-            let result = search(&request);
-            worker_checkpoint(&request, &child, &abandoned)?;
-            result
-        })
-        .map_err(|_| worker_error("cannot admit native query work"))?;
-    let result = worker.join(cx).await;
-    // The caller's cancellation wins over ready work AND worker failure. The
-    // worker never owns a result-delivery callback or a live selection handle.
-    checkpoint(cx, "native_ann.query_worker.delivery")?;
-    let result = result.map_err(|error| match error {
-        JoinError::Cancelled(_) => cancelled(),
-        _ => worker_error("native query worker did not complete"),
-    })?;
-    drop(awaiting);
-    result
-}
+use crate::native_ann::{NativeAnnIndex, NativeShardHit, NativeShardSet, NativeWorker, checkpoint};
+use crate::{Cx, SearchResult, VectorHit};
 
 impl NativeAnnIndex {
     /// Search an Arc-retained owner on the caller's blocking pool.
@@ -150,15 +68,16 @@ impl NativeAnnIndex {
     {
         checkpoint(cx, "native_ann.query_worker.single")?;
         self.admit_identity(query.identity())?;
-        require_pool(cx, &pool)?;
+        NativeWorker::QUERY.require_pool(cx, &pool)?;
         if k == 0 || self.live_count() == 0 {
             return self.search_filtered(cx, &query, k, ef, accept);
         }
         let index = Arc::clone(self);
-        on_pool(cx, pool, move |request| {
-            index.search_filtered(request, &query, k, ef, accept)
-        })
-        .await
+        NativeWorker::QUERY
+            .run(cx, pool, move |request| {
+                index.search_filtered(request, &query, k, ef, accept)
+            })
+            .await
     }
 }
 
@@ -216,17 +135,18 @@ impl NativeShardSet {
         checkpoint(cx, "native_ann.query_worker.shards")?;
         // Admission guarantees a nonempty inventory, including empty corpora.
         self.shard(0)
-            .ok_or_else(|| worker_error("missing admitted shard inventory"))?
+            .ok_or_else(|| NativeWorker::QUERY.error("missing admitted shard inventory"))?
             .admit_identity(query.identity())?;
-        require_pool(cx, &pool)?;
+        NativeWorker::QUERY.require_pool(cx, &pool)?;
         if k == 0 || self.live_count() == 0 {
             return self.search_filtered(cx, &query, k, ef, accept);
         }
         let index = self.clone();
-        on_pool(cx, pool, move |request| {
-            index.search_filtered(request, &query, k, ef, accept)
-        })
-        .await
+        NativeWorker::QUERY
+            .run(cx, pool, move |request| {
+                index.search_filtered(request, &query, k, ef, accept)
+            })
+            .await
     }
 }
 
@@ -234,11 +154,12 @@ impl NativeShardSet {
 mod tests {
     use super::*;
     use std::future::Future;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, mpsc};
     use std::task::{Context, Poll, Waker};
     use std::time::{Duration, Instant};
 
+    use crate::SearchError;
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::runtime::blocking_pool::BlockingPool;
     use frankensearch_core::generation::{
@@ -511,7 +432,7 @@ mod tests {
         let calls = run(1, |cx, pool| async move {
             let (started, entered) = mpsc::channel();
             let (release, gate) = mpsc::channel();
-            let mut blocker = Box::pin(on_pool(&cx, pool.clone(), move |_| {
+            let mut blocker = Box::pin(NativeWorker::QUERY.run(&cx, pool.clone(), move |_| {
                 assert!(!Cx::is_active());
                 started.send(()).unwrap();
                 gate.recv_timeout(Duration::from_secs(10)).unwrap();

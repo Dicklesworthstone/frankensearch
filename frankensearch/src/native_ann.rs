@@ -6,13 +6,19 @@
 //! retained artifact's space, producer and input fingerprints before graph
 //! traversal, including zero-result requests.
 //!
-//! Graph operations are synchronous and belong on the caller's blocking/CPU lane.
-//! Cancellation checkpoints bracket graph construction/loading and search;
-//! they do not preempt the native engine inside a synchronous call. No runtime,
-//! task, fallback embedder or detached worker is created here.
+//! Graph kernels are synchronous and belong on the caller's blocking/CPU lane.
+//! Builders and pool query APIs place that work on a caller-owned pool and join
+//! the worker before delivery. Graph construction and traversal check the
+//! caller's cancellation during their work. Synchronous loading and structural
+//! admission are bracketed by checkpoints. No runtime, pool, fallback embedder
+//! or detached publication worker is created here.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use asupersync::runtime::JoinError;
+use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
 use frankensearch_core::BoundQueryEmbedding;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
@@ -85,13 +91,53 @@ impl NativeAnnIndex {
         seed: u64,
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.build")?;
-        let graph = ValidatedNativeHnsw::build(Arc::clone(&owner), params, seed)?;
+        let graph = ValidatedNativeHnsw::build(cx, Arc::clone(&owner), params, seed)?;
         checkpoint(cx, "native_ann.build_complete")?;
         Ok(Self {
             owner,
             graph: NativeBackend::Ann(Box::new(graph)),
             default_ef_search: params.ef_search,
         })
+    }
+
+    /// Reuse this graph in a newer admitted generation when every existing
+    /// document retains its exact vector and live/tombstone state.
+    ///
+    /// New documents are inserted into a private successor graph. Physical row
+    /// reordering is resolved by document identity; the predecessor's graph and
+    /// owner remain unchanged and searchable. The complete embedding, input,
+    /// producer and storage contracts must agree, as must the graph parameters
+    /// and construction seed. No source pathname is reopened.
+    ///
+    /// Returns `None` when the backend, construction policy or source changes
+    /// require a full graph build. This is an eligibility decision, not an error
+    /// fallback: cancellation and structural errors propagate to the caller.
+    /// The returned graph must still be saved and selected as part of a complete
+    /// successor generation by the caller's normal publication protocol.
+    ///
+    /// # Errors
+    /// Refuses a non-newer ANN generation and propagates cancellation, owner
+    /// validation, graph insertion and structural-admission failures.
+    pub fn try_reuse_for_owner(
+        &self,
+        cx: &Cx,
+        owner: Arc<ValidatedFsviBytes>,
+        params: HnswParams,
+        seed: u64,
+    ) -> SearchResult<Option<Self>> {
+        checkpoint(cx, "native_ann.update_graph")?;
+        let candidate = params.validate().and_then(|()| match &self.graph {
+            NativeBackend::Ann(graph) if graph.matches_build_policy(params, seed) => {
+                graph.try_reuse_for_owner(cx, Arc::clone(&owner))
+            }
+            NativeBackend::Ann(_) | NativeBackend::Exact(_) => Ok(None),
+        });
+        checkpoint(cx, "native_ann.update_graph_complete")?;
+        Ok(candidate?.map(|graph| Self {
+            owner,
+            graph: NativeBackend::Ann(Box::new(graph)),
+            default_ef_search: params.ef_search,
+        }))
     }
 
     /// Reopen a graph only when its receipt matches this exact admitted owner.
@@ -304,7 +350,7 @@ impl NativeAnnIndex {
         }
         loop {
             checkpoint(cx, "native_ann.search_window")?;
-            let candidates = graph.search(query.vector(), width, Some(width))?;
+            let candidates = graph.search(cx, query.vector(), width, Some(width))?;
             checkpoint(cx, "native_ann.search_candidates")?;
             let mut hits = Vec::with_capacity(candidates.len());
             for candidate in candidates {
@@ -460,6 +506,119 @@ fn checkpoint(cx: &Cx, phase: &str) -> SearchResult<()> {
         });
     }
     Ok(())
+}
+
+// Build and query jobs share the same ownership and cancellation protocol.
+// Keeping their labels separate preserves useful failure provenance without
+// allowing either path to acquire a different executor-fallback policy.
+#[derive(Clone, Copy)]
+struct NativeWorker {
+    kind: &'static str,
+    subsystem: &'static str,
+    admission: &'static str,
+    request: &'static str,
+    child: &'static str,
+    delivery: &'static str,
+}
+
+impl NativeWorker {
+    const QUERY: Self = Self {
+        kind: "query",
+        subsystem: "native_ann.query_worker",
+        admission: "native_ann.query_worker.admission",
+        request: "native_ann.query_worker.request",
+        child: "native_ann.query_worker.child",
+        delivery: "native_ann.query_worker.delivery",
+    };
+    const BUILD: Self = Self {
+        kind: "build",
+        subsystem: "native_ann.build_worker",
+        admission: "native_ann.build_worker.admission",
+        request: "native_ann.build_worker.request",
+        child: "native_ann.build_worker.child",
+        delivery: "native_ann.build_worker.delivery",
+    };
+
+    fn error(self, reason: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> SearchError {
+        SearchError::SubsystemError {
+            subsystem: self.subsystem,
+            source: reason.into(),
+        }
+    }
+
+    fn cancelled(self) -> SearchError {
+        SearchError::Cancelled {
+            phase: self.subsystem.to_owned(),
+            reason: format!("native {} work was abandoned or cancelled", self.kind),
+        }
+    }
+
+    fn require_pool(self, cx: &Cx, pool: &BlockingPoolHandle) -> SearchResult<()> {
+        checkpoint(cx, self.admission)?;
+        if pool.is_shutdown() {
+            return Err(self.error(format!("the caller-owned {} pool is shut down", self.kind)));
+        }
+        Ok(())
+    }
+
+    fn checkpoint(self, cx: &Cx, child: &Cx, abandoned: &AtomicBool) -> SearchResult<()> {
+        checkpoint(cx, self.request)?;
+        checkpoint(child, self.child)?;
+        if abandoned.load(Ordering::Acquire) {
+            return Err(self.cancelled());
+        }
+        Ok(())
+    }
+
+    async fn run<T, F>(self, cx: &Cx, pool: BlockingPoolHandle, work: F) -> SearchResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Cx) -> SearchResult<T> + Send + 'static,
+    {
+        self.require_pool(cx, &pool)?;
+        let awaiting = AwaitingNativeWorker(Arc::new(AtomicBool::new(false)));
+        let abandoned = Arc::clone(&awaiting.0);
+        let request = cx.clone();
+        let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool));
+        let mut worker = worker_cx
+            .spawn_blocking(move |child: Cx| {
+                self.checkpoint(&request, &child, &abandoned)?;
+                // Shutdown can race submission. Asupersync can recover rejected
+                // work on an executor task; never invoke native work there.
+                if Cx::is_active() {
+                    return Err(self.error(format!(
+                        "native {} work cannot run on the async executor",
+                        self.kind
+                    )));
+                }
+                let result = work(&request);
+                self.checkpoint(&request, &child, &abandoned)?;
+                result
+            })
+            .map_err(|_| self.error(format!("cannot admit native {} work", self.kind)))?;
+        // Join the owned worker even after a cancellation request. Racing this
+        // join with cancellation would leave an unobserved writer or traversal.
+        let result = worker.join(cx).await;
+        // Caller cancellation wins over ready work AND worker failure. Workers
+        // never own result-delivery callbacks or a live generation selection.
+        checkpoint(cx, self.delivery)?;
+        let result = result.map_err(|error| match error {
+            JoinError::Cancelled(_) => self.cancelled(),
+            _ => self.error(format!("native {} worker did not complete", self.kind)),
+        })?;
+        drop(awaiting);
+        result
+    }
+}
+
+// A queued closure can outlive its join future. Do not start expensive native
+// work when its receiver was dropped. This never cancels unrelated pool users.
+struct AwaitingNativeWorker(Arc<AtomicBool>);
+
+impl Drop for AwaitingNativeWorker {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 fn invalid(field: &str, value: &str, reason: &str) -> SearchError {

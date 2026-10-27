@@ -120,7 +120,8 @@ impl NativeIndexBuilder {
     /// Sources move into children, rather than cloning all document bodies.
     ///
     /// Existing roots are refused. No files are removed on failure or drop.
-    /// CPU/filesystem work remains on the caller's lane. No workers are spawned.
+    /// Each child uses the configured or inherited caller pool for vector
+    /// finalization and graph work. No pool or runtime is created.
     ///
     /// # Errors
     /// Rejects zero partition size, more than 1024 partitions, invalid sources,
@@ -131,6 +132,7 @@ impl NativeIndexBuilder {
         max_documents_per_shard: usize,
     ) -> SearchResult<NativeBuiltShardedIndex> {
         checkpoint(cx, "native_ann.sharded_build.start")?;
+        self.build_pool(cx)?;
         if max_documents_per_shard == 0 {
             return Err(rejected(
                 "partition_size",
@@ -171,6 +173,7 @@ impl NativeIndexBuilder {
                 // Every successor partition shares one admitted predecessor
                 // inventory. Source IDs, not old shard ordinals, select reuse.
                 reuse: self.reuse.as_ref().map(Arc::clone),
+                blocking_pool: self.blocking_pool.clone(),
             };
             partitions.push(Box::pin(builder.build(cx)).await?);
         }

@@ -35,6 +35,20 @@ present tier by default; `--exact` creates exact-scan tiers without graphs.
 Neither choice changes model identity. Storage is F32; inference batches default
 to 16 documents and may be selected with `--batch-size 1..256`.
 
+Vector sealing, FSVI admission, native graph construction or reuse, and graph
+persistence run on the command-owned blocking pool. The same placement applies
+to incremental updates, rebuilds, sharded cohorts, and authority builds. The
+command joins the complete worker result before it can return or publish that
+generation. A stopped pool refuses the operation; it cannot move graph work
+back onto the async executor. Cancellation can leave private candidate files,
+but those files do not select a generation or replace an existing receipt.
+
+Library callers can select a pool with `NativeIndexBuilder::with_blocking_pool`
+or `NativeIndexUpdate::with_blocking_pool`. Otherwise, construction inherits the
+pool attached to the supplied `Cx`. The caller owns the pool's lifetime and
+shutdown. With neither source of a pool, the existing synchronous execution
+contract applies. Provider inference retains its existing async API.
+
 `--input` may be omitted to consume standard input. Each record has required
 string `id` and `content`, optional string/null `title`, and optional string-valued
 `metadata`. Unknown fields, duplicate IDs, malformed records and invalid UTF-8
@@ -49,11 +63,20 @@ and 100,000 documents. These bound input, not model scratch space or total RSS.
 
 `authority-index` builds and publishes a complete generation through the fixed
 `LOCK` and `AUTHORITY` protocol. Its immutable components are one FSVI v2 vector
-tier, a sealed Quill image, and the generation metadata. `authority-search`
+tier, a sealed Quill image, the generation metadata, and an optional native HNSW
+graph. `authority-search`
 reopens the exact authority named by the saved receipt and searches the retained
 vector and lexical images together, including deferred result metadata.
 
-Choose either `--tier fast` or `--tier quality`. Both use exact vector retrieval.
+Choose either `--tier fast` or `--tier quality`. `--retrieval exact|hnsw` selects
+the vector search policy independently of the tier; new indexes default to
+`exact`. HNSW uses the native engine's default parameters and deterministic seed
+42. The graph is published as a fourth immutable component. Its complete native
+receipt is authenticated inside the metadata and binds the graph to the exact
+FSVI image, artifact generation, producer, storage identity, and live document
+set. Admission also checks its structure, checksums, topology and parameters.
+Missing or corrupt declared graphs cause refusal; they never silently change
+the retrieval mode.
 A quality generation loads its quality producer directly; it does not require
 a fast model. The source checkpoint is explicit: `--source-low` and
 `--source-high` are the inclusive source sequence boundaries that produced this
@@ -74,7 +97,7 @@ mkdir -m 700 "$HOME/frankensearch-authority"
   --root "$HOME/frankensearch-authority/g1" \
   --work-dir "$HOME/frankensearch-authority/g1-work" \
   --receipt "$HOME/frankensearch-authority/g1.json" \
-  --tier fast --source-low 1 --source-high 42 --cooperative-local \
+  --tier fast --retrieval hnsw --source-low 1 --source-high 42 --cooperative-local \
   --input ./documents.jsonl --model-dir /absolute/path/to/installed/models
 ./target/release/frankensearch-native authority-search \
   --receipt "$HOME/frankensearch-authority/g1.json" \
@@ -82,19 +105,23 @@ mkdir -m 700 "$HOME/frankensearch-authority"
   --query 'retry network requests' --limit 10
 ```
 
-`--cooperative-local` is required when publishing. It declares that the caller
+`--cooperative-local` is required by `authority-index` when creating the root.
+Rebuilds and updates inherit the recorded profile. It declares that the caller
 owns the local root and that this command supplies no external anti-rollback
 service. This choice is persisted in the receipt. Search cannot change the
 receipt's security profile, generation, authority, producer identity, or tier.
 A changed current authority is a refusal, even when its components are otherwise
 valid. Already opened readers retain their original component bytes.
+Search and recovery derive the retrieval mode from the admitted generation, not
+from a command-line override or a separately discovered graph path. Successful
+responses report `retrieval: "exact"` or `retrieval: "hnsw"` for the actual reader.
 
 ### Rebuild an existing authority generation
 
 `authority-rebuild` replaces the complete source cohort in the existing root.
 It reads the selected generation from `--from-receipt`, retains that admitted
 reader, and captures its exact authority pair before reading input or loading a
-model. Supply the complete replacement JSONL corpus: omitted documents disappear
+model. By default, supply the complete replacement JSONL corpus: omitted documents disappear
 from the new generation, while readers already holding the old generation keep
 its original documents and metadata.
 
@@ -119,12 +146,61 @@ an unchanged source cut is allowed. Empty corpora remain unsupported by this
 route's metadata contract. Rebuild advances both the artifact generation and
 authority sequence, refusing exhausted counters before inference.
 
+Rebuild preserves the selected generation's retrieval policy, including the
+full HNSW parameter set and seed authenticated by its native receipt. Supply
+`--retrieval exact` to deliberately replace it with an exact-scan generation,
+or `--retrieval hnsw` to select the default HNSW configuration explicitly.
+The replacement graph is built from the new complete cohort; the retained
+previous reader keeps its own original graph and vectors.
+
 The loaded provider must match the selected generation's complete identity
 before embedding begins. To intentionally rebuild with another producer, add
 `--migrate-model` and select its local model using the usual model options. This
 re-embeds the whole cohort and records the new producer; it does not relabel or
 reuse the old vectors. The tier stays fixed, including direct quality-only
 inference. Provider identity must remain stable throughout the build.
+
+To rebuild the selected generation's existing documents, supply
+`--retained-source`. This reads the complete stored cohort from its already
+admitted vector and Quill images, preserves the exact source checkpoint, and
+re-embeds every live document. Original JSONL files and build work directories
+are unnecessary. For example, this rebuild retains the documents while changing
+retrieval to HNSW:
+
+```sh
+./target/release/frankensearch-native authority-rebuild \
+  --from-receipt "$HOME/frankensearch-authority/g1.json" \
+  --work-dir "$HOME/frankensearch-authority/g2-work" \
+  --receipt "$HOME/frankensearch-authority/g2.json" \
+  --retained-source --retrieval hnsw \
+  --model-dir /absolute/path/to/installed/models
+```
+
+Combine `--retained-source` with `--migrate-model` and the new model's local
+options for a full-cohort model migration without resupplying the corpus.
+`--input`, `--source-low`, and `--source-high` are excluded in retained-source
+mode; it neither reads standard input nor assigns a new source checkpoint.
+An ordinary rebuild with replacement JSONL still requires explicit source
+boundaries.
+
+Retained export requires the shipping Quill schema, matching live vector,
+lexical, and metadata counts, and each document's exact stored identifier, full
+content, title, and canonical string-map metadata. Tombstones are omitted. Empty
+stored titles export as absent titles because Quill stores both forms as empty
+bytes; nonempty titles and content are preserved exactly. Embeddings consume
+document content. Missing or malformed fields refuse the whole rebuild before
+model loading, inference, or creation of the new work directory.
+
+`--max-source-bytes N` on rebuild is available only with `--retained-source` and defaults to
+256 MiB. It bounds the sum of raw stored `id`, `content`, `title`, and
+`metadata_json` bytes, including JSON punctuation and escaping in the metadata
+field, checked before decoding each field. The budget does not bound process
+RSS: retained images, field materialization, and decoded documents also use
+memory. The separate encoded-image budget still applies during admission, and
+the CLI still requires at most 100,000 documents and a 16 MiB JSON-encoded record
+including its newline for each exported document. Library callers can obtain
+the same complete cohort through
+`NativeGenerationSnapshot::source_documents(&cx, max_source_bytes)`.
 
 Staging creates absent objects relative to the retained root descriptor. An
 existing content-addressed image is reused only after qualified admission
@@ -140,8 +216,329 @@ without changing that winner's authority or owner evidence. It does not refresh
 its expectation and overwrite the winner. Rebuild explicitly from the winning
 receipt to try a new replacement. Successful output has `event: "rebuilt"`,
 `publication: "committed"`, `serving: "activated"`, the replaced authority, and
-whether the model identity changed. A later output failure still reports the
-known commit.
+whether the model identity changed. The `source` field is `"retained_generation"`
+for retained-source rebuilding and `"input"` for replacement JSONL. A later
+output failure still reports the known commit.
+
+### Incremental authority upserts and deletes
+
+`authority-update` applies a JSONL delta to the exact generation selected by
+`--from-receipt`. It recovers the complete source from the retained Quill image
+and reuses the stored vectors for unchanged document content. Title and metadata
+changes update the retained source and lexical image without document inference.
+Only the final new or changed content for each ID is embedded.
+
+An input file can contain:
+
+```jsonl
+{"op":"upsert","id":"retry-guide","content":"Retry transient failures with bounded exponential backoff.","title":"Retry guide","metadata":{"version":"2"}}
+{"op":"delete","id":"obsolete-guide"}
+{"op":"upsert","id":"new-guide","content":"Use jitter to spread retries across clients."}
+```
+
+An upsert replaces the complete document, including its title and metadata.
+Omitted optional fields use their empty defaults. The last operation for each
+ID wins, but every input record must still be valid, including records later
+overwritten by another edit. Deleting an absent ID has no effect.
+
+```sh
+./target/release/frankensearch-native authority-update \
+  --from-receipt "$HOME/frankensearch-authority/g2.json" \
+  --work-dir "$HOME/frankensearch-authority/g3-work" \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --source-low 1 --source-high 63 \
+  --input ./edits.jsonl \
+  --model-dir /absolute/path/to/installed/models
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --query 'retry transient failures' --limit 10
+```
+
+Omit `--input` to read bounded JSONL from standard input. Both source checkpoint
+boundaries are required and must be at least their selected predecessor values.
+An empty delta can advance the checkpoint with zero document inference. A delta
+that deletes the entire cohort is refused before model loading or creation of
+the new work directory because this generation metadata contract requires a
+nonempty cohort.
+
+The selected generation fixes the root, security profile, tier, complete
+producer identity, F16/F32 vector encoding, and retrieval policy, including all
+HNSW parameters and the seed. The matching local model is required even for
+metadata-only updates; quality-only generations load their quality model
+directly. Use `authority-rebuild` for an intentional producer migration or
+retrieval-policy change. Original input files and original build work
+directories are unnecessary.
+
+The input delta is limited to 256 MiB, with 16 MiB per encoded record and
+100,000 distinct edited IDs. The complete merged source is independently
+limited to 100,000 documents and 256 MiB of encoded JSONL, so repeated small
+updates cannot exceed the cohort limit. `--max-source-bytes` separately bounds
+raw source export from the predecessor, using the same 256 MiB default and
+field accounting described for retained-source rebuilds. Final source bounds,
+malformed input, stale receipt selection and backward checkpoints are checked
+before loading the model. `--batch-size` controls inference batches;
+`--max-image-bytes` bounds component admission.
+
+Vector reuse saves document inference. Every successor still writes and admits
+complete FSVI, Quill, metadata and optional HNSW images. The new work directory
+and receipt must be separate from each other and from the selected root.
+Existing snapshots retain their original source, vectors and graph throughout
+the update and after publication.
+
+Publication uses the exact authority pair captured before reading input or
+loading the model. A competing publication produces `not_committed`; the
+command retains the losing attempt's recovery receipt and preserves the
+winner. Retry from the winning receipt explicitly. A successful response has
+`event: "updated"`, `publication: "committed"`, `serving: "activated"`,
+the new `selection`, the replaced authority, the final `documents` count,
+and `edited_ids` after last-operation resolution. A result-output failure
+preserves known publication and activation status.
+
+Library callers can prepare the same transaction through
+`NativeGenerationSnapshot::begin_update(&cx, work_dir, generation, provider, max_source_bytes)`,
+apply `upsert_document` / `delete_document`, and call
+`NativeIndexUpdate::build_exact_generation(&cx, tier, source, max_image_bytes)`.
+The returned complete generation is ready for the ordinary expected-authority
+publisher; building it does not itself select a new authority.
+
+### Roll back the most recent authority publication
+
+`authority-rollback` restores the immediate predecessor still held by the
+authenticated authority slots. It works after a process restart and uses the
+existing component images without loading a model or re-embedding documents:
+
+```sh
+./target/release/frankensearch-native authority-rollback \
+  --from-receipt "$HOME/frankensearch-authority/g2.json" \
+  --target-receipt "$HOME/frankensearch-authority/g1.json" \
+  --receipt "$HOME/frankensearch-authority/rollback-g3.json"
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/rollback-g3.json" \
+  --model-dir /absolute/path/to/g1/models \
+  --query 'retry network requests' --limit 10
+```
+
+The current and target receipts must identify the same root, cooperative-local
+security profile, and semantic tier. Both complete generations must pass bounded
+admission. The target must be the current manifest's exact predecessor and must
+still occupy the other authenticated physical slot. A receipt for an arbitrary
+older generation is insufficient. This command requires a healthy current
+closure; it does not repair corrupt components or discover historical targets.
+
+Rollback publishes a new `Rollback` activation at the current authority sequence
+plus one. The target's artifact generation, source checkpoint, producer identity,
+document set, and vector/lexical/ANN/metadata images remain unchanged. Its
+retrieval mode is restored with those images. This can reverse a model migration;
+subsequent search requires the target producer's local model. No model, source,
+input, retrieval, or work-directory options are accepted by the rollback command.
+
+Predecessor admission is pinned to the captured current authority pair. A
+concurrent publication refuses admission or loses the normal exclusive
+publication fence. It never selects the winner as a replacement expectation.
+Only a fresh activation manifest is staged, and the new receipt must be outside
+the root. Existing components and receipts are preserved. The receipt records
+the complete prepared attempt before publication, so an interrupted result can
+be reconciled with:
+
+```sh
+./target/release/frankensearch-native authority-recover \
+  --receipt "$HOME/frankensearch-authority/rollback-g3.json"
+```
+
+Successful output reports `event: "rolled_back"`, `publication: "committed"`,
+`serving: "activated"`, the restored retrieval mode, `replaces` for the old
+current authority, and `restores` for the selected predecessor. The new receipt
+selects the higher authority sequence. Output failure after publication still
+reports the known committed state. An already running authority server keeps
+its retained generation until explicit activation; a producer-changing rollback
+requires restarting that server with the restored model.
+
+### Keep an authority generation warm across requests
+
+`authority-serve` opens one selected generation and loads its local producer once,
+then serves bounded JSONL requests from standard input:
+
+```sh
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --model-dir /absolute/path/to/installed/models --limit 10 --allow-activation
+```
+
+After the `ready` event, send requests such as:
+
+```json
+{"id":"first","query":"retry network requests","limit":10}
+{"id":"second","query":"connection pooling","limit":5}
+```
+
+Each request searches the retained vector, lexical and optional HNSW images with
+the warm producer. It does not reload models, rediscover component paths or follow
+the root's current authority implicitly. Publishing a newer generation elsewhere
+does not redirect an already running session. Results identify the authority,
+artifact generation, tier and actual retrieval mode used for that request.
+
+With `--allow-activation`, the stdin controller can explicitly install a newer
+receipt between requests. Send `op: "activate"`, `receipt` naming the new receipt,
+and `expected_authority` copied exactly from the session's last successful
+selection event. The new receipt must select a higher authority sequence in the
+same root, security profile and tier, with the same producer, embedding space and
+input contract. Intentional rollback can therefore install older artifact bytes
+under its new, higher authority sequence. A producer migration requires restarting
+the server with that generation's local model configuration.
+
+Activation admits the complete candidate through the root descriptor retained at
+startup and swaps readers only after all checks pass. A malformed, foreign,
+corrupt or stale activation reports a failed request and leaves the previous
+reader installed. Search requests cannot change activation permission, the image
+budget or the producer. With both activation and updates disabled, the session
+stays pinned to its startup generation.
+
+Input records are limited to 1 MiB. An oversized record stops the session without
+draining it; an ordinary invalid bounded request produces one failure response.
+Responses are completely encoded under the existing native CLI output bound
+before emission. Output failure stops the session. Send `quit`, `exit`, or EOF
+to finish. As with the existing native stdio server, input reads block on the
+owning lane, and cancellation is observed between reads and requests.
+
+### Publish edits through the warm authority server
+
+Add `--allow-updates` to let the stdin controller apply durable incremental
+updates using the already loaded model:
+
+```sh
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --allow-updates --batch-size 64 --max-source-bytes 268435456
+```
+
+The `ready` response advertises `updates_enabled`, the mutation count limit,
+batch size and source-export budget. Each update is one JSON object with these
+fields:
+
+| Field | Value |
+|---|---|
+| `op` | `"update"` |
+| `id` | Optional request ID |
+| `expected_authority` | The exact byte array from the session's latest `ready`, `results`, `activated`, or `updated` response |
+| `work_dir` | A new absolute work-directory path |
+| `new_receipt` | A new absolute receipt-file path |
+| `source_low`, `source_high` | The explicit inclusive source checkpoint, with neither boundary moving backward |
+| `changes` | An array of the upsert/delete objects accepted by `authority-update` |
+
+An update contains at most 1,000 mutation records, counting overwritten edits,
+and must fit within the existing 1 MiB request limit. Every record is validated;
+the final operation for each ID wins. Empty `changes` may advance the checkpoint.
+The complete resulting cohort must remain nonempty and satisfy the same
+100,000-document, 16 MiB record and 256 MiB encoded-source limits as the one-shot
+command. Destinations must be UTF-8 paths of at most 4,096 bytes, outside the
+selected root and separate from each other. `--batch-size` on the server
+requires `--allow-updates`; `--max-source-bytes` also bounds filtered queries
+when writes are disabled.
+
+The server verifies that its retained authority pair is still current before
+source export or inference. It preserves that exact pair throughout the build.
+The original model, tier, F16/F32 encoding, retrieval policy and graph parameters
+remain fixed. Unchanged content, including metadata-only edits, reuses its stored
+vector. Complete successor images are built and admitted through the same path
+as `authority-update`.
+
+The new recovery receipt is synced before publication. A successful update
+installs the exact admitted reader returned by the publisher, then acknowledges
+`event: "updated"`, `publication: "committed"`, and `serving: "activated"`.
+The response includes the new `authority`, `selection`, `receipt`, final
+`documents` count, `edited_ids` count and `previous_authority`. Subsequent
+queries use that selection without reloading the model. Update requests are
+serialized with queries, so a long build occupies the request loop.
+
+When the session has a fixed filter, the complete successor source and its
+eligible membership are prepared before publication under the configured query
+source budget. The acknowledged update installs the new receipt, reader and
+scope together. Metadata-only changes can therefore move a document into or out
+of scope while reusing its vector. Empty membership stays restricted, and later
+updates can populate it again. A source-budget or predicate refusal preserves
+the old authority and scope; unfiltered sessions skip this scope preparation.
+
+Update permission includes installation of its own successful successor.
+`--allow-activation` independently permits selecting a receipt published
+elsewhere. A stale client, an externally advanced root, invalid edits or a
+losing publication preserves the current warm reader. After an external advance,
+explicitly activate the winning receipt before updating again.
+
+Failure responses keep the serving `authority` separate from any
+`candidate_authority`. They report `publication` as `not_committed`,
+`unknown`, or `committed`, and `serving` as `not_activated` when the
+candidate was not installed. A `receipt` is included only once its saved
+recovery attempt is known to be durable. If publication is uncertain, run
+`authority-recover` with that receipt before continuing. An unresolved attempt
+or stale base refuses further writes. Existing retained readers remain available.
+
+Cancellation after acknowledged publication does not erase its outcome, and a
+broken output stream ends the session while retaining the known publication and
+activation status in the terminal error. The server never retries an uncertain
+write automatically.
+
+### Filter fixed-authority search and warm requests
+
+`authority-search --filter JSON` and `authority-serve --filter JSON` use the
+same source predicate as ordinary native search: an optional exact `ids` set,
+a literal `id_prefix`, and exact string-valued `metadata`. All present
+constraints must match. Comparisons are case-sensitive; no glob, expression,
+or path interpretation is applied.
+
+```sh
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --query 'retry transient failures' --limit 10 \
+  --filter '{"id_prefix":"src/","metadata":{"language":"rust"}}'
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --model-dir /absolute/path/to/installed/models --allow-activation \
+  --filter '{"metadata":{"project":"client"}}' --max-source-bytes 134217728
+```
+
+The server's fixed filter is evaluated once against its retained source. Each
+search request may add a `filter` object. This narrows the fixed membership;
+it cannot widen or replace it:
+
+```jsonl
+{"id":"rust","query":"retry requests","filter":{"id_prefix":"src/","metadata":{"language":"rust"}}}
+{"id":"all-allowed","query":"retry requests","filter":{}}
+{"id":"none","query":"retry requests","filter":{"ids":[]}}
+```
+
+An absent or null request filter preserves the fixed scope. An empty object
+adds no restriction; `ids: []` selects no documents. Filtered result frames
+report `scope.filtered: true` and `scope.eligible_documents`, the number of
+eligible source documents before query matching. Empty scopes return no hits
+and perform no query inference, while still requiring the selected producer
+identity and local model.
+
+Both vector and lexical candidates are restricted before normalization,
+fusion, and winner hydration. Retrieval widens within the same immutable
+generation to find eligible candidates instead of discarding a completed
+top-k page. HNSW remains approximate, and lexical scoring retains whole-corpus
+statistics. A selective lexical query can examine the full matching cohort.
+
+`--max-source-bytes` bounds complete stored-source export using the raw-field
+accounting described for retained-source rebuilds, with a 256 MiB default. It
+does not bound total process memory. A fixed server scope retains that source
+once and reuses it for narrowed requests. Without a fixed scope, a filtered
+request exports its own bounded source; unfiltered searches export none.
+Requests cannot increase the configured budget. Filters retain the existing
+limits of 4096 IDs, 64 metadata fields, and 64 KiB of decoded filter text.
+Invalid filters fail the request without producing an unrestricted result.
+
+Explicit activation evaluates the fixed filter against the newly admitted
+generation before replacing any session state. Source validation, budget, or
+policy failure preserves the previous reader and its membership. Previously
+retained library scopes likewise keep their original source and authority
+across publication and rollback; they are not live revocation mechanisms.
+Library callers can retain an `Arc<NativeGenerationSnapshot>`, call
+`snapshot.scope(&cx, max_source_bytes, predicate)`, and use `narrow` to derive
+an intersected scope without exporting the source again.
 
 ### Quality models, budgets, and publication recovery
 
@@ -176,6 +573,8 @@ exceed the image size recorded by the trusted receipt. This bounds encoded
 images, not model memory, query scratch space, page cache, or other retained
 readers. Indexing inference batches default to 64 documents on this route and
 can be selected with `--batch-size`.
+HNSW graph bytes count toward this same aggregate budget during building,
+staging, selected-reader admission, and recovery.
 
 The publication budget also applies when activating a reader after the commit.
 If another publisher selects a larger generation in that interval, admission
@@ -261,6 +660,8 @@ using `QualifiedGenerationRoot::stage_immutable_file`, prepare an attempt agains
 publish it through `GenerationPublisherV1::publish_prepared`. The normal publisher
 re-admits the retained objects and applies the configured anti-rollback floor.
 Use the target's original vector binding when admitting the resulting reader.
+For an HNSW target, those receipts retain its graph and native owner binding;
+rollback preserves its retrieval mode, parameters and seed as well as its vectors.
 
 An intervening publication causes the stale rollback attempt to lose its exact
 comparison. Existing readers keep their original bytes throughout successful
@@ -268,10 +669,20 @@ rollback or failure. This is a retained-snapshot library API; it does not add
 historical discovery through paths or a rollback CLI command.
 
 The authority commands provide initial publication, full-cohort successor
-rebuilds, exact selected search, and publication recovery. The existing
+rebuilds, authority-selected exact or HNSW search, warm stdio serving with explicit
+activation, and publication recovery. The existing
 `update`, `rebuild`, and `serve` commands
 continue to use their own selected-snapshot receipts. Work files and staged
 candidates remain available after success or failure.
+
+The library entry points retain their existing names:
+`NativeIndexBuilder::build_exact_generation` and
+`NativeGenerationSnapshot::admit_exact`. Here, "exact" describes the complete
+component authority contract. Select `NativeBuildRetrieval::Hnsw` on the builder
+to include a native graph, and use `retrieval_configuration()` on a built or
+admitted generation to preserve its validated policy. This route still admits
+one vector tier per generation; combined fast/quality and sharded authority
+descriptors remain outside its supported shape.
 
 ## Native quality without the ONNX feature bundle
 

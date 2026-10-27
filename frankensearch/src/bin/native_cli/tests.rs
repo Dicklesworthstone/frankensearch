@@ -11,6 +11,56 @@ fn options(args: &[&str]) -> Options {
 }
 
 #[test]
+fn stopped_command_pool_is_refused_before_input_models_or_candidate_paths() {
+    use asupersync::runtime::blocking_pool::BlockingPool;
+    use std::time::Duration;
+
+    run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().unwrap();
+        let stopped = BlockingPool::new(0, 1);
+        let handle = stopped.handle();
+        assert!(stopped.shutdown_and_wait(Duration::from_secs(10)));
+        for command in [Command::Index, Command::Update, Command::Rebuild] {
+            let mut options =
+                options(&["index", "--index-dir", "unused", "--receipt", "unused.json"]);
+            options.command = command;
+            let candidate = dir.path().join(format!("{command:?}"));
+            options.directory = Some(candidate.clone());
+            options.receipt = dir.path().join("missing-predecessor.json");
+            options.new_receipt = Some(dir.path().join("new-selection.json"));
+            options.input = Some(dir.path().join("missing-input.jsonl"));
+            options.models = Some(dir.path().join("missing-models"));
+            let mut output = Vec::new();
+            // Test the update entry points directly too: a provided pool must
+            // reach their build Cx even without dispatch through main execute.
+            let error = match command {
+                Command::Index => execute(&cx, options, &mut output, Some(handle.clone())).await,
+                Command::Update => {
+                    update::execute(&cx, &options, &mut output, Some(handle.clone())).await
+                }
+                Command::Rebuild => {
+                    update::rebuild(&cx, &options, &mut output, Some(handle.clone())).await
+                }
+                Command::Search | Command::Serve => unreachable!(),
+            }
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<frankensearch::SearchError>(),
+                Some(frankensearch::SearchError::SubsystemError {
+                    subsystem: "native_cli.execution",
+                    ..
+                })
+            ));
+            assert!(!candidate.exists());
+            assert!(!dir.path().join("new-selection.json").exists());
+            assert!(output.is_empty());
+        }
+        let inherited = cx.with_blocking_pool_handle(Some(handle));
+        assert!(execution_context(&inherited, None).is_err());
+    });
+}
+
+#[test]
 fn parser_requires_explicit_destinations_and_rejects_inapplicable_options() {
     let index = options(&["index", "--index-dir", "new", "--receipt", "selected.json"]);
     assert_eq!(index.command, Command::Index);

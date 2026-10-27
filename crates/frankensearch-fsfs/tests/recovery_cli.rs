@@ -128,6 +128,104 @@ fn command_help_and_usage_errors_do_not_create_a_store() {
 }
 
 #[test]
+fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() {
+    use frankensearch_fsfs::FsfsConfig;
+    use frankensearch_fsfs::config::DegradationOverrideMode;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source = directory.path().join("source");
+    let root = directory.path().join("store");
+    let receipt = directory.path().join("prepared.json");
+    let config_path = directory.path().join("recovery.toml");
+    fs::create_dir(&source).unwrap();
+    fs::write(
+        source.join("alpha.md"),
+        "recoverystagingsentinel initial document",
+    )
+    .unwrap();
+    let mut config = FsfsConfig::default();
+    config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+    config.indexing.offline = true;
+    config.search.rerank = false;
+    "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
+    fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+    let configure = |command: &mut Command| {
+        command
+            .current_dir(directory.path())
+            .arg("--index-dir")
+            .arg(&root)
+            .arg("--config")
+            .arg(&config_path)
+            .env("HOME", directory.path())
+            .env("XDG_CONFIG_HOME", directory.path().join("empty-config"))
+            .env(
+                "FRANKENSEARCH_MODEL_DIR",
+                directory.path().join("missing-models"),
+            )
+            .env("FRANKENSEARCH_CHECK_UPDATES", "0");
+    };
+    let mut prepare = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    configure(&mut prepare);
+    prepare
+        .arg("--rebuild-source")
+        .arg(&source)
+        .args(["--prepare", "--query", "recoverystagingsentinel"])
+        .arg("--save-preparation")
+        .arg(&receipt);
+    let output = run(&mut prepare, directory.path(), Duration::from_secs(120));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let prepared = body(&output)["data"].clone();
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["source_rebuild_performed"], true);
+    assert_eq!(prepared["selection_write_performed"], false);
+    assert_eq!(prepared["preview"][0]["hits"][0]["path"], "alpha.md");
+    assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
+    let target = root
+        .join("generations")
+        .join(prepared["generation_id"].as_str().unwrap());
+    let sealed = files(&target);
+    fs::rename(&source, directory.path().join("source-unavailable")).unwrap();
+
+    let mut apply = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    configure(&mut apply);
+    apply.arg("--resume-file").arg(&receipt).args([
+        "--apply",
+        "--query",
+        "recoverystagingsentinel",
+    ]);
+    let output = run(&mut apply, directory.path(), Duration::from_secs(120));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let restored = body(&output)["data"].clone();
+    assert_eq!(restored["state"], "restored_durable");
+    assert_eq!(restored["generation_id"], prepared["generation_id"]);
+    assert_eq!(restored["source_rebuild_performed"], false);
+    assert_eq!(restored["preview"][0]["hits"][0]["path"], "alpha.md");
+    assert_eq!(files(&target), sealed);
+
+    let mut search = Command::new(env!("CARGO_BIN_EXE_fsfs"));
+    search.args(["search", "recoverystagingsentinel"]);
+    configure(&mut search);
+    search.args(["--no-daemon", "--format", "json", "--quiet"]);
+    let output = run(&mut search, directory.path(), Duration::from_secs(120));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_eq!(body(&output)["data"]["hits"][0]["path"], "alpha.md");
+    assert_eq!(files(&target), sealed);
+    assert!(!directory.path().join("missing-models").exists());
+}
+
+#[test]
 fn confirmation_survives_invalid_config_and_missing_models_without_republication() {
     run_test_with_cx(|cx| async move {
         use std::os::unix::fs::MetadataExt;

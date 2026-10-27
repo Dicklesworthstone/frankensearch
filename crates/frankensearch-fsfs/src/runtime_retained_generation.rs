@@ -3,6 +3,12 @@
 // source of truth. The existing runtime source is left byte-for-byte intact.
 include!("runtime.rs");
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetainedBuildKind {
+    Index,
+    Recovery,
+}
+
 /// A reusable search reader bound to one admitted complete generation.
 ///
 /// Publishing a successor does not retarget this reader. Open a new reader to
@@ -107,7 +113,7 @@ impl RetainedSearchReader {
     fn search_mode(&self) -> SearchResult<SearchExecutionMode> {
         degraded_search_mode(
             self.runtime.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.runtime.requested_search_mode(),
         )
     }
 }
@@ -391,7 +397,7 @@ impl FsfsRuntime {
         // refuses search opens the least; each search then reports the refusal.
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )
         .unwrap_or(SearchExecutionMode::LexicalOnly);
         let resources = Box::pin(
@@ -470,6 +476,31 @@ impl FsfsRuntime {
     where
         F: FnOnce(&Cx) -> SearchResult<()> + Send,
     {
+        let (build, summary, candidate_mode) = self
+            .build_retained_generation(cx, store_root, RetainedBuildKind::Index)
+            .await?;
+        let publication = build.publish_with_precommit(
+            cx,
+            |_, path| Self::validate_search_generation_at_root(path, candidate_mode),
+            precommit,
+        )?;
+        Ok((publication, summary))
+    }
+
+    // Share the real source indexer, reuse policy and admission between direct
+    // indexing and explicit build/preview/publish recovery. The build keeps its
+    // original predecessor and lease through every async indexing boundary.
+    #[allow(clippy::future_not_send)]
+    async fn build_retained_generation(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        kind: RetainedBuildKind,
+    ) -> SearchResult<(
+        crate::generation_store::GenerationBuild,
+        FsfsIndexPayload,
+        SearchExecutionMode,
+    )> {
         use crate::generation_store::CompleteGenerationStore;
 
         retained_search_checkpoint(cx)?;
@@ -484,7 +515,10 @@ impl FsfsRuntime {
             });
         }
         let store = CompleteGenerationStore::create(cx, store_root)?;
-        let build = store.begin(cx)?;
+        let build = match kind {
+            RetainedBuildKind::Index => store.begin(cx)?,
+            RetainedBuildKind::Recovery => store.begin_recovery_rebuild(cx)?,
+        };
         let mut input = self.cli_input.clone();
         input.command = CliCommand::Index;
         input.target_path = Some(target_root);
@@ -496,6 +530,11 @@ impl FsfsRuntime {
         // unrelated runtime with no blocking pool.
         let mut candidate = self.clone().with_cli_input(input);
         candidate.config.indexing.watch_mode = false;
+        if kind == RetainedBuildKind::Recovery {
+            candidate.cli_input.full_reindex = true;
+            candidate.unchanged_sources = None;
+            candidate.seeded_from_receipt = false;
+        }
         candidate.discovery_excluded_root = Some(store.root().to_path_buf());
         let summary =
             Box::pin(candidate.run_retained_index_with_reuse(cx, &store, build.path())).await?;
@@ -520,12 +559,7 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
-        let publication = build.publish_with_precommit(
-            cx,
-            |_, path| Self::validate_search_generation_at_root(path, candidate_mode),
-            precommit,
-        )?;
-        Ok((publication, summary))
+        Ok((build, summary, candidate_mode))
     }
 
     /// Insert or replace the supplied JSONL documents in a complete successor.

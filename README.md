@@ -705,6 +705,19 @@ and `degraded` profiles keep quality disabled: a winning `fast_only=false`
 returns a configuration error naming the profile. A hard pause disables quality
 after source precedence and records the safety clamp in profile diagnostics.
 
+`fsfs search --quality-only "query"` searches the quality vector tier directly,
+without running lexical or fast-vector retrieval. Ordinary searches return one
+`Initial` phase with `skip_reason="quality_only"`; `--expand` can additionally
+produce a `Refined` ranking from quality-only query variants. The mode supports the same filters, limits,
+streaming output and daemon transport as ordinary search. The selected quality
+model and its compatible index must be available; missing models, incompatible
+vectors, cancellation and quality timeouts are errors. This mode does not fall
+back to another tier. It conflicts with `--fast-only` or a resolved
+`search.fast_only=true`; use `--no-fast-only` when the configuration disables
+quality, with a pressure profile that permits it. Lite builds and forced
+lexical-only pressure mode refuse quality-only requests. Raw `fsfs serve`
+requests select it with `"mode":"quality_only"` (or `"quality"`).
+
 Common environment variables:
 
 | Variable | Purpose | Example |
@@ -1049,9 +1062,9 @@ or both before sharing the index with a `TwoTierSearcher`:
 ```rust,ignore
 use frankensearch_index::native_hnsw::HnswParams;
 
-// `index` is an already admitted FSVI v2 TwoTierIndex.
-index.enable_native_fast_hnsw(HnswParams::default(), 42)?;
-index.enable_native_quality_hnsw(HnswParams::default(), 43)?;
+// `index` is an already admitted FSVI v2 TwoTierIndex; `cx` is the caller's &Cx.
+index.enable_native_fast_hnsw(cx, HnswParams::default(), 42)?;
+index.enable_native_quality_hnsw(cx, HnswParams::default(), 43)?;
 ```
 
 Each graph shares its retained vector owner. The progressive fast phase retrieves
@@ -1068,7 +1081,13 @@ admission, bypassing native ANN and MRL candidate selection. Native retrieval is
 available through `ActivatedTierSearch` and `TwoTierSearcher`; the raw-vector
 `TwoTierIndex::search_fast` API keeps its existing path.
 
-Graph construction is synchronous. Generation replacement builds every requested
+Graph construction through these low-level index methods is synchronous.
+For document-to-index construction, `NativeIndexBuilder` uses the blocking pool
+carried by the caller's `Cx`, or an explicit `with_blocking_pool` override, for
+vector sealing, admission, graph construction and persistence. The caller owns
+and drains that pool; callers without one provide a suitable synchronous lane.
+
+Generation replacement builds every requested
 successor graph before installing new state; failure leaves the current index
 intact. The quality policy survives a successor that temporarily has no quality
 tier. To retain the graphs across process restarts, explicitly save both graphs

@@ -2034,7 +2034,7 @@ impl TwoTierSearcher {
                 let embeddings = TieredQueryEmbeddings::fast_only(bound);
                 // Exact and native retrieval both admit the actual response
                 // before touching retained vector bytes or invoking filters.
-                self.index.activate_owner_backed_search(&embeddings)?;
+                self.index.activate_owner_backed_search(cx, &embeddings)?;
                 cancellation_checkpoint(cx, "fast_activation_to_search")?;
                 self.index.has_native_fast_hnsw().then_some(embeddings)
             }
@@ -2160,7 +2160,7 @@ impl TwoTierSearcher {
                         (None, Some(embeddings)) => {
                             let hits = self
                                 .index
-                                .activate_owner_backed_search(embeddings)?
+                                .activate_owner_backed_search(cx, embeddings)?
                                 .search_fast(semantic_budget)?;
                             cancellation_checkpoint(cx, "native_fast_search_to_filter")?;
                             let zero_signal = if hits.is_empty() {
@@ -2179,7 +2179,7 @@ impl TwoTierSearcher {
                         (Some(params), embeddings) => {
                             let hits = if let Some(embeddings) = embeddings {
                                 let activated =
-                                    self.index.activate_owner_backed_search(embeddings)?;
+                                    self.index.activate_owner_backed_search(cx, embeddings)?;
                                 let fast =
                                     activated.fast().ok_or_else(|| SearchError::InvalidConfig {
                                         field: "search_activation.fast".to_owned(),
@@ -2229,7 +2229,7 @@ impl TwoTierSearcher {
                     && let Some(embeddings) = native_embeddings.as_ref()
                 {
                     cancellation_checkpoint(cx, "native_fast_filter_to_coverage")?;
-                    let activated = self.index.activate_owner_backed_search(embeddings)?;
+                    let activated = self.index.activate_owner_backed_search(cx, embeddings)?;
                     metrics.coverage = Some(activated.coverage(&fast_hits, semantic_budget)?);
                     cancellation_checkpoint(cx, "native_fast_coverage_to_fusion")?;
                 }
@@ -2551,7 +2551,7 @@ impl TwoTierSearcher {
             // provider's advertised identity cannot relabel a foreign response.
             let bound = BoundQueryEmbedding::new(quality_vec.clone(), identity.clone())?;
             let embeddings = TieredQueryEmbeddings::quality_only(bound);
-            self.index.activate_owner_backed_search(&embeddings)?;
+            self.index.activate_owner_backed_search(cx, &embeddings)?;
             cancellation_checkpoint(cx, "quality_activation_to_prf")?;
         }
 
@@ -2667,7 +2667,7 @@ impl TwoTierSearcher {
                 cancellation_checkpoint(cx, "quality_identity_to_activation")?;
                 let bound = BoundQueryEmbedding::new(quality_vec.clone(), quality_identity)?;
                 let embeddings = TieredQueryEmbeddings::quality_only(bound);
-                let activated = self.index.activate_owner_backed_search(&embeddings)?;
+                let activated = self.index.activate_owner_backed_search(cx, &embeddings)?;
                 cancellation_checkpoint(cx, "quality_activation_to_search")?;
                 let hits = activated.search_quality(quality_budget)?;
                 cancellation_checkpoint(cx, "quality_search_to_coverage")?;
@@ -5880,9 +5880,10 @@ mod tests {
         )
         .unwrap();
         if layout == "native-v2" {
+            let cx = Cx::for_testing();
             let params = frankensearch_index::native_hnsw::HnswParams::default();
-            index.enable_native_fast_hnsw(params, 43).unwrap();
-            index.enable_native_quality_hnsw(params, 47).unwrap();
+            index.enable_native_fast_hnsw(&cx, params, 43).unwrap();
+            index.enable_native_quality_hnsw(&cx, params, 47).unwrap();
         } else {
             assert_eq!(layout, "exact-v2");
         }
@@ -6814,12 +6815,12 @@ mod tests {
                     let asynchronous = matches!(mode, "native-async" | "refused-reload");
                     if native && !index.has_native_fast_hnsw() {
                         let index = Arc::get_mut(&mut index).expect("previous searcher dropped");
-                        index.enable_native_fast_hnsw(params, 17).unwrap();
+                        index.enable_native_fast_hnsw(&cx, params, 17).unwrap();
                     }
                     if native_quality && with_quality && !index.has_native_quality_hnsw() {
                         Arc::get_mut(&mut index)
                             .expect("previous searcher dropped")
-                            .enable_native_quality_hnsw(params, 19)
+                            .enable_native_quality_hnsw(&cx, params, 19)
                             .unwrap();
                     }
                     if mode == "reopened" {
@@ -6881,8 +6882,8 @@ mod tests {
                                 &artifact_binding("native-progressive-quality", 4, 66),
                             );
                             let stale = Arc::get_mut(&mut stale).unwrap();
-                            stale.enable_native_fast_hnsw(params, 17).unwrap();
-                            stale.enable_native_quality_hnsw(params, 19).unwrap();
+                            stale.enable_native_fast_hnsw(&cx, params, 17).unwrap();
+                            stale.enable_native_quality_hnsw(&cx, params, 19).unwrap();
                             let stale_fast_path = stale_dir.join("fast.fshnsw");
                             let stale_quality_path = stale_dir.join("quality.fshnsw");
                             stale.save_native_fast_hnsw(&stale_fast_path).unwrap();
@@ -7049,6 +7050,7 @@ mod tests {
             Arc::get_mut(&mut index)
                 .unwrap()
                 .enable_native_fast_hnsw(
+                    &cx,
                     frankensearch_index::native_hnsw::HnswParams::default(),
                     23,
                 )
@@ -7134,6 +7136,7 @@ mod tests {
                 Arc::get_mut(&mut index)
                     .unwrap()
                     .enable_native_fast_hnsw(
+                        &cx,
                         frankensearch_index::native_hnsw::HnswParams::default(),
                         29,
                     )
@@ -7189,6 +7192,7 @@ mod tests {
             Arc::get_mut(&mut index)
                 .unwrap()
                 .enable_native_fast_hnsw(
+                    &cx,
                     frankensearch_index::native_hnsw::HnswParams::default(),
                     31,
                 )
@@ -7268,6 +7272,7 @@ mod tests {
             .unwrap();
             index
                 .enable_native_fast_hnsw(
+                    &cx,
                     frankensearch_index::native_hnsw::HnswParams {
                         m0: 2,
                         ef_search: 1,
@@ -7337,6 +7342,7 @@ mod tests {
                     Arc::get_mut(&mut index)
                         .expect("previous searcher released its index")
                         .enable_native_quality_hnsw(
+                            &cx,
                             frankensearch_index::native_hnsw::HnswParams::default(),
                             7,
                         )
@@ -7429,6 +7435,7 @@ mod tests {
             Arc::get_mut(&mut index)
                 .expect("the native fixture has one owner")
                 .enable_native_quality_hnsw(
+                    &cx,
                     frankensearch_index::native_hnsw::HnswParams::default(),
                     11,
                 )
@@ -7537,6 +7544,7 @@ mod tests {
             Arc::get_mut(&mut index)
                 .expect("the native fixture has one owner")
                 .enable_native_quality_hnsw(
+                    &cx,
                     frankensearch_index::native_hnsw::HnswParams::default(),
                     13,
                 )

@@ -401,7 +401,7 @@ pub struct SearchPayload {
     /// Why the semantic lane did not fully participate, when that is known.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub skip_reason: Option<String>,
-    /// Published fast-tier embedder identity for the searched FSVI.
+    /// Published embedder identity for the searched primary FSVI tier.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub vector_generation_id: Option<String>,
     /// True when that identity is a hash/fnv control artifact.

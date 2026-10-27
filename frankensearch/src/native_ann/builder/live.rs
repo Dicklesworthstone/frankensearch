@@ -412,8 +412,9 @@ impl NativeLiveHybridUpdate {
 
     /// Build a complete hybrid candidate without holding a serving-selection lock.
     ///
-    /// Inference is incremental; vector/graph and lexical rebuilding still have
-    /// full-cohort costs. Dropping this pending future cannot install a partial
+    /// Inference and eligible native graph construction are incremental; vector,
+    /// source and lexical artifacts still have full-cohort costs. Dropping this
+    /// pending future cannot install a partial
     /// candidate. Finish with [`NativeLiveHybridIndex::install`], which refuses
     /// this candidate if another update has won in the meantime.
     ///

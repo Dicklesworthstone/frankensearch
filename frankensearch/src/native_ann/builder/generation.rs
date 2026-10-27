@@ -1,4 +1,4 @@
-//! Source-owned exact components for the fixed generation-authority publisher.
+//! Source-owned native components for the fixed generation-authority publisher.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -17,18 +17,23 @@ use frankensearch_core::generation::{
 use frankensearch_fusion::generation_publication::{
     GenerationCandidateV1, GenerationPublicationErrorV1,
 };
-use frankensearch_index::exact_component_adapters::vector_component_receipt;
+use frankensearch_index::exact_component_adapters::{
+    ann_component_receipt, vector_component_receipt,
+};
 use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
+use frankensearch_index::native_hnsw::{NativeHnswGenerationReceiptV2, ValidatedNativeHnsw};
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
 
-use super::super::{checkpoint, invalid, lower_hex};
+use super::super::generation::NATIVE_ANN_RECEIPT_KEY;
+use super::super::{NativeRetrievalMode, checkpoint, invalid, lower_hex};
+use super::scope::PreparedNativeGenerationScope;
 use super::{NativeBuildRetrieval, NativeBuiltTier, NativeIndexBuilder, hybrid};
-use crate::{Cx, SearchResult};
+use crate::{Cx, IndexableDocument, SearchResult};
 
-/// Complete owned vector, lexical, and metadata images from one source cohort.
+/// Complete owned vector, lexical, metadata, and optional native ANN images.
 ///
-/// The only constructor builds all three components and joins their actual
+/// The only constructor builds every component from one source cohort and joins its actual
 /// document-set/checkpoint receipts. No arbitrary reader or caller-provided
 /// checksum can construct this payload. Images remain usable after the build
 /// directory is moved or removed. Publication still requires the qualified-root
@@ -38,21 +43,28 @@ pub struct NativeBuiltExactGeneration {
     metadata: GenerationManifest,
     components: ExactGenerationComponentsV1,
     vector: Arc<[u8]>,
+    ann: Option<Arc<[u8]>>,
     lexical: Arc<[u8]>,
     metadata_bytes: Arc<[u8]>,
+    retrieval: NativeBuildRetrieval,
     max_image_bytes: usize,
 }
 
 impl NativeIndexBuilder {
-    /// Build a single exact vector tier and its complete immutable Quill cohort.
+    /// Build a single vector tier and its complete immutable Quill cohort.
     ///
     /// `tier` labels the explicitly supplied primary provider as fast or quality;
     /// a quality-only generation does not load or invent a fast provider. A
-    /// second provider, HNSW, an empty cohort, and an unrepresentable source range are
+    /// second provider, an empty cohort, and an unrepresentable source range are
     /// refused before inference or file creation. The source range is supplied
     /// by the caller that owns the source cut, not inferred from document IDs.
     ///
-    /// The encoded-image budget includes all three components and reserves the
+    /// The selected retrieval policy is preserved: HNSW includes a verified raw
+    /// graph image and its full owner-bound receipt in the metadata image.
+    /// "Exact" names the complete component authority contract, not a requirement
+    /// to use exhaustive vector search.
+    ///
+    /// The encoded-image budget includes every component and reserves the
     /// maximum activation-manifest size. It is not a process-memory or work-file
     /// limit. Quill is populated in the admitted FSVI's physical live-row order,
     /// which can differ from source-ID order. Its stored fields are checked
@@ -73,11 +85,11 @@ impl NativeIndexBuilder {
         max_image_bytes: usize,
     ) -> SearchResult<NativeBuiltExactGeneration> {
         checkpoint(cx, "native_ann.builder.generation_start")?;
-        if self.quality.is_some() || !matches!(self.fast.retrieval, NativeBuildRetrieval::Exact) {
+        if self.quality.is_some() {
             return Err(invalid(
                 "builder.generation.plan",
                 "unsupported",
-                "exact authority generations require exactly one provider and no ANN",
+                "authority generations require exactly one vector provider",
             ));
         }
         if self.documents.is_empty()
@@ -96,8 +108,11 @@ impl NativeIndexBuilder {
         let component_budget =
             remaining_budget(max_image_bytes, GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V2)?;
         let started = timestamp_millis()?;
+        let retrieval = self.fast.retrieval;
         let vectors = Box::pin(self.build(cx)).await?;
         let (vector, owner) = capture_vector(cx, vectors.fast(), component_budget)?;
+        let after_vector = remaining_budget(component_budget, vector.len())?;
+        let native_ann = capture_ann(cx, vectors.fast(), Arc::clone(&owner), after_vector)?;
         let source_checkpoint = SourceCheckpointV1::derive(&source);
         let mut ordered = Vec::with_capacity(owner.live_count());
         for physical in 0..owner.record_count() {
@@ -123,7 +138,21 @@ impl NativeIndexBuilder {
             ordered.iter().map(|document| document.id.as_str()),
         )
         .map_err(|error| invalid("builder.generation.docset", "invalid", &error.to_string()))?;
-        let lexical_budget = remaining_budget(component_budget, vector.len())?;
+        let ann_receipt = native_ann
+            .as_ref()
+            .map(|(_, receipt)| {
+                ann_component_receipt(
+                    receipt,
+                    ordered.iter().map(|document| document.id.as_str()),
+                    source_checkpoint,
+                )
+                .map_err(|error| invalid("builder.generation.ann", "receipt", &error.to_string()))
+            })
+            .transpose()?;
+        let lexical_budget = remaining_budget(
+            after_vector,
+            native_ann.as_ref().map_or(0, |(bytes, _)| bytes.len()),
+        )?;
         let (writer, reader, _seal) =
             hybrid::create_lexical(cx, &vectors.directory().join("lexical"), ordered).await?;
         hybrid::cohort::validate(cx, &reader, vectors.documents())?;
@@ -143,6 +172,7 @@ impl NativeIndexBuilder {
             owner.witness().record_count,
             &vector_receipt,
             image.receipt(),
+            native_ann.as_ref().map(|(_, receipt)| receipt),
         )?;
         let metadata_bytes: Arc<[u8]> = serde_json::to_vec(&metadata)
             .map_err(|error| {
@@ -165,7 +195,7 @@ impl NativeIndexBuilder {
         let components = ExactGenerationComponentsV1::admit(
             vector_receipt,
             image.receipt().clone(),
-            None,
+            ann_receipt,
             metadata_receipt,
         )
         .map_err(|error| invalid("builder.generation.components", "join", &error.to_string()))?;
@@ -175,8 +205,10 @@ impl NativeIndexBuilder {
             metadata,
             components,
             vector,
+            ann: native_ann.map(|(bytes, _)| bytes),
             lexical,
             metadata_bytes,
+            retrieval,
             max_image_bytes,
         })
     }
@@ -195,15 +227,32 @@ impl NativeBuiltExactGeneration {
         &self.metadata
     }
 
+    /// Actual retrieval mode whose complete component images are retained.
+    #[must_use]
+    pub const fn retrieval_mode(&self) -> NativeRetrievalMode {
+        match self.retrieval {
+            NativeBuildRetrieval::Exact => NativeRetrievalMode::Exact {
+                reason: super::super::NativeExactReason::Requested,
+            },
+            NativeBuildRetrieval::Hnsw { .. } => NativeRetrievalMode::Ann,
+        }
+    }
+
+    /// Construction/search parameters preserved in the authenticated generation.
+    #[must_use]
+    pub const fn retrieval_configuration(&self) -> NativeBuildRetrieval {
+        self.retrieval
+    }
+
     /// Share immutable component bytes without reopening the build directory.
-    /// The ANN role is absent for this explicitly exact generation.
+    /// The ANN role is present only when HNSW was explicitly selected.
     #[must_use]
     pub fn component_bytes(&self, role: GenerationComponentRole) -> Option<Arc<[u8]>> {
         match role {
             GenerationComponentRole::Vector => Some(Arc::clone(&self.vector)),
             GenerationComponentRole::Lexical => Some(Arc::clone(&self.lexical)),
             GenerationComponentRole::Metadata => Some(Arc::clone(&self.metadata_bytes)),
-            GenerationComponentRole::Ann => None,
+            GenerationComponentRole::Ann => self.ann.as_ref().map(Arc::clone),
         }
     }
 
@@ -249,6 +298,51 @@ impl NativeBuiltExactGeneration {
         cx: &Cx,
         candidate: &GenerationCandidateV1,
     ) -> SearchResult<()> {
+        self.admit_candidate(cx, candidate)?;
+        Ok(())
+    }
+
+    /// Prepare a complete source scope before staging or publishing a candidate.
+    ///
+    /// The actual retained vector, lexical, metadata and optional ANN images are
+    /// admitted against this exact candidate using the production reader checks.
+    /// Its full stored source must fit `max_source_bytes` before any predicate is
+    /// called. The budget and source semantics match
+    /// [`crate::native_ann::NativeGenerationSnapshot::source_documents`].
+    /// No model runs, pathname is reopened, or authority is changed. Predicates
+    /// run once per source document and are not retained. After publication,
+    /// [`PreparedNativeGenerationScope::bind`] checks and attaches the exact
+    /// admitted result without repeating source work or observing cancellation.
+    ///
+    /// # Errors
+    /// Refuses candidate/component drift, invalid stored source, budget
+    /// exhaustion, predicate errors and cancellation without a partial scope.
+    /// Predicate panics are not intercepted.
+    pub fn prepare_scope(
+        &self,
+        cx: &Cx,
+        candidate: &GenerationCandidateV1,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<PreparedNativeGenerationScope> {
+        let readers = self.admit_candidate(cx, candidate)?;
+        let source = readers.source_documents(cx, max_source_bytes)?;
+        PreparedNativeGenerationScope::from_source(
+            cx,
+            candidate.authority(),
+            candidate.manifest().components(),
+            self.binding.clone(),
+            self.metadata.vector_artifacts[0].embedder_tier,
+            source,
+            accept,
+        )
+    }
+
+    fn admit_candidate(
+        &self,
+        cx: &Cx,
+        candidate: &GenerationCandidateV1,
+    ) -> SearchResult<super::super::generation::CompositeReaders> {
         super::super::generation::admit_components(
             cx,
             candidate.manifest(),
@@ -260,9 +354,9 @@ impl NativeBuiltExactGeneration {
                 Arc::clone(&self.lexical),
                 Arc::clone(&self.metadata_bytes),
             ],
+            self.ann.as_ref().map(Arc::clone),
             self.max_image_bytes,
-        )?;
-        Ok(())
+        )
     }
 }
 
@@ -270,7 +364,7 @@ fn capture_vector(
     cx: &Cx,
     tier: &NativeBuiltTier,
     budget: usize,
-) -> SearchResult<(Arc<[u8]>, ValidatedFsviBytes)> {
+) -> SearchResult<(Arc<[u8]>, Arc<ValidatedFsviBytes>)> {
     let retained = tier.index().owner_witness();
     let len = usize::try_from(retained.byte_len).map_err(|_| image_budget_error())?;
     if len > budget {
@@ -312,9 +406,63 @@ fn capture_vector(
         ));
     }
     checkpoint(cx, "native_ann.builder.generation_vector_complete")?;
-    Ok((bytes, owner))
+    Ok((bytes, Arc::new(owner)))
 }
 
+fn capture_ann(
+    cx: &Cx,
+    tier: &NativeBuiltTier,
+    owner: Arc<ValidatedFsviBytes>,
+    budget: usize,
+) -> SearchResult<Option<(Arc<[u8]>, NativeHnswGenerationReceiptV2)>> {
+    let (path, receipt) = match (tier.graph_path(), tier.graph_receipt.as_ref()) {
+        (None, None) => return Ok(None),
+        (Some(path), Some(receipt)) => (path, receipt),
+        _ => {
+            return Err(invalid(
+                "builder.generation.ann",
+                "missing",
+                "the completed native graph requires its retained owner-bound receipt",
+            ));
+        }
+    };
+    let len = usize::try_from(receipt.graph_byte_len).map_err(|_| image_budget_error())?;
+    if len > budget {
+        return Err(image_budget_error());
+    }
+    checkpoint(cx, "native_ann.builder.generation_ann_open")?;
+    let mut file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() != receipt.graph_byte_len {
+        return Err(invalid(
+            "builder.generation.ann",
+            "changed",
+            "the completed graph file differs from its retained build receipt",
+        ));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| image_budget_error())?;
+    let mut chunk = [0_u8; 16 * 1024];
+    while bytes.len() < len {
+        checkpoint(cx, "native_ann.builder.generation_ann_read")?;
+        let count = chunk.len().min(len - bytes.len());
+        file.read_exact(&mut chunk[..count])?;
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    if file.read(&mut chunk[..1])? != 0 {
+        return Err(image_budget_error());
+    }
+    checkpoint(cx, "native_ann.builder.generation_ann_admit")?;
+    let bytes: Arc<[u8]> = bytes.into();
+    ValidatedNativeHnsw::from_bytes(owner, Arc::clone(&bytes), receipt)
+        .map_err(|error| invalid("builder.generation.ann", "invalid", &error.to_string()))?;
+    checkpoint(cx, "native_ann.builder.generation_ann_complete")?;
+    Ok(Some((bytes, receipt.clone())))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_metadata(
     binding: &FsviV2IdentityBinding,
     tier: EmbedderTierTag,
@@ -323,6 +471,7 @@ fn build_metadata(
     record_count: u64,
     vector: &ExactComponentReceiptV1,
     lexical: &ExactComponentReceiptV1,
+    ann: Option<&NativeHnswGenerationReceiptV2>,
 ) -> SearchResult<GenerationManifest> {
     let tier_name = match tier {
         EmbedderTierTag::Fast => "fast",
@@ -374,6 +523,18 @@ fn build_metadata(
         total_documents: vector.live_document_count,
         metadata: BTreeMap::new(),
     };
+    if let Some(receipt) = ann {
+        let encoded = serde_json::to_string(receipt).map_err(|error| {
+            invalid(
+                "builder.generation.ann",
+                "serialization",
+                &error.to_string(),
+            )
+        })?;
+        metadata
+            .metadata
+            .insert(NATIVE_ANN_RECEIPT_KEY.to_owned(), encoded);
+    }
     metadata.manifest_hash = compute_manifest_hash(&metadata)?;
     require_valid(&validate_manifest(&metadata))?;
     Ok(metadata)

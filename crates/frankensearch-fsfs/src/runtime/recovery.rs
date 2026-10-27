@@ -28,7 +28,8 @@ fn retained_recovery_error(reason: &str) -> SearchError {
 pub struct PreparedRetainedRecovery {
     plan: crate::generation_store::PreparedGenerationRestore,
     reader: RetainedSearchReader,
-    // No preview is required, but an attempted preview must finish successfully.
+    // A source rebuild requires preview; receipt-directed recovery allows none.
+    // Every attempted preview must finish successfully.
     // Set false before any await so dropping a polled future cannot authorize a
     // restore, including when an earlier preview completed successfully.
     preview_ready: bool,
@@ -87,7 +88,9 @@ impl PreparedRetainedRecovery {
     /// Errors, cancellation, failed refinement and dropping an unfinished future
     /// block `restore`. A successful retry on this same preparation clears that
     /// block without rebasing the captured selection. Merely constructing an
-    /// unpolled future has no effect. Returned progressive payloads are unchanged.
+    /// unpolled future has no effect. A nonblank query and positive limit are
+    /// required: a no-op query cannot establish a successful recovery preview.
+    /// Returned progressive payloads are unchanged.
     ///
     /// # Errors
     /// Returns producer drift, retrieval, configuration or cancellation errors.
@@ -98,6 +101,12 @@ impl PreparedRetainedRecovery {
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
         self.preview_ready = false;
+        retained_search_checkpoint(cx)?;
+        if query.trim().is_empty() || limit == 0 {
+            return Err(retained_recovery_error(
+                "recovery preview requires a nonblank query and a positive limit",
+            ));
+        }
         self.reader.validate_retained_recovery_resources(cx)?;
         let result = self.reader.search(cx, query, limit).await;
         retained_search_checkpoint(cx)?;
@@ -166,6 +175,61 @@ impl PreparedRetainedRecovery {
 }
 
 impl FsfsRuntime {
+    /// Rebuild sources into a sealed inactive generation for explicit preview.
+    ///
+    /// The source directory and query filters/ranking come from this runtime's
+    /// CLI input and configuration. Every document is reindexed with locally
+    /// available producers; this never downloads models or relabels old vector
+    /// bytes. It uses the ordinary source indexer and complete-generation seal.
+    /// The store must be outside the source and the catalog generation-local.
+    /// A malformed selection or damaged old bundle is captured only as bounded
+    /// expected-old evidence; no old artifact is admitted or reused. Ordinary
+    /// indexing keeps its strict refusal of a damaged selected generation.
+    ///
+    /// A successful [`PreparedRetainedRecovery::search`] is mandatory before
+    /// exporting a resume receipt or calling `restore`. Until explicit restore,
+    /// the predecessor remains selected and readable. The original selection
+    /// guard survives indexing, producer admission and preview; a competing
+    /// publication is refused, never automatically rebased. Dropping or failing
+    /// this future leaves its unselected candidate intact. Reopening the store
+    /// after restore uses the exact sealed candidate, not a second source scan.
+    ///
+    /// This is a cooperative-store source rebuild, not an executor for the
+    /// core planner's capability-blocked model-acquisition/authority actions.
+    /// Synchronous indexing and filesystem work belongs on a caller's blocking
+    /// lane, as for [`Self::rebuild_retained_generation`].
+    ///
+    /// # Errors
+    /// Returns source/configuration, contention, producer, indexing, integrity,
+    /// I/O or cancellation errors without changing the active selection.
+    #[allow(clippy::future_not_send)]
+    pub async fn prepare_retained_rebuild(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+    ) -> SearchResult<PreparedRetainedRecovery> {
+        self.preflight_retained_recovery(cx)?;
+        let mut runtime = self.clone();
+        runtime.config.indexing.offline = true;
+        runtime.cli_input.full_reindex = true;
+        let (build, _, candidate_mode) = runtime
+            .build_retained_generation(cx, store_root, RetainedBuildKind::Recovery)
+            .await?;
+        let plan = build.prepare(cx, |_, path| {
+            Self::validate_search_generation_at_root(path, candidate_mode)
+        })?;
+        let store = crate::generation_store::CompleteGenerationStore::open(cx, store_root)?;
+        let reader = runtime
+            .open_retained_recovery_target(cx, &store, plan.target().clone())
+            .await?;
+        retained_search_checkpoint(cx)?;
+        Ok(PreparedRetainedRecovery {
+            plan,
+            reader,
+            preview_ready: false,
+        })
+    }
+
     /// Re-admit a saved preparation without accepting a newer selected head.
     ///
     /// All three receipt fields must come from the same successful preparation:
@@ -635,6 +699,162 @@ mod retained_recovery_tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn prepared_source_rebuild_requires_preview_then_publishes_exact_queried_snapshot() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            fs::write(source.join("beta.md"), "sharedtoken rebuilt beta document").unwrap();
+            let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            let target = plan.generation().clone();
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(old.clone()));
+            assert!(plan.expected_selection_sha256(&cx).is_err());
+            assert!(plan.search(&cx, "  ", 10).await.is_err());
+            assert!(plan.search(&cx, "sharedtoken", 0).await.is_err());
+            assert!(plan.expected_selection_sha256(&cx).is_err());
+            assert!(plan.reader.resources.fast_embedder.is_some());
+            assert!(plan.reader.resources.quality_embedder.is_some());
+            let preview = plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(preview.last().unwrap().hits.len(), 2);
+            assert!(plan.expected_selection_sha256(&cx).is_ok());
+            // Preview/restore serves the sealed source snapshot, even when the
+            // live source changes after the build. It never rebuilds on replay.
+            fs::write(source.join("later.md"), "sharedtoken after preparation").unwrap();
+            let (publication, mut recovered) = plan.restore(&cx).unwrap();
+            assert!(
+                matches!(publication, GenerationPublication::Durable(ref value) if value == &target)
+            );
+            assert_eq!(store.active(&cx).unwrap(), Some(target));
+            assert_eq!(
+                recovered
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
+            assert_eq!(
+                pinned
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+            let mut fresh = fresh_runtime(&runtime)
+                .open_retained_search(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(
+                fresh
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
+        });
+    }
+
+    #[test]
+    fn prepared_source_rebuild_refuses_skipped_cancelled_and_stale_previews() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+            let plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            assert!(plan.restore(&cx).is_err());
+            assert_eq!(store.active(&cx).unwrap(), Some(old.clone()));
+            let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                plan.search(&cx, "sharedtoken", 10).await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            assert!(plan.restore(&cx).is_err());
+            assert_eq!(store.active(&cx).unwrap(), Some(old));
+            let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            fs::write(source.join("winner.md"), "sharedtoken concurrent winner").unwrap();
+            let winner = publish(&runtime, &cx, &root).await;
+            assert!(plan.restore(&cx).is_err());
+            assert_eq!(store.active(&cx).unwrap(), Some(winner));
+        });
+    }
+
+    #[test]
+    fn prepared_source_rebuild_recovers_damaged_selection_without_inheriting_old_bytes() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            for damage in ["fast", "quality", "lexical", "selection"] {
+                let directory = tempfile::tempdir().unwrap();
+                let (runtime, source, root) = fixture(directory.path());
+                let old = publish(&runtime, &cx, &root).await;
+                let pointer = root.join(COMPLETE_GENERATION_POINTER);
+                let damaged_path = match damage {
+                    "fast" => old.path().join(FSFS_VECTOR_INDEX_FILE),
+                    "quality" => old.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE),
+                    "lexical" => {
+                        let relative = old
+                            .sealed_artifacts()
+                            .unwrap()
+                            .into_keys()
+                            .find(|path| path.ends_with(".fslx"))
+                            .expect("fixture has a Quill segment");
+                        old.path().join(relative)
+                    }
+                    "selection" => pointer.clone(),
+                    _ => unreachable!(),
+                };
+                fs::write(&damaged_path, b"corrupt recovery evidence").unwrap();
+                let old_bytes = file_bytes(old.path());
+                let expected_selection = fs::read(&pointer).unwrap();
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                assert!(store.begin(&cx).is_err(), "{damage}");
+                fs::write(source.join("beta.md"), "sharedtoken recovered from sources").unwrap();
+                let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+                assert_eq!(fs::read(&pointer).unwrap(), expected_selection, "{damage}");
+                assert_eq!(file_bytes(old.path()), old_bytes, "{damage}");
+                let preview = plan.search(&cx, "sharedtoken", 10).await.unwrap();
+                assert_eq!(preview.last().unwrap().hits.len(), 2, "{damage}");
+                let target = plan.generation().clone();
+                let (publication, mut reader) = plan.restore(&cx).unwrap();
+                assert!(matches!(publication, GenerationPublication::Durable(_)));
+                assert_eq!(store.active(&cx).unwrap(), Some(target), "{damage}");
+                assert_eq!(file_bytes(old.path()), old_bytes, "{damage}");
+                assert_eq!(
+                    reader
+                        .search(&cx, "sharedtoken", 10)
+                        .await
+                        .unwrap()
+                        .last()
+                        .unwrap()
+                        .hits
+                        .len(),
+                    2
+                );
+            }
+        });
     }
 
     #[test]

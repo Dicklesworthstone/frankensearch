@@ -12,9 +12,9 @@ use frankensearch_core::{GenerationRootSecurityProfileV1, SearchError, SearchRes
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
-    SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, canonical_store_root,
-    degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms, retained_search_checkpoint,
-    store_overlaps_source, validate_retained_catalog_path,
+    SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, SearchStreamResources,
+    canonical_store_root, degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms,
+    retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
@@ -923,7 +923,7 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )?;
         self.validate_semantic_model_selection(mode)?;
         let query = self
@@ -1036,13 +1036,14 @@ impl FsfsRuntime {
                     limit,
                     &stream_id,
                     writer,
-                    Some((
-                        &mut reader.resources,
-                        SearchExecutionFlags {
+                    Some(SearchStreamResources {
+                        resources: &mut reader.resources,
+                        flags: SearchExecutionFlags {
                             include_snippets: true,
                             persist_explain_session: true,
                         },
-                    )),
+                        requested_mode: reader.runtime.requested_search_mode(),
+                    }),
                 )
                 .await;
         }
@@ -1237,6 +1238,7 @@ impl FsfsRuntime {
             .runtime
             .execute_expanded_query_variants(
                 cx,
+                query,
                 queries,
                 limit.saturating_mul(2).max(20),
                 &mut reader.resources,
@@ -4001,7 +4003,12 @@ mod tests {
             assert_eq!(store.active(&cx).unwrap(), Some(predecessor.clone()));
             assert_eq!(sealed_inventory(predecessor.path()), before_inventory);
 
-            for command in [CliCommand::Index, CliCommand::Delete, CliCommand::Compact, CliCommand::Flush] {
+            for command in [
+                CliCommand::Index,
+                CliCommand::Delete,
+                CliCommand::Compact,
+                CliCommand::Flush,
+            ] {
                 let mut paused = runtime.clone();
                 paused.config.pressure.degradation_override =
                     crate::config::DegradationOverrideMode::ForcePaused;

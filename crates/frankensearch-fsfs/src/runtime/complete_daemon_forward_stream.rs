@@ -15,7 +15,9 @@ use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
-use super::super::super::super::{SearchOutputPhase, SearchServeFrame, SearchServeOptions};
+use super::super::super::super::{
+    SearchOutputPhase, SearchServeFrame, SearchServeOptions, SearchStreamResources,
+};
 use super::super::{FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL, streaming};
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_RESPONSE_MAX_BYTES, ForwardedSearch, FsfsRuntime,
@@ -130,13 +132,14 @@ pub(super) async fn serve(
                 request.request.search.limit,
                 &request.request.request_id,
                 &mut writer,
-                Some((
-                    &mut session.reader.resources,
-                    SearchExecutionFlags {
+                Some(SearchStreamResources {
+                    resources: &mut session.reader.resources,
+                    flags: SearchExecutionFlags {
                         include_snippets: true,
                         persist_explain_session: true,
                     },
-                )),
+                    requested_mode: query_runtime.requested_search_mode(),
+                }),
             )
             .await
     };
@@ -187,7 +190,10 @@ async fn serve_cached_search(
     // terminal handler, including a pressure override that refuses the mode
     // before the executor is entered.
     let result = async {
-        let mode = session.reader.search_mode()?;
+        let mode = super::degraded_search_mode(
+            runtime.config.pressure.degradation_override,
+            runtime.requested_search_mode(),
+        )?;
         let mut cached = false;
         let mut sink = |frame| match frame {
             SearchServeFrame::Attested { cached: hit, .. } => {
@@ -626,6 +632,7 @@ mod tests {
         let mut request = request();
         request.search.filter = Some("path:src".into());
         request.search.explain = true;
+        request.search.quality_only = true;
         let wrapper = StreamRequest {
             fsfs_complete_cli_stream: VERSION,
             request,
@@ -636,6 +643,7 @@ mod tests {
         assert!(is_streamed(&bytes));
         let parsed = parse_request(&bytes).unwrap();
         assert!(parsed.request.search.explain);
+        assert!(parsed.request.search.quality_only);
         assert_eq!(parsed.request.search.filter, wrapper.request.search.filter);
         // Every other version is refused at both levels, the immediately
         // preceding one included: `VERSION`'s history lists what each changed.

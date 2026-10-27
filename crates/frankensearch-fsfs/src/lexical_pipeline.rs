@@ -12,10 +12,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use asupersync::Cx;
 use compact_str::CompactString;
 use frankensearch_core::{IndexableDocument, LexicalWrite, SearchError, SearchResult};
+use frankensearch_quill::{DEFAULT_SCHEMA, QuillIndex, indexable_document_content_hash};
 pub use frankensearch_quill::{
     ParallelIngestTerminal, QuillObservedUpsert, QuillScaleoutRoute, QuillScaleoutWitness,
 };
-use frankensearch_quill::{DEFAULT_SCHEMA, QuillIndex, indexable_document_content_hash};
 use tracing::debug;
 
 use crate::config::IngestionClass;
@@ -565,7 +565,9 @@ impl<'a> QuillLexicalBackend<'a> {
     /// any batch entered the Quill accumulation driver during prior flushes.
     #[must_use]
     pub fn latest_scaleout_run_seq(&self) -> Option<u64> {
-        self.scaleout_witnesses.last().map(|witness| witness.run_seq)
+        self.scaleout_witnesses
+            .last()
+            .map(|witness| witness.run_seq)
     }
 
     /// Consume and return the run-scoped [`QuillScaleoutWitness`] matching

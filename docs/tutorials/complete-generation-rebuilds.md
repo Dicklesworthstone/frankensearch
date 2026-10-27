@@ -22,6 +22,45 @@ Provision verified semantic models as for ordinary indexing. This route does not
 turn a missing model into a hash fallback, bypass producer checks, or repair old
 vectors merely because a new model is installed.
 
+### Import a model from an offline bundle
+
+The workspace `fsfs-import-model` executable installs one explicitly selected
+registered model from local files. Build it with the inference backend for that
+model; the ordinary default features support Model2Vec and ONNX, and
+`--no-default-features --features semantic-native` supports Model2Vec and the
+native quality models. A lite build refuses a missing backend before creating
+the cache.
+
+```sh
+cargo build --release -p frankensearch-fsfs --bin fsfs-import-model
+
+fsfs-import-model --model potion-base-8m \
+  --from-dir /media/potion-base-8M \
+  --output /home/me/.local/share/frankensearch/models --offline --format json
+```
+
+`--output` names the model cache root used by your fsfs configuration, not an
+index directory. The command adds the model's conventional subdirectory. For
+example, `--model all-minilm-l6-v2-native` uses `all-MiniLM-L6-v2-native`, separate
+from the ONNX model. The bundle must contain the selected model's pinned artifact
+tree. This command always stays offline; `--offline` is an optional explicit
+acknowledgement. It does not change configuration or select a different model.
+
+Import uses the frozen manifest to verify the files, executes the registered
+loader's golden-vector certificate, and checks the loaded producer's full
+identity before installing the staged cache. A verified existing cache is
+load-tested and reused even if the supplied bundle has been removed. A rejected
+attempt preserves the previous cache, and a successful replacement retains its
+backup. Caches inside sealed search generations are refused.
+
+The JSON result includes the acquisition receipt, verified byte count,
+manifest fingerprint, local-bundle or warm-cache provenance, and
+`requires_reindex: true`. Success means **acquired-needs-reindex**: existing
+index compatibility has not been assessed. Use the source-rebuild preview below
+to regenerate vectors with the configured model and inspect results before
+publication. The importer does not execute or bypass the core recovery planner's
+scoped authorization guards.
+
 The model-free lite build (`--no-default-features`, the MUSL and Intel macOS
 release assets) publishes lexical-only generations with no vector tier. As on
 the legacy layout, its searches run lexical-only, `append-batch` and `delete`
@@ -83,6 +122,52 @@ reason to scan for another generation or fall back to the legacy mutable index.
 Setting the opt-in variable to false does not override that protection. Do not
 point mutation commands at a sealed generation subdirectory.
 
+## Preview a source rebuild before publishing it
+
+The workspace `fsfs-recover` binary can rebuild a source directory into a sealed,
+inactive generation, execute a query against that exact snapshot, and leave the
+current generation selected until you explicitly apply the preparation:
+
+```sh
+fsfs-recover --index-dir /work/search-store \
+  --config /work/fsfs.toml --rebuild-source /work/source \
+  --query "connection pooling" --limit 10 --prepare \
+  --save-preparation /work/prepared-search.json
+
+fsfs-recover --index-dir /work/search-store \
+  --config /work/fsfs.toml --resume-file /work/prepared-search.json \
+  --query "connection pooling" --limit 10 --apply
+```
+
+Use `--apply` with `--rebuild-source` for one invocation that rebuilds, previews
+and publishes. Source rebuilding always requires `--query` and an explicit
+`--prepare` or `--apply`. It recomputes source embeddings with the configured,
+already available models; it never downloads a model. A lexical-only build or
+explicit `force_lexical_only` configuration prepares a lexical-only generation.
+The store must be outside the source tree and the catalog generation-local.
+Unlike ordinary indexing, this explicit recovery can start with a damaged
+selected bundle or malformed bounded selection descriptor. It captures the
+original descriptor under publication ownership, rebuilds independently from
+sources, refuses inherited hardlinked artifacts, and retains the damaged bytes.
+Unsafe selection objects (such as symlinks) and oversized descriptors still fail.
+
+Failed indexing, producer admission, cancellation or a failed preview leaves
+the previous generation selected. A successful preview is required before
+exporting its selection guard or publishing. Preview releases publication
+ownership, so another indexer can proceed; if it publishes first, applying the
+old preparation fails instead of replacing its work. Existing readers keep
+their pinned generation after a successful publication.
+
+The saved preparation names the sealed snapshot and its original selection
+guard. Resuming does not rescan the source, and source changes after preparation
+do not alter the target. Keep the preparation in trusted storage outside the
+store; it is not a retention pin. The response names the new generation and
+reports `source_rebuild_performed` only for the invocation that rebuilt it.
+Use the receipt-directed durability confirmation command after an uncertain
+publication rather than rebuilding again. This capability uses the cooperative
+complete-store protocol; it does not execute the core recovery planner's
+model-acquisition or fixed-authority actions.
+
 ## Warm standard-input serving
 
 A long-lived process can reuse admitted models and indexes while following
@@ -94,7 +179,7 @@ fsfs serve --index-dir /work/search-store --config /work/fsfs.toml --format json
 
 Send the existing JSON request shape, for example
 `{"query":"connection pooling","limit":10}`, or a plain query line. Each
-request uses the buffered `fsfs.search.serve.v15` response shape, after
+request uses the buffered `fsfs.search.serve.v16` response shape, after
 one ready event. Send `quit` or close stdin to stop. This is not the progressive
 socket transport: use direct `search --stream` for immediate phase delivery.
 
@@ -149,6 +234,11 @@ filters, limits and the search policy (`quality_weight`, `rrf_k`,
 `quality_timeout_ms`, `fast_only`, `rerank`, `rerank_timeout_ms`, and so
 `--fast-only` and `--rerank`) apply to the individual request, so one daemon
 serves clients that differ only there. Use the same configuration otherwise.
+`--quality-only` also travels with each request and selects direct quality-tier
+retrieval, preserving filters and limits without requiring the fast model.
+It requires a compatible quality index and ordinarily returns one `Initial` phase; an
+unavailable quality tier or a quality timeout fails the request. The daemon
+keeps quality-only cache entries separate from hybrid and fast-only results.
 Buffered and progressive forwarded searches share the daemon's in-memory result
 cache with raw buffered requests that resolve to the same query, limit, mode,
 filter and policy, as on the legacy layout; searches with inline explanations
@@ -194,11 +284,28 @@ Terminal. A request pins one admitted generation for every phase and bypasses
 the result cache and persistent explanation writes. The next request refreshes
 selection before using either the cache or the search resources.
 
-Streaming currently accepts only `query`, `limit`, `stream`, and optional
-`mode: "full"`, under the daemon startup configuration. Extra filter, model,
-format and protocol options are refused, not silently ignored. Buffered CLI
-forwarding uses its separate versioned request. The legacy v4 request-overlay
-protocol is not supported by this endpoint.
+The optional `mode` selects `full` (the default), `fast_only`, `quality_only`,
+or `lexical_only`; `fast`, `quality`, and `lexical` are accepted aliases.
+For example, a request can search the independently admitted quality tier:
+
+```json
+{"query":"connection pooling","limit":10,"stream":true,"mode":"quality_only"}
+```
+
+Quality-only requests require the selected generation's quality vectors and
+their matching model. Admission failures, a conflicting `fast_only` policy,
+or pressure settings that disable quality search return an error before the
+first stream frame. Lexical-only requests do not load semantic models, and
+fast-only requests do not run quality refinement. Started metadata identifies
+the selected retrieval mode and its admitted vector producer, when present.
+
+Along with `query`, `limit`, `stream`, and `mode`, a request may override
+`filter`, `rerank`, `rerank_timeout_ms`, `quality_weight`,
+`quality_timeout_ms`, `rrf_k`, and `fast_only`. These fields use the same
+validation and policy as buffered requests; omitted tuning values inherit the
+daemon startup configuration. Model, format, and unknown protocol options are
+refused. Buffered CLI forwarding uses its separate versioned request. The
+legacy v4 request-overlay protocol is not supported by this endpoint.
 
 A refusal before any stream bytes are emitted uses the existing buffered
 `ok: false` error response. Once streaming starts, an output failure or outer

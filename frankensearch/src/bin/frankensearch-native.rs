@@ -73,7 +73,9 @@ const MAX_DOCUMENTS: usize = 100_000;
 const MAX_RECEIPT_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const HELP: &str = "frankensearch-native: native HNSW + FSVI v2 + Quill\n\n\
-  authority-index / authority-rebuild / authority-search / authority-recover: fixed AUTHORITY generations\n\
+  authority-index / authority-rebuild / authority-update / authority-search /\n\
+  authority-serve / authority-recover / authority-rollback:\n\
+         fixed AUTHORITY generations with incremental updates and warm stdio serving\n\
          (use authority-index --help for the complete command contract)\n\n\
   index  --index-dir NEW_DIR --receipt NEW_JSON [--input JSONL]\n\
          [--model-dir DIR] [--fast-only] [--exact] [--batch-size N] [--shard-size N]\n\
@@ -730,6 +732,16 @@ async fn execute(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    // Native builders inherit the same caller-owned lane used for model and
+    // query work, including warm updates and replacement-model builds. Refuse
+    // a stopped lane before opening input, creating paths or loading models.
+    let context = if options.lexical_only {
+        cx.clone()
+    } else {
+        execution_context(cx, pool)?
+    };
+    let cx = &context;
+    let pool = cx.blocking_pool_handle();
     match options.command {
         Command::Search if options.lexical_only => lexical::execute(cx, &options, output).await,
         Command::Serve if options.lexical_only => {
@@ -874,6 +886,25 @@ async fn execute(
             emit(output, &page)
         }
     }
+}
+
+fn execution_context(cx: &Cx, pool: Option<BlockingPoolHandle>) -> Result<Cx> {
+    if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+        return Err(frankensearch::SearchError::Cancelled {
+            phase: "native_cli.execution".to_owned(),
+            reason: "native command was cancelled before execution".to_owned(),
+        }
+        .into());
+    }
+    let pool = pool.or_else(|| cx.blocking_pool_handle());
+    if pool.as_ref().is_some_and(BlockingPoolHandle::is_shutdown) {
+        return Err(frankensearch::SearchError::SubsystemError {
+            subsystem: "native_cli.execution",
+            source: "the caller-owned native execution pool is shut down".into(),
+        }
+        .into());
+    }
+    Ok(cx.clone().with_blocking_pool_handle(pool))
 }
 
 struct LimitedBuffer {

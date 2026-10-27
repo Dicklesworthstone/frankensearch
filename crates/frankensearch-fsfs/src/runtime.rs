@@ -631,8 +631,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v13 / stream v11: apply and attest the client's rerank deadline.
 // v14 / stream v12: attest the selected fast model before any cached phase.
 // v15 / stream v13: attest the checked, actually selected quality producer.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v15";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v13";
+// v16 / stream v14: require and attest the independent quality-only primary.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v16";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v14";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -938,6 +939,7 @@ impl DashboardSearchStage {
 enum SearchExecutionMode {
     Full,
     FastOnly,
+    QualityOnly,
     LexicalOnly,
 }
 
@@ -947,6 +949,7 @@ impl SearchExecutionMode {
         match self {
             Self::Full => "full",
             Self::FastOnly => "fast_only",
+            Self::QualityOnly => "quality_only",
             Self::LexicalOnly => "lexical_only",
         }
     }
@@ -962,6 +965,23 @@ fn degraded_search_mode(
     requested: SearchExecutionMode,
 ) -> SearchResult<SearchExecutionMode> {
     use crate::config::DegradationOverrideMode;
+    if matches!(requested, SearchExecutionMode::QualityOnly) {
+        if matches!(
+            override_mode,
+            DegradationOverrideMode::ForceLexicalOnly
+                | DegradationOverrideMode::ForceMetadataOnly
+                | DegradationOverrideMode::ForcePaused
+        ) {
+            return Err(degradation_refusal(override_mode, "quality-only search"));
+        }
+        if !SEMANTIC_LOADERS_COMPILED {
+            return Err(SearchError::EmbedderUnavailable {
+                model: "quality".to_owned(),
+                reason: "quality-only search requires a build with semantic loaders; install the standard fsfs build"
+                    .to_owned(),
+            });
+        }
+    }
     match override_mode {
         DegradationOverrideMode::ForceLexicalOnly => Ok(SearchExecutionMode::LexicalOnly),
         DegradationOverrideMode::ForceMetadataOnly | DegradationOverrideMode::ForcePaused => {
@@ -982,7 +1002,7 @@ const SEMANTIC_LOADERS_COMPILED: bool = cfg!(feature = "semantic-support");
 /// The search mode this build can serve for `requested` (see
 /// [`SEMANTIC_LOADERS_COMPILED`]).
 const fn build_search_mode(requested: SearchExecutionMode) -> SearchExecutionMode {
-    if SEMANTIC_LOADERS_COMPILED {
+    if SEMANTIC_LOADERS_COMPILED || matches!(requested, SearchExecutionMode::QualityOnly) {
         requested
     } else {
         SearchExecutionMode::LexicalOnly
@@ -1010,11 +1030,12 @@ fn parse_search_execution_mode(raw: Option<&str>) -> SearchResult<SearchExecutio
     match raw {
         None | Some("full") => Ok(SearchExecutionMode::Full),
         Some("fast" | "fast_only") => Ok(SearchExecutionMode::FastOnly),
+        Some("quality" | "quality_only") => Ok(SearchExecutionMode::QualityOnly),
         Some("lexical" | "lexical_only") => Ok(SearchExecutionMode::LexicalOnly),
         Some(value) => Err(SearchError::InvalidConfig {
             field: "cli.serve.mode".to_owned(),
             value: value.to_owned(),
-            reason: "expected full|fast_only|lexical_only".to_owned(),
+            reason: "expected full|fast_only|quality_only|lexical_only".to_owned(),
         }),
     }
 }
@@ -1044,6 +1065,10 @@ impl SemanticVoiDecision {
 struct SearchExecutionResources {
     index_root: PathBuf,
     generation_fingerprint: String,
+    /// Tiers opened (or attempted) for this generation. An optional corrupt
+    /// quality file must not make every Full request reopen otherwise warm
+    /// resources, while changing from a narrower mode must admit its new tier.
+    resource_mode: SearchExecutionMode,
     lexical_index: Option<QuillSearchIndex>,
     shadow_observer: Option<frankensearch_core::ShadowLexicalObserver>,
     shadow_pressure_sampler: Option<Arc<ShadowPressureSampler>>,
@@ -1305,28 +1330,32 @@ impl SearchExecutionResources {
             } else {
                 CapabilityState::Disabled
             },
-            fast_semantic: if !matches!(mode, SearchExecutionMode::LexicalOnly)
-                && self.vector_index.as_ref().is_some_and(|index| {
-                    !FsfsRuntime::is_legacy_hash_vector_generation(index.embedder_id())
-                })
-                && (self.fast_embedder.is_some() || !self.fast_embedder_attempted)
+            fast_semantic: if !matches!(
+                mode,
+                SearchExecutionMode::LexicalOnly | SearchExecutionMode::QualityOnly
+            ) && self.vector_index.as_ref().is_some_and(|index| {
+                !FsfsRuntime::is_legacy_hash_vector_generation(index.embedder_id())
+            }) && (self.fast_embedder.is_some() || !self.fast_embedder_attempted)
             {
                 CapabilityState::Enabled
             } else {
                 CapabilityState::Disabled
             },
-            hash_control: if !matches!(mode, SearchExecutionMode::LexicalOnly)
-                && self.vector_index.as_ref().is_some_and(|index| {
-                    FsfsRuntime::is_legacy_hash_vector_generation(index.embedder_id())
-                })
-                && (self.fast_embedder.is_some() || !self.fast_embedder_attempted)
+            hash_control: if !matches!(
+                mode,
+                SearchExecutionMode::LexicalOnly | SearchExecutionMode::QualityOnly
+            ) && self.vector_index.as_ref().is_some_and(|index| {
+                FsfsRuntime::is_legacy_hash_vector_generation(index.embedder_id())
+            }) && (self.fast_embedder.is_some() || !self.fast_embedder_attempted)
             {
                 CapabilityState::Enabled
             } else {
                 CapabilityState::Disabled
             },
-            quality_semantic: if matches!(mode, SearchExecutionMode::Full)
-                && !fast_only
+            quality_semantic: if matches!(
+                mode,
+                SearchExecutionMode::Full | SearchExecutionMode::QualityOnly
+            ) && !fast_only
                 && self.quality_stage_viable(fast_only)
             {
                 CapabilityState::Enabled
@@ -1365,6 +1394,15 @@ impl SearchExecutionResources {
 struct SearchExecutionFlags {
     include_snippets: bool,
     persist_explain_session: bool,
+}
+
+/// A retained stream's resources and requested retrieval mode travel together.
+/// The daemon applies its degradation policy without rewriting that policy to
+/// represent a client's choice.
+struct SearchStreamResources<'a> {
+    resources: &'a mut SearchExecutionResources,
+    flags: SearchExecutionFlags,
+    requested_mode: SearchExecutionMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1422,7 +1460,7 @@ struct SearchCacheRecord {
     payloads: Vec<SearchPayload>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SearchServeRequest {
     query: String,
     #[serde(default)]
@@ -6244,6 +6282,9 @@ pub struct FsfsRuntime {
     /// A timed-out initialization retains its permit and successful model, so
     /// the next query can refine without repeating the cold load.
     quality_load_gate: Arc<asupersync::sync::Mutex<QualityEmbedderSlot>>,
+    /// A raw quality-only stream shares this request-local budget across
+    /// pre-Started producer admission and retrieval. Never stored on the daemon.
+    quality_budget_started_at: Option<asupersync::types::Time>,
     #[cfg(feature = "rerank")]
     native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
     #[cfg(feature = "embedded-models")]
@@ -6302,6 +6343,7 @@ impl FsfsRuntime {
             quality_load_gate: Arc::new(asupersync::sync::Mutex::new(
                 QualityEmbedderSlot::default(),
             )),
+            quality_budget_started_at: None,
             #[cfg(feature = "rerank")]
             native_blocking_pool: None,
             #[cfg(feature = "embedded-models")]
@@ -8280,27 +8322,35 @@ impl FsfsRuntime {
         limit: usize,
         stream_id: &str,
         writer: &mut W,
-        mut resources_override: Option<(&mut SearchExecutionResources, SearchExecutionFlags)>,
+        mut resources_override: Option<SearchStreamResources<'_>>,
     ) -> SearchResult<()> {
         let mut seq = 0_u64;
-
-        self.emit_search_stream_started(query, stream_id, &mut seq, writer)?;
+        let requested_mode = resources_override.as_ref().map_or_else(
+            || self.requested_search_mode(),
+            |execution| execution.requested_mode,
+        );
+        let mode = degraded_search_mode(self.config.pressure.degradation_override, requested_mode);
+        // Keep Started followed by a typed terminal on refusal for existing
+        // CLI callers. Raw daemon requests complete admission before this call.
+        self.emit_search_stream_started_in_mode(
+            query,
+            stream_id,
+            mode.as_ref().copied().unwrap_or(requested_mode),
+            &mut seq,
+            writer,
+        )?;
         let search_result = async {
             let mut phase_sink = |stage_payload: &SearchPayload| {
                 self.emit_search_stream_payload(stage_payload, stream_id, &mut seq, writer)
             };
-            if let Some((resources, flags)) = resources_override.as_mut() {
-                let mode = degraded_search_mode(
-                    self.config.pressure.degradation_override,
-                    SearchExecutionMode::Full,
-                )?;
+            if let Some(execution) = resources_override.as_mut() {
                 self.execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
                     limit,
-                    mode,
-                    resources,
-                    *flags,
+                    mode?,
+                    execution.resources,
+                    execution.flags,
                     Some(&mut phase_sink),
                 )
                 .await
@@ -8308,7 +8358,7 @@ impl FsfsRuntime {
                     if self.complete_explain_target.is_some()
                         && let Some(last) = artifacts.last_mut()
                     {
-                        self.attach_complete_search_explanations(cx, last, resources)?;
+                        self.attach_complete_search_explanations(cx, last, execution.resources)?;
                     }
                     Ok(artifacts
                         .into_iter()
@@ -9038,6 +9088,10 @@ impl FsfsRuntime {
         let mut runtime = self.clone();
         let mut cli = runtime.cli_input.clone();
         cli.filter.clone_from(&request.filter);
+        cli.quality_only = matches!(
+            parse_search_execution_mode(request.mode.as_deref())?,
+            SearchExecutionMode::QualityOnly
+        );
         runtime = runtime.with_cli_input(cli);
         // The client's effective `search.rerank` travels with the request so
         // `fsfs search --rerank` means the same thing through the daemon; the
@@ -9102,7 +9156,7 @@ impl FsfsRuntime {
         // place, so a newer publication rebinds all resources here. A per-request
         // `QuillSearchIndex::refresh` found nothing more: it reopened the
         // snapshot, re-hashing every segment file, only to report "unchanged".
-        if self
+        if runtime
             .rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?
         {
@@ -9122,6 +9176,11 @@ impl FsfsRuntime {
             .then(|| hot_cache.get(&cache_key))
             .flatten();
         let cached = cached_payloads.is_some();
+        if cached && matches!(mode, SearchExecutionMode::QualityOnly) {
+            runtime
+                .with_quality_deadline(cx, runtime.admit_required_quality(cx, resources))
+                .await?;
+        }
         Self::validate_bound_search_resources(resources, mode)?;
         let policy = runtime.search_serve_policy_for_mode(mode)?;
         if let Some(sink) = frame_sink.as_mut() {
@@ -9129,10 +9188,17 @@ impl FsfsRuntime {
                 schema_version: FSFS_SEARCH_SERVE_STREAM_VERSION.to_owned(),
                 policy: Box::new(policy.clone()),
                 generation_fingerprint: resources.generation_fingerprint.clone(),
-                vector_generation_id: resources
-                    .vector_index
-                    .as_ref()
-                    .map(|index| index.embedder_id().to_owned()),
+                vector_generation_id: if matches!(mode, SearchExecutionMode::QualityOnly) {
+                    resources
+                        .quality_vector_index
+                        .as_ref()
+                        .map(|index| index.embedder_id().to_owned())
+                } else {
+                    resources
+                        .vector_index
+                        .as_ref()
+                        .map(|index| index.embedder_id().to_owned())
+                },
                 query: request.query.clone(),
                 mode: mode.label().to_owned(),
                 limit: requested_limit,
@@ -9178,6 +9244,9 @@ impl FsfsRuntime {
                 .collect::<Vec<_>>()
         };
         Self::validate_bound_search_resources(resources, mode)?;
+        if matches!(mode, SearchExecutionMode::QualityOnly) {
+            Self::validate_required_quality_resources(resources)?;
+        }
         Self::search_daemon_checkpoint(cx)?;
         // Misses retain the full fused-candidate evidence saved by the search
         // above. Only a cache hit needs to reconstruct the latest CLI context
@@ -9496,7 +9565,7 @@ impl FsfsRuntime {
         {
             let mode = degraded_search_mode(
                 self.config.pressure.degradation_override,
-                SearchExecutionMode::Full,
+                self.requested_search_mode(),
             )?;
             self.validate_semantic_model_selection(mode)?;
             let socket_path = self.resolve_daemon_socket_path()?;
@@ -9745,8 +9814,15 @@ impl FsfsRuntime {
                 }
                 if generation_fingerprint != fingerprint
                     || vector_generation_id
-                        != Self::inspect_published_vector_generation(index_root)
-                            .map(|generation| generation.id)
+                        != if matches!(
+                            parse_search_execution_mode(request.mode.as_deref())?,
+                            SearchExecutionMode::QualityOnly
+                        ) {
+                            Self::inspect_published_quality_generation(index_root)
+                        } else {
+                            Self::inspect_published_vector_generation(index_root)
+                        }
+                        .map(|generation| generation.id)
                 {
                     return Err(Self::search_daemon_error(
                         "daemon generation or producer disagreement",
@@ -9953,7 +10029,7 @@ impl FsfsRuntime {
         // socket routing does, before contacting a retained warm daemon.
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )?;
         self.selected_model_ids_for_mode(mode)?;
         if let Some(path) = self.cli_input.daemon_socket.as_deref() {
@@ -9970,7 +10046,7 @@ impl FsfsRuntime {
     fn default_daemon_socket_path(&self) -> SearchResult<PathBuf> {
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )?;
         let (fast_model, quality_model) = self.selected_model_ids_for_mode(mode)?;
         let (socket_dir, index_stem) = self.default_daemon_socket_stem()?;
@@ -10053,18 +10129,42 @@ impl FsfsRuntime {
         runtime_base.join("frankensearch").join("daemon")
     }
 
+    #[cfg(test)]
     fn search_stream_started_event(&self, query: &str, stream_id: &str) -> StreamStartedEvent {
+        self.search_stream_started_event_in_mode(query, stream_id, self.requested_search_mode())
+    }
+
+    fn search_stream_started_event_in_mode(
+        &self,
+        query: &str,
+        stream_id: &str,
+        mode: SearchExecutionMode,
+    ) -> StreamStartedEvent {
         let mut event =
             StreamStartedEvent::new(stream_id, query, self.cli_input.format.to_string());
+        if matches!(mode, SearchExecutionMode::LexicalOnly) {
+            event.skip_reason = Some("lexical_only".to_owned());
+            return event;
+        }
         let Ok(index_root) = self.resolve_status_index_root() else {
             return event;
         };
-        if let Some(published) = Self::inspect_published_vector_generation(&index_root) {
+        let quality_only = matches!(mode, SearchExecutionMode::QualityOnly);
+        let published = if quality_only {
+            Self::inspect_published_quality_generation(&index_root)
+        } else {
+            Self::inspect_published_vector_generation(&index_root)
+        };
+        if let Some(published) = published {
             event.vector_generation_id = Some(published.id);
             event.vector_generation_is_hash = published.is_hash_control;
             event.semantic_admitted = !published.is_hash_control;
-            if published.is_hash_control {
+            if quality_only {
+                event.skip_reason = Some("quality_only".to_owned());
+            } else if published.is_hash_control {
                 event.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
+            } else if matches!(mode, SearchExecutionMode::FastOnly) {
+                event.skip_reason = Some("fast_only".to_owned());
             }
         } else {
             event.skip_reason = Some("no_vector_index".to_owned());
@@ -10079,13 +10179,30 @@ impl FsfsRuntime {
         seq: &mut u64,
         writer: &mut W,
     ) -> SearchResult<()> {
+        self.emit_search_stream_started_in_mode(
+            query,
+            stream_id,
+            self.requested_search_mode(),
+            seq,
+            writer,
+        )
+    }
+
+    fn emit_search_stream_started_in_mode<W: Write>(
+        &self,
+        query: &str,
+        stream_id: &str,
+        mode: SearchExecutionMode,
+        seq: &mut u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
         let frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
             iso_timestamp_now(),
             "search",
             StreamEvent::<SearchHitPayload>::Started(
-                self.search_stream_started_event(query, stream_id),
+                self.search_stream_started_event_in_mode(query, stream_id, mode),
             ),
         );
         emit_stream_frame(&frame, self.cli_input.format, writer)?;
@@ -10112,6 +10229,15 @@ impl FsfsRuntime {
         stage_override: Option<(&str, &str, &str)>,
     ) -> SearchResult<()> {
         let (stage, reason_code, message) = stage_override.unwrap_or(match payload.phase {
+            SearchOutputPhase::Initial
+                if payload.skip_reason.as_deref() == Some("quality_only") =>
+            {
+                (
+                    "retrieve.quality",
+                    "query.stream.initial_ready",
+                    "quality results ready",
+                )
+            }
             SearchOutputPhase::Initial if payload.vector_generation_is_hash => (
                 "retrieve.hash_control",
                 "query.stream.initial_ready",
@@ -11260,6 +11386,7 @@ impl FsfsRuntime {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn execute_search_payloads_cached_for_cli_inner(
         &self,
         cx: &Cx,
@@ -11269,7 +11396,7 @@ impl FsfsRuntime {
     ) -> SearchResult<Vec<SearchPayload>> {
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )?;
         self.validate_semantic_model_selection(mode)?;
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
@@ -11289,8 +11416,28 @@ impl FsfsRuntime {
         let key = prepared.search_cache_key(query, limit, mode)?;
         match self.try_load_search_payload_cache(&key, &lookup_fingerprint) {
             Ok(Some(payloads)) => {
+                // A persisted semantic answer does not establish that its
+                // exact producer is still available in this process.
+                let quality_resources = if matches!(mode, SearchExecutionMode::QualityOnly) {
+                    let mut resources = self
+                        .prepare_search_execution_resources_at_root_with_modes(
+                            cx,
+                            &index_root,
+                            mode,
+                            mode,
+                        )
+                        .await?;
+                    self.with_quality_deadline(cx, self.admit_required_quality(cx, &mut resources))
+                        .await?;
+                    Some(resources)
+                } else {
+                    None
+                };
                 if let Some(sink) = phase_sink.as_deref_mut() {
                     for payload in &payloads {
+                        if let Some(resources) = &quality_resources {
+                            Self::validate_required_quality_resources(resources)?;
+                        }
                         Self::validate_search_generation_fingerprint(
                             &index_root,
                             &lookup_fingerprint,
@@ -11304,6 +11451,9 @@ impl FsfsRuntime {
                     &lookup_fingerprint,
                     mode,
                 )?;
+                if let Some(resources) = &quality_resources {
+                    Self::validate_required_quality_resources(resources)?;
+                }
                 Self::semantic_retry_checkpoint(cx, "fsfs.search.finalize")?;
                 if let Err(error) =
                     self.persist_explain_session_for_cached_payloads(query, &payloads)
@@ -11382,13 +11532,14 @@ impl FsfsRuntime {
         let expansion_limit = (limit.saturating_mul(2)).max(20);
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )?;
         let mut resources = self.prepare_search_execution_resources(cx, mode).await?;
         let expansion_fingerprint = resources.generation_fingerprint.clone();
         let all_payloads = self
             .execute_expanded_query_variants(
                 cx,
+                query,
                 &expansion.queries,
                 expansion_limit,
                 &mut resources,
@@ -11401,8 +11552,11 @@ impl FsfsRuntime {
             .await?;
 
         // Fuse all results using cross-query reciprocal rank fusion.
-        let fused_payload =
+        let mut fused_payload =
             Self::fuse_expanded_payloads(query, &all_payloads, limit, self.config.search.rrf_k);
+        if matches!(mode, SearchExecutionMode::QualityOnly) {
+            fused_payload = Self::annotate_search_payload(fused_payload, &resources, mode);
+        }
         Self::validate_search_generation_fingerprint(
             &resources.index_root,
             &expansion_fingerprint,
@@ -11438,9 +11592,11 @@ impl FsfsRuntime {
         Ok(expansion)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_expanded_query_variants(
         &self,
         cx: &Cx,
+        original_query: &str,
         queries: &[query_expansion::ExpandedQuery],
         expansion_limit: usize,
         resources: &mut SearchExecutionResources,
@@ -11449,8 +11605,18 @@ impl FsfsRuntime {
     ) -> SearchResult<Vec<SearchPayload>> {
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )?;
+        let normalized_original = Self::normalize_search_query(original_query);
+        let original = ParsedQuery::parse(&normalized_original);
+        if original.has_negations() && resources.lexical_index.is_none() {
+            return Err(SearchError::InvalidConfig {
+                field: "query_expansion.exclusions".to_owned(),
+                value: "lexical_index_unavailable".to_owned(),
+                reason: "expanded queries require the lexical index to preserve the original query's exclusions"
+                    .to_owned(),
+            });
+        }
         let mut payloads = Vec::new();
         for expanded in queries {
             cx.checkpoint().map_err(|_| SearchError::Cancelled {
@@ -11462,15 +11628,23 @@ impl FsfsRuntime {
                 expansion_fingerprint,
                 mode,
             )?;
+            let variant_query = if matches!(
+                expanded.strategy,
+                query_expansion::ExpansionStrategy::Original
+            ) {
+                normalized_original.clone()
+            } else {
+                Self::expanded_query_with_exclusions(&original, &expanded.text)?
+            };
             info!(
                 strategy = expanded.strategy.label(),
-                query_text = expanded.text,
+                query_text = variant_query,
                 "fsfs expanded query: executing search variant"
             );
             let mut variant_payloads = self
                 .execute_search_payloads_with_mode_using_resources(
                     cx,
-                    &expanded.text,
+                    &variant_query,
                     expansion_limit,
                     mode,
                     resources,
@@ -11496,6 +11670,49 @@ impl FsfsRuntime {
             );
         }
         Ok(payloads)
+    }
+
+    /// Every variant inherits the user's exclusions before retrieval selects
+    /// candidates. Put them first so a long generated query cannot truncate
+    /// them away; filtering only the fused hits would lose eligible runners-up.
+    fn expanded_query_with_exclusions(
+        original: &ParsedQuery,
+        expanded_query: &str,
+    ) -> SearchResult<String> {
+        if !original.has_negations() {
+            return Ok(expanded_query.to_owned());
+        }
+        let exclusions = original
+            .negative_terms
+            .iter()
+            .map(|term| format!("-{term}"))
+            .chain(
+                original
+                    .negative_phrases
+                    .iter()
+                    .map(|phrase| format!("-\"{phrase}\"")),
+            )
+            .collect::<Vec<_>>()
+            .join(" ");
+        let prepared = Self::normalize_search_query(&format!("{exclusions} {expanded_query}"));
+        let parsed = ParsedQuery::parse(&prepared);
+        if !original
+            .negative_terms
+            .iter()
+            .all(|term| parsed.negative_terms.contains(term))
+            || !original
+                .negative_phrases
+                .iter()
+                .all(|phrase| parsed.negative_phrases.contains(phrase))
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "query_expansion.exclusions".to_owned(),
+                value: "query_limit".to_owned(),
+                reason: "expanded query cannot preserve every original exclusion within the query length limit"
+                    .to_owned(),
+            });
+        }
+        Ok(prepared)
     }
 
     /// Fuse search payloads from multiple expanded queries using RRF.
@@ -11760,6 +11977,16 @@ impl FsfsRuntime {
             .map_or_else(String::new, |model| model.manifest_id().to_owned()))
     }
 
+    /// A quality-only request names its required primary tier explicitly.
+    /// It never acquires a dependency on the configured fast producer.
+    const fn requested_search_mode(&self) -> SearchExecutionMode {
+        if self.cli_input.quality_only {
+            SearchExecutionMode::QualityOnly
+        } else {
+            SearchExecutionMode::Full
+        }
+    }
+
     /// A lexical answer has no embedding producer. Ignore unrelated model
     /// configuration only when the effective execution mode is lexical-only.
     fn selected_model_ids_for_mode(
@@ -11768,6 +11995,10 @@ impl FsfsRuntime {
     ) -> SearchResult<(String, String)> {
         if matches!(build_search_mode(mode), SearchExecutionMode::LexicalOnly) {
             return Ok((String::new(), String::new()));
+        }
+        if matches!(mode, SearchExecutionMode::QualityOnly) {
+            self.validate_semantic_model_selection(mode)?;
+            return Ok((String::new(), self.selected_quality_model_id()?));
         }
         Ok((
             self.selected_fast_model_id()?,
@@ -11788,6 +12019,26 @@ impl FsfsRuntime {
     }
 
     fn validate_semantic_model_selection(&self, mode: SearchExecutionMode) -> SearchResult<()> {
+        if matches!(mode, SearchExecutionMode::QualityOnly) {
+            degraded_search_mode(self.config.pressure.degradation_override, mode)?;
+            if self.config.search.fast_only {
+                return Err(SearchError::InvalidConfig {
+                    field: "search.fast_only".to_owned(),
+                    value: "true".to_owned(),
+                    reason: "quality-only search conflicts with search.fast_only; use --no-fast-only or disable it in the configuration"
+                        .to_owned(),
+                });
+            }
+            self.validate_registered_local_model_intent()?;
+            if self.selected_quality_model_id()?.is_empty() {
+                return Err(SearchError::EmbedderUnavailable {
+                    model: "quality".to_owned(),
+                    reason: "quality-only search requires indexing.quality_model to select a verified quality producer"
+                        .to_owned(),
+                });
+            }
+            return Ok(());
+        }
         if matches!(build_search_mode(mode), SearchExecutionMode::LexicalOnly) {
             return Ok(());
         }
@@ -11885,7 +12136,7 @@ impl FsfsRuntime {
     fn search_serve_policy(&self) -> SearchResult<SearchServePolicy> {
         let mode = degraded_search_mode(
             self.config.pressure.degradation_override,
-            SearchExecutionMode::Full,
+            self.requested_search_mode(),
         )?;
         self.search_serve_policy_for_mode(mode)
     }
@@ -12361,7 +12612,12 @@ impl FsfsRuntime {
         resources: &SearchExecutionResources,
         mode: SearchExecutionMode,
     ) -> SearchPayload {
-        if let Some(index) = resources.vector_index.as_ref() {
+        let vector_index = if matches!(mode, SearchExecutionMode::QualityOnly) {
+            resources.quality_vector_index.as_deref()
+        } else {
+            resources.vector_index.as_ref()
+        };
+        if let Some(index) = vector_index {
             let id = index.embedder_id();
             let is_hash = Self::is_legacy_hash_vector_generation(id);
             payload.vector_generation_id = Some(id.to_owned());
@@ -12377,6 +12633,7 @@ impl FsfsRuntime {
         if payload.skip_reason.is_none() {
             payload.skip_reason = match mode {
                 SearchExecutionMode::FastOnly => Some("fast_only".to_owned()),
+                SearchExecutionMode::QualityOnly => Some("quality_only".to_owned()),
                 SearchExecutionMode::LexicalOnly => Some("lexical_only".to_owned()),
                 SearchExecutionMode::Full => None,
             };
@@ -12634,6 +12891,7 @@ impl FsfsRuntime {
 
         let (latency_loss_if_unhelpful, miss_loss_if_helpful) = match mode {
             SearchExecutionMode::FastOnly => (9.0_f64, 5.6_f64),
+            SearchExecutionMode::QualityOnly => (0.0_f64, 9.2_f64),
             SearchExecutionMode::Full if output_limit <= 500 => (6.0_f64, 7.8_f64),
             SearchExecutionMode::Full => (3.2_f64, 9.2_f64),
             SearchExecutionMode::LexicalOnly => (1.0_f64, 0.0_f64),
@@ -12814,6 +13072,11 @@ impl FsfsRuntime {
         self.validate_semantic_model_selection(mode)?;
         self.rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
+        if matches!(mode, SearchExecutionMode::QualityOnly) {
+            return self
+                .execute_quality_only_search(cx, query, limit, resources, flags, phase_sink)
+                .await;
+        }
         let lexical_stats = resources
             .lexical_index
             .as_ref()
@@ -16028,21 +16291,24 @@ impl FsfsRuntime {
         } else {
             let requested_topology = match mode {
                 SearchExecutionMode::FastOnly => RetrievalTopology::FastOnly,
+                SearchExecutionMode::QualityOnly => RetrievalTopology::QualityOnly,
                 SearchExecutionMode::Full | SearchExecutionMode::LexicalOnly => {
                     RetrievalTopology::FullProgressive
                 }
             };
             RecoveryRequest {
-                mode: RequestMode::Hybrid,
+                mode: if matches!(mode, SearchExecutionMode::QualityOnly) {
+                    RequestMode::ExplicitSemantic
+                } else {
+                    RequestMode::Hybrid
+                },
                 requested_topology,
             }
         }
     }
 
     const fn runtime_recovery_policy(&self) -> frankensearch_core::recovery_plan::RecoveryPolicy {
-        use frankensearch_core::recovery_plan::{
-            InteractionPolicy, NetworkPolicy, RecoveryPolicy,
-        };
+        use frankensearch_core::recovery_plan::{InteractionPolicy, NetworkPolicy, RecoveryPolicy};
 
         let interaction = if matches!(self.cli_input.format, OutputFormat::Table) {
             InteractionPolicy::Interactive
@@ -16073,8 +16339,7 @@ impl FsfsRuntime {
         use frankensearch_core::recovery_plan::{SemanticReadiness, VerifiedSemanticProvenance};
         use frankensearch_core::traits::ModelTier;
 
-        let check_by_name =
-            |name: &str| checks.iter().find(|check| check.name == name);
+        let check_by_name = |name: &str| checks.iter().find(|check| check.name == name);
         let index_check = check_by_name("index");
         if index_check.is_some_and(|check| {
             check.verdict == DoctorVerdict::Fail
@@ -22001,7 +22266,31 @@ impl FsfsRuntime {
         resources: &mut SearchExecutionResources,
     ) -> SearchResult<bool> {
         let current_fingerprint = Self::search_index_fingerprint_at_root(&resources.index_root)?;
-        if current_fingerprint == resources.generation_fingerprint {
+        // A daemon may have opened this same generation for a narrower mode.
+        // Changing the requested primary must admit its own file even when no
+        // publication changed the generation fingerprint.
+        let missing_requested_tier = match mode {
+            SearchExecutionMode::Full | SearchExecutionMode::FastOnly => {
+                resources.vector_index.is_none()
+                    && resources.index_root.join(FSFS_VECTOR_INDEX_FILE).exists()
+                    || matches!(mode, SearchExecutionMode::Full)
+                        && !matches!(resources.resource_mode, SearchExecutionMode::Full)
+                        && resources.quality_vector_index.is_none()
+                        && resources
+                            .index_root
+                            .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                            .exists()
+            }
+            SearchExecutionMode::QualityOnly => {
+                resources.quality_vector_index.is_none()
+                    && resources
+                        .index_root
+                        .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                        .exists()
+            }
+            SearchExecutionMode::LexicalOnly => false,
+        };
+        if current_fingerprint == resources.generation_fingerprint && !missing_requested_tier {
             if !matches!(mode, SearchExecutionMode::LexicalOnly) {
                 Self::validate_search_generation_at_root(&resources.index_root, mode)?;
             }
@@ -22013,7 +22302,11 @@ impl FsfsRuntime {
                 cx,
                 &index_root,
                 mode,
-                SearchExecutionMode::Full,
+                if matches!(mode, SearchExecutionMode::QualityOnly) {
+                    mode
+                } else {
+                    SearchExecutionMode::Full
+                },
             )
             .await?;
         Ok(true)
@@ -22111,6 +22404,7 @@ impl FsfsRuntime {
             true
         };
         let should_open_vector = semantic_generation_ready
+            && !matches!(resource_mode, SearchExecutionMode::QualityOnly)
             && (!matches!(resource_mode, SearchExecutionMode::LexicalOnly)
                 || lexical_index.is_none());
         let degradation_advice = Vec::new();
@@ -22127,16 +22421,20 @@ impl FsfsRuntime {
             .map(|index| semantic_windows::load_mapping(index_root, index))
             .transpose()?
             .flatten();
-        // The quality tier is an enhancement over a working fast tier: a
-        // missing file simply means INITIAL-only search, and an unreadable
-        // one degrades to the same rather than refusing the whole search.
+        // Progressive search treats quality as optional. An explicit
+        // quality-only request requires this tier independently of fast and
+        // never converts a missing or unreadable primary into lexical results.
+        // A warm server also opens standalone quality stores for later requests.
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
-        let quality_vector_index = if vector_index.is_some()
-            && matches!(resource_mode, SearchExecutionMode::Full)
-            && quality_vector_path.exists()
+        let quality_required = matches!(admission_mode, SearchExecutionMode::QualityOnly);
+        let quality_vector_index = if matches!(
+            resource_mode,
+            SearchExecutionMode::Full | SearchExecutionMode::QualityOnly
+        ) && (quality_required || quality_vector_path.exists())
         {
             match VectorIndex::open_read_only(&quality_vector_path) {
                 Ok(index) => Some(index),
+                Err(error) if quality_required => return Err(error),
                 Err(error) => {
                     warn!(
                         path = %quality_vector_path.display(),
@@ -22150,7 +22448,7 @@ impl FsfsRuntime {
             None
         };
 
-        if lexical_index.is_none() && vector_index.is_none() {
+        if lexical_index.is_none() && vector_index.is_none() && quality_vector_index.is_none() {
             return Err(SearchError::InvalidConfig {
                 field: "cli.index_dir".to_owned(),
                 value: index_root.display().to_string(),
@@ -22172,6 +22470,7 @@ impl FsfsRuntime {
         Ok(SearchExecutionResources {
             index_root: index_root.to_path_buf(),
             generation_fingerprint,
+            resource_mode,
             lexical_index,
             shadow_observer,
             shadow_pressure_sampler,
@@ -22459,17 +22758,255 @@ impl FsfsRuntime {
         F: Future<Output = SearchResult<T>>,
     {
         let budget_ms = self.config.search.quality_timeout_ms;
-        let started = Instant::now();
-        let timed = asupersync::time::timeout(cx.now(), Duration::from_millis(budget_ms), work);
+        let started_at = self.quality_budget_started_at.unwrap_or_else(|| cx.now());
+        let timeout_error = || SearchError::SearchTimeout {
+            elapsed_ms: cx.now().duration_since(started_at) / 1_000_000,
+            budget_ms,
+        };
         with_cancellation(cx, "quality_refinement", async {
-            timed.await.unwrap_or_else(|_| {
-                Err(SearchError::SearchTimeout {
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    budget_ms,
-                })
-            })
+            let now = cx.now();
+            let elapsed = Duration::from_nanos(now.duration_since(started_at));
+            let remaining = Duration::from_millis(budget_ms)
+                .checked_sub(elapsed)
+                .ok_or_else(timeout_error)?;
+            asupersync::time::timeout(now, remaining, work)
+                .await
+                .unwrap_or_else(|_| Err(timeout_error()))
         })
         .await
+    }
+
+    /// Admit the required primary tier before inference or a cached answer.
+    /// A quality-only search never depends on fast-tier availability, and an
+    /// unavailable quality producer is an error rather than a skipped stage.
+    async fn admit_required_quality(
+        &self,
+        cx: &Cx,
+        resources: &mut SearchExecutionResources,
+    ) -> SearchResult<()> {
+        Self::semantic_retry_checkpoint(cx, "fsfs.quality_only.admit")?;
+        let index = resources.quality_vector_index.as_ref().ok_or_else(|| {
+            SearchError::InvalidConfig {
+                field: "semantic.quality_generation".to_owned(),
+                value: "missing".to_owned(),
+                reason: "quality-only search requires a published quality-tier vector index; index the source with a verified quality model first"
+                    .to_owned(),
+            }
+        })?;
+        if Self::is_legacy_hash_vector_generation(index.embedder_id()) {
+            return Err(SearchError::InvalidConfig {
+                field: "semantic.quality_generation".to_owned(),
+                value: "legacy_hash".to_owned(),
+                reason: "quality-only search cannot use a hash control generation; rebuild with a verified quality model"
+                    .to_owned(),
+            });
+        }
+        self.maybe_prepare_quality_embedder(cx, resources).await?;
+        Self::validate_required_quality_resources(resources)?;
+        Self::semantic_retry_checkpoint(cx, "fsfs.quality_only.admit")
+    }
+
+    fn validate_required_quality_resources(
+        resources: &SearchExecutionResources,
+    ) -> SearchResult<()> {
+        let index =
+            resources
+                .quality_vector_index
+                .as_ref()
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "semantic.quality_generation".to_owned(),
+                    value: "missing".to_owned(),
+                    reason: "quality-only search requires a published quality-tier vector index"
+                        .to_owned(),
+                })?;
+        let admitted = resources.quality_embedder.as_ref().ok_or_else(|| {
+            SearchError::EmbedderUnavailable {
+                model: "quality".to_owned(),
+                reason:
+                    "quality-only search requires the verified producer for its stored quality tier"
+                        .to_owned(),
+            }
+        })?;
+        Self::ensure_semantic_embedder_admissible(admitted.embedder(), false)?;
+        Self::admit_quality_generation_for_embedder(index, admitted.embedder())?;
+        admitted.check_current_identity()?;
+        Self::validate_bound_search_resources(resources, SearchExecutionMode::QualityOnly)
+    }
+
+    /// Direct retrieval from the quality space. This is a required primary
+    /// stage, so it does not inherit progressive search's fast/lexical gate or
+    /// its optional-refinement fallback. It emits one complete Initial phase.
+    #[allow(clippy::too_many_lines)]
+    async fn execute_quality_only_search(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        resources: &mut SearchExecutionResources,
+        flags: SearchExecutionFlags,
+        mut phase_sink: Option<SearchPhaseSink<'_>>,
+    ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        let normalized_query = Self::normalize_search_query(query);
+        let filter = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
+        let parsed = ParsedQuery::parse(&normalized_query);
+        if parsed.has_negations() && resources.lexical_index.is_none() {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.search_query".to_owned(),
+                value: "quality_only_exclusions".to_owned(),
+                reason: "query exclusions require the lexical index to identify excluded documents; quality-only search will not ignore them"
+                    .to_owned(),
+            });
+        }
+        let lexical_stats = resources
+            .lexical_index
+            .as_ref()
+            .map(SegmentStatsProvider::segment_stats)
+            .transpose()?;
+        let quality_rows = resources.quality_vector_index.as_ref().map_or(0, |index| {
+            index
+                .record_count()
+                .saturating_add(index.wal_record_count())
+        });
+        let output_limit = Self::resolve_output_limit(limit, None, Some(quality_rows));
+        let candidate_budget = if self.config.search.rerank {
+            output_limit.saturating_mul(3)
+        } else {
+            output_limit
+        }
+        .min(quality_rows);
+        let semantic_query = if parsed.has_negations() && !parsed.is_positive_empty() {
+            parsed.positive.clone()
+        } else {
+            normalized_query.clone()
+        };
+        let candidates = self
+            .with_quality_deadline(cx, async {
+                self.admit_required_quality(cx, resources).await?;
+                if normalized_query.is_empty() || output_limit == 0 {
+                    return Ok(Vec::new());
+                }
+                let excluded = Self::query_exclusions(
+                    cx,
+                    resources.lexical_index.as_ref(),
+                    &parsed,
+                    lexical_stats.map_or(0, |stats| stats.live_docs),
+                )?;
+                self.quality_candidates(
+                    cx,
+                    resources,
+                    &semantic_query,
+                    candidate_budget,
+                    filter.as_ref(),
+                    excluded,
+                    &[],
+                )
+                .await?
+                .ok_or_else(|| SearchError::EmbedderUnavailable {
+                    model: "quality".to_owned(),
+                    reason: "the required quality producer became unavailable".to_owned(),
+                })
+            })
+            .await?;
+        Self::semantic_retry_checkpoint(cx, "fsfs.quality_only.results")?;
+        Self::validate_required_quality_resources(resources)?;
+        let orchestrator = QueryExecutionOrchestrator::new(QueryFusionPolicy {
+            rrf_k: self.config.search.rrf_k,
+        });
+        // With no lexical or fast votes, only quality similarity determines
+        // rank; the existing one-arm RRF preserves the public score contract.
+        let fused = orchestrator.fuse_rankings(&[], &candidates, candidate_budget, 0);
+        let reranker = self.prepared_reranker(cx).await?;
+        let rerank_stage = StageDirective {
+            enabled: self.config.search.rerank,
+            candidate_budget,
+            timeout_ms: self.config.search.rerank_timeout_ms,
+            reason_code: "query.stage.rerank.enabled",
+        };
+        let RerankStageOutcome {
+            fused,
+            payload: rerank_payload,
+        } = self
+            .apply_rerank_stage(
+                cx,
+                reranker.as_deref(),
+                &rerank_stage,
+                &resources.index_root,
+                &normalized_query,
+                fused,
+            )
+            .await?;
+        let mut snippets = HashMap::new();
+        if flags.include_snippets
+            && let Some(lexical) = resources.lexical_index.as_ref()
+        {
+            Self::fill_hit_snippets(
+                cx,
+                lexical,
+                &normalized_query,
+                &SnippetConfig {
+                    highlight_prefix: String::new(),
+                    highlight_postfix: String::new(),
+                    ..SnippetConfig::default()
+                },
+                &fused[..fused.len().min(output_limit)],
+                &mut snippets,
+            )?;
+        }
+        let mut payload = Self::attach_search_context(
+            Self::build_limited_payload(
+                orchestrator,
+                &normalized_query,
+                SearchOutputPhase::Initial,
+                &fused,
+                &fused,
+                &snippets,
+                output_limit,
+                false,
+            ),
+            lexical_stats.map(Self::index_freshness_payload),
+            resources,
+            SearchExecutionMode::QualityOnly,
+        );
+        HitLineLocator::new(&resources.index_root).annotate(&mut payload);
+        if self.config.search.rerank {
+            payload.rerank = Some(rerank_payload);
+        }
+        let (_, mut quality_hits) = self.blend_semantic_candidates(&[], &candidates, None);
+        let returned = payload
+            .hits
+            .iter()
+            .map(|hit| hit.path.as_str())
+            .collect::<HashSet<_>>();
+        quality_hits.retain(|hit| returned.contains(hit.path.as_str()));
+        payload.semantic_blend = Some(SemanticBlendPayload {
+            quality_weight: 1.0,
+            fast_embedder: String::new(),
+            quality_embedder: resources
+                .quality_embedder
+                .as_ref()
+                .map_or_else(String::new, |admitted| admitted.embedder().id().to_owned()),
+            hits: quality_hits,
+        });
+        let artifact = SearchPhaseArtifact {
+            phase: SearchOutputPhase::Initial,
+            fused,
+            payload,
+        };
+        Self::semantic_retry_checkpoint(cx, "fsfs.quality_only.finalize")?;
+        Self::validate_required_quality_resources(resources)?;
+        if let Some(sink) = phase_sink.as_deref_mut() {
+            sink(&artifact.payload)?;
+        }
+        Self::semantic_retry_checkpoint(cx, "fsfs.quality_only.finalize")?;
+        Self::validate_required_quality_resources(resources)?;
+        if flags.persist_explain_session {
+            self.persist_search_artifact_explanation(
+                &resources.index_root,
+                &normalized_query,
+                &artifact,
+            );
+        }
+        Ok(vec![artifact])
     }
 
     async fn quality_candidates(
@@ -23368,6 +23905,7 @@ impl FsfsRuntime {
             return Ok(true);
         }
         Ok(index_root.join(FSFS_VECTOR_INDEX_FILE).exists()
+            || index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists()
             || index_root.join("lexical").exists()
             || index_root.join(FSFS_VECTOR_MANIFEST_FILE).exists()
             || index_root.join(FSFS_LEXICAL_MANIFEST_FILE).exists())
@@ -25280,7 +25818,7 @@ fn print_cli_help() {
         "Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online"
     );
     println!(
-        "Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --rerank --expand"
+        "Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --quality-only --rerank --expand"
     );
     println!(
         "              --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
@@ -31960,7 +32498,14 @@ mod tests {
     fn disagreeing_blend_resources(root: &Path) -> SearchExecutionResources {
         let write = |name: &str, id: &str, rows: &[(&str, [f32; 2])]| {
             let path = root.join(name);
-            let mut writer = VectorIndex::create(&path, id, 2).unwrap();
+            let mut writer = VectorIndex::create_with_revision(
+                &path,
+                id,
+                &test_identity(id, 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
             for (doc_id, vector) in rows {
                 writer.write_record(doc_id, vector).unwrap();
             }
@@ -31990,6 +32535,7 @@ mod tests {
         SearchExecutionResources {
             index_root: root.to_path_buf(),
             generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(root).unwrap(),
+            resource_mode: SearchExecutionMode::Full,
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
@@ -32002,6 +32548,570 @@ mod tests {
             quality_embedder_attempted: true,
             degradation_advice: Vec::new(),
         }
+    }
+
+    #[test]
+    fn quality_only_retrieves_its_primary_without_fast_votes_and_preserves_filters() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            let fast = Arc::new(PendingSemanticEmbedder::new("blend-fast-2", 2));
+            resources.fast_embedder = Some(admitted_shared(&fast));
+            let lexical = create_test_quill(&cx, &temp.path().join("lexical")).await;
+            for (id, text) in [
+                ("a.rs", "quality search alpha"),
+                ("b.rs", "quality search omitthis"),
+                ("quality-only.rs", "quality search independent winner"),
+                (
+                    "lexical-only.rs",
+                    "quality search quality search quality search",
+                ),
+            ] {
+                lexical
+                    .index_document(&cx, &IndexableDocument::new(id, text))
+                    .await
+                    .unwrap();
+            }
+            lexical.commit(&cx).await.unwrap();
+            resources.lexical_index = Some(
+                QuillSearchIndex::open(&cx, temp.path().join("lexical"), QuillConfig::default())
+                    .await
+                    .unwrap(),
+            );
+            resources.generation_fingerprint =
+                FsfsRuntime::search_index_fingerprint_at_root(temp.path()).unwrap();
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config);
+            let flags = SearchExecutionFlags {
+                include_snippets: true,
+                persist_explain_session: false,
+            };
+            let mut emitted = Vec::new();
+            let phases = runtime
+                .execute_quality_only_search(
+                    &cx,
+                    "quality search",
+                    FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL,
+                    &mut resources,
+                    flags,
+                    Some(&mut |payload: &SearchPayload| {
+                        emitted.push(payload.phase);
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(emitted, [SearchOutputPhase::Initial]);
+            assert_eq!(phases.len(), 1);
+            let payload = &phases[0].payload;
+            assert_eq!(payload.skip_reason.as_deref(), Some("quality_only"));
+            assert_eq!(
+                payload.vector_generation_id.as_deref(),
+                Some("blend-quality-2")
+            );
+            assert_eq!(
+                payload
+                    .hits
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["b.rs", "quality-only.rs", "a.rs"]
+            );
+            assert!(
+                payload
+                    .hits
+                    .iter()
+                    .all(|hit| hit.lexical_rank.is_none() && hit.semantic_rank.is_some())
+            );
+            let evidence = payload.semantic_blend.as_ref().unwrap();
+            assert!(evidence.fast_embedder.is_empty());
+            assert_eq!(evidence.quality_weight, 1.0);
+            assert!(evidence.hits.iter().all(|hit| {
+                hit.fast.is_none()
+                    && hit
+                        .quality
+                        .as_ref()
+                        .is_some_and(|quality| quality.weight == 1.0)
+            }));
+            assert_eq!(
+                fast.calls.load(Ordering::SeqCst),
+                0,
+                "the fast producer is never polled"
+            );
+
+            resources.vector_index = None;
+            resources.fast_embedder = None;
+            let filtered = runtime.clone().with_cli_input(CliInput {
+                filter: Some("path:a.rs".to_owned()),
+                ..CliInput::default()
+            });
+            let phases = filtered
+                .execute_quality_only_search(&cx, "quality search", 10, &mut resources, flags, None)
+                .await
+                .unwrap();
+            assert_eq!(phases[0].payload.hits.len(), 1);
+            assert_eq!(phases[0].payload.hits[0].path, "a.rs");
+            let phases = runtime
+                .execute_quality_only_search(
+                    &cx,
+                    "quality search -omitthis",
+                    10,
+                    &mut resources,
+                    flags,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                phases[0]
+                    .payload
+                    .hits
+                    .iter()
+                    .map(|hit| hit.path.as_str())
+                    .collect::<Vec<_>>(),
+                ["quality-only.rs", "a.rs"]
+            );
+            assert!(
+                phases[0]
+                    .payload
+                    .hits
+                    .iter()
+                    .all(|hit| hit.snippet.is_some())
+            );
+        });
+    }
+
+    #[test]
+    fn quality_only_primary_failures_never_emit_a_lexical_or_fast_fallback() {
+        run_on_runtime_task(|cx| async move {
+            for failure in ["index", "producer", "identity", "hash", "exclusion"] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                let runtime = FsfsRuntime::new(FsfsConfig::default());
+                match failure {
+                    "index" => resources.quality_vector_index = None,
+                    "producer" => {
+                        resources.quality_embedder = None;
+                        resources.quality_embedder_attempted = true;
+                    }
+                    "identity" => {
+                        resources.quality_embedder =
+                            Some(admitted(BlendQueryEmbedder("wrong-quality-2")))
+                    }
+                    "hash" => {
+                        let path = temp.path().join("hash-quality.fsvi");
+                        let mut writer = VectorIndex::create(&path, "fnv1a-2", 2).unwrap();
+                        writer.write_record("hash.rs", &[1.0, 0.0]).unwrap();
+                        writer.finish().unwrap();
+                        resources.quality_vector_index =
+                            Some(Arc::new(VectorIndex::open_read_only(&path).unwrap()));
+                    }
+                    "exclusion" => {}
+                    _ => unreachable!(),
+                }
+                let mut emitted = 0;
+                let query = if failure == "exclusion" {
+                    "quality -omitted"
+                } else {
+                    "quality query"
+                };
+                let result = runtime
+                    .execute_quality_only_search(
+                        &cx,
+                        query,
+                        10,
+                        &mut resources,
+                        SearchExecutionFlags {
+                            include_snippets: false,
+                            persist_explain_session: false,
+                        },
+                        Some(&mut |_| {
+                            emitted += 1;
+                            Ok(())
+                        }),
+                    )
+                    .await;
+                assert!(result.is_err(), "{failure} must refuse, not fall back");
+                assert_eq!(emitted, 0, "{failure} emitted a successful phase");
+            }
+        });
+    }
+
+    #[test]
+    fn quality_only_required_inference_obeys_deadline_and_cancellation_without_initial() {
+        use std::task::{Context, Waker};
+
+        run_on_runtime_task(|cx| async move {
+            for cancel in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let mut resources = disagreeing_blend_resources(temp.path());
+                let backend = Arc::new(PendingSemanticEmbedder::new("blend-quality-2", 2));
+                resources.quality_embedder = Some(admitted_shared(&backend));
+                let mut config = FsfsConfig::default();
+                config.search.quality_timeout_ms = if cancel { 60_000 } else { 50 };
+                let runtime = FsfsRuntime::new(config);
+                let mut emitted = 0;
+                let mut sink = |_: &SearchPayload| {
+                    emitted += 1;
+                    Ok(())
+                };
+                let mut operation = Box::pin(runtime.execute_quality_only_search(
+                    &cx,
+                    "quality query",
+                    10,
+                    &mut resources,
+                    SearchExecutionFlags {
+                        include_snippets: false,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut sink),
+                ));
+                if cancel {
+                    let wake = Arc::new(RuntimeInferenceWake::default());
+                    let waker = Waker::from(Arc::clone(&wake));
+                    assert!(
+                        operation
+                            .as_mut()
+                            .poll(&mut Context::from_waker(&waker))
+                            .is_pending()
+                    );
+                    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+                    cx.cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("quality-only cancellation"),
+                    );
+                    assert!(matches!(
+                        operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(SearchError::Cancelled { .. }))
+                    ));
+                } else {
+                    assert!(matches!(
+                        operation.as_mut().await,
+                        Err(SearchError::SearchTimeout { .. })
+                    ));
+                }
+                drop(operation);
+                assert_eq!(emitted, 0);
+                assert_eq!(backend.dropped.load(Ordering::SeqCst), 1);
+                cx.set_cancel_requested(false);
+            }
+        });
+    }
+
+    #[test]
+    fn quality_only_policy_never_downgrades_to_a_lite_or_pressure_fallback() {
+        use crate::config::DegradationOverrideMode;
+        for mode in [
+            DegradationOverrideMode::ForceLexicalOnly,
+            DegradationOverrideMode::ForceMetadataOnly,
+            DegradationOverrideMode::ForcePaused,
+        ] {
+            assert!(super::degraded_search_mode(mode, SearchExecutionMode::QualityOnly).is_err());
+        }
+        let result = super::degraded_search_mode(
+            DegradationOverrideMode::Auto,
+            SearchExecutionMode::QualityOnly,
+        );
+        if super::SEMANTIC_LOADERS_COMPILED {
+            assert_eq!(result.unwrap(), SearchExecutionMode::QualityOnly);
+        } else {
+            assert!(matches!(
+                result,
+                Err(SearchError::EmbedderUnavailable { .. })
+            ));
+        }
+        for spelling in ["quality", "quality_only"] {
+            assert_eq!(
+                super::parse_search_execution_mode(Some(spelling)).unwrap(),
+                SearchExecutionMode::QualityOnly
+            );
+        }
+        let request =
+            FsfsRuntime::runtime_recovery_request(SearchExecutionMode::QualityOnly, false);
+        assert_eq!(
+            request.mode,
+            frankensearch_core::recovery_plan::RequestMode::ExplicitSemantic
+        );
+        assert_eq!(
+            request.requested_topology,
+            frankensearch_core::RetrievalTopology::QualityOnly
+        );
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn quality_only_opens_a_standalone_primary_without_resolving_or_opening_fast() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let quality_path = temp.path().join(super::FSFS_VECTOR_QUALITY_INDEX_FILE);
+            fs::create_dir_all(quality_path.parent().unwrap()).unwrap();
+            let mut writer = VectorIndex::create_with_revision(
+                &quality_path,
+                "blend-quality-2",
+                &test_identity("blend-quality-2", 2).fingerprint(),
+                2,
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap();
+            writer.write_record("quality.rs", &[1.0, 0.0]).unwrap();
+            writer.finish().unwrap();
+            let mut config = FsfsConfig::default();
+            config.indexing.fast_model = "invalid-fast-producer".to_owned();
+            let runtime = FsfsRuntime::new(config);
+            let resources = runtime
+                .prepare_search_execution_resources_at_root_with_modes(
+                    &cx,
+                    temp.path(),
+                    SearchExecutionMode::QualityOnly,
+                    SearchExecutionMode::QualityOnly,
+                )
+                .await
+                .unwrap();
+            assert!(resources.vector_index.is_none());
+            assert!(resources.quality_vector_index.is_some());
+            assert!(!resources.fast_embedder_attempted);
+
+            // The long-lived server opens a standalone quality artifact even
+            // before it knows which mode the first client will request.
+            let server = runtime
+                .prepare_search_execution_resources_at_root_with_modes(
+                    &cx,
+                    temp.path(),
+                    SearchExecutionMode::LexicalOnly,
+                    SearchExecutionMode::Full,
+                )
+                .await
+                .unwrap();
+            assert!(server.vector_index.is_none());
+            assert!(server.quality_vector_index.is_some());
+
+            // A broken unrelated fast artifact must not turn an independent
+            // required-quality request into a fast-index validation failure.
+            fs::write(
+                temp.path().join(super::FSFS_VECTOR_INDEX_FILE),
+                b"not an FSVI fast generation",
+            )
+            .unwrap();
+            let resources = runtime
+                .prepare_search_execution_resources_at_root_with_modes(
+                    &cx,
+                    temp.path(),
+                    SearchExecutionMode::QualityOnly,
+                    SearchExecutionMode::QualityOnly,
+                )
+                .await
+                .unwrap();
+            assert!(resources.vector_index.is_none());
+            assert!(resources.quality_vector_index.is_some());
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn quality_only_warm_mode_switches_admit_the_new_tier_without_a_publication() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            drop(published_blend_resources(temp.path()));
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut resources = runtime
+                .prepare_search_execution_resources_at_root_with_modes(
+                    &cx,
+                    temp.path(),
+                    SearchExecutionMode::FastOnly,
+                    SearchExecutionMode::FastOnly,
+                )
+                .await
+                .unwrap();
+            let fingerprint = resources.generation_fingerprint.clone();
+            assert!(resources.vector_index.is_some());
+            assert!(resources.quality_vector_index.is_none());
+            assert!(
+                runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::QualityOnly,
+                        &mut resources,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(resources.generation_fingerprint, fingerprint);
+            assert!(resources.vector_index.is_none());
+            assert!(resources.quality_vector_index.is_some());
+            assert!(
+                runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(resources.generation_fingerprint, fingerprint);
+            assert!(resources.vector_index.is_some());
+            assert!(resources.quality_vector_index.is_some());
+            assert!(
+                !runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                    )
+                    .await
+                    .unwrap()
+            );
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn quality_only_requires_a_corrupt_optional_tier_without_reopening_full_queries() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            drop(published_blend_resources(temp.path()));
+            fs::write(
+                temp.path().join(super::FSFS_VECTOR_QUALITY_INDEX_FILE),
+                b"not an FSVI quality generation",
+            )
+            .unwrap();
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let mut resources = runtime
+                .prepare_search_execution_resources_at_root_with_modes(
+                    &cx,
+                    temp.path(),
+                    SearchExecutionMode::Full,
+                    SearchExecutionMode::Full,
+                )
+                .await
+                .unwrap();
+            assert!(resources.vector_index.is_some());
+            assert!(resources.quality_vector_index.is_none());
+            assert!(
+                !runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::Full,
+                        &mut resources,
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                runtime
+                    .rebind_search_resources_if_generation_changed(
+                        &cx,
+                        SearchExecutionMode::QualityOnly,
+                        &mut resources,
+                    )
+                    .await
+                    .is_err()
+            );
+        });
+    }
+
+    #[cfg(all(feature = "semantic-support", unix))]
+    #[test]
+    fn quality_only_daemon_attests_the_primary_and_revalidates_cached_producers() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = published_blend_resources(temp.path());
+            let mut config = FsfsConfig::default();
+            config.indexing.fast_model = "invalid-fast-producer".to_owned();
+            config.storage.index_dir = temp.path().display().to_string();
+            config.search.quality_timeout_ms = 5_000;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                index_dir: Some(temp.path().to_path_buf()),
+                quality_only: true,
+                ..CliInput::default()
+            });
+            let request = FsfsRuntime::parse_search_serve_request(
+                r#"{"query":"quality query","mode":"quality_only","limit":10,"rerank":false}"#,
+            )
+            .unwrap();
+            let mut cache = HashMap::new();
+            let fingerprint = resources.generation_fingerprint.clone();
+            let mut state = super::SearchServeStreamState::default();
+            let mut delivered = Vec::new();
+            let cold = runtime
+                .execute_search_serve_request_with_sink(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut cache,
+                    super::SearchServeOptions {
+                        hot_cache_enabled: true,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut |frame| {
+                        if let Some(payload) = runtime.accept_search_serve_frame(
+                            frame,
+                            &mut state,
+                            &request,
+                            temp.path(),
+                            &fingerprint,
+                        )? {
+                            delivered.push(payload);
+                        }
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(!cold.cached);
+            assert_eq!(delivered, cold.payloads);
+            assert_eq!(delivered.len(), 1);
+            assert_eq!(delivered[0].hits[0].path, "b.rs");
+            assert_eq!(
+                state.vector_generation_id.as_deref(),
+                Some("blend-quality-2")
+            );
+            let started = runtime.search_stream_started_event("quality query", "quality-stream");
+            assert_eq!(
+                started.vector_generation_id.as_deref(),
+                Some("blend-quality-2")
+            );
+            assert_eq!(started.skip_reason.as_deref(), Some("quality_only"));
+            let warm = runtime
+                .execute_search_serve_request(
+                    &cx,
+                    request.clone(),
+                    &mut resources,
+                    &mut cache,
+                    true,
+                )
+                .await
+                .unwrap();
+            assert!(warm.cached);
+            assert_eq!(warm.payloads, cold.payloads);
+
+            resources.quality_embedder = Some(admitted(BlendQueryEmbedder("foreign-quality-2")));
+            let mut phases = 0;
+            let refused = runtime
+                .execute_search_serve_request_with_sink(
+                    &cx,
+                    request,
+                    &mut resources,
+                    &mut cache,
+                    super::SearchServeOptions {
+                        hot_cache_enabled: true,
+                        persist_explain_session: false,
+                    },
+                    Some(&mut |frame| {
+                        if matches!(frame, super::SearchServeFrame::Phase { .. }) {
+                            phases += 1;
+                        }
+                        Ok(())
+                    }),
+                )
+                .await;
+            assert!(
+                refused.is_err(),
+                "a hot answer cannot hide a changed producer"
+            );
+            assert_eq!(phases, 0);
+        });
     }
 
     /// GH #54: the crash window 0dc3df2f repaired reaches the fsfs query path.
@@ -32046,6 +33156,7 @@ mod tests {
                 index_root: temp.path().to_path_buf(),
                 generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
                     .unwrap(),
+                resource_mode: SearchExecutionMode::Full,
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -32621,6 +33732,11 @@ mod tests {
         assert!(
             serde_json::from_value::<super::SearchServeResponse>(unbound).is_err(),
             "an omitted deadline cannot acknowledge a current request"
+        );
+        response.schema_version = "fsfs.search.serve.v15".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that cannot require the quality-only primary cannot attest"
         );
         response.schema_version = "fsfs.search.serve.v14".to_owned();
         assert!(
@@ -33426,6 +34542,9 @@ mod tests {
         // weight; v3 blends quality discoveries without fast scores; v2
         // predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v13",
+            "fsfs.search.serve.stream.v12",
+            "fsfs.search.serve.stream.v11",
             "fsfs.search.serve.stream.v10",
             "fsfs.search.serve.stream.v9",
             "fsfs.search.serve.stream.v8",
@@ -33730,7 +34849,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn published_blend_resources(root: &Path) -> SearchExecutionResources {
+    pub(super) fn published_blend_resources(root: &Path) -> SearchExecutionResources {
         let mut resources = disagreeing_blend_resources(root);
         fs::create_dir_all(root.join("vector")).unwrap();
         fs::copy(
@@ -34636,6 +35755,39 @@ mod tests {
     }
 
     #[test]
+    fn quality_deadline_retains_the_admission_budget_and_cancellation_priority() {
+        run_on_runtime_task(|cx| async move {
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 50;
+            let mut runtime = FsfsRuntime::new(config);
+            runtime.quality_budget_started_at = Some(cx.now());
+            // Time consumed before retrieval belongs to the same quality
+            // request. Even immediately ready inference cannot restart it.
+            asupersync::time::sleep(cx.now(), Duration::from_millis(60)).await;
+            let mut polled = false;
+            let result = runtime
+                .with_quality_deadline(&cx, async {
+                    polled = true;
+                    Ok::<_, SearchError>(42)
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(SearchError::SearchTimeout { elapsed_ms, budget_ms: 50 })
+                    if elapsed_ms >= 50
+            ));
+            assert!(!polled, "expired work must not begin inference");
+            cx.set_cancel_requested(true);
+            let result = runtime
+                .with_quality_deadline(&cx, async { Ok::<_, SearchError>(42) })
+                .await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert_eq!(runtime.config.search.quality_timeout_ms, 50);
+        });
+    }
+
+    #[test]
     fn quality_deadline_exact_tie_prefers_ready_work_but_expired_work_is_rejected() {
         use asupersync::types::Time;
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
@@ -34986,6 +36138,31 @@ mod tests {
                 && source.contains("asupersync::time::sleep"),
             "daemon connection retry must sleep through Cx so cancel is observed"
         );
+    }
+
+    #[test]
+    fn standalone_quality_index_is_recognized_before_search_admission() {
+        let directory = tempfile::tempdir().expect("quality-only tempdir");
+        let index_root = directory.path().join("index");
+        let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+            command: CliCommand::Search,
+            quality_only: true,
+            index_dir: Some(index_root.clone()),
+            ..CliInput::default()
+        });
+        assert!(!runtime.index_artifacts_exist().expect("absent index"));
+
+        let quality_path = index_root.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE);
+        fs::create_dir_all(quality_path.parent().expect("vector directory"))
+            .expect("create quality index directory");
+        VectorIndex::create(&quality_path, "all-minilm-l6-v2", 384)
+            .expect("create standalone quality index")
+            .finish()
+            .expect("finish standalone quality index");
+
+        assert!(runtime.index_artifacts_exist().expect("quality index"));
+        assert!(!index_root.join(super::FSFS_VECTOR_INDEX_FILE).exists());
+        assert!(!index_root.join("lexical").exists());
     }
 
     /// The public contract, not just the helper: a cancelled daemon wait must
@@ -36489,6 +37666,7 @@ mod tests {
         let resources = SearchExecutionResources {
             index_root: root.to_path_buf(),
             generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(root).unwrap(),
+            resource_mode: SearchExecutionMode::Full,
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
@@ -38344,6 +39522,22 @@ mod tests {
     }
 
     #[test]
+    fn expanded_queries_preserve_original_exclusions_when_generated_text_is_truncated() {
+        let original = super::ParsedQuery::parse(r#"alpha -banned NOT "internal secret""#);
+        let expanded = format!(
+            r"\-literal {}",
+            "alpha ".repeat(crate::query_planning::MAX_QUERY_CHARS)
+        );
+        let prepared = FsfsRuntime::expanded_query_with_exclusions(&original, &expanded)
+            .expect("preserve exclusions ahead of generated text");
+        let parsed = super::ParsedQuery::parse(&prepared);
+        assert_eq!(parsed.negative_terms, original.negative_terms);
+        assert_eq!(parsed.negative_phrases, original.negative_phrases);
+        assert!(parsed.positive.starts_with("-literal alpha"));
+        assert!(prepared.chars().count() <= crate::query_planning::MAX_QUERY_CHARS);
+    }
+
+    #[test]
     fn expanded_query_variants_reject_cross_generation_fusion() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("index root");
@@ -38406,6 +39600,7 @@ mod tests {
             let first_payloads = runtime
                 .execute_expanded_query_variants(
                     &cx,
+                    "alpha",
                     &first,
                     20,
                     &mut resources,
@@ -38439,6 +39634,7 @@ mod tests {
             let error = runtime
                 .execute_expanded_query_variants(
                     &cx,
+                    "alpha",
                     &second,
                     20,
                     &mut resources,
@@ -38504,6 +39700,7 @@ mod tests {
                 index_root: temp.path().to_path_buf(),
                 generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
                     .expect("phase fixture fingerprint"),
+                resource_mode: SearchExecutionMode::Full,
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -38555,6 +39752,7 @@ mod tests {
             let variants = runtime
                 .execute_expanded_query_variants(
                     &cx,
+                    &queries[0].text,
                     &queries,
                     1,
                     &mut resources,
@@ -38616,6 +39814,7 @@ mod tests {
                     serving_root.path(),
                 )
                 .expect("serve generation fingerprint"),
+                resource_mode: SearchExecutionMode::Full,
                 lexical_index: Some(reader),
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -45043,13 +46242,20 @@ mod tests {
     /// "banned" and sits near the query in both vector tiers, and the vector
     /// lanes embed only "alpha", so the attractor c.rs is not pulled in either.
     #[test]
-    fn negated_terms_exclude_documents_from_the_vector_lanes() {
+    fn negated_terms_exclude_documents_from_vector_lanes_and_expanded_queries() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("exclusion fixture");
             let mut resources = disagreeing_blend_resources(temp.path());
             let write = |name: &str, embedder: &str, rows: &[(&str, [f32; 2])]| {
                 let path = temp.path().join(name);
-                let mut writer = VectorIndex::create(&path, embedder, 2).unwrap();
+                let mut writer = VectorIndex::create_with_revision(
+                    &path,
+                    embedder,
+                    &test_identity(embedder, 2).fingerprint(),
+                    2,
+                    frankensearch_index::Quantization::F16,
+                )
+                .unwrap();
                 for (doc_id, vector) in rows {
                     writer.write_record(doc_id, vector).unwrap();
                 }
@@ -45079,7 +46285,7 @@ mod tests {
             let quill = create_test_quill(&cx, &temp.path().join("lexical")).await;
             for (path, text) in [
                 ("a.rs", "alpha"),
-                ("b.rs", "alpha banned"),
+                ("b.rs", "alpha banned internal secret"),
                 ("c.rs", "gamma"),
             ] {
                 quill
@@ -45106,7 +46312,12 @@ mod tests {
                 persist_explain_session: false,
             };
             // Natural-language wording: the planner runs both vector lanes.
-            for exclusion in ["-banned", "NOT \"banned\"", "-\"banned\""] {
+            for exclusion in [
+                "-banned",
+                "NOT \"banned\"",
+                "-\"banned\"",
+                "NOT \"internal secret\"",
+            ] {
                 let query = format!("how do alpha documents rank {exclusion}");
                 let phases = runtime
                     .execute_search_payloads_with_mode_using_resources(
@@ -45138,6 +46349,69 @@ mod tests {
                     .find(|hit| hit.path == "a.rs")
                     .unwrap();
                 assert_eq!(initial_a.semantic_rank, Some(0), "{query}");
+
+                // Generated variants deliberately omit the negative clauses.
+                // In the quality tier the excluded b.rs is the best match;
+                // a limit of one proves exclusions run before top-k selection.
+                let variants = [
+                    query_expansion::ExpandedQuery {
+                        text: query.clone(),
+                        strategy: query_expansion::ExpansionStrategy::Original,
+                    },
+                    query_expansion::ExpandedQuery {
+                        text: "alpha".to_owned(),
+                        strategy: query_expansion::ExpansionStrategy::Keyword,
+                    },
+                    query_expansion::ExpandedQuery {
+                        text: "how should alpha documents be ranked".to_owned(),
+                        strategy: query_expansion::ExpansionStrategy::Semantic,
+                    },
+                    query_expansion::ExpandedQuery {
+                        text: "alpha documents describe the document ranking process".to_owned(),
+                        strategy: query_expansion::ExpansionStrategy::HyDE,
+                    },
+                ];
+                for quality_only in [false, true] {
+                    let expanded_runtime = runtime.clone().with_cli_input(CliInput {
+                        quality_only,
+                        ..runtime.cli_input.clone()
+                    });
+                    let fingerprint = resources.generation_fingerprint.clone();
+                    let outcome = expanded_runtime
+                        .execute_expanded_query_variants(
+                            &cx,
+                            &query,
+                            &variants,
+                            1,
+                            &mut resources,
+                            &fingerprint,
+                            flags,
+                        )
+                        .await;
+                    if quality_only && !super::SEMANTIC_LOADERS_COMPILED {
+                        assert!(matches!(
+                            outcome,
+                            Err(SearchError::EmbedderUnavailable { model, .. }) if model == "quality"
+                        ));
+                        continue;
+                    }
+                    let payloads = outcome.expect("each variant inherits the original exclusions");
+                    assert_eq!(payloads.len(), variants.len());
+                    for payload in &payloads {
+                        assert_eq!(
+                            payload.hits.len(),
+                            1,
+                            "{query}, quality_only={quality_only}"
+                        );
+                        assert_eq!(
+                            payload.hits[0].path, "a.rs",
+                            "{query}, quality_only={quality_only}"
+                        );
+                    }
+                    let fused = FsfsRuntime::fuse_expanded_payloads(&query, &payloads, 1, 60.0);
+                    assert_eq!(fused.hits.len(), 1);
+                    assert_eq!(fused.hits[0].path, "a.rs");
+                }
             }
             // Without an exclusion b.rs is an ordinary hit.
             let plain = runtime
@@ -45159,6 +46433,27 @@ mod tests {
                     .iter()
                     .any(|hit| hit.path == "b.rs")
             );
+
+            resources.lexical_index = None;
+            let fingerprint = resources.generation_fingerprint.clone();
+            let variants = [query_expansion::ExpandedQuery {
+                text: "alpha".to_owned(),
+                strategy: query_expansion::ExpansionStrategy::Keyword,
+            }];
+            let error = runtime
+                .execute_expanded_query_variants(
+                    &cx,
+                    "alpha -banned",
+                    &variants,
+                    1,
+                    &mut resources,
+                    &fingerprint,
+                    flags,
+                )
+                .await
+                .expect_err("missing exclusion evidence must not broaden expanded retrieval");
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == "query_expansion.exclusions"));
         });
     }
 
@@ -46017,6 +47312,7 @@ mod tests {
                 index_root: temp.path().to_path_buf(),
                 generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
                     .expect("search generation fingerprint"),
+                resource_mode: SearchExecutionMode::Full,
                 lexical_index: Some(reader),
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -47514,6 +48810,7 @@ mod tests {
                 index_root: temp.path().to_path_buf(),
                 generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
                     .expect("stream generation fingerprint"),
+                resource_mode: SearchExecutionMode::Full,
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -47548,13 +48845,14 @@ mod tests {
                 5,
                 stream_id,
                 &mut transport,
-                Some((
-                    &mut resources,
-                    SearchExecutionFlags {
+                Some(super::SearchStreamResources {
+                    resources: &mut resources,
+                    flags: SearchExecutionFlags {
                         include_snippets: false,
                         persist_explain_session: false,
                     },
-                )),
+                    requested_mode: runtime.requested_search_mode(),
+                }),
             ));
 
             let first_poll = poll_fn(|task_cx| Poll::Ready(search.as_mut().poll(task_cx))).await;
@@ -47642,6 +48940,7 @@ mod tests {
                 index_root: temp.path().to_path_buf(),
                 generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
                     .expect("quality-failure generation fingerprint"),
+                resource_mode: SearchExecutionMode::Full,
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -47896,6 +49195,7 @@ mod tests {
                 index_root: temp.path().to_path_buf(),
                 generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
                     .expect("stream generation fingerprint"),
+                resource_mode: SearchExecutionMode::Full,
                 lexical_index: Some(lexical_index),
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -47923,13 +49223,14 @@ mod tests {
                     5,
                     "stream-fast-cancel",
                     &mut transport,
-                    Some((
-                        &mut resources,
-                        SearchExecutionFlags {
+                    Some(super::SearchStreamResources {
+                        resources: &mut resources,
+                        flags: SearchExecutionFlags {
                             include_snippets: false,
                             persist_explain_session: false,
                         },
-                    )),
+                        requested_mode: runtime.requested_search_mode(),
+                    }),
                 )
                 .await;
 
@@ -47979,6 +49280,7 @@ mod tests {
                 index_root: temp.path().to_path_buf(),
                 generation_fingerprint: FsfsRuntime::search_index_fingerprint_at_root(temp.path())
                     .expect("stream generation fingerprint"),
+                resource_mode: SearchExecutionMode::Full,
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
@@ -48013,13 +49315,14 @@ mod tests {
                     5,
                     "stream-quality-cancel",
                     &mut transport,
-                    Some((
-                        &mut resources,
-                        SearchExecutionFlags {
+                    Some(super::SearchStreamResources {
+                        resources: &mut resources,
+                        flags: SearchExecutionFlags {
                             include_snippets: false,
                             persist_explain_session: false,
                         },
-                    )),
+                        requested_mode: runtime.requested_search_mode(),
+                    }),
                 )
                 .await;
 
@@ -51144,6 +52447,7 @@ mod tests {
         let resources = |loaded: bool, attempted: bool| SearchExecutionResources {
             index_root: temp.path().to_path_buf(),
             generation_fingerprint: "test".to_owned(),
+            resource_mode: SearchExecutionMode::Full,
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
@@ -51183,6 +52487,7 @@ mod tests {
         let resources = SearchExecutionResources {
             index_root: temp.path().to_path_buf(),
             generation_fingerprint: "test".to_owned(),
+            resource_mode: SearchExecutionMode::Full,
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
@@ -51224,6 +52529,7 @@ mod tests {
         let resources = SearchExecutionResources {
             index_root: PathBuf::from("/tmp/missing-vector"),
             generation_fingerprint: "test".to_owned(),
+            resource_mode: SearchExecutionMode::Full,
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
@@ -52060,6 +53366,7 @@ mod tests {
         let resources = SearchExecutionResources {
             index_root: temp.path().to_path_buf(),
             generation_fingerprint: "test".to_owned(),
+            resource_mode: SearchExecutionMode::Full,
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,

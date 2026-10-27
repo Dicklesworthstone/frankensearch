@@ -171,9 +171,13 @@ embedded once per required tier. Precision and graph policy are inherited from
 the admitted predecessor. Deleting everything retains one empty identity-bearing
 partition and can be followed by an ordinary sharded update after restart.
 
-Every source/vector image, graph and the global Quill index is rebuilt in the new
-directory. Only inference is incremental; this is not O(changed-bytes) writing or
-a measured speedup. The new complete hybrid receipt is saved and synced before a
+Every source/vector image and the global Quill index is rebuilt in the new
+directory. Native graphs retain eligible predecessor topology and insert new rows
+when a whole predecessor partition survives unchanged within a successor; changed
+vectors, removed rows, or different graph policies select a full build. Every
+graph is saved with a receipt bound to the new vector owner, including physical
+row remapping. This is not O(changed-bytes) writing or a measured speedup.
+The new complete hybrid receipt is saved and synced before a
 successful `updated` response. Old files, receipts and readers remain untouched.
 Cancellation or a required late-stage failure can leave inert candidate files,
 but never a partial-index success receipt. Failed output after receipt persistence

@@ -25,6 +25,148 @@ fn pointer(store: &CompleteGenerationStore) -> Vec<u8> {
 }
 
 #[test]
+fn prepared_build_seals_without_selection_and_releases_publication_ownership() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let old = published(&store, &cx, b"old");
+        let before = pointer(&store);
+        let build = store.begin(&cx).unwrap();
+        fs::write(build.path().join("content.txt"), b"new").unwrap();
+        let plan = build
+            .prepare(&cx, |_, path| {
+                assert_eq!(fs::read(path.join("content.txt"))?, b"new");
+                Ok(())
+            })
+            .unwrap();
+        let target = plan.target().clone();
+        assert_ne!(target, old);
+        assert!(target.path().join(COMPLETE_GENERATION_MANIFEST).is_file());
+        assert_eq!(pointer(&store), before);
+        assert_eq!(store.active(&cx).unwrap(), Some(old.clone()));
+        // A second real build can acquire ownership while this sealed
+        // preparation is pinned. Dropping it does not change selection.
+        drop(store.begin(&cx).unwrap());
+        let guard = plan.expected_selection_sha256();
+        drop(plan);
+        let resumed = store
+            .resume_restore(&cx, target.id(), target.manifest_sha256(), &guard)
+            .unwrap();
+        assert_eq!(
+            durable(resumed.restore(&cx, |_, _| Ok(())).unwrap()),
+            target
+        );
+        assert_eq!(store.active(&cx).unwrap(), Some(target));
+        assert_eq!(fs::read(old.path().join("content.txt")).unwrap(), b"old");
+    });
+}
+
+#[test]
+fn prepared_build_preserves_original_predecessor_and_failed_admission() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let old = published(&store, &cx, b"old");
+        let build = store.begin(&cx).unwrap();
+        fs::write(build.path().join("content.txt"), b"candidate").unwrap();
+        let plan = build.prepare(&cx, |_, _| Ok(())).unwrap();
+        let target = plan.target().clone();
+        let winner = published(&store, &cx, b"winner");
+        assert!(plan.restore(&cx, |_, _| Ok(())).is_err());
+        assert_eq!(store.active(&cx).unwrap(), Some(winner.clone()));
+        assert!(target.path().is_dir());
+        let build = store.begin(&cx).unwrap();
+        fs::write(build.path().join("content.txt"), b"invalid").unwrap();
+        assert!(
+            build
+                .prepare(&cx, |_, path| Err(invalid(
+                    path,
+                    "fixture refuses admission"
+                )))
+                .is_err()
+        );
+        assert_eq!(store.active(&cx).unwrap(), Some(winner));
+        assert_eq!(fs::read(old.path().join("content.txt")).unwrap(), b"old");
+    });
+}
+
+#[test]
+fn prepared_first_build_keeps_an_empty_store_unselected_until_restore() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let build = store.begin(&cx).unwrap();
+        fs::write(build.path().join("content.txt"), b"first").unwrap();
+        let plan = build.prepare(&cx, |_, _| Ok(())).unwrap();
+        assert_eq!(store.active(&cx).unwrap(), None);
+        assert!(!store.root().join(COMPLETE_GENERATION_POINTER).exists());
+        let target = plan.target().clone();
+        assert_eq!(durable(plan.restore(&cx, |_, _| Ok(())).unwrap()), target);
+        assert_eq!(store.active(&cx).unwrap(), Some(target));
+    });
+}
+
+#[test]
+fn recovery_rebuild_binds_malformed_selection_and_refuses_shared_artifacts() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let old = published(&store, &cx, b"old");
+        fs::write(
+            store.root().join(COMPLETE_GENERATION_POINTER),
+            b"damaged head",
+        )
+        .unwrap();
+        assert!(store.begin(&cx).is_err());
+        let build = store.begin_recovery_rebuild(&cx).unwrap();
+        let debug = format!("{build:?}");
+        assert!(!debug.contains("damaged head"));
+        assert!(!debug.contains(&format!("{:?}", b"damaged head".as_slice())));
+        fs::hard_link(
+            old.path().join("content.txt"),
+            build.path().join("content.txt"),
+        )
+        .unwrap();
+        assert!(build.prepare(&cx, |_, _| Ok(())).is_err());
+        assert_eq!(pointer(&store), b"damaged head");
+        let build = store.begin_recovery_rebuild(&cx).unwrap();
+        fs::write(build.path().join("content.txt"), b"independent rebuild").unwrap();
+        let plan = build.prepare(&cx, |_, _| Ok(())).unwrap();
+        assert_eq!(pointer(&store), b"damaged head");
+        fs::write(
+            store.root().join(COMPLETE_GENERATION_POINTER),
+            b"different damaged head",
+        )
+        .unwrap();
+        assert!(plan.restore(&cx, |_, _| Ok(())).is_err());
+        assert_eq!(pointer(&store), b"different damaged head");
+        assert_eq!(fs::read(old.path().join("content.txt")).unwrap(), b"old");
+    });
+}
+
+#[test]
+fn recovery_rebuild_refuses_unsafe_and_oversized_selection_evidence() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"outside selection").unwrap();
+        let selection = store.root().join(COMPLETE_GENERATION_POINTER);
+        std::os::unix::fs::symlink(&outside, &selection).unwrap();
+        assert!(store.begin_recovery_rebuild(&cx).is_err());
+        fs::rename(&selection, root.path().join("retained-symlink")).unwrap();
+        fs::write(
+            &selection,
+            vec![b'x'; usize::try_from(MAX_POINTER_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(store.begin_recovery_rebuild(&cx).is_err());
+        assert!(!store.root().join(GENERATIONS).exists());
+        assert_eq!(fs::read(&outside).unwrap(), b"outside selection");
+    });
+}
+
+#[test]
 fn retained_open_requires_exact_receipt_and_never_changes_selection() {
     run_test_with_cx(|cx| async move {
         let root = tempfile::tempdir().unwrap();

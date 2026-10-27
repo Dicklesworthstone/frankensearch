@@ -583,6 +583,11 @@ impl HnswIndex {
     /// scans source rows to construct a replacement graph and never writes,
     /// replaces, renames, or changes permissions or mtimes.
     ///
+    /// Rows of `source_index` tombstoned after the graph was built may stay
+    /// mapped: search with [`Self::knn_search_with_stats_against`], which skips
+    /// them. Such a graph is not current, so [`Self::matches_vector_index`]
+    /// reports `false` for it.
+    ///
     /// # Errors
     ///
     /// Returns an error when the metadata file cannot be read or parsed, its
@@ -1565,8 +1570,14 @@ impl HnswIndex {
     ///
     /// Since `HnswIndex` no longer stores vectors, this checks:
     /// 1. Dimension match.
-    /// 2. Every live physical row is mapped once with the correct `doc_id`.
+    /// 2. Every live physical row is mapped once with the correct `doc_id`, and
+    ///    no mapped row has been tombstoned since the build.
     /// 3. The fingerprint of every live vector.
+    ///
+    /// A `false` from (2) alone does not mean the graph is unusable:
+    /// [`Self::try_load_native`] still admits a graph whose mapped rows were
+    /// tombstoned after the build, and [`Self::knn_search_with_stats_against`]
+    /// filters them. Owners that want a current graph rebuild on `false`.
     ///
     /// # Errors
     ///
@@ -1589,6 +1600,7 @@ impl HnswIndex {
             &self.doc_ids,
             &self.source_positions,
             self.source_record_count,
+            MappedTombstones::Refuse,
         )? {
             return Ok(false);
         }
@@ -3110,10 +3122,10 @@ fn fingerprint_vector_index_positions(
     Ok(h)
 }
 
-/// Verify the graph's persisted row map covers every live source row exactly
-/// once and binds the expected document identity. Same semantics as the public
-/// `matches_vector_index` but doesn't need a constructed `HnswIndex`, so we
-/// can check it before paying for the native graph load.
+/// Verify the graph's persisted row map can serve the live source before
+/// paying for the native graph load. Unlike the public `matches_vector_index`,
+/// it admits a mapped row that was tombstoned after the build (see
+/// [`MappedTombstones::Admit`]).
 fn meta_matches_live_doc_ids(meta: &HnswMeta, index: &VectorIndex) -> SearchResult<bool> {
     if meta.dimension != index.dimension() {
         return Ok(false);
@@ -3123,14 +3135,38 @@ fn meta_matches_live_doc_ids(meta: &HnswMeta, index: &VectorIndex) -> SearchResu
         &meta.doc_ids,
         &meta.source_positions,
         meta.source_record_count,
+        MappedTombstones::Admit,
     )
 }
 
+/// How a graph's row map treats a mapped row that was tombstoned after the
+/// build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MappedTombstones {
+    /// The graph must be current: no mapped row may be tombstoned. Owners use
+    /// this answer ([`HnswIndex::matches_vector_index`]) to decide whether to
+    /// rebuild the graph.
+    Refuse,
+    /// The graph may still serve the source. Soft deletion after the build (an
+    /// in-place WAL replacement tombstones the replaced main row) is a valid
+    /// state transition, as [`fingerprint_vector_index_positions`] already
+    /// treats it: searches given the source skip tombstoned neighbours and
+    /// repair an underfill with an exact scan of the current live rows.
+    /// Refusing such a graph at native load sent every shard with one replaced
+    /// document to exact search until a rebuild.
+    Admit,
+}
+
+/// Whether a graph's row map serves `index`: each mapped row exists once with
+/// the mapped document identity, and every live row is mapped (an unmapped live
+/// row is a row the graph can never return). `mapped_tombstones` decides
+/// whether a mapped row may have been tombstoned since the build.
 fn source_map_matches_live_rows(
     index: &VectorIndex,
     doc_ids: &[String],
     positions: &[u32],
     source_record_count: usize,
+    mapped_tombstones: MappedTombstones,
 ) -> SearchResult<bool> {
     if source_record_count != index.record_count() || positions.len() != doc_ids.len() {
         return Ok(false);
@@ -3141,7 +3177,9 @@ fn source_map_matches_live_rows(
         let Some(seen) = covered.get_mut(row) else {
             return Ok(false);
         };
-        if *seen || index.is_deleted(row) || id != index.doc_id_at(row)? {
+        let refused_tombstone =
+            mapped_tombstones == MappedTombstones::Refuse && index.is_deleted(row);
+        if *seen || refused_tombstone || id != index.doc_id_at(row)? {
             return Ok(false);
         }
         *seen = true;
@@ -3149,7 +3187,7 @@ fn source_map_matches_live_rows(
     Ok(covered
         .iter()
         .enumerate()
-        .all(|(row, &seen)| seen != index.is_deleted(row)))
+        .all(|(row, &seen)| seen || index.is_deleted(row)))
 }
 
 fn fingerprint_source_map(positions: &[u32], source_record_count: usize) -> u64 {
@@ -4606,6 +4644,124 @@ mod tests {
             Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
         );
         assert_eq!(forced, expected);
+    }
+
+    #[test]
+    fn persisted_graph_loads_natively_after_a_covered_row_is_tombstoned() {
+        let root = temp_path("persisted-post-build-tombstone", "dir");
+        std::fs::create_dir_all(&root).expect("create fixture dir");
+        let fsvi_path = root.join("source.fsvi");
+        let vectors: Vec<Vec<f32>> = (0..32).map(|i| normalized_vector(i, 16)).collect();
+        let source = write_index(&fsvi_path, &vectors).expect("write source FSVI");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("build ANN");
+        let metadata_path = root.join("source-ann.hnsw");
+        ann.save(&metadata_path).expect("save native ANN");
+        drop(source);
+
+        // The tombstone is durable, as a WAL replacement's is: a fresh handle sees it.
+        let mut writer = VectorIndex::open(&fsvi_path).expect("reopen source to delete");
+        assert!(
+            writer
+                .soft_delete("doc-0005")
+                .expect("tombstone a covered row")
+        );
+        drop(writer);
+        let reopened = VectorIndex::open(&fsvi_path).expect("reopen tombstoned source");
+        assert_eq!(reopened.live_count(), 31);
+
+        let native = HnswIndex::try_load_native(&metadata_path, &reopened)
+            .expect("inspect native graph")
+            .expect("a graph whose covered row was tombstoned after the build stays native");
+        assert!(
+            !native.matches_vector_index(&reopened).expect("match"),
+            "the graph is not current, so an owner that wants a fresh graph still rebuilds"
+        );
+        let (_, disposition) =
+            HnswIndex::load_with_disposition(&metadata_path, &reopened).expect("strict load");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+
+        let query = &vectors[5];
+        let expected = reopened
+            .search_main_top_k(query, 5)
+            .expect("exact search over the live rows");
+        let (hits, _) = native
+            .knn_search_with_stats_against(&reopened, query, 5, HNSW_DEFAULT_EF_SEARCH)
+            .expect("tombstone-aware ANN search");
+        assert!(hits.iter().all(|hit| hit.doc_id != "doc-0005"));
+        assert_eq!(
+            hits.iter().map(|hit| &hit.doc_id).collect::<Vec<_>>(),
+            expected.iter().map(|hit| &hit.doc_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn source_map_admits_tombstoned_mapped_rows_but_refuses_an_unmapped_live_row() {
+        let path = temp_path("source-map-coverage", "fsvi");
+        let mut index = write_index(
+            &path,
+            &[
+                vec![1.0_f32, 0.0, 0.0],
+                vec![0.0_f32, 1.0, 0.0],
+                vec![0.0_f32, 0.0, 1.0],
+            ],
+        )
+        .expect("source");
+        let ids = |rows: &[usize]| -> Vec<String> {
+            rows.iter().map(|row| format!("doc-{row:04}")).collect()
+        };
+        let positions = |rows: &[usize]| -> Vec<u32> {
+            rows.iter()
+                .map(|&row| u32::try_from(row).expect("row"))
+                .collect()
+        };
+        let matches = |index: &VectorIndex, rows: &[usize], mode: MappedTombstones| {
+            source_map_matches_live_rows(index, &ids(rows), &positions(rows), 3, mode)
+                .expect("check")
+        };
+
+        for mode in [MappedTombstones::Admit, MappedTombstones::Refuse] {
+            assert!(matches(&index, &[0, 1, 2], mode), "{mode:?}");
+            assert!(
+                !matches(&index, &[0, 1], mode),
+                "{mode:?}: live row 2 is unmapped"
+            );
+            assert!(
+                !matches(&index, &[0, 1, 1], mode),
+                "{mode:?}: row 1 is mapped twice"
+            );
+            assert!(
+                !source_map_matches_live_rows(
+                    &index,
+                    &["doc-0000".into(), "doc-0002".into(), "doc-0001".into()],
+                    &positions(&[0, 1, 2]),
+                    3,
+                    mode,
+                )
+                .expect("check"),
+                "{mode:?}: row 1 is mapped under another document identity"
+            );
+        }
+
+        assert!(index.soft_delete("doc-0001").expect("tombstone row 1"));
+        assert!(
+            matches(&index, &[0, 1, 2], MappedTombstones::Admit),
+            "native load admits a mapped row tombstoned after the build"
+        );
+        assert!(
+            !matches(&index, &[0, 1, 2], MappedTombstones::Refuse),
+            "a graph with a mapped tombstone is not current"
+        );
+        for mode in [MappedTombstones::Admit, MappedTombstones::Refuse] {
+            assert!(
+                matches(&index, &[0, 2], mode),
+                "{mode:?}: a tombstoned row need not be mapped"
+            );
+            assert!(
+                !matches(&index, &[0, 1], mode),
+                "{mode:?}: live row 2 is still unmapped"
+            );
+        }
     }
 
     #[test]

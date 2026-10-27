@@ -2,12 +2,14 @@
 //!
 //! Source edits never mutate the retained predecessor. Reuse is by exact source
 //! ID, content, producer identity and storage precision, not by row number. New
-//! FSVI rows and optional graphs are always built for the successor's membership.
+//! FSVI rows and optional graphs always bind to the successor's membership.
+//! Compatible native graphs retain their topology and insert only new documents.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::super::NativeAnnIndex;
 use super::sharded::NativeBuiltShardedIndex;
 use super::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltIndex, NativeBuiltTier,
@@ -19,9 +21,15 @@ use frankensearch_index::native_hnsw::HnswParams;
 use frankensearch_index::{ValidatedFsviBytes, VectorIndexWriter};
 
 #[cfg(feature = "quill")]
-use super::NativeBuiltHybridIndex;
-#[cfg(feature = "quill")]
 use super::sharded::NativeBuiltShardedHybridIndex;
+#[cfg(feature = "quill")]
+use super::{NativeBuiltExactGeneration, NativeBuiltHybridIndex};
+#[cfg(feature = "quill")]
+use crate::native_ann::NativeGenerationSnapshot;
+#[cfg(feature = "quill")]
+use frankensearch_core::generation::{CommitRange, EmbedderTierTag};
+#[cfg(feature = "quill")]
+use frankensearch_index::generation_root::generation_reader::OpenedGenerationSnapshotV1;
 
 /// Pending upserts/deletes against one immutable source/vector cohort.
 ///
@@ -40,8 +48,10 @@ use super::sharded::NativeBuiltShardedHybridIndex;
 /// This stages a successor, not a CURRENT switch or a durable rollback floor.
 /// The predecessor remains searchable throughout a failed, cancelled or dropped
 /// update. A caller must seal/select the completed successor through its existing
-/// publication policy. Source, vector and graph rebuilding still have their
-/// ordinary full-cohort memory and I/O costs; only inference is incremental.
+/// publication policy. Source and vector artifacts retain their full-cohort
+/// memory and I/O costs. A compatible native graph is cloned and extended when
+/// all predecessor rows survive unchanged; edits, deletions or graph-policy
+/// changes rebuild it. Both paths persist a complete successor graph/receipt.
 /// Construct with [`NativeBuiltIndex::begin_update`] or
 /// [`NativeBuiltShardedIndex::begin_update`]. Either source layout may produce
 /// an ordinary or partitioned successor. Repartitioning preserves inference
@@ -179,6 +189,8 @@ impl NativeIndexUpdate {
         }
         builder.reuse = Some(Arc::new(ReuseSource {
             partitions: retained,
+            #[cfg(feature = "quill")]
+            authority: None,
         }));
         checkpoint(cx, "native_ann.update.prepared")?;
         Ok(Self {
@@ -189,6 +201,106 @@ impl NativeIndexUpdate {
 }
 
 impl NativeIndexUpdate {
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn from_authority(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        provider: Arc<dyn crate::Embedder>,
+        snapshot: &NativeGenerationSnapshot,
+        max_source_bytes: usize,
+        index: Arc<NativeAnnIndex>,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.update.authority")?;
+        // An explicitly reopened predecessor carries the newer selection's
+        // physical slot pair. That pair cannot authorize incremental edits to
+        // its historical source. A previously current retained snapshot keeps
+        // its own original pair and remains eligible for ordinary stale fencing.
+        if snapshot
+            .retained_snapshot()
+            .selected_predecessor_of()
+            .is_some()
+        {
+            return Err(invalid(
+                "update.authority",
+                "reopened-predecessor",
+                "incremental updates require a snapshot with its originally selected authority pair",
+            ));
+        }
+        let predecessor = index.owner_witness().generation;
+        if generation.sequence <= predecessor.sequence {
+            return Err(invalid(
+                "update.generation",
+                "not-newer",
+                "an update requires a strictly higher generation sequence",
+            ));
+        }
+        let precision = match index.owner_witness().quantization {
+            frankensearch_index::Quantization::F32 => NativeBuildPrecision::F32,
+            frankensearch_index::Quantization::F16 => NativeBuildPrecision::F16,
+        };
+        let mut builder = NativeIndexBuilder::new(directory, generation, provider)?;
+        builder.fast.precision = precision;
+        builder.fast.retrieval = snapshot.retrieval_configuration();
+        builder.build_pool(cx)?;
+        let tier = snapshot.tier();
+        let key = match tier {
+            EmbedderTierTag::Fast => "fast",
+            EmbedderTierTag::Quality => "quality",
+        };
+        // The plan retains the actual provider output identity. Normalize only
+        // its persistence encoding, exactly as the original writer did, before
+        // comparing the COMPLETE authenticated identity, including storage.
+        let binding = builder.fast.binding(&predecessor)?;
+        if snapshot.metadata().embedders.get(key) != Some(binding.frozen_identity()) {
+            return Err(invalid(
+                "update.producer",
+                "changed",
+                "incremental reuse requires the original complete producer and storage identity",
+            ));
+        }
+        index.admit_identity(&builder.fast.identity)?;
+        let mut documents = snapshot.source_documents(cx, max_source_bytes)?;
+        documents.sort_by(|left, right| left.id.cmp(&right.id));
+        let fast = ReuseTier::from_owner(
+            cx,
+            index,
+            &documents,
+            builder.fast.identity.fingerprint(),
+            precision,
+        )?;
+        builder.reuse = Some(Arc::new(ReuseSource {
+            partitions: vec![ReusePartition {
+                documents: documents.into(),
+                fast,
+                quality: None,
+            }],
+            authority: Some(AuthorityReuse {
+                _snapshot: Arc::clone(snapshot.retained_snapshot()),
+                tier,
+                source: snapshot.metadata().commit_range.clone(),
+            }),
+        }));
+        checkpoint(cx, "native_ann.update.authority_prepared")?;
+        Ok(Self {
+            builder,
+            edits: BTreeMap::new(),
+        })
+    }
+
+    /// Finalize successor vectors and graphs on this caller-owned pool.
+    ///
+    /// Overrides the pool inherited through the build Cx. The predecessor is
+    /// never changed by worker completion; installation remains a caller action.
+    #[must_use]
+    pub fn with_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        self.builder = self.builder.with_blocking_pool(pool);
+        self
+    }
+
     /// Insert a new document or replace the complete source document for this ID.
     /// Later edits for the same ID replace this edit. Empty IDs fail before build.
     #[must_use]
@@ -270,11 +382,73 @@ impl NativeIndexUpdate {
         Box::pin(self.prepare(cx)?.build(cx)).await
     }
 
+    /// Build complete authority-publishable components from these source edits.
+    ///
+    /// Unchanged content reuses its retained vector. Every successor vector,
+    /// lexical, metadata and optional graph image is rebuilt and admitted as one
+    /// complete cohort. This creates no authority selection and never changes
+    /// the predecessor. Use the ordinary publisher with its original expected
+    /// authority pair; a concurrent publication may still win that comparison.
+    ///
+    /// Updates begun from an authority snapshot preserve its tier label and may
+    /// not move either source-checkpoint boundary backward. As with
+    /// [`NativeIndexBuilder::build_exact_generation`], this route requires one
+    /// provider and a nonempty resulting source cohort. Finalization inherits
+    /// the configured/caller-context pool through the ordinary builder.
+    ///
+    /// # Errors
+    /// Includes edit/identity/inference/build errors and refuses an authority
+    /// tier change, backward source range, empty successor or invalid image budget.
+    #[cfg(feature = "quill")]
+    pub async fn build_exact_generation(
+        self,
+        cx: &Cx,
+        tier: EmbedderTierTag,
+        source: CommitRange,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.update.generation")?;
+        if let Some(authority) = self
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            && (tier != authority.tier
+                || source.low < authority.source.low
+                || source.high < authority.source.high)
+        {
+            return Err(invalid(
+                "update.authority_contract",
+                "changed",
+                "authority updates must preserve their tier and advance source boundaries monotonically",
+            ));
+        }
+        // The vector worker owns a reuse pin, but drops it before the composite
+        // builder exports and admits Quill. Keep this independent pin through
+        // that complete operation as well.
+        let authority_pin = self
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            .map(|authority| Arc::clone(&authority._snapshot));
+        let result =
+            Box::pin(
+                self.prepare(cx)?
+                    .build_exact_generation(cx, tier, source, max_image_bytes),
+            )
+            .await;
+        drop(authority_pin);
+        result
+    }
+
     /// Repartition the edited source cohort without re-embedding unchanged rows.
     ///
-    /// The ordinary builder recreates all vector images and graphs. Reuse looks
+    /// The ordinary builder recreates all vector images. Vector reuse looks
     /// up the exact ID/content/producer/precision in the shared predecessor
-    /// inventory, independent of both old and new shard boundaries. All child
+    /// inventory, independent of both old and new shard boundaries. A graph can
+    /// be extended only when a predecessor partition survives completely within
+    /// one successor partition; other partition changes rebuild that graph. All child
     /// builds must succeed; no admitted prefix or live selection is returned.
     /// Empty output retains one identity-bearing partition. Choose a new root.
     ///
@@ -329,6 +503,7 @@ impl NativeIndexUpdate {
 
     fn prepare(mut self, cx: &Cx) -> SearchResult<NativeIndexBuilder> {
         checkpoint(cx, "native_ann.update.edits")?;
+        self.builder.build_pool(cx)?;
         if self.edits.contains_key("") {
             return Err(invalid(
                 "update.document_id",
@@ -407,6 +582,17 @@ pub(super) struct ReuseSource {
     // Shared by ALL successor children: no repeated source-body, vector-slab,
     // or physical-row-map copies when repartitioning the predecessor.
     partitions: Vec<ReusePartition>,
+    #[cfg(feature = "quill")]
+    authority: Option<AuthorityReuse>,
+}
+
+#[cfg(feature = "quill")]
+struct AuthorityReuse {
+    // Keep the original root/closure/reader pin even when only this prepared
+    // update remains alive, including while a blocking finalizer owns it.
+    _snapshot: Arc<OpenedGenerationSnapshotV1>,
+    tier: EmbedderTierTag,
+    source: CommitRange,
 }
 
 struct ReusePartition {
@@ -442,9 +628,43 @@ impl ReuseSource {
             .ok()?;
         Some((partition, position))
     }
+
+    /// Try one retained partition, selected by the first surviving source ID.
+    /// The native boundary proves exact membership/vector compatibility before
+    /// cloning anything. Trying every old partition could make repartitioning
+    /// quadratic; an ineligible candidate deliberately selects a fresh build.
+    pub(super) fn try_reuse_graph(
+        &self,
+        cx: &Cx,
+        role: ReuseRole,
+        owner: Arc<ValidatedFsviBytes>,
+        documents: &[IndexableDocument],
+        params: HnswParams,
+        seed: u64,
+    ) -> SearchResult<Option<NativeAnnIndex>> {
+        for document in documents {
+            checkpoint(cx, "native_ann.update.graph_candidate")?;
+            let Some((partition, _)) = self.find(&document.id) else {
+                continue;
+            };
+            let tier = match role {
+                ReuseRole::Fast => &partition.fast,
+                ReuseRole::Quality => partition.quality.as_ref().ok_or_else(|| {
+                    invalid(
+                        "update.graph_candidate",
+                        "quality",
+                        "missing retained quality owner",
+                    )
+                })?,
+            };
+            return tier.index.try_reuse_for_owner(cx, owner, params, seed);
+        }
+        Ok(None)
+    }
 }
 
 struct ReuseTier {
+    index: Arc<NativeAnnIndex>,
     owner: Arc<ValidatedFsviBytes>,
     physical_rows: Vec<usize>,
     producer_fingerprint: String,
@@ -453,18 +673,48 @@ struct ReuseTier {
 
 impl ReuseTier {
     fn new(cx: &Cx, tier: &NativeBuiltTier, documents: &[IndexableDocument]) -> SearchResult<Self> {
-        let owner = Arc::clone(&tier.index.owner);
-        if owner.record_count() != documents.len() || owner.live_count() != documents.len() {
+        Self::from_owner(
+            cx,
+            Arc::clone(&tier.index),
+            documents,
+            tier.producer_identity.fingerprint(),
+            tier.precision,
+        )
+    }
+
+    fn from_owner(
+        cx: &Cx,
+        index: Arc<NativeAnnIndex>,
+        documents: &[IndexableDocument],
+        producer_fingerprint: String,
+        precision: NativeBuildPrecision,
+    ) -> SearchResult<Self> {
+        let owner = Arc::clone(&index.owner);
+        if owner.live_count() != documents.len() {
             return Err(invalid(
                 "update.source_join",
                 "cardinality",
                 "source/tier membership differs",
             ));
         }
+        for (position, document) in documents.iter().enumerate() {
+            checkpoint(cx, "native_ann.update.source_order")?;
+            if document.id.is_empty() || (position > 0 && documents[position - 1].id >= document.id)
+            {
+                return Err(invalid(
+                    "update.source_join",
+                    "order",
+                    "retained sources must have unique nonempty IDs in increasing order",
+                ));
+            }
+        }
         let mut physical_rows = vec![usize::MAX; documents.len()];
         for physical in 0..owner.record_count() {
             checkpoint(cx, "native_ann.update.row_map")?;
             let row = owner.row(physical)?;
+            if !row.flags().is_live() {
+                continue;
+            }
             let source = documents
                 .binary_search_by(|document| document.id.as_str().cmp(row.doc_id()))
                 .map_err(|_| {
@@ -474,21 +724,27 @@ impl ReuseTier {
                         "row has no source document",
                     )
                 })?;
-            if !row.flags().is_live()
-                || std::mem::replace(&mut physical_rows[source], physical) != usize::MAX
-            {
+            if std::mem::replace(&mut physical_rows[source], physical) != usize::MAX {
                 return Err(invalid(
                     "update.source_join",
-                    "duplicate-or-deleted",
+                    "duplicate",
                     "source rows must be live and unique",
                 ));
             }
         }
+        if physical_rows.contains(&usize::MAX) {
+            return Err(invalid(
+                "update.source_join",
+                "missing",
+                "every retained source must resolve to one live physical row",
+            ));
+        }
         Ok(Self {
+            index,
             owner,
             physical_rows,
-            producer_fingerprint: tier.producer_identity.fingerprint(),
-            precision: tier.precision,
+            producer_fingerprint,
+            precision,
         })
     }
 }
@@ -951,6 +1207,147 @@ mod tests {
             assert_eq!(quality.submitted.load(Ordering::SeqCst), 5);
             assert_eq!(fast.calls.load(Ordering::SeqCst), 1);
             assert_eq!(quality.calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn append_updates_reuse_both_graphs_across_row_reordering_and_selected_restart() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let fast = Provider::new("append-fast", 2);
+            let quality = Provider::new("append-quality", 3);
+            let old = builder(&dir.path().join("old"), &fast, &quality)
+                .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                .with_quality_storage(NativeBuildPrecision::F32, graph(true))
+                .unwrap()
+                .build(&cx)
+                .await
+                .unwrap();
+            let old_graph = std::fs::read(old.fast().graph_path().unwrap()).unwrap();
+            let additions: Vec<_> = (0..20)
+                .map(|n| IndexableDocument::new(format!("arrival-{n}"), "vertical"))
+                .collect();
+            let next_path = dir.path().join("next");
+            let next = old
+                .begin_update(&cx, &next_path, generation(2))
+                .unwrap()
+                .upsert_documents(additions.clone())
+                .upsert_document(
+                    IndexableDocument::new("a", "fractional").with_title("updated metadata"),
+                )
+                .build(&cx)
+                .await
+                .unwrap();
+            assert_eq!(fast.submitted.load(Ordering::SeqCst), 25);
+            assert_eq!(quality.submitted.load(Ordering::SeqCst), 25);
+            assert!(
+                (0..old.fast().index.owner.record_count()).any(|row| {
+                    old.fast().index.owner.doc_id_at(row).unwrap()
+                        != next.fast().index.owner.doc_id_at(row).unwrap()
+                }),
+                "the fixture must exercise physical-row remapping",
+            );
+
+            // An independently built graph starts with the successor's physical
+            // row order; the extended graph must retain the old logical nodes.
+            let rebuilt =
+                NativeIndexBuilder::new(dir.path().join("rebuilt"), generation(2), fast.clone())
+                    .unwrap()
+                    .with_quality_embedder(quality.clone())
+                    .unwrap()
+                    .with_fast_storage(NativeBuildPrecision::F16, graph(true))
+                    .with_quality_storage(NativeBuildPrecision::F32, graph(true))
+                    .unwrap()
+                    .add_documents(documents())
+                    .add_documents(additions)
+                    .build(&cx)
+                    .await
+                    .unwrap();
+            for (actual, cold) in [
+                (next.fast(), rebuilt.fast()),
+                (next.quality().unwrap(), rebuilt.quality().unwrap()),
+            ] {
+                assert_eq!(actual.index.owner_witness(), cold.index.owner_witness());
+                assert_ne!(
+                    actual.graph_receipt.as_ref().unwrap().topology_sha256,
+                    cold.graph_receipt.as_ref().unwrap().topology_sha256,
+                    "an eligible update must extend the retained graph, not rebuild it",
+                );
+                for query in ["vertical", "horizontal", "diagonal", "fractional"] {
+                    assert_eq!(
+                        actual.search(&cx, query, 25).await.unwrap(),
+                        cold.search(&cx, query, 25).await.unwrap(),
+                    );
+                    let hits = actual
+                        .index()
+                        .search_text_filtered(&cx, actual.embedder(), query, 1, Some(4), |id| {
+                            id == "arrival-19"
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(hits[0].doc_id, "arrival-19");
+                }
+            }
+            assert_eq!(
+                std::fs::read(old.fast().graph_path().unwrap()).unwrap(),
+                old_graph
+            );
+            assert_eq!(old.fast().index().live_count(), 5);
+            assert_eq!(
+                old.fast().search(&cx, "vertical", 1).await.unwrap()[0].doc_id,
+                "b"
+            );
+            let receipt = next.seal_for_reopen(&cx).unwrap();
+            drop(next);
+            let reopened = NativeBuiltIndex::open_selected(
+                &cx,
+                &next_path,
+                &receipt,
+                fast.clone(),
+                Some(quality.clone()),
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.document("a").unwrap().title.as_deref(),
+                Some("updated metadata")
+            );
+            for (actual, cold) in [
+                (reopened.fast(), rebuilt.fast()),
+                (reopened.quality().unwrap(), rebuilt.quality().unwrap()),
+            ] {
+                assert_eq!(
+                    actual.search(&cx, "vertical", 25).await.unwrap(),
+                    cold.search(&cx, "vertical", 25).await.unwrap(),
+                );
+            }
+
+            // Restarted handles retain the remapping for a later metadata-only
+            // successor without invoking either provider again.
+            fast.fault.store(FAIL, Ordering::SeqCst);
+            quality.fault.store(FAIL, Ordering::SeqCst);
+            let metadata = reopened
+                .begin_update(&cx, dir.path().join("metadata"), generation(3))
+                .unwrap()
+                .upsert_document(IndexableDocument::new("b", "vertical").with_metadata("rev", "3"))
+                .build(&cx)
+                .await
+                .unwrap();
+            assert_eq!(
+                metadata
+                    .fast()
+                    .graph_receipt
+                    .as_ref()
+                    .unwrap()
+                    .topology_sha256,
+                reopened
+                    .fast()
+                    .graph_receipt
+                    .as_ref()
+                    .unwrap()
+                    .topology_sha256,
+            );
+            assert_eq!(metadata.document("b").unwrap().metadata["rev"], "3");
         });
     }
 

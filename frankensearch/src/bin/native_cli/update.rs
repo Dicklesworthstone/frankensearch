@@ -1,7 +1,7 @@
 //! Incremental inference into a new selected native hybrid cohort. The original
 //! receipt, source text, vectors, graphs and Quill publication remain untouched.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use frankensearch::native_ann::builder::NativeHybridReopenLimits;
 use frankensearch::native_ann::builder::sharded::{
@@ -12,8 +12,8 @@ use super::{
     BlockingPoolHandle, BufRead, BufReader, Cx, Deserialize, File, GenerationComponentReceiptV1,
     HashMap, IndexableDocument, MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECORD_BYTES, Models,
     NativeBuiltHybridIndex, Options, Path, Read, Result, SCHEMA, SELECTION_SCHEMA, Selection,
-    SnapshotReceipt, Write, bad, build_with_generation, cohort, emit, encode, fs, io, models,
-    new_generation, new_path, save_selection, sharded,
+    SnapshotReceipt, Write, bad, build_with_generation, cohort, emit, encode, execution_context,
+    fs, io, models, new_generation, new_path, save_selection, sharded,
 };
 
 pub type Edits = BTreeMap<String, Option<IndexableDocument>>;
@@ -112,8 +112,26 @@ pub fn validate_final_cohort<'a>(
     index: impl Into<cohort::Index<'a>>,
     edits: &Edits,
 ) -> Result<usize> {
-    update_checkpoint(cx)?;
     let index = index.into();
+    // Iterate the complete source inventory, not just its first partition.
+    // The iterator borrows bodies; input accounting does not clone the corpus.
+    let documents: Box<dyn Iterator<Item = &'a IndexableDocument> + 'a> = match index {
+        cohort::Index::Single(index) => Box::new(index.vectors().documents().iter()),
+        cohort::Index::Sharded(index) => Box::new(index.vectors().documents()),
+    };
+    validate_final_source(cx, documents, edits)
+}
+
+/// Apply the same final-cohort limits to retained hybrid and authority sources.
+/// Only document IDs are retained while accounting for the merged source; the
+/// source bodies and edits remain borrowed, including for sharded inventories.
+pub fn validate_final_source<'a>(
+    cx: &Cx,
+    documents: impl IntoIterator<Item = &'a IndexableDocument>,
+    edits: &Edits,
+) -> Result<usize> {
+    update_checkpoint(cx)?;
+    let mut retained_ids = BTreeSet::new();
     let mut count = 0_usize;
     let mut bytes = 0_usize;
     let mut admit = |document: &IndexableDocument| -> Result<()> {
@@ -134,14 +152,11 @@ pub fn validate_final_cohort<'a>(
         }
         Ok(())
     };
-    // Iterate the complete source inventory, not just its first partition.
-    // The iterator borrows bodies; input accounting does not clone the corpus.
-    let documents: Box<dyn Iterator<Item = &'a IndexableDocument> + 'a> = match index {
-        cohort::Index::Single(index) => Box::new(index.vectors().documents().iter()),
-        cohort::Index::Sharded(index) => Box::new(index.vectors().documents()),
-    };
     for previous in documents {
         update_checkpoint(cx)?;
+        if !retained_ids.insert(previous.id.as_str()) {
+            return Err(bad("the retained source contains a duplicate document ID"));
+        }
         match edits.get(&previous.id) {
             Some(Some(document)) => admit(document)?,
             Some(None) => {}
@@ -150,11 +165,7 @@ pub fn validate_final_cohort<'a>(
     }
     for (id, document) in edits {
         update_checkpoint(cx)?;
-        let previous = match index {
-            cohort::Index::Single(index) => index.vectors().document(id),
-            cohort::Index::Sharded(index) => index.vectors().document(id),
-        };
-        if previous.is_none()
+        if !retained_ids.contains(id.as_str())
             && let Some(document) = document
         {
             admit(document)?;
@@ -317,6 +328,9 @@ pub async fn execute(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    let context = execution_context(cx, pool)?;
+    let cx = &context;
+    let pool = cx.blocking_pool_handle();
     execute_with_loader(cx, options, output, |root, quality| {
         models::load(cx, root, quality, &options.quality, pool)
     })
@@ -414,6 +428,9 @@ pub async fn rebuild(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    let context = execution_context(cx, pool)?;
+    let cx = &context;
+    let pool = cx.blocking_pool_handle();
     rebuild_with_loader(cx, options, output, |root, quality| {
         models::load(cx, root, quality, &options.quality, pool)
     })

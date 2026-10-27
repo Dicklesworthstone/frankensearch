@@ -198,7 +198,10 @@ fn unsupported_builds_fail_before_files_or_a_pending_provider_is_polled() {
                 builder(&directory.path().join("ann"), &provider).with_fast_storage(
                     NativeBuildPrecision::F32,
                     NativeBuildRetrieval::Hnsw {
-                        params: HnswParams::default(),
+                        params: HnswParams {
+                            m: 0,
+                            ..HnswParams::default()
+                        },
                         seed: 9,
                     },
                 ),
@@ -282,6 +285,127 @@ fn capture_requires_the_original_exact_vector_witness_and_budget() {
         *altered.last_mut().unwrap() ^= 1;
         std::fs::write(vectors.fast().vector_path(), altered).unwrap();
         assert!(capture_vector(&cx, vectors.fast(), BUDGET).is_err());
+        let hits = vectors.fast().search(&cx, "vertical", 1).await.unwrap();
+        assert_eq!(hits[0].doc_id, "b");
+    });
+}
+
+#[test]
+fn native_generation_retains_all_four_images_policy_and_budget_after_relocation() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for (tier, precision, name) in [
+            (EmbedderTierTag::Fast, NativeBuildPrecision::F16, "fast"),
+            (
+                EmbedderTierTag::Quality,
+                NativeBuildPrecision::F32,
+                "quality",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let work = directory.path().join("work");
+            let provider = Arc::new(Provider::new(name, 2, Reply::Correct));
+            let params = HnswParams {
+                m: 4,
+                m0: 8,
+                ef_construction: 24,
+                ef_search: 17,
+            };
+            let seed = 0x453;
+            let mut built = builder(&work, &provider)
+                .with_fast_storage(precision, NativeBuildRetrieval::Hnsw { params, seed })
+                .build_exact_generation(&cx, tier, SOURCE, BUDGET)
+                .await
+                .unwrap();
+            let candidate = candidate(&built);
+            assert!(built.components.has_ann());
+            assert_eq!(built.retrieval_mode(), NativeRetrievalMode::Ann);
+            match built.retrieval_configuration() {
+                NativeBuildRetrieval::Hnsw {
+                    params: actual,
+                    seed: actual_seed,
+                } => {
+                    assert_eq!(actual, params);
+                    assert_eq!(actual_seed, seed);
+                }
+                NativeBuildRetrieval::Exact => panic!("the selected graph must be retained"),
+            }
+            let receipt: NativeHnswGenerationReceiptV2 =
+                serde_json::from_str(&built.metadata().metadata[NATIVE_ANN_RECEIPT_KEY]).unwrap();
+            let ann = built.component_bytes(GenerationComponentRole::Ann).unwrap();
+            assert_eq!(receipt.seed, seed);
+            assert_eq!(receipt.graph_byte_len, u64::try_from(ann.len()).unwrap());
+            let raw_hash: [u8; 32] = Sha256::digest(&ann).into();
+            assert_eq!(receipt.graph_sha256, lower_hex(&raw_hash));
+            assert_eq!(
+                candidate.manifest().components().ann.unwrap().sha256,
+                raw_hash
+            );
+            assert_eq!(built.metadata().vector_artifacts[0].embedder_tier, tier);
+            let owned = [
+                GenerationComponentRole::Vector,
+                GenerationComponentRole::Lexical,
+                GenerationComponentRole::Ann,
+                GenerationComponentRole::Metadata,
+            ]
+            .into_iter()
+            .map(|role| built.component_bytes(role).unwrap().len())
+            .sum::<usize>()
+                + candidate.manifest().canonical_bytes().len();
+            assert_eq!(candidate.owned_image_bytes(), u64::try_from(owned).unwrap());
+            std::fs::rename(&work, directory.path().join("moved")).unwrap();
+            std::fs::create_dir(&work).unwrap();
+            std::fs::write(work.join("fast.fshnsw"), b"unrelated successor").unwrap();
+            built.validate_candidate(&cx, &candidate).unwrap();
+
+            built.max_image_bytes = owned - ann.len();
+            assert!(built.validate_candidate(&cx, &candidate).is_err());
+            assert!(
+                built
+                    .candidate(
+                        [0x69; 16],
+                        None,
+                        GenerationAuthorityActionV1::Activate,
+                        [0x79; 32]
+                    )
+                    .is_err()
+            );
+            built.max_image_bytes = BUDGET;
+            let mut corrupt = ann.to_vec();
+            *corrupt.last_mut().unwrap() ^= 1;
+            built.ann = Some(corrupt.into());
+            assert!(built.validate_candidate(&cx, &candidate).is_err());
+            built.ann = Some(ann);
+            built.validate_candidate(&cx, &candidate).unwrap();
+        }
+    });
+}
+
+#[test]
+fn native_capture_rejects_changed_graph_bytes_and_includes_the_graph_budget() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(Provider::new("fast", 2, Reply::Correct));
+        let vectors = builder(&directory.path().join("work"), &provider)
+            .with_fast_storage(
+                NativeBuildPrecision::F32,
+                NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 73,
+                },
+            )
+            .build(&cx)
+            .await
+            .unwrap();
+        let (_, owner) = capture_vector(&cx, vectors.fast(), BUDGET).unwrap();
+        let (bytes, receipt) = capture_ann(&cx, vectors.fast(), Arc::clone(&owner), BUDGET)
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt, *vectors.fast().graph_receipt.as_ref().unwrap());
+        assert!(capture_ann(&cx, vectors.fast(), Arc::clone(&owner), bytes.len() - 1).is_err());
+        let mut altered = bytes.to_vec();
+        *altered.last_mut().unwrap() ^= 1;
+        std::fs::write(vectors.fast().graph_path().unwrap(), altered).unwrap();
+        assert!(capture_ann(&cx, vectors.fast(), owner, BUDGET).is_err());
         let hits = vectors.fast().search(&cx, "vertical", 1).await.unwrap();
         assert_eq!(hits[0].doc_id, "b");
     });

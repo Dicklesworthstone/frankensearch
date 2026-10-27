@@ -43,9 +43,19 @@ The server takes one predecessor pin, builds through `NativeLiveHybridUpdate`,
 and retains both original producers and the existing vector precision and graph
 policy. Eligible unchanged bodies reuse vectors independently in each tier;
 metadata/title-only changes update source and Quill without embedding inference.
-Deletes disappear from every successor component. Inference is incremental, but
-source/vector images, native graphs and Quill are still complete-cohort builds.
+Deletes disappear from every successor component. Inference is incremental.
+When every predecessor vector and its document identity survive unchanged, native
+graph construction retains the old topology and inserts only new documents.
+Physical row reordering is authenticated in the successor graph, including after
+restart. Changed vectors, deletions, precision changes or different graph
+parameters select a full graph build. Source/vector images and Quill still cover
+the complete cohort, and every successor receives a complete graph and receipt.
 This is not an O(changed-bytes) or measured performance claim.
+
+New native graph files use FSHNSW format v2, whose checksums and topology digest
+bind the logical-node-to-physical-row permutation. Existing v1 graphs and their
+receipts retain their original validation and remain readable. Their next saved
+successor uses v2; no re-embedding is required solely for this format transition.
 
 Only a successful complete build is sealed. Its new selection receipt is written
 and synced before the existing exact-predecessor live installation. Success is a
