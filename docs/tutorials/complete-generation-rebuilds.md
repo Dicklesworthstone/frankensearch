@@ -22,6 +22,45 @@ Provision verified semantic models as for ordinary indexing. This route does not
 turn a missing model into a hash fallback, bypass producer checks, or repair old
 vectors merely because a new model is installed.
 
+### Import a model from an offline bundle
+
+The workspace `fsfs-import-model` executable installs one explicitly selected
+registered model from local files. Build it with the inference backend for that
+model; the ordinary default features support Model2Vec and ONNX, and
+`--no-default-features --features semantic-native` supports Model2Vec and the
+native quality models. A lite build refuses a missing backend before creating
+the cache.
+
+```sh
+cargo build --release -p frankensearch-fsfs --bin fsfs-import-model
+
+fsfs-import-model --model potion-base-8m \
+  --from-dir /media/potion-base-8M \
+  --output /home/me/.local/share/frankensearch/models --offline --format json
+```
+
+`--output` names the model cache root used by your fsfs configuration, not an
+index directory. The command adds the model's conventional subdirectory. For
+example, `--model all-minilm-l6-v2-native` uses `all-MiniLM-L6-v2-native`, separate
+from the ONNX model. The bundle must contain the selected model's pinned artifact
+tree. This command always stays offline; `--offline` is an optional explicit
+acknowledgement. It does not change configuration or select a different model.
+
+Import uses the frozen manifest to verify the files, executes the registered
+loader's golden-vector certificate, and checks the loaded producer's full
+identity before installing the staged cache. A verified existing cache is
+load-tested and reused even if the supplied bundle has been removed. A rejected
+attempt preserves the previous cache, and a successful replacement retains its
+backup. Caches inside sealed search generations are refused.
+
+The JSON result includes the acquisition receipt, verified byte count,
+manifest fingerprint, local-bundle or warm-cache provenance, and
+`requires_reindex: true`. Success means **acquired-needs-reindex**: existing
+index compatibility has not been assessed. Use the source-rebuild preview below
+to regenerate vectors with the configured model and inspect results before
+publication. The importer does not execute or bypass the core recovery planner's
+scoped authorization guards.
+
 The model-free lite build (`--no-default-features`, the MUSL and Intel macOS
 release assets) publishes lexical-only generations with no vector tier. As on
 the legacy layout, its searches run lexical-only, `append-batch` and `delete`
