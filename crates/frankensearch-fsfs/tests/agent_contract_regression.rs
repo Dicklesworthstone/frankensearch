@@ -62,6 +62,7 @@ fn sample_error_envelope() -> OutputEnvelope<TestPayload> {
             exit_code: exit_code::MODEL_UNAVAILABLE,
             suggestion: Some("Run: fsfs download-models".to_string()),
             context: Some("Fast embedder not available".to_string()),
+            recovery_plan: None,
         },
         test_meta(),
         "2026-02-14T12:00:01Z",
@@ -521,6 +522,7 @@ fn broken_envelope_ok_true_with_error_fails_validation() {
         exit_code: 1,
         suggestion: None,
         context: None,
+        recovery_plan: None,
     });
     let result = validate_envelope(&env, CompatibilityMode::Strict);
     assert!(!result.valid);
@@ -547,6 +549,7 @@ fn envelope_with_unknown_error_code_fails_strict_validation() {
             exit_code: 1,
             suggestion: None,
             context: None,
+            recovery_plan: None,
         },
         test_meta(),
         "2026-02-14T12:00:00Z",
@@ -917,6 +920,7 @@ fn envelope_handles_unicode_in_error_message() {
             exit_code: 1,
             suggestion: None,
             context: None,
+            recovery_plan: None,
         },
         test_meta(),
         "2026-02-14T12:00:00Z",
