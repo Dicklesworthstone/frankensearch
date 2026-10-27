@@ -100,6 +100,180 @@ pub struct NativeGenerationSnapshot {
     readers: CompositeReaders,
 }
 
+/// Queryable, immutable components of one exact unpublished candidate.
+///
+/// Only the source-owned complete generation builder can create this handle.
+/// Admission and retrieval use the same component and provider checks as a
+/// selected [`NativeGenerationSnapshot`], including both independent owners and
+/// configured ANN graphs. Keeping it alive retains every admitted image without
+/// reopening the build directory. It contains no qualified root or publication
+/// capability, and its candidate authority is never proof of a selected head.
+///
+/// Preview queries require nonblank text, a positive limit and a nonempty live
+/// cohort. This deliberately prevents an empty/no-op result from being used as
+/// evidence that a replacement producer can execute a semantic query. Ordinary
+/// selected-generation queries retain their existing empty-query behavior.
+pub struct NativeGenerationPreview {
+    candidate_authority: AuthorityRefV1,
+    readers: CompositeReaders,
+}
+
+impl NativeGenerationPreview {
+    pub(super) const fn new(
+        candidate_authority: AuthorityRefV1,
+        readers: CompositeReaders,
+    ) -> Self {
+        Self {
+            candidate_authority,
+            readers,
+        }
+    }
+
+    /// Prospective authority identity, not an assertion that it is published.
+    #[must_use]
+    pub const fn candidate_authority(&self) -> AuthorityRefV1 {
+        self.candidate_authority
+    }
+
+    /// Independently admitted shape of this candidate's vector owners.
+    #[must_use]
+    pub const fn topology(&self) -> NativeGenerationTopology {
+        self.readers.topology()
+    }
+
+    /// Metadata authenticated by this candidate's exact component closure.
+    #[must_use]
+    pub const fn metadata(&self) -> &GenerationManifest {
+        &self.readers.metadata
+    }
+
+    /// Execute the candidate's primary tier and hydrate its actual results.
+    /// Quality-only candidates invoke only the supplied quality producer.
+    ///
+    /// # Errors
+    /// Refuses no-op previews, producer drift, invalid query embeddings,
+    /// retrieval/hydration failures and cancellation. No fallback is attempted.
+    pub async fn search_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers.search_text(cx, embedder, text, k).await
+    }
+
+    /// Execute quality directly, including in a complete two-tier candidate.
+    /// The fast producer is neither required nor invoked.
+    ///
+    /// # Errors
+    /// Refuses no-op previews, missing quality, producer/embedding mismatch,
+    /// retrieval/hydration failures and cancellation.
+    pub async fn search_quality_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_quality_text(cx, embedder, text, k)
+            .await
+    }
+
+    /// Execute both independent producers and return their refined union.
+    /// An Initial-only page never counts as successful complete validation.
+    ///
+    /// # Errors
+    /// Refuses no-op previews, absent tiers, either producer's drift or failure,
+    /// invalid embeddings, retrieval/hydration failures and cancellation.
+    pub async fn search_refined_text(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_refined_text(cx, fast, quality, text, k)
+            .await
+    }
+
+    /// Lazily preview both phases from this exact candidate.
+    /// Callers using this as validation must consume refinement successfully;
+    /// an unpolled or dropped stream proves no complete semantic execution.
+    ///
+    /// # Errors
+    /// Refuses no-op previews, absent tiers, producer drift and cancellation.
+    pub fn search_progressive_with_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        self.readers
+            .search_progressive_with_quality(cx, fast, quality, text, k)
+    }
+
+    pub(in crate::native_ann) fn require_query(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+        eligible: usize,
+    ) -> SearchResult<()> {
+        checkpoint(cx, "native_ann.generation.preview")?;
+        if text.trim().is_empty() || k == 0 || eligible == 0 {
+            return Err(refused("preview", "nonempty-semantic-query-required"));
+        }
+        Ok(())
+    }
+
+    pub(in crate::native_ann) fn source_documents(
+        &self,
+        cx: &Cx,
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<IndexableDocument>> {
+        self.readers.source_documents(cx, max_source_bytes)
+    }
+
+    pub(in crate::native_ann) fn scoped_lexical(&self) -> &dyn LexicalRead {
+        &self.readers.lexical
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn scoped_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        primary: &'a dyn Embedder,
+        quality: Option<&'a dyn Embedder>,
+        quality_only: bool,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.require_query(cx, text, k, allowed.len())?;
+        self.readers.scoped_progressive(
+            cx,
+            primary,
+            quality,
+            quality_only,
+            lexical,
+            text,
+            k,
+            allowed,
+        )
+    }
+}
+
 pub(super) struct CompositeReaders {
     vector: Arc<NativeAnnIndex>,
     quality: Option<Arc<NativeAnnIndex>>,
@@ -746,14 +920,8 @@ impl NativeGenerationSnapshot {
         k: usize,
         allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        checkpoint(cx, "native_ann.generation.scoped_search")?;
-        let live_count =
-            usize::try_from(self.readers.vector.owner_witness().live_count).unwrap_or(usize::MAX);
-        let k = k.min(live_count).min(allowed.len());
         self.readers
-            .vector
-            .search_hybrid_progressive(cx, embedder, None, lexical, text, k)?
-            .with_allowed_documents_arc(allowed)
+            .scoped_progressive(cx, embedder, None, false, lexical, text, k, allowed)
     }
 
     pub(in crate::native_ann) fn scoped_quality_progressive<'a>(
@@ -765,22 +933,8 @@ impl NativeGenerationSnapshot {
         k: usize,
         allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        checkpoint(cx, "native_ann.generation.scoped_quality_search")?;
-        let quality = if self.readers.tier == EmbedderTierTag::Quality {
-            &self.readers.vector
-        } else {
-            self.readers.full_quality()?
-        };
-        quality
-            .search_hybrid_progressive(
-                cx,
-                embedder,
-                None,
-                lexical,
-                text,
-                self.readers.bounded_limit(k).min(allowed.len()),
-            )?
-            .with_allowed_documents_arc(allowed)
+        self.readers
+            .scoped_progressive(cx, embedder, None, true, lexical, text, k, allowed)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -794,18 +948,8 @@ impl NativeGenerationSnapshot {
         k: usize,
         allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        checkpoint(cx, "native_ann.generation.scoped_progressive_search")?;
         self.readers
-            .vector
-            .search_hybrid_progressive(
-                cx,
-                fast,
-                Some((self.readers.full_quality()?.as_ref(), quality)),
-                lexical,
-                text,
-                self.readers.bounded_limit(k).min(allowed.len()),
-            )?
-            .with_allowed_documents_arc(allowed)
+            .scoped_progressive(cx, fast, Some(quality), false, lexical, text, k, allowed)
     }
 }
 
@@ -853,6 +997,39 @@ impl CompositeReaders {
 
     fn bounded_limit(&self, requested: usize) -> usize {
         requested.min(usize::try_from(self.vector.owner_witness().live_count).unwrap_or(usize::MAX))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scoped_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        primary: &'a dyn Embedder,
+        quality: Option<&'a dyn Embedder>,
+        quality_only: bool,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation.scoped_search")?;
+        let index = if quality_only && self.tier != EmbedderTierTag::Quality {
+            self.full_quality()?
+        } else {
+            &self.vector
+        };
+        let refinement = quality
+            .map(|provider| self.full_quality().map(|index| (index.as_ref(), provider)))
+            .transpose()?;
+        index
+            .search_hybrid_progressive(
+                cx,
+                primary,
+                refinement,
+                lexical,
+                text,
+                self.bounded_limit(k).min(allowed.len()),
+            )?
+            .with_allowed_documents_arc(allowed)
     }
 
     async fn search_lexical_with_reader(

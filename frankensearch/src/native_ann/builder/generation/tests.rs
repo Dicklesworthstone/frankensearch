@@ -1,5 +1,6 @@
 use super::*;
 use std::future::Future;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use frankensearch_core::generation::{ActivationManifest, ArtifactGenerationIdentityV1};
@@ -10,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use super::super::tests::{Provider, Reply, documents, generation};
 use crate::native_ann::NativeAnnIndex;
 use crate::native_ann::builder::NativeBuildPrecision;
-use crate::{IndexableDocument, SearchError};
+use crate::{Embedder, IndexableDocument, SearchError, SearchFuture};
 
 const BUDGET: usize = 16 * 1024 * 1024;
 const SOURCE: CommitRange = CommitRange { low: 4, high: 9 };
@@ -80,6 +81,14 @@ fn empty_generations_retain_complete_single_and_progressive_images_without_infer
                 .unwrap();
                 let candidate = candidate(&built);
                 built.validate_candidate(&cx, &candidate).unwrap();
+                let preview = built.preview_candidate(&cx, &candidate).unwrap();
+                assert!(
+                    preview
+                        .search_text(&cx, &Provider::new(label, 2, Reply::Correct), "query", 1)
+                        .await
+                        .is_err(),
+                    "an empty generation cannot prove successful semantic execution"
+                );
                 assert_eq!(built.metadata().total_documents, 0);
                 assert_eq!(built.metadata().commit_range, SOURCE);
                 assert_eq!(built.metadata().embedders.len(), if full { 2 } else { 1 });
@@ -635,6 +644,7 @@ fn candidate_validation_refuses_rebound_bytes_checkpoint_and_generation() {
             )
             .unwrap();
             assert!(built.validate_candidate(&cx, &foreign).is_err());
+            assert!(built.preview_candidate(&cx, &foreign).is_err());
         }
         built.validate_candidate(&cx, &candidate(&built)).unwrap();
     });
@@ -874,5 +884,412 @@ fn cancellation_never_returns_a_partial_component_payload() {
             .await;
         assert!(matches!(result, Err(SearchError::Cancelled { .. })));
         assert!(!work.join("lexical").exists());
+    });
+}
+
+#[test]
+fn unpublished_candidate_previews_execute_every_tier_and_retain_original_images() {
+    use crate::native_ann::NativeGenerationTopology;
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for (tier, full, fast_ann, quality_ann) in [
+            (EmbedderTierTag::Fast, false, false, false),
+            (EmbedderTierTag::Quality, false, false, false),
+            (EmbedderTierTag::Fast, false, true, false),
+            (EmbedderTierTag::Quality, false, true, false),
+            (EmbedderTierTag::Fast, true, false, false),
+            (EmbedderTierTag::Fast, true, true, false),
+            (EmbedderTierTag::Fast, true, false, true),
+            (EmbedderTierTag::Fast, true, true, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let work = directory.path().join("work");
+            let primary = Arc::new(Provider::new("primary", 2, Reply::Correct));
+            let quality = Arc::new(Provider::new("independent-quality", 3, Reply::Correct));
+            let retrieval = |ann| {
+                if ann {
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams::default(),
+                        seed: 91,
+                    }
+                } else {
+                    NativeBuildRetrieval::Exact
+                }
+            };
+            let mut configured = builder(&work, &primary)
+                .with_fast_storage(NativeBuildPrecision::F32, retrieval(fast_ann));
+            if full {
+                configured = configured
+                    .with_quality_embedder(quality.clone())
+                    .unwrap()
+                    .with_quality_storage(NativeBuildPrecision::F32, retrieval(quality_ann))
+                    .unwrap();
+            }
+            let built = if full {
+                configured
+                    .build_progressive_generation(&cx, SOURCE, BUDGET)
+                    .await
+            } else {
+                configured
+                    .build_exact_generation(&cx, tier, SOURCE, BUDGET)
+                    .await
+            }
+            .unwrap();
+            let candidate = candidate(&built);
+            let preview = Arc::new(built.preview_candidate(&cx, &candidate).unwrap());
+            assert_eq!(preview.candidate_authority(), candidate.authority());
+            assert_eq!(preview.metadata().total_documents, 5);
+            assert_eq!(
+                preview.topology(),
+                if full {
+                    NativeGenerationTopology::FullProgressive
+                } else if tier == EmbedderTierTag::Quality {
+                    NativeGenerationTopology::QualityOnly
+                } else {
+                    NativeGenerationTopology::FastOnly
+                }
+            );
+            assert_eq!(primary.queries.load(Ordering::SeqCst), 0);
+            assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+            let predicates = AtomicUsize::new(0);
+            let scope = preview
+                .scope(&cx, BUDGET, |document| {
+                    predicates.fetch_add(1, Ordering::SeqCst);
+                    Ok(document.id == "b")
+                })
+                .unwrap();
+            assert_eq!(predicates.load(Ordering::SeqCst), 5);
+            assert_eq!(scope.len(), 1);
+            assert_eq!(scope.candidate_authority(), candidate.authority());
+            assert!(scope.document("a").is_none());
+            assert_eq!(scope.document("b").unwrap().content, "vertical");
+            drop(built);
+            std::fs::rename(&work, directory.path().join("moved")).unwrap();
+            std::fs::create_dir(&work).unwrap();
+            std::fs::write(work.join("fast.fsvi"), b"unrelated candidate").unwrap();
+            let hits = preview
+                .search_text(&cx, primary.as_ref(), "vertical", 2)
+                .await
+                .unwrap();
+            assert_eq!(hits[0].doc_id, "b");
+            assert_eq!(primary.queries.load(Ordering::SeqCst), 1);
+            assert_eq!(hits[0].metadata.as_ref().unwrap()["source_cut"], "original");
+            let scoped = scope
+                .search_text(&cx, primary.as_ref(), "vertical", 10)
+                .await
+                .unwrap();
+            assert_eq!(scoped.len(), 1);
+            assert_eq!(scoped[0].doc_id, "b");
+            if tier == EmbedderTierTag::Quality {
+                assert!(scoped[0].fast_score.is_none());
+                assert!(scoped[0].quality_score.is_some());
+                assert_eq!(
+                    scoped,
+                    scope
+                        .search_quality_text(&cx, primary.as_ref(), "vertical", 10)
+                        .await
+                        .unwrap()
+                );
+            }
+            if full {
+                let before = primary.queries.load(Ordering::SeqCst);
+                let quality_hits = preview
+                    .search_quality_text(&cx, quality.as_ref(), "vertical", 1)
+                    .await
+                    .unwrap();
+                assert_eq!(primary.queries.load(Ordering::SeqCst), before);
+                assert_eq!(quality_hits[0].doc_id, "b");
+                assert!(quality_hits[0].fast_score.is_none());
+                assert!(quality_hits[0].quality_score.is_some());
+                let refined = preview
+                    .search_refined_text(&cx, primary.as_ref(), quality.as_ref(), "vertical", 1)
+                    .await
+                    .unwrap();
+                assert_eq!(refined[0].doc_id, "b");
+                assert!(refined[0].fast_score.is_some());
+                assert!(refined[0].quality_score.is_some());
+                let scoped = scope
+                    .search_refined_text(&cx, primary.as_ref(), quality.as_ref(), "vertical", 1)
+                    .await
+                    .unwrap();
+                assert_eq!(scoped[0].doc_id, "b");
+                assert_eq!(quality.queries.load(Ordering::SeqCst), 3);
+            } else if tier == EmbedderTierTag::Fast {
+                assert!(
+                    preview
+                        .search_quality_text(&cx, quality.as_ref(), "vertical", 1)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(quality.queries.load(Ordering::SeqCst), 0);
+            }
+            assert_eq!(predicates.load(Ordering::SeqCst), 5);
+            assert!(!directory.path().join("AUTHORITY").exists());
+            assert!(!work.join("AUTHORITY").exists());
+        }
+    });
+}
+
+#[test]
+fn candidate_preview_scopes_widen_before_fusion_and_never_accept_noop_validation() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for ann in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = Arc::new(Provider::new("scope", 2, Reply::Correct));
+            let mut source: Vec<_> = (0..24)
+                .map(|index| {
+                    IndexableDocument::new(format!("private-{index:02}"), "vertical")
+                        .with_metadata("visible", false)
+                })
+                .collect();
+            for id in ["public-a", "public-b"] {
+                source.push(
+                    IndexableDocument::new(id, "vertical with enough padding to rank later")
+                        .with_title("retained public source")
+                        .with_metadata("visible", true),
+                );
+            }
+            let built = NativeIndexBuilder::new(
+                directory.path().join("work"),
+                generation(),
+                provider.clone(),
+            )
+            .unwrap()
+            .add_documents(source)
+            .with_fast_storage(
+                NativeBuildPrecision::F32,
+                if ann {
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams {
+                            ef_search: 1,
+                            ..HnswParams::default()
+                        },
+                        seed: 93,
+                    }
+                } else {
+                    NativeBuildRetrieval::Exact
+                },
+            )
+            .build_exact_generation(&cx, EmbedderTierTag::Fast, SOURCE, BUDGET)
+            .await
+            .unwrap();
+            let preview = Arc::new(built.preview_candidate(&cx, &candidate(&built)).unwrap());
+            let predicates = AtomicUsize::new(0);
+            assert!(
+                preview
+                    .scope(&cx, 1, |_| {
+                        predicates.fetch_add(1, Ordering::SeqCst);
+                        Ok(true)
+                    })
+                    .is_err()
+            );
+            assert_eq!(predicates.load(Ordering::SeqCst), 0);
+            let scope = preview
+                .scope(&cx, BUDGET, |document| {
+                    predicates.fetch_add(1, Ordering::SeqCst);
+                    Ok(document
+                        .metadata
+                        .get("visible")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true))
+                })
+                .unwrap();
+            let hits = scope
+                .search_text(&cx, provider.as_ref(), "vertical", 2)
+                .await
+                .unwrap();
+            assert_eq!(hits.len(), 2);
+            assert!(hits.iter().all(|hit| hit.doc_id.starts_with("public-")));
+            assert!(
+                hits.iter()
+                    .all(|hit| hit.metadata.as_ref().unwrap()["visible"] == true)
+            );
+            assert_eq!(predicates.load(Ordering::SeqCst), 26);
+            let before = provider.queries.load(Ordering::SeqCst);
+            for (query, limit) in [("", 1), (" \n\t", 1), ("vertical", 0)] {
+                assert!(
+                    preview
+                        .search_text(&cx, provider.as_ref(), query, limit)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    scope
+                        .search_text(&cx, provider.as_ref(), query, limit)
+                        .await
+                        .is_err()
+                );
+            }
+            let empty = preview.scope(&cx, BUDGET, |_| Ok(false)).unwrap();
+            assert!(empty.is_empty());
+            assert!(
+                empty
+                    .search_text(&cx, provider.as_ref(), "vertical", 1)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(provider.queries.load(Ordering::SeqCst), before);
+            let foreign = Provider::new("other-producer", 2, Reply::Correct);
+            assert!(
+                scope
+                    .search_text(&cx, &foreign, "vertical", 1)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(foreign.queries.load(Ordering::SeqCst), 0);
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                scope
+                    .search_text(&cx, provider.as_ref(), "vertical", 1)
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            assert_eq!(provider.queries.load(Ordering::SeqCst), before);
+            assert_eq!(
+                scope
+                    .search_text(&cx, provider.as_ref(), "vertical", 2)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+    });
+}
+
+struct PreviewQueryProvider {
+    inner: Provider,
+    fault: AtomicU8,
+}
+
+impl PreviewQueryProvider {
+    fn new(name: &str, dimension: u32) -> Self {
+        Self {
+            inner: Provider::new(name, dimension, Reply::Correct),
+            fault: AtomicU8::new(0),
+        }
+    }
+}
+
+impl Embedder for PreviewQueryProvider {
+    fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        self.inner.embed(cx, text)
+    }
+
+    fn embed_batch_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        texts: &'a [&'a str],
+    ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
+        self.inner.embed_batch_bound(cx, texts)
+    }
+
+    fn embed_bound<'a>(
+        &'a self,
+        cx: &'a Cx,
+        text: &'a str,
+    ) -> SearchFuture<'a, frankensearch_core::IdentityBoundEmbedding> {
+        Box::pin(async move {
+            let values = self.inner.embed(cx, text).await?;
+            let mut identity = self.inner.identity()?.clone();
+            match self.fault.load(Ordering::SeqCst) {
+                1 => return Err(invalid("preview.test", "failed", "preview producer failed")),
+                2 => identity.producer.backend = "changed-after-admission".to_owned(),
+                3 => {
+                    cx.set_cancel_requested(true);
+                }
+                4 => return std::future::pending().await,
+                _ => {}
+            }
+            Ok(frankensearch_core::IdentityBoundEmbedding { values, identity })
+        })
+    }
+
+    fn identity(&self) -> SearchResult<&frankensearch_core::generation::EmbeddingIdentityBundleV1> {
+        self.inner.identity()
+    }
+
+    fn bound_batch_is_native(&self) -> bool {
+        true
+    }
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+    fn dimension(&self) -> usize {
+        self.inner.dimension()
+    }
+    fn is_semantic(&self) -> bool {
+        self.inner.is_semantic()
+    }
+    fn category(&self) -> crate::ModelCategory {
+        self.inner.category()
+    }
+}
+
+#[test]
+fn full_candidate_preview_rejects_failed_drifted_cancelled_and_abandoned_refinement() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let fast = Arc::new(PreviewQueryProvider::new("fast", 2));
+        let quality = Arc::new(PreviewQueryProvider::new("quality", 3));
+        let built =
+            NativeIndexBuilder::new(directory.path().join("work"), generation(), fast.clone())
+                .unwrap()
+                .with_quality_embedder(quality.clone())
+                .unwrap()
+                .add_documents(documents())
+                .build_progressive_generation(&cx, SOURCE, BUDGET)
+                .await
+                .unwrap();
+        let candidate = candidate(&built);
+        let preview = Arc::new(built.preview_candidate(&cx, &candidate).unwrap());
+        let scope = preview.scope(&cx, BUDGET, |_| Ok(true)).unwrap();
+        for fault in [1, 2, 3] {
+            quality.fault.store(fault, Ordering::SeqCst);
+            assert!(
+                preview
+                    .search_refined_text(&cx, fast.as_ref(), quality.as_ref(), "vertical", 1)
+                    .await
+                    .is_err()
+            );
+            cx.set_cancel_requested(false);
+            assert!(
+                scope
+                    .search_refined_text(&cx, fast.as_ref(), quality.as_ref(), "vertical", 1)
+                    .await
+                    .is_err()
+            );
+            cx.set_cancel_requested(false);
+        }
+        quality.fault.store(4, Ordering::SeqCst);
+        let mut pending = Box::pin(scope.search_refined_text(
+            &cx,
+            fast.as_ref(),
+            quality.as_ref(),
+            "vertical",
+            1,
+        ));
+        assert!(
+            pending
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        let queries = quality.inner.queries.load(Ordering::SeqCst);
+        drop(pending);
+        assert_eq!(quality.inner.queries.load(Ordering::SeqCst), queries);
+        quality.fault.store(0, Ordering::SeqCst);
+        let hits = scope
+            .search_refined_text(&cx, fast.as_ref(), quality.as_ref(), "vertical", 1)
+            .await
+            .unwrap();
+        assert_eq!(hits[0].doc_id, "b");
+        assert!(hits[0].quality_score.is_some());
+        assert_eq!(preview.candidate_authority(), candidate.authority());
+        assert!(!directory.path().join("AUTHORITY").exists());
     });
 }

@@ -16,7 +16,8 @@ use frankensearch_index::FsviV2IdentityBinding;
 use super::NativeBuiltHybridIndex;
 use super::sharded::NativeBuiltShardedHybridIndex;
 use crate::native_ann::{
-    NativeGenerationSnapshot, NativeProgressiveSearch, NativeSearchPhase, checkpoint, invalid,
+    NativeGenerationPreview, NativeGenerationSnapshot, NativeGenerationTopology,
+    NativeProgressiveSearch, NativeSearchPhase, checkpoint, invalid,
 };
 use crate::{
     Cx, Embedder, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
@@ -66,6 +67,18 @@ pub struct NativeScopedHybridIndex<'a> {
 /// query scoping, not revocation of a previously issued reader or scope.
 pub struct NativeScopedGenerationSnapshot {
     snapshot: Arc<NativeGenerationSnapshot>,
+    lexical: ScopedLexical<'static>,
+}
+
+/// A fixed source scope over one exact unpublished generation preview.
+///
+/// The predicate is frozen once over the candidate's bounded source inventory.
+/// Its production lexical adapter and both semantic candidate pools enforce
+/// membership before fusion and hydration. This is prospective query validation,
+/// not a selected authority or permission to publish. Empty scopes cannot serve
+/// as successful semantic validation and return a typed preview refusal.
+pub struct NativeScopedGenerationPreview {
+    preview: Arc<NativeGenerationPreview>,
     lexical: ScopedLexical<'static>,
 }
 
@@ -207,6 +220,179 @@ impl NativeGenerationSnapshot {
             membership,
         ))
     }
+}
+
+impl NativeGenerationPreview {
+    /// Freeze a fixed source predicate over this exact unpublished candidate.
+    ///
+    /// The complete retained source must fit `max_source_bytes` before invoking
+    /// any predicate. Membership never changes during query widening or model
+    /// execution, and neither construction nor querying can publish a head.
+    ///
+    /// # Errors
+    /// Refuses invalid or oversized source, predicate failure and cancellation
+    /// without returning a partial scope. Predicate panics are not intercepted.
+    pub fn scope(
+        self: &Arc<Self>,
+        cx: &Cx,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<NativeScopedGenerationPreview> {
+        checkpoint(cx, "native_ann.generation_preview_scope.start")?;
+        let source = self.source_documents(cx, max_source_bytes)?;
+        let membership = prepare_generation_membership(cx, source, accept)?;
+        Ok(NativeScopedGenerationPreview {
+            preview: Arc::clone(self),
+            lexical: ScopedLexical {
+                index: ScopeSource::Preview {
+                    preview: Arc::clone(self),
+                    documents: membership.documents,
+                },
+                allowed: membership.allowed,
+            },
+        })
+    }
+}
+
+impl NativeScopedGenerationPreview {
+    /// Prospective candidate identity; no claim of current publication.
+    #[must_use]
+    pub fn candidate_authority(&self) -> AuthorityRefV1 {
+        self.preview.candidate_authority()
+    }
+
+    /// Number of eligible source documents, not query matches.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.lexical.allowed.len()
+    }
+
+    /// Whether semantic validation would be a no-op for this fixed filter.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.lexical.allowed.is_empty()
+    }
+
+    /// Resolve an eligible source document from the original candidate image.
+    #[must_use]
+    pub fn document(&self, id: &str) -> Option<&IndexableDocument> {
+        if self.lexical.allowed.contains(id) {
+            self.lexical.index.document(id)
+        } else {
+            None
+        }
+    }
+
+    /// Execute the primary provider within this exact candidate's fixed scope.
+    /// Quality-only candidates preserve quality score provenance.
+    ///
+    /// # Errors
+    /// Refuses a no-op preview, producer/embedding disagreement, retrieval or
+    /// hydration failure, or cancellation. No fallback or publication occurs.
+    pub async fn search_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.preview.scoped_progressive(
+            cx,
+            embedder,
+            None,
+            false,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+        )?)
+        .await?;
+        if self.preview.topology() == NativeGenerationTopology::QualityOnly {
+            quality_provenance(cx, &mut results)?;
+        }
+        Ok(results)
+    }
+
+    /// Execute quality directly without requiring or invoking the fast model.
+    /// Membership is applied before retrieval, fusion and winner hydration.
+    ///
+    /// # Errors
+    /// Refuses no-op previews, missing quality, provider/embedding mismatch,
+    /// retrieval/hydration failure and cancellation.
+    pub async fn search_quality_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.preview.scoped_progressive(
+            cx,
+            embedder,
+            None,
+            true,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+        )?)
+        .await?;
+        quality_provenance(cx, &mut results)?;
+        Ok(results)
+    }
+
+    /// Execute both selected producers and collect successful refinement.
+    /// A failed quality phase returns an error rather than an Initial-only page.
+    ///
+    /// # Errors
+    /// Refuses no-op previews, absent tiers, provider/embedding disagreement,
+    /// phase/hydration failures and cancellation.
+    pub async fn search_refined_text(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        collect(self.search_progressive_with_quality(cx, fast, quality, text, k)?).await
+    }
+
+    /// Lazily preview Initial and Refined using the same frozen membership.
+    /// Complete validation requires successful consumption of refinement.
+    ///
+    /// # Errors
+    /// Refuses no-op previews, absent tiers, provider mismatch and cancellation.
+    pub fn search_progressive_with_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.preview.scoped_progressive(
+            cx,
+            fast,
+            Some(quality),
+            false,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+        )
+    }
+}
+
+fn quality_provenance(cx: &Cx, results: &mut [ScoredResult]) -> SearchResult<()> {
+    for result in results {
+        checkpoint(cx, "native_ann.generation_scope.quality_result")?;
+        result.quality_score = result.fast_score.take();
+        if result.source == ScoreSource::SemanticFast {
+            result.source = ScoreSource::SemanticQuality;
+        }
+    }
+    Ok(())
 }
 
 impl NativeScopedGenerationSnapshot {
@@ -786,6 +972,10 @@ enum ScopeSource<'a> {
         snapshot: Arc<NativeGenerationSnapshot>,
         documents: Arc<BTreeMap<String, IndexableDocument>>,
     },
+    Preview {
+        preview: Arc<NativeGenerationPreview>,
+        documents: Arc<BTreeMap<String, IndexableDocument>>,
+    },
 }
 
 impl ScopeSource<'_> {
@@ -794,6 +984,7 @@ impl ScopeSource<'_> {
             Self::Single(index) => index.lexical(),
             Self::Sharded(index) => index.lexical(),
             Self::Authority { snapshot, .. } => snapshot.scoped_lexical(),
+            Self::Preview { preview, .. } => preview.scoped_lexical(),
         }
     }
 
@@ -801,7 +992,7 @@ impl ScopeSource<'_> {
         match self {
             Self::Single(index) => index.vectors().documents().len(),
             Self::Sharded(index) => index.vectors().document_count(),
-            Self::Authority { documents, .. } => documents.len(),
+            Self::Authority { documents, .. } | Self::Preview { documents, .. } => documents.len(),
         }
     }
 
@@ -809,7 +1000,9 @@ impl ScopeSource<'_> {
         match self {
             Self::Single(index) => index.vectors().document(id),
             Self::Sharded(index) => index.vectors().document(id),
-            Self::Authority { documents, .. } => documents.get(id),
+            Self::Authority { documents, .. } | Self::Preview { documents, .. } => {
+                documents.get(id)
+            }
         }
     }
 }

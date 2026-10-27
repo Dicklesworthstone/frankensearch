@@ -481,6 +481,34 @@ impl NativeBuiltExactGeneration {
         Ok(())
     }
 
+    /// Open the exact unpublished candidate for real semantic query validation.
+    ///
+    /// This retains the same fully admitted component readers used by published
+    /// native generations. It verifies the candidate against this build's actual
+    /// bytes, identities, topology and source checkpoint before returning. The
+    /// handle never discovers a root, stages objects, or changes authority.
+    /// Its candidate reference describes prospective publication only.
+    ///
+    /// A caller may validate primary, direct quality, or complete progressive
+    /// retrieval and prepare a fixed source scope before choosing to publish.
+    /// Query failure or cancellation is returned without publishing anything.
+    /// Querying this handle does not itself authorize a later publication: the
+    /// caller must preserve the exact candidate and expected-old authority pair.
+    ///
+    /// # Errors
+    /// Refuses candidate/component drift, invalid retained images or metadata,
+    /// unsupported topology, image-budget exhaustion and cancellation.
+    pub fn preview_candidate(
+        &self,
+        cx: &Cx,
+        candidate: &GenerationCandidateV1,
+    ) -> SearchResult<super::super::NativeGenerationPreview> {
+        Ok(super::super::NativeGenerationPreview::new(
+            candidate.authority(),
+            self.admit_candidate(cx, candidate)?,
+        ))
+    }
+
     /// Prepare a complete source scope before staging or publishing a candidate.
     ///
     /// The actual retained vector, lexical, metadata and optional ANN images are

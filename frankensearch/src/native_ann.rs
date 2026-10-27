@@ -47,7 +47,7 @@ mod shards;
 mod scoring_tests;
 
 #[cfg(feature = "quill")]
-pub use generation::{NativeGenerationSnapshot, NativeGenerationTopology};
+pub use generation::{NativeGenerationPreview, NativeGenerationSnapshot, NativeGenerationTopology};
 #[cfg(feature = "quill")]
 pub use quill::NativeQuillSnapshot;
 
