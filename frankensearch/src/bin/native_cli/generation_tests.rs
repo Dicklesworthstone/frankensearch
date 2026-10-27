@@ -5230,16 +5230,8 @@ mod warm_authority {
                 let calls = provider.calls.load(Ordering::Relaxed);
                 let ordinary = parent.join("ordinary.jsonl");
                 fs::write(&ordinary, "{\"op\":\"delete\",\"id\":\"absent\"}\n").unwrap();
-                let deletes = parent.join("deletes.jsonl");
-                fs::write(
-                    &deletes,
-                    concat!(
-                        "{\"op\":\"upsert\",\"id\":\"retry-baseline\",\"content\":\"discarded\"}\n",
-                        "{\"op\":\"delete\",\"id\":\"retry-baseline\"}\n",
-                        "{\"op\":\"delete\",\"id\":\"garden-baseline\"}\n",
-                    ),
-                )
-                .unwrap();
+                let invalid_delete = parent.join("invalid-delete.jsonl");
+                fs::write(&invalid_delete, "{\"op\":\"delete\",\"id\":\" \"}\n").unwrap();
                 let malformed = parent.join("malformed.jsonl");
                 fs::write(
                     &malformed,
@@ -5261,12 +5253,12 @@ mod warm_authority {
                     ),
                     ("source-budget", &ordinary, 1, 5, 1, "stored-payload-limit"),
                     (
-                        "delete-all",
-                        &deletes,
+                        "invalid-delete",
+                        &invalid_delete,
                         1,
                         5,
                         crate::MAX_INPUT_BYTES,
-                        "nonempty",
+                        "nonblank",
                     ),
                     (
                         "invalid-overwritten",
@@ -6200,13 +6192,13 @@ mod warm_authority {
             inside["work_dir"] = serde_json::json!(root_path.join("forbidden-work"));
             let mut relative = update_message(&parent, "relative", &old, 6, changes.clone());
             relative["work_dir"] = serde_json::json!("relative-work");
-            let delete_all = update_message(
+            let invalid_delete = update_message(
                 &parent,
-                "delete-all",
+                "invalid-delete",
                 &old,
                 6,
                 serde_json::json!([
-                    {"op":"delete", "id":"retry-old"}, {"op":"delete", "id":"garden-old"}
+                    {"op":"delete", "id":" "}
                 ]),
             );
             let too_many = update_message(
@@ -6226,7 +6218,7 @@ mod warm_authority {
                 ("overflow", overflow, "invalid_source_checkpoint"),
                 ("inside", inside, "update_refused"),
                 ("relative", relative, "invalid_update_request"),
-                ("delete-all", delete_all, "update_refused"),
+                ("invalid-delete", invalid_delete, "invalid_update_mutations"),
                 ("too-many", too_many, "update_mutation_limit"),
             ] {
                 let output = exchange(&cx, &mut session, &[request]).await;
@@ -7222,6 +7214,753 @@ mod progressive_authority {
             .await
             .unwrap();
         frames(&output)
+    }
+
+    fn topology_models(mode: QueryMode, fast: &Arc<Provider>, quality: &Arc<Provider>) -> Models {
+        Models {
+            fast: if mode == QueryMode::Quality {
+                quality.clone()
+            } else {
+                fast.clone()
+            },
+            quality: (mode == QueryMode::Full).then(|| quality.clone() as Arc<dyn Embedder>),
+        }
+    }
+
+    fn retrieval_parameters(snapshot: &NativeGenerationSnapshot) -> Option<(HnswParams, u64)> {
+        match snapshot.retrieval_configuration() {
+            NativeBuildRetrieval::Exact => None,
+            NativeBuildRetrieval::Hnsw { params, seed } => Some((params, seed)),
+        }
+    }
+
+    fn empty_lifecycle_index_options(
+        parent: &Path,
+        mode: QueryMode,
+        ann: bool,
+        input: &Path,
+    ) -> Options {
+        let mut options = parse(&index_arguments()).unwrap().unwrap();
+        options.root = Some(parent.join("root"));
+        options.work = Some(parent.join("initial-work"));
+        options.receipt = parent.join("initial.json");
+        options.input = Some(input.to_path_buf());
+        options.tier = Some(if mode == QueryMode::Quality {
+            EmbedderTierTag::Quality
+        } else {
+            EmbedderTierTag::Fast
+        });
+        options.progressive = mode == QueryMode::Full;
+        options.retrieval = Some(if ann {
+            NativeBuildRetrieval::Hnsw {
+                params: HnswParams::default(),
+                seed: 17,
+            }
+        } else {
+            NativeBuildRetrieval::Exact
+        });
+        options.source_low = Some(2);
+        options.source_high = Some(7);
+        options
+    }
+
+    #[test]
+    fn empty_authority_commands_index_rebuild_and_reopen_without_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (mode, ann) in [
+                (QueryMode::Fast, false),
+                (QueryMode::Fast, true),
+                (QueryMode::Quality, false),
+                (QueryMode::Quality, true),
+                (QueryMode::Full, false),
+                (QueryMode::Full, true),
+            ] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let input = parent.join("empty.jsonl");
+                fs::write(&input, b"\n \t\n").unwrap();
+                let options = empty_lifecycle_index_options(&parent, mode, ann, &input);
+                let mut loads = 0;
+                let mut output = Vec::new();
+                index_with_loader(&cx, &options, &mut output, |requested| {
+                    assert_eq!(requested, mode);
+                    loads += 1;
+                    Ok(topology_models(requested, &fast, &quality))
+                })
+                .await
+                .unwrap();
+                assert_eq!(loads, 1, "even an empty index admits its producer topology");
+                assert_eq!(calls(&fast, &quality), (0, 0));
+                let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(report["event"], "indexed");
+                assert_eq!(report["publication"], "committed");
+                let initial = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(initial.documents, 0);
+                assert!(initial.image_bytes > 0);
+                assert_eq!(initial.quality_identity.is_some(), mode == QueryMode::Full);
+                assert_eq!(initial.query_mode(None).unwrap(), mode);
+                fs::rename(
+                    options.work.as_ref().unwrap(),
+                    parent.join("archived-initial-work"),
+                )
+                .unwrap();
+                let opened = initial.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(opened.metadata().total_documents, 0);
+                assert_eq!(
+                    opened.metadata().commit_range,
+                    CommitRange { low: 2, high: 7 }
+                );
+                assert!(opened.source_documents(&cx, 0).unwrap().is_empty());
+                assert!(opened.source_document(&cx, "absent", 0).unwrap().is_none());
+                let retrieval = retrieval_parameters(&opened);
+                let quality_retrieval = opened.quality_retrieval_configuration();
+                assert_eq!(
+                    quality_retrieval,
+                    (mode == QueryMode::Full).then(|| options.build_retrieval(None))
+                );
+                let authority_bytes = fs::read(initial.root.join("AUTHORITY")).unwrap();
+                let mut forged = initial.clone();
+                forged.documents = 1;
+                assert!(forged.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                assert_eq!(
+                    fs::read(initial.root.join("AUTHORITY")).unwrap(),
+                    authority_bytes
+                );
+
+                // A fresh command admits each requested producer but performs
+                // no query inference, including both progressive phases.
+                let mut query_modes = if mode == QueryMode::Full {
+                    vec![QueryMode::Fast, QueryMode::Quality, QueryMode::Full]
+                } else {
+                    vec![mode]
+                };
+                query_modes.push(QueryMode::Lexical);
+                for query_mode in query_modes {
+                    let mut query = parse(&[
+                        "authority-search",
+                        "--receipt",
+                        "unused",
+                        "--query",
+                        "retry",
+                    ])
+                    .unwrap()
+                    .unwrap();
+                    query.receipt = options.receipt.clone();
+                    query.mode = Some(query_mode);
+                    query.lexical_only = query_mode == QueryMode::Lexical;
+                    query.stream = true;
+                    query.max_source_bytes = 1;
+                    query.filter = Some(Filter::parse(r#"{"metadata":{"tenant":"A"}}"#).unwrap());
+                    output.clear();
+                    let mut requested = Vec::new();
+                    search_with_loader(&cx, &query, &mut output, |tier| {
+                        assert_ne!(
+                            query_mode,
+                            QueryMode::Lexical,
+                            "empty lexical queries must not load a model"
+                        );
+                        requested.push(tier);
+                        Ok(match tier {
+                            EmbedderTierTag::Fast => fast.clone(),
+                            EmbedderTierTag::Quality => quality.clone(),
+                        })
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        requested,
+                        match query_mode {
+                            QueryMode::Fast => vec![EmbedderTierTag::Fast],
+                            QueryMode::Quality => vec![EmbedderTierTag::Quality],
+                            QueryMode::Full =>
+                                vec![EmbedderTierTag::Fast, EmbedderTierTag::Quality],
+                            QueryMode::Lexical => vec![],
+                        }
+                    );
+                    let responses = frames(&output);
+                    assert_eq!(
+                        responses.len(),
+                        if query_mode == QueryMode::Full { 2 } else { 1 }
+                    );
+                    for response in &responses {
+                        assert_eq!(response["event"], "results");
+                        assert_eq!(response["authority"], serde_json::json!(initial.authority));
+                        assert_eq!(response["scope"]["eligible_documents"], 0);
+                        assert!(response["results"].as_array().unwrap().is_empty());
+                    }
+                    if query_mode == QueryMode::Full {
+                        assert_eq!(responses[0]["phase"], "initial");
+                        assert_eq!(responses[1]["phase"], "refined");
+                    } else if query_mode == QueryMode::Lexical {
+                        assert_eq!(responses[0]["phase"], "lexical");
+                        assert_eq!(responses[0]["retrieval"], "lexical");
+                        assert_eq!(responses[0]["semantic_used"], false);
+                        assert_eq!(responses[0]["semantic_components_verified"], true);
+                    }
+                    assert_eq!(calls(&fast, &quality), (0, 0));
+                }
+                let mut source = parse(&[
+                    "authority-fetch",
+                    "--receipt",
+                    "unused",
+                    "--doc-id",
+                    "absent",
+                ])
+                .unwrap()
+                .unwrap();
+                source.receipt = options.receipt.clone();
+                source.max_source_bytes = 1;
+                output.clear();
+                fetch(&cx, &source, &mut output).unwrap();
+                assert_eq!(
+                    frames(&output)[0]["documents"],
+                    serde_json::json!([{"doc_id":"absent", "status":"unavailable"}])
+                );
+                assert_eq!(calls(&fast, &quality), (0, 0));
+
+                // Both explicit empty input and retained empty source pass
+                // through the actual rebuild publication/receipt path.
+                let mut previous = initial;
+                let mut predecessor_path = options.receipt.clone();
+                for (label, retained_source) in
+                    [("input-rebuild", false), ("retained-rebuild", true)]
+                {
+                    let arguments = if retained_source {
+                        retained_rebuild_arguments()
+                    } else {
+                        rebuild_arguments()
+                    };
+                    let mut rebuild_options = parse(&arguments).unwrap().unwrap();
+                    rebuild_options.from_receipt = Some(predecessor_path.clone());
+                    rebuild_options.work = Some(parent.join(format!("{label}-work")));
+                    rebuild_options.receipt = parent.join(format!("{label}.json"));
+                    rebuild_options.max_source_bytes = 1;
+                    if !retained_source {
+                        rebuild_options.input = Some(input.clone());
+                        rebuild_options.source_low = Some(2);
+                        rebuild_options.source_high = Some(8);
+                    }
+                    output.clear();
+                    rebuild_with_loader(&cx, &rebuild_options, &mut output, |requested| {
+                        assert_eq!(requested, mode);
+                        loads += 1;
+                        Ok(topology_models(requested, &fast, &quality))
+                    })
+                    .await
+                    .unwrap();
+                    let report = &frames(&output)[0];
+                    assert_eq!(report["event"], "rebuilt");
+                    assert_eq!(report["model_migrated"], false);
+                    assert_eq!(
+                        report["source"],
+                        if retained_source {
+                            "retained_generation"
+                        } else {
+                            "input"
+                        }
+                    );
+                    let successor = Receipt::read(&rebuild_options.receipt).unwrap();
+                    assert_eq!(successor.documents, 0);
+                    assert_eq!(successor.identity, previous.identity);
+                    assert_eq!(successor.quality_identity, previous.quality_identity);
+                    assert_eq!(
+                        successor.authority().unwrap().sequence,
+                        previous.authority().unwrap().sequence + 1
+                    );
+                    let successor_reader = successor.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(
+                        successor_reader.metadata().commit_range,
+                        CommitRange { low: 2, high: 8 }
+                    );
+                    assert_eq!(retrieval_parameters(&successor_reader), retrieval);
+                    assert_eq!(
+                        successor_reader.quality_retrieval_configuration(),
+                        quality_retrieval
+                    );
+                    assert!(
+                        successor_reader
+                            .source_documents(&cx, 0)
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert_eq!(calls(&fast, &quality), (0, 0));
+                    previous = successor;
+                    predecessor_path = rebuild_options.receipt;
+                }
+                assert_eq!(loads, 3);
+                assert!(opened.source_documents(&cx, 0).unwrap().is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn authority_delete_all_refills_and_rolls_back_complete_empty_generations() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (mode, ann) in [
+                (QueryMode::Fast, true),
+                (QueryMode::Quality, false),
+                (QueryMode::Full, false),
+                (QueryMode::Full, true),
+            ] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let input = parent.join("original.jsonl");
+                fs::write(&input, concat!(
+                    "{\"id\":\"zeta\",\"content\":\"retry network requests\",\"metadata\":{\"version\":\"original\"}}\n",
+                    "{\"id\":\"alpha\",\"content\":\"garden flowers\"}\n",
+                )).unwrap();
+                let initial_options = empty_lifecycle_index_options(&parent, mode, ann, &input);
+                index_with_loader(&cx, &initial_options, &mut Vec::new(), |requested| {
+                    Ok(topology_models(requested, &fast, &quality))
+                })
+                .await
+                .unwrap();
+                let initial = Receipt::read(&initial_options.receipt).unwrap();
+                let initial_bytes = fs::read(&initial_options.receipt).unwrap();
+                let retained = initial.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let images: Vec<_> = [
+                    GenerationComponentRole::Vector,
+                    GenerationComponentRole::Lexical,
+                    GenerationComponentRole::Metadata,
+                    GenerationComponentRole::Ann,
+                ]
+                .into_iter()
+                .filter_map(|role| {
+                    retained
+                        .retained_snapshot()
+                        .manifest()
+                        .components()
+                        .get(role)
+                        .map(|component| {
+                            let path = initial
+                                .root
+                                .join(component_object_name_v1(role, component.sha256));
+                            let bytes = fs::read(&path).unwrap();
+                            (path, bytes)
+                        })
+                })
+                .collect();
+                let initial_calls = match mode {
+                    QueryMode::Fast => (2, 0),
+                    QueryMode::Quality => (0, 2),
+                    QueryMode::Full => (2, 2),
+                    QueryMode::Lexical => unreachable!("index construction requires a producer"),
+                };
+                assert_eq!(calls(&fast, &quality), initial_calls);
+                let deletes = parent.join("delete-all.jsonl");
+                fs::write(&deletes, concat!(
+                    "{\"op\":\"upsert\",\"id\":\"zeta\",\"content\":\"discarded intermediate content\"}\n",
+                    "{\"op\":\"delete\",\"id\":\"zeta\"}\n",
+                    "{\"op\":\"delete\",\"id\":\"alpha\"}\n",
+                )).unwrap();
+                let delete_options =
+                    update_options(&parent, &initial_options.receipt, "deleted", &deletes, 8);
+                let mut output = Vec::new();
+                update_generation_with_loader(&cx, &delete_options, &mut output, |tier| {
+                    Ok(match tier {
+                        EmbedderTierTag::Fast => fast.clone(),
+                        EmbedderTierTag::Quality => quality.clone(),
+                    })
+                })
+                .await
+                .unwrap();
+                let response = &frames(&output)[0];
+                assert_eq!(response["event"], "updated");
+                assert_eq!(response["publication"], "committed");
+                assert_eq!(response["documents"], 0);
+                assert_eq!(response["edited_ids"], 2);
+                assert_eq!(calls(&fast, &quality), initial_calls);
+                let empty = Receipt::read(&delete_options.receipt).unwrap();
+                assert_eq!(empty.documents, 0);
+                assert_eq!(empty.identity, initial.identity);
+                assert_eq!(empty.quality_identity, initial.quality_identity);
+                assert_eq!(
+                    empty.authority().unwrap().sequence,
+                    initial.authority().unwrap().sequence + 1
+                );
+                let empty_reader = empty.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    retrieval_parameters(&empty_reader),
+                    retrieval_parameters(&retained)
+                );
+                assert_eq!(
+                    empty_reader.quality_retrieval_configuration(),
+                    retained.quality_retrieval_configuration()
+                );
+                assert!(empty_reader.source_documents(&cx, 0).unwrap().is_empty());
+                assert!(
+                    empty_reader
+                        .source_document(&cx, "zeta", 0)
+                        .unwrap()
+                        .is_none()
+                );
+
+                let refill = parent.join("refill.jsonl");
+                fs::write(&refill, concat!(
+                    "{\"op\":\"upsert\",\"id\":\"zeta\",\"content\":\"retry repopulated requests\"}\n",
+                    "{\"op\":\"upsert\",\"id\":\"new\",\"content\":\"garden replanted\"}\n",
+                )).unwrap();
+                let refill_options =
+                    update_options(&parent, &delete_options.receipt, "refilled", &refill, 9);
+                update_generation_with_loader(&cx, &refill_options, &mut Vec::new(), |tier| {
+                    Ok(match tier {
+                        EmbedderTierTag::Fast => fast.clone(),
+                        EmbedderTierTag::Quality => quality.clone(),
+                    })
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    calls(&fast, &quality),
+                    (initial_calls.0 * 2, initial_calls.1 * 2)
+                );
+                let refilled = Receipt::read(&refill_options.receipt).unwrap();
+                let refilled_reader = refilled.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(refilled.documents, 2);
+                assert_eq!(refilled.identity, empty.identity);
+                assert_eq!(refilled.quality_identity, empty.quality_identity);
+                assert_eq!(
+                    refilled_reader.quality_retrieval_configuration(),
+                    retained.quality_retrieval_configuration()
+                );
+                assert_eq!(
+                    refilled_reader
+                        .source_document(&cx, "zeta", MAX_INPUT_BYTES)
+                        .unwrap()
+                        .unwrap()
+                        .content,
+                    "retry repopulated requests"
+                );
+                let mut forged = refilled.clone();
+                forged.documents = 0;
+                assert!(
+                    forged.open(&cx, DEFAULT_IMAGE_BYTES).is_err(),
+                    "zero in a receipt cannot relabel a populated cohort"
+                );
+
+                let before = calls(&fast, &quality);
+                let loaded = topology_models(mode, &fast, &quality);
+                let mut phases = Vec::new();
+                query_admitted(
+                    &cx,
+                    &empty_reader,
+                    None,
+                    &loaded,
+                    plan(mode, true),
+                    |phase, hits| {
+                        phases.push(phase);
+                        assert!(hits.is_empty());
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(phases.len(), if mode == QueryMode::Full { 2 } else { 1 });
+                assert_eq!(
+                    calls(&fast, &quality),
+                    before,
+                    "the retained empty reader stays empty after refill"
+                );
+                assert_eq!(
+                    retained
+                        .source_document(&cx, "zeta", MAX_INPUT_BYTES)
+                        .unwrap()
+                        .unwrap()
+                        .content,
+                    "retry network requests"
+                );
+                assert_eq!(fs::read(&initial_options.receipt).unwrap(), initial_bytes);
+                for (path, bytes) in &images {
+                    assert_eq!(fs::read(path).unwrap(), *bytes);
+                }
+
+                // Rollback reuses either complete target at a new authority
+                // sequence, including a target with no documents or vectors.
+                let mut rollback_options = parse(&rollback_arguments()).unwrap().unwrap();
+                rollback_options.from_receipt = Some(refill_options.receipt.clone());
+                rollback_options.target_receipt = Some(delete_options.receipt.clone());
+                rollback_options.receipt = parent.join("restore-empty.json");
+                rollback(&cx, &rollback_options, &mut Vec::new()).unwrap();
+                let restored_empty = Receipt::read(&rollback_options.receipt).unwrap();
+                assert_eq!(restored_empty.generation, empty.generation);
+                assert_eq!(restored_empty.documents, 0);
+                assert_eq!(
+                    restored_empty.authority().unwrap().sequence,
+                    refilled.authority().unwrap().sequence + 1
+                );
+                let restored_empty_reader = restored_empty.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    restored_empty_reader
+                        .retained_snapshot()
+                        .manifest()
+                        .components(),
+                    empty_reader.retained_snapshot().manifest().components()
+                );
+                rollback_options.from_receipt = Some(rollback_options.receipt.clone());
+                rollback_options.target_receipt = Some(refill_options.receipt);
+                rollback_options.receipt = parent.join("restore-populated.json");
+                rollback(&cx, &rollback_options, &mut Vec::new()).unwrap();
+                let restored_populated = Receipt::read(&rollback_options.receipt).unwrap();
+                assert_eq!(restored_populated.generation, refilled.generation);
+                assert_eq!(restored_populated.documents, 2);
+                assert_eq!(
+                    restored_populated.authority().unwrap().sequence,
+                    restored_empty.authority().unwrap().sequence + 1
+                );
+                let restored_reader = restored_populated.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    restored_reader.retained_snapshot().manifest().components(),
+                    refilled_reader.retained_snapshot().manifest().components()
+                );
+                assert_eq!(calls(&fast, &quality), before);
+            }
+        });
+    }
+
+    #[test]
+    fn warm_authority_delete_all_and_refill_preserve_fixed_scopes_and_empty_checkpoints() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (mode, ann) in [
+                (QueryMode::Fast, true),
+                (QueryMode::Quality, false),
+                (QueryMode::Full, false),
+                (QueryMode::Full, true),
+            ] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let input = parent.join("original.jsonl");
+                fs::write(&input, concat!(
+                    "{\"id\":\"zeta\",\"content\":\"retry network requests\",\"metadata\":{\"tenant\":\"A\"}}\n",
+                    "{\"id\":\"alpha\",\"content\":\"garden flowers\",\"metadata\":{\"tenant\":\"B\"}}\n",
+                )).unwrap();
+                let options = empty_lifecycle_index_options(&parent, mode, ann, &input);
+                index_with_loader(&cx, &options, &mut Vec::new(), |requested| {
+                    Ok(topology_models(requested, &fast, &quality))
+                })
+                .await
+                .unwrap();
+                let initial = Receipt::read(&options.receipt).unwrap();
+                let root = admit_root(&initial.root).unwrap();
+                let retained = Arc::new(initial.open(&cx, DEFAULT_IMAGE_BYTES).unwrap());
+                let fixed = Filter::parse(r#"{"metadata":{"tenant":"A"}}"#).unwrap();
+                let original_scope = retained
+                    .scope(&cx, MAX_INPUT_BYTES, |document| Ok(fixed.matches(document)))
+                    .unwrap();
+                let mut session = AuthoritySession::new(
+                    &cx,
+                    root,
+                    initial.clone(),
+                    Arc::clone(&retained),
+                    topology_models(mode, &fast, &quality),
+                    (2, DEFAULT_IMAGE_BYTES),
+                    false,
+                )
+                .unwrap()
+                .with_filter(&cx, Some(fixed), MAX_INPUT_BYTES)
+                .unwrap()
+                .with_updates(2, MAX_INPUT_BYTES)
+                .unwrap();
+                let before = calls(&fast, &quality);
+                let emptied_path = parent.join("emptied.json");
+                let response = exchange(
+                    &cx,
+                    &mut session,
+                    &[serde_json::json!({
+                        "op":"update", "id":"delete-all", "expected_authority":initial.authority,
+                        "work_dir":parent.join("emptied-work"), "new_receipt":emptied_path,
+                        "source_low":2, "source_high":8,
+                        "changes":[{"op":"delete","id":"zeta"},{"op":"delete","id":"alpha"}],
+                    })],
+                )
+                .await;
+                assert_eq!(response[0]["documents"], 2);
+                assert_eq!(response[0]["scope"]["eligible_documents"], 1);
+                assert_eq!(response[1]["event"], "updated");
+                assert_eq!(response[1]["publication"], "committed");
+                assert_eq!(response[1]["serving"], "activated");
+                assert_eq!(response[1]["documents"], 0);
+                assert_eq!(response[1]["scope"]["eligible_documents"], 0);
+                assert_eq!(calls(&fast, &quality), before);
+                let emptied = Receipt::read(&emptied_path).unwrap();
+                assert_eq!(session.receipt.authority, emptied.authority);
+                assert_eq!(emptied.identity, initial.identity);
+                assert_eq!(emptied.quality_identity, initial.quality_identity);
+                let empty_reader = Arc::clone(&session.snapshot);
+                assert!(empty_reader.source_documents(&cx, 0).unwrap().is_empty());
+                let response = exchange(&cx, &mut session, &[
+                    serde_json::json!({"query":"retry", "mode":mode.as_str(), "stream":true, "filter":{}}),
+                    serde_json::json!({
+                        "op":"fetch", "expected_authority":emptied.authority,
+                        "documents":[{"doc_id":"zeta"},{"doc_id":"alpha"}], "filter":{},
+                    }),
+                    serde_json::json!({"query":"retry", "mode":"lexical", "filter":{}}),
+                ]).await;
+                assert_eq!(response[0]["documents"], 0);
+                assert_eq!(response[0]["scope"]["eligible_documents"], 0);
+                let expected_phases = if mode == QueryMode::Full { 2 } else { 1 };
+                assert_eq!(response.len(), expected_phases + 3);
+                for frame in &response[1..=expected_phases] {
+                    assert_eq!(frame["event"], "results");
+                    assert_eq!(frame["authority"], serde_json::json!(emptied.authority));
+                    assert_eq!(frame["scope"]["eligible_documents"], 0);
+                    assert!(frame["results"].as_array().unwrap().is_empty());
+                }
+                assert_eq!(
+                    response[expected_phases + 1]["documents"],
+                    serde_json::json!([
+                        {"doc_id":"zeta","status":"unavailable"},
+                        {"doc_id":"alpha","status":"unavailable"},
+                    ])
+                );
+                let lexical = response.last().unwrap();
+                assert_eq!(lexical["phase"], "lexical");
+                assert_eq!(lexical["scope"]["eligible_documents"], 0);
+                assert_eq!(lexical["semantic_used"], false);
+                assert!(lexical["results"].as_array().unwrap().is_empty());
+                assert_eq!(calls(&fast, &quality), before);
+
+                let checkpoint_path = parent.join("checkpoint.json");
+                let response = exchange(
+                    &cx,
+                    &mut session,
+                    &[serde_json::json!({
+                        "op":"update", "id":"checkpoint", "expected_authority":emptied.authority,
+                        "work_dir":parent.join("checkpoint-work"), "new_receipt":checkpoint_path,
+                        "source_low":2, "source_high":9, "changes":[],
+                    })],
+                )
+                .await;
+                assert_eq!(response[1]["event"], "updated");
+                assert_eq!(response[1]["documents"], 0);
+                assert_eq!(response[1]["edited_ids"], 0);
+                assert_eq!(response[1]["scope"]["eligible_documents"], 0);
+                assert_eq!(calls(&fast, &quality), before);
+                let checkpoint = Receipt::read(&checkpoint_path).unwrap();
+                assert_eq!(
+                    checkpoint.authority().unwrap().sequence,
+                    emptied.authority().unwrap().sequence + 1
+                );
+                let checkpoint_reader = checkpoint.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    checkpoint_reader.metadata().commit_range,
+                    CommitRange { low: 2, high: 9 }
+                );
+                assert!(
+                    checkpoint_reader
+                        .source_documents(&cx, 0)
+                        .unwrap()
+                        .is_empty()
+                );
+
+                let refill_path = parent.join("refilled.json");
+                let response = exchange(&cx, &mut session, &[
+                    serde_json::json!({
+                        "op":"update", "id":"refill", "expected_authority":checkpoint.authority,
+                        "work_dir":parent.join("refilled-work"), "new_receipt":refill_path,
+                        "source_low":2, "source_high":10, "changes":[
+                            {"op":"upsert","id":"visible","content":"retry allowed refill","metadata":{"tenant":"A"}},
+                            {"op":"upsert","id":"private","content":"retry PRIVATE_SOURCE","metadata":{"tenant":"B"}},
+                        ],
+                    }),
+                    serde_json::json!({"query":"retry", "mode":mode.as_str(), "stream":true, "filter":{}}),
+                    serde_json::json!({"query":"retry", "mode":"lexical", "filter":{}}),
+                ]).await;
+                assert_eq!(response[0]["documents"], 0);
+                assert_eq!(response[1]["event"], "updated");
+                assert_eq!(response[1]["documents"], 2);
+                assert_eq!(response[1]["scope"]["eligible_documents"], 1);
+                assert_eq!(response.len(), expected_phases + 3);
+                for frame in &response[2..] {
+                    assert_eq!(frame["event"], "results");
+                    assert_eq!(frame["scope"]["eligible_documents"], 1);
+                    assert_eq!(frame["results"].as_array().unwrap().len(), 1);
+                    assert_eq!(frame["results"][0]["doc_id"], "visible");
+                }
+                assert_eq!(
+                    calls(&fast, &quality),
+                    match mode {
+                        QueryMode::Fast => (before.0 + 3, before.1),
+                        QueryMode::Quality => (before.0, before.1 + 3),
+                        QueryMode::Full => (before.0 + 3, before.1 + 3),
+                        QueryMode::Lexical =>
+                            unreachable!("index construction requires a producer"),
+                    },
+                    "only two new documents and the nonempty scoped query invoke each selected tier"
+                );
+                let refilled = Receipt::read(&refill_path).unwrap();
+                assert_eq!(refilled.identity, initial.identity);
+                assert_eq!(refilled.quality_identity, initial.quality_identity);
+                let before = calls(&fast, &quality);
+                let response = exchange(
+                    &cx,
+                    &mut session,
+                    &[serde_json::json!({
+                        "op":"fetch", "expected_authority":refilled.authority,
+                        "documents":[{"doc_id":"visible"},{"doc_id":"private"},{"doc_id":"zeta"}],
+                        "filter":{},
+                    })],
+                )
+                .await;
+                assert_eq!(
+                    response[1]["documents"][0]["content"],
+                    "retry allowed refill"
+                );
+                assert_eq!(
+                    response[1]["documents"][1],
+                    serde_json::json!({"doc_id":"private","status":"unavailable"})
+                );
+                assert_eq!(
+                    response[1]["documents"][2],
+                    serde_json::json!({"doc_id":"zeta","status":"unavailable"})
+                );
+                assert_eq!(calls(&fast, &quality), before);
+
+                let response = exchange(&cx, &mut session, &[
+                    serde_json::json!({
+                        "op":"update", "id":"empty-again", "expected_authority":refilled.authority,
+                        "work_dir":parent.join("empty-again-work"), "new_receipt":parent.join("empty-again.json"),
+                        "source_low":2, "source_high":11,
+                        "changes":[{"op":"delete","id":"visible"},{"op":"delete","id":"private"}],
+                    }),
+                    serde_json::json!({"query":"retry", "mode":mode.as_str(), "stream":true, "filter":{}}),
+                    serde_json::json!({"query":"retry", "mode":"lexical", "filter":{}}),
+                ]).await;
+                assert_eq!(response[1]["event"], "updated");
+                assert_eq!(response[1]["documents"], 0);
+                assert_eq!(response[1]["scope"]["eligible_documents"], 0);
+                for frame in &response[2..] {
+                    assert_eq!(frame["scope"]["eligible_documents"], 0);
+                    assert!(frame["results"].as_array().unwrap().is_empty());
+                }
+                assert_eq!(calls(&fast, &quality), before);
+                assert_eq!(session.snapshot.metadata().total_documents, 0);
+                assert!(empty_reader.source_documents(&cx, 0).unwrap().is_empty());
+                assert!(
+                    checkpoint_reader
+                        .source_documents(&cx, 0)
+                        .unwrap()
+                        .is_empty()
+                );
+                let loaded = topology_models(mode, &fast, &quality);
+                query_admitted(
+                    &cx,
+                    &retained,
+                    Some(&original_scope),
+                    &loaded,
+                    plan(mode, true),
+                    |_, hits| {
+                        assert_eq!(hits.len(), 1);
+                        assert_eq!(hits[0].doc_id, "zeta");
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        });
     }
 
     #[test]

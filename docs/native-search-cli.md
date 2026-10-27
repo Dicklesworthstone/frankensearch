@@ -332,9 +332,22 @@ overwritten by another edit. Deleting an absent ID has no effect.
 Omit `--input` to read bounded JSONL from standard input. Both source checkpoint
 boundaries are required and must be at least their selected predecessor values.
 An empty delta can advance the checkpoint with zero document inference. A delta
-that deletes the entire cohort is refused before model loading or creation of
-the new work directory because this generation metadata contract requires a
-nonempty cohort.
+that deletes the entire cohort publishes a complete empty generation. Its
+zero-row vector images, empty Quill source, metadata and optional graph are
+admitted and committed together. Searches return no hits, source fetches report
+the requested documents as unavailable, and later upserts repopulate the same
+root. Full generations retain both independently bound tiers when empty.
+
+Empty input is also supported by `authority-index` and `authority-rebuild`,
+including `--retained-source` rebuilds of an empty predecessor. Empty generations
+keep their producer identities, storage and retrieval contracts, source
+checkpoint and canonical empty document-set digest. Semantic builds and queries
+still load and check the matching models, but zero documents require no embedding
+inference. Lexical-only queries and source fetches remain model-free. Missing or
+corrupt component images remain admission
+errors. Readers retained before a delete-all publication keep their original
+results, and rollback can restore either an empty or populated predecessor
+through a new, higher-sequence activation.
 
 The selected generation fixes the root, security profile, topology, complete
 producer identities, F16/F32 vector encodings, and each tier's retrieval policy,
@@ -620,7 +633,7 @@ fields:
 An update contains at most 1,000 mutation records, counting overwritten edits,
 and must fit within the existing 1 MiB request limit. Every record is validated;
 the final operation for each ID wins. Empty `changes` may advance the checkpoint.
-The complete resulting cohort must remain nonempty and satisfy the same
+The complete resulting cohort may be empty and must satisfy the same
 100,000-document, 16 MiB record and 256 MiB encoded-source limits as the one-shot
 command. Destinations must be UTF-8 paths of at most 4,096 bytes, outside the
 selected root and separate from each other. `--batch-size` on the server

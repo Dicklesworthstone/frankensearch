@@ -124,7 +124,8 @@ Update applies bounded upsert/delete JSONL to the retained source, with the last
 operation for each ID winning. It reuses unchanged content vectors and preserves\n\
 the selected producers, topology, precision, and retrieval policy. Only changed or new\n\
 content is embedded; complete vector, graph, and Quill images are still produced.\n\
-The final cohort must be nonempty and satisfy the combined encoded-source limits.\n\
+The final cohort satisfies the combined encoded-source limits. Deleting every\n\
+document publishes a complete empty generation that later updates can populate.\n\
 Updates require nonbackward source checkpoints and a new work directory/receipt.\n\
 Use rebuild for producer or retrieval changes. Update never changes old images.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
@@ -809,7 +810,6 @@ impl Receipt {
         if !self.root.is_absolute()
             || self.root_id == [0; 16]
             || self.profile != PROFILE.as_str()
-            || self.documents == 0
             || self.documents > MAX_DOCUMENTS as u64
             || self.image_bytes == 0
         {
@@ -1375,6 +1375,22 @@ async fn index(
     output: &mut impl Write,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<()> {
+    Box::pin(index_with_loader(cx, options, output, |mode| {
+        load_authority_models(cx, options, mode, pool)
+    }))
+    .await
+}
+
+async fn index_with_loader<F>(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    load_models: F,
+) -> Result<()>
+where
+    F: FnOnce(QueryMode) -> Result<Models>,
+{
+    checkpoint(cx)?;
     let root_path = new_path(options.root.as_deref().ok_or_else(|| bad("missing root"))?)?;
     let work_path = new_path(
         options
@@ -1390,11 +1406,6 @@ async fn index(
         Some(path) => read_documents(&mut BufReader::new(File::open(path)?))?,
         None => read_documents(&mut io::stdin().lock())?,
     };
-    if documents.is_empty() {
-        return Err(bad(
-            "the generation metadata contract requires a nonempty source cohort",
-        ));
-    }
     let tier = options.tier.ok_or_else(|| bad("missing tier"))?;
     let mode = if options.progressive {
         QueryMode::Full
@@ -1403,7 +1414,7 @@ async fn index(
     } else {
         QueryMode::Fast
     };
-    let loaded = load_authority_models(cx, options, mode, pool)?;
+    let loaded = load_models(mode)?;
     let mut builder = NativeIndexBuilder::new(&work_path, new_generation(1)?, loaded.fast)?
         .with_batch_size(options.batch_size)?
         .with_max_batch_input_bytes(MAX_RECORD_BYTES)?
@@ -1565,6 +1576,7 @@ async fn rebuild_with_loader<F>(
 where
     F: FnMut(QueryMode) -> Result<Models>,
 {
+    checkpoint(cx)?;
     let selected = Receipt::read(
         options
             .from_receipt
@@ -1607,11 +1619,6 @@ where
             None => read_documents(&mut io::stdin().lock())?,
         }
     };
-    if documents.is_empty() {
-        return Err(bad(
-            "the generation metadata contract requires a nonempty source cohort",
-        ));
-    }
     let loaded = load_models(selected.query_mode(None)?)?;
     let expected_identity = rebuild_identity(
         &selected.identity,
@@ -1797,9 +1804,6 @@ where
     let documents = retained_rebuild_documents(cx, snapshot, spec.limits.max_source_bytes)?;
     let edits = read_edits()?;
     let document_count = mutations::validate_final_source(cx, &documents, &edits)?;
-    if document_count == 0 {
-        return Err(bad("authority updates require a nonempty final cohort"));
-    }
     // The library prepares reuse from the same immutable image. Let these
     // preflight bodies go before loading a model or materializing that source.
     checkpoint(cx)?;
