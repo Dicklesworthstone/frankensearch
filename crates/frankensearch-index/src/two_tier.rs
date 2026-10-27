@@ -379,6 +379,14 @@ impl TierSource {
         }
     }
 
+    /// Share this exact admitted allocation with a retained native graph.
+    fn admitted_owner_arc(&self) -> Option<&Arc<ValidatedFsviBytes>> {
+        match self {
+            Self::PathOpened(_) => None,
+            Self::AdmittedV2 { owner, .. } => Some(owner),
+        }
+    }
+
     /// The identity binding this tier was admitted under, when it came from
     /// exact FSVI v2 admission.
     const fn admitted_binding(&self) -> Option<&FsviV2IdentityBinding> {
@@ -417,6 +425,45 @@ struct NativeTierHnsw {
     params: HnswParams,
     seed: u64,
     graph: Option<ValidatedNativeHnsw>,
+}
+
+impl NativeTierHnsw {
+    /// Prepare a policy for another admitted owner without changing the old
+    /// graph. Reuse is an exact-row decision: only an ineligible successor
+    /// (`Ok(None)`) may rebuild; cancellation and operational failures propagate.
+    fn for_replacement(
+        &self,
+        cx: &Cx,
+        owner: Option<&Arc<ValidatedFsviBytes>>,
+    ) -> SearchResult<Self> {
+        let graph = match owner {
+            Some(owner) => {
+                // This container does not select publication authority. Keep
+                // its existing full-build behavior for an explicitly admitted
+                // reopen or rollback; incremental reuse requires a successor.
+                let reused = if let Some(previous) = &self.graph
+                    && owner.witness().generation.sequence
+                        > previous.owner_witness().generation.sequence
+                {
+                    previous.try_reuse_for_owner(cx, Arc::clone(owner))?
+                } else {
+                    None
+                };
+                Some(match reused {
+                    Some(graph) => graph,
+                    None => {
+                        ValidatedNativeHnsw::build(cx, Arc::clone(owner), self.params, self.seed)?
+                    }
+                })
+            }
+            None => None,
+        };
+        Ok(Self {
+            params: self.params,
+            seed: self.seed,
+            graph,
+        })
+    }
 }
 
 /// Dual-index container used by progressive search orchestration.
@@ -980,9 +1027,11 @@ impl TwoTierIndex {
     /// without an exact retry. Construction observes the caller's cancellation
     /// during graph work. A failed or cancelled build preserves the previous policy.
     ///
-    /// [`Self::try_replace_admitted_v2`] builds the successor's graph before
-    /// swapping either tier. Fresh pathname opens require explicit opt-in again,
-    /// either by construction or [`Self::load_native_fast_hnsw`].
+    /// [`Self::try_replace_admitted_v2`] prepares the successor's graph before
+    /// swapping either tier, reusing unchanged rows and inserting appended rows
+    /// when their complete identities and persisted bytes still match. Fresh
+    /// pathname opens require explicit opt-in again, either by construction or
+    /// [`Self::load_native_fast_hnsw`].
     ///
     /// # Errors
     /// Rejects invalid graph parameters, legacy tiers, or disagreement between
@@ -1042,8 +1091,10 @@ impl TwoTierIndex {
     /// The policy is reapplied transactionally by
     /// [`Self::try_replace_admitted_v2`]. A successor without quality keeps the
     /// policy with no graph; a later quality-bearing successor builds its own
-    /// graph. A fresh pathname reopen starts in exact mode until explicitly
-    /// opted in again, either by construction or [`Self::load_native_quality_hnsw`].
+    /// graph. Newer generations with unchanged or append-only rows can reuse
+    /// their exact admitted predecessor graph. A fresh pathname reopen starts
+    /// in exact mode until explicitly opted in again, either by construction or
+    /// [`Self::load_native_quality_hnsw`].
     /// Build and query failures propagate without exact retry.
     /// Construction observes the caller's cancellation during graph work.
     ///
@@ -1129,7 +1180,8 @@ impl TwoTierIndex {
     /// silently falls back to exact retrieval. Any failure preserves both
     /// tiers and their existing retrieval policies. After success, queries
     /// retain the admitted graph in memory; later pathname changes cannot
-    /// retarget it. Generation replacement rebuilds for the successor owner.
+    /// retarget it. Generation replacement reuses eligible unchanged rows or
+    /// rebuilds for the successor owner before either tier is installed.
     ///
     /// # Errors
     /// Rejects legacy/mixed tiers, invalid or mismatched parameters/seed, and
@@ -1338,10 +1390,17 @@ impl TwoTierIndex {
     /// is unaffected either way — each index retains its own admitted byte
     /// image, so an installed successor never invalidates a live predecessor.
     ///
+    /// Each native tier independently reuses an unchanged or append-only graph
+    /// for a strictly newer generation. Reuse verifies complete identities,
+    /// persisted vector bytes and row state, retaining graph node identities
+    /// even when new documents change the physical row ordering. Edited or
+    /// deleted rows require a full build. A reuse error or cancellation never
+    /// triggers a rebuild and leaves both incumbent tiers installed.
+    ///
     /// # Errors
     ///
     /// Returns the errors of [`Self::open_admitted_v2_with_paths`] and of any
-    /// requested native graph build, before any state change.
+    /// requested native graph reuse or build, before any state change.
     pub fn try_replace_admitted_v2(
         &mut self,
         cx: &Cx,
@@ -1371,13 +1430,21 @@ impl TwoTierIndex {
             }
         };
         if let Some(policy) = &self.native_fast_hnsw {
-            candidate.enable_native_fast_hnsw(cx, policy.params, policy.seed)?;
+            candidate.validate_native_hnsw_tiers("fast")?;
+            candidate.native_fast_hnsw =
+                Some(policy.for_replacement(cx, candidate.fast_source.admitted_owner_arc())?);
         }
         if let Some(policy) = &self.native_quality_hnsw {
-            // Build against the candidate's own retained allocation before
-            // replacing any part of the incumbent. A failure leaves both its
-            // previous vector owner and graph installed.
-            candidate.enable_native_quality_hnsw(cx, policy.params, policy.seed)?;
+            candidate.validate_native_hnsw_tiers("quality")?;
+            candidate.native_quality_hnsw = Some(
+                policy.for_replacement(
+                    cx,
+                    candidate
+                        .quality_source
+                        .as_ref()
+                        .and_then(TierSource::admitted_owner_arc),
+                )?,
+            );
         }
         tier_checkpoint(cx, "two_tier.replace_admitted_v2")?;
         info!(
@@ -8562,6 +8629,362 @@ mod tests {
                 }
             );
         }
+    }
+
+    fn native_refresh_generation(
+        root: &Path,
+        sequence: u64,
+        fast_rows: &[(&str, &[f32])],
+        quality_rows: &[(&str, &[f32])],
+    ) -> (
+        TwoTierIndexPaths,
+        FsviV2IdentityBinding,
+        FsviV2IdentityBinding,
+    ) {
+        let directory = root.join(format!("generation-{sequence}"));
+        fs::create_dir(&directory).unwrap();
+        let fast_path = directory.join("fast.fsvi");
+        let quality_path = directory.join("quality.fsvi");
+        let (fast, _) = fsvi_v2_binding("incremental-refresh-fast", 4, sequence);
+        let (quality, _) = fsvi_v2_binding("incremental-refresh-quality", 4, sequence);
+        write_v2_tier(&fast_path, &fast, fast_rows);
+        write_v2_tier(&quality_path, &quality, quality_rows);
+        (
+            TwoTierIndexPaths::new(fast_path).with_quality_index(quality_path),
+            fast,
+            quality,
+        )
+    }
+
+    #[test]
+    fn native_refresh_reuses_remapped_appends_and_persists_unchanged_successors() {
+        let mut ids = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+        ids.sort_by_key(|id| crate::fnv1a_hash(id.as_bytes()));
+        let vectors = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [0.6, 0.8, 0.0, 0.0],
+            [-1.0, 0.0, 0.0, 0.0],
+        ];
+        let fast_rows: Vec<_> = ids
+            .iter()
+            .zip(&vectors)
+            .map(|(&id, vector)| (id, vector.as_slice()))
+            .collect();
+        let quality_rows: Vec<_> = ids
+            .iter()
+            .zip(vectors.iter().rev())
+            .map(|(&id, vector)| (id, vector.as_slice()))
+            .collect();
+        let (_, fast_identity) = fsvi_v2_binding("incremental-refresh-fast", 4, 1);
+        let (_, quality_identity) = fsvi_v2_binding("incremental-refresh-quality", 4, 1);
+        let embeddings = TieredQueryEmbeddings::progressive(
+            bound_query(&fast_identity, &[1.0, 0.0, 0.0, 0.0]),
+            bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]),
+        );
+        for (native_fast, native_quality) in [(true, false), (false, true), (true, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let cx = Cx::for_testing();
+            let (paths, fast, quality) = native_refresh_generation(
+                root,
+                1,
+                &[fast_rows[1], fast_rows[3], fast_rows[5]],
+                &[quality_rows[0], quality_rows[2], quality_rows[4]],
+            );
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &fast,
+                Some(&quality),
+            )
+            .unwrap();
+            let params = HnswParams::default();
+            if native_fast {
+                index.enable_native_fast_hnsw(&cx, params, 3).unwrap();
+            }
+            if native_quality {
+                index.enable_native_quality_hnsw(&cx, params, 7).unwrap();
+            }
+            let (next_paths, next_fast, next_quality) =
+                native_refresh_generation(root, 2, &fast_rows, &quality_rows);
+            let mut rebuilt = TwoTierIndex::open_admitted_v2_with_paths(
+                &next_paths,
+                TwoTierConfig::default(),
+                &next_fast,
+                Some(&next_quality),
+            )
+            .unwrap();
+            let exact = rebuilt
+                .activate_owner_backed_search(&cx, &embeddings)
+                .unwrap()
+                .search_union(6)
+                .unwrap();
+            index
+                .try_replace_admitted_v2(&cx, &next_paths, &next_fast, Some(&next_quality))
+                .unwrap();
+            assert_eq!(index.has_native_fast_hnsw(), native_fast);
+            assert_eq!(index.has_native_quality_hnsw(), native_quality);
+            assert_eq!(
+                index
+                    .activate_owner_backed_search(&cx, &embeddings)
+                    .unwrap()
+                    .search_union(6)
+                    .unwrap(),
+                exact,
+                "remapped graph nodes resolve the successor's exact physical rows"
+            );
+
+            let mut appended_receipts = Vec::new();
+            for (tier, enabled, seed) in [("fast", native_fast, 3), ("quality", native_quality, 7)]
+            {
+                if !enabled {
+                    continue;
+                }
+                let appended_path = root.join(format!("appended-{tier}.fshnsw"));
+                let rebuilt_path = root.join(format!("rebuilt-{tier}.fshnsw"));
+                let (appended, rebuilt_receipt) = if tier == "fast" {
+                    rebuilt.enable_native_fast_hnsw(&cx, params, seed).unwrap();
+                    (
+                        index.save_native_fast_hnsw(&appended_path).unwrap(),
+                        rebuilt.save_native_fast_hnsw(&rebuilt_path).unwrap(),
+                    )
+                } else {
+                    rebuilt
+                        .enable_native_quality_hnsw(&cx, params, seed)
+                        .unwrap();
+                    (
+                        index.save_native_quality_hnsw(&appended_path).unwrap(),
+                        rebuilt.save_native_quality_hnsw(&rebuilt_path).unwrap(),
+                    )
+                };
+                assert_ne!(
+                    appended.topology_sha256, rebuilt_receipt.topology_sha256,
+                    "the append must preserve node identities through a nonidentity row map"
+                );
+                assert_eq!(appended.point_count, 6);
+                assert_eq!(appended.artifact_generation.sequence, 2);
+                appended_receipts.push((tier, seed, appended));
+            }
+
+            // Another publication changes identity but no document bytes.
+            // The graph produced by the append must survive exactly, including
+            // its nonidentity source-row map; a fresh build would lose it.
+            let (same_paths, same_fast, same_quality) =
+                native_refresh_generation(root, 3, &fast_rows, &quality_rows);
+            index
+                .try_replace_admitted_v2(&cx, &same_paths, &same_fast, Some(&same_quality))
+                .unwrap();
+            let mut reopened = TwoTierIndex::open_admitted_v2_with_paths(
+                &same_paths,
+                TwoTierConfig::default(),
+                &same_fast,
+                Some(&same_quality),
+            )
+            .unwrap();
+            for (tier, seed, appended) in appended_receipts {
+                let graph_path = root.join(format!("unchanged-{tier}.fshnsw"));
+                let receipt = if tier == "fast" {
+                    let receipt = index.save_native_fast_hnsw(&graph_path).unwrap();
+                    reopened
+                        .load_native_fast_hnsw(&graph_path, params, seed)
+                        .unwrap();
+                    receipt
+                } else {
+                    let receipt = index.save_native_quality_hnsw(&graph_path).unwrap();
+                    reopened
+                        .load_native_quality_hnsw(&graph_path, params, seed)
+                        .unwrap();
+                    receipt
+                };
+                assert_eq!(receipt.graph_sha256, appended.graph_sha256);
+                assert_eq!(receipt.topology_sha256, appended.topology_sha256);
+                assert_ne!(receipt.receipt_sha256, appended.receipt_sha256);
+                assert_eq!(receipt.artifact_generation.sequence, 3);
+                assert_ne!(
+                    receipt.fsvi_whole_image_sha256,
+                    appended.fsvi_whole_image_sha256
+                );
+            }
+            assert_eq!(reopened.has_native_fast_hnsw(), native_fast);
+            assert_eq!(reopened.has_native_quality_hnsw(), native_quality);
+            assert_eq!(
+                reopened
+                    .activate_owner_backed_search(&cx, &embeddings)
+                    .unwrap()
+                    .search_union(6)
+                    .unwrap(),
+                exact
+            );
+        }
+    }
+
+    #[test]
+    fn native_refresh_rebuilds_edited_deleted_and_tombstoned_rows() {
+        let mut original = [
+            ("alpha", [1.0, 0.0, 0.0, 0.0].as_slice()),
+            ("bravo", [0.0, 1.0, 0.0, 0.0].as_slice()),
+            ("charlie", [0.0, 0.0, 1.0, 0.0].as_slice()),
+        ];
+        original.sort_by_key(|(doc_id, _)| crate::fnv1a_hash(doc_id.as_bytes()));
+        for change in ["edit", "delete", "tombstone"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let cx = Cx::for_testing();
+            let (paths, fast, quality) =
+                native_refresh_generation(root, 1, &original[1..], &original);
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &fast,
+                Some(&quality),
+            )
+            .unwrap();
+            let params = HnswParams::default();
+            index.enable_native_fast_hnsw(&cx, params, 3).unwrap();
+            index.enable_native_quality_hnsw(&cx, params, 7).unwrap();
+            let (append_paths, append_fast, append_quality) =
+                native_refresh_generation(root, 2, &original, &original);
+            index
+                .try_replace_admitted_v2(&cx, &append_paths, &append_fast, Some(&append_quality))
+                .unwrap();
+            // The appended row sorts before every old row. Start from this
+            // nonidentity map so retaining the old graph cannot accidentally
+            // match a full build of the small edited/tombstoned fixture.
+            let remapped = index
+                .save_native_fast_hnsw(&root.join("remapped.fshnsw"))
+                .unwrap();
+            let mut changed = original.to_vec();
+            if change == "edit" {
+                changed.iter_mut().find(|row| row.0 == "bravo").unwrap().1 = &[0.6, 0.8, 0.0, 0.0];
+            } else if change == "delete" {
+                changed.retain(|row| row.0 != "bravo");
+            }
+            let (next_paths, next_fast, next_quality) =
+                native_refresh_generation(root, 3, &changed, &original);
+            if change == "tombstone" {
+                let mut writer =
+                    VectorIndex::create_v2(next_paths.fast_index(), next_fast.clone()).unwrap();
+                for (doc_id, vector) in &changed {
+                    if *doc_id == "bravo" {
+                        writer.write_tombstone_record(doc_id, vector).unwrap();
+                    } else {
+                        writer.write_record(doc_id, vector).unwrap();
+                    }
+                }
+                writer.finish().unwrap();
+            }
+            let mut rebuilt = TwoTierIndex::open_admitted_v2_with_paths(
+                &next_paths,
+                TwoTierConfig::default(),
+                &next_fast,
+                Some(&next_quality),
+            )
+            .unwrap();
+            index
+                .try_replace_admitted_v2(&cx, &next_paths, &next_fast, Some(&next_quality))
+                .unwrap();
+            rebuilt.enable_native_fast_hnsw(&cx, params, 3).unwrap();
+            let actual = index
+                .save_native_fast_hnsw(&root.join("refreshed.fshnsw"))
+                .unwrap();
+            let expected = rebuilt
+                .save_native_fast_hnsw(&root.join("rebuilt.fshnsw"))
+                .unwrap();
+            assert_eq!(actual.graph_sha256, expected.graph_sha256, "{change}");
+            assert_ne!(actual.topology_sha256, remapped.topology_sha256, "{change}");
+            let (_, identity) = fsvi_v2_binding("incremental-refresh-fast", 4, 3);
+            let embeddings =
+                TieredQueryEmbeddings::fast_only(bound_query(&identity, &[0.0, 1.0, 0.0, 0.0]));
+            let activated = index
+                .activate_owner_backed_search(&cx, &embeddings)
+                .unwrap();
+            let hits = activated.search_fast(3).unwrap();
+            assert_eq!(hits, activated.fast().unwrap().search_top_k(3).unwrap());
+            if change != "edit" {
+                assert!(hits.iter().all(|hit| hit.doc_id != "bravo"));
+            }
+            assert!(index.has_native_quality_hnsw());
+            assert_eq!(index.quality_admitted_owner().unwrap().live_count(), 3);
+        }
+    }
+
+    #[test]
+    fn native_refresh_rejected_generation_keeps_both_incumbent_graphs() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let cx = Cx::for_testing();
+        let original = [("retained", [1.0, 0.0, 0.0, 0.0].as_slice())];
+        let (paths, fast, quality) = native_refresh_generation(root, 1, &original, &original);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast,
+            Some(&quality),
+        )
+        .unwrap();
+        let params = HnswParams::default();
+        index.enable_native_fast_hnsw(&cx, params, 3).unwrap();
+        index.enable_native_quality_hnsw(&cx, params, 7).unwrap();
+        let before_fast = index.fast_admitted_owner().unwrap().witness().clone();
+        let before_quality = index.quality_admitted_owner().unwrap().witness().clone();
+        let fast_graph = root.join("fast.fshnsw");
+        let quality_graph = root.join("quality.fshnsw");
+        let fast_receipt = index.save_native_fast_hnsw(&fast_graph).unwrap();
+        let quality_receipt = index.save_native_quality_hnsw(&quality_graph).unwrap();
+        let appended = [original[0], ("appended", [0.0, 1.0, 0.0, 0.0].as_slice())];
+        let (next_paths, next_fast, _) = native_refresh_generation(root, 2, &appended, &original);
+        let (next_quality, _) = fsvi_v2_binding("incremental-refresh-quality", 4, 3);
+        write_v2_tier(
+            next_paths.quality_index().unwrap(),
+            &next_quality,
+            &original,
+        );
+
+        // Each artifact is independently valid, but mixing complete generation
+        // identities cannot replace either incumbent owner or graph.
+        let error = index
+            .try_replace_admitted_v2(&cx, &next_paths, &next_fast, Some(&next_quality))
+            .unwrap_err();
+        assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+            if field == "two_tier.native_fast_hnsw.generation"));
+        assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before_fast);
+        assert_eq!(
+            index.quality_admitted_owner().unwrap().witness(),
+            &before_quality
+        );
+        assert_eq!(
+            index.save_native_fast_hnsw(&fast_graph).unwrap(),
+            fast_receipt
+        );
+        assert_eq!(
+            index.save_native_quality_hnsw(&quality_graph).unwrap(),
+            quality_receipt
+        );
+        assert_eq!(index.fast_index_path(), paths.fast_index());
+        assert_eq!(index.quality_index_path(), paths.quality_index());
+
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            index.try_replace_admitted_v2(&cx, &next_paths, &next_fast, Some(&next_quality)),
+            Err(SearchError::Cancelled { .. })
+        ));
+        cx.set_cancel_requested(false);
+        let (_, fast_identity) = fsvi_v2_binding("incremental-refresh-fast", 4, 1);
+        let (_, quality_identity) = fsvi_v2_binding("incremental-refresh-quality", 4, 1);
+        let embeddings = TieredQueryEmbeddings::progressive(
+            bound_query(&fast_identity, &[1.0, 0.0, 0.0, 0.0]),
+            bound_query(&quality_identity, &[1.0, 0.0, 0.0, 0.0]),
+        );
+        let hits = index
+            .activate_owner_backed_search(&cx, &embeddings)
+            .unwrap()
+            .search_union(2)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "retained");
     }
 
     #[test]
