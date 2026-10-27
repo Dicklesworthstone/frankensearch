@@ -15,7 +15,7 @@ use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
-use super::super::super::FSFS_DAEMON_RESPONSE_MAX_BYTES;
+use super::super::super::{FSFS_DAEMON_RESPONSE_MAX_BYTES, parse_search_execution_mode};
 use super::{IO_POLL_INTERVAL, complete_cli_error, retained_search_checkpoint};
 
 #[path = "complete_daemon_stream/drain.rs"]
@@ -230,9 +230,9 @@ pub(super) async fn drive<T>(
     }
 }
 
-/// Streaming uses the daemon's admitted full-search configuration. Until
-/// per-request overlays share the ordinary streaming route, refuse them
-/// explicitly rather than silently dropping filters or changing model space.
+/// Raw streaming accepts the buffered request's retrieval modes and search
+/// policy. Validate mode names through the same parser before any frame or
+/// retrieval; unknown options still fail instead of being silently ignored.
 pub(super) fn validate_request(bytes: &[u8]) -> SearchResult<()> {
     let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
         complete_cli_error(
@@ -249,12 +249,18 @@ pub(super) fn validate_request(bytes: &[u8]) -> SearchResult<()> {
             // checked when the policy is applied.
             "query" | "limit" | "stream" | "filter" | "rerank" | "rerank_timeout_ms"
             | "quality_weight" | "quality_timeout_ms" | "rrf_k" | "fast_only" => {}
-            "mode" if value.is_null() || value.as_str() == Some("full") => {}
+            "mode" if value.is_null() => {}
+            "mode" => {
+                let mode = value.as_str().ok_or_else(|| {
+                    complete_cli_error("daemon_stream", "streaming mode must be a string or null")
+                })?;
+                parse_search_execution_mode(Some(mode))?;
+            }
             _ => {
                 return Err(complete_cli_error(
                     "daemon_stream",
                     &format!(
-                        "unsupported streaming option {key}; a stream takes query, limit, mode=full and the buffered request's search policy"
+                        "unsupported streaming option {key}; a stream takes query, limit, mode and the buffered request's search policy"
                     ),
                 ));
             }
@@ -425,14 +431,30 @@ mod tests {
     }
 
     #[test]
-    fn streaming_takes_the_search_policy_and_refuses_other_options_and_nonfull_modes() {
-        validate_request(br#"{"query":"x","limit":10,"stream":true,"mode":"full"}"#).unwrap();
+    fn streaming_accepts_buffered_modes_and_policy_but_rejects_unknown_options() {
+        for mode in [
+            "full",
+            "fast",
+            "fast_only",
+            "quality",
+            "quality_only",
+            "lexical",
+            "lexical_only",
+        ] {
+            let request = serde_json::json!({
+                "query": "x", "limit": 10, "stream": true, "mode": mode
+            });
+            validate_request(&serde_json::to_vec(&request).unwrap()).unwrap();
+        }
+        validate_request(br#"{"query":"x","stream":true,"mode":null}"#).unwrap();
         validate_request(
             br#"{"query":"x","stream":true,"filter":"src","rerank":false,"rerank_timeout_ms":300,"quality_weight":0.5,"quality_timeout_ms":900,"rrf_k":30,"fast_only":true}"#,
         )
         .unwrap();
         for raw in [
-            br#"{"query":"x","stream":true,"mode":"fast"}"#.as_slice(),
+            br#"{"query":"x","stream":true,"mode":"unknown"}"#.as_slice(),
+            br#"{"query":"x","stream":true,"mode":1}"#,
+            br#"{"query":"x","stream":true,"mode":true}"#,
             br#"{"query":"x","stream":true,"protocol":"unknown"}"#,
             br#"{"query":"x","stream":true,"explain":true}"#,
         ] {
@@ -537,7 +559,10 @@ mod tests {
         drop(client);
         check_peer(&server).unwrap();
         drop(retained);
-        assert_eq!(check_peer(&server).unwrap_err().kind(), ErrorKind::BrokenPipe);
+        assert_eq!(
+            check_peer(&server).unwrap_err().kind(),
+            ErrorKind::BrokenPipe
+        );
     }
 
     #[test]

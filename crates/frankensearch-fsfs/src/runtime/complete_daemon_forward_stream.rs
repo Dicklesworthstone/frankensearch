@@ -15,7 +15,9 @@ use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
-use super::super::super::super::{SearchOutputPhase, SearchServeFrame, SearchServeOptions};
+use super::super::super::super::{
+    SearchOutputPhase, SearchServeFrame, SearchServeOptions, SearchStreamResources,
+};
 use super::super::{FSFS_DAEMON_REQUEST_MAX_BYTES, IO_POLL_INTERVAL, streaming};
 use super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_RESPONSE_MAX_BYTES, ForwardedSearch, FsfsRuntime,
@@ -130,13 +132,14 @@ pub(super) async fn serve(
                 request.request.search.limit,
                 &request.request.request_id,
                 &mut writer,
-                Some((
-                    &mut session.reader.resources,
-                    SearchExecutionFlags {
+                Some(SearchStreamResources {
+                    resources: &mut session.reader.resources,
+                    flags: SearchExecutionFlags {
                         include_snippets: true,
                         persist_explain_session: true,
                     },
-                )),
+                    requested_mode: query_runtime.requested_search_mode(),
+                }),
             )
             .await
     };

@@ -12,9 +12,9 @@ use frankensearch_core::{GenerationRootSecurityProfileV1, SearchError, SearchRes
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
-    SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, canonical_store_root,
-    degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms, retained_search_checkpoint,
-    store_overlaps_source, validate_retained_catalog_path,
+    SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, SearchStreamResources,
+    canonical_store_root, degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms,
+    retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
@@ -1036,13 +1036,14 @@ impl FsfsRuntime {
                     limit,
                     &stream_id,
                     writer,
-                    Some((
-                        &mut reader.resources,
-                        SearchExecutionFlags {
+                    Some(SearchStreamResources {
+                        resources: &mut reader.resources,
+                        flags: SearchExecutionFlags {
                             include_snippets: true,
                             persist_explain_session: true,
                         },
-                    )),
+                        requested_mode: reader.runtime.requested_search_mode(),
+                    }),
                 )
                 .await;
         }

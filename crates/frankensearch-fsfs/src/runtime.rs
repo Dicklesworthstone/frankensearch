@@ -1396,6 +1396,15 @@ struct SearchExecutionFlags {
     persist_explain_session: bool,
 }
 
+/// A retained stream's resources and requested retrieval mode travel together.
+/// The daemon applies its degradation policy without rewriting that policy to
+/// represent a client's choice.
+struct SearchStreamResources<'a> {
+    resources: &'a mut SearchExecutionResources,
+    flags: SearchExecutionFlags,
+    requested_mode: SearchExecutionMode,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SearchServeOptions {
     hot_cache_enabled: bool,
@@ -6273,6 +6282,9 @@ pub struct FsfsRuntime {
     /// A timed-out initialization retains its permit and successful model, so
     /// the next query can refine without repeating the cold load.
     quality_load_gate: Arc<asupersync::sync::Mutex<QualityEmbedderSlot>>,
+    /// A raw quality-only stream shares this request-local budget across
+    /// pre-Started producer admission and retrieval. Never stored on the daemon.
+    quality_budget_started_at: Option<asupersync::types::Time>,
     #[cfg(feature = "rerank")]
     native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
     #[cfg(feature = "embedded-models")]
@@ -6331,6 +6343,7 @@ impl FsfsRuntime {
             quality_load_gate: Arc::new(asupersync::sync::Mutex::new(
                 QualityEmbedderSlot::default(),
             )),
+            quality_budget_started_at: None,
             #[cfg(feature = "rerank")]
             native_blocking_pool: None,
             #[cfg(feature = "embedded-models")]
@@ -8309,27 +8322,35 @@ impl FsfsRuntime {
         limit: usize,
         stream_id: &str,
         writer: &mut W,
-        mut resources_override: Option<(&mut SearchExecutionResources, SearchExecutionFlags)>,
+        mut resources_override: Option<SearchStreamResources<'_>>,
     ) -> SearchResult<()> {
         let mut seq = 0_u64;
-
-        self.emit_search_stream_started(query, stream_id, &mut seq, writer)?;
+        let requested_mode = resources_override.as_ref().map_or_else(
+            || self.requested_search_mode(),
+            |execution| execution.requested_mode,
+        );
+        let mode = degraded_search_mode(self.config.pressure.degradation_override, requested_mode);
+        // Keep Started followed by a typed terminal on refusal for existing
+        // CLI callers. Raw daemon requests complete admission before this call.
+        self.emit_search_stream_started_in_mode(
+            query,
+            stream_id,
+            mode.as_ref().copied().unwrap_or(requested_mode),
+            &mut seq,
+            writer,
+        )?;
         let search_result = async {
             let mut phase_sink = |stage_payload: &SearchPayload| {
                 self.emit_search_stream_payload(stage_payload, stream_id, &mut seq, writer)
             };
-            if let Some((resources, flags)) = resources_override.as_mut() {
-                let mode = degraded_search_mode(
-                    self.config.pressure.degradation_override,
-                    self.requested_search_mode(),
-                )?;
+            if let Some(execution) = resources_override.as_mut() {
                 self.execute_search_phase_artifacts_with_mode_using_resources(
                     cx,
                     query,
                     limit,
-                    mode,
-                    resources,
-                    *flags,
+                    mode?,
+                    execution.resources,
+                    execution.flags,
                     Some(&mut phase_sink),
                 )
                 .await
@@ -8337,7 +8358,7 @@ impl FsfsRuntime {
                     if self.complete_explain_target.is_some()
                         && let Some(last) = artifacts.last_mut()
                     {
-                        self.attach_complete_search_explanations(cx, last, resources)?;
+                        self.attach_complete_search_explanations(cx, last, execution.resources)?;
                     }
                     Ok(artifacts
                         .into_iter()
@@ -10108,13 +10129,27 @@ impl FsfsRuntime {
         runtime_base.join("frankensearch").join("daemon")
     }
 
+    #[cfg(test)]
     fn search_stream_started_event(&self, query: &str, stream_id: &str) -> StreamStartedEvent {
+        self.search_stream_started_event_in_mode(query, stream_id, self.requested_search_mode())
+    }
+
+    fn search_stream_started_event_in_mode(
+        &self,
+        query: &str,
+        stream_id: &str,
+        mode: SearchExecutionMode,
+    ) -> StreamStartedEvent {
         let mut event =
             StreamStartedEvent::new(stream_id, query, self.cli_input.format.to_string());
+        if matches!(mode, SearchExecutionMode::LexicalOnly) {
+            event.skip_reason = Some("lexical_only".to_owned());
+            return event;
+        }
         let Ok(index_root) = self.resolve_status_index_root() else {
             return event;
         };
-        let quality_only = self.cli_input.quality_only;
+        let quality_only = matches!(mode, SearchExecutionMode::QualityOnly);
         let published = if quality_only {
             Self::inspect_published_quality_generation(&index_root)
         } else {
@@ -10128,6 +10163,8 @@ impl FsfsRuntime {
                 event.skip_reason = Some("quality_only".to_owned());
             } else if published.is_hash_control {
                 event.skip_reason = Some("non_semantic_fast_embedder_vector_control".to_owned());
+            } else if matches!(mode, SearchExecutionMode::FastOnly) {
+                event.skip_reason = Some("fast_only".to_owned());
             }
         } else {
             event.skip_reason = Some("no_vector_index".to_owned());
@@ -10142,13 +10179,30 @@ impl FsfsRuntime {
         seq: &mut u64,
         writer: &mut W,
     ) -> SearchResult<()> {
+        self.emit_search_stream_started_in_mode(
+            query,
+            stream_id,
+            self.requested_search_mode(),
+            seq,
+            writer,
+        )
+    }
+
+    fn emit_search_stream_started_in_mode<W: Write>(
+        &self,
+        query: &str,
+        stream_id: &str,
+        mode: SearchExecutionMode,
+        seq: &mut u64,
+        writer: &mut W,
+    ) -> SearchResult<()> {
         let frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
             iso_timestamp_now(),
             "search",
             StreamEvent::<SearchHitPayload>::Started(
-                self.search_stream_started_event(query, stream_id),
+                self.search_stream_started_event_in_mode(query, stream_id, mode),
             ),
         );
         emit_stream_frame(&frame, self.cli_input.format, writer)?;
@@ -22704,15 +22758,20 @@ impl FsfsRuntime {
         F: Future<Output = SearchResult<T>>,
     {
         let budget_ms = self.config.search.quality_timeout_ms;
-        let started = Instant::now();
-        let timed = asupersync::time::timeout(cx.now(), Duration::from_millis(budget_ms), work);
+        let started_at = self.quality_budget_started_at.unwrap_or_else(|| cx.now());
+        let timeout_error = || SearchError::SearchTimeout {
+            elapsed_ms: cx.now().duration_since(started_at) / 1_000_000,
+            budget_ms,
+        };
         with_cancellation(cx, "quality_refinement", async {
-            timed.await.unwrap_or_else(|_| {
-                Err(SearchError::SearchTimeout {
-                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                    budget_ms,
-                })
-            })
+            let now = cx.now();
+            let elapsed = Duration::from_nanos(now.duration_since(started_at));
+            let remaining = Duration::from_millis(budget_ms)
+                .checked_sub(elapsed)
+                .ok_or_else(timeout_error)?;
+            asupersync::time::timeout(now, remaining, work)
+                .await
+                .unwrap_or_else(|_| Err(timeout_error()))
         })
         .await
     }
@@ -34790,7 +34849,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn published_blend_resources(root: &Path) -> SearchExecutionResources {
+    pub(super) fn published_blend_resources(root: &Path) -> SearchExecutionResources {
         let mut resources = disagreeing_blend_resources(root);
         fs::create_dir_all(root.join("vector")).unwrap();
         fs::copy(
@@ -35692,6 +35751,39 @@ mod tests {
                 matches!(result, Err(SearchError::Cancelled { .. })),
                 "even ready success loses to caller cancellation"
             );
+        });
+    }
+
+    #[test]
+    fn quality_deadline_retains_the_admission_budget_and_cancellation_priority() {
+        run_on_runtime_task(|cx| async move {
+            let mut config = FsfsConfig::default();
+            config.search.quality_timeout_ms = 50;
+            let mut runtime = FsfsRuntime::new(config);
+            runtime.quality_budget_started_at = Some(cx.now());
+            // Time consumed before retrieval belongs to the same quality
+            // request. Even immediately ready inference cannot restart it.
+            asupersync::time::sleep(cx.now(), Duration::from_millis(60)).await;
+            let mut polled = false;
+            let result = runtime
+                .with_quality_deadline(&cx, async {
+                    polled = true;
+                    Ok::<_, SearchError>(42)
+                })
+                .await;
+            assert!(matches!(
+                result,
+                Err(SearchError::SearchTimeout { elapsed_ms, budget_ms: 50 })
+                    if elapsed_ms >= 50
+            ));
+            assert!(!polled, "expired work must not begin inference");
+            cx.set_cancel_requested(true);
+            let result = runtime
+                .with_quality_deadline(&cx, async { Ok::<_, SearchError>(42) })
+                .await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert_eq!(runtime.config.search.quality_timeout_ms, 50);
         });
     }
 
@@ -46285,7 +46377,7 @@ mod tests {
                         ..runtime.cli_input.clone()
                     });
                     let fingerprint = resources.generation_fingerprint.clone();
-                    let payloads = expanded_runtime
+                    let outcome = expanded_runtime
                         .execute_expanded_query_variants(
                             &cx,
                             &query,
@@ -46295,8 +46387,15 @@ mod tests {
                             &fingerprint,
                             flags,
                         )
-                        .await
-                        .expect("each variant inherits the original exclusions");
+                        .await;
+                    if quality_only && !super::SEMANTIC_LOADERS_COMPILED {
+                        assert!(matches!(
+                            outcome,
+                            Err(SearchError::EmbedderUnavailable { model, .. }) if model == "quality"
+                        ));
+                        continue;
+                    }
+                    let payloads = outcome.expect("each variant inherits the original exclusions");
                     assert_eq!(payloads.len(), variants.len());
                     for payload in &payloads {
                         assert_eq!(
@@ -48746,13 +48845,14 @@ mod tests {
                 5,
                 stream_id,
                 &mut transport,
-                Some((
-                    &mut resources,
-                    SearchExecutionFlags {
+                Some(super::SearchStreamResources {
+                    resources: &mut resources,
+                    flags: SearchExecutionFlags {
                         include_snippets: false,
                         persist_explain_session: false,
                     },
-                )),
+                    requested_mode: runtime.requested_search_mode(),
+                }),
             ));
 
             let first_poll = poll_fn(|task_cx| Poll::Ready(search.as_mut().poll(task_cx))).await;
@@ -49123,13 +49223,14 @@ mod tests {
                     5,
                     "stream-fast-cancel",
                     &mut transport,
-                    Some((
-                        &mut resources,
-                        SearchExecutionFlags {
+                    Some(super::SearchStreamResources {
+                        resources: &mut resources,
+                        flags: SearchExecutionFlags {
                             include_snippets: false,
                             persist_explain_session: false,
                         },
-                    )),
+                        requested_mode: runtime.requested_search_mode(),
+                    }),
                 )
                 .await;
 
@@ -49214,13 +49315,14 @@ mod tests {
                     5,
                     "stream-quality-cancel",
                     &mut transport,
-                    Some((
-                        &mut resources,
-                        SearchExecutionFlags {
+                    Some(super::SearchStreamResources {
+                        resources: &mut resources,
+                        flags: SearchExecutionFlags {
                             include_snippets: false,
                             persist_explain_session: false,
                         },
-                    )),
+                        requested_mode: runtime.requested_search_mode(),
+                    }),
                 )
                 .await;
 

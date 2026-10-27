@@ -284,11 +284,28 @@ Terminal. A request pins one admitted generation for every phase and bypasses
 the result cache and persistent explanation writes. The next request refreshes
 selection before using either the cache or the search resources.
 
-Streaming currently accepts only `query`, `limit`, `stream`, and optional
-`mode: "full"`, under the daemon startup configuration. Extra filter, model,
-format and protocol options are refused, not silently ignored. Buffered CLI
-forwarding uses its separate versioned request. The legacy v4 request-overlay
-protocol is not supported by this endpoint.
+The optional `mode` selects `full` (the default), `fast_only`, `quality_only`,
+or `lexical_only`; `fast`, `quality`, and `lexical` are accepted aliases.
+For example, a request can search the independently admitted quality tier:
+
+```json
+{"query":"connection pooling","limit":10,"stream":true,"mode":"quality_only"}
+```
+
+Quality-only requests require the selected generation's quality vectors and
+their matching model. Admission failures, a conflicting `fast_only` policy,
+or pressure settings that disable quality search return an error before the
+first stream frame. Lexical-only requests do not load semantic models, and
+fast-only requests do not run quality refinement. Started metadata identifies
+the selected retrieval mode and its admitted vector producer, when present.
+
+Along with `query`, `limit`, `stream`, and `mode`, a request may override
+`filter`, `rerank`, `rerank_timeout_ms`, `quality_weight`,
+`quality_timeout_ms`, `rrf_k`, and `fast_only`. These fields use the same
+validation and policy as buffered requests; omitted tuning values inherit the
+daemon startup configuration. Model, format, and unknown protocol options are
+refused. Buffered CLI forwarding uses its separate versioned request. The
+legacy v4 request-overlay protocol is not supported by this endpoint.
 
 A refusal before any stream bytes are emitted uses the existing buffered
 `ok: false` error response. Once streaming starts, an output failure or outer
