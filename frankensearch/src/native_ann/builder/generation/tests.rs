@@ -15,6 +15,168 @@ use crate::{IndexableDocument, SearchError};
 const BUDGET: usize = 16 * 1024 * 1024;
 const SOURCE: CommitRange = CommitRange { low: 4, high: 9 };
 
+#[test]
+fn progressive_generation_retains_independent_tiers_and_one_complete_source_cohort() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        // The second case deliberately has identical explicit providers and
+        // identical vector images: role-qualified metadata paths remain unique.
+        for (quality_name, quality_dimension) in [("quality", 3), ("fast", 2)] {
+            let directory = tempfile::tempdir().unwrap();
+            let work = directory.path().join("work");
+            let fast = Arc::new(Provider::new("fast", 2, Reply::Correct));
+            let quality = Arc::new(Provider::new(
+                quality_name,
+                quality_dimension,
+                Reply::Correct,
+            ));
+            let built = builder(&work, &fast)
+                .with_quality_embedder(quality)
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                .unwrap()
+                .with_batch_size(2)
+                .unwrap()
+                .build_progressive_generation(&cx, SOURCE, BUDGET)
+                .await
+                .unwrap();
+            let candidate = candidate(&built);
+            built.validate_candidate(&cx, &candidate).unwrap();
+            let mut scoped_ids = Vec::new();
+            built
+                .prepare_scope(&cx, &candidate, BUDGET, |document| {
+                    scoped_ids.push(document.id.clone());
+                    Ok(document.id != "a")
+                })
+                .unwrap();
+            assert_eq!(scoped_ids.len(), 5);
+            assert_eq!(
+                scoped_ids
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
+                5
+            );
+            assert!(
+                built
+                    .prepare_scope(&cx, &candidate, 0, |_| {
+                        panic!("the complete two-tier source export must fit before predicates run")
+                    })
+                    .is_err()
+            );
+            let quality_binding = built.quality_binding().unwrap();
+            assert_eq!(
+                quality_binding.dimension(),
+                usize::try_from(quality_dimension).unwrap()
+            );
+            assert_eq!(quality_binding.generation(), built.binding().generation());
+            assert_eq!(built.metadata().total_documents, 5);
+            assert_eq!(built.metadata().embedders.len(), 2);
+            assert_eq!(built.metadata().vector_artifacts.len(), 2);
+            assert_eq!(
+                built.metadata().vector_artifacts[0].embedder_tier,
+                EmbedderTierTag::Fast
+            );
+            assert_eq!(
+                built.metadata().vector_artifacts[1].embedder_tier,
+                EmbedderTierTag::Quality
+            );
+            assert_ne!(
+                built.metadata().vector_artifacts[0].path,
+                built.metadata().vector_artifacts[1].path
+            );
+            let cohort = ExactVectorCohortV1::admit(
+                &cx,
+                built
+                    .component_bytes(GenerationComponentRole::Vector)
+                    .unwrap(),
+                built.binding(),
+                quality_binding,
+                SourceCheckpointV1::derive(&SOURCE),
+                BUDGET,
+            )
+            .unwrap();
+            assert_eq!(cohort.receipt(), built.components.vector());
+            assert_eq!(cohort.fast_receipt().live_document_count, 5);
+            assert_eq!(cohort.quality_receipt().live_document_count, 5);
+            assert!(
+                built
+                    .metadata()
+                    .activation_invariants
+                    .iter()
+                    .any(|invariant| matches!(
+                        invariant.kind,
+                        InvariantKind::VectorCountConsistency { expected_total: 10 }
+                    ))
+            );
+            assert!(
+                crate::native_ann::generation::admit_components(
+                    &cx,
+                    candidate.manifest(),
+                    built.binding(),
+                    DEFAULT_SCHEMA,
+                    QuillConfig::default(),
+                    [
+                        built
+                            .component_bytes(GenerationComponentRole::Vector)
+                            .unwrap(),
+                        built
+                            .component_bytes(GenerationComponentRole::Lexical)
+                            .unwrap(),
+                        built
+                            .component_bytes(GenerationComponentRole::Metadata)
+                            .unwrap()
+                    ],
+                    None,
+                    BUDGET,
+                )
+                .is_err(),
+                "single-tier admission cannot discard the quality owner"
+            );
+            std::fs::rename(&work, directory.path().join("relocated")).unwrap();
+            std::fs::create_dir(&work).unwrap();
+            std::fs::write(work.join("fast.fsvi"), b"unrelated future generation").unwrap();
+            built.validate_candidate(&cx, &candidate).unwrap();
+        }
+    });
+}
+
+#[test]
+fn progressive_generation_requires_two_exact_plans_before_inference_or_io() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for plan in 0..3 {
+            let directory = tempfile::tempdir().unwrap();
+            let work = directory.path().join("absent");
+            let fast = Arc::new(Provider::new("fast", 2, Reply::Pending));
+            let mut configured = builder(&work, &fast);
+            if plan != 0 {
+                configured = configured
+                    .with_quality_embedder(Arc::new(Provider::new("quality", 3, Reply::Pending)))
+                    .unwrap();
+                let ann = NativeBuildRetrieval::Hnsw {
+                    params: HnswParams::default(),
+                    seed: 5,
+                };
+                configured = if plan == 1 {
+                    configured.with_fast_storage(NativeBuildPrecision::F32, ann)
+                } else {
+                    configured
+                        .with_quality_storage(NativeBuildPrecision::F32, ann)
+                        .unwrap()
+                };
+            }
+            let mut future = Box::pin(configured.build_progressive_generation(&cx, SOURCE, BUDGET));
+            assert!(matches!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(SearchError::InvalidConfig { .. }))
+            ));
+            assert!(!work.exists());
+        }
+    });
+}
+
 fn builder(path: &std::path::Path, provider: &Arc<Provider>) -> NativeIndexBuilder {
     NativeIndexBuilder::new(path, generation(), provider.clone())
         .unwrap()

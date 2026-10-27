@@ -202,6 +202,7 @@ impl NativeIndexUpdate {
 
 impl NativeIndexUpdate {
     #[cfg(feature = "quill")]
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::native_ann) fn from_authority(
         cx: &Cx,
         directory: impl AsRef<Path>,
@@ -210,6 +211,7 @@ impl NativeIndexUpdate {
         snapshot: &NativeGenerationSnapshot,
         max_source_bytes: usize,
         index: Arc<NativeAnnIndex>,
+        quality: Option<(Arc<dyn crate::Embedder>, Arc<NativeAnnIndex>)>,
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.update.authority")?;
         // An explicitly reopened predecessor carries the newer selection's
@@ -260,6 +262,50 @@ impl NativeIndexUpdate {
             ));
         }
         index.admit_identity(&builder.fast.identity)?;
+        let quality = if let Some((provider, index)) = quality {
+            if index.owner_witness().generation != predecessor {
+                return Err(invalid(
+                    "update.inventory",
+                    "generation",
+                    "quality belongs to another generation",
+                ));
+            }
+            let precision = match index.owner_witness().quantization {
+                frankensearch_index::Quantization::F32 => NativeBuildPrecision::F32,
+                frankensearch_index::Quantization::F16 => NativeBuildPrecision::F16,
+            };
+            builder = builder
+                .with_quality_embedder(provider)?
+                .with_quality_storage(precision, snapshot.retrieval_configuration())?;
+            let plan = builder.quality.as_ref().ok_or_else(|| {
+                invalid(
+                    "update.producer",
+                    "missing",
+                    "an independently supplied quality provider is required",
+                )
+            })?;
+            let binding = plan.binding(&predecessor)?;
+            if snapshot.metadata().embedders.get("quality") != Some(binding.frozen_identity()) {
+                return Err(invalid(
+                    "update.producer",
+                    "changed",
+                    "incremental reuse requires the original complete quality producer and storage identity",
+                ));
+            }
+            index.admit_identity(&plan.identity)?;
+            Some((index, plan.identity.fingerprint(), precision))
+        } else {
+            None
+        };
+        if quality.is_some()
+            != (snapshot.topology() == crate::native_ann::NativeGenerationTopology::FullProgressive)
+        {
+            return Err(invalid(
+                "update.inventory",
+                "topology",
+                "retained update providers must match the complete selected topology",
+            ));
+        }
         let mut documents = snapshot.source_documents(cx, max_source_bytes)?;
         documents.sort_by(|left, right| left.id.cmp(&right.id));
         let fast = ReuseTier::from_owner(
@@ -269,15 +315,22 @@ impl NativeIndexUpdate {
             builder.fast.identity.fingerprint(),
             precision,
         )?;
+        let quality = quality
+            .map(|(index, fingerprint, precision)| {
+                ReuseTier::from_owner(cx, index, &documents, fingerprint, precision)
+            })
+            .transpose()?;
+        let progressive = quality.is_some();
         builder.reuse = Some(Arc::new(ReuseSource {
             partitions: vec![ReusePartition {
                 documents: documents.into(),
                 fast,
-                quality: None,
+                quality,
             }],
             authority: Some(AuthorityReuse {
-                _snapshot: Arc::clone(snapshot.retained_snapshot()),
+                snapshot: Arc::clone(snapshot.retained_snapshot()),
                 tier,
+                progressive,
                 source: snapshot.metadata().commit_range.clone(),
             }),
         }));
@@ -414,6 +467,7 @@ impl NativeIndexUpdate {
             .as_ref()
             .and_then(|reuse| reuse.authority.as_ref())
             && (tier != authority.tier
+                || authority.progressive
                 || source.low < authority.source.low
                 || source.high < authority.source.high)
         {
@@ -431,13 +485,63 @@ impl NativeIndexUpdate {
             .reuse
             .as_ref()
             .and_then(|reuse| reuse.authority.as_ref())
-            .map(|authority| Arc::clone(&authority._snapshot));
+            .map(|authority| Arc::clone(&authority.snapshot));
         let result =
             Box::pin(
                 self.prepare(cx)?
                     .build_exact_generation(cx, tier, source, max_image_bytes),
             )
             .await;
+        drop(authority_pin);
+        result
+    }
+
+    /// Build a complete fast-and-quality successor using per-tier retained reuse.
+    ///
+    /// Both original providers and both exact storage plans remain explicit.
+    /// Changed content is embedded independently in each tier, while unchanged
+    /// vectors are copied only from their matching admitted owner. The original
+    /// authority pin survives until all new components pass joint admission.
+    /// This constructs a candidate and never publishes or modifies a predecessor.
+    ///
+    /// # Errors
+    /// Refuses a topology change, backward source boundaries, empty output,
+    /// unsupported ANN plans, identity drift, budget exhaustion or cancellation.
+    #[cfg(feature = "quill")]
+    pub async fn build_progressive_generation(
+        self,
+        cx: &Cx,
+        source: CommitRange,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.update.progressive_generation")?;
+        if let Some(authority) = self
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            && (!authority.progressive
+                || source.low < authority.source.low
+                || source.high < authority.source.high)
+        {
+            return Err(invalid(
+                "update.authority_contract",
+                "changed",
+                "authority updates must preserve both tiers and advance source boundaries monotonically",
+            ));
+        }
+        let authority_pin = self
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            .map(|authority| Arc::clone(&authority.snapshot));
+        let result = Box::pin(self.prepare(cx)?.build_progressive_generation(
+            cx,
+            source,
+            max_image_bytes,
+        ))
+        .await;
         drop(authority_pin);
         result
     }
@@ -590,8 +694,9 @@ pub(super) struct ReuseSource {
 struct AuthorityReuse {
     // Keep the original root/closure/reader pin even when only this prepared
     // update remains alive, including while a blocking finalizer owns it.
-    _snapshot: Arc<OpenedGenerationSnapshotV1>,
+    snapshot: Arc<OpenedGenerationSnapshotV1>,
     tier: EmbedderTierTag,
+    progressive: bool,
     source: CommitRange,
 }
 
@@ -1162,6 +1267,95 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    #[cfg(feature = "quill")]
+    #[test]
+    fn incremental_native_sources_build_a_complete_two_tier_authority_candidate() {
+        use frankensearch_core::generation::{
+            GenerationAuthorityActionV1, GenerationComponentRole, SourceCheckpointV1,
+        };
+        use frankensearch_index::vector_cohort::ExactVectorCohortV1;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let fast = Provider::new("update-fast", 2);
+            let quality = Provider::new("update-quality", 3);
+            let old = builder(&directory.path().join("old"), &fast, &quality)
+                .with_fast_storage(NativeBuildPrecision::F16, NativeBuildRetrieval::Exact)
+                .with_quality_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                .unwrap()
+                .build(&cx)
+                .await
+                .unwrap();
+            let old_fast = std::fs::read(old.fast.vector_path()).unwrap();
+            let old_quality = std::fs::read(old.quality().unwrap().vector_path()).unwrap();
+            let source = CommitRange { low: 3, high: 9 };
+            let budget = 16 * 1024 * 1024;
+            let built = old
+                .begin_update(&cx, directory.path().join("next"), generation(2))
+                .unwrap()
+                .delete_document("x")
+                .upsert_document(
+                    IndexableDocument::new("a", "fractional").with_metadata("version", "updated"),
+                )
+                .upsert_document(IndexableDocument::new("b", "horizontal"))
+                .upsert_document(IndexableDocument::new("inserted", "vertical"))
+                .build_progressive_generation(&cx, source.clone(), budget)
+                .await
+                .unwrap();
+            assert_eq!(fast.submitted.load(Ordering::SeqCst), 7);
+            assert_eq!(quality.submitted.load(Ordering::SeqCst), 7);
+            assert_eq!(std::fs::read(old.fast.vector_path()).unwrap(), old_fast);
+            assert_eq!(
+                std::fs::read(old.quality().unwrap().vector_path()).unwrap(),
+                old_quality
+            );
+            let candidate = built
+                .candidate(
+                    [0xb1; 16],
+                    None,
+                    GenerationAuthorityActionV1::Activate,
+                    [0xb2; 32],
+                )
+                .unwrap();
+            built.validate_candidate(&cx, &candidate).unwrap();
+            let cohort = ExactVectorCohortV1::admit(
+                &cx,
+                built
+                    .component_bytes(GenerationComponentRole::Vector)
+                    .unwrap(),
+                built.binding(),
+                built.quality_binding().unwrap(),
+                SourceCheckpointV1::derive(&source),
+                budget,
+            )
+            .unwrap();
+            assert_eq!(cohort.fast().dimension(), 2);
+            assert_eq!(cohort.quality().dimension(), 3);
+            assert_eq!(cohort.fast().live_count(), 5);
+            assert_eq!(cohort.quality().live_count(), 5);
+            for (previous, next) in [
+                (&old.fast.index.owner, cohort.fast()),
+                (&old.quality().unwrap().index.owner, cohort.quality()),
+            ] {
+                let row = |owner: &ValidatedFsviBytes, id: &str| {
+                    (0..owner.record_count())
+                        .find(|physical| owner.row(*physical).unwrap().doc_id() == id)
+                        .unwrap()
+                };
+                assert_eq!(
+                    previous.vector_at_f32(row(previous, "a")).unwrap(),
+                    next.vector_at_f32(row(next, "a")).unwrap()
+                );
+                assert!(
+                    (0..next.record_count())
+                        .all(|physical| next.row(physical).unwrap().doc_id() != "x")
+                );
+                assert_eq!(next.vector_at_f32(row(next, "b")).unwrap()[0], 1.0);
+            }
+            assert_eq!(built.metadata().total_documents, 5);
+            assert_eq!(built.metadata().commit_range, source);
         });
     }
 

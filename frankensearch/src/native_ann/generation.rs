@@ -25,6 +25,7 @@ use frankensearch_index::generation_root::generation_reader::{
 use frankensearch_index::native_hnsw::{
     HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
 };
+use frankensearch_index::vector_cohort::ExactVectorCohortV1;
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{
     DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillIndexError, QuillSnapshotIndex,
@@ -49,7 +50,19 @@ mod tests;
 // byte receipt has exactly the existing ann_component_receipt semantics.
 pub(super) const NATIVE_ANN_RECEIPT_KEY: &str = "native_hnsw_receipt_v2";
 
-/// Query-capable readers for one fixed-authority, single-tier native generation.
+/// Independently admitted vector owners stored in a complete authority generation.
+/// This describes stored shape, not semantic readiness or a request's chosen mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeGenerationTopology {
+    /// One explicitly selected fast tier.
+    FastOnly,
+    /// One explicitly selected quality tier.
+    QualityOnly,
+    /// Complete independently identified fast and quality tiers.
+    FullProgressive,
+}
+
+/// Query-capable readers for one fixed-authority native generation.
 ///
 /// The authority-selected vector, lexical and metadata images are parsed and
 /// joined before the handle becomes usable. The full FSVI generation and frozen
@@ -61,7 +74,9 @@ pub(super) const NATIVE_ANN_RECEIPT_KEY: &str = "native_hnsw_receipt_v2";
 /// (fast or quality), with exact search or an authenticated native HNSW component.
 /// A declared ANN requires its raw graph image and full native receipt in the
 /// selected metadata; a missing or invalid accelerator is never replaced by
-/// exact search. Multi-tier/sharded descriptors remain unsupported. Metadata
+/// exact search. Complete fast-plus-quality generations use two independently
+/// admitted exact owners in one packed Vector component. Partial/sharded and
+/// two-tier ANN descriptors remain unsupported. Metadata
 /// paths are descriptive names, never paths to open. Vector artifact
 /// counts describe physical rows, including tombstones; the common document set
 /// and metadata total count describe live documents. The existing metadata
@@ -82,6 +97,7 @@ pub struct NativeGenerationSnapshot {
 
 pub(super) struct CompositeReaders {
     vector: Arc<NativeAnnIndex>,
+    quality: Option<Arc<NativeAnnIndex>>,
     lexical: QuillSnapshotIndex,
     metadata: GenerationManifest,
     tier: EmbedderTierTag,
@@ -144,6 +160,52 @@ impl NativeGenerationSnapshot {
         Ok(Self { authority, readers })
     }
 
+    /// Admit both independently selected exact tiers and their common Quill cohort.
+    ///
+    /// Both bindings come from the caller's trusted selection. Their complete
+    /// document coverage, source checkpoint and artifact generation must agree;
+    /// dimensions and producers may differ. The same aggregate image budget,
+    /// synchronous cancellation and retained-owner rules as [`Self::admit_exact`]
+    /// apply. Neither a missing tier nor an ANN is silently substituted.
+    ///
+    /// # Errors
+    /// Refuses incomplete topology, identity/source/coverage disagreement,
+    /// malformed or oversized components and cancellation before serving.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_progressive(
+        cx: &Cx,
+        authority: Arc<OpenedGenerationSnapshotV1>,
+        expected_fast: &FsviV2IdentityBinding,
+        expected_quality: &FsviV2IdentityBinding,
+        schema: SchemaDescriptor,
+        config: QuillConfig,
+        max_image_bytes: usize,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.generation.progressive_admit")?;
+        let component = |role| {
+            authority
+                .closure()
+                .bytes(role)
+                .ok_or_else(|| refused("component", "missing"))
+        };
+        let readers = admit_progressive_components(
+            cx,
+            authority.manifest(),
+            expected_fast,
+            expected_quality,
+            schema,
+            config,
+            [
+                component(GenerationComponentRole::Vector)?,
+                component(GenerationComponentRole::Lexical)?,
+                component(GenerationComponentRole::Metadata)?,
+            ],
+            max_image_bytes,
+        )?;
+        checkpoint(cx, "native_ann.generation.admitted")?;
+        Ok(Self { authority, readers })
+    }
+
     /// The exact authority retained by this reader, including rollback sequence.
     #[must_use]
     pub fn authority(&self) -> AuthorityRefV1 {
@@ -156,10 +218,17 @@ impl NativeGenerationSnapshot {
         &self.authority
     }
 
-    /// The single vector tier independently declared by the selected metadata.
+    /// The primary vector tier declared by the selected metadata.
+    /// Complete progressive generations have a fast primary and a separate quality owner.
     #[must_use]
     pub const fn tier(&self) -> EmbedderTierTag {
         self.readers.tier
+    }
+
+    /// Stored independently admitted tier topology, without running a query.
+    #[must_use]
+    pub const fn topology(&self) -> NativeGenerationTopology {
+        self.readers.topology()
     }
 
     /// The actual retrieval mode of this handle.
@@ -305,6 +374,9 @@ impl NativeGenerationSnapshot {
         provider: Arc<dyn Embedder>,
         max_source_bytes: usize,
     ) -> SearchResult<NativeIndexUpdate> {
+        if self.readers.quality.is_some() {
+            return Err(refused("update", "both-providers-required"));
+        }
         NativeIndexUpdate::from_authority(
             cx,
             directory,
@@ -313,6 +385,42 @@ impl NativeGenerationSnapshot {
             self,
             max_source_bytes,
             Arc::clone(&self.readers.vector),
+            None,
+        )
+    }
+
+    /// Prepare complete two-tier edits with independent retained-vector reuse.
+    ///
+    /// Both providers are admitted before source export or inference. Each tier
+    /// reuses only its own unchanged document vectors; the original authority
+    /// and both owners remain pinned through successor construction. Source
+    /// export has [`Self::source_documents`]' payload budget. Finish with
+    /// [`NativeIndexUpdate::build_progressive_generation`].
+    ///
+    /// # Errors
+    /// Refuses an absent tier, non-newer generation, changed provider, unsupported
+    /// storage, inconsistent retained sources, cancellation or source-budget exhaustion.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_progressive_update(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        fast_provider: Arc<dyn Embedder>,
+        quality_provider: Arc<dyn Embedder>,
+        max_source_bytes: usize,
+    ) -> SearchResult<NativeIndexUpdate> {
+        checkpoint(cx, "native_ann.generation.progressive_update")?;
+        let quality = self.readers.full_quality()?;
+        NativeIndexUpdate::from_authority(
+            cx,
+            directory,
+            generation,
+            fast_provider,
+            self,
+            max_source_bytes,
+            Arc::clone(&self.readers.vector),
+            Some((quality_provider, Arc::clone(quality))),
         )
     }
 
@@ -491,7 +599,9 @@ impl NativeGenerationSnapshot {
     ///
     /// The configured producer is checked before inference and its bound output
     /// is checked again before scoring. Quality-only generations run the quality
-    /// lane directly; they do not require or invent a fast tier.
+    /// lane directly; they do not require or invent a fast tier. In a complete
+    /// progressive generation this explicitly queries the primary fast tier;
+    /// use [`Self::search_refined_text`] to retrieve both tiers.
     ///
     /// # Errors
     ///
@@ -505,6 +615,60 @@ impl NativeGenerationSnapshot {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         self.readers.search_text(cx, embedder, text, k).await
+    }
+
+    /// Retrieve and hydrate quality results without invoking the fast provider.
+    ///
+    /// # Errors
+    /// Refuses missing quality, changed producer, invalid embeddings or cancellation.
+    pub async fn search_quality_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.readers
+            .search_quality_text(cx, embedder, text, k)
+            .await
+    }
+
+    /// Retrieve each tier independently and fuse their candidate union.
+    /// Quality may promote a document absent from the fast candidate window.
+    ///
+    /// # Errors
+    /// Requires both admitted owners and providers, including for zero results;
+    /// propagates inference, retrieval, hydration and cancellation errors.
+    pub async fn search_refined_text(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.readers
+            .search_refined_text(cx, fast, quality, text, k)
+            .await
+    }
+
+    /// Lazily emit Initial and Refined results from this same retained generation.
+    /// Both provider identities are admitted before inference; quality work starts
+    /// only when the caller requests refinement. Dropping the stream preserves
+    /// the original immutable readers and starts no detached work.
+    ///
+    /// # Errors
+    /// Refuses absent tiers, producer disagreement, invalid budgets and cancellation.
+    pub fn search_progressive_with_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.readers
+            .search_progressive_with_quality(cx, fast, quality, text, k)
     }
 
     // Only the closed source-scope adapter may wrap this immutable lexical
@@ -532,6 +696,58 @@ impl NativeGenerationSnapshot {
         self.readers
             .vector
             .search_hybrid_progressive(cx, embedder, None, lexical, text, k)?
+            .with_allowed_documents_arc(allowed)
+    }
+
+    pub(in crate::native_ann) fn scoped_quality_progressive<'a>(
+        &'a self,
+        cx: &'a Cx,
+        embedder: &'a dyn Embedder,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation.scoped_quality_search")?;
+        let quality = if self.readers.tier == EmbedderTierTag::Quality {
+            &self.readers.vector
+        } else {
+            self.readers.full_quality()?
+        };
+        quality
+            .search_hybrid_progressive(
+                cx,
+                embedder,
+                None,
+                lexical,
+                text,
+                self.readers.bounded_limit(k).min(allowed.len()),
+            )?
+            .with_allowed_documents_arc(allowed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn scoped_progressive_with_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        lexical: &'a dyn LexicalRead,
+        text: &'a str,
+        k: usize,
+        allowed: Arc<BTreeSet<String>>,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation.scoped_progressive_search")?;
+        self.readers
+            .vector
+            .search_hybrid_progressive(
+                cx,
+                fast,
+                Some((self.readers.full_quality()?.as_ref(), quality)),
+                lexical,
+                text,
+                self.readers.bounded_limit(k).min(allowed.len()),
+            )?
             .with_allowed_documents_arc(allowed)
     }
 }
@@ -562,6 +778,26 @@ fn same_anchor_security_identity(
 }
 
 impl CompositeReaders {
+    const fn topology(&self) -> NativeGenerationTopology {
+        if self.quality.is_some() {
+            NativeGenerationTopology::FullProgressive
+        } else if matches!(self.tier, EmbedderTierTag::Quality) {
+            NativeGenerationTopology::QualityOnly
+        } else {
+            NativeGenerationTopology::FastOnly
+        }
+    }
+
+    fn full_quality(&self) -> SearchResult<&Arc<NativeAnnIndex>> {
+        self.quality
+            .as_ref()
+            .ok_or_else(|| refused("topology", "complete-quality-required"))
+    }
+
+    fn bounded_limit(&self, requested: usize) -> usize {
+        requested.min(usize::try_from(self.vector.owner_witness().live_count).unwrap_or(usize::MAX))
+    }
+
     fn source_context(&self, cx: &Cx) -> SearchResult<(Arc<KeeperSnapshot>, usize, [u16; 4])> {
         checkpoint(cx, "native_ann.generation.source")?;
         let snapshot = self
@@ -734,9 +970,7 @@ impl CompositeReaders {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.search")?;
-        let live_count =
-            usize::try_from(self.vector.owner_witness().live_count).unwrap_or(usize::MAX);
-        let k = k.min(live_count);
+        let k = self.bounded_limit(k);
         match self.tier {
             EmbedderTierTag::Fast => {
                 self.vector
@@ -749,6 +983,64 @@ impl CompositeReaders {
                     .await
             }
         }
+    }
+
+    async fn search_quality_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.generation.quality_search")?;
+        let quality = if self.tier == EmbedderTierTag::Quality {
+            &self.vector
+        } else {
+            self.full_quality()?
+        };
+        quality
+            .search_hybrid_quality_text(cx, embedder, &self.lexical, text, self.bounded_limit(k))
+            .await
+    }
+
+    async fn search_refined_text(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.generation.refined_search")?;
+        self.vector
+            .search_hybrid_refined_text(
+                cx,
+                fast,
+                (self.full_quality()?.as_ref(), quality),
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+            )
+            .await
+    }
+
+    fn search_progressive_with_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        checkpoint(cx, "native_ann.generation.progressive_search")?;
+        self.vector.search_hybrid_progressive(
+            cx,
+            fast,
+            Some((self.full_quality()?.as_ref(), quality)),
+            &self.lexical,
+            text,
+            self.bounded_limit(k),
+        )
     }
 }
 
@@ -763,12 +1055,66 @@ pub(super) fn admit_components(
     ann_image: Option<Arc<[u8]>>,
     max_image_bytes: usize,
 ) -> SearchResult<CompositeReaders> {
+    admit_components_impl(
+        cx,
+        activation,
+        expected_vector,
+        None,
+        schema,
+        config,
+        images,
+        ann_image,
+        max_image_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn admit_progressive_components(
+    cx: &Cx,
+    activation: &ActivationManifest,
+    expected_fast: &FsviV2IdentityBinding,
+    expected_quality: &FsviV2IdentityBinding,
+    schema: SchemaDescriptor,
+    config: QuillConfig,
+    images: [Arc<[u8]>; 3],
+    max_image_bytes: usize,
+) -> SearchResult<CompositeReaders> {
+    admit_components_impl(
+        cx,
+        activation,
+        expected_fast,
+        Some(expected_quality),
+        schema,
+        config,
+        images,
+        None,
+        max_image_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_components_impl(
+    cx: &Cx,
+    activation: &ActivationManifest,
+    expected_vector: &FsviV2IdentityBinding,
+    expected_quality: Option<&FsviV2IdentityBinding>,
+    schema: SchemaDescriptor,
+    config: QuillConfig,
+    images: [Arc<[u8]>; 3],
+    ann_image: Option<Arc<[u8]>>,
+    max_image_bytes: usize,
+) -> SearchResult<CompositeReaders> {
     checkpoint(cx, "native_ann.generation.components")?;
     let declared = activation.components();
     if declared.ann.is_some() != ann_image.is_some() {
         return Err(refused("ann", "component-presence-mismatch"));
     }
-    if activation.generation() != expected_vector.generation() {
+    if expected_quality.is_some() && declared.ann.is_some() {
+        return Err(refused("ann", "progressive-ann-unsupported"));
+    }
+    if activation.generation() != expected_vector.generation()
+        || expected_quality.is_some_and(|quality| quality.generation() != activation.generation())
+    {
         return Err(refused("generation", "binding-mismatch"));
     }
     let image_bytes = images
@@ -803,9 +1149,10 @@ pub(super) fn admit_components(
     checkpoint(cx, "native_ann.generation.metadata")?;
     let metadata: GenerationManifest =
         serde_json::from_slice(&metadata_bytes).map_err(|_| refused("metadata", "invalid-json"))?;
-    if metadata.vector_artifacts.len() != 1
+    let tier_count = if expected_quality.is_some() { 2 } else { 1 };
+    if metadata.vector_artifacts.len() != tier_count
         || metadata.lexical_artifacts.len() != 1
-        || metadata.embedders.len() != 1
+        || metadata.embedders.len() != tier_count
         || !metadata.repair_descriptors.is_empty()
     {
         return Err(refused("metadata", "unsupported-component-shape"));
@@ -826,10 +1173,26 @@ pub(super) fn admit_components(
         return Err(refused("checkpoint", "source-mismatch"));
     }
     checkpoint(cx, "native_ann.generation.vector")?;
-    let owner = Arc::new(
-        ValidatedFsviBytes::from_arc(vector_bytes, expected_vector)
-            .map_err(|_| refused("vector", "admission-failed"))?,
-    );
+    let cohort = expected_quality
+        .map(|quality| {
+            ExactVectorCohortV1::admit(
+                cx,
+                Arc::clone(&vector_bytes),
+                expected_vector,
+                quality,
+                checkpoint_value,
+                max_image_bytes,
+            )
+        })
+        .transpose()?;
+    let owner = if let Some(cohort) = &cohort {
+        Arc::clone(cohort.fast())
+    } else {
+        Arc::new(
+            ValidatedFsviBytes::from_arc(vector_bytes, expected_vector)
+                .map_err(|_| refused("vector", "admission-failed"))?,
+        )
+    };
     let witness = owner.witness();
     let mut identifiers = Vec::new();
     for row in 0..owner.record_count() {
@@ -839,12 +1202,16 @@ pub(super) fn admit_components(
             identifiers.push(row.doc_id().to_owned());
         }
     }
-    let vector_receipt = vector_component_receipt(
+    let primary_receipt = vector_component_receipt(
         witness,
         identifiers.iter().map(String::as_str),
         checkpoint_value,
     )
     .map_err(|_| refused("vector", "invalid-document-set"))?;
+    let vector_receipt = cohort.as_ref().map_or_else(
+        || primary_receipt.clone(),
+        |cohort| cohort.receipt().clone(),
+    );
     if vector_receipt.bytes != declared.vector
         || vector_receipt.docset_digest != activation.document_set_sha256()
     {
@@ -876,8 +1243,13 @@ pub(super) fn admit_components(
         &metadata,
         expected_vector,
         activation,
-        owner.record_count(),
-        witness.live_count,
+        &owner,
+        &primary_receipt,
+        expected_quality
+            .zip(cohort.as_ref())
+            .map(|(binding, cohort)| {
+                (binding, cohort.quality().as_ref(), cohort.quality_receipt())
+            }),
     )?;
     let lexical_receipt = ExactComponentReceiptV1 {
         role: GenerationComponentRole::Lexical,
@@ -941,8 +1313,13 @@ pub(super) fn admit_components(
     checkpoint(cx, "native_ann.generation.ready")?;
     let lexical = lexical_result.map_err(|_| refused("lexical", "invalid-search-configuration"))?;
     let tier = metadata.vector_artifacts[0].embedder_tier;
+    let quality = cohort
+        .as_ref()
+        .map(|cohort| NativeAnnIndex::exact(cx, Arc::clone(cohort.quality())).map(Arc::new))
+        .transpose()?;
     Ok(CompositeReaders {
         vector: Arc::new(vector),
+        quality,
         lexical,
         metadata,
         tier,
@@ -955,33 +1332,62 @@ fn validate_artifact_metadata(
     metadata: &GenerationManifest,
     binding: &FsviV2IdentityBinding,
     activation: &ActivationManifest,
-    record_count: usize,
-    live_count: u64,
+    owner: &ValidatedFsviBytes,
+    vector_receipt: &ExactComponentReceiptV1,
+    quality: Option<(
+        &FsviV2IdentityBinding,
+        &ValidatedFsviBytes,
+        &ExactComponentReceiptV1,
+    )>,
 ) -> SearchResult<()> {
     let declared = activation.components();
-    let vector = &metadata.vector_artifacts[0];
     let lexical = &metadata.lexical_artifacts[0];
-    let tier = match vector.embedder_tier {
-        EmbedderTierTag::Fast => "fast",
-        EmbedderTierTag::Quality => "quality",
-    };
-    if metadata.embedders.get(tier) != Some(binding.frozen_identity())
-        || usize::try_from(vector.dimension).ok() != Some(binding.dimension())
-        || usize::try_from(vector.vector_count).ok() != Some(record_count)
-        || vector.size_bytes != declared.vector.byte_len
-        || vector.checksum != lower_hex(&declared.vector.sha256)
-        || lexical.document_count != live_count
+    let live_count = owner.witness().live_count;
+    if lexical.document_count != live_count
         || lexical.size_bytes != declared.lexical.byte_len
         || lexical.checksum != lower_hex(&declared.lexical.sha256)
         || metadata.total_documents != live_count
     {
         return Err(refused("metadata", "artifact-binding-mismatch"));
     }
+    let mut record_count = 0u64;
+    for (position, (binding, owner, receipt)) in std::iter::once((binding, owner, vector_receipt))
+        .chain(quality)
+        .enumerate()
+    {
+        let vector = &metadata.vector_artifacts[position];
+        let tier = match vector.embedder_tier {
+            EmbedderTierTag::Fast => "fast",
+            EmbedderTierTag::Quality => "quality",
+        };
+        if quality.is_some()
+            && (vector.embedder_tier
+                != if position == 0 {
+                    EmbedderTierTag::Fast
+                } else {
+                    EmbedderTierTag::Quality
+                }
+                || vector.path != format!("{tier}/{}.vector", lower_hex(&receipt.bytes.sha256)))
+        {
+            return Err(refused("metadata", "progressive-tier-order"));
+        }
+        if metadata.embedders.get(tier) != Some(binding.frozen_identity())
+            || usize::try_from(vector.dimension).ok() != Some(binding.dimension())
+            || vector.vector_count != owner.witness().record_count
+            || vector.size_bytes != receipt.bytes.byte_len
+            || vector.checksum != lower_hex(&receipt.bytes.sha256)
+        {
+            return Err(refused("metadata", "artifact-binding-mismatch"));
+        }
+        record_count = record_count
+            .checked_add(owner.witness().record_count)
+            .ok_or_else(|| refused("metadata", "record-count-overflow"))?;
+    }
     for invariant in &metadata.activation_invariants {
         match &invariant.kind {
             InvariantKind::AllArtifactsVerified | InvariantKind::EmbedderRevisionMatch => {}
             InvariantKind::VectorCountConsistency { expected_total }
-                if usize::try_from(*expected_total).ok() == Some(record_count) => {}
+                if *expected_total == record_count => {}
             _ => return Err(refused("metadata", "unsupported-activation-predicate")),
         }
     }

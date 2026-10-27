@@ -327,6 +327,90 @@ impl NativeScopedGenerationSnapshot {
         }
         Ok(results)
     }
+
+    /// Search only the admitted quality owner and lexical reader in this scope.
+    ///
+    /// Both quality-only and complete progressive generations are supported.
+    /// The fast provider is never required or invoked. Scope membership applies
+    /// before vector selection, lexical fusion and winner hydration; returned
+    /// physical indices belong to the quality owner.
+    ///
+    /// # Errors
+    /// Refuses absent quality, producer disagreement, retrieval or hydration
+    /// failure and cancellation, including ordinary admission for empty scopes.
+    pub async fn search_quality_text(
+        &self,
+        cx: &Cx,
+        embedder: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        let mut results = collect(self.snapshot.scoped_quality_progressive(
+            cx,
+            embedder,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+        )?)
+        .await?;
+        for result in &mut results {
+            checkpoint(cx, "native_ann.generation_scope.quality_result")?;
+            result.quality_score = result.fast_score.take();
+            if result.source == ScoreSource::SemanticFast {
+                result.source = ScoreSource::SemanticQuality;
+            }
+        }
+        Ok(results)
+    }
+
+    /// Retrieve both independently admitted vector tiers within this scope.
+    ///
+    /// Quality searches its complete eligible owner and may promote a document
+    /// outside the initial fast window. Both vector pools and the lexical pool
+    /// use this same frozen membership before fusion or winner hydration. A
+    /// required quality failure is returned instead of an Initial-only page.
+    ///
+    /// # Errors
+    /// Refuses missing tiers, either changed producer, inference or retrieval
+    /// failure, invalid hydration and cancellation.
+    pub async fn search_refined_text(
+        &self,
+        cx: &Cx,
+        fast: &dyn Embedder,
+        quality: &dyn Embedder,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        collect(self.search_progressive_with_quality(cx, fast, quality, text, k)?).await
+    }
+
+    /// Lazily emit scoped Initial and Refined phases from the same retained cohort.
+    ///
+    /// Both producers are admitted before inference, even for an empty scope or
+    /// zero-result request. Quality inference begins only when refinement is
+    /// requested. Dropping the stream leaves the scope and its source pin intact.
+    ///
+    /// # Errors
+    /// Refuses absent tiers, producer disagreement, invalid budgets or cancellation.
+    pub fn search_progressive_with_quality<'a>(
+        &'a self,
+        cx: &'a Cx,
+        fast: &'a dyn Embedder,
+        quality: &'a dyn Embedder,
+        text: &'a str,
+        k: usize,
+    ) -> SearchResult<NativeProgressiveSearch<'a>> {
+        self.snapshot.scoped_progressive_with_quality(
+            cx,
+            fast,
+            quality,
+            &self.lexical,
+            text,
+            k,
+            Arc::clone(&self.lexical.allowed),
+        )
+    }
 }
 
 impl NativeBuiltHybridIndex {

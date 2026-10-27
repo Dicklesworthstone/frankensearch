@@ -22,6 +22,7 @@ use frankensearch_index::exact_component_adapters::{
 };
 use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
 use frankensearch_index::native_hnsw::{NativeHnswGenerationReceiptV2, ValidatedNativeHnsw};
+use frankensearch_index::vector_cohort::{ExactVectorCohortV1, VECTOR_COHORT_HEADER_BYTES_V1};
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
 use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
 
@@ -40,6 +41,7 @@ use crate::{Cx, IndexableDocument, SearchResult};
 /// publisher; neither construction nor candidate creation changes AUTHORITY.
 pub struct NativeBuiltExactGeneration {
     binding: FsviV2IdentityBinding,
+    quality_binding: Option<FsviV2IdentityBinding>,
     metadata: GenerationManifest,
     components: ExactGenerationComponentsV1,
     vector: Arc<[u8]>,
@@ -92,6 +94,58 @@ impl NativeIndexBuilder {
                 "authority generations require exactly one vector provider",
             ));
         }
+        Box::pin(self.build_composite_generation(cx, tier, source, max_image_bytes)).await
+    }
+
+    /// Build independently identified fast and quality tiers over one complete cohort.
+    ///
+    /// Both providers must be explicitly supplied, and both retrieval plans must
+    /// be exact. Their dimensions may differ. Each FSVI image retains its own
+    /// identity and receipt inside one canonical authority Vector component;
+    /// Quill and metadata cover the same complete source checkpoint. Partial
+    /// coverage, shards and a two-tier ANN component are not inferred.
+    ///
+    /// The encoded-image budget and caller-owned execution policy are the same
+    /// as [`Self::build_exact_generation`]. No authority is published here.
+    ///
+    /// # Errors
+    /// Refuses missing quality or a non-exact plan before inference or work-file
+    /// creation, and propagates complete component, source, budget and cancellation errors.
+    pub async fn build_progressive_generation(
+        self,
+        cx: &Cx,
+        source: CommitRange,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.builder.progressive_generation_start")?;
+        if !matches!(self.fast.retrieval, NativeBuildRetrieval::Exact)
+            || !self
+                .quality
+                .as_ref()
+                .is_some_and(|quality| matches!(quality.retrieval, NativeBuildRetrieval::Exact))
+        {
+            return Err(invalid(
+                "builder.generation.plan",
+                "unsupported",
+                "complete progressive authority generations require independently supplied fast and quality exact tiers",
+            ));
+        }
+        Box::pin(self.build_composite_generation(
+            cx,
+            EmbedderTierTag::Fast,
+            source,
+            max_image_bytes,
+        ))
+        .await
+    }
+
+    async fn build_composite_generation(
+        self,
+        cx: &Cx,
+        tier: EmbedderTierTag,
+        source: CommitRange,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
         if self.documents.is_empty()
             || source
                 .high
@@ -111,9 +165,26 @@ impl NativeIndexBuilder {
         let retrieval = self.fast.retrieval;
         let vectors = Box::pin(self.build(cx)).await?;
         let (vector, owner) = capture_vector(cx, vectors.fast(), component_budget)?;
+        let source_checkpoint = SourceCheckpointV1::derive(&source);
+        let cohort = if let Some(quality) = vectors.quality() {
+            let remaining = remaining_budget(
+                remaining_budget(component_budget, vector.len())?,
+                VECTOR_COHORT_HEADER_BYTES_V1,
+            )?;
+            let (quality_bytes, _quality_owner) = capture_vector(cx, quality, remaining)?;
+            Some(ExactVectorCohortV1::build(
+                cx,
+                (vectors.fast().binding(), Arc::clone(&vector)),
+                (quality.binding(), quality_bytes),
+                source_checkpoint,
+                component_budget,
+            )?)
+        } else {
+            None
+        };
+        let vector = cohort.as_ref().map_or(vector, ExactVectorCohortV1::bytes);
         let after_vector = remaining_budget(component_budget, vector.len())?;
         let native_ann = capture_ann(cx, vectors.fast(), Arc::clone(&owner), after_vector)?;
-        let source_checkpoint = SourceCheckpointV1::derive(&source);
         let mut ordered = Vec::with_capacity(owner.live_count());
         for physical in 0..owner.record_count() {
             checkpoint(cx, "native_ann.builder.generation_document")?;
@@ -164,7 +235,8 @@ impl NativeIndexBuilder {
             .map_err(|error| invalid("builder.generation.lexical", "image", &error.to_string()))?;
         let lexical = image.bytes();
         let binding = vectors.fast().binding().clone();
-        let metadata = build_metadata(
+        let quality_binding = vectors.quality().map(|quality| quality.binding().clone());
+        let mut metadata = build_metadata(
             &binding,
             tier,
             source,
@@ -174,6 +246,42 @@ impl NativeIndexBuilder {
             image.receipt(),
             native_ann.as_ref().map(|(_, receipt)| receipt),
         )?;
+        if let (Some(cohort), Some(quality_binding)) = (&cohort, &quality_binding) {
+            let quality = cohort.quality_receipt();
+            metadata.vector_artifacts[0].path =
+                format!("fast/{}", metadata.vector_artifacts[0].path);
+            metadata.embedders.insert(
+                "quality".to_owned(),
+                quality_binding.frozen_identity().clone(),
+            );
+            metadata.vector_artifacts.push(VectorArtifact {
+                path: format!(
+                    "quality/{}",
+                    component_object_name_v1(GenerationComponentRole::Vector, quality.bytes.sha256)
+                ),
+                size_bytes: quality.bytes.byte_len,
+                checksum: lower_hex(&quality.bytes.sha256),
+                vector_count: cohort.quality().witness().record_count,
+                dimension: quality_binding.frozen_identity().identity.space.dimension,
+                embedder_tier: EmbedderTierTag::Quality,
+            });
+            let physical_rows = owner
+                .witness()
+                .record_count
+                .checked_add(cohort.quality().witness().record_count)
+                .ok_or_else(image_budget_error)?;
+            for invariant in &mut metadata.activation_invariants {
+                if let InvariantKind::VectorCountConsistency { expected_total } =
+                    &mut invariant.kind
+                {
+                    *expected_total = physical_rows;
+                    "Every source document has a stored vector in each independently admitted tier"
+                        .clone_into(&mut invariant.description);
+                }
+            }
+            metadata.manifest_hash = compute_manifest_hash(&metadata)?;
+            require_valid(&validate_manifest(&metadata))?;
+        }
         let metadata_bytes: Arc<[u8]> = serde_json::to_vec(&metadata)
             .map_err(|error| {
                 invalid(
@@ -193,7 +301,9 @@ impl NativeIndexBuilder {
                     invalid("builder.generation.metadata", "receipt", &error.to_string())
                 })?;
         let components = ExactGenerationComponentsV1::admit(
-            vector_receipt,
+            cohort
+                .as_ref()
+                .map_or(vector_receipt, |cohort| cohort.receipt().clone()),
             image.receipt().clone(),
             ann_receipt,
             metadata_receipt,
@@ -202,6 +312,7 @@ impl NativeIndexBuilder {
         checkpoint(cx, "native_ann.builder.generation_complete")?;
         Ok(NativeBuiltExactGeneration {
             binding,
+            quality_binding,
             metadata,
             components,
             vector,
@@ -219,6 +330,13 @@ impl NativeBuiltExactGeneration {
     #[must_use]
     pub const fn binding(&self) -> &FsviV2IdentityBinding {
         &self.binding
+    }
+
+    /// Independently selected quality identity in a complete progressive generation.
+    /// The primary binding is fast when this is present.
+    #[must_use]
+    pub const fn quality_binding(&self) -> Option<&FsviV2IdentityBinding> {
+        self.quality_binding.as_ref()
     }
 
     /// Complete metadata derived from the admitted components.
@@ -343,6 +461,22 @@ impl NativeBuiltExactGeneration {
         cx: &Cx,
         candidate: &GenerationCandidateV1,
     ) -> SearchResult<super::super::generation::CompositeReaders> {
+        if let Some(quality_binding) = &self.quality_binding {
+            return super::super::generation::admit_progressive_components(
+                cx,
+                candidate.manifest(),
+                &self.binding,
+                quality_binding,
+                DEFAULT_SCHEMA,
+                QuillConfig::default(),
+                [
+                    Arc::clone(&self.vector),
+                    Arc::clone(&self.lexical),
+                    Arc::clone(&self.metadata_bytes),
+                ],
+                self.max_image_bytes,
+            );
+        }
         super::super::generation::admit_components(
             cx,
             candidate.manifest(),

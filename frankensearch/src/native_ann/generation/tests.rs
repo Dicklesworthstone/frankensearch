@@ -16,6 +16,477 @@ use frankensearch_quill::{CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, QuillIndex, Sche
 
 const BUDGET: usize = 16 * 1024 * 1024;
 
+struct ProgressiveProvider {
+    identity: EmbeddingIdentityBundleV1,
+    quality: bool,
+    calls: AtomicUsize,
+}
+
+impl ProgressiveProvider {
+    fn new(quality: bool) -> Self {
+        let name = if quality {
+            "progressive-quality"
+        } else {
+            "progressive-fast"
+        };
+        let mut identity =
+            EmbeddingIdentityBundleV1::explicit_test_model(name, if quality { 3 } else { 2 });
+        identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+        identity.space.hash_control = None;
+        identity.space.artifact_manifest_fingerprint = if quality { "c" } else { "a" }.repeat(64);
+        identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+            role: "weights".to_owned(),
+            sha256: if quality { "d" } else { "b" }.repeat(64),
+            size: 1,
+        }];
+        identity.producer.space_fingerprint = identity.space.fingerprint();
+        identity.validate().unwrap();
+        Self {
+            identity,
+            quality,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Embedder for ProgressiveProvider {
+    fn embed<'a>(&'a self, _: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let special = text == "quality-special";
+            Ok(if self.quality {
+                if special || text == "unmatched" {
+                    vec![1.0, 0.0, 0.0]
+                } else {
+                    vec![0.0, 1.0, 0.0]
+                }
+            } else if special {
+                vec![0.0, 1.0]
+            } else {
+                vec![1.0, 0.0]
+            })
+        })
+    }
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
+    }
+    fn dimension(&self) -> usize {
+        if self.quality { 3 } else { 2 }
+    }
+    fn id(&self) -> &str {
+        &self.identity.space.logical_model_id
+    }
+    fn model_name(&self) -> &str {
+        self.id()
+    }
+    fn is_semantic(&self) -> bool {
+        true
+    }
+    fn category(&self) -> ModelCategory {
+        ModelCategory::TransformerEmbedder
+    }
+}
+
+struct ProgressiveFixture {
+    directory: tempfile::TempDir,
+    fast: Arc<ProgressiveProvider>,
+    quality: Arc<ProgressiveProvider>,
+    fast_binding: FsviV2IdentityBinding,
+    quality_binding: FsviV2IdentityBinding,
+    metadata: GenerationManifest,
+    activation: ActivationManifest,
+    images: [Arc<[u8]>; 3],
+}
+
+impl ProgressiveFixture {
+    fn admit(&self, cx: &Cx) -> SearchResult<CompositeReaders> {
+        admit_progressive_components(
+            cx,
+            &self.activation,
+            &self.fast_binding,
+            &self.quality_binding,
+            DEFAULT_SCHEMA,
+            config(),
+            self.images.clone(),
+            BUDGET,
+        )
+    }
+
+    fn admit_resealed(&self, cx: &Cx, images: [Arc<[u8]>; 3]) -> SearchResult<CompositeReaders> {
+        let activation = activation(
+            &self.fast_binding,
+            &images,
+            self.activation.document_set_sha256(),
+            None,
+        );
+        admit_progressive_components(
+            cx,
+            &activation,
+            &self.fast_binding,
+            &self.quality_binding,
+            DEFAULT_SCHEMA,
+            config(),
+            images,
+            BUDGET,
+        )
+    }
+}
+
+async fn progressive_fixture(cx: &Cx) -> ProgressiveFixture {
+    let directory = tempfile::tempdir().unwrap();
+    let fast = Arc::new(ProgressiveProvider::new(false));
+    let quality = Arc::new(ProgressiveProvider::new(true));
+    let built = crate::native_ann::builder::NativeIndexBuilder::new(
+        directory.path().join("source"),
+        ArtifactGenerationIdentityV1::new(7, [0x37; 16]).unwrap(),
+        fast.clone(),
+    )
+    .unwrap()
+    .with_quality_embedder(quality.clone())
+    .unwrap()
+    .add_documents(["a", "b", "c", "d", "e"].into_iter().map(|id| {
+        IndexableDocument::new(id, "ordinary cohort document").with_metadata("version", "old")
+    }))
+    .add_document(
+        IndexableDocument::new("quality-only", "quality-special").with_metadata("version", "old"),
+    )
+    .build_progressive_generation(cx, CommitRange { low: 1, high: 4 }, BUDGET)
+    .await
+    .unwrap();
+    let candidate = built
+        .candidate(
+            [0x73; 16],
+            None,
+            GenerationAuthorityActionV1::Activate,
+            [0x74; 32],
+        )
+        .unwrap();
+    built.validate_candidate(cx, &candidate).unwrap();
+    fast.calls.store(0, Ordering::SeqCst);
+    quality.calls.store(0, Ordering::SeqCst);
+    ProgressiveFixture {
+        directory,
+        fast,
+        quality,
+        fast_binding: built.binding().clone(),
+        quality_binding: built.quality_binding().unwrap().clone(),
+        metadata: built.metadata().clone(),
+        activation: candidate.manifest().clone(),
+        images: [
+            built
+                .component_bytes(GenerationComponentRole::Vector)
+                .unwrap(),
+            built
+                .component_bytes(GenerationComponentRole::Lexical)
+                .unwrap(),
+            built
+                .component_bytes(GenerationComponentRole::Metadata)
+                .unwrap(),
+        ],
+    }
+}
+
+#[test]
+fn progressive_authority_retrieves_quality_beyond_fast_window_and_defers_quality_work() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = progressive_fixture(&cx).await;
+        let readers = fixture.admit(&cx).unwrap();
+        assert_eq!(
+            readers.topology(),
+            NativeGenerationTopology::FullProgressive
+        );
+        let fast = readers
+            .search_text(&cx, fixture.fast.as_ref(), "unmatched", 3)
+            .await
+            .unwrap();
+        assert!(fast.iter().all(|hit| hit.doc_id != "quality-only"));
+        let refined = readers
+            .search_refined_text(
+                &cx,
+                fixture.fast.as_ref(),
+                fixture.quality.as_ref(),
+                "unmatched",
+                1,
+            )
+            .await
+            .unwrap();
+        assert_eq!(refined[0].doc_id, "quality-only");
+        assert_eq!(refined[0].metadata.as_ref().unwrap()["version"], "old");
+        let fast_before = fixture.fast.calls.load(Ordering::SeqCst);
+        let quality_before = fixture.quality.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            readers
+                .search_quality_text(&cx, fixture.quality.as_ref(), "unmatched", 1)
+                .await
+                .unwrap()[0]
+                .doc_id,
+            "quality-only"
+        );
+        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_before);
+        assert_eq!(
+            fixture.quality.calls.load(Ordering::SeqCst),
+            quality_before + 1
+        );
+
+        let quality_before = fixture.quality.calls.load(Ordering::SeqCst);
+        let mut stream = readers
+            .search_progressive_with_quality(
+                &cx,
+                fixture.fast.as_ref(),
+                fixture.quality.as_ref(),
+                "unmatched",
+                1,
+            )
+            .unwrap();
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), quality_before);
+        let Some(crate::native_ann::NativeSearchPhase::Initial { results, .. }) =
+            stream.next_phase().await.unwrap()
+        else {
+            panic!("initial phase required")
+        };
+        assert_ne!(results[0].doc_id, "quality-only");
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), quality_before);
+        let Some(crate::native_ann::NativeSearchPhase::Refined { results, .. }) =
+            stream.next_phase().await.unwrap()
+        else {
+            panic!("refined phase required")
+        };
+        assert_eq!(results[0].doc_id, "quality-only");
+        assert_eq!(
+            fixture.quality.calls.load(Ordering::SeqCst),
+            quality_before + 1
+        );
+        assert!(stream.next_phase().await.unwrap().is_none());
+        drop(stream);
+
+        for (name, bytes) in ["vector", "lexical", "metadata"]
+            .into_iter()
+            .zip(&fixture.images)
+        {
+            std::fs::write(fixture.directory.path().join(name), bytes).unwrap();
+        }
+        let reread: [Arc<[u8]>; 3] = ["vector", "lexical", "metadata"].map(|name| {
+            std::fs::read(fixture.directory.path().join(name))
+                .unwrap()
+                .into()
+        });
+        let reopened = fixture.admit_resealed(&cx, reread).unwrap();
+        std::fs::rename(
+            fixture.directory.path().join("source"),
+            fixture.directory.path().join("relocated"),
+        )
+        .unwrap();
+        std::fs::create_dir(fixture.directory.path().join("source")).unwrap();
+        std::fs::write(
+            fixture.directory.path().join("source/fast.fsvi"),
+            b"unrelated bytes",
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .search_refined_text(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1
+                )
+                .await
+                .unwrap()[0]
+                .doc_id,
+            "quality-only"
+        );
+        assert_eq!(readers.source_documents(&cx, BUDGET).unwrap().len(), 6);
+    });
+}
+
+#[test]
+fn progressive_selected_source_uses_common_membership_and_exact_payload_budget() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = progressive_fixture(&cx).await;
+        let readers = fixture.admit(&cx).unwrap();
+        let documents = readers.source_documents(&cx, BUDGET).unwrap();
+        let expected = documents
+            .iter()
+            .find(|document| document.id == "quality-only")
+            .unwrap();
+        let metadata: BTreeMap<_, _> = expected.metadata.iter().collect();
+        let payload_bytes = expected.id.len()
+            + expected.content.len()
+            + expected.title.as_deref().unwrap_or("").len()
+            + serde_json::to_vec(&metadata).unwrap().len();
+        let selected = readers
+            .source_documents_by_ids(
+                &cx,
+                &["quality-only", "absent", "quality-only"],
+                payload_bytes * 2,
+            )
+            .unwrap();
+        assert!(selected[1].is_none());
+        for document in [selected[0].as_ref().unwrap(), selected[2].as_ref().unwrap()] {
+            assert_eq!(document.id, expected.id);
+            assert_eq!(document.content, expected.content);
+            assert_eq!(document.metadata, expected.metadata);
+        }
+        assert_source_refused(
+            readers.source_documents_by_ids(&cx, &["quality-only"], payload_bytes - 1),
+            "stored-payload-limit",
+        );
+        assert_source_refused(
+            readers.source_documents(&cx, payload_bytes),
+            "stored-payload-limit",
+        );
+        assert!(
+            readers
+                .source_documents_by_ids(&cx, &["absent"], 0)
+                .unwrap()[0]
+                .is_none()
+        );
+        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn progressive_authority_admits_both_producers_before_any_inference_even_zero_k() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = progressive_fixture(&cx).await;
+        let readers = fixture.admit(&cx).unwrap();
+        let mut foreign = ProgressiveProvider::new(true);
+        foreign
+            .identity
+            .producer
+            .implementation_revision
+            .push_str("-foreign");
+        foreign.identity.validate().unwrap();
+        for k in [0, 1] {
+            assert!(
+                readers
+                    .search_refined_text(&cx, fixture.fast.as_ref(), &foreign, "unmatched", k)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                readers
+                    .search_progressive_with_quality(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        &foreign,
+                        "unmatched",
+                        k
+                    )
+                    .is_err()
+            );
+            assert!(
+                readers
+                    .search_quality_text(&cx, &foreign, "unmatched", k)
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            readers
+                .search_refined_text(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    0
+                )
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            fixture.admit(&cx),
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            readers
+                .search_refined_text(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1
+                )
+                .await,
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn progressive_authority_refuses_swapped_owners_resealed_metadata_and_component_drift() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = progressive_fixture(&cx).await;
+        assert!(
+            admit_progressive_components(
+                &cx,
+                &fixture.activation,
+                &fixture.quality_binding,
+                &fixture.fast_binding,
+                DEFAULT_SCHEMA,
+                config(),
+                fixture.images.clone(),
+                BUDGET
+            )
+            .is_err()
+        );
+        assert!(
+            admit_progressive_components(
+                &cx,
+                &fixture.activation,
+                &fixture.fast_binding,
+                &fixture.quality_binding,
+                DEFAULT_SCHEMA,
+                config(),
+                fixture.images.clone(),
+                1
+            )
+            .is_err()
+        );
+        for component in 0..3 {
+            let mut images = fixture.images.clone();
+            let mut bytes = images[component].to_vec();
+            let last = bytes.last_mut().unwrap();
+            *last ^= 1;
+            images[component] = bytes.into();
+            assert!(fixture.admit_resealed(&cx, images).is_err());
+        }
+        for change in 0..6 {
+            let mut metadata = fixture.metadata.clone();
+            match change {
+                0 => metadata.vector_artifacts[1].checksum = "a".repeat(64),
+                1 => metadata.vector_artifacts[1].vector_count += 1,
+                2 => metadata.vector_artifacts[1].dimension += 1,
+                3 => metadata.vector_artifacts.swap(0, 1),
+                4 => {
+                    metadata.embedders.insert(
+                        "quality".to_owned(),
+                        fixture.fast_binding.frozen_identity().clone(),
+                    );
+                }
+                _ => metadata.total_documents += 1,
+            }
+            metadata.manifest_hash = compute_manifest_hash(&metadata).unwrap();
+            let mut images = fixture.images.clone();
+            images[2] = serde_json::to_vec(&metadata).unwrap().into();
+            assert!(
+                fixture.admit_resealed(&cx, images).is_err(),
+                "mutation {change}"
+            );
+        }
+        assert!(fixture.admit(&cx).is_ok());
+    });
+}
+
 struct Provider {
     identity: EmbeddingIdentityBundleV1,
     calls: AtomicUsize,
@@ -1268,6 +1739,395 @@ mod qualified_rollback {
             .find(|physical| owner.row(*physical).unwrap().doc_id() == id)
             .unwrap();
         owner.vector_at_f32(physical).unwrap()
+    }
+
+    fn publish_progressive(
+        cx: &Cx,
+        root: &QualifiedGenerationRoot,
+        candidate: &GenerationCandidateV1,
+        bindings: (&FsviV2IdentityBinding, &FsviV2IdentityBinding),
+        pair: ExpectedAuthorityPairV1,
+        writer_id: [u8; 16],
+    ) -> NativeGenerationSnapshot {
+        let mut publisher = GenerationPublisherV1::new(root, ROOT_ID, writer_id, PROFILE).unwrap();
+        let attempt = publisher
+            .prepare_attempt(candidate, pair, writer_id, writer_id)
+            .unwrap();
+        let result = publisher
+            .publish_prepared(cx, candidate, &attempt, None, BUDGET as u64)
+            .unwrap();
+        assert!(matches!(
+            result.publication,
+            PublicationOutcomeV1::Committed { .. }
+        ));
+        let Some(GenerationActivationV1::Installed(opened)) = result.activation else {
+            panic!("complete progressive publication must activate")
+        };
+        NativeGenerationSnapshot::admit_progressive(
+            cx,
+            opened,
+            bindings.0,
+            bindings.1,
+            DEFAULT_SCHEMA,
+            config(),
+            BUDGET,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn progressive_authority_updates_reuse_both_owners_and_rollback_the_complete_cohort() {
+        let parent = update_parent("progressive");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = progressive_fixture(&cx).await;
+            let root_path = parent.join("root");
+            let root = create_root(&root_path);
+            let components = fixture.admit(&cx).unwrap();
+            let original = GenerationCandidateV1::new(
+                [0xc1; 16],
+                None,
+                GenerationAuthorityActionV1::Activate,
+                fixture.fast_binding.generation(),
+                [0xc2; 32],
+                &components.components,
+            )
+            .unwrap();
+            for (role, receipt) in original.manifest().components().iter() {
+                let image = match role {
+                    GenerationComponentRole::Vector => &fixture.images[0],
+                    GenerationComponentRole::Lexical => &fixture.images[1],
+                    GenerationComponentRole::Metadata => &fixture.images[2],
+                    GenerationComponentRole::Ann => panic!("unexpected graph"),
+                };
+                root.stage_immutable_file(
+                    &component_object_path_v1(role, receipt.sha256).unwrap(),
+                    image,
+                )
+                .unwrap();
+            }
+            stage_manifest(&root, &original);
+            let retained = publish_progressive(
+                &cx,
+                &root,
+                &original,
+                (&fixture.fast_binding, &fixture.quality_binding),
+                ExpectedAuthorityPairV1::default(),
+                [0xc3; 16],
+            );
+            assert_eq!(
+                retained.topology(),
+                NativeGenerationTopology::FullProgressive
+            );
+            let successor_generation = ArtifactGenerationIdentityV1::new(8, [0xc4; 16]).unwrap();
+            let refused = parent.join("single-refused");
+            assert!(
+                retained
+                    .begin_update(
+                        &cx,
+                        &refused,
+                        successor_generation,
+                        fixture.fast.clone(),
+                        BUDGET
+                    )
+                    .is_err()
+            );
+            assert!(!refused.exists());
+            let mut foreign = ProgressiveProvider::new(true);
+            foreign
+                .identity
+                .producer
+                .implementation_revision
+                .push_str("-foreign");
+            let refused = parent.join("foreign-refused");
+            let error = retained
+                .begin_progressive_update(
+                    &cx,
+                    &refused,
+                    successor_generation,
+                    fixture.fast.clone(),
+                    Arc::new(foreign),
+                    0,
+                )
+                .err()
+                .unwrap();
+            assert!(error.to_string().contains("producer"));
+            assert!(!refused.exists());
+            assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+
+            let authority_before = fs::read(root_path.join("AUTHORITY")).unwrap();
+            let lock_before = fs::read(root_path.join("LOCK")).unwrap();
+            let update = retained
+                .begin_progressive_update(
+                    &cx,
+                    parent.join("successor"),
+                    successor_generation,
+                    fixture.fast.clone(),
+                    fixture.quality.clone(),
+                    BUDGET,
+                )
+                .unwrap()
+                .delete_document("a")
+                .upsert_document(
+                    IndexableDocument::new("b", "ordinary cohort document")
+                        .with_title("New title")
+                        .with_metadata("version", "new"),
+                )
+                .upsert_document(IndexableDocument::new("inserted", "quality-special"));
+            fs::rename(
+                fixture.directory.path().join("source"),
+                fixture.directory.path().join("relocated"),
+            )
+            .unwrap();
+            let built = update
+                .build_progressive_generation(&cx, CommitRange { low: 1, high: 8 }, BUDGET)
+                .await
+                .unwrap();
+            assert_eq!(
+                fixture.fast.calls.load(Ordering::SeqCst),
+                1,
+                "unchanged and metadata-only edits reuse fast vectors"
+            );
+            assert_eq!(
+                fixture.quality.calls.load(Ordering::SeqCst),
+                1,
+                "quality independently reuses its own unchanged vectors"
+            );
+            assert_eq!(
+                built.binding().frozen_identity(),
+                fixture.fast_binding.frozen_identity()
+            );
+            assert_eq!(
+                built.quality_binding().unwrap().frozen_identity(),
+                fixture.quality_binding.frozen_identity()
+            );
+            assert_eq!(built.metadata().total_documents, 6);
+            assert_eq!(
+                fs::read(root_path.join("AUTHORITY")).unwrap(),
+                authority_before
+            );
+            assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), lock_before);
+            let candidate = built
+                .candidate(
+                    [0xc5; 16],
+                    Some(retained.authority()),
+                    GenerationAuthorityActionV1::Activate,
+                    [0xc6; 32],
+                )
+                .unwrap();
+            built.validate_candidate(&cx, &candidate).unwrap();
+            stage(&root, &built, &candidate);
+            let current = publish_progressive(
+                &cx,
+                &root,
+                &candidate,
+                (built.binding(), built.quality_binding().unwrap()),
+                retained.retained_snapshot().authority_pair(),
+                [0xc7; 16],
+            );
+            let documents = current.source_documents(&cx, BUDGET).unwrap();
+            assert!(!documents.iter().any(|document| document.id == "a"));
+            assert!(documents.iter().any(|document| document.id == "inserted"));
+            let changed = documents
+                .iter()
+                .find(|document| document.id == "b")
+                .unwrap();
+            assert_eq!(changed.title.as_deref(), Some("New title"));
+            assert_eq!(changed.metadata["version"], "new");
+            assert!(
+                retained
+                    .source_documents(&cx, BUDGET)
+                    .unwrap()
+                    .iter()
+                    .any(|document| document.id == "a")
+            );
+            for (old, new) in [
+                (&retained.readers.vector, &current.readers.vector),
+                (
+                    retained.readers.quality.as_ref().unwrap(),
+                    current.readers.quality.as_ref().unwrap(),
+                ),
+            ] {
+                let row = |index: &NativeAnnIndex| {
+                    (0..index.owner.record_count())
+                        .find(|physical| index.owner.row(*physical).unwrap().doc_id() == "b")
+                        .unwrap()
+                };
+                assert_eq!(
+                    old.owner.vector_at_f32(row(old)).unwrap(),
+                    new.owner.vector_at_f32(row(new)).unwrap()
+                );
+            }
+            let reopened_root = QualifiedGenerationRoot::admit(
+                &root_path,
+                GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1).unwrap(),
+            )
+            .unwrap();
+            let SnapshotOpenOutcomeV1::Opened(opened) = reopened_root
+                .open_generation_snapshot_with_budget(ROOT_ID, PROFILE, None, BUDGET as u64)
+                .unwrap()
+            else {
+                panic!("current complete cohort must reopen")
+            };
+            let reopened = NativeGenerationSnapshot::admit_progressive(
+                &cx,
+                opened,
+                built.binding(),
+                built.quality_binding().unwrap(),
+                DEFAULT_SCHEMA,
+                config(),
+                BUDGET,
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.topology(),
+                NativeGenerationTopology::FullProgressive
+            );
+            let rollback = retained
+                .rollback_candidate(&cx, &reopened, [0xc8; 16], [0xc9; 32])
+                .unwrap();
+            assert_eq!(
+                rollback.manifest().components().vector,
+                original.manifest().components().vector
+            );
+            stage_manifest(&root, &rollback);
+            let restored = publish_progressive(
+                &cx,
+                &root,
+                &rollback,
+                (&fixture.fast_binding, &fixture.quality_binding),
+                reopened.retained_snapshot().authority_pair(),
+                [0xca; 16],
+            );
+            assert_eq!(
+                restored.authority().sequence,
+                reopened.authority().sequence + 1
+            );
+            assert_eq!(
+                restored
+                    .search_refined_text(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        fixture.quality.as_ref(),
+                        "unmatched",
+                        1
+                    )
+                    .await
+                    .unwrap()[0]
+                    .doc_id,
+                "quality-only"
+            );
+            assert!(
+                current
+                    .source_documents(&cx, BUDGET)
+                    .unwrap()
+                    .iter()
+                    .any(|document| document.id == "inserted")
+            );
+            assert!(
+                !restored
+                    .source_documents(&cx, BUDGET)
+                    .unwrap()
+                    .iter()
+                    .any(|document| document.id == "inserted")
+            );
+
+            // Scopes stay on the originally retained packed cohort after both a
+            // successor activation and rollback. The independently searched
+            // quality owner must still promote a candidate outside the scoped
+            // fast window, and neither phase may return excluded IDs.
+            let retained = Arc::new(retained);
+            let scoped = retained
+                .scope(&cx, BUDGET, |document| Ok(document.id != "a"))
+                .unwrap();
+            let quality_calls = fixture.quality.calls.load(Ordering::SeqCst);
+            let mut stream = scoped
+                .search_progressive_with_quality(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "unmatched",
+                    1,
+                )
+                .unwrap();
+            let Some(crate::native_ann::NativeSearchPhase::Initial {
+                results,
+                candidates,
+            }) = stream.next_phase().await.unwrap()
+            else {
+                panic!("scoped Initial required")
+            };
+            assert_eq!(candidates.fast, 3);
+            assert!(
+                results
+                    .iter()
+                    .all(|hit| hit.doc_id != "a" && hit.doc_id != "quality-only")
+            );
+            assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), quality_calls);
+            let Some(crate::native_ann::NativeSearchPhase::Refined {
+                results,
+                candidates,
+            }) = stream.next_phase().await.unwrap()
+            else {
+                panic!("scoped Refined required")
+            };
+            assert_eq!(candidates.quality, 3);
+            assert_eq!(results[0].doc_id, "quality-only");
+            assert_eq!(results[0].metadata.as_ref().unwrap()["version"], "old");
+            assert!(stream.next_phase().await.unwrap().is_none());
+            drop(stream);
+            let fast_calls = fixture.fast.calls.load(Ordering::SeqCst);
+            let quality_hits = scoped
+                .search_quality_text(&cx, fixture.quality.as_ref(), "unmatched", 1)
+                .await
+                .unwrap();
+            assert_eq!(quality_hits[0].doc_id, "quality-only");
+            assert!(quality_hits[0].fast_score.is_none());
+            assert_eq!(quality_hits[0].quality_score, Some(1.0));
+            assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), fast_calls);
+
+            // The lexical corpus contains several excluded matches. Filtering
+            // must happen before normalization/fusion and retained hydration.
+            let narrowed = scoped
+                .narrow(&cx, |document| Ok(document.id == "e"))
+                .unwrap();
+            let results = narrowed
+                .search_refined_text(
+                    &cx,
+                    fixture.fast.as_ref(),
+                    fixture.quality.as_ref(),
+                    "cohort",
+                    usize::MAX,
+                )
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].doc_id, "e");
+            assert!(results[0].lexical_score.is_some());
+            assert_eq!(results[0].metadata.as_ref().unwrap()["version"], "old");
+            assert!(narrowed.document("quality-only").is_none());
+            assert!(scoped.document("quality-only").is_some());
+
+            let empty = scoped.narrow(&cx, |_| Ok(false)).unwrap();
+            let mut foreign = ProgressiveProvider::new(true);
+            foreign
+                .identity
+                .producer
+                .implementation_revision
+                .push_str("-foreign");
+            assert!(
+                empty
+                    .search_progressive_with_quality(
+                        &cx,
+                        fixture.fast.as_ref(),
+                        &foreign,
+                        "cohort",
+                        0,
+                    )
+                    .is_err()
+            );
+            assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+        });
     }
 
     struct ScopeProvider(Provider);
