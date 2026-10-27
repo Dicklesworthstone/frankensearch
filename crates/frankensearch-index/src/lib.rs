@@ -46,6 +46,7 @@
 //! └───────────────────────────────────────────┘
 //! ```
 
+pub mod ann_cohort;
 pub mod exact_component_adapters;
 #[cfg(unix)]
 pub mod fd_acl;
