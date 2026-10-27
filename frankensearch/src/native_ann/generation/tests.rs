@@ -1233,7 +1233,8 @@ mod qualified_rollback {
                         )
                         .with_title("Eligible retained title")
                         .with_metadata("tenant", "blue")
-                        .with_metadata("version", "selected"),
+                        .with_metadata("version", "selected")
+                        .with_metadata("escaped", "\"\n\\\t"),
                     );
                 }
                 let built = NativeIndexBuilder::new(
@@ -1256,6 +1257,95 @@ mod qualified_rollback {
                         [0xb3; 32],
                     )
                     .unwrap();
+                // The prepared scope must consume the actual retained images,
+                // including escaped metadata bytes, before anything is staged.
+                fs::rename(
+                    parent.join(format!("{name}-build")),
+                    parent.join(format!("{name}-build-relocated")),
+                )
+                .unwrap();
+                let payload_bytes: usize = documents
+                    .iter()
+                    .map(|document| {
+                        let metadata: BTreeMap<_, _> = document.metadata.iter().collect();
+                        document.id.len()
+                            + document.content.len()
+                            + document.title.as_deref().unwrap_or("").len()
+                            + serde_json::to_vec(&metadata).unwrap().len()
+                    })
+                    .sum();
+                let root_path = parent.join(format!("{name}-root"));
+                let before_authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                let before_lock = fs::read(root_path.join("LOCK")).unwrap();
+                let before_scope_calls = provider.0.calls.load(Ordering::SeqCst);
+                assert!(matches!(
+                    built.prepare_scope(&cx, &candidate, payload_bytes - 1, |_| {
+                        panic!("the complete source budget must be admitted first")
+                    }),
+                    Err(SearchError::InvalidConfig { field, value, .. })
+                        if field == "native_ann.generation.source"
+                            && value == "stored-payload-limit"
+                ));
+                let mut failed_visits = 0;
+                assert!(matches!(
+                    built.prepare_scope(&cx, &candidate, payload_bytes, |_| {
+                        failed_visits += 1;
+                        if failed_visits == documents.len() {
+                            Err(refused("scope-test", "last-predicate-failed"))
+                        } else {
+                            Ok(true)
+                        }
+                    }),
+                    Err(SearchError::InvalidConfig { value, .. })
+                        if value == "last-predicate-failed"
+                ));
+                assert_eq!(failed_visits, documents.len());
+                let mut cancelled_visits = 0;
+                assert!(matches!(
+                    built.prepare_scope(&cx, &candidate, payload_bytes, |_| {
+                        cancelled_visits += 1;
+                        if cancelled_visits == documents.len() {
+                            cx.set_cancel_requested(true);
+                        }
+                        Ok(true)
+                    }),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert_eq!(cancelled_visits, documents.len());
+                assert!(matches!(
+                    built.prepare_scope(&cx, &candidate, 0, |_| {
+                        panic!("cancelled preparation cannot evaluate a predicate")
+                    }),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                cx.set_cancel_requested(false);
+                let mut prepared_visits = Vec::new();
+                let prepared = built
+                    .prepare_scope(&cx, &candidate, payload_bytes, |document| {
+                        prepared_visits.push(document.id.clone());
+                        Ok(document.metadata.get("tenant").map(String::as_str) == Some("blue"))
+                    })
+                    .unwrap();
+                assert_eq!(prepared_visits.len(), documents.len());
+                // Same source, generation, tier, producer and component receipts
+                // cannot authorize attaching another candidate's membership.
+                let other_candidate = built
+                    .candidate(
+                        [0xb5; 16],
+                        None,
+                        GenerationAuthorityActionV1::Activate,
+                        [0xb6; 32],
+                    )
+                    .unwrap();
+                let wrong_prepared = built
+                    .prepare_scope(&cx, &other_candidate, payload_bytes, |_| Ok(true))
+                    .unwrap();
+                assert_eq!(provider.0.calls.load(Ordering::SeqCst), before_scope_calls);
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    before_authority
+                );
+                assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), before_lock);
                 stage(&root, &built, &candidate);
                 let retained = Arc::new(publish(
                     &cx,
@@ -1266,6 +1356,20 @@ mod qualified_rollback {
                     [0xb4; 16],
                 ));
                 assert_eq!(retained.retrieval_mode(), built.retrieval_mode());
+                assert!(matches!(
+                    wrong_prepared.bind(Arc::clone(&retained)),
+                    Err(SearchError::InvalidConfig { field, value, .. })
+                        if field == "native_ann.scope.prepared" && value == "candidate-mismatch"
+                ));
+                // A cancellation arriving after known publication cannot abort
+                // binding the already-prepared exact selection.
+                cx.set_cancel_requested(true);
+                let prepared_scope = prepared.bind(Arc::clone(&retained)).unwrap();
+                cx.set_cancel_requested(false);
+                assert_eq!(prepared_visits.len(), documents.len());
+                assert_eq!(prepared_scope.len(), 2);
+                assert!(prepared_scope.document("excluded-0").is_none());
+                assert_eq!(provider.0.calls.load(Ordering::SeqCst), before_scope_calls);
                 let calls = provider.0.calls.load(Ordering::SeqCst);
                 let mut visited = Vec::new();
                 let scope = retained
@@ -1290,6 +1394,10 @@ mod qualified_rollback {
                     assert_eq!(actual.content, expected.content);
                     assert_eq!(actual.title, expected.title);
                     assert_eq!(actual.metadata, expected.metadata);
+                    let prepared_document = prepared_scope.document(&expected.id).unwrap();
+                    assert_eq!(prepared_document.content, expected.content);
+                    assert_eq!(prepared_document.title, expected.title);
+                    assert_eq!(prepared_document.metadata, expected.metadata);
                 }
 
                 // Neither ordinary source window contains an eligible row.
@@ -1324,6 +1432,13 @@ mod qualified_rollback {
                     .await
                     .unwrap();
                 assert_eq!(filtered.len(), 2);
+                assert_same_scored_results(
+                    &prepared_scope
+                        .search_text(&cx, provider.as_ref(), "needle", 2)
+                        .await
+                        .unwrap(),
+                    &filtered,
+                );
                 for hit in &filtered {
                     assert!(hit.doc_id.starts_with("included-"));
                     assert_eq!(hit.source, ScoreSource::Hybrid);
@@ -1416,6 +1531,7 @@ mod qualified_rollback {
                 drop(empty);
                 drop(narrowed);
                 drop(scope);
+                drop(prepared_scope);
                 assert!(pin.upgrade().is_none());
             }
         });
@@ -2147,6 +2263,93 @@ mod qualified_rollback {
                 .unwrap();
                 assert_eq!(reopened_target.retrieval_mode(), retained.retrieval_mode());
                 assert_eq!(reopened_target.tier(), tier);
+
+                // Historical reopening authenticates the target under the
+                // CURRENT physical pair. It permits rollback, but cannot lend
+                // that newer pair to an incremental edit of the old source.
+                let refused_work = parent.join(format!("{name}-reopened-update"));
+                let update_generation = ArtifactGenerationIdentityV1::new(9, [0xae; 16]).unwrap();
+                let control_authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+                let control_lock = fs::read(root_path.join("LOCK")).unwrap();
+                let before_calls = original_provider.calls.load(Ordering::SeqCst);
+                let mut forbidden = Provider::new();
+                forbidden.identity.producer.backend.clear();
+                assert!(forbidden.identity.validate().is_err());
+                let forbidden = Arc::new(forbidden);
+                for provider in [original_provider.clone(), forbidden.clone()] {
+                    assert!(matches!(
+                        reopened_target.begin_update(
+                            &cx,
+                            &refused_work,
+                            update_generation,
+                            provider,
+                            0,
+                        ),
+                        Err(SearchError::InvalidConfig { field, value, .. })
+                            if field == "native_ann.update.authority"
+                                && value == "reopened-predecessor"
+                    ));
+                }
+                assert!(!refused_work.exists());
+                assert_eq!(original_provider.calls.load(Ordering::SeqCst), before_calls);
+                assert_eq!(forbidden.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    control_authority
+                );
+                assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), control_lock);
+
+                // A handle retained while it really WAS current still owns its
+                // original pair. Its complete successor can be built, but that
+                // stale pair must lose publication after a competing writer won.
+                let old_update = retained
+                    .begin_update(
+                        &cx,
+                        parent.join(format!("{name}-old-retained-update")),
+                        update_generation,
+                        original_provider.clone(),
+                        BUDGET,
+                    )
+                    .unwrap()
+                    .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 10 }, BUDGET)
+                    .await
+                    .unwrap();
+                assert_eq!(original_provider.calls.load(Ordering::SeqCst), before_calls);
+                let stale_candidate = old_update
+                    .candidate(
+                        [0xaf; 16],
+                        Some(retained.authority()),
+                        GenerationAuthorityActionV1::Activate,
+                        [0xb0; 32],
+                    )
+                    .unwrap();
+                stage(&root, &old_update, &stale_candidate);
+                let rejected = {
+                    let mut publisher =
+                        GenerationPublisherV1::new(&root, ROOT_ID, [0xb1; 16], PROFILE).unwrap();
+                    let attempt = publisher
+                        .prepare_attempt(
+                            &stale_candidate,
+                            retained.retained_snapshot().authority_pair(),
+                            [0xb2; 16],
+                            [0xb3; 16],
+                        )
+                        .unwrap();
+                    publisher.publish_prepared(&cx, &stale_candidate, &attempt, None, BUDGET as u64)
+                };
+                assert!(matches!(
+                    rejected,
+                    Err(crate::GenerationPublicationErrorV1::StaleExpectedAuthority)
+                        | Ok(crate::GenerationPublicationResultV1 {
+                            publication: PublicationOutcomeV1::NotCommitted(_),
+                            ..
+                        })
+                ));
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    control_authority
+                );
+                assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), control_lock);
                 assert!(
                     current
                         .rollback_candidate(&cx, &retained, [0x8c; 16], [0x8d; 32])

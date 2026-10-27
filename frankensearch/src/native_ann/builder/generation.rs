@@ -27,8 +27,9 @@ use frankensearch_quill::{DEFAULT_SCHEMA, QuillConfig};
 
 use super::super::generation::NATIVE_ANN_RECEIPT_KEY;
 use super::super::{NativeRetrievalMode, checkpoint, invalid, lower_hex};
+use super::scope::PreparedNativeGenerationScope;
 use super::{NativeBuildRetrieval, NativeBuiltTier, NativeIndexBuilder, hybrid};
-use crate::{Cx, SearchResult};
+use crate::{Cx, IndexableDocument, SearchResult};
 
 /// Complete owned vector, lexical, metadata, and optional native ANN images.
 ///
@@ -297,6 +298,51 @@ impl NativeBuiltExactGeneration {
         cx: &Cx,
         candidate: &GenerationCandidateV1,
     ) -> SearchResult<()> {
+        self.admit_candidate(cx, candidate)?;
+        Ok(())
+    }
+
+    /// Prepare a complete source scope before staging or publishing a candidate.
+    ///
+    /// The actual retained vector, lexical, metadata and optional ANN images are
+    /// admitted against this exact candidate using the production reader checks.
+    /// Its full stored source must fit `max_source_bytes` before any predicate is
+    /// called. The budget and source semantics match
+    /// [`crate::native_ann::NativeGenerationSnapshot::source_documents`].
+    /// No model runs, pathname is reopened, or authority is changed. Predicates
+    /// run once per source document and are not retained. After publication,
+    /// [`PreparedNativeGenerationScope::bind`] checks and attaches the exact
+    /// admitted result without repeating source work or observing cancellation.
+    ///
+    /// # Errors
+    /// Refuses candidate/component drift, invalid stored source, budget
+    /// exhaustion, predicate errors and cancellation without a partial scope.
+    /// Predicate panics are not intercepted.
+    pub fn prepare_scope(
+        &self,
+        cx: &Cx,
+        candidate: &GenerationCandidateV1,
+        max_source_bytes: usize,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<PreparedNativeGenerationScope> {
+        let readers = self.admit_candidate(cx, candidate)?;
+        let source = readers.source_documents(cx, max_source_bytes)?;
+        PreparedNativeGenerationScope::from_source(
+            cx,
+            candidate.authority(),
+            candidate.manifest().components(),
+            self.binding.clone(),
+            self.metadata.vector_artifacts[0].embedder_tier,
+            source,
+            accept,
+        )
+    }
+
+    fn admit_candidate(
+        &self,
+        cx: &Cx,
+        candidate: &GenerationCandidateV1,
+    ) -> SearchResult<super::super::generation::CompositeReaders> {
         super::super::generation::admit_components(
             cx,
             candidate.manifest(),
@@ -310,8 +356,7 @@ impl NativeBuiltExactGeneration {
             ],
             self.ann.as_ref().map(Arc::clone),
             self.max_image_bytes,
-        )?;
-        Ok(())
+        )
     }
 }
 

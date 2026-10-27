@@ -419,7 +419,7 @@ fn same_anchor_security_identity(
 }
 
 impl CompositeReaders {
-    fn source_documents(
+    pub(super) fn source_documents(
         &self,
         cx: &Cx,
         max_source_bytes: usize,

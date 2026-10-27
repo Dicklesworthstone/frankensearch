@@ -8,7 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
-use frankensearch_core::generation::EmbedderTierTag;
+use frankensearch_core::generation::{
+    AuthorityRefV1, EmbedderTierTag, GenerationComponentReceiptsV2,
+};
+use frankensearch_index::FsviV2IdentityBinding;
 
 use super::NativeBuiltHybridIndex;
 use super::sharded::NativeBuiltShardedHybridIndex;
@@ -66,6 +69,117 @@ pub struct NativeScopedGenerationSnapshot {
     lexical: ScopedLexical<'static>,
 }
 
+/// Fully prepared source membership for one exact unpublished candidate.
+///
+/// Construction reads the candidate's actual admitted component images and
+/// evaluates its predicate before publication. This opaque value retains the
+/// complete bounded source inventory and membership, but cannot search until
+/// [`Self::bind`] supplies that exact authority-admitted snapshot. Binding does
+/// not export source, evaluate a predicate, or observe cancellation.
+pub struct PreparedNativeGenerationScope {
+    authority: AuthorityRefV1,
+    components: GenerationComponentReceiptsV2,
+    binding: FsviV2IdentityBinding,
+    tier: EmbedderTierTag,
+    membership: GenerationScopeMembership,
+}
+
+struct GenerationScopeMembership {
+    documents: Arc<BTreeMap<String, IndexableDocument>>,
+    allowed: Arc<BTreeSet<String>>,
+}
+
+fn prepare_generation_membership(
+    cx: &Cx,
+    source: Vec<IndexableDocument>,
+    mut accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+) -> SearchResult<GenerationScopeMembership> {
+    let mut documents = BTreeMap::new();
+    let mut allowed = BTreeSet::new();
+    for document in source {
+        checkpoint(cx, "native_ann.generation_scope.document")?;
+        let accepted = accept(&document);
+        checkpoint(cx, "native_ann.generation_scope.document_complete")?;
+        if accepted? {
+            allowed.insert(document.id.clone());
+        }
+        if documents.insert(document.id.clone(), document).is_some() {
+            return Err(invalid(
+                "scope.source",
+                "duplicate-id",
+                "the retained source inventory must contain unique document IDs",
+            ));
+        }
+    }
+    checkpoint(cx, "native_ann.generation_scope.complete")?;
+    Ok(GenerationScopeMembership {
+        documents: Arc::new(documents),
+        allowed: Arc::new(allowed),
+    })
+}
+
+impl PreparedNativeGenerationScope {
+    pub(super) fn from_source(
+        cx: &Cx,
+        authority: AuthorityRefV1,
+        components: GenerationComponentReceiptsV2,
+        binding: FsviV2IdentityBinding,
+        tier: EmbedderTierTag,
+        source: Vec<IndexableDocument>,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+    ) -> SearchResult<Self> {
+        Ok(Self {
+            authority,
+            components,
+            binding,
+            tier,
+            membership: prepare_generation_membership(cx, source, accept)?,
+        })
+    }
+
+    /// Bind the precomputed scope to the exact admitted publication result.
+    ///
+    /// The complete authority reference, component receipts, artifact generation,
+    /// tier and frozen embedding/storage identity must agree. Equality of document
+    /// IDs or generation sequence alone never authorizes reuse. Every source and
+    /// predicate operation is already complete; this step only checks retained
+    /// identities and moves the prepared maps into a searchable scope.
+    ///
+    /// There is deliberately no cancellation checkpoint: a caller may bind a
+    /// known committed publication even if cancellation arrived after commit.
+    /// A mismatch after publication must be reported as committed but not
+    /// activated, preserving the durable receipt and previous serving selection.
+    ///
+    /// # Errors
+    /// Refuses a snapshot that does not select this exact prepared candidate.
+    pub fn bind(
+        self,
+        snapshot: Arc<NativeGenerationSnapshot>,
+    ) -> SearchResult<NativeScopedGenerationSnapshot> {
+        let manifest = snapshot.retained_snapshot().manifest();
+        let tier_name = match self.tier {
+            EmbedderTierTag::Fast => "fast",
+            EmbedderTierTag::Quality => "quality",
+        };
+        if snapshot.authority() != self.authority
+            || manifest.generation() != self.binding.generation()
+            || manifest.components() != self.components
+            || snapshot.tier() != self.tier
+            || snapshot.metadata().embedders.get(tier_name) != Some(self.binding.frozen_identity())
+        {
+            return Err(invalid(
+                "scope.prepared",
+                "candidate-mismatch",
+                "prepared source membership belongs to a different authority candidate",
+            ));
+        }
+        Ok(NativeScopedGenerationSnapshot::from_membership(
+            snapshot,
+            self.membership,
+        ))
+    }
+}
+
 impl NativeGenerationSnapshot {
     /// Freeze a source predicate over this exact retained authority generation.
     ///
@@ -83,42 +197,35 @@ impl NativeGenerationSnapshot {
         self: &Arc<Self>,
         cx: &Cx,
         max_source_bytes: usize,
-        mut accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
+        accept: impl FnMut(&IndexableDocument) -> SearchResult<bool>,
     ) -> SearchResult<NativeScopedGenerationSnapshot> {
         checkpoint(cx, "native_ann.generation_scope.start")?;
         let source = self.source_documents(cx, max_source_bytes)?;
-        let mut documents = BTreeMap::new();
-        let mut allowed = BTreeSet::new();
-        for document in source {
-            checkpoint(cx, "native_ann.generation_scope.document")?;
-            let accepted = accept(&document);
-            checkpoint(cx, "native_ann.generation_scope.document_complete")?;
-            if accepted? {
-                allowed.insert(document.id.clone());
-            }
-            if documents.insert(document.id.clone(), document).is_some() {
-                return Err(invalid(
-                    "scope.source",
-                    "duplicate-id",
-                    "the retained source inventory must contain unique document IDs",
-                ));
-            }
-        }
-        checkpoint(cx, "native_ann.generation_scope.complete")?;
-        Ok(NativeScopedGenerationSnapshot {
-            snapshot: Arc::clone(self),
-            lexical: ScopedLexical {
-                index: ScopeSource::Authority {
-                    snapshot: Arc::clone(self),
-                    documents: Arc::new(documents),
-                },
-                allowed: Arc::new(allowed),
-            },
-        })
+        let membership = prepare_generation_membership(cx, source, accept)?;
+        Ok(NativeScopedGenerationSnapshot::from_membership(
+            Arc::clone(self),
+            membership,
+        ))
     }
 }
 
 impl NativeScopedGenerationSnapshot {
+    fn from_membership(
+        snapshot: Arc<NativeGenerationSnapshot>,
+        membership: GenerationScopeMembership,
+    ) -> Self {
+        Self {
+            lexical: ScopedLexical {
+                index: ScopeSource::Authority {
+                    snapshot: Arc::clone(&snapshot),
+                    documents: membership.documents,
+                },
+                allowed: membership.allowed,
+            },
+            snapshot,
+        }
+    }
+
     /// Number of source documents eligible in this scope, not query matches.
     #[must_use]
     pub fn len(&self) -> usize {

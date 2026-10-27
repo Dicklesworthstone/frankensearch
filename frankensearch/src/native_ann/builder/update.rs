@@ -212,6 +212,21 @@ impl NativeIndexUpdate {
         index: Arc<NativeAnnIndex>,
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.update.authority")?;
+        // An explicitly reopened predecessor carries the newer selection's
+        // physical slot pair. That pair cannot authorize incremental edits to
+        // its historical source. A previously current retained snapshot keeps
+        // its own original pair and remains eligible for ordinary stale fencing.
+        if snapshot
+            .retained_snapshot()
+            .selected_predecessor_of()
+            .is_some()
+        {
+            return Err(invalid(
+                "update.authority",
+                "reopened-predecessor",
+                "incremental updates require a snapshot with its originally selected authority pair",
+            ));
+        }
         let predecessor = index.owner_witness().generation;
         if generation.sequence <= predecessor.sequence {
             return Err(invalid(
