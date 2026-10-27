@@ -39,7 +39,8 @@ use super::{
     invalid, lower_hex,
 };
 use crate::{
-    Cx, Embedder, GenerationCandidateV1, IndexableDocument, LexicalRead, ScoredResult, SearchResult,
+    Cx, Embedder, GenerationCandidateV1, IndexableDocument, LexicalRead, ScoreSource, ScoredResult,
+    SearchResult,
 };
 
 #[cfg(test)]
@@ -671,6 +672,49 @@ impl NativeGenerationSnapshot {
             .search_progressive_with_quality(cx, fast, quality, text, k)
     }
 
+    /// Search the retained Quill image without loading or invoking a model.
+    ///
+    /// This is an explicit keyword request over the already fully admitted
+    /// authority, not a fallback from failed semantic retrieval. Every result
+    /// belongs to the common live document cohort of all admitted vector owners.
+    /// Scores and ordering are Quill's raw lexical results; no semantic fusion,
+    /// vector address, or semantic score is reported. Only winning documents
+    /// are hydrated, using the same lexical snapshot that produced them.
+    ///
+    /// Both single-tier and complete progressive generations are supported.
+    /// A zero limit returns no results after checking cancellation. Larger
+    /// limits are bounded by the admitted live cohort. No source corpus is
+    /// exported, authority followed, or component pathname reopened.
+    ///
+    /// # Errors
+    /// Propagates lexical query, hydration and cancellation failures, and
+    /// refuses inconsistent scores, duplicate or nonlive IDs, or hydration
+    /// that changes a winner's identity or score.
+    pub async fn search_lexical_text(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.readers
+            .search_lexical_with_reader(cx, &self.readers.lexical, text, k)
+            .await
+    }
+
+    // Only the closed scope adapter may replace the lexical view; its reader
+    // and membership retain this same immutable authority and live cohort.
+    pub(in crate::native_ann) async fn scoped_lexical_text(
+        &self,
+        cx: &Cx,
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.readers
+            .search_lexical_with_reader(cx, lexical, text, k)
+            .await
+    }
+
     // Only the closed source-scope adapter may wrap this immutable lexical
     // reader. Its source inventory is exported from these same admitted images.
     pub(in crate::native_ann) fn scoped_lexical(&self) -> &dyn LexicalRead {
@@ -796,6 +840,79 @@ impl CompositeReaders {
 
     fn bounded_limit(&self, requested: usize) -> usize {
         requested.min(usize::try_from(self.vector.owner_witness().live_count).unwrap_or(usize::MAX))
+    }
+
+    async fn search_lexical_with_reader(
+        &self,
+        cx: &Cx,
+        lexical: &dyn LexicalRead,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        checkpoint(cx, "native_ann.generation.lexical_search")?;
+        let k = self.bounded_limit(k);
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let query = lexical.query_text(text);
+        let response = lexical.search_candidates(cx, &query, k).await;
+        checkpoint(cx, "native_ann.generation.lexical_response")?;
+        let batch = response?;
+        if batch.results().len() > k {
+            return Err(refused("lexical-search", "overfull-response"));
+        }
+        let mut seen = BTreeSet::new();
+        for hit in batch.results() {
+            checkpoint(cx, "native_ann.generation.lexical_candidate")?;
+            self.validate_lexical_hit(hit)?;
+            if !seen.insert(hit.doc_id.as_str()) {
+                return Err(refused("lexical-search", "duplicate-document"));
+            }
+        }
+        drop(seen);
+        let (mut results, context) = batch.into_parts();
+        let identities: Vec<_> = results
+            .iter()
+            .map(|hit| (hit.doc_id.clone(), hit.score.to_bits()))
+            .collect();
+        let hydrated = lexical
+            .hydrate_candidates(cx, context.as_ref(), &mut results)
+            .await;
+        checkpoint(cx, "native_ann.generation.lexical_hydrated")?;
+        hydrated?;
+        for (hit, (id, score)) in results.iter_mut().zip(identities) {
+            checkpoint(cx, "native_ann.generation.lexical_result")?;
+            if hit.doc_id != id || hit.score.to_bits() != score {
+                return Err(refused("lexical-search", "hydration-changed-winner"));
+            }
+            self.validate_lexical_hit(hit)?;
+            // A lexical document coordinate is not a physical vector address.
+            hit.index = None;
+        }
+        checkpoint(cx, "native_ann.generation.lexical_complete")?;
+        Ok(results)
+    }
+
+    fn validate_lexical_hit(&self, hit: &ScoredResult) -> SearchResult<()> {
+        if !hit.score.is_finite()
+            || hit.lexical_score.map(f32::to_bits) != Some(hit.score.to_bits())
+            || hit.source != ScoreSource::Lexical
+            || hit.fast_score.is_some()
+            || hit.quality_score.is_some()
+            || hit.rerank_score.is_some()
+        {
+            return Err(refused("lexical-search", "invalid-score-provenance"));
+        }
+        if self
+            .vector
+            .owner
+            .find_live_row_by_doc_id(hit.doc_id.as_str())
+            .map_err(|_| refused("lexical-search", "invalid-vector-row"))?
+            .is_none()
+        {
+            return Err(refused("lexical-search", "nonlive-document"));
+        }
+        Ok(())
     }
 
     fn source_context(&self, cx: &Cx) -> SearchResult<(Arc<KeeperSnapshot>, usize, [u16; 4])> {

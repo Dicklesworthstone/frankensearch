@@ -187,6 +187,56 @@ async fn progressive_fixture(cx: &Cx) -> ProgressiveFixture {
 }
 
 #[test]
+fn progressive_lexical_search_never_invokes_either_admitted_provider() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fixture = progressive_fixture(&cx).await;
+        let readers = fixture.admit(&cx).unwrap();
+        assert_eq!(
+            readers.topology(),
+            NativeGenerationTopology::FullProgressive
+        );
+        assert_eq!(readers.vector.owner_witness().live_count, 6);
+        assert_eq!(
+            readers.full_quality().unwrap().owner_witness().live_count,
+            6
+        );
+        std::fs::rename(
+            fixture.directory.path().join("source"),
+            fixture.directory.path().join("relocated"),
+        )
+        .unwrap();
+        for query in ["cohort", "quality-special", "absent-term"] {
+            for k in [0, 1, usize::MAX] {
+                let canonical = readers.lexical.query_text(query);
+                let expected = readers
+                    .lexical
+                    .search(&cx, &canonical, k.min(6))
+                    .await
+                    .unwrap();
+                let actual = readers
+                    .search_lexical_with_reader(&cx, &readers.lexical, query, k)
+                    .await
+                    .unwrap();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_eq!(actual.doc_id, expected.doc_id);
+                    assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+                    assert_eq!(actual.lexical_score, expected.lexical_score);
+                    assert_eq!(actual.metadata, expected.metadata);
+                    assert_eq!(actual.metadata.as_deref().unwrap()["version"], "old");
+                    assert_eq!(actual.source, ScoreSource::Lexical);
+                    assert!(actual.index.is_none());
+                    assert!(actual.fast_score.is_none() && actual.quality_score.is_none());
+                    assert!(actual.rerank_score.is_none());
+                }
+            }
+        }
+        assert_eq!(fixture.fast.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fixture.quality.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
 fn progressive_authority_retrieves_quality_beyond_fast_window_and_defers_quality_work() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let fixture = progressive_fixture(&cx).await;
@@ -1108,6 +1158,109 @@ fn retained_source_checks_schema_and_complete_cohort_without_text_queries() {
                     "live-count-mismatch"
                 },
             );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn model_free_lexical_search_preserves_raw_scores_and_retained_hydration() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for tier in [EmbedderTierTag::Fast, EmbedderTierTag::Quality] {
+            let provider = Provider::new();
+            let fixture = fixture(&cx, &provider, tier).await;
+            let exact = fixture.admit(&cx).unwrap();
+            let fixture = fixture.with_ann(&cx, HnswParams::default(), 73);
+            let ann = fixture.admit(&cx).unwrap();
+            std::fs::rename(
+                fixture.directory.path().join("source"),
+                fixture.directory.path().join("relocated"),
+            )
+            .unwrap();
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            // No provider is retained by either reader or accepted by this API.
+            drop(provider);
+            for readers in [exact, ann] {
+                for query in ["common", "common retained", "absent-term"] {
+                    for k in [0, 1, usize::MAX] {
+                        let canonical = readers.lexical.query_text(query);
+                        let expected = readers
+                            .lexical
+                            .search(&cx, &canonical, k.min(2))
+                            .await
+                            .unwrap();
+                        let actual = readers
+                            .search_lexical_with_reader(&cx, &readers.lexical, query, k)
+                            .await
+                            .unwrap();
+                        assert_eq!(actual.len(), expected.len());
+                        for (actual, expected) in actual.iter().zip(expected) {
+                            assert_eq!(actual.doc_id, expected.doc_id);
+                            assert_ne!(actual.doc_id, "dead");
+                            assert_eq!(actual.score.to_bits(), expected.score.to_bits());
+                            assert_eq!(actual.lexical_score, expected.lexical_score);
+                            assert_eq!(actual.metadata, expected.metadata);
+                            assert_eq!(actual.metadata.as_deref().unwrap()["version"], "old");
+                            assert_eq!(actual.source, ScoreSource::Lexical);
+                            assert!(actual.index.is_none());
+                            assert!(actual.fast_score.is_none() && actual.quality_score.is_none());
+                            assert!(actual.rerank_score.is_none());
+                        }
+                    }
+                }
+                cx.set_cancel_requested(true);
+                for k in [0, usize::MAX] {
+                    assert!(matches!(
+                        readers
+                            .search_lexical_with_reader(&cx, &readers.lexical, "common", k)
+                            .await,
+                        Err(SearchError::Cancelled { .. })
+                    ));
+                }
+                cx.set_cancel_requested(false);
+                assert_eq!(
+                    readers
+                        .search_lexical_with_reader(&cx, &readers.lexical, "common", 2)
+                        .await
+                        .unwrap()
+                        .len(),
+                    2
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn lexical_search_refuses_winners_outside_the_admitted_live_cohort() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let provider = Provider::new();
+        let fixture = fixture(&cx, &provider, EmbedderTierTag::Fast).await;
+        for id in ["dead", "foreign"] {
+            let readers = fixture.admit(&cx).unwrap();
+            let writer = QuillIndex::create(
+                &cx,
+                fixture.directory.path().join(format!("foreign-{id}")),
+                config(),
+            )
+            .await
+            .unwrap();
+            writer
+                .index_documents(&cx, &[IndexableDocument::new(id, "common")])
+                .await
+                .unwrap();
+            writer.commit(&cx).await.unwrap();
+            let foreign = retained_lexical(&cx, &writer.snapshot().unwrap());
+            // Exercise the production cohort guard using real, independently
+            // admitted lexical bytes: a tombstone and an unknown ID both fail.
+            assert!(matches!(
+                readers
+                    .search_lexical_with_reader(&cx, &foreign, "common", 1)
+                    .await,
+                Err(SearchError::InvalidConfig { field, value, .. })
+                    if field == "native_ann.generation.lexical-search"
+                        && value == "nonlive-document"
+            ));
         }
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     });
@@ -2040,6 +2193,37 @@ mod qualified_rollback {
             let scoped = retained
                 .scope(&cx, BUDGET, |document| Ok(document.id != "a"))
                 .unwrap();
+            let before_keyword = (
+                fixture.fast.calls.load(Ordering::SeqCst),
+                fixture.quality.calls.load(Ordering::SeqCst),
+            );
+            let expected_keyword: Vec<_> = retained
+                .search_lexical_text(&cx, "cohort", usize::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|hit| hit.doc_id != "a")
+                .take(2)
+                .collect();
+            assert_eq!(expected_keyword.len(), 2);
+            assert_same_scored_results(
+                &scoped.search_lexical_text(&cx, "cohort", 2).await.unwrap(),
+                &expected_keyword,
+            );
+            assert!(expected_keyword.iter().all(|hit| {
+                hit.source == ScoreSource::Lexical
+                    && hit.index.is_none()
+                    && hit.fast_score.is_none()
+                    && hit.quality_score.is_none()
+                    && hit.metadata.as_deref().unwrap()["version"] == "old"
+            }));
+            assert_eq!(
+                (
+                    fixture.fast.calls.load(Ordering::SeqCst),
+                    fixture.quality.calls.load(Ordering::SeqCst),
+                ),
+                before_keyword
+            );
             let quality_calls = fixture.quality.calls.load(Ordering::SeqCst);
             let mut stream = scoped
                 .search_progressive_with_quality(
@@ -2434,6 +2618,46 @@ mod qualified_rollback {
                         .iter()
                         .all(|hit| hit.doc_id.starts_with("excluded-"))
                 );
+                let before_keyword = provider.0.calls.load(Ordering::SeqCst);
+                let raw_lexical = retained
+                    .readers
+                    .lexical
+                    .search(&cx, "needle", documents.len())
+                    .await
+                    .unwrap();
+                assert_same_scored_results(
+                    &retained
+                        .search_lexical_text(&cx, "needle", usize::MAX)
+                        .await
+                        .unwrap(),
+                    &raw_lexical,
+                );
+                let expected_keyword: Vec<_> = raw_lexical
+                    .into_iter()
+                    .filter(|hit| hit.doc_id.starts_with("included-"))
+                    .collect();
+                assert_eq!(expected_keyword.len(), 2);
+                for k in [1, 2, usize::MAX] {
+                    let expected = &expected_keyword[..k.min(expected_keyword.len())];
+                    let keyword = scope.search_lexical_text(&cx, "needle", k).await.unwrap();
+                    assert_same_scored_results(&keyword, expected);
+                    assert_same_scored_results(
+                        &prepared_scope
+                            .search_lexical_text(&cx, "needle", k)
+                            .await
+                            .unwrap(),
+                        expected,
+                    );
+                    assert!(keyword.iter().all(|hit| {
+                        hit.source == ScoreSource::Lexical
+                            && hit.index.is_none()
+                            && hit.fast_score.is_none()
+                            && hit.quality_score.is_none()
+                            && hit.rerank_score.is_none()
+                            && hit.metadata.as_deref().unwrap()["tenant"] == "blue"
+                    }));
+                }
+                assert_eq!(provider.0.calls.load(Ordering::SeqCst), before_keyword);
                 let filtered = scope
                     .search_text(&cx, provider.as_ref(), "needle", 2)
                     .await
@@ -2485,6 +2709,14 @@ mod qualified_rollback {
                 assert!(narrowed.document("included-alpha").is_none());
                 assert_eq!(
                     narrowed
+                        .search_lexical_text(&cx, "needle", usize::MAX)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "included-beta"
+                );
+                assert_eq!(
+                    narrowed
                         .narrow(&cx, |_| Ok(true))
                         .unwrap()
                         .search_text(&cx, provider.as_ref(), "needle", usize::MAX)
@@ -2504,6 +2736,30 @@ mod qualified_rollback {
                         .is_empty()
                 );
                 let before_empty = provider.0.calls.load(Ordering::SeqCst);
+                assert!(
+                    empty
+                        .search_lexical_text(&cx, "needle", usize::MAX)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    scope
+                        .search_lexical_text(&cx, "needle", 0)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                cx.set_cancel_requested(true);
+                assert!(matches!(
+                    empty.search_lexical_text(&cx, "needle", 0).await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert!(matches!(
+                    scope.search_lexical_text(&cx, "needle", 2).await,
+                    Err(SearchError::Cancelled { .. })
+                ));
+                cx.set_cancel_requested(false);
                 assert!(
                     empty
                         .search_text(&cx, provider.as_ref(), "needle", 1)
@@ -2859,6 +3115,29 @@ mod qualified_rollback {
                             doc.id == "gamma" && doc.content == "changed complete source"
                         })
                 );
+                let before_keyword = provider.calls.load(Ordering::SeqCst);
+                let old_keyword = retained
+                    .search_lexical_text(&cx, "common", usize::MAX)
+                    .await
+                    .unwrap();
+                let new_keyword = current
+                    .search_lexical_text(&cx, "common", usize::MAX)
+                    .await
+                    .unwrap();
+                assert!(old_keyword.iter().any(|hit| hit.doc_id == "alpha"));
+                assert!(!old_keyword.iter().any(|hit| hit.doc_id == "gamma"));
+                assert!(new_keyword.iter().any(|hit| hit.doc_id == "gamma"));
+                assert!(!new_keyword.iter().any(|hit| hit.doc_id == "alpha"));
+                for (hits, version) in [(&old_keyword, "old"), (&new_keyword, "new")] {
+                    let beta = hits.iter().find(|hit| hit.doc_id == "beta").unwrap();
+                    assert_eq!(beta.metadata.as_deref().unwrap()["version"], version);
+                    assert!(hits.iter().all(|hit| {
+                        hit.doc_id != "dead"
+                            && hit.index.is_none()
+                            && hit.source == ScoreSource::Lexical
+                    }));
+                }
+                assert_eq!(provider.calls.load(Ordering::SeqCst), before_keyword);
                 let old_hits = retained
                     .search_text(&cx, provider.as_ref(), "common", 5)
                     .await

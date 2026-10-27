@@ -127,6 +127,57 @@ fn rollback_arguments() -> Vec<&'static str> {
 }
 
 #[test]
+fn authority_lexical_options_require_explicit_read_only_execution() {
+    for command in ["authority-search", "authority-serve"] {
+        let mut arguments = vec![command, "--receipt", "selected.json", "--lexical-only"];
+        if command == "authority-search" {
+            arguments.extend(["--query", "retry"]);
+        }
+        let options = parse(&arguments).unwrap().unwrap();
+        assert!(options.lexical_only);
+        for extra in [
+            vec!["--model-dir", "models"],
+            vec!["--quality-backend", "onnx"],
+            vec!["--quality-model-dir", "models"],
+            vec!["--allow-updates"],
+            vec!["--lexical-only"],
+        ] {
+            let mut rejected = arguments.clone();
+            rejected.extend(extra);
+            assert!(parse(&rejected).is_err(), "{rejected:?}");
+        }
+        if command == "authority-serve" {
+            arguments.push("--allow-activation");
+            assert!(parse(&arguments).unwrap().unwrap().allow_activation);
+        }
+    }
+    for command in [
+        "authority-index",
+        "authority-update",
+        "authority-rebuild",
+        "authority-fetch",
+    ] {
+        assert!(parse(&[command, "--receipt", "selected.json", "--lexical-only"]).is_err());
+    }
+    for mode in ["lexical", "fast", "quality", "full"] {
+        assert!(
+            serde_json::from_value::<AuthorityRequest>(serde_json::json!({
+                "query": "retry", "mode": mode,
+            }))
+            .is_ok()
+        );
+    }
+    for mode in ["semantic", "hybrid", "auto", "lexical_fallback"] {
+        assert!(
+            serde_json::from_value::<AuthorityRequest>(serde_json::json!({
+                "query": "retry", "mode": mode,
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn authority_fetch_options_select_windows_without_model_or_writer_grants() {
     let base = [
         "authority-fetch",
@@ -3299,6 +3350,234 @@ mod warm_authority {
     }
 
     #[test]
+    fn authority_lexical_search_uses_no_model_and_filters_before_the_cutoff() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann) in [
+                ("lexical-fast-exact", EmbedderTierTag::Fast, false),
+                ("lexical-quality-exact", EmbedderTierTag::Quality, false),
+                ("lexical-fast-hnsw", EmbedderTierTag::Fast, true),
+                ("lexical-quality-hnsw", EmbedderTierTag::Quality, true),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let selected = publish_source_fixture(
+                    &cx,
+                    &parent,
+                    &provider,
+                    tier,
+                    ann,
+                    vec![
+                        IndexableDocument::new("blocked", "retry retry retry retry")
+                            .with_metadata("tenant", "red"),
+                        IndexableDocument::new("allowed", "retry network requests with a backoff")
+                            .with_title("Retry guide")
+                            .with_metadata("tenant", "blue"),
+                        IndexableDocument::new("garden", "grow flowers")
+                            .with_metadata("tenant", "blue"),
+                    ],
+                )
+                .await;
+                let receipt_path = parent.join("source.json");
+                let authority_before = fs::read(selected.root.join("AUTHORITY")).unwrap();
+                let lock_before = fs::read(selected.root.join("LOCK")).unwrap();
+                let receipt_before = fs::read(&receipt_path).unwrap();
+                let calls = provider.calls.load(Ordering::Relaxed);
+                let mut options =
+                    search_options(&receipt_path, Some(r#"{"metadata":{"tenant":"blue"}}"#));
+                options.lexical_only = true;
+                let mut output = Vec::new();
+                search_with_loader(&cx, &options, &mut output, |_| {
+                    panic!("explicit lexical search must never load a model")
+                })
+                .await
+                .unwrap();
+                let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(response["mode"], "lexical");
+                assert_eq!(response["retrieval"], "lexical");
+                assert_eq!(response["semantic_used"], false);
+                assert_eq!(response["semantic_components_verified"], true);
+                assert_eq!(response["authority"], serde_json::json!(selected.authority));
+                assert_eq!(response["scope"]["eligible_documents"], 2);
+                let hits = response["results"].as_array().unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0]["doc_id"], "allowed");
+                assert_eq!(hits[0]["source"], "Lexical");
+                assert_eq!(hits[0]["score"], hits[0]["lexical_score"]);
+                assert!(hits[0]["score"].as_f64().unwrap().is_finite());
+                assert_eq!(hits[0]["metadata"]["tenant"], "blue");
+                for field in ["fast_score", "quality_score", "rerank_score", "index"] {
+                    assert!(hits[0][field].is_null(), "{field}");
+                }
+
+                // The same scope cannot create a semantic fallback on failure.
+                options.lexical_only = false;
+                output.clear();
+                assert!(
+                    search_with_loader(&cx, &options, &mut output, |_| {
+                        Err(bad("model unavailable"))
+                    })
+                    .await
+                    .is_err()
+                );
+                assert!(output.is_empty());
+                options.lexical_only = true;
+                options.max_source_bytes = 1;
+                assert!(
+                    search_with_loader(&cx, &options, &mut output, |_| {
+                        panic!("source admission failure cannot load a model")
+                    })
+                    .await
+                    .is_err()
+                );
+                assert!(output.is_empty());
+                options.max_source_bytes = MAX_INPUT_BYTES;
+                cx.set_cancel_requested(true);
+                assert!(
+                    search_with_loader(&cx, &options, &mut output, |_| {
+                        panic!("cancelled lexical search cannot load a model")
+                    })
+                    .await
+                    .is_err()
+                );
+                cx.set_cancel_requested(false);
+                assert!(output.is_empty());
+                assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+                assert_eq!(
+                    fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                    authority_before
+                );
+                assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock_before);
+                assert_eq!(fs::read(receipt_path).unwrap(), receipt_before);
+
+                let semantic_mode = match tier {
+                    EmbedderTierTag::Fast => "fast",
+                    EmbedderTierTag::Quality => "quality",
+                };
+                let mut hybrid = open_session(&cx, selected.clone(), &provider, false);
+                let responses = exchange(&cx, &mut hybrid, &[
+                    serde_json::json!({"query":"retry", "mode":"lexical", "filter":{"ids":["allowed"]}}),
+                    serde_json::json!({"query":"retry", "mode":semantic_mode}),
+                ]).await;
+                let modes = responses[0]["query_modes"].as_array().unwrap();
+                assert_eq!(modes.len(), 2);
+                assert!(modes.contains(&serde_json::json!(semantic_mode)));
+                assert!(modes.contains(&serde_json::json!("lexical")));
+                assert_eq!(responses[1]["results"][0]["doc_id"], "allowed");
+                assert_eq!(responses[1]["retrieval"], "lexical");
+                assert_eq!(responses[1]["semantic_used"], false);
+                assert_eq!(responses[2]["mode"], semantic_mode);
+                assert_eq!(provider.calls.load(Ordering::Relaxed), calls + 1);
+            }
+        });
+    }
+
+    #[test]
+    fn lexical_authority_sessions_retain_scope_and_activate_without_semantic_privileges() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("lexical-activation");
+            let old_provider = provider();
+            let selected = publish(
+                &cx,
+                &parent,
+                None,
+                &old_provider,
+                EmbedderTierTag::Quality,
+                "old",
+                true,
+            )
+            .await;
+            let root = admit_root(&selected.root).unwrap();
+            let snapshot = Arc::new(
+                selected
+                    .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                    .unwrap(),
+            );
+            let old_snapshot = Arc::clone(&snapshot);
+            let mut session = AuthoritySession::new(
+                &cx,
+                root,
+                selected.clone(),
+                snapshot,
+                AuthorityModels::Lexical,
+                (10, DEFAULT_IMAGE_BYTES),
+                true,
+            )
+            .unwrap()
+            .with_filter(
+                &cx,
+                Some(Filter::parse(r#"{"id_prefix":"retry-"}"#).unwrap()),
+                MAX_INPUT_BYTES,
+            )
+            .unwrap();
+            let mut next_identity = identity().identity;
+            next_identity.producer.implementation_revision =
+                "next-keyword-only-producer".to_owned();
+            let new_provider = Arc::new(Provider {
+                identity: next_identity,
+                calls: AtomicUsize::new(0),
+            });
+            let next = publish(
+                &cx,
+                &parent,
+                Some(&old_snapshot),
+                &new_provider,
+                EmbedderTierTag::Quality,
+                "new",
+                false,
+            )
+            .await;
+            let old_calls = old_provider.calls.load(Ordering::Relaxed);
+            let new_calls = new_provider.calls.load(Ordering::Relaxed);
+            let authority_after = fs::read(selected.root.join("AUTHORITY")).unwrap();
+            let lock_after = fs::read(selected.root.join("LOCK")).unwrap();
+            let responses = exchange(
+                &cx,
+                &mut session,
+                &[
+                    serde_json::json!({"query":"retry"}),
+                    serde_json::json!({"query":"retry", "mode":"quality"}),
+                    serde_json::json!({"query":"garden", "filter":{"ids":["garden-old"]}}),
+                    serde_json::json!({"op":"activate", "receipt":parent.join("new.json"),
+                    "expected_authority":selected.authority}),
+                    serde_json::json!({"query":"retry"}),
+                    serde_json::json!({"op":"fetch", "expected_authority":next.authority,
+                    "documents":[{"doc_id":"retry-new"}]}),
+                ],
+            )
+            .await;
+            assert_eq!(responses[0]["query_modes"], serde_json::json!(["lexical"]));
+            assert_eq!(responses[0]["updates_enabled"], false);
+            assert_eq!(responses[1]["results"][0]["doc_id"], "retry-old");
+            assert_eq!(responses[2]["code"], "semantic_search_disabled");
+            assert!(responses[3]["results"].as_array().unwrap().is_empty());
+            assert_eq!(responses[3]["scope"]["eligible_documents"], 0);
+            assert_eq!(responses[4]["event"], "activated");
+            assert_eq!(responses[5]["results"][0]["doc_id"], "retry-new");
+            assert_eq!(responses[5]["authority"], serde_json::json!(next.authority));
+            assert_eq!(
+                responses[6]["documents"][0]["content"],
+                "retry network requests"
+            );
+            assert_eq!(
+                old_snapshot
+                    .search_lexical_text(&cx, "retry", 10)
+                    .await
+                    .unwrap()[0]
+                    .doc_id,
+                "retry-old"
+            );
+            assert_eq!(old_provider.calls.load(Ordering::Relaxed), old_calls);
+            assert_eq!(new_provider.calls.load(Ordering::Relaxed), new_calls);
+            assert_eq!(
+                fs::read(selected.root.join("AUTHORITY")).unwrap(),
+                authority_after
+            );
+            assert_eq!(fs::read(selected.root.join("LOCK")).unwrap(), lock_after);
+            assert!(session.with_updates(2, MAX_INPUT_BYTES).is_err());
+        });
+    }
+
+    #[test]
     fn filtered_search_and_sessions_keep_the_owner_scope_on_retained_images() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             for (label, tier, ann) in [
@@ -5990,7 +6269,11 @@ mod warm_authority {
             let mut session = open_session(&cx, old.clone(), &provider, false)
                 .with_updates(2, crate::MAX_INPUT_BYTES)
                 .unwrap();
-            session.models.fast = gated.clone();
+            session.models = Models {
+                fast: gated.clone(),
+                quality: None,
+            }
+            .into();
             let request = update_message(
                 &parent,
                 "loser",

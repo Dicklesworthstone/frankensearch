@@ -594,6 +594,56 @@ broken output stream ends the session while retaining the known publication and
 activation status in the terminal error. The server never retries an uncertain
 write automatically.
 
+### Search a fixed authority without loading a model
+
+`authority-search --lexical-only` and `authority-serve --lexical-only` explicitly
+select keyword search over the authority's retained Quill image, for fast-only,
+quality-only, and complete two-tier generations:
+
+```sh
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --lexical-only --query 'retry requests' --limit 10 \
+  --filter '{"metadata":{"project":"client"}}'
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --lexical-only --allow-activation
+```
+
+This makes keyword retrieval available when the embedding model is unavailable.
+It neither loads nor invokes a model. The complete selected authority, including
+its vector and declared ANN images, must still pass normal admission; this is
+not a partial-component recovery path. An old receipt still refuses a fresh open
+after the root advances, while an existing session keeps its retained reader.
+
+Results report `mode: "lexical"`, `retrieval: "lexical"`,
+`semantic_used: false`, and `semantic_components_verified: true`. Scores are raw
+Quill BM25 with lexical provenance; vector addresses and fast, quality and rerank
+scores are absent. Metadata hydration uses the same retained lexical snapshot.
+Fixed and request filters apply before the result cutoff and use the existing
+source budgets. An empty scope stays empty without loading a model.
+
+Authority servers with loaded models also accept an explicit lexical query:
+
+```jsonl
+{"id":"keywords","query":"retry requests","mode":"lexical","limit":10}
+```
+
+Omitting `mode` uses the server's startup choice. A server with loaded models
+permits its available `fast`, `quality`, or `full` modes plus `lexical`; a
+lexical-only server refuses all three model-backed modes with
+`semantic_search_disabled`. Model failures never change the requested mode.
+The ready frame lists the supported `query_modes`. One-shot search also accepts
+`--mode lexical`; combining `--lexical-only` with a semantic mode is an error.
+
+Lexical startup rejects model options and `--allow-updates`. Source fetching
+remains available, and `--allow-activation` permits a complete newer authority
+on the same qualified root, topology and security profile. Since no model is loaded,
+the successor may have different producers. Activation still prepares the fixed
+scope before changing any serving state. Library users can call
+`search_lexical_text(&cx, query, limit)` on either a `NativeGenerationSnapshot`
+or its prepared `NativeScopedGenerationSnapshot` without supplying an embedder.
+
 ### Filter fixed-authority search and warm requests
 
 `authority-search --filter JSON` and `authority-serve --filter JSON` use the
@@ -628,8 +678,9 @@ An absent or null request filter preserves the fixed scope. An empty object
 adds no restriction; `ids: []` selects no documents. Filtered result frames
 report `scope.filtered: true` and `scope.eligible_documents`, the number of
 eligible source documents before query matching. Empty scopes return no hits
-and perform no query inference, while still requiring each selected producer's
-identity and local model.
+and perform no query inference. Semantic execution still requires each selected
+producer's identity and local model; explicit lexical execution requires neither
+model loading nor query inference.
 An empty full stream emits both empty `initial` and `refined` frames to complete
 the request. Cancellation, inference failure, or a failed output write cannot
 produce a successful completion frame.

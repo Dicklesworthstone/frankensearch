@@ -411,6 +411,30 @@ impl NativeScopedGenerationSnapshot {
             Arc::clone(&self.lexical.allowed),
         )
     }
+
+    /// Search this frozen source scope using only retained lexical scores.
+    ///
+    /// Membership is applied before the result limit, including when excluded
+    /// documents occupy the entire initial candidate window. The immutable
+    /// Quill reader may widen through the complete cohort to fill a selective
+    /// scope; only the final window's snapshot is used for winner hydration.
+    /// No model, vector scoring, source export or predicate evaluation runs.
+    /// Returned results retain raw BM25 scores and have no vector addresses or
+    /// semantic scores. Empty scopes and zero limits still check cancellation.
+    ///
+    /// # Errors
+    /// Propagates lexical query, hydration and cancellation failures, or an
+    /// inconsistent result outside the retained live cohort or frozen scope.
+    pub async fn search_lexical_text(
+        &self,
+        cx: &Cx,
+        text: &str,
+        k: usize,
+    ) -> SearchResult<Vec<ScoredResult>> {
+        self.snapshot
+            .scoped_lexical_text(cx, &self.lexical, text, k.min(self.len()))
+            .await
+    }
 }
 
 impl NativeBuiltHybridIndex {

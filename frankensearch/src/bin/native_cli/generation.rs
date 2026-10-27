@@ -75,14 +75,15 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       --source-low N --source-high N [--input EDITS_JSONL]\n\
       [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
-  authority-search --receipt JSON --query TEXT [--limit N]\n\
+  authority-search --receipt JSON --query TEXT [--limit N] [--lexical-only]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--mode fast|quality|full] [--stream] [--filter JSON]\n\
+      [--mode fast|quality|full|lexical] [--stream] [--filter JSON]\n\
       [--max-source-bytes N] [--max-image-bytes N]\n\n\
   authority-fetch --receipt JSON --doc-id ID [--offset-bytes N] [--max-bytes N]\n\
       [--include-metadata] [--filter JSON] [--max-source-bytes N]\n\
       [--max-image-bytes N]\n\n\
   authority-serve --receipt JSON [--limit N] [--allow-activation] [--allow-updates]\n\
+      [--lexical-only]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N] [--batch-size N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
@@ -152,11 +153,18 @@ a full generation. Streaming emits separate Initial and Refined frames. It never
 authority implicitly. With --allow-activation, an explicit request may select a\n\
 new receipt: {\"op\":\"activate\",\"receipt\":\"/absolute/new.json\",\n\
 \"expected_authority\":[...the current ready/results authority bytes...]}.\n\
-Activation keeps the same qualified root, topology, security profile and producers.\n\
+Activation keeps the same qualified root, topology and security profile. Semantic\n\
+sessions also require the same producers; lexical sessions have no loaded models.\n\
 It admits the complete currently selected successor before swapping readers;\n\
 rejection retains the previous reader and returns a bounded failed response.\n\
 Authority sequence must advance, including rollback to older artifact generations.\n\
 Model migration requires restarting with the new receipt and local model options.\n\
+Explicit --lexical-only on authority-search/serve runs retained Quill keyword\n\
+search without loading or invoking a model. It excludes model options and\n\
+--allow-updates, but permits source fetch and granted activation. The complete\n\
+authority still must pass component admission. Results report mode/retrieval\n\
+lexical and raw BM25 scores. Warm requests may choose mode=lexical; a lexical\n\
+session refuses fast/quality/full. There is no automatic fallback after a model error.\n\
 With --allow-updates, an explicit update request can publish and serve a successor\n\
 using the retained model: op=update, expected_authority, work_dir, new_receipt,\n\
 source_low, source_high, and changes (upsert/delete objects). Destinations must be\n\
@@ -171,7 +179,7 @@ Search/fetch/serve --filter accepts exact IDs, a literal id_prefix, and string-v
 metadata. Every present constraint must match the retained source document.\n\
 Search requests may include a filter object; it intersects the server's fixed\n\
 filter and cannot widen it. Membership filters vector and lexical candidates\n\
-before fusion. An empty scope still requires the selected producer identity.\n\
+before fusion. Hybrid queries, including empty scopes, require the selected producer.\n\
 Filtered source export is bounded by --max-source-bytes (default 256 MiB).\n\
 The fixed server scope stays on its retained generation. Activation and updates\n\
 prepare its successor membership before changing selection or publication.\n\
@@ -209,6 +217,7 @@ enum QueryMode {
     Fast,
     Quality,
     Full,
+    Lexical,
 }
 
 impl QueryMode {
@@ -217,6 +226,7 @@ impl QueryMode {
             Self::Fast => "fast",
             Self::Quality => "quality",
             Self::Full => "full",
+            Self::Lexical => "lexical",
         }
     }
 }
@@ -243,6 +253,7 @@ struct Options {
     offset_bytes: usize,
     max_bytes: usize,
     include_metadata: bool,
+    lexical_only: bool,
     filter: Option<Filter>,
     limit: usize,
     batch_size: usize,
@@ -306,6 +317,7 @@ impl Options {
             offset_bytes: 0,
             max_bytes: 8 * 1024,
             include_metadata: false,
+            lexical_only: false,
             filter: None,
             limit: 10,
             batch_size: 64,
@@ -367,6 +379,9 @@ impl Options {
                     options.allow_activation = true;
                 }
                 "--allow-updates" if command == Command::Serve => options.allow_updates = true,
+                "--lexical-only" if matches!(command, Command::Search | Command::Serve) => {
+                    options.lexical_only = true;
+                }
                 "--model-dir"
                     if !matches!(
                         command,
@@ -473,9 +488,10 @@ impl Options {
                         "fast" => QueryMode::Fast,
                         "quality" => QueryMode::Quality,
                         "full" => QueryMode::Full,
+                        "lexical" => QueryMode::Lexical,
                         _ => {
                             return Err(bad(
-                                "authority search mode must be fast, quality, or full",
+                                "authority search mode must be fast, quality, full, or lexical",
                             ));
                         }
                     });
@@ -486,6 +502,20 @@ impl Options {
         }
         if options.receipt.as_os_str().is_empty() {
             return Err(bad("authority commands require --receipt"));
+        }
+        if options.lexical_only && options.mode.is_some_and(|mode| mode != QueryMode::Lexical) {
+            return Err(bad("--lexical-only conflicts with a semantic --mode"));
+        }
+        options.lexical_only |= options.mode == Some(QueryMode::Lexical);
+        if options.lexical_only
+            && (options.models.is_some()
+                || options.quality.backend.is_some()
+                || options.quality.directory.is_some()
+                || options.allow_updates)
+        {
+            return Err(bad(
+                "--lexical-only excludes model options and --allow-updates",
+            ));
         }
         match command {
             Command::Index => {
@@ -816,7 +846,7 @@ impl Receipt {
             NativeGenerationTopology::FullProgressive => QueryMode::Full,
         };
         let mode = requested.unwrap_or(default);
-        if mode == default || self.quality_identity.is_some() {
+        if mode == QueryMode::Lexical || mode == default || self.quality_identity.is_some() {
             Ok(mode)
         } else {
             Err(serve_refused("query_tier_unavailable"))
@@ -2014,6 +2044,9 @@ fn load_authority_models(
     mode: QueryMode,
     pool: Option<BlockingPoolHandle>,
 ) -> Result<Models> {
+    if mode == QueryMode::Lexical {
+        return Err(serve_refused("lexical_requires_model_free_execution"));
+    }
     if mode == QueryMode::Full {
         models::load(cx, options.models.as_deref(), true, &options.quality, pool)
     } else {
@@ -2049,6 +2082,9 @@ async fn query_admitted<F>(
 where
     F: FnMut(&'static str, &[ScoredResult]) -> Result<()>,
 {
+    if plan.mode == QueryMode::Lexical {
+        return Err(serve_refused("lexical_requires_model_free_execution"));
+    }
     if plan.mode == QueryMode::Full {
         let quality = loaded
             .quality
@@ -2206,8 +2242,14 @@ where
         .ok_or_else(|| bad("missing query"))?;
     validate_query(query)?;
     let receipt = Receipt::read(&options.receipt)?;
-    let mode = receipt.query_mode(options.mode)?;
-    options.quality.validate_usage(mode != QueryMode::Fast)?;
+    let mode = receipt.query_mode(if options.lexical_only {
+        Some(QueryMode::Lexical)
+    } else {
+        options.mode
+    })?;
+    options
+        .quality
+        .validate_usage(matches!(mode, QueryMode::Quality | QueryMode::Full))?;
     let snapshot = Arc::new(receipt.open(cx, options.max_image_bytes)?);
     // Source bounds and filter admission precede model loading. The scope owns
     // the same admitted generation that supplies every vector and lexical hit.
@@ -2217,17 +2259,22 @@ where
         options.filter.as_ref(),
         options.max_source_bytes,
     )?;
-    let loaded = Models {
-        fast: load_model(if mode == QueryMode::Quality {
-            EmbedderTierTag::Quality
-        } else {
-            EmbedderTierTag::Fast
-        })?,
-        quality: if mode == QueryMode::Full {
-            Some(load_model(EmbedderTierTag::Quality)?)
-        } else {
-            None
-        },
+    let loaded = if mode == QueryMode::Lexical {
+        AuthorityModels::Lexical
+    } else {
+        Models {
+            fast: load_model(if mode == QueryMode::Quality {
+                EmbedderTierTag::Quality
+            } else {
+                EmbedderTierTag::Fast
+            })?,
+            quality: if mode == QueryMode::Full {
+                Some(load_model(EmbedderTierTag::Quality)?)
+            } else {
+                None
+            },
+        }
+        .into()
     };
     let plan = QueryPlan {
         text: query,
@@ -2235,7 +2282,7 @@ where
         mode,
         stream: options.stream,
     };
-    query_admitted(
+    query_selected(
         cx,
         &snapshot,
         scope.as_ref(),
@@ -2254,6 +2301,7 @@ where
                 &mut response,
                 scope.as_ref().map(NativeScopedGenerationSnapshot::len),
             );
+            annotate_execution(&mut response, mode);
             emit(output, &response)
         },
     )
@@ -2336,6 +2384,92 @@ struct AuthoritySearchRequest {
     #[serde(default)]
     stream: bool,
     filter: Option<Filter>,
+}
+
+/// Explicit execution policy. A missing or failed model never selects lexical
+/// execution; that choice must come from startup options or a query request.
+enum AuthorityModels {
+    Semantic(Models),
+    Lexical,
+}
+
+impl From<Models> for AuthorityModels {
+    fn from(models: Models) -> Self {
+        Self::Semantic(models)
+    }
+}
+
+impl AuthorityModels {
+    const fn is_lexical(&self) -> bool {
+        matches!(self, Self::Lexical)
+    }
+
+    fn models(&self) -> Result<&Models> {
+        match self {
+            Self::Semantic(models) => Ok(models),
+            Self::Lexical => Err(serve_refused("semantic_search_disabled")),
+        }
+    }
+
+    fn admit(&self, receipt: &Receipt) -> Result<()> {
+        match self {
+            Self::Semantic(models) => admit_serving_models(receipt, models),
+            Self::Lexical => Ok(()),
+        }
+    }
+
+    fn query_mode(&self, receipt: &Receipt, requested: Option<QueryMode>) -> Result<QueryMode> {
+        let mode = if self.is_lexical() {
+            requested.unwrap_or(QueryMode::Lexical)
+        } else {
+            receipt.query_mode(requested)?
+        };
+        if mode != QueryMode::Lexical && self.is_lexical() {
+            return Err(serve_refused("semantic_search_disabled"));
+        }
+        receipt.query_mode(Some(mode))
+    }
+}
+
+async fn query_selected<F>(
+    cx: &Cx,
+    snapshot: &NativeGenerationSnapshot,
+    scope: Option<&NativeScopedGenerationSnapshot>,
+    models: &AuthorityModels,
+    plan: QueryPlan<'_>,
+    mut deliver: F,
+) -> Result<()>
+where
+    F: FnMut(&'static str, &[frankensearch::ScoredResult]) -> Result<()>,
+{
+    if plan.mode == QueryMode::Lexical {
+        let results = match scope {
+            Some(scope) => scope.search_lexical_text(cx, plan.text, plan.limit).await?,
+            None => {
+                snapshot
+                    .search_lexical_text(cx, plan.text, plan.limit)
+                    .await?
+            }
+        };
+        checkpoint(cx)?;
+        deliver("lexical", &results)
+    } else {
+        query_admitted(cx, snapshot, scope, models.models()?, plan, deliver).await
+    }
+}
+
+fn annotate_execution(response: &mut serde_json::Value, mode: QueryMode) {
+    response["mode"] = serde_json::json!(mode.as_str());
+    // Every authority reader still admits its complete component closure.
+    // Query execution is separate from whether its stored bytes were verified.
+    response["semantic_components_verified"] = serde_json::json!(true);
+    if response["event"] == "results" && mode == QueryMode::Lexical {
+        response["semantic_used"] = serde_json::json!(false);
+    }
+    if mode == QueryMode::Lexical {
+        response["phase"] = serde_json::json!("lexical");
+        response["retrieval"] = serde_json::json!("lexical");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -2454,7 +2588,7 @@ struct AuthoritySession {
     root: QualifiedGenerationRoot,
     receipt: Receipt,
     snapshot: Arc<NativeGenerationSnapshot>,
-    models: Models,
+    models: AuthorityModels,
     default_limit: usize,
     max_image_bytes: usize,
     max_source_bytes: usize,
@@ -2470,12 +2604,13 @@ impl AuthoritySession {
         root: QualifiedGenerationRoot,
         receipt: Receipt,
         snapshot: impl Into<Arc<NativeGenerationSnapshot>>,
-        models: Models,
+        models: impl Into<AuthorityModels>,
         limits: (usize, usize),
         allow_activation: bool,
     ) -> Result<Self> {
         checkpoint(cx)?;
         let snapshot = snapshot.into();
+        let models = models.into();
         receipt.validate()?;
         let retained = snapshot.retained_snapshot();
         let anchors = root.anchor_witnesses();
@@ -2509,7 +2644,7 @@ impl AuthoritySession {
         {
             return Err(serve_refused("session_selection_mismatch"));
         }
-        admit_serving_models(&receipt, &models)?;
+        models.admit(&receipt)?;
         checkpoint(cx)?;
         Ok(Self {
             root,
@@ -2527,6 +2662,7 @@ impl AuthoritySession {
     }
 
     fn with_updates(mut self, batch_size: usize, max_source_bytes: usize) -> Result<Self> {
+        self.models.models()?;
         if batch_size == 0 || batch_size > MAX_DOCUMENTS || max_source_bytes == 0 {
             return Err(serve_refused("invalid_update_limits"));
         }
@@ -2574,6 +2710,9 @@ impl AuthoritySession {
             &mut response,
             self.scope.as_ref().map(NativeScopedGenerationSnapshot::len),
         );
+        if self.models.is_lexical() {
+            annotate_execution(&mut response, QueryMode::Lexical);
+        }
         response
     }
 
@@ -2637,8 +2776,10 @@ impl AuthoritySession {
         if limit == 0 || limit > 1_000 {
             return Err(serve_refused("invalid_limit"));
         }
-        let mode = self.receipt.query_mode(request.mode)?;
-        admit_serving_models(&self.receipt, &self.models)?;
+        let mode = self.models.query_mode(&self.receipt, request.mode)?;
+        if mode != QueryMode::Lexical {
+            self.models.admit(&self.receipt)?;
+        }
         if let Some(filter) = &request.filter {
             filter
                 .validate()
@@ -2659,7 +2800,7 @@ impl AuthoritySession {
         let scope = narrowed.as_ref().or(self.scope.as_ref());
         // NativeGenerationSnapshot independently checks the producer before
         // inference and the actual bound output afterward, including zero hits.
-        query_admitted(
+        query_selected(
             cx,
             &self.snapshot,
             scope,
@@ -2676,6 +2817,7 @@ impl AuthoritySession {
                 response["results"] = serde_json::json!(results);
                 response["mode"] = serde_json::json!(mode.as_str());
                 response["phase"] = serde_json::json!(phase);
+                annotate_execution(&mut response, mode);
                 annotate_scope(
                     &mut response,
                     scope.map(NativeScopedGenerationSnapshot::len),
@@ -2846,7 +2988,7 @@ impl AuthoritySession {
             &self.receipt,
             &self.snapshot,
             prepared,
-            &self.models,
+            self.models.models()?,
             self.fixed_filter
                 .as_ref()
                 .map(|filter| (filter, self.max_source_bytes)),
@@ -2901,10 +3043,12 @@ impl AuthoritySession {
             (None, None) => true,
             _ => false,
         };
-        if !same_query_contract(&candidate.identity, &self.receipt.identity) || !same_quality {
+        if !self.models.is_lexical()
+            && (!same_query_contract(&candidate.identity, &self.receipt.identity) || !same_quality)
+        {
             return Err(serve_refused("activation_producer_mismatch"));
         }
-        admit_serving_models(&candidate, &self.models)?;
+        self.models.admit(&candidate)?;
         checkpoint(cx)?;
         // The receipt selects an authority on the original qualified physical
         // root. Never reopen the candidate's root pathname or adopt a copy.
@@ -2913,7 +3057,7 @@ impl AuthoritySession {
                 .open_on_root(cx, &self.root, self.max_image_bytes)
                 .map_err(|_| serve_refused("activation_admission_failed"))?,
         );
-        admit_serving_models(&candidate, &self.models)?;
+        self.models.admit(&candidate)?;
         // Re-evaluate the fixed policy against the new retained source before
         // installing any part of the selection. A budget or source failure
         // leaves both the old reader and its old membership intact.
@@ -2957,12 +3101,19 @@ async fn serve_session(
     output: &mut impl Write,
 ) -> Result<()> {
     checkpoint(cx)?;
-    admit_serving_models(&session.receipt, &session.models)?;
+    session.models.admit(&session.receipt)?;
     let mut ready = session.response("ready", true, None, None);
     ready["documents"] = serde_json::json!(session.receipt.documents);
     ready["activation_enabled"] = serde_json::json!(session.allow_activation);
     ready["updates_enabled"] = serde_json::json!(session.update_limits.is_some());
     ready["fetch_enabled"] = serde_json::json!(true);
+    ready["query_modes"] = if session.models.is_lexical() {
+        serde_json::json!(["lexical"])
+    } else if session.receipt.quality_identity.is_some() {
+        serde_json::json!(["fast", "quality", "full", "lexical"])
+    } else {
+        serde_json::json!([session.receipt.query_mode(None)?.as_str(), "lexical"])
+    };
     ready["max_fetch_documents"] = serde_json::json!(source::MAX_DOCUMENTS);
     ready["max_fetch_content_bytes"] = serde_json::json!(source::MAX_CONTENT_BYTES);
     ready["max_fetch_response_bytes"] = serde_json::json!(source::MAX_RESPONSE_BYTES);
@@ -2974,8 +3125,11 @@ async fn serve_session(
     ready["default_limit"] = serde_json::json!(session.default_limit);
     ready["max_source_bytes"] = serde_json::json!(session.max_source_bytes);
     ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
-    ready["default_mode"] = serde_json::json!(session.receipt.query_mode(None)?.as_str());
-    ready["progressive_available"] = serde_json::json!(session.receipt.quality_identity.is_some());
+    ready["default_mode"] =
+        serde_json::json!(session.models.query_mode(&session.receipt, None)?.as_str());
+    ready["progressive_available"] = serde_json::json!(
+        !session.models.is_lexical() && session.receipt.quality_identity.is_some()
+    );
     emit(output, &ready)?;
     let mut record = Vec::new();
     let mut ordinal = 0_u64;
@@ -3123,7 +3277,11 @@ async fn serve(
     )?;
     // Complete image and source-scope admission precede model loading. Both
     // producers and retained images remain warm until explicit activation/exit.
-    let loaded = load_authority_models(cx, options, receipt.query_mode(None)?, pool)?;
+    let loaded = if options.lexical_only {
+        AuthorityModels::Lexical
+    } else {
+        load_authority_models(cx, options, receipt.query_mode(None)?, pool)?.into()
+    };
     let mut session = AuthoritySession::new(
         cx,
         root,
