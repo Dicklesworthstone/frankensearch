@@ -1783,6 +1783,9 @@ mod warm_authority {
 
     use frankensearch::IndexableDocument;
     use frankensearch_core::generation::GenerationComponentRole;
+    use frankensearch_index::generation_root::generation_reader::{
+        activation_manifest_name_v1, component_object_name_v1,
+    };
 
     use super::*;
 
@@ -1921,6 +1924,785 @@ mod warm_authority {
         })
     }
 
+    async fn publish_source_fixture(
+        cx: &Cx,
+        parent: &Path,
+        provider: &Arc<Provider>,
+        tier: EmbedderTierTag,
+        ann: bool,
+        documents: Vec<IndexableDocument>,
+    ) -> Receipt {
+        let root_path = parent.join("root");
+        let root = create_root(&root_path).expect("qualified Linux root is required");
+        let model: Arc<dyn Embedder> = provider.clone();
+        let retrieval = if ann {
+            NativeBuildRetrieval::Hnsw {
+                params: HnswParams::default(),
+                seed: 17,
+            }
+        } else {
+            NativeBuildRetrieval::Exact
+        };
+        let built = NativeIndexBuilder::new(
+            parent.join("source-work"),
+            new_generation(1).unwrap(),
+            model,
+        )
+        .unwrap()
+        .with_fast_storage(NativeBuildPrecision::F32, retrieval)
+        .add_documents(documents)
+        .build_exact_generation(
+            cx,
+            tier,
+            CommitRange { low: 1, high: 5 },
+            DEFAULT_IMAGE_BYTES,
+        )
+        .await
+        .unwrap();
+        stage_and_publish(
+            cx,
+            &root,
+            &root_path,
+            &parent.join("source.json"),
+            &built,
+            None,
+            PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+        )
+        .unwrap()
+        .receipt
+    }
+
+    fn fetch_message(
+        selected: &Receipt,
+        id: &str,
+        documents: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "op":"fetch", "id":id, "expected_authority":selected.authority,
+            "documents":documents,
+        })
+    }
+
+    #[test]
+    fn authority_fetch_requests_require_an_exact_selection_and_strict_window_fields() {
+        let valid = fetch_message(&receipt(), "source", serde_json::json!([{"doc_id":"a"}]));
+        assert!(matches!(
+            serde_json::from_value::<AuthorityRequest>(valid.clone()).unwrap(),
+            AuthorityRequest::Fetch(_)
+        ));
+        for field in ["op", "expected_authority", "documents"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<AuthorityRequest>(missing).is_err(),
+                "{field}"
+            );
+        }
+        for field in [
+            "expected_generation",
+            "query",
+            "receipt",
+            "path",
+            "timeout_ms",
+            "model_dir",
+        ] {
+            let mut unknown = valid.clone();
+            unknown[field] = serde_json::json!("private-request-sentinel");
+            assert!(
+                serde_json::from_value::<AuthorityRequest>(unknown).is_err(),
+                "{field}"
+            );
+        }
+        for document in [
+            serde_json::json!({"doc_id":"a", "path":"private-request-sentinel"}),
+            serde_json::json!({"doc_id":"a", "offset_bytes":-1}),
+            serde_json::json!({"doc_id":"a", "include_metadata":"true"}),
+        ] {
+            let mut malformed = valid.clone();
+            malformed["documents"] = serde_json::json!([document]);
+            assert!(serde_json::from_value::<AuthorityRequest>(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn authority_fetch_reads_selective_utf8_windows_in_order_without_model_work_or_grants() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann) in [
+                ("fetch-fast-exact", EmbedderTierTag::Fast, false),
+                ("fetch-quality-hnsw", EmbedderTierTag::Quality, true),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let content = "  café🦀\n東京\u{0}<script>&\r\n";
+                let requested = IndexableDocument::new("unicode", content)
+                    .with_title("Retained title")
+                    .with_metadata("tenant", "A");
+                let source_budget = requested.id.len()
+                    + requested.content.len()
+                    + requested.title.as_deref().map_or(0, str::len)
+                    + serde_json::to_vec(&requested.metadata).unwrap().len();
+                let selected = publish_source_fixture(
+                    &cx,
+                    &parent,
+                    &provider,
+                    tier,
+                    ann,
+                    vec![
+                        requested,
+                        IndexableDocument::new("unrequested", "garden ".repeat(1_024)),
+                    ],
+                )
+                .await;
+                // The complete corpus and repeated full copies of unicode do
+                // not fit this budget. Its one distinct requested source does.
+                let mut session = open_session(&cx, selected.clone(), &provider, false)
+                    .with_filter(&cx, None, source_budget)
+                    .unwrap();
+                let request = fetch_message(
+                    &selected,
+                    "windows",
+                    serde_json::json!([
+                        {"doc_id":"unicode", "max_bytes":4, "include_metadata":true},
+                        {"doc_id":"missing-first"},
+                        {"doc_id":"unicode", "offset_bytes":4, "max_bytes":4},
+                        {"doc_id":"unicode", "offset_bytes":7, "max_bytes":4},
+                        {"doc_id":"unicode"},
+                        {"doc_id":"unicode", "offset_bytes":content.len(), "max_bytes":4},
+                        {"doc_id":"missing-last", "include_metadata":true}
+                    ]),
+                );
+                let before = provider.calls.load(Ordering::Relaxed);
+                let output = exchange(&cx, &mut session, &[request]).await;
+                assert_eq!(output[0]["activation_enabled"], false);
+                assert_eq!(output[0]["updates_enabled"], false);
+                assert_eq!(output[0]["fetch_enabled"], true);
+                assert_eq!(output[0]["max_fetch_documents"], 32);
+                assert_eq!(output[0]["max_fetch_content_bytes"], 65_536);
+                assert_eq!(output[0]["max_fetch_response_bytes"], 1024 * 1024);
+                let result = &output[1];
+                assert_eq!(result["event"], "terminal");
+                assert_eq!(result["operation"], "fetch");
+                assert_eq!(result["status"], "complete");
+                assert_eq!(result["source"], "retained_snapshot");
+                assert_eq!(result["partial_results"], false);
+                assert_eq!(result["authority"], serde_json::json!(selected.authority));
+                assert_eq!(result["generation"], serde_json::json!(selected.generation));
+                assert_eq!(result["request"], 1);
+                assert_eq!(result["id"], "windows");
+                assert!(result.get("scope").is_none());
+                let rows = result["documents"].as_array().unwrap();
+                assert_eq!(rows.len(), 7);
+                assert_eq!(rows[0]["content"], "  ca");
+                assert_eq!(rows[0]["end_offset_bytes"], 4);
+                assert_eq!(rows[0]["next_offset_bytes"], 4);
+                assert_eq!(rows[0]["title"], "Retained title");
+                assert_eq!(rows[0]["metadata"], serde_json::json!({"tenant":"A"}));
+                assert_eq!(
+                    rows[1],
+                    serde_json::json!({"status":"unavailable", "doc_id":"missing-first"})
+                );
+                assert_eq!(rows[2]["content"], "fé");
+                assert_eq!(rows[2]["offset_bytes"], 4);
+                assert_eq!(rows[2]["end_offset_bytes"], 7);
+                assert_eq!(rows[2]["next_offset_bytes"], 7);
+                assert_eq!(rows[3]["content"], "🦀");
+                assert_eq!(rows[3]["end_offset_bytes"], 11);
+                assert_eq!(rows[4]["content"], content);
+                assert_eq!(rows[4]["total_bytes"], content.len());
+                assert!(rows[4]["next_offset_bytes"].is_null());
+                assert_eq!(rows[5]["content"], "");
+                assert!(rows[5]["next_offset_bytes"].is_null());
+                for row in &rows[2..6] {
+                    assert!(row.get("metadata").is_none());
+                    assert!(row.get("title").is_none());
+                }
+                assert_eq!(
+                    rows[6],
+                    serde_json::json!({"status":"unavailable", "doc_id":"missing-last"})
+                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            }
+        });
+    }
+
+    #[test]
+    fn authority_fetch_intersects_scopes_and_hides_deleted_missing_and_excluded_sources() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("fetch-scopes");
+            let provider = provider();
+            let old = publish_source_fixture(
+                &cx,
+                &parent,
+                &provider,
+                EmbedderTierTag::Quality,
+                true,
+                vec![
+                    IndexableDocument::new("allowed", "retry allowed source")
+                        .with_title("Allowed title")
+                        .with_metadata("tenant", "A"),
+                    IndexableDocument::new("excluded", "PRIVATE_EXCLUDED_SOURCE")
+                        .with_title("PRIVATE_EXCLUDED_TITLE")
+                        .with_metadata("tenant", "B"),
+                    IndexableDocument::new("deleted", "PRIVATE_DELETED_SOURCE")
+                        .with_metadata("tenant", "A"),
+                ],
+            )
+            .await;
+            let mut writer = open_session(&cx, old.clone(), &provider, false)
+                .with_updates(2, crate::MAX_INPUT_BYTES)
+                .unwrap();
+            let before = provider.calls.load(Ordering::Relaxed);
+            let deletion = update_message(
+                &parent,
+                "deleted-source",
+                &old,
+                6,
+                serde_json::json!([{"op":"delete", "id":"deleted"}]),
+            );
+            assert_eq!(
+                exchange(&cx, &mut writer, &[deletion]).await[1]["event"],
+                "updated"
+            );
+            let selected = Receipt::read(&parent.join("deleted-source.json")).unwrap();
+            let fixed = crate::filter::Filter::parse(r#"{"metadata":{"tenant":"A"}}"#).unwrap();
+            let mut session = open_session(&cx, selected.clone(), &provider, false)
+                .with_filter(&cx, Some(fixed), crate::MAX_INPUT_BYTES)
+                .unwrap();
+            let windows = serde_json::json!([
+                {"doc_id":"excluded", "offset_bytes":usize::MAX, "include_metadata":true},
+                {"doc_id":"missing", "offset_bytes":usize::MAX, "include_metadata":true},
+                {"doc_id":"deleted", "offset_bytes":usize::MAX, "include_metadata":true},
+                {"doc_id":"allowed", "include_metadata":true},
+                {"doc_id":"allowed"}
+            ]);
+            let ordinary = fetch_message(&selected, "fixed", windows.clone());
+            let mut narrow = fetch_message(&selected, "narrow", windows.clone());
+            narrow["filter"] = serde_json::json!({"ids":["excluded"]});
+            let mut broad = fetch_message(&selected, "broad", windows);
+            broad["filter"] = serde_json::json!({});
+            let output = exchange(&cx, &mut session, &[ordinary, narrow, broad]).await;
+            for position in [1, 3] {
+                assert_eq!(output[position]["event"], "terminal");
+                assert_eq!(
+                    output[position]["scope"],
+                    serde_json::json!({"filtered":true})
+                );
+                let rows = output[position]["documents"].as_array().unwrap();
+                for (row, id) in rows[..3].iter().zip(["excluded", "missing", "deleted"]) {
+                    assert_eq!(
+                        *row,
+                        serde_json::json!({"status":"unavailable", "doc_id":id})
+                    );
+                }
+                assert_eq!(rows[3]["content"], "retry allowed source");
+                assert_eq!(rows[3]["metadata"]["tenant"], "A");
+                assert_eq!(rows[3]["title"], "Allowed title");
+                assert!(rows[4].get("metadata").is_none());
+                assert!(rows[4].get("title").is_none());
+            }
+            assert_eq!(output[2]["scope"], serde_json::json!({"filtered":true}));
+            assert!(
+                output[2]["documents"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["status"] == "unavailable")
+            );
+            let encoded = serde_json::to_string(&output).unwrap();
+            assert!(!encoded.contains("PRIVATE_EXCLUDED"));
+            assert!(!encoded.contains("PRIVATE_DELETED"));
+            let mut unscoped = open_session(&cx, selected.clone(), &provider, false);
+            let mut requested_filter = fetch_message(
+                &selected,
+                "request-filter",
+                serde_json::json!([
+                    {"doc_id":"excluded", "offset_bytes":usize::MAX, "include_metadata":true},
+                    {"doc_id":"allowed", "include_metadata":true}
+                ]),
+            );
+            requested_filter["filter"] = serde_json::json!({"metadata":{"tenant":"A"}});
+            let output = exchange(&cx, &mut unscoped, &[requested_filter]).await;
+            assert_eq!(output[1]["scope"], serde_json::json!({"filtered":true}));
+            assert_eq!(
+                output[1]["documents"][0],
+                serde_json::json!({"status":"unavailable", "doc_id":"excluded"})
+            );
+            assert_eq!(output[1]["documents"][1]["content"], "retry allowed source");
+            assert!(
+                !serde_json::to_string(&output)
+                    .unwrap()
+                    .contains("PRIVATE_EXCLUDED")
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+        });
+    }
+
+    #[test]
+    fn authority_fetch_keeps_its_original_source_after_publication_and_path_movement() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("fetch-retained-paths");
+            let provider = provider();
+            let old = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Fast,
+                "old",
+                true,
+            )
+            .await;
+            let mut session = open_session(&cx, old.clone(), &provider, false);
+            let winner = publish(
+                &cx,
+                &parent,
+                Some(&session.snapshot),
+                &provider,
+                EmbedderTierTag::Fast,
+                "winner",
+                true,
+            )
+            .await;
+            let head = fs::read(old.root.join("AUTHORITY")).unwrap();
+            fs::rename(parent.join("old-work"), parent.join("archived-work")).unwrap();
+            fs::rename(&old.root, parent.join("relocated-root")).unwrap();
+            let before = provider.calls.load(Ordering::Relaxed);
+            let old_request = fetch_message(
+                &old,
+                "retained",
+                serde_json::json!([
+                    {"doc_id":"retry-old", "include_metadata":true}, {"doc_id":"garden-old"}
+                ]),
+            );
+            let new_request = fetch_message(
+                &winner,
+                "wrong-owner",
+                serde_json::json!([
+                    {"doc_id":"retry-winner"}
+                ]),
+            );
+            let output = exchange(&cx, &mut session, &[old_request, new_request]).await;
+            assert_eq!(output[1]["event"], "terminal");
+            assert_eq!(output[1]["authority"], serde_json::json!(old.authority));
+            assert_eq!(
+                output[1]["documents"][0]["content"],
+                "retry network requests"
+            );
+            assert_eq!(output[1]["documents"][0]["metadata"]["version"], "old");
+            assert_eq!(output[1]["documents"][1]["content"], "garden flowers");
+            assert_eq!(output[2]["event"], "failed");
+            assert_eq!(output[2]["operation"], "fetch");
+            assert_eq!(output[2]["code"], "stale_expected_authority");
+            assert!(output[2].get("documents").is_none());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            assert_eq!(
+                fs::read(parent.join("relocated-root").join("AUTHORITY")).unwrap(),
+                head
+            );
+            assert_eq!(session.receipt.authority, old.authority);
+        });
+    }
+
+    #[test]
+    fn authority_fetch_follows_session_updates_activation_and_rollback_authority() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("fetch-authority-transitions");
+            let provider = provider();
+            let old = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Quality,
+                "old",
+                true,
+            )
+            .await;
+            let mut session = open_session(&cx, old.clone(), &provider, true)
+                .with_updates(2, crate::MAX_INPUT_BYTES)
+                .unwrap();
+            let before = provider.calls.load(Ordering::Relaxed);
+            let original_fetch = fetch_message(
+                &old,
+                "original-source",
+                serde_json::json!([
+                    {"doc_id":"retry-old", "include_metadata":true}
+                ]),
+            );
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[serde_json::json!({"query":"retry"}), original_fetch.clone()],
+            )
+            .await;
+            assert_eq!(output[1]["results"][0]["doc_id"], "retry-old");
+            assert_eq!(output[2]["authority"], output[1]["authority"]);
+            assert_eq!(
+                output[2]["documents"][0]["content"],
+                "retry network requests"
+            );
+            let update = update_message(
+                &parent,
+                "edited-source",
+                &old,
+                6,
+                serde_json::json!([
+                    {"op":"upsert", "id":"retry-old", "content":"retry changed source",
+                     "title":"Changed title", "metadata":{"version":"edited"}},
+                    {"op":"delete", "id":"garden-old"}
+                ]),
+            );
+            assert_eq!(
+                exchange(&cx, &mut session, &[update]).await[1]["event"],
+                "updated"
+            );
+            let edited = Receipt::read(&parent.join("edited-source.json")).unwrap();
+            let updated_fetch = fetch_message(
+                &edited,
+                "updated-source",
+                serde_json::json!([
+                    {"doc_id":"retry-old", "include_metadata":true}, {"doc_id":"garden-old"}
+                ]),
+            );
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[
+                    original_fetch,
+                    serde_json::json!({"query":"retry changed"}),
+                    updated_fetch.clone(),
+                ],
+            )
+            .await;
+            assert_eq!(output[1]["code"], "stale_expected_authority");
+            assert!(output[1].get("documents").is_none());
+            assert_eq!(output[3]["authority"], output[2]["authority"]);
+            assert_eq!(output[3]["documents"][0]["content"], "retry changed source");
+            assert_eq!(output[3]["documents"][0]["title"], "Changed title");
+            assert_eq!(output[3]["documents"][0]["metadata"]["version"], "edited");
+            assert_eq!(
+                output[3]["documents"][1],
+                serde_json::json!({"status":"unavailable", "doc_id":"garden-old"})
+            );
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                before + 3,
+                "two queries and one changed document infer; all source fetches remain model-free"
+            );
+
+            let external = publish(
+                &cx,
+                &parent,
+                Some(&session.snapshot),
+                &provider,
+                EmbedderTierTag::Quality,
+                "external",
+                false,
+            )
+            .await;
+            let before = provider.calls.load(Ordering::Relaxed);
+            let external_fetch = fetch_message(
+                &external,
+                "external-source",
+                serde_json::json!([
+                    {"doc_id":"retry-external", "include_metadata":true}
+                ]),
+            );
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[
+                    serde_json::json!({"op":"activate", "receipt":parent.join("external.json"),
+                    "expected_authority":edited.authority}),
+                    updated_fetch.clone(),
+                    external_fetch.clone(),
+                ],
+            )
+            .await;
+            assert_eq!(output[1]["event"], "activated");
+            assert_eq!(output[2]["code"], "stale_expected_authority");
+            assert_eq!(output[3]["documents"][0]["metadata"]["version"], "external");
+
+            let mut rollback_options = parse(&rollback_arguments()).unwrap().unwrap();
+            rollback_options.from_receipt = Some(parent.join("external.json"));
+            rollback_options.target_receipt = Some(parent.join("edited-source.json"));
+            rollback_options.receipt = parent.join("restored-source.json");
+            rollback(&cx, &rollback_options, &mut Vec::new()).unwrap();
+            let restored = Receipt::read(&rollback_options.receipt).unwrap();
+            assert_eq!(restored.generation, edited.generation);
+            assert_ne!(restored.authority, edited.authority);
+            let restored_fetch = fetch_message(
+                &restored,
+                "restored-source",
+                serde_json::json!([
+                    {"doc_id":"retry-old", "include_metadata":true}
+                ]),
+            );
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[
+                    serde_json::json!({"op":"activate", "receipt":rollback_options.receipt,
+                    "expected_authority":external.authority}),
+                    updated_fetch,
+                    external_fetch,
+                    restored_fetch,
+                ],
+            )
+            .await;
+            assert_eq!(output[1]["event"], "activated");
+            for position in [2, 3] {
+                assert_eq!(output[position]["code"], "stale_expected_authority");
+                assert!(output[position].get("documents").is_none());
+            }
+            assert_eq!(output[4]["event"], "terminal");
+            assert_eq!(
+                output[4]["authority"],
+                serde_json::json!(restored.authority)
+            );
+            assert_eq!(output[4]["documents"][0]["content"], "retry changed source");
+            assert_eq!(output[4]["documents"][0]["metadata"]["version"], "edited");
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                before,
+                "activation, rollback and retained source fetches require no inference"
+            );
+        });
+    }
+
+    #[test]
+    fn authority_fetch_refusals_are_atomic_bounded_and_leave_the_next_request_usable() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("fetch-refusals");
+            let provider = provider();
+            let selected = publish_source_fixture(
+                &cx,
+                &parent,
+                &provider,
+                EmbedderTierTag::Fast,
+                false,
+                vec![IndexableDocument::new(
+                    "unicode",
+                    "🦀retained-source-canary",
+                )],
+            )
+            .await;
+            let mut session = open_session(&cx, selected.clone(), &provider, false);
+            let before = provider.calls.load(Ordering::Relaxed);
+            let valid = fetch_message(
+                &selected,
+                "valid",
+                serde_json::json!([{"doc_id":"unicode"}]),
+            );
+            let mut bad_authority = valid.clone();
+            bad_authority["expected_authority"] = serde_json::json!([1, 2]);
+            let mut stale = valid.clone();
+            stale["expected_authority"] = serde_json::json!(receipt().authority);
+            let mut bad_id = valid.clone();
+            bad_id["id"] = serde_json::json!("bad\u{0}private-request-sentinel");
+            let mut wrong_op = valid.clone();
+            wrong_op["op"] = serde_json::json!("unsupported-source-operation");
+            let mut rejected = vec![
+                (bad_authority, "invalid_expected_authority"),
+                (stale.clone(), "stale_expected_authority"),
+                (bad_id, "invalid_request_id"),
+                (wrong_op, "invalid_fetch_request"),
+            ];
+            for windows in [
+                serde_json::json!([]),
+                serde_json::json!([{"doc_id":" "}]),
+                serde_json::json!([{"doc_id":"a\u{0}b"}]),
+                serde_json::json!([{"doc_id":"unicode", "max_bytes":3}]),
+                serde_json::json!([{"doc_id":"unicode", "max_bytes":65_537}]),
+                serde_json::json!(vec![serde_json::json!({"doc_id":"unicode"}); 33]),
+                serde_json::json!([{"doc_id":"x".repeat(65_536)}]),
+                serde_json::json!([{"doc_id":"x".repeat(40_000)}, {"doc_id":"y".repeat(40_000)}]),
+            ] {
+                rejected.push((
+                    fetch_message(&selected, "bad-windows", windows),
+                    "invalid_fetch_windows",
+                ));
+            }
+            // The valid first window must never escape when a later available
+            // document has an offset inside a UTF-8 scalar or beyond its end.
+            for offset in [1, usize::MAX] {
+                rejected.push((
+                    fetch_message(
+                        &selected,
+                        "bad-offset",
+                        serde_json::json!([
+                            {"doc_id":"unicode"}, {"doc_id":"unicode", "offset_bytes":offset}
+                        ]),
+                    ),
+                    "fetch_refused",
+                ));
+            }
+            let mut requests = rejected
+                .iter()
+                .map(|(request, _)| request.clone())
+                .collect::<Vec<_>>();
+            requests.push(valid.clone());
+            let output = exchange(&cx, &mut session, &requests).await;
+            for (frame, (_, code)) in output[1..output.len() - 1].iter().zip(&rejected) {
+                assert_eq!(frame["event"], "failed");
+                assert_eq!(frame["operation"], "fetch");
+                assert_eq!(frame["status"], "failed");
+                assert_eq!(frame["partial_results"], false);
+                assert_eq!(frame["code"], *code);
+                assert!(frame.get("documents").is_none());
+                let encoded = serde_json::to_string(frame).unwrap();
+                assert!(encoded.len() < 2_048);
+                assert!(!encoded.contains("retained-source-canary"));
+                assert!(!encoded.contains("private-request-sentinel"));
+            }
+            assert_eq!(output.last().unwrap()["event"], "terminal");
+            assert_eq!(
+                output.last().unwrap()["documents"][0]["content"],
+                "🦀retained-source-canary"
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+
+            let mut bounded = open_session(&cx, selected.clone(), &provider, false)
+                .with_filter(&cx, None, 16)
+                .unwrap();
+            let mut small_window = valid;
+            small_window["documents"][0]["max_bytes"] = serde_json::json!(4);
+            let missing = fetch_message(
+                &selected,
+                "missing",
+                serde_json::json!([{"doc_id":"absent"}]),
+            );
+            let output = exchange(&cx, &mut bounded, &[stale, small_window, missing]).await;
+            assert_eq!(
+                output[1]["code"], "stale_expected_authority",
+                "authority fencing must precede the source-budget lookup"
+            );
+            assert_eq!(
+                output[2]["code"], "fetch_refused",
+                "a four-byte output window still requires admission of the complete stored source"
+            );
+            assert!(output[2].get("documents").is_none());
+            assert_eq!(output[3]["event"], "terminal");
+            assert_eq!(
+                output[3]["documents"][0],
+                serde_json::json!({"status":"unavailable", "doc_id":"absent"})
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            assert_eq!(bounded.receipt.authority, selected.authority);
+        });
+    }
+
+    #[test]
+    fn authority_fetch_bounds_encoded_output_and_stops_on_delivery_failure() {
+        struct RejectFetch {
+            writes: usize,
+            delivered: Vec<u8>,
+        }
+        impl Write for RejectFetch {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                if self.writes > 1 {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                }
+                self.delivered.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("fetch-output-bound");
+            let provider = provider();
+            // Each full window is at most 64 KiB raw, but JSON escaping expands
+            // its NULs sixfold. Three copies exceed the encoded 1 MiB cap.
+            let content = format!("retry{}", "\u{0}".repeat(65_532));
+            let selected = publish_source_fixture(
+                &cx,
+                &parent,
+                &provider,
+                EmbedderTierTag::Fast,
+                true,
+                vec![
+                    IndexableDocument::new("escaped", content)
+                        .with_title("PRIVATE_OPTIONAL_TITLE")
+                        .with_metadata("note", "PRIVATE_OPTIONAL_METADATA"),
+                ],
+            )
+            .await;
+            let mut session = open_session(&cx, selected.clone(), &provider, false)
+                .with_filter(&cx, None, 100_000)
+                .unwrap();
+            let single = fetch_message(
+                &selected,
+                "single",
+                serde_json::json!([
+                    {"doc_id":"escaped", "max_bytes":65_536, "include_metadata":true}
+                ]),
+            );
+            let overflow = fetch_message(
+                &selected,
+                "overflow",
+                serde_json::json!(vec![
+                    serde_json::json!({"doc_id":"escaped", "max_bytes":65_536, "include_metadata":true});
+                    3
+                ]),
+            );
+            let small = fetch_message(
+                &selected,
+                "small",
+                serde_json::json!([
+                    {"doc_id":"escaped", "max_bytes":4}
+                ]),
+            );
+            let before = provider.calls.load(Ordering::Relaxed);
+            let output = exchange(&cx, &mut session, &[single, overflow, small.clone()]).await;
+            assert_eq!(output[1]["event"], "terminal");
+            assert_eq!(
+                output[1]["documents"][0]["content"].as_str().unwrap().len(),
+                65_536
+            );
+            assert_eq!(
+                output[1]["documents"][0]["metadata"]["note"],
+                "PRIVATE_OPTIONAL_METADATA"
+            );
+            assert_eq!(output[2]["event"], "failed");
+            assert_eq!(output[2]["code"], "fetch_refused");
+            assert_eq!(output[2]["partial_results"], false);
+            assert!(output[2].get("documents").is_none());
+            let failure = serde_json::to_string(&output[2]).unwrap();
+            assert!(failure.len() < 2_048);
+            assert!(!failure.contains("PRIVATE_OPTIONAL"));
+            assert_eq!(output[3]["event"], "terminal");
+            assert_eq!(output[3]["documents"][0]["content"], "retr");
+            assert!(output[3]["documents"][0].get("metadata").is_none());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+
+            let mut input = serde_json::to_vec(&small).unwrap();
+            input.extend_from_slice(b"\n{\"query\":\"retry\"}\n");
+            let mut output = RejectFetch {
+                writes: 0,
+                delivered: Vec::new(),
+            };
+            let error = serve_session(&cx, &mut session, &mut Cursor::new(input), &mut output)
+                .await
+                .unwrap_err();
+            assert!(publication_failure(error.as_ref()).is_none());
+            assert_eq!(output.writes, 2);
+            assert_eq!(
+                frames(&output.delivered).len(),
+                1,
+                "only readiness was delivered; a broken source reply does not emit another frame"
+            );
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                before,
+                "the next query cannot execute after a fetch delivery failure"
+            );
+            assert_eq!(session.receipt.authority, selected.authority);
+        });
+    }
+
     fn component_path(
         root: &Path,
         snapshot: &NativeGenerationSnapshot,
@@ -1932,7 +2714,7 @@ mod warm_authority {
             .components()
             .get(role)
             .unwrap();
-        root.join(component_object_path_v1(role, receipt.sha256).unwrap())
+        root.join(component_object_name_v1(role, receipt.sha256))
     }
 
     fn search_options(receipt: &Path, filter: Option<&str>) -> Options {
@@ -2904,9 +3686,9 @@ mod warm_authority {
             options.target_receipt = Some(parent.join("old.json"));
             options.max_image_bytes = DEFAULT_IMAGE_BYTES;
 
-            let current_manifest = current
-                .root
-                .join(activation_manifest_path_v1(current.authority().unwrap().object_id).unwrap());
+            let current_manifest = current.root.join(activation_manifest_name_v1(
+                current.authority().unwrap().object_id,
+            ));
             let manifest_bytes = fs::read(&current_manifest).unwrap();
             let preserved_manifest = parent.join("original-current-manifest");
             fs::rename(&current_manifest, &preserved_manifest).unwrap();

@@ -49,7 +49,7 @@ use sha2::{Digest as _, Sha256};
 use super::{
     MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Result, SCHEMA, bad, emit,
     encode, execution_context, filter::Filter, models, new_generation, new_path,
-    positive as number, read_documents, update as mutations, validate_query, value,
+    positive as number, read_documents, serve::source, update as mutations, validate_query, value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
@@ -161,6 +161,13 @@ Filtered source export is bounded by --max-source-bytes (default 256 MiB).\n\
 The fixed server scope stays on its retained generation. Activation and updates\n\
 prepare its successor membership before changing selection or publication.\n\
 Unfiltered queries do not export source.\n\
+Read-only source requests use op=fetch, expected_authority, and documents with\n\
+doc_id, offset_bytes, max_bytes and include_metadata. The exact retained authority\n\
+must match before source lookup. Requests allow up to 32 UTF-8 windows, at most\n\
+64 KiB each; the complete encoded reply is limited to 1 MiB. Fixed and request\n\
+filters restrict source access.\n\
+Unfiltered fetch materializes only distinct requested documents, bounded by\n\
+--max-source-bytes; no model runs and no current path or authority is reopened.\n\
 Requests are limited to 1 MiB; oversized input or output failure ends the session.\n\
 Send quit/exit or close stdin to stop. Reads block on the owning execution lane.\n\
 Work files remain available after completion or failure. Stdout is JSON.\n";
@@ -1837,11 +1844,22 @@ struct AuthorityUpdateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityFetchRequest {
+    op: String,
+    id: Option<String>,
+    expected_authority: Vec<u8>,
+    documents: Vec<source::DocumentRequest>,
+    filter: Option<Filter>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum AuthorityRequest {
     Search(AuthoritySearchRequest),
     Activate(AuthorityActivateRequest),
     Update(AuthorityUpdateRequest),
+    Fetch(AuthorityFetchRequest),
 }
 
 #[derive(Debug)]
@@ -2121,6 +2139,81 @@ impl AuthoritySession {
         Ok((results, scope.map(NativeScopedGenerationSnapshot::len)))
     }
 
+    fn fetch(&self, cx: &Cx, request: &AuthorityFetchRequest, ordinal: u64) -> Result<Vec<u8>> {
+        checkpoint(cx)?;
+        super::serve::validate_id(request.id.as_deref())
+            .map_err(|_| serve_refused("invalid_request_id"))?;
+        if request.op != "fetch" {
+            return Err(serve_refused("invalid_fetch_request"));
+        }
+        let expected = AuthorityRefV1::from_canonical_bytes(&request.expected_authority)
+            .map_err(|_| serve_refused("invalid_expected_authority"))?;
+        // Artifact identity alone is insufficient: rollback can select the same
+        // component images under a different authority. Fence every source read
+        // before looking up a document or evaluating its source predicate.
+        if expected != self.snapshot.authority() {
+            return Err(serve_refused("stale_expected_authority"));
+        }
+        source::validate_windows(&request.documents)
+            .map_err(|_| serve_refused("invalid_fetch_windows"))?;
+        if let Some(filter) = &request.filter {
+            filter
+                .validate()
+                .map_err(|_| serve_refused("invalid_filter"))?;
+        }
+        let mut response = self.response("terminal", true, Some(ordinal), request.id.as_deref());
+        response["operation"] = serde_json::json!("fetch");
+        response["status"] = serde_json::json!("complete");
+        response["partial_results"] = serde_json::json!(false);
+        response["seq"] = serde_json::json!(0);
+        response["source"] = serde_json::json!("retained_snapshot");
+        if self.scope.is_some() || request.filter.is_some() {
+            // A selective source lookup does not enumerate the entire request
+            // scope, so do not label a window count as global eligibility.
+            response["scope"] = serde_json::json!({ "filtered": true });
+        }
+        if let Some(scope) = &self.scope {
+            // The fixed membership and complete bounded source inventory were
+            // prepared with this exact retained authority. Excluded IDs remain
+            // unavailable without reading their fields or checking their offsets.
+            source::render_documents(
+                cx,
+                &request.documents,
+                request.filter.as_ref(),
+                None,
+                |id| scope.document(id),
+                &response,
+            )
+        } else {
+            // Read only requested live IDs, once per distinct document. Preserve
+            // window order and duplicates in the borrowed renderer, not by
+            // duplicating complete source allocations or charging them twice.
+            let ids = request
+                .documents
+                .iter()
+                .map(source::DocumentRequest::doc_id)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let documents =
+                self.snapshot
+                    .source_documents_by_ids(cx, &ids, self.max_source_bytes)?;
+            source::render_documents(
+                cx,
+                &request.documents,
+                request.filter.as_ref(),
+                None,
+                |id| {
+                    documents
+                        .iter()
+                        .flatten()
+                        .find(|document| document.id == id)
+                },
+                &response,
+            )
+        }
+    }
+
     async fn update(
         &mut self,
         cx: &Cx,
@@ -2316,6 +2409,10 @@ async fn serve_session(
     ready["documents"] = serde_json::json!(session.receipt.documents);
     ready["activation_enabled"] = serde_json::json!(session.allow_activation);
     ready["updates_enabled"] = serde_json::json!(session.update_limits.is_some());
+    ready["fetch_enabled"] = serde_json::json!(true);
+    ready["max_fetch_documents"] = serde_json::json!(source::MAX_DOCUMENTS);
+    ready["max_fetch_content_bytes"] = serde_json::json!(source::MAX_CONTENT_BYTES);
+    ready["max_fetch_response_bytes"] = serde_json::json!(source::MAX_RESPONSE_BYTES);
     if let Some(limits) = session.update_limits {
         ready["max_mutations"] = serde_json::json!(MAX_AUTHORITY_MUTATIONS);
         ready["update_batch_size"] = serde_json::json!(limits.batch_size);
@@ -2392,6 +2489,37 @@ async fn serve_session(
                         response
                     });
                 (id, result, true)
+            }
+            AuthorityRequest::Fetch(request) => {
+                let id = request
+                    .id
+                    .as_deref()
+                    .filter(|id| super::serve::validate_id(Some(id)).is_ok());
+                let result = session.fetch(cx, &request, ordinal);
+                checkpoint(cx)?;
+                match result {
+                    Ok(bytes) => {
+                        // The complete authority envelope and borrowed source
+                        // windows already fit the encoded response budget. A
+                        // partial write ends serving without a second frame.
+                        output.write_all(&bytes)?;
+                        output.flush()?;
+                    }
+                    Err(error) => {
+                        if error
+                            .downcast_ref::<SearchError>()
+                            .is_some_and(|error| matches!(error, SearchError::Cancelled { .. }))
+                        {
+                            return Err(error);
+                        }
+                        let mut response =
+                            session.failure(ordinal, id, error.as_ref(), "fetch_refused");
+                        response["operation"] = serde_json::json!("fetch");
+                        response["partial_results"] = serde_json::json!(false);
+                        emit(output, &response)?;
+                    }
+                }
+                continue;
             }
         };
         // Updates may already have committed, or returned a typed uncertain

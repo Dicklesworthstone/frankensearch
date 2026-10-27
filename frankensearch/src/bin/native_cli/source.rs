@@ -34,6 +34,38 @@ pub struct DocumentRequest {
     include_metadata: bool,
 }
 
+impl DocumentRequest {
+    pub(crate) fn doc_id(&self) -> &str {
+        &self.doc_id
+    }
+}
+
+/// Validate the bounded windows before any retained source is materialized.
+pub(crate) fn validate_windows(documents: &[DocumentRequest]) -> Result<()> {
+    if documents.is_empty() || documents.len() > MAX_DOCUMENTS {
+        return Err(bad("fetch requires between 1 and 32 document windows"));
+    }
+    let mut remaining = MAX_ID_BYTES;
+    for document in documents {
+        if document.doc_id.trim().is_empty()
+            || document.doc_id.contains('\0')
+            || document.doc_id.len() > usize::from(u16::MAX)
+            || document.doc_id.len() > remaining
+        {
+            return Err(bad(
+                "fetch IDs must be nonblank, NUL-free, at most 65535 bytes each and 64 KiB in total",
+            ));
+        }
+        remaining -= document.doc_id.len();
+        // Four bytes fit any one UTF-8 scalar. End rounding can therefore
+        // never return a non-final empty window that makes no progress.
+        if !(4..=MAX_CONTENT_BYTES).contains(&document.max_bytes) {
+            return Err(bad("fetch max_bytes must be between 4 and 65536"));
+        }
+    }
+    Ok(())
+}
+
 /// The expected generation is mandatory: a later live selection must not answer
 /// a request for the text behind an earlier search result, even for the same ID.
 #[derive(Debug, Deserialize)]
@@ -65,27 +97,7 @@ impl Request {
         serve::validate_id(self.id())?;
         expected_generation.validate()?;
         query::validate_timeout(*timeout_ms)?;
-        if documents.is_empty() || documents.len() > MAX_DOCUMENTS {
-            return Err(bad("fetch requires between 1 and 32 document windows"));
-        }
-        let mut remaining = MAX_ID_BYTES;
-        for document in documents {
-            if document.doc_id.trim().is_empty()
-                || document.doc_id.contains('\0')
-                || document.doc_id.len() > usize::from(u16::MAX)
-                || document.doc_id.len() > remaining
-            {
-                return Err(bad(
-                    "fetch IDs must be nonblank, NUL-free, at most 65535 bytes each and 64 KiB in total",
-                ));
-            }
-            remaining -= document.doc_id.len();
-            // Four bytes fit any one UTF-8 scalar. End rounding can therefore
-            // never return a non-final empty window that makes no progress.
-            if !(4..=MAX_CONTENT_BYTES).contains(&document.max_bytes) {
-                return Err(bad("fetch max_bytes must be between 4 and 65536"));
-            }
-        }
+        validate_windows(documents)?;
         if let Some(filter) = filter {
             filter.validate()?;
         }
@@ -128,6 +140,12 @@ struct Response<'a> {
     seq: u64,
     generation: ArtifactGenerationIdentityV1,
     source: &'static str,
+}
+
+#[derive(Serialize)]
+struct DocumentFrame<'a, T> {
+    #[serde(flatten)]
+    envelope: T,
     documents: Vec<DocumentResponse<'a>>,
 }
 
@@ -161,7 +179,42 @@ fn render<'a>(
             "fetch expected_generation differs from the retained snapshot; search again or use the original selection",
         ));
     }
-    if let Some(filter) = base_filter {
+    render_documents(
+        cx,
+        documents,
+        filter.as_ref(),
+        base_filter,
+        lookup,
+        &Response {
+            schema: SCHEMA,
+            event: "terminal",
+            operation: "fetch",
+            status: "complete",
+            ok: true,
+            partial_results: false,
+            request: ordinal,
+            id: request.id(),
+            seq: 0,
+            generation,
+            source: "retained_snapshot",
+        },
+    )
+}
+
+/// Render borrowed source windows and their selection envelope in one bounded
+/// buffer. Both serving protocols validate their own generation/authority fence
+/// before calling this helper; no source body is cloned into a JSON value.
+pub(crate) fn render_documents<'a>(
+    cx: &Cx,
+    documents: &'a [DocumentRequest],
+    request_filter: Option<&filter::Filter>,
+    base_filter: Option<&filter::Filter>,
+    lookup: impl Fn(&str) -> Option<&'a IndexableDocument>,
+    envelope: &impl Serialize,
+) -> Result<Vec<u8>> {
+    checkpoint(cx)?;
+    validate_windows(documents)?;
+    for filter in [base_filter, request_filter].into_iter().flatten() {
         filter.validate()?;
     }
     let mut responses = Vec::with_capacity(documents.len());
@@ -170,7 +223,7 @@ fn render<'a>(
         let document = lookup(&window.doc_id);
         checkpoint(cx)?;
         let Some(document) = document.filter(|document| {
-            [base_filter, filter.as_ref()]
+            [base_filter, request_filter]
                 .into_iter()
                 .flatten()
                 .all(|filter| filter.matches(document))
@@ -218,18 +271,8 @@ fn render<'a>(
     // bounds encoded bytes (including escaping and the newline) BEFORE output;
     // do not first clone unbounded fields into a serde_json::Value.
     let outcome = encode(
-        &Response {
-            schema: SCHEMA,
-            event: "terminal",
-            operation: "fetch",
-            status: "complete",
-            ok: true,
-            partial_results: false,
-            request: ordinal,
-            id: request.id(),
-            seq: 0,
-            generation,
-            source: "retained_snapshot",
+        &DocumentFrame {
+            envelope,
             documents: responses,
         },
         MAX_RESPONSE_BYTES,

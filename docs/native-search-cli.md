@@ -194,7 +194,7 @@ model loading, inference, or creation of the new work directory.
 `--max-source-bytes N` on rebuild is available only with `--retained-source` and defaults to
 256 MiB. It bounds the sum of raw stored `id`, `content`, `title`, and
 `metadata_json` bytes, including JSON punctuation and escaping in the metadata
-field, checked before decoding each field. The budget does not bound process
+field, checked before copying or decoding each field. The budget does not bound process
 RSS: retained images, field materialization, and decoded documents also use
 memory. The separate encoded-image budget still applies during admission, and
 the CLI still requires at most 100,000 documents and a 16 MiB JSON-encoded record
@@ -415,7 +415,7 @@ After the `ready` event, send requests such as:
 {"id":"second","query":"connection pooling","limit":5}
 ```
 
-Each request searches the retained vector, lexical and optional HNSW images with
+Each query searches the retained vector, lexical and optional HNSW images with
 the warm producer. It does not reload models, rediscover component paths or follow
 the root's current authority implicitly. Publishing a newer generation elsewhere
 does not redirect an already running session. Results identify the authority,
@@ -440,7 +440,8 @@ stays pinned to its startup generation.
 Input records are limited to 1 MiB. An oversized record stops the session without
 draining it; an ordinary invalid bounded request produces one failure response.
 Responses are completely encoded under the existing native CLI output bound
-before emission. Output failure stops the session. Send `quit`, `exit`, or EOF
+before emission; source-fetch responses have a stricter 1 MiB bound. Output
+failure stops the session. Send `quit`, `exit`, or EOF
 to finish. As with the existing native stdio server, input reads block on the
 owning lane, and cancellation is observed between reads and requests.
 
@@ -478,7 +479,7 @@ The complete resulting cohort must remain nonempty and satisfy the same
 command. Destinations must be UTF-8 paths of at most 4,096 bytes, outside the
 selected root and separate from each other. `--batch-size` on the server
 requires `--allow-updates`; `--max-source-bytes` also bounds filtered queries
-when writes are disabled.
+and selected source retrieval when writes are disabled.
 
 The server verifies that its retained authority pair is still current before
 source export or inference. It preserves that exact pair throughout the build.
@@ -582,6 +583,83 @@ across publication and rollback; they are not live revocation mechanisms.
 Library callers can retain an `Arc<NativeGenerationSnapshot>`, call
 `snapshot.scope(&cx, max_source_bytes, predicate)`, and use `narrow` to derive
 an intersected scope without exporting the source again.
+
+### Fetch document text from the selected authority
+
+Every `authority-serve` session accepts read-only `fetch` requests, including
+sessions without activation or update permission. This retrieves the stored text
+behind a search hit from the exact retained authority. It uses no inference,
+model reload, current-file read, or implicit authority refresh. The `ready` frame
+advertises `fetch_enabled` and the document, content-window and response limits.
+
+Each request has these fields:
+
+| Field | Value |
+|---|---|
+| `op` | `"fetch"` |
+| `id` | Optional request ID |
+| `expected_authority` | The complete byte array from the search result whose source is being requested |
+| `documents` | Between 1 and 32 document-window objects |
+| `filter` | Optional source predicate that further restricts the fixed server scope |
+
+For example, the `documents` array can request two windows of the same document
+and the beginning of another:
+
+```json
+[
+  {"doc_id":"src/client.rs","offset_bytes":0,"max_bytes":8192,"include_metadata":true},
+  {"doc_id":"src/client.rs","offset_bytes":8192,"max_bytes":8192},
+  {"doc_id":"docs/retries.md","max_bytes":4096}
+]
+```
+
+`offset_bytes` defaults to zero and must be a UTF-8 boundary within the stored
+body. `max_bytes` defaults to 8192 and accepts 4 through 65536 bytes. The end of
+a window rounds down to a UTF-8 boundary. Use the returned `next_offset_bytes`
+for continuation; it is null at the end. IDs remain literal document IDs, never
+filesystem paths. They must be nonblank and NUL-free, at most 65535 bytes each,
+and at most 64 KiB in total across the requested windows. Repeated windows count
+toward the 32-window and ID limits and retain their original order.
+
+Success is one `event: "terminal"` frame with `operation: "fetch"`,
+`status: "complete"`, `partial_results: false`, `source: "retained_snapshot"`,
+and the authority, artifact generation, tier, profile and retrieval mode. Each
+found document supplies `doc_id`, `content`, `offset_bytes`, `end_offset_bytes`,
+`total_bytes` and `next_offset_bytes`. Title and metadata are included only when
+`include_metadata` is true. Absent, deleted and excluded IDs all return exactly
+`{"status":"unavailable","doc_id":"the-requested-id"}` with no source details.
+Filtered fetches report `scope.filtered: true`; they do not scan the corpus to
+compute a global eligible-document count.
+
+The full expected authority is checked before source access. A request carrying
+an older authority fails after activation or update, even when a rollback has
+restored the same artifact generation and component bytes. A server that has
+not activated an externally published successor continues fetching from its
+original retained reader. Clients must keep the authority from the matching
+search result, rather than attach a newer authority to an old hit.
+
+With a fixed filter, fetch borrows its admitted source inventory and only resolves
+eligible IDs. Without one, it loads just the distinct requested live documents
+from the retained vector and Quill readers. `--max-source-bytes` bounds their
+combined raw stored ID, content, title and canonical metadata fields, using the
+same accounting as retained-source rebuilds. Repeated windows share one source
+materialization. This bound covers complete selected document fields even when
+only a small content window is requested or metadata is omitted. It is not a
+process-memory limit or an assertion that the entire corpus was exported.
+
+The complete encoded frame, including JSON escaping, selection fields and final
+newline, must fit 1 MiB. Invalid offsets, source-budget exhaustion or an oversized
+encoded reply produce one bounded failure with no document prefix, and the next
+request remains usable. A failed write or flush ends serving without a second
+frame. Cancellation follows the existing authority-session contract.
+
+Library clients can use `snapshot.source_document(&cx, id, max_source_bytes)` or
+`snapshot.source_documents_by_ids(&cx, &ids, max_source_bytes)` without a model.
+The batch API preserves order and duplicates, returns `None` for absent/deleted
+IDs, and charges the raw source budget for each returned document entry. Callers
+can deduplicate IDs when multiple windows share the same document, as the CLI
+does. Both APIs retain the selected immutable reader and return no partial batch
+on source validation, budget, allocation or cancellation failure.
 
 ### Quality models, budgets, and publication recovery
 
