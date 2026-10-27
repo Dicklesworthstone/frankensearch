@@ -971,11 +971,12 @@ impl NativeHnswGenerationBindingV2 {
 /// use frankensearch_index::native_hnsw::ValidatedNativeHnsw;
 ///
 /// fn substitute_store(
+///     cx: &asupersync::Cx,
 ///     bound: &ValidatedNativeHnsw,
 ///     other: &ValidatedFsviBytes,
 ///     query: &[f32],
 /// ) {
-///     let _ = bound.search(query, 10, None, other);
+///     let _ = bound.search(cx, query, 10, None, other);
 /// }
 /// ```
 ///
@@ -985,8 +986,8 @@ impl NativeHnswGenerationBindingV2 {
 /// ```compile_fail
 /// use frankensearch_index::native_hnsw::ValidatedNativeHnsw;
 ///
-/// fn detach_hit(bound: ValidatedNativeHnsw, query: &[f32]) {
-///     let hit = bound.search(query, 1, None).unwrap().remove(0);
+/// fn detach_hit(bound: ValidatedNativeHnsw, cx: &asupersync::Cx, query: &[f32]) {
+///     let hit = bound.search(cx, query, 1, None).unwrap().remove(0);
 ///     drop(bound);
 ///     let _ = hit.doc_id();
 /// }
@@ -1078,20 +1079,36 @@ impl ValidatedNativeHnsw {
     /// exact physical-row identity in topology and receipt material, but
     /// [`Self::search`] never exposes them as hits.
     ///
+    /// Construction checks the caller's cancellation before every inserted row
+    /// and distance computation. Cancellation discards the private graph; no
+    /// partial graph is published. Identity and structural admission are checked
+    /// before and after their synchronous validation work.
+    ///
     /// # Errors
     ///
     /// Returns identity/cardinality errors from receipt binding construction
     /// or distance-computation errors from the admitted owner, and a
     /// `native-hnsw` [`SearchError::SubsystemError`] if post-build structural
-    /// attestation rejects the graph.
+    /// attestation rejects the graph. Returns [`SearchError::Cancelled`] when
+    /// the caller cancels or exhausts its task budget.
     pub fn build(
+        cx: &Cx,
         owner: Arc<ValidatedFsviBytes>,
         params: HnswParams,
         seed: u64,
     ) -> SearchResult<Self> {
+        native_checkpoint(cx, "native_hnsw.build")?;
         let binding = Self::binding_for_owner(owner.as_ref())?;
-        let graph = NativeHnsw::build(params, seed, owner.as_ref())?;
-        Self::from_verified_graph(owner, binding, graph)
+        let store = CheckedDistanceStore {
+            cx,
+            phase: "native_hnsw.build",
+            inner: owner.as_ref(),
+        };
+        let graph = NativeHnsw::build(params, seed, &store)?;
+        native_checkpoint(cx, "native_hnsw.build")?;
+        let bound = Self::from_verified_graph(owner, binding, graph)?;
+        native_checkpoint(cx, "native_hnsw.build")?;
+        Ok(bound)
     }
 
     /// Reuse this graph for an unchanged or append-only successor owner.
@@ -1201,10 +1218,14 @@ impl ValidatedNativeHnsw {
             native_reuse_checkpoint(cx)?;
             graph.adjacency.push(point.clone());
         }
-        let store = MappedFsviStore {
+        let mapped = MappedFsviStore {
             owner: owner.as_ref(),
             source_rows: &source_rows,
-            cancellation: Some(cx),
+        };
+        let store = CheckedDistanceStore {
+            cx,
+            phase: "native_hnsw.reuse",
+            inner: &mapped,
         };
         for ordinal in graph.len()..source_rows.len() {
             native_reuse_checkpoint(cx)?;
@@ -1303,19 +1324,24 @@ impl ValidatedNativeHnsw {
     /// deterministically, never beyond the physical row count, until exactly
     /// `min(k, owner.live_count())` hits are available. A full-width underfill
     /// is a typed structural defect rather than a silent short result.
+    /// Cancellation is checked during traversal and widening as well as before
+    /// returning hits; a cancelled query never returns a partial result.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::DimensionMismatch`] when the query does not
     /// match the admitted owner's dimension, [`SearchError::InvalidConfig`]
     /// for non-finite query values, or graph-distance and owner row-resolution
-    /// errors.
+    /// errors. Returns [`SearchError::Cancelled`] before publishing results
+    /// when the caller cancels or exhausts its task budget.
     pub fn search(
         &self,
+        cx: &Cx,
         query: &[f32],
         k: usize,
         ef: Option<usize>,
     ) -> SearchResult<Vec<ValidatedNativeHnswHit<'_>>> {
+        native_checkpoint(cx, "native_hnsw.search")?;
         if query.len() != self.owner.dimension() {
             return Err(SearchError::DimensionMismatch {
                 expected: self.owner.dimension(),
@@ -1337,10 +1363,14 @@ impl ValidatedNativeHnsw {
         }
 
         let physical_rows = owner.record_count();
-        let store = MappedFsviStore {
+        let mapped = MappedFsviStore {
             owner,
             source_rows: &self.graph.source_rows,
-            cancellation: None,
+        };
+        let store = CheckedDistanceStore {
+            cx,
+            phase: "native_hnsw.search",
+            inner: &mapped,
         };
         let mut candidate_count = expected_live_hits.min(physical_rows);
         let mut search_ef = ef
@@ -1349,12 +1379,14 @@ impl ValidatedNativeHnsw {
             .min(physical_rows);
 
         loop {
+            store.checkpoint()?;
             let candidates = self
                 .graph
                 .search(query, candidate_count, Some(search_ef), &store)?;
             let mut live_hits = Vec::with_capacity(expected_live_hits);
             for (node, distance) in candidates {
-                let physical_row = store.physical_row(node)?;
+                store.checkpoint()?;
+                let physical_row = mapped.physical_row(node)?;
                 let physical_index =
                     usize::try_from(physical_row).map_err(|_| SearchError::InvalidConfig {
                         field: "native_hnsw.physical_row".to_owned(),
@@ -1374,6 +1406,7 @@ impl ValidatedNativeHnsw {
                 });
                 // ubs:ignore -- result cardinalities are not secret material.
                 if live_hits.len() == expected_live_hits {
+                    store.checkpoint()?;
                     return Ok(live_hits);
                 }
             }
@@ -2029,6 +2062,12 @@ impl LevelSampler {
 /// vector data (the FSVI slab) and lets the graph reuse whichever SIMD
 /// kernel the store already selected.
 trait VectorDistance {
+    /// Check a caller-owned cancellation context, when this operation has one.
+    /// Numerical fixtures and persistence validators do not create a context.
+    fn checkpoint(&self) -> SearchResult<()> {
+        Ok(())
+    }
+
     /// Distance between stored row `id` and `query`. Smaller is nearer.
     ///
     /// # Errors
@@ -2074,13 +2113,46 @@ impl VectorDistance for ValidatedFsviBytes {
 }
 
 fn native_reuse_checkpoint(cx: &Cx) -> SearchResult<()> {
+    native_checkpoint(cx, "native_hnsw.reuse")
+}
+
+fn native_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
     if cx.checkpoint().is_err() || cx.is_cancel_requested() {
         return Err(SearchError::Cancelled {
-            phase: "native_hnsw.reuse".to_owned(),
+            phase: phase.to_owned(),
             reason: "operation cancelled".to_owned(),
         });
     }
     Ok(())
+}
+
+/// The graph algorithm reads through this adapter for every cancellable build,
+/// reuse and query. It borrows the real caller context and never fabricates one.
+struct CheckedDistanceStore<'a, D> {
+    cx: &'a Cx,
+    phase: &'static str,
+    inner: &'a D,
+}
+
+impl<D: VectorDistance> VectorDistance for CheckedDistanceStore<'_, D> {
+    fn checkpoint(&self) -> SearchResult<()> {
+        native_checkpoint(self.cx, self.phase)?;
+        self.inner.checkpoint()
+    }
+
+    fn distance_to_query(&self, id: u32, query: &[f32]) -> SearchResult<f32> {
+        self.checkpoint()?;
+        self.inner.distance_to_query(id, query)
+    }
+
+    fn distance_between(&self, a: u32, b: u32) -> SearchResult<f32> {
+        self.checkpoint()?;
+        self.inner.distance_between(a, b)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
 }
 
 /// Graph nodes retain insertion identity across FSVI's physical-row sorting.
@@ -2088,7 +2160,6 @@ fn native_reuse_checkpoint(cx: &Cx) -> SearchResult<()> {
 struct MappedFsviStore<'a> {
     owner: &'a ValidatedFsviBytes,
     source_rows: &'a [u32],
-    cancellation: Option<&'a Cx>,
 }
 
 impl MappedFsviStore<'_> {
@@ -2101,23 +2172,14 @@ impl MappedFsviStore<'_> {
             )
         })
     }
-
-    fn checkpoint(&self) -> SearchResult<()> {
-        if let Some(cx) = self.cancellation {
-            native_reuse_checkpoint(cx)?;
-        }
-        Ok(())
-    }
 }
 
 impl VectorDistance for MappedFsviStore<'_> {
     fn distance_to_query(&self, id: u32, query: &[f32]) -> SearchResult<f32> {
-        self.checkpoint()?;
         self.owner.distance_to_query(self.physical_row(id)?, query)
     }
 
     fn distance_between(&self, a: u32, b: u32) -> SearchResult<f32> {
-        self.checkpoint()?;
         self.owner
             .distance_between(self.physical_row(a)?, self.physical_row(b)?)
     }
@@ -2916,6 +2978,7 @@ impl NativeHnsw {
     ///
     /// Propagates distance-computation failures from `store`.
     fn build<D: VectorDistance>(params: HnswParams, seed: u64, store: &D) -> SearchResult<Self> {
+        store.checkpoint()?;
         let mut graph = Self::new(params, seed)?;
         let count = u32::try_from(store.len()).map_err(|_| SearchError::InvalidConfig {
             field: "store.len".to_owned(),
@@ -2923,8 +2986,10 @@ impl NativeHnsw {
             reason: "row count must fit in u32".to_owned(),
         })?;
         for id in 0..count {
+            store.checkpoint()?;
             graph.insert(id, store)?;
         }
+        store.checkpoint()?;
         Ok(graph)
     }
 
@@ -2956,6 +3021,7 @@ impl NativeHnsw {
         store: &D,
         visited: &mut VisitedSet,
     ) -> SearchResult<()> {
+        store.checkpoint()?;
         // A saturating conversion here would let the (4-billionth) insert
         // into a full graph look like a valid in-order one, so report the
         // capacity explicitly instead.
@@ -3067,6 +3133,9 @@ impl NativeHnsw {
             Ok(())
         })();
 
+        // Cancellation after the final distance still participates in the
+        // insertion transaction: no new row or mutated neighbour list escapes.
+        let outcome = outcome.and_then(|()| store.checkpoint());
         if let Err(error) = outcome {
             journal.rollback(&mut self.adjacency);
             self.adjacency.truncate(original_point_count);
@@ -3173,6 +3242,7 @@ impl NativeHnsw {
         }
 
         while let Some(Nearest(current)) = frontier.pop() {
+            store.checkpoint()?;
             // Stop once the frontier's nearest is worse than the worst kept
             // result and the result set is already full.
             if let Some(worst) = results.peek()
@@ -3205,6 +3275,7 @@ impl NativeHnsw {
 
         let mut ordered = results.into_vec();
         ordered.sort_unstable();
+        store.checkpoint()?;
         Ok(ordered)
     }
 
@@ -3420,6 +3491,7 @@ impl NativeHnsw {
         ef: Option<usize>,
         store: &D,
     ) -> SearchResult<Vec<(u32, f32)>> {
+        store.checkpoint()?;
         self.verify_store_cardinality(store)
             .map_err(|source| SearchError::SubsystemError {
                 subsystem: "native-hnsw",
@@ -3450,6 +3522,7 @@ impl NativeHnsw {
 
         let mut candidates =
             self.search_layer_query(&[current], query, 0, ef, store, &mut visited)?;
+        store.checkpoint()?;
         candidates.truncate(k);
         Ok(candidates
             .into_iter()
@@ -4351,6 +4424,53 @@ mod tests {
         }
     }
 
+    /// Request cancellation after a deterministic amount of real distance
+    /// work. The production checked adapter must notice it before continuing
+    /// traversal or publishing a completed insertion.
+    struct CancellingStore<'a> {
+        inner: &'a TestStore,
+        cx: &'a Cx,
+        cancel_after: usize,
+        distance_calls: Cell<usize>,
+    }
+
+    impl<'a> CancellingStore<'a> {
+        fn new(inner: &'a TestStore, cx: &'a Cx, cancel_after: usize) -> Self {
+            Self {
+                inner,
+                cx,
+                cancel_after,
+                distance_calls: Cell::new(0),
+            }
+        }
+
+        fn finished_distance(&self) {
+            let calls = self.distance_calls.get() + 1;
+            self.distance_calls.set(calls);
+            if calls == self.cancel_after {
+                self.cx.set_cancel_requested(true);
+            }
+        }
+    }
+
+    impl VectorDistance for CancellingStore<'_> {
+        fn distance_to_query(&self, id: u32, query: &[f32]) -> SearchResult<f32> {
+            let distance = self.inner.distance_to_query(id, query)?;
+            self.finished_distance();
+            Ok(distance)
+        }
+
+        fn distance_between(&self, a: u32, b: u32) -> SearchResult<f32> {
+            let distance = self.inner.distance_between(a, b)?;
+            self.finished_distance();
+            Ok(distance)
+        }
+
+        fn len(&self) -> usize {
+            self.inner.len()
+        }
+    }
+
     fn topology_snapshot(graph: &NativeHnsw) -> (Vec<Vec<Vec<u32>>>, Option<u32>, usize, usize) {
         (
             graph
@@ -4607,12 +4727,85 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_native_build_and_search_refuse_fast_paths_without_publishing() {
+        let cx = Cx::for_testing();
+        for count in [0, 8] {
+            let owner = generation_owner(99, 0x09, "cancelled-native", 4, count);
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                ValidatedNativeHnsw::build(&cx, Arc::clone(&owner), params(), 42),
+                Err(SearchError::Cancelled { phase, .. }) if phase == "native_hnsw.build"
+            ));
+            assert_eq!(Arc::strong_count(&owner), 1);
+
+            cx.set_cancel_requested(false);
+            let graph = ValidatedNativeHnsw::build(&cx, Arc::clone(&owner), params(), 42)
+                .expect("uncancelled build");
+            let query = [1.0, 0.0, 0.0, 0.0];
+            let expected = graph.search(&cx, &query, 8, Some(8)).unwrap();
+            cx.set_cancel_requested(true);
+            for k in [0, 8] {
+                assert!(matches!(
+                    graph.search(&cx, &query, k, Some(8)),
+                    Err(SearchError::Cancelled { phase, .. }) if phase == "native_hnsw.search"
+                ));
+            }
+            cx.set_cancel_requested(false);
+            assert_eq!(graph.search(&cx, &query, 8, Some(8)).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn native_build_and_search_stop_during_distance_work() {
+        let store = TestStore::synthetic(64, 8);
+        let cx = Cx::for_testing();
+        let cancelling = CancellingStore::new(&store, &cx, 100);
+        let checked = CheckedDistanceStore {
+            cx: &cx,
+            phase: "native_hnsw.build",
+            inner: &cancelling,
+        };
+        assert!(matches!(
+            NativeHnsw::build(params(), 42, &checked),
+            Err(SearchError::Cancelled { phase, .. }) if phase == "native_hnsw.build"
+        ));
+        assert_eq!(cancelling.distance_calls.get(), 100);
+
+        cx.set_cancel_requested(false);
+        let graph = NativeHnsw::build(params(), 42, &store).unwrap();
+        let query = TestStore::query(7, 8);
+        let expected = graph.search(&query, 8, Some(64), &store).unwrap();
+        let cancelling = CancellingStore::new(&store, &cx, 5);
+        let checked = CheckedDistanceStore {
+            cx: &cx,
+            phase: "native_hnsw.search",
+            inner: &cancelling,
+        };
+        assert!(matches!(
+            graph.search(&query, 8, Some(64), &checked),
+            Err(SearchError::Cancelled { phase, .. }) if phase == "native_hnsw.search"
+        ));
+        assert_eq!(cancelling.distance_calls.get(), 5);
+
+        cx.set_cancel_requested(false);
+        assert_eq!(
+            graph.search(&query, 8, Some(64), &checked).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn successor_reuses_unchanged_topology_and_binds_the_new_owner() {
         let directory = tempfile::tempdir().expect("temporary successor directory");
         let previous_owner = generation_owner(100, 0x10, "unchanged-successor", 8, 32);
         let next_owner = generation_owner(101, 0x11, "unchanged-successor", 8, 32);
-        let previous = ValidatedNativeHnsw::build(Arc::clone(&previous_owner), params(), 42)
-            .expect("build predecessor");
+        let previous = ValidatedNativeHnsw::build(
+            &Cx::for_testing(),
+            Arc::clone(&previous_owner),
+            params(),
+            42,
+        )
+        .expect("build predecessor");
         let next = previous
             .try_reuse_for_owner(&Cx::for_testing(), Arc::clone(&next_owner))
             .expect("reuse unchanged membership")
@@ -4666,6 +4859,7 @@ mod tests {
     #[test]
     fn empty_predecessor_can_reuse_or_insert_its_first_successor_nodes() {
         let previous = ValidatedNativeHnsw::build(
+            &Cx::for_testing(),
             generation_owner(105, 0x15, "empty-successor", 4, 0),
             params(),
             42,
@@ -4686,9 +4880,14 @@ mod tests {
                 .verify()
                 .expect("first insertion populates the source map");
             assert_eq!(
-                next.search(&[1.0, 0.0, 0.0, 0.0], count, Some(count))
-                    .expect("search empty or newly populated successor")
-                    .len(),
+                next.search(
+                    &Cx::for_testing(),
+                    &[1.0, 0.0, 0.0, 0.0],
+                    count,
+                    Some(count)
+                )
+                .expect("search empty or newly populated successor")
+                .len(),
                 count
             );
         }
@@ -4710,8 +4909,8 @@ mod tests {
                 fsvi_v2_binding_with_quantization(110, 0x10, "append-successor", 8, quantization);
             let owner =
                 admitted_fsvi_owner(directory.path(), "initial.fsvi", &binding, &rows[..32]);
-            let mut previous =
-                ValidatedNativeHnsw::build(owner, params(), 93).expect("build initial graph");
+            let mut previous = ValidatedNativeHnsw::build(&Cx::for_testing(), owner, params(), 93)
+                .expect("build initial graph");
             for (sequence, count) in [(111, 64), (112, 96), (113, 96)] {
                 let next_binding = fsvi_v2_binding_with_quantization(
                     sequence,
@@ -4769,7 +4968,7 @@ mod tests {
                         .search_top_k(&query, 7, None)
                         .expect("exact successor search");
                     let actual = next
-                        .search(&query, 7, Some(count))
+                        .search(&Cx::for_testing(), &query, 7, Some(count))
                         .expect("full-width remapped graph search");
                     assert_eq!(
                         actual
@@ -4834,8 +5033,8 @@ mod tests {
             &rows[..24],
         );
         let seed = seed_with_tombstoned_entry(&owner);
-        let previous =
-            ValidatedNativeHnsw::build(owner, params(), seed).expect("build predecessor");
+        let previous = ValidatedNativeHnsw::build(&Cx::for_testing(), owner, params(), seed)
+            .expect("build predecessor");
         let next_binding = fsvi_v2_binding(121, 0x21, "tombstone-successor", 8);
         let next_owner =
             admitted_fsvi_owner_with_flags(directory.path(), "next.fsvi", &next_binding, &rows);
@@ -4844,7 +5043,12 @@ mod tests {
             .expect("append tombstone successor")
             .expect("eligible unchanged tombstone layout");
         let hits = next
-            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 48, Some(1))
+            .search(
+                &Cx::for_testing(),
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                48,
+                Some(1),
+            )
             .expect("widen through remapped tombstone routes");
         assert_eq!(next.len(), 48);
         assert_eq!(hits.len(), next_owner.live_count());
@@ -4865,8 +5069,8 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary incompatible successor directory");
         let rows = fsvi_rows(8, 4);
         let previous_owner = generation_owner(130, 0x30, "incompatible-successor", 4, 8);
-        let previous =
-            ValidatedNativeHnsw::build(previous_owner, params(), 5).expect("build predecessor");
+        let previous = ValidatedNativeHnsw::build(&Cx::for_testing(), previous_owner, params(), 5)
+            .expect("build predecessor");
         let binding = fsvi_v2_binding(131, 0x31, "incompatible-successor", 4);
         let mut edited = rows.clone();
         edited[2].1 = vec![0.5; 4];
@@ -4975,14 +5179,15 @@ mod tests {
         // source directory has already left scope before this call returns.
         let owner = generation_owner(80, 0x80, "retained-build-owner", 4, 16);
         let weak_owner = Arc::downgrade(&owner);
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 80)
-            .expect("build retains the admitted owner");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 80)
+                .expect("build retains the admitted owner");
         assert_eq!(Arc::strong_count(&owner), 2);
 
         drop(owner);
         assert_eq!(weak_owner.strong_count(), 1);
         let hits = bound
-            .search(&[1.0, 0.0, 0.0, 0.0], 4, None)
+            .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 4, None)
             .expect("retained build owner remains searchable");
         assert_eq!(hits.len(), 4);
         assert!(hits.iter().all(|hit| hit.flags().is_live()));
@@ -5019,11 +5224,17 @@ mod tests {
             ValidatedFsviBytes::open_published(&current_path, &binding)
                 .expect("admit original published FSVI"),
         );
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 82)
-            .expect("build graph from admitted owner");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 82)
+                .expect("build graph from admitted owner");
         assert_eq!(
             bound
-                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(owner.record_count()))
+                .search(
+                    &Cx::for_testing(),
+                    &[1.0, 0.0, 0.0, 0.0],
+                    1,
+                    Some(owner.record_count())
+                )
                 .expect("search original owner through ANN")[0]
                 .doc_id(),
             "doc-alpha"
@@ -5054,7 +5265,12 @@ mod tests {
         );
         assert_eq!(
             bound
-                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(owner.record_count()))
+                .search(
+                    &Cx::for_testing(),
+                    &[1.0, 0.0, 0.0, 0.0],
+                    1,
+                    Some(owner.record_count())
+                )
                 .expect("search retained owner-bound ANN")[0]
                 .doc_id(),
             "doc-alpha",
@@ -5086,11 +5302,17 @@ mod tests {
             ValidatedFsviBytes::open_published(&current_path, &binding)
                 .expect("admit original published FSVI"),
         );
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 83)
-            .expect("build graph from admitted owner");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 83)
+                .expect("build graph from admitted owner");
         assert_eq!(
             bound
-                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(owner.record_count()))
+                .search(
+                    &Cx::for_testing(),
+                    &[1.0, 0.0, 0.0, 0.0],
+                    1,
+                    Some(owner.record_count())
+                )
                 .expect("search original owner through ANN")[0]
                 .doc_id(),
             "doc-alpha"
@@ -5135,7 +5357,12 @@ mod tests {
         );
         assert_eq!(
             bound
-                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(owner.record_count()))
+                .search(
+                    &Cx::for_testing(),
+                    &[1.0, 0.0, 0.0, 0.0],
+                    1,
+                    Some(owner.record_count())
+                )
                 .expect("search retained owner-bound ANN")[0]
                 .doc_id(),
             "doc-alpha",
@@ -5175,10 +5402,16 @@ mod tests {
         let exact = owner
             .search_top_k(&query, owner.live_count(), None)
             .expect("exact same-owner search");
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 84)
-            .expect("build graph from exact-search owner");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 84)
+                .expect("build graph from exact-search owner");
         let ann = bound
-            .search(&query, owner.live_count(), Some(owner.record_count()))
+            .search(
+                &Cx::for_testing(),
+                &query,
+                owner.live_count(),
+                Some(owner.record_count()),
+            )
             .expect("full-beam owner-bound ANN search");
 
         assert_eq!(
@@ -5209,8 +5442,9 @@ mod tests {
         let loaded = {
             let directory = tempfile::tempdir().expect("temporary graph directory");
             let graph_path = directory.path().join("retained-owner.fshnsw");
-            let built = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 81)
-                .expect("build owner-bound graph");
+            let built =
+                ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 81)
+                    .expect("build owner-bound graph");
             built.save(&graph_path).expect("save owner-bound graph");
             drop(built);
             assert_eq!(Arc::strong_count(&owner), 1);
@@ -5226,7 +5460,7 @@ mod tests {
         drop(owner);
         assert_eq!(weak_owner.strong_count(), 1);
         let hits = loaded
-            .search(&[0.0, 1.0, 0.0, 0.0], 4, None)
+            .search(&Cx::for_testing(), &[0.0, 1.0, 0.0, 0.0], 4, None)
             .expect("retained loaded owner remains searchable");
         assert_eq!(hits.len(), 4);
         assert!(hits.iter().all(|hit| hit.flags().is_live()));
@@ -5244,8 +5478,13 @@ mod tests {
         let graph_path = directory.path().join("graph.fshnsw");
         let receipt_path = directory.path().join("graph.fshnsw.receipt");
         let owner = generation_owner(u64::MAX, 0xa5, "receipt-round-trip", 8, 48);
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 0x51de_cafe)
-            .expect("owner-bound build");
+        let bound = ValidatedNativeHnsw::build(
+            &Cx::for_testing(),
+            Arc::clone(&owner),
+            params(),
+            0x51de_cafe,
+        )
+        .expect("owner-bound build");
         let binding = &bound.binding;
 
         assert_eq!(
@@ -5306,7 +5545,12 @@ mod tests {
             topology_snapshot(&bound.graph)
         );
         let hits = loaded
-            .search(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8, None)
+            .search(
+                &Cx::for_testing(),
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                8,
+                None,
+            )
             .expect("owner-bound search");
         assert!(!hits.is_empty());
         for hit in hits {
@@ -5380,8 +5624,9 @@ mod tests {
             admitted_fsvi_owner(directory.path(), "vectors-a.fsvi", &fsvi_binding, &rows_a);
         let owner_b =
             admitted_fsvi_owner(directory.path(), "vectors-b.fsvi", &fsvi_binding, &rows_b);
-        let bound_a = ValidatedNativeHnsw::build(Arc::clone(&owner_a), params(), 31)
-            .expect("owner-bound graph");
+        let bound_a =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner_a), params(), 31)
+                .expect("owner-bound graph");
         let binding_a = &bound_a.binding;
         let binding_b =
             NativeHnswGenerationBindingV2::from_validated_fsvi(&owner_b).expect("binding b");
@@ -5438,8 +5683,9 @@ mod tests {
             admitted_fsvi_owner(directory.path(), "docset-a.fsvi", &fsvi_binding, &rows_a);
         let owner_b =
             admitted_fsvi_owner(directory.path(), "docset-b.fsvi", &fsvi_binding, &rows_b);
-        let bound_a = ValidatedNativeHnsw::build(Arc::clone(&owner_a), params(), 32)
-            .expect("owner-bound graph");
+        let bound_a =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner_a), params(), 32)
+                .expect("owner-bound graph");
         let binding_a = &bound_a.binding;
         let binding_b =
             NativeHnswGenerationBindingV2::from_validated_fsvi(&owner_b).expect("binding b");
@@ -5584,8 +5830,9 @@ mod tests {
         assert_eq!(layout_b[layout_b.len() - 1].1, FsviRecordFlags::TOMBSTONE);
         assert_ne!(layout_a, layout_b);
 
-        let bound_a = ValidatedNativeHnsw::build(Arc::clone(&owner_a), params(), 35)
-            .expect("public tombstone-aware graph fixture");
+        let bound_a =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner_a), params(), 35)
+                .expect("public tombstone-aware graph fixture");
         let graph_path = directory.path().join("layout.fshnsw");
         bound_a
             .save(&graph_path)
@@ -5683,10 +5930,16 @@ mod tests {
             "exact F32 search must separate the sub-F16-step pair"
         );
 
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 44)
-            .expect("build graph from F32 owner");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 44)
+                .expect("build graph from F32 owner");
         let ann = bound
-            .search(&query, owner.live_count(), Some(owner.record_count()))
+            .search(
+                &Cx::for_testing(),
+                &query,
+                owner.live_count(),
+                Some(owner.record_count()),
+            )
             .expect("full-beam owner-bound ANN search over F32 storage");
         assert_eq!(
             ann.iter()
@@ -5789,8 +6042,9 @@ mod tests {
             successor_binding_v2.fsvi_whole_image_sha256
         );
 
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&predecessor), params(), 41)
-            .expect("predecessor owner-bound graph");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&predecessor), params(), 41)
+                .expect("predecessor owner-bound graph");
         let graph_path = directory.path().join("generation.fshnsw");
         bound.save(&graph_path).expect("publish receipted graph");
         ValidatedNativeHnsw::load(Arc::clone(&predecessor), &graph_path)
@@ -5928,8 +6182,9 @@ mod tests {
             "the whole-image witness is the only field that separates the twins"
         );
 
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&first), params(), 43)
-            .expect("first publication owner-bound graph");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&first), params(), 43)
+                .expect("first publication owner-bound graph");
         let graph_path = directory.path().join("nonce.fshnsw");
         bound.save(&graph_path).expect("publish receipted graph");
         ValidatedNativeHnsw::load(Arc::clone(&first), &graph_path)
@@ -5969,8 +6224,9 @@ mod tests {
             &rows,
         );
 
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 36)
-            .expect("tombstoned owner builds a public ANN handle");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 36)
+                .expect("tombstoned owner builds a public ANN handle");
         assert_eq!(bound.len(), 2, "both physical rows remain routing nodes");
         assert_eq!(owner.live_count(), 1);
         assert_eq!(owner.tombstone_count(), 1);
@@ -5989,7 +6245,7 @@ mod tests {
             .vector_at_f32(tombstone_index)
             .expect("query equal to the nearest tombstoned vector");
         let hits = bound
-            .search(&query, 8, Some(1))
+            .search(&Cx::for_testing(), &query, 8, Some(1))
             .expect("bounded search widens past its tombstoned nearest candidate");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id(), "live");
@@ -6019,7 +6275,7 @@ mod tests {
         );
         assert_eq!(
             loaded
-                .search(&query, 8, Some(1))
+                .search(&Cx::for_testing(), &query, 8, Some(1))
                 .expect("loaded bounded widening"),
             hits
         );
@@ -6067,7 +6323,7 @@ mod tests {
                 {
                     return None;
                 }
-                ValidatedNativeHnsw::build(Arc::clone(&owner), params(), seed)
+                ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), seed)
                     .ok()
                     .map(|bound| (seed, bound))
             })
@@ -6087,10 +6343,10 @@ mod tests {
             .vector_at_f32(usize::try_from(entry).expect("entry fits usize"))
             .expect("query equal to the tombstoned entry vector");
         let first = bound
-            .search(&query, usize::MAX, Some(1))
+            .search(&Cx::for_testing(), &query, usize::MAX, Some(1))
             .expect("bounded widening reaches every required live row");
         let second = bound
-            .search(&query, usize::MAX, Some(1))
+            .search(&Cx::for_testing(), &query, usize::MAX, Some(1))
             .expect("repeat bounded widening is deterministic");
         assert_eq!(first, second);
         assert_eq!(first.len(), owner.live_count());
@@ -6153,21 +6409,22 @@ mod tests {
             &fsvi_binding,
             &rows,
         );
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 41)
-            .expect("all physical tombstones remain valid routing nodes");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 41)
+                .expect("all physical tombstones remain valid routing nodes");
 
         assert_eq!(bound.len(), 8);
         assert_eq!(owner.live_count(), 0);
         assert_eq!(owner.tombstone_count(), 8);
         assert!(
             bound
-                .search(&[1.0, 0.0, 0.0, 0.0], 8, Some(1))
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 8, Some(1))
                 .expect("all-tombstoned search")
                 .is_empty()
         );
         assert!(
             bound
-                .search(&[1.0, 0.0, 0.0, 0.0], 0, Some(1))
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 0, Some(1))
                 .expect("zero-k search")
                 .is_empty()
         );
@@ -6273,8 +6530,9 @@ mod tests {
             &rows,
         );
         let seed = seed_with_tombstoned_entry(&owner);
-        let mut bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), seed)
-            .expect("build structurally valid owner-bound graph");
+        let mut bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), seed)
+                .expect("build structurally valid owner-bound graph");
         let live_row = (0..owner.record_count())
             .find(|&index| owner.row(index).expect("owner row").flags().is_live())
             .expect("one live row");
@@ -6298,7 +6556,7 @@ mod tests {
         // ubs:ignore -- a public test query must not taint unrelated comparisons.
         let query = owner.vector_at_f32(live_row).expect("live query vector");
         let error = bound
-            .search(&query, 1, Some(1))
+            .search(&Cx::for_testing(), &query, 1, Some(1))
             .expect_err("full-width underfill must fail closed");
         assert!(
             matches!(&error, SearchError::SubsystemError { .. }),
@@ -6330,11 +6588,16 @@ mod tests {
             &nonempty_binding,
             &nonempty_rows,
         );
-        let nonempty = ValidatedNativeHnsw::build(Arc::clone(&nonempty_owner), params(), 37)
-            .expect("build nonempty owner-bound graph");
+        let nonempty = ValidatedNativeHnsw::build(
+            &Cx::for_testing(),
+            Arc::clone(&nonempty_owner),
+            params(),
+            37,
+        )
+        .expect("build nonempty owner-bound graph");
 
         let wrong_dimension = nonempty
-            .search(&[1.0, 0.0, 0.0], 0, None)
+            .search(&Cx::for_testing(), &[1.0, 0.0, 0.0], 0, None)
             .expect_err("zero-k must not bypass query-dimension validation");
         assert!(matches!(
             wrong_dimension,
@@ -6345,7 +6608,7 @@ mod tests {
         ));
         for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let error = nonempty
-                .search(&[non_finite, 0.0, 0.0, 0.0], 0, None)
+                .search(&Cx::for_testing(), &[non_finite, 0.0, 0.0, 0.0], 0, None)
                 .expect_err("zero-k must not bypass non-finite query validation");
             assert!(
                 matches!(
@@ -6363,7 +6626,7 @@ mod tests {
         }
         assert!(
             nonempty
-                .search(&[1.0, 0.0, 0.0, 0.0], 0, None)
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 0, None)
                 .expect("valid zero-k query")
                 .is_empty()
         );
@@ -6375,11 +6638,12 @@ mod tests {
             &empty_binding,
             &[],
         );
-        let empty = ValidatedNativeHnsw::build(Arc::clone(&empty_owner), params(), 38)
-            .expect("build empty owner-bound graph");
+        let empty =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&empty_owner), params(), 38)
+                .expect("build empty owner-bound graph");
 
         let wrong_dimension = empty
-            .search(&[1.0, 0.0, 0.0], 1, None)
+            .search(&Cx::for_testing(), &[1.0, 0.0, 0.0], 1, None)
             .expect_err("empty graph must not bypass query-dimension validation");
         assert!(matches!(
             wrong_dimension,
@@ -6390,7 +6654,7 @@ mod tests {
         ));
         for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let error = empty
-                .search(&[non_finite, 0.0, 0.0, 0.0], 1, None)
+                .search(&Cx::for_testing(), &[non_finite, 0.0, 0.0, 0.0], 1, None)
                 .expect_err("empty graph must not bypass non-finite query validation");
             assert!(
                 matches!(
@@ -6408,7 +6672,7 @@ mod tests {
         }
         assert!(
             empty
-                .search(&[1.0, 0.0, 0.0, 0.0], 1, None)
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 1, None)
                 .expect("valid empty-graph query")
                 .is_empty()
         );
@@ -6555,8 +6819,9 @@ mod tests {
         let graph_path = directory.path().join("legacy.fshnsw");
         let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
         let owner = generation_owner(33, 0x33, "legacy-rejection", 4, 4);
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 33)
-            .expect("owner-bound graph");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 33)
+                .expect("owner-bound graph");
         bound.save(&graph_path).expect("owner-bound save");
         let canonical = std::fs::read(&receipt_path).expect("canonical receipt");
         std::fs::write(&graph_path, b"graph bytes must not be read")
@@ -6602,8 +6867,9 @@ mod tests {
         let graph_path = directory.path().join("count-mismatch.fshnsw");
         let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
         let owner = generation_owner(34, 0x34, "count-mismatch", 4, 5);
-        let mut bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 34)
-            .expect("owner-bound graph");
+        let mut bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 34)
+                .expect("owner-bound graph");
         bound.graph.adjacency.pop().expect("test graph row");
 
         let error = bound
@@ -6625,8 +6891,9 @@ mod tests {
         let graph_path = directory.path().join("graph.fshnsw");
         let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
         let owner = generation_owner(9, 9, "receipt-corruption", 6, 32);
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 0x99)
-            .expect("owner-bound graph");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 0x99)
+                .expect("owner-bound graph");
 
         bound.graph.save(&graph_path).expect("unbound graph save");
         let missing = ValidatedNativeHnsw::load(Arc::clone(&owner), &graph_path)
@@ -6684,10 +6951,12 @@ mod tests {
         let second_receipt =
             native_hnsw_generation_receipt_path(&second_path).expect("second receipt");
         let owner = generation_owner(11, 0x11, "swap-stale", 6, 40);
-        let first = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 11)
-            .expect("first owner-bound graph");
-        let second = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 29)
-            .expect("second owner-bound graph");
+        let first =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 11)
+                .expect("first owner-bound graph");
+        let second =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 29)
+                .expect("second owner-bound graph");
 
         first.save(&first_path).expect("save first");
         second.save(&second_path).expect("save second");
@@ -6738,10 +7007,12 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let graph_path = directory.path().join("race.fshnsw");
         let owner = generation_owner(3, 3, "replacement-race", 6, 48);
-        let original = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 3)
-            .expect("original owner-bound graph");
-        let replacement = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 5)
-            .expect("replacement owner-bound graph");
+        let original =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 3)
+                .expect("original owner-bound graph");
+        let replacement =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 5)
+                .expect("replacement owner-bound graph");
         original.save(&graph_path).expect("save original binding");
 
         let error = ValidatedNativeHnsw::load_with_after_first_observation(
@@ -6762,8 +7033,9 @@ mod tests {
         let graph_path = directory.path().join("all-fields.fshnsw");
         let receipt_path = native_hnsw_generation_receipt_path(&graph_path).expect("receipt path");
         let owner = generation_owner(77, 0x77, "every-receipt-field", 8, 48);
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 0xfeed)
-            .expect("owner-bound graph");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 0xfeed)
+                .expect("owner-bound graph");
         let original = bound.save(&graph_path).expect("owner-bound save");
 
         macro_rules! rejects_resealed {
@@ -6991,8 +7263,9 @@ mod tests {
 
         let directory = tempfile::tempdir().expect("temporary directory");
         let owner = generation_owner(19, 0x19, "path-hardening", 4, 16);
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 19)
-            .expect("owner-bound graph");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 19)
+                .expect("owner-bound graph");
 
         let preflight_graph = directory.path().join("preflight.fshnsw");
         let preflight_receipt =
@@ -7078,8 +7351,9 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary v1 directory");
         let path = directory.path().join("original-v1.fshnsw");
         let owner = generation_owner(140, 0x40, "version-one-owner", 4, 2);
-        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 17)
-            .expect("build owner binding for original graph");
+        let bound =
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 17)
+                .expect("build owner binding for original graph");
         let mut receipt = bound.save(&path).expect("owner receipt");
         assert_eq!(sha256_hex(&V1_BYTES), V1_GRAPH_SHA256);
         std::fs::write(&path, V1_BYTES).expect("write frozen original-format graph");
@@ -7105,7 +7379,7 @@ mod tests {
         );
         assert_eq!(
             loaded
-                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(2))
+                .search(&Cx::for_testing(), &[1.0, 0.0, 0.0, 0.0], 1, Some(2))
                 .expect("v1 owner search")[0]
                 .doc_id(),
             "doc-0000"
@@ -7143,7 +7417,8 @@ mod tests {
         let path = directory.path().join("graph.fshnsw");
         let owner = generation_owner(150, 0x50, "source-map-owner", 4, 8);
         let bound =
-            ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 11).expect("build graph");
+            ValidatedNativeHnsw::build(&Cx::for_testing(), Arc::clone(&owner), params(), 11)
+                .expect("build graph");
         bound.save(&path).expect("save v2 graph");
         let bytes = std::fs::read(&path).expect("v2 bytes");
         for (physical_row, expected_detail) in [(1, "more than one graph node"), (8, "outside")] {
@@ -7729,6 +8004,48 @@ mod tests {
                 expected_topology,
                 "retry after distance failure {fail_at} did not reproduce the clean insertion"
             );
+        }
+    }
+
+    #[test]
+    fn cancellation_rolls_back_insert_even_after_its_last_distance() {
+        let store = TestStore::synthetic(48, 8);
+        let mut before = NativeHnsw::new(params(), 0x00a7_0b1c).unwrap();
+        for id in 0..40 {
+            before.insert(id, &store).unwrap();
+        }
+        let counting = FailingStore::new(&store, None);
+        let mut expected = before.clone();
+        expected.insert(40, &counting).unwrap();
+        let distance_boundaries = counting.between_calls();
+        assert!(distance_boundaries > params().m0);
+
+        for cancel_after in [1, distance_boundaries / 2, distance_boundaries] {
+            let cx = Cx::for_testing();
+            let cancelling = CancellingStore::new(&store, &cx, cancel_after);
+            let checked = CheckedDistanceStore {
+                cx: &cx,
+                phase: "native_hnsw.reuse",
+                inner: &cancelling,
+            };
+            let mut trial = before.clone();
+            assert!(matches!(
+                trial.insert(40, &checked),
+                Err(SearchError::Cancelled { phase, .. }) if phase == "native_hnsw.reuse"
+            ));
+            assert_eq!(cancelling.distance_calls.get(), cancel_after);
+            assert_eq!(topology_snapshot(&trial), topology_snapshot(&before));
+            assert_eq!(trial.source_rows, before.source_rows);
+            trial
+                .verify()
+                .expect("cancelled insertion preserves a sound graph");
+
+            cx.set_cancel_requested(false);
+            trial
+                .insert(40, &checked)
+                .expect("retry cancelled insertion");
+            assert_eq!(topology_snapshot(&trial), topology_snapshot(&expected));
+            assert_eq!(trial.source_rows, expected.source_rows);
         }
     }
 

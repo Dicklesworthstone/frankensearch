@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
+use asupersync::Cx;
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::{
@@ -923,11 +924,12 @@ impl TwoTierIndex {
     ///
     /// fn hold_owner_across_install(
     ///     index: &mut TwoTierIndex,
+    ///     cx: &asupersync::Cx,
     ///     paths: &TwoTierIndexPaths,
     ///     binding: &FsviV2IdentityBinding,
     /// ) {
     ///     let owner = index.fast_admitted_owner();
-    ///     let _ = index.try_replace_admitted_v2(paths, binding, None);
+    ///     let _ = index.try_replace_admitted_v2(cx, paths, binding, None);
     ///     let _ = owner;
     /// }
     /// ```
@@ -976,7 +978,8 @@ impl TwoTierIndex {
     /// scales with physical rows and degree; tombstone routing can widen query
     /// candidates to the full physical row count. Smaller beams are approximate
     /// without a certified recall claim. Build and query errors propagate
-    /// without an exact retry. A failed build preserves the previous policy.
+    /// without an exact retry. Construction observes the caller's cancellation
+    /// during graph work. A failed or cancelled build preserves the previous policy.
     ///
     /// [`Self::try_replace_admitted_v2`] builds the successor's graph before
     /// swapping either tier. Fresh pathname opens require explicit opt-in again,
@@ -986,13 +989,21 @@ impl TwoTierIndex {
     /// Rejects invalid graph parameters, legacy tiers, or disagreement between
     /// the complete generation, document-ID contract or semantic/control kind
     /// of admitted tiers, before graph construction.
-    pub fn enable_native_fast_hnsw(&mut self, params: HnswParams, seed: u64) -> SearchResult<()> {
+    /// Returns [`SearchError::Cancelled`] if the caller cancels or exhausts its budget.
+    pub fn enable_native_fast_hnsw(
+        &mut self,
+        cx: &Cx,
+        params: HnswParams,
+        seed: u64,
+    ) -> SearchResult<()> {
+        tier_checkpoint(cx, "two_tier.native_fast_hnsw")?;
         params.validate()?;
         self.validate_native_hnsw_tiers("fast")?;
         let TierSource::AdmittedV2 { owner, .. } = &self.fast_source else {
             unreachable!("native tier validation requires an admitted fast owner");
         };
-        let graph = ValidatedNativeHnsw::build(Arc::clone(owner), params, seed)?;
+        let graph = ValidatedNativeHnsw::build(cx, Arc::clone(owner), params, seed)?;
+        tier_checkpoint(cx, "two_tier.native_fast_hnsw")?;
         self.native_fast_hnsw = Some(NativeTierHnsw {
             params,
             seed,
@@ -1035,27 +1046,35 @@ impl TwoTierIndex {
     /// graph. A fresh pathname reopen starts in exact mode until explicitly
     /// opted in again, either by construction or [`Self::load_native_quality_hnsw`].
     /// Build and query failures propagate without exact retry.
+    /// Construction observes the caller's cancellation during graph work.
     ///
     /// # Errors
     /// Rejects invalid graph parameters, legacy tiers, or disagreement between
     /// the complete generation, document-ID contract or semantic/control kind
-    /// of the admitted tiers. A failed build leaves the prior policy unchanged.
+    /// of the admitted tiers. A failed or cancelled build leaves the prior policy
+    /// unchanged. Cancellation returns [`SearchError::Cancelled`].
     pub fn enable_native_quality_hnsw(
         &mut self,
+        cx: &Cx,
         params: HnswParams,
         seed: u64,
     ) -> SearchResult<()> {
+        tier_checkpoint(cx, "two_tier.native_quality_hnsw")?;
         params.validate()?;
         self.validate_native_hnsw_tiers("quality")?;
         let graph = match self.quality_source.as_ref() {
-            Some(TierSource::AdmittedV2 { owner, .. }) => {
-                Some(ValidatedNativeHnsw::build(Arc::clone(owner), params, seed)?)
-            }
+            Some(TierSource::AdmittedV2 { owner, .. }) => Some(ValidatedNativeHnsw::build(
+                cx,
+                Arc::clone(owner),
+                params,
+                seed,
+            )?),
             Some(TierSource::PathOpened(_)) => {
                 unreachable!("native tier validation refuses an unadmitted quality owner");
             }
             None => None,
         };
+        tier_checkpoint(cx, "two_tier.native_quality_hnsw")?;
         self.native_quality_hnsw = Some(NativeTierHnsw {
             params,
             seed,
@@ -1326,10 +1345,12 @@ impl TwoTierIndex {
     /// requested native graph build, before any state change.
     pub fn try_replace_admitted_v2(
         &mut self,
+        cx: &Cx,
         paths: &TwoTierIndexPaths,
         fast_binding: &FsviV2IdentityBinding,
         quality_binding: Option<&FsviV2IdentityBinding>,
     ) -> SearchResult<()> {
+        tier_checkpoint(cx, "two_tier.replace_admitted_v2")?;
         let mut candidate = match Self::open_admitted_v2_with_paths(
             paths,
             self.config.clone(),
@@ -1351,14 +1372,15 @@ impl TwoTierIndex {
             }
         };
         if let Some(policy) = &self.native_fast_hnsw {
-            candidate.enable_native_fast_hnsw(policy.params, policy.seed)?;
+            candidate.enable_native_fast_hnsw(cx, policy.params, policy.seed)?;
         }
         if let Some(policy) = &self.native_quality_hnsw {
             // Build against the candidate's own retained allocation before
             // replacing any part of the incumbent. A failure leaves both its
             // previous vector owner and graph installed.
-            candidate.enable_native_quality_hnsw(policy.params, policy.seed)?;
+            candidate.enable_native_quality_hnsw(cx, policy.params, policy.seed)?;
         }
+        tier_checkpoint(cx, "two_tier.replace_admitted_v2")?;
         info!(
             previous_generation = self.admitted_generation_sequence(),
             installed_generation = candidate.admitted_generation_sequence(),
@@ -1412,19 +1434,28 @@ impl TwoTierIndex {
     /// otherwise force every search caller to carry a binding it has no way
     /// to obtain.
     ///
+    /// The activation retains a clone of the caller's context. Cancellation
+    /// remains visible to subsequent retrieval and coverage calls, including
+    /// requests for zero results. Native traversal checks during graph work;
+    /// synchronous exact scans check before and after the scan.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] naming the exact tier and
     /// contract field for a topology, identity, producer, dimension or
     /// generation mismatch, and for a tier the query requests that this
-    /// index does not retain as an admitted v2 owner.
+    /// index does not retain as an admitted v2 owner. Returns
+    /// [`SearchError::Cancelled`] when the caller cancels or exhausts its budget.
     pub fn activate_owner_backed_search<'index, 'query>(
         &'index self,
+        cx: &Cx,
         embeddings: &'query TieredQueryEmbeddings,
     ) -> SearchResult<ActivatedTierSearch<'index, 'query>> {
+        tier_checkpoint(cx, "search_activation")?;
         let topology = embeddings.supported_topology();
         let fast = match embeddings.fast() {
             Some(query) => Some(activate_tier(
+                cx,
                 self.fast_source.admitted_pair(),
                 query,
                 "fast",
@@ -1439,6 +1470,7 @@ impl TwoTierIndex {
         };
         let quality = match embeddings.quality() {
             Some(query) => Some(activate_tier(
+                cx,
                 self.quality_source
                     .as_ref()
                     .and_then(TierSource::admitted_pair),
@@ -1462,6 +1494,7 @@ impl TwoTierIndex {
                     .to_owned(),
             });
         }
+        tier_checkpoint(cx, "search_activation")?;
         Ok(ActivatedTierSearch {
             fast,
             quality,
@@ -2740,6 +2773,7 @@ fn ensure_identity_describes_tier(
 /// it (bd-ctzo). Holding this is the proof the join happened.
 #[derive(Debug)]
 pub struct ActivatedTier<'index, 'query> {
+    cx: Cx,
     owner: &'index ValidatedFsviBytes,
     query: &'query BoundQueryEmbedding,
     tier: &'static str,
@@ -2753,7 +2787,10 @@ impl ActivatedTier<'_, '_> {
     ///
     /// Propagates typed row/vector decode failures from the owner.
     pub fn search_top_k(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
-        self.owner.search_top_k(self.query.vector(), k, None)
+        tier_checkpoint(&self.cx, "search_activation.exact")?;
+        let result = self.owner.search_top_k(self.query.vector(), k, None);
+        tier_checkpoint(&self.cx, "search_activation.exact")?;
+        result
     }
 
     /// Exact top-k with explicit parallelism settings over the retained owner.
@@ -2768,14 +2805,19 @@ impl ActivatedTier<'_, '_> {
         k: usize,
         params: SearchParams,
     ) -> SearchResult<Vec<VectorHit>> {
-        self.owner
-            .index
-            .search_top_k_with_params(self.query.vector(), k, None, params)
+        tier_checkpoint(&self.cx, "search_activation.exact")?;
+        let result =
+            self.owner
+                .index
+                .search_top_k_with_params(self.query.vector(), k, None, params);
+        tier_checkpoint(&self.cx, "search_activation.exact")?;
+        result
     }
 
     /// Retrieve with this activation's configured backend. Exact rescoring
     /// reads the same retained allocation and uses the exact lane's scorer.
     fn search_candidates(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        tier_checkpoint(&self.cx, "search_activation.candidates")?;
         let Some((graph, ef_search)) = self.native_hnsw else {
             return self.search_top_k(k);
         };
@@ -2784,9 +2826,10 @@ impl ActivatedTier<'_, '_> {
             return Ok(Vec::new());
         }
         let width = target.max(ef_search).min(self.owner.record_count());
-        let candidates = graph.search(self.query.vector(), width, Some(width))?;
+        let candidates = graph.search(&self.cx, self.query.vector(), width, Some(width))?;
         let mut hits = Vec::with_capacity(candidates.len());
         for candidate in candidates {
+            tier_checkpoint(&self.cx, "search_activation.rescore")?;
             let index = candidate.physical_row();
             let row = usize::try_from(index).map_err(|_| SearchError::InvalidConfig {
                 field: format!("search_activation.{}.physical_row", self.tier),
@@ -2814,6 +2857,7 @@ impl ActivatedTier<'_, '_> {
                 .then_with(|| left.index.cmp(&right.index))
         });
         hits.truncate(target);
+        tier_checkpoint(&self.cx, "search_activation.candidates")?;
         Ok(hits)
     }
 
@@ -2851,6 +2895,16 @@ pub struct ActivatedTierSearch<'index, 'query> {
 }
 
 impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
+    fn checkpoint(&self) -> SearchResult<()> {
+        for tier in [self.fast.as_ref(), self.quality.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            tier_checkpoint(&tier.cx, "search_activation")?;
+        }
+        Ok(())
+    }
+
     /// Topology the validated query bindings actually support.
     #[must_use]
     pub const fn topology(&self) -> RetrievalTopology {
@@ -2927,8 +2981,10 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     /// Propagates typed decode failures from re-reading each activated tier's
     /// own top-`k` doc ids, which is how contribution is attributed.
     pub fn coverage(&self, returned: &[VectorHit], k: usize) -> SearchResult<SearchCoverageV1> {
+        self.checkpoint()?;
         let fast = Self::tier_coverage(self.fast.as_ref(), returned, k)?;
         let quality = Self::tier_coverage(self.quality.as_ref(), returned, k)?;
+        self.checkpoint()?;
         Ok(SearchCoverageV1::new(self.topology, fast, quality))
     }
 
@@ -2971,12 +3027,14 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
     ///
     /// Propagates typed decode failures from either tier.
     pub fn search_union(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.checkpoint()?;
         let mut merged: BTreeMap<String, VectorHit> = BTreeMap::new();
         for tier in [self.fast.as_ref(), self.quality.as_ref()]
             .into_iter()
             .flatten()
         {
             for hit in tier.search_candidates(k)? {
+                tier_checkpoint(&tier.cx, "search_activation.union")?;
                 merged
                     .entry(hit.doc_id.to_string())
                     .and_modify(|existing| {
@@ -2995,6 +3053,7 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
                 .then_with(|| left.doc_id.cmp(&right.doc_id))
         });
         union.truncate(k);
+        self.checkpoint()?;
         Ok(union)
     }
 }
@@ -3011,6 +3070,7 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
 ///
 /// [`validate_expected_v2_binding`]: crate::VectorIndex::open_admitted_v2
 fn activate_tier<'index, 'query>(
+    cx: &Cx,
     admitted: Option<(&'index ValidatedFsviBytes, &FsviV2IdentityBinding)>,
     query: &'query BoundQueryEmbedding,
     tier: &'static str,
@@ -3077,11 +3137,22 @@ fn activate_tier<'index, 'query>(
     // change. Coverage still reports the generation from the owner witness
     // (`ActivatedTier::generation_sequence`), never from a caller.
     Ok(ActivatedTier {
+        cx: cx.clone(),
         owner,
         query,
         tier,
         native_hnsw,
     })
+}
+
+fn tier_checkpoint(cx: &Cx, phase: &'static str) -> SearchResult<()> {
+    if cx.checkpoint().is_err() || cx.is_cancel_requested() {
+        return Err(SearchError::Cancelled {
+            phase: phase.to_owned(),
+            reason: "operation cancelled".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 fn admit_v2_tier(
@@ -6845,7 +6916,7 @@ mod tests {
         // caller presents generation two's binding. Admission must reject it.
         let (generation_two, _) = fsvi_v2_binding("refresh-model", 4, 32);
         let refusal = index
-            .try_replace_admitted_v2(&paths, &generation_two, None)
+            .try_replace_admitted_v2(&Cx::for_testing(), &paths, &generation_two, None)
             .expect_err("a candidate whose identity does not match the artifact is refused");
         assert!(
             matches!(
@@ -6879,7 +6950,7 @@ mod tests {
         ];
         write_v2_tier(&fast_path, &generation_two, &successor_rows);
         index
-            .try_replace_admitted_v2(&paths, &generation_two, None)
+            .try_replace_admitted_v2(&Cx::for_testing(), &paths, &generation_two, None)
             .expect("a matching candidate installs");
         let installed = index.fast_admitted_owner().expect("successor retained");
         assert_eq!(installed.witness().generation.sequence, 32);
@@ -7093,7 +7164,12 @@ mod tests {
                 )
                 .expect("admit generation two on an independent handle");
                 successor
-                    .try_replace_admitted_v2(&successor_paths, &generation_two, None)
+                    .try_replace_admitted_v2(
+                        &Cx::for_testing(),
+                        &successor_paths,
+                        &generation_two,
+                        None,
+                    )
                     .expect("re-admitting the installed generation succeeds");
                 assert_eq!(successor.doc_count(), 3);
                 overlapped_ref.store(
@@ -7389,7 +7465,12 @@ mod tests {
         ];
         write_v2_tier(&fast_path, &generation_two, &successor_rows);
         let refusal = index
-            .try_replace_admitted_v2(&paths, &generation_two, Some(&generation_two))
+            .try_replace_admitted_v2(
+                &Cx::for_testing(),
+                &paths,
+                &generation_two,
+                Some(&generation_two),
+            )
             .expect_err("a candidate whose quality tier cannot be admitted is refused whole");
         assert!(
             matches!(
@@ -7608,13 +7689,13 @@ mod tests {
         assert!(!opened.fast_identity_is_attested());
         assert!(opened.fast_space_fingerprint_hex().is_none());
         assert!(matches!(
-            opened.enable_native_quality_hnsw(HnswParams::default(), 7),
+            opened.enable_native_quality_hnsw(&Cx::for_testing(), HnswParams::default(), 7),
             Err(SearchError::InvalidConfig { field, .. })
                 if field == "two_tier.native_quality_hnsw.owner"
         ));
         assert!(!opened.has_native_quality_hnsw());
         assert!(matches!(
-            opened.enable_native_fast_hnsw(HnswParams::default(), 7),
+            opened.enable_native_fast_hnsw(&Cx::for_testing(), HnswParams::default(), 7),
             Err(SearchError::InvalidConfig { field, .. })
                 if field == "two_tier.native_fast_hnsw.owner"
         ));
@@ -7662,6 +7743,175 @@ mod tests {
     }
 
     #[test]
+    fn activated_search_retains_cancellation_for_exact_and_native_tiers() {
+        let directory = tempfile::tempdir().unwrap();
+        let fast_path = directory.path().join("fast.fsvi");
+        let quality_path = directory.path().join("quality.fsvi");
+        let (fast_binding, fast_identity) = fsvi_v2_binding("cancel-fast", 4, 74);
+        let (quality_binding, quality_identity) = fsvi_v2_binding("cancel-quality", 4, 74);
+        write_v2_tier(
+            &fast_path,
+            &fast_binding,
+            &[("fast", &[1.0, 0.0, 0.0, 0.0])],
+        );
+        write_v2_tier(
+            &quality_path,
+            &quality_binding,
+            &[("quality", &[0.0, 1.0, 0.0, 0.0])],
+        );
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let embeddings = TieredQueryEmbeddings::progressive(
+            bound_query(&fast_identity, &[1.0, 0.0, 0.0, 0.0]),
+            bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]),
+        );
+        for native in [false, true] {
+            let cx = Cx::for_testing();
+            let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &fast_binding,
+                Some(&quality_binding),
+            )
+            .unwrap();
+            if native {
+                index
+                    .enable_native_fast_hnsw(&cx, HnswParams::default(), 42)
+                    .unwrap();
+                index
+                    .enable_native_quality_hnsw(&cx, HnswParams::default(), 43)
+                    .unwrap();
+            }
+            let activated = index
+                .activate_owner_backed_search(&cx, &embeddings)
+                .unwrap();
+            let expected = activated.search_union(2).unwrap();
+            assert_eq!(expected.len(), 2);
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                index.activate_owner_backed_search(&cx, &embeddings),
+                Err(SearchError::Cancelled { .. })
+            ));
+            for k in [0, 2] {
+                for result in [
+                    activated.search_fast(k),
+                    activated.search_quality(k),
+                    activated.search_union(k),
+                    activated.fast().unwrap().search_top_k(k),
+                    activated
+                        .quality()
+                        .unwrap()
+                        .search_top_k_with_params(k, SearchParams::default()),
+                ] {
+                    assert!(
+                        matches!(result, Err(SearchError::Cancelled { .. })),
+                        "native={native}, k={k}"
+                    );
+                }
+                assert!(matches!(
+                    activated.coverage(&expected, k),
+                    Err(SearchError::Cancelled { .. })
+                ));
+            }
+            cx.set_cancel_requested(false);
+            assert_eq!(activated.search_union(2).unwrap(), expected);
+            assert!(activated.coverage(&expected, 2).is_ok());
+        }
+    }
+
+    #[test]
+    fn cancelled_native_builds_and_refresh_leave_both_policies_and_owners_serving() {
+        let directory = tempfile::tempdir().unwrap();
+        let fast_path = directory.path().join("fast.fsvi");
+        let quality_path = directory.path().join("quality.fsvi");
+        let (fast_binding, fast_identity) = fsvi_v2_binding("cancel-refresh-fast", 4, 74);
+        let (quality_binding, quality_identity) = fsvi_v2_binding("cancel-refresh-quality", 4, 74);
+        write_v2_tier(
+            &fast_path,
+            &fast_binding,
+            &[("fast", &[1.0, 0.0, 0.0, 0.0])],
+        );
+        write_v2_tier(
+            &quality_path,
+            &quality_binding,
+            &[("quality", &[0.0, 1.0, 0.0, 0.0])],
+        );
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let cx = Cx::for_testing();
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .unwrap();
+        let params = HnswParams::default();
+        index.enable_native_fast_hnsw(&cx, params, 42).unwrap();
+        index.enable_native_quality_hnsw(&cx, params, 43).unwrap();
+        let before_fast = index.fast_admitted_owner().unwrap().witness().clone();
+        let before_quality = index.quality_admitted_owner().unwrap().witness().clone();
+        let embeddings = TieredQueryEmbeddings::progressive(
+            bound_query(&fast_identity, &[1.0, 0.0, 0.0, 0.0]),
+            bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]),
+        );
+        let expected = index
+            .activate_owner_backed_search(&cx, &embeddings)
+            .unwrap()
+            .search_union(2)
+            .unwrap();
+
+        let successor_path = directory.path().join("successor.fsvi");
+        let (successor, _) = fsvi_v2_binding("cancel-refresh-fast", 4, 75);
+        write_v2_tier(
+            &successor_path,
+            &successor,
+            &[("successor", &[1.0, 0.0, 0.0, 0.0])],
+        );
+        let successor_paths = TwoTierIndexPaths::new(&successor_path);
+        cx.set_cancel_requested(true);
+        for result in [
+            index.enable_native_fast_hnsw(&cx, params, 99),
+            index.enable_native_quality_hnsw(&cx, params, 99),
+            index.try_replace_admitted_v2(&cx, &successor_paths, &successor, None),
+        ] {
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+        }
+        assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before_fast);
+        assert_eq!(
+            index.quality_admitted_owner().unwrap().witness(),
+            &before_quality
+        );
+        assert_eq!(index.native_fast_hnsw.as_ref().unwrap().seed, 42);
+        assert_eq!(index.native_quality_hnsw.as_ref().unwrap().seed, 43);
+        assert_eq!(index.fast_index_path(), paths.fast_index());
+        assert_eq!(index.quality_index_path(), paths.quality_index());
+
+        cx.set_cancel_requested(false);
+        assert_eq!(
+            index
+                .activate_owner_backed_search(&cx, &embeddings)
+                .unwrap()
+                .search_union(2)
+                .unwrap(),
+            expected
+        );
+        index
+            .try_replace_admitted_v2(&cx, &successor_paths, &successor, None)
+            .unwrap();
+        assert_eq!(
+            index
+                .fast_admitted_owner()
+                .unwrap()
+                .witness()
+                .generation
+                .sequence,
+            75
+        );
+        assert!(index.has_native_fast_hnsw());
+        assert!(!index.has_native_quality_hnsw());
+        assert_eq!(index.native_quality_hnsw.as_ref().unwrap().seed, 43);
+    }
+
+    #[test]
     fn native_graph_load_rejects_policy_changes_without_replacing_either_tier() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
@@ -7695,8 +7945,12 @@ mod tests {
         let mut index = open();
         assert_eq!(index.fast_index_path(), fast_path);
         assert_eq!(index.quality_index_path(), Some(quality_path.as_path()));
-        index.enable_native_fast_hnsw(params, 42).unwrap();
-        index.enable_native_quality_hnsw(params, 43).unwrap();
+        index
+            .enable_native_fast_hnsw(&Cx::for_testing(), params, 42)
+            .unwrap();
+        index
+            .enable_native_quality_hnsw(&Cx::for_testing(), params, 43)
+            .unwrap();
         let fast_receipt = index.save_native_fast_hnsw(&fast_graph).unwrap();
         let quality_receipt = index.save_native_quality_hnsw(&quality_graph).unwrap();
         assert_eq!(fast_receipt.seed, 42);
@@ -7717,7 +7971,7 @@ mod tests {
             bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]),
         );
         let before = index
-            .activate_owner_backed_search(&embeddings)
+            .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
             .unwrap()
             .search_union(2)
             .unwrap();
@@ -7769,7 +8023,7 @@ mod tests {
         assert_eq!((quality_policy.params, quality_policy.seed), (params, 43));
         assert_eq!(
             index
-                .activate_owner_backed_search(&embeddings)
+                .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
                 .unwrap()
                 .search_union(2)
                 .unwrap(),
@@ -7793,7 +8047,7 @@ mod tests {
         assert_eq!(fs::read(&fast_graph).unwrap(), b"corrupt graph");
         assert_eq!(
             index
-                .activate_owner_backed_search(&embeddings)
+                .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
                 .unwrap()
                 .search_union(2)
                 .unwrap(),
@@ -7818,7 +8072,7 @@ mod tests {
         .unwrap();
         assert!(index.save_native_fast_hnsw(&graph_path).is_err());
         index
-            .enable_native_quality_hnsw(HnswParams::default(), 1)
+            .enable_native_quality_hnsw(&Cx::for_testing(), HnswParams::default(), 1)
             .unwrap();
         assert!(index.save_native_quality_hnsw(&graph_path).is_err());
         assert!(matches!(
@@ -7849,7 +8103,7 @@ mod tests {
             .unwrap();
             assert_eq!(index.fast_index_path(), fast_path);
             index
-                .enable_native_fast_hnsw(HnswParams::default(), 1)
+                .enable_native_fast_hnsw(&Cx::for_testing(), HnswParams::default(), 1)
                 .unwrap();
             let saved = index.save_native_fast_hnsw(&graph_path);
             assert!(
@@ -7918,6 +8172,7 @@ mod tests {
             let before = index.fast_admitted_owner().unwrap().witness().clone();
             index
                 .enable_native_fast_hnsw(
+                    &Cx::for_testing(),
                     HnswParams {
                         ef_search: 96,
                         ..HnswParams::default()
@@ -7938,7 +8193,7 @@ mod tests {
             let fast_embeddings = TieredQueryEmbeddings::fast_only(fast_query);
             for k in [0, 1, 7, 96] {
                 let activated = index
-                    .activate_owner_backed_search(&fast_embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &fast_embeddings)
                     .unwrap();
                 let hits = activated.search_fast(k).unwrap();
                 assert_eq!(
@@ -7970,13 +8225,17 @@ mod tests {
                 &quality_identity,
                 &[1.0, 0.0, 0.0, 0.0],
             ));
-            assert!(index.activate_owner_backed_search(&foreign).is_err());
+            assert!(
+                index
+                    .activate_owner_backed_search(&Cx::for_testing(), &foreign)
+                    .is_err()
+            );
             let quality_embeddings = TieredQueryEmbeddings::quality_only(bound_query(
                 &quality_identity,
                 &[0.0, 1.0, 0.0, 0.0],
             ));
             let quality_exact = index
-                .activate_owner_backed_search(&quality_embeddings)
+                .activate_owner_backed_search(&Cx::for_testing(), &quality_embeddings)
                 .unwrap()
                 .search_quality(1)
                 .unwrap();
@@ -7985,25 +8244,25 @@ mod tests {
                 bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]),
             );
             let union_before = index
-                .activate_owner_backed_search(&progressive_embeddings)
+                .activate_owner_backed_search(&Cx::for_testing(), &progressive_embeddings)
                 .unwrap()
                 .search_union(11)
                 .unwrap();
             index
-                .enable_native_quality_hnsw(HnswParams::default(), 5)
+                .enable_native_quality_hnsw(&Cx::for_testing(), HnswParams::default(), 5)
                 .unwrap();
             assert!(index.has_native_fast_hnsw());
             assert!(index.has_native_quality_hnsw());
             assert_eq!(
                 index
-                    .activate_owner_backed_search(&quality_embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &quality_embeddings)
                     .unwrap()
                     .search_quality(1)
                     .unwrap(),
                 quality_exact
             );
             let both = index
-                .activate_owner_backed_search(&progressive_embeddings)
+                .activate_owner_backed_search(&Cx::for_testing(), &progressive_embeddings)
                 .unwrap();
             let union = both.search_union(11).unwrap();
             assert_eq!(union, union_before);
@@ -8027,13 +8286,14 @@ mod tests {
             );
             assert_eq!(index.fast_admitted_owner().unwrap().witness(), &before);
             let before_hits = index
-                .activate_owner_backed_search(&fast_embeddings)
+                .activate_owner_backed_search(&Cx::for_testing(), &fast_embeddings)
                 .unwrap()
                 .search_fast(3)
                 .unwrap();
             assert!(
                 index
                     .enable_native_fast_hnsw(
+                        &Cx::for_testing(),
                         HnswParams {
                             m0: 1,
                             ..HnswParams::default()
@@ -8044,7 +8304,7 @@ mod tests {
             );
             assert_eq!(
                 index
-                    .activate_owner_backed_search(&fast_embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &fast_embeddings)
                     .unwrap()
                     .search_fast(3)
                     .unwrap(),
@@ -8082,6 +8342,7 @@ mod tests {
         // valley on the physical 0-1-2-3 path, distinguishing routed retrieval.
         index
             .enable_native_fast_hnsw(
+                &Cx::for_testing(),
                 HnswParams {
                     m0: 2,
                     ef_search: 1,
@@ -8092,7 +8353,9 @@ mod tests {
             .unwrap();
         let embeddings =
             TieredQueryEmbeddings::fast_only(bound_query(&identity, &[0.0, 1.0, 0.0, 0.0]));
-        let activated = index.activate_owner_backed_search(&embeddings).unwrap();
+        let activated = index
+            .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
+            .unwrap();
         let exact = activated.fast().unwrap().search_top_k(1).unwrap();
         let approximate = activated.search_fast(1).unwrap();
         assert_eq!(exact[0].doc_id, ids[3]);
@@ -8156,6 +8419,7 @@ mod tests {
             let before = index.quality_admitted_owner().unwrap().witness().clone();
             index
                 .enable_native_quality_hnsw(
+                    &Cx::for_testing(),
                     HnswParams {
                         ef_search: 96,
                         ..HnswParams::default()
@@ -8179,7 +8443,9 @@ mod tests {
                 &[0.0, 1.0, 0.0, 0.0],
             ));
             for k in [0, 1, 7, 96] {
-                let activated = index.activate_owner_backed_search(&embeddings).unwrap();
+                let activated = index
+                    .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
+                    .unwrap();
                 let exact = activated.quality().unwrap().search_top_k(k).unwrap();
                 let hits = activated.search_quality(k).unwrap();
                 assert_eq!(hits, exact, "precision={precision:?}, k={k}");
@@ -8203,13 +8469,14 @@ mod tests {
             }
             assert_eq!(index.quality_admitted_owner().unwrap().witness(), &before);
             let before_hits = index
-                .activate_owner_backed_search(&embeddings)
+                .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
                 .unwrap()
                 .search_quality(1)
                 .unwrap();
             assert!(
                 index
                     .enable_native_quality_hnsw(
+                        &Cx::for_testing(),
                         HnswParams {
                             m0: 1,
                             ..HnswParams::default()
@@ -8221,7 +8488,7 @@ mod tests {
             assert!(index.has_native_quality_hnsw());
             assert_eq!(
                 index
-                    .activate_owner_backed_search(&embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
                     .unwrap()
                     .search_quality(1)
                     .unwrap(),
@@ -8266,6 +8533,7 @@ mod tests {
         // than crossing row 2 to the exact winner. This distinguishes the modes.
         index
             .enable_native_quality_hnsw(
+                &Cx::for_testing(),
                 HnswParams {
                     m0: 2,
                     ef_search: 1,
@@ -8278,7 +8546,9 @@ mod tests {
             &quality_identity,
             &[0.0, 1.0, 0.0, 0.0],
         ));
-        let activated = index.activate_owner_backed_search(&embeddings).unwrap();
+        let activated = index
+            .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
+            .unwrap();
         let exact = activated.quality().unwrap().search_top_k(1).unwrap();
         let approximate = activated.search_quality(1).unwrap();
         assert_eq!(exact[0].doc_id, ids[3]);
@@ -8335,17 +8605,17 @@ mod tests {
             assert_eq!(index.quality_index_path(), paths.quality_index());
             if enable_fast {
                 index
-                    .enable_native_fast_hnsw(HnswParams::default(), 3)
+                    .enable_native_fast_hnsw(&Cx::for_testing(), HnswParams::default(), 3)
                     .unwrap();
                 retained_reader
-                    .enable_native_fast_hnsw(HnswParams::default(), 3)
+                    .enable_native_fast_hnsw(&Cx::for_testing(), HnswParams::default(), 3)
                     .unwrap();
             }
             index
-                .enable_native_quality_hnsw(HnswParams::default(), 7)
+                .enable_native_quality_hnsw(&Cx::for_testing(), HnswParams::default(), 7)
                 .unwrap();
             retained_reader
-                .enable_native_quality_hnsw(HnswParams::default(), 7)
+                .enable_native_quality_hnsw(&Cx::for_testing(), HnswParams::default(), 7)
                 .unwrap();
             let (_, identity) = fsvi_v2_binding("native-refresh-quality", 4, 1);
             let embeddings =
@@ -8356,7 +8626,12 @@ mod tests {
             fs::write(bad_paths.quality_index().unwrap(), b"invalid fsvi").unwrap();
             assert!(
                 index
-                    .try_replace_admitted_v2(&bad_paths, &bad_fast, bad_quality.as_ref())
+                    .try_replace_admitted_v2(
+                        &Cx::for_testing(),
+                        &bad_paths,
+                        &bad_fast,
+                        bad_quality.as_ref()
+                    )
                     .is_err()
             );
             assert!(index.has_native_quality_hnsw());
@@ -8367,7 +8642,7 @@ mod tests {
             assert_eq!(index.quality_index_path(), paths.quality_index());
             assert_eq!(
                 index
-                    .activate_owner_backed_search(&embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
                     .unwrap()
                     .search_quality(1)
                     .unwrap()[0]
@@ -8393,7 +8668,7 @@ mod tests {
             .unwrap();
             assert!(ordinary.quality_admitted_owner().is_some());
             assert!(matches!(
-                index.try_replace_admitted_v2(&mixed_paths, &mixed_fast, Some(&foreign_quality)),
+                index.try_replace_admitted_v2(&Cx::for_testing(), &mixed_paths, &mixed_fast, Some(&foreign_quality)),
                 Err(SearchError::InvalidConfig { field, .. })
                     if field == if enable_fast {
                         "two_tier.native_fast_hnsw.generation"
@@ -8410,7 +8685,12 @@ mod tests {
 
             let (fast_only_paths, fast_only_binding, _) = make_generation(2, None);
             index
-                .try_replace_admitted_v2(&fast_only_paths, &fast_only_binding, None)
+                .try_replace_admitted_v2(
+                    &Cx::for_testing(),
+                    &fast_only_paths,
+                    &fast_only_binding,
+                    None,
+                )
                 .unwrap();
             assert!(!index.has_native_quality_hnsw());
             assert_eq!(index.has_native_fast_hnsw(), enable_fast);
@@ -8423,7 +8703,7 @@ mod tests {
             ));
             assert_eq!(
                 index
-                    .activate_owner_backed_search(&fast_embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &fast_embeddings)
                     .unwrap()
                     .search_fast(1)
                     .unwrap()[0]
@@ -8431,12 +8711,17 @@ mod tests {
                 "fast-2"
             );
             assert!(index.quality_admitted_owner().is_none());
-            assert!(index.activate_owner_backed_search(&embeddings).is_err());
+            assert!(
+                index
+                    .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
+                    .is_err()
+            );
 
             let (successor_paths, successor_fast, successor_quality) =
                 make_generation(3, Some("new-quality"));
             index
                 .try_replace_admitted_v2(
+                    &Cx::for_testing(),
                     &successor_paths,
                     &successor_fast,
                     successor_quality.as_ref(),
@@ -8450,7 +8735,7 @@ mod tests {
             assert_eq!(retained_reader.quality_index_path(), paths.quality_index());
             assert_eq!(
                 index
-                    .activate_owner_backed_search(&fast_embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &fast_embeddings)
                     .unwrap()
                     .search_fast(1)
                     .unwrap()[0]
@@ -8459,7 +8744,7 @@ mod tests {
             );
             assert_eq!(
                 retained_reader
-                    .activate_owner_backed_search(&fast_embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &fast_embeddings)
                     .unwrap()
                     .search_fast(1)
                     .unwrap()[0]
@@ -8472,7 +8757,7 @@ mod tests {
             );
             assert_eq!(
                 index
-                    .activate_owner_backed_search(&embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
                     .unwrap()
                     .search_quality(1)
                     .unwrap()[0]
@@ -8481,7 +8766,7 @@ mod tests {
             );
             assert_eq!(
                 retained_reader
-                    .activate_owner_backed_search(&embeddings)
+                    .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
                     .unwrap()
                     .search_quality(1)
                     .unwrap()[0]
@@ -8557,7 +8842,7 @@ mod tests {
         // The fast pool at k=1 contains ONLY doc-near.
         let fast_only_embeddings = TieredQueryEmbeddings::fast_only(fast_query.clone());
         let fast_only = index
-            .activate_owner_backed_search(&fast_only_embeddings)
+            .activate_owner_backed_search(&Cx::for_testing(), &fast_only_embeddings)
             .expect("fast-only activation");
         // HashControl, not FastOnly: `fsvi_v2_binding` builds its identities
         // from `explicit_test_model`, which is a deterministic control space.
@@ -8578,7 +8863,7 @@ mod tests {
         // QualityOnly retrieves from the quality owner directly and reaches it.
         let quality_only_embeddings = TieredQueryEmbeddings::quality_only(quality_query.clone());
         let quality_only = index
-            .activate_owner_backed_search(&quality_only_embeddings)
+            .activate_owner_backed_search(&Cx::for_testing(), &quality_only_embeddings)
             .expect("quality-only activation");
         assert_eq!(quality_only.topology(), RetrievalTopology::HashControl);
         assert_eq!(
@@ -8594,7 +8879,7 @@ mod tests {
         // FullProgressive unions independent per-tier retrieval.
         let progressive_embeddings = TieredQueryEmbeddings::progressive(fast_query, quality_query);
         let progressive = index
-            .activate_owner_backed_search(&progressive_embeddings)
+            .activate_owner_backed_search(&Cx::for_testing(), &progressive_embeddings)
             .expect("progressive activation");
         assert_eq!(progressive.topology(), RetrievalTopology::HashControl);
         let union = progressive.search_union(2).expect("union");
@@ -8673,7 +8958,7 @@ mod tests {
         let matching =
             TieredQueryEmbeddings::fast_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
         let activated = index
-            .activate_owner_backed_search(&matching)
+            .activate_owner_backed_search(&Cx::for_testing(), &matching)
             .expect("the matching query activates");
         assert_eq!(activated.search_fast(1).expect("search")[0].doc_id, "doc-a");
 
@@ -8683,7 +8968,7 @@ mod tests {
         let foreign =
             TieredQueryEmbeddings::fast_only(bound_query(&foreign_identity, &[1.0, 0.0, 0.0, 0.0]));
         let error = index
-            .activate_owner_backed_search(&foreign)
+            .activate_owner_backed_search(&Cx::for_testing(), &foreign)
             .expect_err("a same-dimension foreign space must be refused");
         assert!(
             matches!(
@@ -8724,7 +9009,7 @@ mod tests {
             &[1.0, 0.0, 0.0, 0.0],
         ));
         let error = index
-            .activate_owner_backed_search(&compatible)
+            .activate_owner_backed_search(&Cx::for_testing(), &compatible)
             .expect_err("a certified-compatible foreign producer must be refused");
         assert!(
             matches!(
@@ -8740,7 +9025,7 @@ mod tests {
         let quality_bound =
             TieredQueryEmbeddings::quality_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
         let error = index
-            .activate_owner_backed_search(&quality_bound)
+            .activate_owner_backed_search(&Cx::for_testing(), &quality_bound)
             .expect_err("a missing quality owner must be refused");
         assert!(
             matches!(
@@ -8765,7 +9050,7 @@ mod tests {
             "a legacy v1 tier retains no admitted identity to join against"
         );
         let error = legacy
-            .activate_owner_backed_search(&matching)
+            .activate_owner_backed_search(&Cx::for_testing(), &matching)
             .expect_err("a legacy tier is not searchable under typed activation");
         assert!(
             matches!(
@@ -8804,7 +9089,7 @@ mod tests {
         let embeddings =
             TieredQueryEmbeddings::fast_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
         let activated = index
-            .activate_owner_backed_search(&embeddings)
+            .activate_owner_backed_search(&Cx::for_testing(), &embeddings)
             .expect("activate");
         let tier = activated.fast().expect("fast tier activated");
         assert_eq!(tier.generation_sequence(), 91);

@@ -768,9 +768,10 @@ impl StagedIdentityBoundGeneration {
     /// and contract field.
     pub fn activate_search<'staged, 'query>(
         &'staged self,
+        cx: &Cx,
         embeddings: &'query TieredQueryEmbeddings,
     ) -> SearchResult<ActivatedTierSearch<'staged, 'query>> {
-        self.index.activate_owner_backed_search(embeddings)
+        self.index.activate_owner_backed_search(cx, embeddings)
     }
 }
 
@@ -3602,7 +3603,7 @@ mod tests {
             let embeddings = TieredQueryEmbeddings::fast_only(query);
 
             let activated = staged
-                .activate_search(&embeddings)
+                .activate_search(&cx, &embeddings)
                 .expect("the generation's own space must activate");
             let hits = activated.search_fast(1).expect("owner-backed search");
             assert_eq!(hits.len(), 1, "the activated capability serves reads");
@@ -3626,7 +3627,7 @@ mod tests {
                     .expect("bind a foreign-space query");
             let foreign_embeddings = TieredQueryEmbeddings::fast_only(foreign_query);
             let error = staged
-                .activate_search(&foreign_embeddings)
+                .activate_search(&cx, &foreign_embeddings)
                 .expect_err("a same-dimension foreign space must be refused");
             assert!(
                 matches!(

@@ -373,17 +373,18 @@ mod tests {
                 Some(&quality),
             )
             .unwrap();
+            let cx = Cx::for_testing();
             for (is_fast, tier) in [(true, &self.policy.fast), (false, &self.policy.quality)] {
                 let Some(tier) = tier else { continue };
                 let path = staged.path().join(tier.graph_path.file_name().unwrap());
                 if is_fast {
                     index
-                        .enable_native_fast_hnsw(tier.params, tier.seed)
+                        .enable_native_fast_hnsw(&cx, tier.params, tier.seed)
                         .unwrap();
                     index.save_native_fast_hnsw(&path).unwrap();
                 } else {
                     index
-                        .enable_native_quality_hnsw(tier.params, tier.seed)
+                        .enable_native_quality_hnsw(&cx, tier.params, tier.seed)
                         .unwrap();
                     index.save_native_quality_hnsw(&path).unwrap();
                 }
@@ -429,7 +430,7 @@ mod tests {
             .collect()
     }
 
-    fn ids(index: &TwoTierIndex, quality: bool) -> Vec<String> {
+    fn ids(cx: &Cx, index: &TwoTierIndex, quality: bool) -> Vec<String> {
         let (name, dimension) = if quality {
             ("pool-quality", 3)
         } else {
@@ -447,7 +448,7 @@ mod tests {
         } else {
             TieredQueryEmbeddings::fast_only(embedding)
         };
-        let activated = index.activate_owner_backed_search(&query).unwrap();
+        let activated = index.activate_owner_backed_search(cx, &query).unwrap();
         let hits = if quality {
             activated.search_quality(10).unwrap()
         } else {
@@ -470,8 +471,8 @@ mod tests {
                 assert_eq!(index.has_native_quality_hnsw(), quality_graph);
                 assert_eq!(index.fast_admitted_binding(), Some(&fixture.fast));
                 assert_eq!(index.quality_admitted_binding(), Some(&fixture.quality));
-                assert_eq!(ids(&index, false), ["fast", "shared"]);
-                assert_eq!(ids(&index, true), ["quality-only", "shared"]);
+                assert_eq!(ids(&cx, &index, false), ["fast", "shared"]);
+                assert_eq!(ids(&cx, &index, true), ["quality-only", "shared"]);
                 assert_eq!(cache.native_cache_policy(), fixture.native().as_ref());
                 assert_eq!(image(fixture.directory.path()), before);
             }
@@ -607,10 +608,10 @@ mod tests {
                 assert_eq!(installed.quality_admitted_binding(), Some(&quality));
                 assert_eq!(installed.has_native_fast_hnsw(), fast_graph);
                 assert_eq!(installed.has_native_quality_hnsw(), quality_graph);
-                assert_eq!(ids(&installed, false), ["new-fast"]);
-                assert_eq!(ids(&installed, true), ["new-quality-only"]);
-                assert_eq!(ids(&old, false), ["fast", "shared"]);
-                assert_eq!(ids(&old, true), ["quality-only", "shared"]);
+                assert_eq!(ids(&cx, &installed, false), ["new-fast"]);
+                assert_eq!(ids(&cx, &installed, true), ["new-quality-only"]);
+                assert_eq!(ids(&cx, &old, false), ["fast", "shared"]);
+                assert_eq!(ids(&cx, &old, true), ["quality-only", "shared"]);
                 assert!(
                     cache
                         .reload_admitted_v2_with_pool(
@@ -658,7 +659,7 @@ mod tests {
             cx.set_cancel_requested(false);
             assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
             assert!(Arc::ptr_eq(&installed, &cache.current()));
-            assert_eq!(ids(&old, true), ["quality-only", "shared"]);
+            assert_eq!(ids(&cx, &old, true), ["quality-only", "shared"]);
         });
     }
 
@@ -699,8 +700,8 @@ mod tests {
                     "{fault} was admitted"
                 );
                 assert!(Arc::ptr_eq(&old, &cache.current()));
-                assert_eq!(ids(&old, false), ["fast", "shared"]);
-                assert_eq!(ids(&old, true), ["quality-only", "shared"]);
+                assert_eq!(ids(&cx, &old, false), ["fast", "shared"]);
+                assert_eq!(ids(&cx, &old, true), ["quality-only", "shared"]);
                 assert_eq!(image(fixture.directory.path()), before);
             }
         });
@@ -730,7 +731,7 @@ mod tests {
             ));
             assert!(poll_once(slow.as_mut()).is_pending());
             rendezvous(&cx, &ready).await;
-            assert_eq!(ids(&cache.current(), false), ["fast", "shared"]);
+            assert_eq!(ids(&cx, &cache.current(), false), ["fast", "shared"]);
             let (new_fast, new_quality) = fixture.stage(7, &["winner"], &["winner-quality"]);
             assert!(
                 cache
@@ -745,9 +746,9 @@ mod tests {
                 "late loader must lose its original token"
             );
             assert!(Arc::ptr_eq(&winner, &cache.current()));
-            assert_eq!(ids(&winner, false), ["winner"]);
-            assert_eq!(ids(&winner, true), ["winner-quality"]);
-            assert_eq!(ids(&old, false), ["fast", "shared"]);
+            assert_eq!(ids(&cx, &winner, false), ["winner"]);
+            assert_eq!(ids(&cx, &winner, true), ["winner-quality"]);
+            assert_eq!(ids(&cx, &old, false), ["fast", "shared"]);
         });
     }
 
@@ -785,8 +786,10 @@ mod tests {
         });
         // run() has drained the real worker pool and dropped its runtime.
         assert!(Arc::ptr_eq(&old, &cache.current()));
-        assert_eq!(ids(&old, false), ["fast", "shared"]);
-        assert_eq!(ids(&old, true), ["quality-only", "shared"]);
+        run(|cx, _| async move {
+            assert_eq!(ids(&cx, &old, false), ["fast", "shared"]);
+            assert_eq!(ids(&cx, &old, true), ["quality-only", "shared"]);
+        });
         assert_eq!(image(fixture.directory.path()), before);
     }
 
@@ -821,7 +824,7 @@ mod tests {
             cx.set_cancel_requested(false);
             assert!(matches!(result, Err(SearchError::Cancelled { .. })));
             assert!(Arc::ptr_eq(&old, &cache.current()));
-            assert_eq!(ids(&old, true), ["quality-only", "shared"]);
+            assert_eq!(ids(&cx, &old, true), ["quality-only", "shared"]);
             assert_eq!(image(fixture.directory.path()), before);
         });
     }

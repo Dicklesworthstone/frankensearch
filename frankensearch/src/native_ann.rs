@@ -7,9 +7,10 @@
 //! traversal, including zero-result requests.
 //!
 //! Graph operations are synchronous and belong on the caller's blocking/CPU lane.
-//! Cancellation checkpoints bracket graph construction/loading and search;
-//! they do not preempt the native engine inside a synchronous call. No runtime,
-//! task, fallback embedder or detached worker is created here.
+//! Graph construction and traversal check the caller's cancellation during
+//! their work. Synchronous loading and structural admission are bracketed by
+//! checkpoints. No runtime, task, fallback embedder or detached worker is
+//! created here.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -85,7 +86,7 @@ impl NativeAnnIndex {
         seed: u64,
     ) -> SearchResult<Self> {
         checkpoint(cx, "native_ann.build")?;
-        let graph = ValidatedNativeHnsw::build(Arc::clone(&owner), params, seed)?;
+        let graph = ValidatedNativeHnsw::build(cx, Arc::clone(&owner), params, seed)?;
         checkpoint(cx, "native_ann.build_complete")?;
         Ok(Self {
             owner,
@@ -344,7 +345,7 @@ impl NativeAnnIndex {
         }
         loop {
             checkpoint(cx, "native_ann.search_window")?;
-            let candidates = graph.search(query.vector(), width, Some(width))?;
+            let candidates = graph.search(cx, query.vector(), width, Some(width))?;
             checkpoint(cx, "native_ann.search_candidates")?;
             let mut hits = Vec::with_capacity(candidates.len());
             for candidate in candidates {
