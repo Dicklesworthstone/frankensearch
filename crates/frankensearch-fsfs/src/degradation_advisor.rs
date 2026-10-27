@@ -6,7 +6,7 @@ use frankensearch_core::SearchError;
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::recovery_plan::{
     ModelAcquisitionTarget, RecoveryContractError, RecoveryPlan, RecoveryPolicy, RecoveryRequest,
-    RequestMode, SemanticReadiness, TrustedRecoveryContext, VerifiedSemanticProvenance, plan,
+    RequestMode, SemanticReadiness, TrustedRecoveryContext, plan,
 };
 use frankensearch_core::traits::ModelTier;
 use frankensearch_core::types::RetrievalTopology;
@@ -304,15 +304,13 @@ pub const fn semantic_readiness_for_failure(
     };
     match failure {
         DegradationFailureKind::MissingQualityModel => SemanticReadiness::ModelMissing { tier },
-        DegradationFailureKind::RefinementFailed | DegradationFailureKind::Timeout => {
-            SemanticReadiness::PartialQualityCoverage {
-                provenance: VerifiedSemanticProvenance::Local,
-                coverage_ppm: 500_000,
-            }
-        }
-        DegradationFailureKind::LexicalFallback | DegradationFailureKind::CacheMiss => {
-            SemanticReadiness::IndexAbsent
-        }
+        // A failed query is not an index census or producer attestation. In
+        // particular, timing out does not prove that half of the quality tier
+        // exists, and a cache miss does not prove that an index is absent.
+        DegradationFailureKind::RefinementFailed
+        | DegradationFailureKind::Timeout
+        | DegradationFailureKind::LexicalFallback
+        | DegradationFailureKind::CacheMiss => SemanticReadiness::ReadinessUnproven,
         DegradationFailureKind::UnverifiableEmbeddingSpace => SemanticReadiness::RemoteUnverified,
         DegradationFailureKind::CorruptIndex => SemanticReadiness::ManifestUnsafe,
         DegradationFailureKind::SemanticZeroSignal => {
@@ -344,6 +342,9 @@ pub fn semantic_readiness_for_search_error(
         }
         SearchError::ModelLoadFailed { .. } | SearchError::HashMismatch { .. } => {
             SemanticReadiness::ModelUnloadable { tier }
+        }
+        SearchError::IndexNotFound { .. } | SearchError::IndexCandidatesNotFound { .. } => {
+            SemanticReadiness::IndexAbsent
         }
         SearchError::DimensionMismatch { .. } | SearchError::IndexVersionMismatch { .. } => {
             SemanticReadiness::IdentityMismatch
@@ -953,6 +954,11 @@ mod tests {
                     assert_eq!(plan.state(), &readiness);
                     assert_eq!(plan.mode(), mode);
                     assert_eq!(plan.requested_topology(), topology);
+                    assert!(
+                        !plan.semantic_available(),
+                        "a failure category cannot prove semantic coverage: {:?}",
+                        fixture.failure
+                    );
                 }
                 for reason in [
                     ZeroSignalReason::NewlyCreatedEmpty,
@@ -976,6 +982,122 @@ mod tests {
                     assert!(!plan.semantic_available());
                 }
             }
+        }
+    }
+
+    #[test]
+    fn execution_failures_never_fabricate_semantic_provenance_or_half_coverage() {
+        use frankensearch_core::recovery_plan::{
+            InteractionPolicy, NetworkPolicy, RecoveryPolicy, RecoveryRequest, RequestMode,
+            SemanticProvenance, SemanticReadiness,
+        };
+        use frankensearch_core::types::RetrievalTopology;
+
+        let failures = [
+            SearchError::SearchTimeout {
+                elapsed_ms: 750,
+                budget_ms: 500,
+            },
+            SearchError::EmbeddingFailed {
+                model: "configured-producer".to_owned(),
+                source: Box::new(std::io::Error::other("request failed")),
+            },
+            SearchError::RerankFailed {
+                model: "configured-reranker".to_owned(),
+                source: Box::new(std::io::Error::other("request failed")),
+            },
+            SearchError::Cancelled {
+                phase: "query".to_owned(),
+                reason: "caller cancelled".to_owned(),
+            },
+            SearchError::InvalidConfig {
+                field: "search.option".to_owned(),
+                value: "unavailable".to_owned(),
+                reason: "request configuration refused".to_owned(),
+            },
+        ];
+        let policy = RecoveryPolicy {
+            interaction: InteractionPolicy::NonInteractive,
+            network: NetworkPolicy::Offline,
+            acquisition_authorization: None,
+        };
+        for error in &failures {
+            for mode in [RequestMode::ExplicitSemantic, RequestMode::Hybrid] {
+                for requested_topology in [
+                    RetrievalTopology::FastOnly,
+                    RetrievalTopology::QualityOnly,
+                    RetrievalTopology::FullProgressive,
+                ] {
+                    let plan = super::recovery_plan_for_search_error(
+                        error,
+                        RecoveryRequest {
+                            mode,
+                            requested_topology,
+                        },
+                        &policy,
+                        None,
+                        1_750_000_000,
+                    )
+                    .unwrap();
+                    assert_eq!(plan.state(), &SemanticReadiness::ReadinessUnproven);
+                    assert_eq!(plan.provenance(), SemanticProvenance::Unavailable);
+                    assert!(!plan.semantic_available());
+                    if mode == RequestMode::ExplicitSemantic {
+                        assert!(plan.response_contract().is_none());
+                    } else {
+                        let response = plan.response_contract().unwrap();
+                        assert_eq!(response.requested_topology(), requested_topology);
+                        assert_eq!(response.realized_topology(), RetrievalTopology::LexicalOnly);
+                        assert_eq!(response.coverage_ppm(), 0);
+                        assert_eq!(response.admitted_semantic_scores(), 0);
+                    }
+                    let action = plan.action().unwrap();
+                    let parsed = crate::parse_cli_args(action.argv().iter().skip(1).cloned())
+                        .expect("the readiness inspection must parse through the real CLI");
+                    assert_eq!(parsed.command, crate::CliCommand::Doctor);
+                    assert_eq!(parsed.format, crate::OutputFormat::Json);
+                    assert_eq!(parsed.index_dir, Some(PathBuf::from("<index-dir>")));
+                    assert!(!action.potentially_destructive());
+                    assert!(!action.network_required());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concrete_index_absence_remains_distinct_from_an_unproven_cache_miss() {
+        use frankensearch_core::recovery_plan::{RequestMode, SemanticReadiness};
+        use frankensearch_core::types::RetrievalTopology;
+
+        for error in [
+            SearchError::IndexNotFound {
+                path: PathBuf::from("/index/fast.fsvi"),
+            },
+            SearchError::IndexCandidatesNotFound {
+                paths: vec![PathBuf::from("/index/fast.fsvi")],
+            },
+        ] {
+            assert_eq!(
+                super::semantic_readiness_for_search_error(
+                    &error,
+                    RequestMode::Hybrid,
+                    RetrievalTopology::FullProgressive,
+                ),
+                SemanticReadiness::IndexAbsent
+            );
+        }
+        for failure in [
+            DegradationFailureKind::LexicalFallback,
+            DegradationFailureKind::CacheMiss,
+        ] {
+            assert_eq!(
+                super::semantic_readiness_for_failure(
+                    failure,
+                    RequestMode::Hybrid,
+                    RetrievalTopology::FullProgressive,
+                ),
+                SemanticReadiness::ReadinessUnproven
+            );
         }
     }
 }

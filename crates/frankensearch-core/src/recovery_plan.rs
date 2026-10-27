@@ -256,6 +256,11 @@ pub enum SemanticReadiness {
     Ready {
         provenance: VerifiedSemanticProvenance,
     },
+    /// A request failed without establishing the producer, usable index, or
+    /// coverage. A timeout or generic execution failure is not a census and
+    /// cannot prove either semantic availability or a particular repair cause.
+    /// An independent readiness probe is required before selecting a mutation.
+    ReadinessUnproven,
     /// No usable model artifact exists in the configured cache for this exact
     /// progressive tier.
     ModelMissing {
@@ -326,6 +331,7 @@ struct PartialQualityCoverageDetailWire {
 #[serde(rename_all = "snake_case")]
 enum SemanticReadinessTagWire {
     Ready,
+    ReadinessUnproven,
     ModelMissing,
     ModelUnloadable,
     IndexAbsent,
@@ -370,6 +376,9 @@ impl<'de> Deserialize<'de> for SemanticReadiness {
                     provenance,
                 })),
             ) => Ok(Self::Ready { provenance }),
+            (SemanticReadinessTagWire::ReadinessUnproven, WireField::Missing) => {
+                Ok(Self::ReadinessUnproven)
+            }
             (
                 SemanticReadinessTagWire::ModelMissing,
                 WireField::Present(SemanticReadinessDetailWire::ModelTier(ModelTierDetailWire {
@@ -429,6 +438,7 @@ impl SemanticReadiness {
     pub const fn state_code(&self) -> &'static str {
         match self {
             Self::Ready { .. } => "recovery.state.ready",
+            Self::ReadinessUnproven => "recovery.state.readiness_unproven",
             Self::ModelMissing { .. } => "recovery.state.model_missing",
             Self::ModelUnloadable { .. } => "recovery.state.model_unloadable",
             Self::IndexAbsent => "recovery.state.index_absent",
@@ -469,7 +479,8 @@ impl SemanticReadiness {
             }
             Self::RemoteUnverified => SemanticProvenance::UnverifiedRemote,
             Self::HashControl => SemanticProvenance::HashControl,
-            Self::ModelMissing { .. }
+            Self::ReadinessUnproven
+            | Self::ModelMissing { .. }
             | Self::ModelUnloadable { .. }
             | Self::IndexAbsent
             | Self::IdentityMismatch
@@ -2271,6 +2282,25 @@ fn action_for(
 ) -> Result<Option<RecoveryAction>, RecoveryContractError> {
     match state {
         SemanticReadiness::Ready { .. } | SemanticReadiness::HashControl => Ok(None),
+        SemanticReadiness::ReadinessUnproven => Ok(Some(simple_action(
+            "recovery.action.inspect_readiness",
+            "The failed request did not establish semantic producer or index readiness. \
+             Inspect the model and index before choosing recovery; a timeout or execution \
+             failure alone does not authorize rebuilding or prove partial coverage.",
+            &[
+                "fsfs",
+                "doctor",
+                "--index-dir",
+                ARG_INDEX_DIR,
+                "--format",
+                "json",
+            ],
+            false,
+            false,
+            true,
+            false,
+            "recovery.post.readiness_inspected",
+        ))),
         SemanticReadiness::ModelMissing { .. } => {
             model_acquisition_action(false, network, acquisition_target).map(Some)
         }
@@ -2657,6 +2687,7 @@ mod tests {
             SemanticReadiness::Ready {
                 provenance: VerifiedSemanticProvenance::Daemon,
             },
+            SemanticReadiness::ReadinessUnproven,
             missing(ModelTier::Quality),
             unloadable(ModelTier::Quality),
             SemanticReadiness::IndexAbsent,
@@ -2839,7 +2870,7 @@ mod tests {
         // Distinct states never share a code with distinct actions.
         let state_codes: std::collections::HashSet<_> =
             states.iter().map(|s| s.state_code()).collect();
-        assert_eq!(state_codes.len(), 13, "one code per state variant");
+        assert_eq!(state_codes.len(), 14, "one code per state variant");
 
         let emitted: std::collections::HashSet<_> = codes.iter().map(String::as_str).collect();
         let v1_codes = [
@@ -2881,6 +2912,9 @@ mod tests {
             );
         }
         for appended in [
+            "recovery.state.readiness_unproven",
+            "recovery.action.inspect_readiness",
+            "recovery.post.readiness_inspected",
             "recovery.state.remote_unverified",
             "recovery.state.hash_control",
             "recovery.action.provide_attestation",
@@ -2940,6 +2974,73 @@ mod tests {
             assert_eq!(response.coverage_ppm(), 0);
             assert_eq!(response.admitted_semantic_scores(), 0);
             assert_eq!(response.degradation_reason_code(), Some(state.state_code()));
+        }
+    }
+
+    #[test]
+    fn unproven_readiness_inspects_without_inventing_coverage_or_mutating_data() {
+        for request in semantic_requests() {
+            for policy in all_policies() {
+                let recovery = planned(SemanticReadiness::ReadinessUnproven, request, policy);
+                assert!(!recovery.semantic_available());
+                assert_eq!(recovery.provenance(), SemanticProvenance::Unavailable);
+                let action = recovery.action().expect("readiness inspection");
+                assert_eq!(action.code(), "recovery.action.inspect_readiness");
+                assert_eq!(
+                    action.argv(),
+                    [
+                        "fsfs",
+                        "doctor",
+                        "--index-dir",
+                        ARG_INDEX_DIR,
+                        "--format",
+                        "json"
+                    ]
+                );
+                assert!(!action.network_required());
+                assert!(!action.consent_required());
+                assert!(!action.potentially_destructive());
+                assert!(action.preserves_old_data());
+                assert!(action.required_authorization().is_none());
+                assert_eq!(
+                    action.expected_postcondition(),
+                    "recovery.post.readiness_inspected"
+                );
+                assert_eq!(recovery.retryability(), Retryability::AfterAction);
+                if matches!(request.mode, RequestMode::ExplicitSemantic) {
+                    assert!(recovery.response_contract().is_none());
+                } else {
+                    let response = recovery.response_contract().expect("lexical-only response");
+                    assert_eq!(response.requested_topology(), request.requested_topology);
+                    assert_eq!(response.realized_topology(), RetrievalTopology::LexicalOnly);
+                    assert_eq!(response.coverage_ppm(), 0);
+                    assert_eq!(response.admitted_semantic_scores(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unproven_readiness_wire_cannot_claim_provenance_or_coverage() {
+        let state = SemanticReadiness::ReadinessUnproven;
+        let wire = serde_json::to_value(&state).unwrap();
+        assert_eq!(wire, serde_json::json!({"state": "readiness_unproven"}));
+        assert_eq!(
+            serde_json::from_value::<SemanticReadiness>(wire).unwrap(),
+            state
+        );
+        for detail in [
+            serde_json::Value::Null,
+            serde_json::json!({"provenance": "local"}),
+            serde_json::json!({"provenance": "local", "coverage_ppm": 500_000}),
+        ] {
+            assert!(
+                serde_json::from_value::<SemanticReadiness>(serde_json::json!({
+                    "state": "readiness_unproven",
+                    "detail": detail,
+                }))
+                .is_err()
+            );
         }
     }
 
@@ -3047,6 +3148,11 @@ mod tests {
     #[test]
     fn planned_semantic_mutations_never_publish_unbound_argv() {
         for state in unready_states() {
+            // Inspection makes no semantic mutation. Its exact read-only argv
+            // and refusal to admit scores are checked independently below.
+            if matches!(state, SemanticReadiness::ReadinessUnproven) {
+                continue;
+            }
             let full_recovery = planned(
                 state.clone(),
                 explicit(RetrievalTopology::FullProgressive),
@@ -5326,6 +5432,7 @@ mod tests {
             SemanticReadiness::Ready {
                 provenance: VerifiedSemanticProvenance::Local,
             },
+            SemanticReadiness::ReadinessUnproven,
             missing(ModelTier::Quality),
             unloadable(ModelTier::Quality),
             SemanticReadiness::IndexAbsent,
@@ -5387,6 +5494,8 @@ mod tests {
         let expected: Vec<&str> = vec![
             "recovery.state.ready|semantic => none,false,false,not_needed,full_progressive,1000000",
             "recovery.state.ready|hybrid => none,false,false,not_needed,full_progressive,1000000",
+            "recovery.state.readiness_unproven|semantic => recovery.action.inspect_readiness,false,false,after_action,none,0",
+            "recovery.state.readiness_unproven|hybrid => recovery.action.inspect_readiness,false,false,after_action,lexical_only,0",
             "recovery.state.model_missing|semantic => recovery.action.acquire_model,true,true,capability_blocked,none,0",
             "recovery.state.model_missing|hybrid => recovery.action.acquire_model,true,true,capability_blocked,lexical_only,0",
             "recovery.state.model_unloadable|semantic => recovery.action.reacquire_model,true,true,capability_blocked,none,0",
