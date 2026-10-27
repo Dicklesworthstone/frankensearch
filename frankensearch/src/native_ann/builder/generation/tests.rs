@@ -16,6 +16,202 @@ const BUDGET: usize = 16 * 1024 * 1024;
 const SOURCE: CommitRange = CommitRange { low: 4, high: 9 };
 
 #[test]
+fn empty_generations_retain_complete_single_and_progressive_images_without_inference() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for (label, tier, ann, quality_ann, full) in [
+            ("fast", EmbedderTierTag::Fast, false, false, false),
+            ("quality", EmbedderTierTag::Quality, false, false, false),
+            ("fast-ann", EmbedderTierTag::Fast, true, false, false),
+            ("quality-ann", EmbedderTierTag::Quality, true, false, false),
+            ("full", EmbedderTierTag::Fast, false, false, true),
+            ("full-fast-ann", EmbedderTierTag::Fast, true, false, true),
+            ("full-quality-ann", EmbedderTierTag::Fast, false, true, true),
+            ("full-both-ann", EmbedderTierTag::Fast, true, true, true),
+        ] {
+            for precision in [NativeBuildPrecision::F16, NativeBuildPrecision::F32] {
+                let directory = tempfile::tempdir().unwrap();
+                let work = directory.path().join(label);
+                // Any document inference would cancel the build, including an
+                // accidental empty batch sent to either provider.
+                let provider = Arc::new(Provider::new(label, 2, Reply::Cancel));
+                let mut configured = NativeIndexBuilder::new(&work, generation(), provider)
+                    .unwrap()
+                    .with_fast_storage(
+                        precision,
+                        if ann {
+                            NativeBuildRetrieval::Hnsw {
+                                params: HnswParams::default(),
+                                seed: 79,
+                            }
+                        } else {
+                            NativeBuildRetrieval::Exact
+                        },
+                    );
+                if full {
+                    configured = configured
+                        .with_quality_embedder(Arc::new(Provider::new(
+                            "independent-quality",
+                            3,
+                            Reply::Cancel,
+                        )))
+                        .unwrap()
+                        .with_quality_storage(
+                            precision,
+                            if quality_ann {
+                                NativeBuildRetrieval::Hnsw {
+                                    params: HnswParams::default(),
+                                    seed: 83,
+                                }
+                            } else {
+                                NativeBuildRetrieval::Exact
+                            },
+                        )
+                        .unwrap();
+                }
+                let mut built = if full {
+                    configured
+                        .build_progressive_generation(&cx, SOURCE, BUDGET)
+                        .await
+                } else {
+                    configured
+                        .build_exact_generation(&cx, tier, SOURCE, BUDGET)
+                        .await
+                }
+                .unwrap();
+                let candidate = candidate(&built);
+                built.validate_candidate(&cx, &candidate).unwrap();
+                assert_eq!(built.metadata().total_documents, 0);
+                assert_eq!(built.metadata().commit_range, SOURCE);
+                assert_eq!(built.metadata().embedders.len(), if full { 2 } else { 1 });
+                assert!(
+                    built
+                        .metadata()
+                        .vector_artifacts
+                        .iter()
+                        .all(|item| item.vector_count == 0)
+                );
+                assert!(
+                    built
+                        .metadata()
+                        .lexical_artifacts
+                        .iter()
+                        .all(|item| item.document_count == 0)
+                );
+                assert_eq!(built.components.has_ann(), ann || quality_ann);
+                assert_eq!(
+                    matches!(
+                        built.retrieval_configuration(),
+                        NativeBuildRetrieval::Hnsw { .. }
+                    ),
+                    ann
+                );
+                assert_eq!(built.quality_retrieval_configuration().is_some(), full);
+                assert_eq!(
+                    matches!(
+                        built.quality_retrieval_configuration(),
+                        Some(NativeBuildRetrieval::Hnsw { .. })
+                    ),
+                    quality_ann
+                );
+                assert_eq!(
+                    built.components.docset_digest(),
+                    CanonicalDocsetV1::from_ordered_live_documents(std::iter::empty::<&str>())
+                        .unwrap()
+                        .digest()
+                );
+                for (role, receipt) in candidate.manifest().components().iter() {
+                    assert!(receipt.byte_len > 0);
+                    assert_eq!(
+                        built.component_bytes(role).unwrap().len() as u64,
+                        receipt.byte_len
+                    );
+                }
+                if full {
+                    let cohort = ExactVectorCohortV1::admit(
+                        &cx,
+                        built.vector.clone(),
+                        built.binding(),
+                        built.quality_binding().unwrap(),
+                        SourceCheckpointV1::derive(&SOURCE),
+                        BUDGET,
+                    )
+                    .unwrap();
+                    assert_eq!(cohort.fast().record_count(), 0);
+                    assert_eq!(cohort.quality().record_count(), 0);
+                    assert_ne!(
+                        built.binding().dimension(),
+                        built.quality_binding().unwrap().dimension()
+                    );
+                } else {
+                    let owner = ValidatedFsviBytes::from_arc(built.vector.clone(), built.binding())
+                        .unwrap();
+                    assert_eq!(owner.record_count(), 0);
+                }
+                let readers = built.admit_candidate(&cx, &candidate).unwrap();
+                assert!(readers.source_documents(&cx, 0).unwrap().is_empty());
+                built
+                    .prepare_scope(&cx, &candidate, 0, |_| panic!("empty corpus has no source"))
+                    .unwrap();
+                std::fs::rename(&work, directory.path().join("relocated")).unwrap();
+                built.validate_candidate(&cx, &candidate).unwrap();
+
+                // A complete empty generation still requires every declared image.
+                let lexical = built.lexical.clone();
+                built.lexical = Arc::from([]);
+                assert!(built.validate_candidate(&cx, &candidate).is_err());
+                built.lexical = lexical;
+                if ann || quality_ann {
+                    let graph = built.ann.take();
+                    assert!(built.validate_candidate(&cx, &candidate).is_err());
+                    built.ann = graph;
+                }
+                cx.set_cancel_requested(true);
+                assert!(matches!(
+                    built.validate_candidate(&cx, &candidate),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                cx.set_cancel_requested(false);
+                built.validate_candidate(&cx, &candidate).unwrap();
+            }
+        }
+    });
+}
+
+#[test]
+fn empty_support_does_not_turn_missing_embedding_outputs_into_an_empty_generation() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for full in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let work = directory.path().join("failed");
+            let fast = Arc::new(Provider::new(
+                "fast",
+                2,
+                if full { Reply::Correct } else { Reply::Short },
+            ));
+            let mut configured = NativeIndexBuilder::new(&work, generation(), fast)
+                .unwrap()
+                .add_document(IndexableDocument::new("one", "source must have a vector"));
+            if full {
+                configured = configured
+                    .with_quality_embedder(Arc::new(Provider::new("quality", 3, Reply::Short)))
+                    .unwrap();
+            }
+            let result = if full {
+                configured
+                    .build_progressive_generation(&cx, SOURCE, BUDGET)
+                    .await
+            } else {
+                configured
+                    .build_exact_generation(&cx, EmbedderTierTag::Fast, SOURCE, BUDGET)
+                    .await
+            };
+            assert!(result.is_err());
+            assert!(!work.join("lexical").exists());
+        }
+    });
+}
+
+#[test]
 fn progressive_generation_retains_independent_tiers_and_one_complete_source_cohort() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         // The second case deliberately has identical explicit providers and
@@ -478,7 +674,7 @@ fn unsupported_builds_fail_before_files_or_a_pending_provider_is_polled() {
                     provider.clone(),
                 )
                 .unwrap(),
-                SOURCE,
+                CommitRange { low: 9, high: 4 },
                 BUDGET,
             ),
             (

@@ -83,8 +83,9 @@ pub enum NativeGenerationTopology {
 /// Partial/sharded descriptors remain unsupported. Metadata
 /// paths are descriptive names, never paths to open. Vector artifact
 /// counts describe physical rows, including tombstones; the common document set
-/// and metadata total count describe live documents. The existing metadata
-/// readiness policy requires at least one live document in this route.
+/// and metadata total count describe live documents. Empty generations retain
+/// complete identity-bound zero-row vector images, an empty lexical image and
+/// the canonical empty document set; absent or corrupt images are still refused.
 ///
 /// Keeping this handle retains the original authority capability and all engine
 /// bytes. Publishing or rolling back another generation does not change an

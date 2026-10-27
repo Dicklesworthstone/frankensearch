@@ -59,9 +59,10 @@ impl NativeIndexBuilder {
     ///
     /// `tier` labels the explicitly supplied primary provider as fast or quality;
     /// a quality-only generation does not load or invent a fast provider. A
-    /// second provider, an empty cohort, and an unrepresentable source range are
-    /// refused before inference or file creation. The source range is supplied
-    /// by the caller that owns the source cut, not inferred from document IDs.
+    /// second provider and an unrepresentable source range are refused before
+    /// inference or file creation. An empty cohort retains complete identity-bound
+    /// vector and lexical images without performing document inference. The source
+    /// range is supplied by the caller that owns the source cut, not inferred from IDs.
     ///
     /// The selected retrieval policy is preserved: HNSW includes a verified raw
     /// graph image and its full owner-bound receipt in the metadata image.
@@ -145,17 +146,16 @@ impl NativeIndexBuilder {
         source: CommitRange,
         max_image_bytes: usize,
     ) -> SearchResult<NativeBuiltExactGeneration> {
-        if self.documents.is_empty()
-            || source
-                .high
-                .checked_sub(source.low)
-                .and_then(|span| span.checked_add(1))
-                .is_none()
+        if source
+            .high
+            .checked_sub(source.low)
+            .and_then(|span| span.checked_add(1))
+            .is_none()
         {
             return Err(invalid(
                 "builder.generation.source",
-                "empty-or-unrepresentable",
-                "a nonempty source cohort and a representable inclusive commit range are required",
+                "unrepresentable",
+                "a representable inclusive commit range is required",
             ));
         }
         let component_budget =

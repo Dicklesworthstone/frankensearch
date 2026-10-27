@@ -3411,6 +3411,438 @@ mod qualified_rollback {
     }
 
     #[test]
+    fn authority_delete_all_reopens_repopulates_and_rolls_back_to_complete_empty_generations() {
+        let parent = update_parent("empty-lifecycle");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann, quality_ann, full) in [
+                ("fast", EmbedderTierTag::Fast, false, false, false),
+                ("quality", EmbedderTierTag::Quality, false, false, false),
+                ("fast-ann", EmbedderTierTag::Fast, true, false, false),
+                ("quality-ann", EmbedderTierTag::Quality, true, false, false),
+                ("full", EmbedderTierTag::Fast, false, false, true),
+                ("full-fast-ann", EmbedderTierTag::Fast, true, false, true),
+                ("full-quality-ann", EmbedderTierTag::Fast, false, true, true),
+                ("full-both-ann", EmbedderTierTag::Fast, true, true, true),
+            ] {
+                let primary = Arc::new(ProgressiveProvider::new(tier == EmbedderTierTag::Quality));
+                let quality = Arc::new(ProgressiveProvider::new(true));
+                let retrieval = progressive_policy(ann, false);
+                let mut builder = NativeIndexBuilder::new(
+                    parent.join(format!("{label}-initial")),
+                    ArtifactGenerationIdentityV1::new(1, [0xd1; 16]).unwrap(),
+                    primary.clone(),
+                )
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F16, retrieval)
+                .add_documents([
+                    IndexableDocument::new("alpha", "common original source"),
+                    IndexableDocument::new("beta", "quality-special"),
+                ]);
+                if full {
+                    builder = builder
+                        .with_quality_embedder(quality.clone())
+                        .unwrap()
+                        .with_quality_storage(
+                            NativeBuildPrecision::F32,
+                            progressive_policy(quality_ann, true),
+                        )
+                        .unwrap();
+                }
+                let built = if full {
+                    builder
+                        .build_progressive_generation(&cx, CommitRange { low: 1, high: 2 }, BUDGET)
+                        .await
+                } else {
+                    builder
+                        .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 2 }, BUDGET)
+                        .await
+                }
+                .unwrap();
+                let root_path = parent.join(format!("{label}-root"));
+                let root = create_root(&root_path);
+                let original = built
+                    .candidate(
+                        [0xd2; 16],
+                        None,
+                        GenerationAuthorityActionV1::Activate,
+                        [0xd3; 32],
+                    )
+                    .unwrap();
+                stage(&root, &built, &original);
+                let retained = if full {
+                    publish_progressive(
+                        &cx,
+                        &root,
+                        &original,
+                        (built.binding(), built.quality_binding().unwrap()),
+                        ExpectedAuthorityPairV1::default(),
+                        [0xd4; 16],
+                    )
+                } else {
+                    publish(
+                        &cx,
+                        &root,
+                        &original,
+                        built.binding(),
+                        ExpectedAuthorityPairV1::default(),
+                        [0xd4; 16],
+                    )
+                };
+                primary.calls.store(0, Ordering::SeqCst);
+                quality.calls.store(0, Ordering::SeqCst);
+                let next_generation = ArtifactGenerationIdentityV1::new(2, [0xd5; 16]).unwrap();
+                let update = if full {
+                    retained.begin_progressive_update(
+                        &cx,
+                        parent.join(format!("{label}-empty")),
+                        next_generation,
+                        primary.clone(),
+                        quality.clone(),
+                        BUDGET,
+                    )
+                } else {
+                    retained.begin_update(
+                        &cx,
+                        parent.join(format!("{label}-empty")),
+                        next_generation,
+                        primary.clone(),
+                        BUDGET,
+                    )
+                }
+                .unwrap()
+                .delete_document("alpha")
+                .delete_document("beta");
+                let authority_before = fs::read(root_path.join("AUTHORITY")).unwrap();
+                let empty_built = if full {
+                    update
+                        .build_progressive_generation(&cx, CommitRange { low: 1, high: 3 }, BUDGET)
+                        .await
+                } else {
+                    update
+                        .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 3 }, BUDGET)
+                        .await
+                }
+                .unwrap();
+                assert_eq!(primary.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(empty_built.metadata().total_documents, 0);
+                assert_eq!(
+                    empty_built.binding().frozen_identity(),
+                    built.binding().frozen_identity()
+                );
+                assert_eq!(
+                    empty_built
+                        .quality_binding()
+                        .map(FsviV2IdentityBinding::frozen_identity),
+                    built
+                        .quality_binding()
+                        .map(FsviV2IdentityBinding::frozen_identity)
+                );
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_before
+                );
+                let empty_candidate = empty_built
+                    .candidate(
+                        [0xd6; 16],
+                        Some(retained.authority()),
+                        GenerationAuthorityActionV1::Activate,
+                        [0xd7; 32],
+                    )
+                    .unwrap();
+                let prepared_scope = empty_built
+                    .prepare_scope(&cx, &empty_candidate, 0, |_| {
+                        panic!("empty cohort has no predicates")
+                    })
+                    .unwrap();
+                stage(&root, &empty_built, &empty_candidate);
+                let empty = Arc::new(if full {
+                    publish_progressive(
+                        &cx,
+                        &root,
+                        &empty_candidate,
+                        (
+                            empty_built.binding(),
+                            empty_built.quality_binding().unwrap(),
+                        ),
+                        retained.retained_snapshot().authority_pair(),
+                        [0xd8; 16],
+                    )
+                } else {
+                    publish(
+                        &cx,
+                        &root,
+                        &empty_candidate,
+                        empty_built.binding(),
+                        retained.retained_snapshot().authority_pair(),
+                        [0xd8; 16],
+                    )
+                });
+                let scope = prepared_scope.bind(Arc::clone(&empty)).unwrap();
+                assert!(scope.is_empty());
+                assert_eq!(empty.topology(), retained.topology());
+                assert_progressive_policy(empty.retrieval_configuration(), ann, false);
+                assert_eq!(empty.quality_retrieval_configuration().is_some(), full);
+                if full {
+                    assert_progressive_policy(
+                        empty.quality_retrieval_configuration().unwrap(),
+                        quality_ann,
+                        true,
+                    );
+                }
+                assert_eq!(
+                    empty
+                        .retained_snapshot()
+                        .manifest()
+                        .components()
+                        .ann
+                        .is_some(),
+                    ann || quality_ann
+                );
+                assert!(empty.source_documents(&cx, 0).unwrap().is_empty());
+                assert!(
+                    empty
+                        .source_documents_by_ids(&cx, &["alpha", "beta", "missing"], 0)
+                        .unwrap()
+                        .iter()
+                        .all(Option::is_none)
+                );
+                assert!(
+                    empty
+                        .search_text(&cx, primary.as_ref(), "common", usize::MAX)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                if full {
+                    assert!(
+                        empty
+                            .search_quality_text(&cx, quality.as_ref(), "common", usize::MAX)
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                    assert!(
+                        empty
+                            .search_refined_text(
+                                &cx,
+                                primary.as_ref(),
+                                quality.as_ref(),
+                                "common",
+                                usize::MAX
+                            )
+                            .await
+                            .unwrap()
+                            .is_empty()
+                    );
+                }
+                let mut foreign = ProgressiveProvider::new(tier == EmbedderTierTag::Quality);
+                foreign
+                    .identity
+                    .producer
+                    .implementation_revision
+                    .push_str("-drift");
+                assert!(empty.search_text(&cx, &foreign, "common", 1).await.is_err());
+                assert_eq!(foreign.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(primary.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+
+                let fresh_root = QualifiedGenerationRoot::admit(
+                    &root_path,
+                    GenerationRootAnchorLayout::new(AUTHORITY_PUBLISHER_LOCK_BYTES_V1).unwrap(),
+                )
+                .unwrap();
+                let SnapshotOpenOutcomeV1::Opened(opened) = fresh_root
+                    .open_generation_snapshot_with_budget(ROOT_ID, PROFILE, None, BUDGET as u64)
+                    .unwrap()
+                else {
+                    panic!("empty generation must reopen from its selected authority")
+                };
+                let reopened = if full {
+                    NativeGenerationSnapshot::admit_progressive(
+                        &cx,
+                        opened,
+                        empty_built.binding(),
+                        empty_built.quality_binding().unwrap(),
+                        DEFAULT_SCHEMA,
+                        config(),
+                        BUDGET,
+                    )
+                } else {
+                    NativeGenerationSnapshot::admit_exact(
+                        &cx,
+                        opened,
+                        empty_built.binding(),
+                        DEFAULT_SCHEMA,
+                        config(),
+                        BUDGET,
+                    )
+                }
+                .unwrap();
+                assert_eq!(reopened.authority(), empty.authority());
+                assert_eq!(reopened.metadata().total_documents, 0);
+                assert_progressive_policy(reopened.retrieval_configuration(), ann, false);
+                if full {
+                    assert_progressive_policy(
+                        reopened.quality_retrieval_configuration().unwrap(),
+                        quality_ann,
+                        true,
+                    );
+                }
+                let next_generation = ArtifactGenerationIdentityV1::new(3, [0xd9; 16]).unwrap();
+                let refill = if full {
+                    reopened.begin_progressive_update(
+                        &cx,
+                        parent.join(format!("{label}-refill")),
+                        next_generation,
+                        primary.clone(),
+                        quality.clone(),
+                        0,
+                    )
+                } else {
+                    reopened.begin_update(
+                        &cx,
+                        parent.join(format!("{label}-refill")),
+                        next_generation,
+                        primary.clone(),
+                        0,
+                    )
+                }
+                .unwrap()
+                .upsert_document(IndexableDocument::new("new", "common repopulated source"));
+                let refill = if full {
+                    refill
+                        .build_progressive_generation(&cx, CommitRange { low: 1, high: 4 }, BUDGET)
+                        .await
+                } else {
+                    refill
+                        .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 4 }, BUDGET)
+                        .await
+                }
+                .unwrap();
+                assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.calls.load(Ordering::SeqCst), usize::from(full));
+                assert_progressive_policy(refill.retrieval_configuration(), ann, false);
+                if full {
+                    assert_progressive_policy(
+                        refill.quality_retrieval_configuration().unwrap(),
+                        quality_ann,
+                        true,
+                    );
+                }
+                let refill_candidate = refill
+                    .candidate(
+                        [0xda; 16],
+                        Some(reopened.authority()),
+                        GenerationAuthorityActionV1::Activate,
+                        [0xdb; 32],
+                    )
+                    .unwrap();
+                stage(&fresh_root, &refill, &refill_candidate);
+                let populated = if full {
+                    publish_progressive(
+                        &cx,
+                        &fresh_root,
+                        &refill_candidate,
+                        (refill.binding(), refill.quality_binding().unwrap()),
+                        reopened.retained_snapshot().authority_pair(),
+                        [0xdc; 16],
+                    )
+                } else {
+                    publish(
+                        &cx,
+                        &fresh_root,
+                        &refill_candidate,
+                        refill.binding(),
+                        reopened.retained_snapshot().authority_pair(),
+                        [0xdc; 16],
+                    )
+                };
+                assert_eq!(
+                    populated
+                        .search_text(&cx, primary.as_ref(), "common", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "new"
+                );
+                assert_eq!(retained.source_documents(&cx, BUDGET).unwrap().len(), 2);
+                assert!(empty.source_documents(&cx, 0).unwrap().is_empty());
+                assert!(
+                    scope
+                        .search_text(&cx, primary.as_ref(), "common", 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+
+                let rollback = reopened
+                    .rollback_candidate(&cx, &populated, [0xdd; 16], [0xde; 32])
+                    .unwrap();
+                assert_eq!(
+                    rollback.authority().sequence,
+                    populated.authority().sequence + 1
+                );
+                assert_eq!(
+                    rollback.manifest().generation(),
+                    empty_candidate.manifest().generation()
+                );
+                assert_eq!(
+                    rollback.manifest().components(),
+                    empty_candidate.manifest().components()
+                );
+                stage_manifest(&fresh_root, &rollback);
+                let restored = if full {
+                    publish_progressive(
+                        &cx,
+                        &fresh_root,
+                        &rollback,
+                        (
+                            empty_built.binding(),
+                            empty_built.quality_binding().unwrap(),
+                        ),
+                        populated.retained_snapshot().authority_pair(),
+                        [0xdf; 16],
+                    )
+                } else {
+                    publish(
+                        &cx,
+                        &fresh_root,
+                        &rollback,
+                        empty_built.binding(),
+                        populated.retained_snapshot().authority_pair(),
+                        [0xdf; 16],
+                    )
+                };
+                assert_eq!(restored.metadata().total_documents, 0);
+                assert_progressive_policy(restored.retrieval_configuration(), ann, false);
+                if full {
+                    assert_progressive_policy(
+                        restored.quality_retrieval_configuration().unwrap(),
+                        quality_ann,
+                        true,
+                    );
+                }
+                assert!(
+                    restored
+                        .search_text(&cx, primary.as_ref(), "common", 1)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    populated
+                        .source_document(&cx, "new", BUDGET)
+                        .unwrap()
+                        .unwrap()
+                        .content,
+                    "common repopulated source"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn authority_updates_refuse_invalid_contracts_before_inference_or_work() {
         let parent = update_parent("refusals");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -3490,7 +3922,7 @@ mod qualified_rollback {
                 ),
                 (
                     EmbedderTierTag::Fast,
-                    CommitRange { low: 1, high: 8 },
+                    CommitRange { low: 9, high: 8 },
                     BUDGET,
                     true,
                 ),

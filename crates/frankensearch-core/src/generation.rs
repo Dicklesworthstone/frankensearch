@@ -4701,7 +4701,8 @@ pub struct GenerationManifest {
     pub repair_descriptors: Vec<RepairDescriptor>,
     /// Activation invariants that must all pass before serving.
     pub activation_invariants: Vec<ActivationInvariant>,
-    /// Total document count across all artifacts.
+    /// Total document count across all artifacts. Empty generations retain
+    /// their artifact descriptors, with every artifact declaring zero rows.
     pub total_documents: u64,
     /// Optional free-form metadata (deployment tags, build host, etc.).
     pub metadata: BTreeMap<String, String>,
@@ -5140,14 +5141,14 @@ fn check_document_count_consistency(m: &GenerationManifest, f: &mut Vec<Validati
         });
     }
 
-    // Vector count should match declared total (per tier, so may be 2x for two-tier).
-    // We only warn if there's a gross mismatch.
-    if m.total_documents == 0 && (!m.vector_artifacts.is_empty() || !m.lexical_artifacts.is_empty())
-    {
+    // Deleting the last document still produces real, sealed index images.
+    // Their presence is valid; any declared live row contradicts an empty
+    // generation. Checked sums also prevent overflow from hiding such rows.
+    if m.total_documents == 0 && (vector_total != Some(0) || lexical_total != Some(0)) {
         f.push(ValidationFinding {
             check: "total_documents",
             severity: FindingSeverity::Error,
-            message: "total_documents is 0 but artifacts are present".into(),
+            message: "total_documents is 0 but artifacts declare documents".into(),
         });
     }
 
@@ -9080,12 +9081,50 @@ mod tests {
     }
 
     #[test]
-    fn zero_total_documents_with_artifacts_is_error() {
-        let mut m = valid_manifest();
-        m.total_documents = 0;
-        let r = validate_manifest(&m);
-        assert!(!r.is_valid());
-        assert!(r.errors().iter().any(|f| f.check == "total_documents"));
+    fn zero_total_documents_with_populated_artifacts_is_error() {
+        for (vector_count, document_count) in [(1, 0), (0, 1), (100, 100)] {
+            let mut m = valid_manifest();
+            m.total_documents = 0;
+            m.vector_artifacts[0].vector_count = vector_count;
+            m.lexical_artifacts[0].document_count = document_count;
+            refresh_manifest_hash(&mut m);
+
+            let r = validate_manifest(&m);
+            assert!(!r.is_valid(), "findings: {:#?}", r.findings);
+            assert!(r.errors().iter().any(|f| f.check == "total_documents"));
+            assert_eq!(r.errors().len(), 1, "findings: {:#?}", r.findings);
+        }
+    }
+
+    #[test]
+    fn empty_generation_cannot_hide_populated_or_overflowing_later_shards() {
+        for first_count in [0, u64::MAX] {
+            let mut m = valid_manifest();
+            m.total_documents = 0;
+            m.vector_artifacts[0].vector_count = first_count;
+            m.lexical_artifacts[0].document_count = first_count;
+            m.vector_artifacts
+                .push(sample_vector_artifact("vectors/later.fsvi", 1));
+            m.lexical_artifacts
+                .push(sample_lexical_artifact("lexical/later", 1));
+            refresh_manifest_hash(&mut m);
+
+            let r = validate_manifest(&m);
+            assert!(!r.is_valid(), "findings: {:#?}", r.findings);
+            assert!(r.errors().iter().any(|f| f.check == "total_documents"));
+            if first_count == u64::MAX {
+                assert!(
+                    r.errors()
+                        .iter()
+                        .any(|f| f.check == "vector_count_overflow")
+                );
+                assert!(
+                    r.errors()
+                        .iter()
+                        .any(|f| f.check == "lexical_document_count_overflow")
+                );
+            }
+        }
     }
 
     #[test]
@@ -9624,6 +9663,12 @@ mod tests {
         let mut manifest = valid_manifest();
         manifest.commit_range = commit_range.clone();
         manifest.total_documents = documents.len() as u64;
+        for artifact in &mut manifest.vector_artifacts {
+            artifact.vector_count = manifest.total_documents;
+        }
+        for artifact in &mut manifest.lexical_artifacts {
+            artifact.document_count = manifest.total_documents;
+        }
         manifest.manifest_hash = String::new();
         manifest.manifest_hash = compute_manifest_hash(&manifest).expect("hash");
         manifest
@@ -9646,18 +9691,137 @@ mod tests {
     fn quartet_around(
         metadata: &ExactComponentReceiptV1,
     ) -> (ExactComponentReceiptV1, ExactComponentReceiptV1) {
-        (
-            component(
-                GenerationComponentRole::Vector,
-                metadata.docset_digest,
-                metadata.source_checkpoint,
-            ),
-            component(
-                GenerationComponentRole::Lexical,
-                metadata.docset_digest,
-                metadata.source_checkpoint,
-            ),
+        let mut vector = component(
+            GenerationComponentRole::Vector,
+            metadata.docset_digest,
+            metadata.source_checkpoint,
+        );
+        let mut lexical = component(
+            GenerationComponentRole::Lexical,
+            metadata.docset_digest,
+            metadata.source_checkpoint,
+        );
+        vector.live_document_count = metadata.live_document_count;
+        lexical.live_document_count = metadata.live_document_count;
+        (vector, lexical)
+    }
+
+    #[test]
+    fn empty_generation_metadata_round_trips_and_admits_with_and_without_ann() {
+        let (manifest, bytes, metadata) = metadata_receipt(
+            &[],
+            &CommitRange {
+                low: 101,
+                high: 101,
+            },
+        );
+        let documents = docset(&[]);
+
+        let validation = validate_manifest(&manifest);
+        assert!(validation.findings.is_empty(), "{:#?}", validation.findings);
+        assert_eq!(manifest.total_documents, 0);
+        assert_eq!(manifest.vector_artifacts[0].vector_count, 0);
+        assert_eq!(manifest.lexical_artifacts[0].document_count, 0);
+        assert!(manifest.vector_artifacts[0].size_bytes > 0);
+        assert!(manifest.lexical_artifacts[0].size_bytes > 0);
+        assert!(!manifest.embedders.is_empty());
+
+        let decoded: GenerationManifest = serde_json::from_slice(&bytes).expect("decode manifest");
+        assert_eq!(decoded, manifest);
+        assert!(validate_manifest(&decoded).findings.is_empty());
+        assert_eq!(metadata.live_document_count, 0);
+        assert_eq!(metadata.docset_digest, documents.digest());
+        assert_ne!(metadata.docset_digest, [0; 32]);
+        assert_ne!(metadata.source_checkpoint, [0; 32]);
+        metadata
+            .verify_metadata_manifest(&decoded, &bytes)
+            .expect("empty metadata retains its sealed image");
+        metadata
+            .verify_metadata_docset(&documents)
+            .expect("empty metadata names the canonical empty docset");
+
+        let (vector, lexical) = quartet_around(&metadata);
+        let mut ann = component(
+            GenerationComponentRole::Ann,
+            metadata.docset_digest,
+            metadata.source_checkpoint,
+        );
+        ann.live_document_count = 0;
+        let with_ann = ExactGenerationComponentsV1::admit(
+            vector.clone(),
+            lexical.clone(),
+            Some(ann),
+            metadata.clone(),
         )
+        .expect("complete empty generation with ANN admits");
+        let without_ann = ExactGenerationComponentsV1::admit(vector, lexical, None, metadata)
+            .expect("complete empty generation without ANN admits");
+        assert_eq!(with_ann.docset_digest(), documents.digest());
+        assert_eq!(without_ann.docset_digest(), documents.digest());
+        assert_ne!(with_ann.composite_digest(), without_ann.composite_digest());
+    }
+
+    #[test]
+    fn empty_generation_still_rejects_incomplete_or_drifting_components() {
+        let (_manifest, _bytes, metadata) = metadata_receipt(
+            &[],
+            &CommitRange {
+                low: 101,
+                high: 101,
+            },
+        );
+        let (vector, lexical) = quartet_around(&metadata);
+
+        let mut populated_lexical = lexical.clone();
+        populated_lexical.live_document_count = 1;
+        assert!(matches!(
+            ExactGenerationComponentsV1::admit(
+                vector.clone(),
+                populated_lexical,
+                None,
+                metadata.clone()
+            ),
+            Err(ComponentJoinErrorV1::LiveDocumentCountDrift { role: "lexical" })
+        ));
+
+        let mut different_docset = metadata.clone();
+        different_docset.docset_digest = docset(&["deleted-document"]).digest();
+        assert!(matches!(
+            ExactGenerationComponentsV1::admit(
+                vector.clone(),
+                lexical.clone(),
+                None,
+                different_docset
+            ),
+            Err(ComponentJoinErrorV1::DocsetDrift { role: "metadata" })
+        ));
+
+        let mut missing_lexical_image = lexical.clone();
+        missing_lexical_image.bytes.byte_len = 0;
+        assert!(matches!(
+            ExactGenerationComponentsV1::admit(
+                vector.clone(),
+                missing_lexical_image,
+                None,
+                metadata
+            ),
+            Err(ComponentJoinErrorV1::InvalidComponent {
+                role: "lexical",
+                ..
+            })
+        ));
+
+        let (_manifest, _bytes, next_metadata) = metadata_receipt(
+            &[],
+            &CommitRange {
+                low: 102,
+                high: 102,
+            },
+        );
+        assert!(matches!(
+            ExactGenerationComponentsV1::admit(vector, lexical, None, next_metadata),
+            Err(ComponentJoinErrorV1::CheckpointDrift { role: "metadata" })
+        ));
     }
 
     /// CONTROL. Without this, every rejection below could be a producer that

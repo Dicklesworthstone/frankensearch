@@ -455,12 +455,13 @@ impl NativeIndexUpdate {
     /// Updates begun from an authority snapshot preserve its tier label and may
     /// not move either source-checkpoint boundary backward. As with
     /// [`NativeIndexBuilder::build_exact_generation`], this route requires one
-    /// provider and a nonempty resulting source cohort. Finalization inherits
-    /// the configured/caller-context pool through the ordinary builder.
+    /// provider. Deleting the final document produces complete empty components
+    /// that a later update can repopulate with the same provider. Finalization
+    /// inherits the configured/caller-context pool through the ordinary builder.
     ///
     /// # Errors
     /// Includes edit/identity/inference/build errors and refuses an authority
-    /// tier change, backward source range, empty successor or invalid image budget.
+    /// tier change, backward source range or invalid image budget.
     #[cfg(feature = "quill")]
     pub async fn build_exact_generation(
         self,
@@ -511,10 +512,11 @@ impl NativeIndexUpdate {
     /// Changed content is embedded independently in each tier, while unchanged
     /// vectors are copied only from their matching admitted owner. The original
     /// authority pin survives until all new components pass joint admission.
+    /// Empty successors preserve both identities and require no document inference.
     /// This constructs a candidate and never publishes or modifies a predecessor.
     ///
     /// # Errors
-    /// Refuses a topology change, backward source boundaries, empty output,
+    /// Refuses a topology change, backward source boundaries,
     /// invalid ANN plans, identity drift, budget exhaustion or cancellation.
     #[cfg(feature = "quill")]
     pub async fn build_progressive_generation(
