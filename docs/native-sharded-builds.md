@@ -226,9 +226,15 @@ tier topology without inference. The same update can explicitly `build` or
 update can conversely build a sharded successor. Existing selected-reopen formats
 work unchanged for the selected output layout.
 
-All successor source/vector images, graphs and global Quill are rebuilt. The final
-source records are cloned/moved as before; all predecessor owners remain resident
-while needed. This is incremental inference, not O(changed-bytes) writes, immutable
+All successor source/vector images and global Quill are rebuilt. Native graph
+construction can reuse a predecessor partition when all its documents survive in
+one successor partition with identical vector bytes, flags, producer and storage
+identity, and graph parameters. New rows are inserted while a persisted row map
+preserves old logical nodes even if physical FSVI rows move. Other partition,
+vector or policy changes select a full graph build. Every successor still writes
+its complete graph and receipt. The final source records are cloned/moved as
+before; all predecessor owners remain resident while needed. This is incremental
+inference and eligible graph construction, not O(changed-bytes) writes, immutable
 file reuse, a memory bound, or a measured speedup. A failure in the last partition,
 required quality tier or lexical stage returns no complete successor. Cancellation
 or dropping pending work retains the predecessor and may leave incomplete new

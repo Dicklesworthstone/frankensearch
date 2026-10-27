@@ -94,6 +94,46 @@ impl NativeAnnIndex {
         })
     }
 
+    /// Reuse this graph in a newer admitted generation when every existing
+    /// document retains its exact vector and live/tombstone state.
+    ///
+    /// New documents are inserted into a private successor graph. Physical row
+    /// reordering is resolved by document identity; the predecessor's graph and
+    /// owner remain unchanged and searchable. The complete embedding, input,
+    /// producer and storage contracts must agree, as must the graph parameters
+    /// and construction seed. No source pathname is reopened.
+    ///
+    /// Returns `None` when the backend, construction policy or source changes
+    /// require a full graph build. This is an eligibility decision, not an error
+    /// fallback: cancellation and structural errors propagate to the caller.
+    /// The returned graph must still be saved and selected as part of a complete
+    /// successor generation by the caller's normal publication protocol.
+    ///
+    /// # Errors
+    /// Refuses a non-newer ANN generation and propagates cancellation, owner
+    /// validation, graph insertion and structural-admission failures.
+    pub fn try_reuse_for_owner(
+        &self,
+        cx: &Cx,
+        owner: Arc<ValidatedFsviBytes>,
+        params: HnswParams,
+        seed: u64,
+    ) -> SearchResult<Option<Self>> {
+        checkpoint(cx, "native_ann.update_graph")?;
+        let candidate = params.validate().and_then(|()| match &self.graph {
+            NativeBackend::Ann(graph) if graph.matches_build_policy(params, seed) => {
+                graph.try_reuse_for_owner(cx, Arc::clone(&owner))
+            }
+            NativeBackend::Ann(_) | NativeBackend::Exact(_) => Ok(None),
+        });
+        checkpoint(cx, "native_ann.update_graph_complete")?;
+        Ok(candidate?.map(|graph| Self {
+            owner,
+            graph: NativeBackend::Ann(Box::new(graph)),
+            default_ef_search: params.ef_search,
+        }))
+    }
+
     /// Reopen a graph only when its receipt matches this exact admitted owner.
     ///
     /// A missing, corrupt or stale receipt is an error, never an implicit

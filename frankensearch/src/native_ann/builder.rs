@@ -447,7 +447,16 @@ impl NativeIndexBuilder {
         if let Some(writer) = quality_writer {
             writer.finish()?;
         }
-        let fast = finish_tier(cx, self.fast, fast_binding, fast_path, &self.documents)?;
+        let fast = finish_tier(
+            cx,
+            self.fast,
+            fast_binding,
+            fast_path,
+            &self.documents,
+            self.reuse
+                .as_deref()
+                .map(|source| (source, ReuseRole::Fast)),
+        )?;
         let quality = match (self.quality, quality_binding) {
             (Some(tier), Some(binding)) => Some(finish_tier(
                 cx,
@@ -455,6 +464,9 @@ impl NativeIndexBuilder {
                 binding,
                 quality_path,
                 &self.documents,
+                self.reuse
+                    .as_deref()
+                    .map(|source| (source, ReuseRole::Quality)),
             )?),
             (None, None) => None,
             _ => {
@@ -594,6 +606,7 @@ fn finish_tier(
     binding: FsviV2IdentityBinding,
     vector_path: PathBuf,
     documents: &[IndexableDocument],
+    reuse: Option<(&ReuseSource, ReuseRole)>,
 ) -> SearchResult<NativeBuiltTier> {
     checkpoint(cx, "native_ann.builder.admit_vectors")?;
     let bytes: Arc<[u8]> = std::fs::read(&vector_path)?.into();
@@ -605,7 +618,16 @@ fn finish_tier(
     let (index, graph_path, graph_receipt) = match plan.retrieval {
         NativeBuildRetrieval::Exact => (NativeAnnIndex::exact(cx, owner)?, None, None),
         NativeBuildRetrieval::Hnsw { params, seed } => {
-            let index = NativeAnnIndex::build(cx, owner, params, seed)?;
+            let reused = reuse
+                .map(|(source, role)| {
+                    source.try_reuse_graph(cx, role, Arc::clone(&owner), documents, params, seed)
+                })
+                .transpose()?
+                .flatten();
+            let index = match reused {
+                Some(index) => index,
+                None => NativeAnnIndex::build(cx, owner, params, seed)?,
+            };
             let graph_path = vector_path.with_extension("fshnsw");
             let receipt = index.save(cx, &graph_path)?;
             (index, Some(graph_path), Some(receipt))
