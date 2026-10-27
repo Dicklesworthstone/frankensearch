@@ -19,7 +19,9 @@ use frankensearch::native_ann::builder::{
     NativeBuildPrecision, NativeBuildRetrieval, NativeBuiltExactGeneration, NativeIndexBuilder,
 };
 use frankensearch::native_ann::{NativeGenerationSnapshot, NativeRetrievalMode};
-use frankensearch::{Cx, Embedder, GenerationActivationV1, GenerationPublisherV1, SearchError};
+use frankensearch::{
+    Cx, Embedder, GenerationActivationV1, GenerationPublisherV1, IndexableDocument, SearchError,
+};
 use frankensearch_core::generation::{
     ArtifactGenerationIdentityV1, AuthorityRefV1, AuthoritySlotV1, CommitRange, EmbedderTierTag,
     FrozenEmbeddingIdentityBundleV1, GenerationAuthorityActionV1, GenerationRootSecurityProfileV1,
@@ -43,8 +45,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    MAX_DOCUMENTS, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Result, SCHEMA, bad, emit, encode, models,
-    new_generation, new_path, positive as number, read_documents, validate_query, value,
+    MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Result, SCHEMA, bad, emit,
+    encode, models, new_generation, new_path, positive as number, read_documents, validate_query,
+    value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
@@ -58,7 +61,8 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
       [--quality-backend onnx|native-int8|native-f32|native-multilingual]\n\
       [--quality-model-dir DIR] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
   authority-rebuild --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
-      --source-low N --source-high N [--input JSONL] [--batch-size N]\n\
+      (--source-low N --source-high N [--input JSONL] | --retained-source)\n\
+      [--max-source-bytes N] [--batch-size N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
@@ -79,6 +83,11 @@ Roots, work directories and receipts must be new, separate locations.\n\
 Rebuild retains the selected root, tier and security profile, replaces the whole\n\
 source cohort, and requires a new work directory and receipt outside the root.\n\
 Source boundaries cannot regress. A different producer requires --migrate-model.\n\
+With --retained-source, rebuild reads complete stored documents from the admitted\n\
+generation and preserves its source checkpoint, without reading JSONL or stdin.\n\
+This excludes --input and --source-low/high. --max-source-bytes applies only to\n\
+this mode and defaults to 256 MiB of raw stored id/content/title/metadata bytes.\n\
+The existing 100000-document and 16 MiB encoded-record limits still apply.\n\
 Rebuild inherits the admitted retrieval policy, including HNSW parameters and\n\
 seed, unless --retrieval explicitly selects exact or the default HNSW policy.\n\
 Concurrent publication refuses the captured old selection; retry explicitly\n\
@@ -135,8 +144,10 @@ struct Options {
     limit: usize,
     batch_size: usize,
     max_image_bytes: usize,
+    max_source_bytes: usize,
     cooperative_local: bool,
     migrate_model: bool,
+    retained_source: bool,
     allow_activation: bool,
 }
 
@@ -179,8 +190,10 @@ impl Options {
             limit: 10,
             batch_size: 64,
             max_image_bytes: DEFAULT_IMAGE_BYTES,
+            max_source_bytes: MAX_INPUT_BYTES,
             cooperative_local: false,
             migrate_model: false,
+            retained_source: false,
             allow_activation: false,
         };
         let mut seen = BTreeSet::new();
@@ -197,6 +210,12 @@ impl Options {
                     options.from_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
+                "--retained-source" if command == Command::Rebuild => {
+                    options.retained_source = true
+                }
+                "--max-source-bytes" if command == Command::Rebuild => {
+                    options.max_source_bytes = number(&value(&mut args)?, usize::MAX)?;
+                }
                 "--allow-activation" if command == Command::Serve => {
                     options.allow_activation = true
                 }
@@ -288,7 +307,21 @@ impl Options {
                         "authority-rebuild requires --from-receipt and --work-dir",
                     ));
                 }
-                options.source_cut()?;
+                if options.retained_source {
+                    if options.input.is_some()
+                        || options.source_low.is_some()
+                        || options.source_high.is_some()
+                    {
+                        return Err(bad(
+                            "--retained-source excludes --input, --source-low, and --source-high",
+                        ));
+                    }
+                } else {
+                    if seen.contains("--max-source-bytes") {
+                        return Err(bad("--max-source-bytes requires --retained-source"));
+                    }
+                    options.source_cut()?;
+                }
             }
             Command::Serve | Command::Recover => {}
         }
@@ -297,6 +330,14 @@ impl Options {
 
     fn build_retrieval(&self, previous: Option<NativeBuildRetrieval>) -> NativeBuildRetrieval {
         self.retrieval.or(previous).unwrap_or_default()
+    }
+
+    fn rebuild_source_cut(&self, previous: &CommitRange) -> Result<CommitRange> {
+        if self.retained_source {
+            Ok(previous.clone())
+        } else {
+            self.source_cut()
+        }
     }
 
     fn source_cut(&self) -> Result<CommitRange> {
@@ -906,6 +947,37 @@ fn validate_successor_source(previous: &CommitRange, source: &CommitRange) -> Re
     Ok(())
 }
 
+fn retained_rebuild_documents(
+    cx: &Cx,
+    snapshot: &NativeGenerationSnapshot,
+    max_source_bytes: usize,
+) -> Result<Vec<IndexableDocument>> {
+    checkpoint(cx)?;
+    if snapshot.metadata().total_documents > u64::try_from(MAX_DOCUMENTS)? {
+        return Err(bad("retained source exceeds the 100000-document limit"));
+    }
+    let documents = snapshot.source_documents(cx, max_source_bytes)?;
+    let mut ids = BTreeSet::new();
+    for document in &documents {
+        checkpoint(cx)?;
+        if document.id.trim().is_empty()
+            || document.id.contains('\0')
+            || document.id.len() > usize::from(u16::MAX)
+            || !ids.insert(document.id.clone())
+        {
+            return Err(bad(
+                "retained source IDs must be unique, nonblank, NUL-free, and at most 65535 bytes",
+            ));
+        }
+        // Apply the CLI's JSONL record bound to the complete decoded document,
+        // including escaping and a newline, before model loading or inference.
+        encode(document, MAX_RECORD_BYTES)
+            .map_err(|_| bad("retained source exceeds the 16 MiB encoded-record limit"))?;
+    }
+    checkpoint(cx)?;
+    Ok(documents)
+}
+
 fn rebuild_identity(
     selected: &Receipt,
     model: &dyn Embedder,
@@ -962,16 +1034,20 @@ async fn rebuild(
     // never substituted into this captured expected pair.
     let snapshot = selected.open_on_root(cx, &root, options.max_image_bytes)?;
     snapshot.authority().next_sequence()?;
-    let source = options.source_cut()?;
+    let source = options.rebuild_source_cut(&snapshot.metadata().commit_range)?;
     validate_successor_source(&snapshot.metadata().commit_range, &source)?;
     let sequence = selected
         .generation
         .sequence
         .checked_add(1)
         .ok_or_else(|| bad("the artifact generation sequence is exhausted"))?;
-    let documents = match &options.input {
-        Some(path) => read_documents(&mut BufReader::new(File::open(path)?))?,
-        None => read_documents(&mut io::stdin().lock())?,
+    let documents = if options.retained_source {
+        retained_rebuild_documents(cx, &snapshot, options.max_source_bytes)?
+    } else {
+        match &options.input {
+            Some(path) => read_documents(&mut BufReader::new(File::open(path)?))?,
+            None => read_documents(&mut io::stdin().lock())?,
+        }
     };
     if documents.is_empty() {
         return Err(bad(
@@ -1014,6 +1090,7 @@ async fn rebuild(
             "schema": SCHEMA, "ok": true, "event": "rebuilt", "publication": "committed",
             "serving": "activated", "retrieval": retrieval_name(built.retrieval_mode()),
             "receipt": receipt_path,
+            "source": if options.retained_source { "retained_generation" } else { "input" },
             "replaces": selected.authority, "model_migrated": receipt.identity != selected.identity,
             "selection": receipt,
         }),

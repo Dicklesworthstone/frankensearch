@@ -4,6 +4,7 @@
 //! rediscovered through a pathname, and a later authority activation cannot
 //! change the bytes used by an already-admitted reader.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use frankensearch_core::generation::{
@@ -23,12 +24,14 @@ use frankensearch_index::native_hnsw::{
     HnswParams, NativeHnswGenerationReceiptV2, ValidatedNativeHnsw,
 };
 use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes};
-use frankensearch_quill::{KeeperSnapshot, QuillConfig, QuillSnapshotIndex, SchemaDescriptor};
+use frankensearch_quill::{
+    DEFAULT_SCHEMA, KeeperSnapshot, QuillConfig, QuillSnapshotIndex, SchemaDescriptor,
+};
 use sha2::Digest as _;
 
 use super::builder::NativeBuildRetrieval;
 use super::{NativeAnnIndex, NativeBackend, NativeRetrievalMode, checkpoint, invalid, lower_hex};
-use crate::{Cx, Embedder, GenerationCandidateV1, ScoredResult, SearchResult};
+use crate::{Cx, Embedder, GenerationCandidateV1, IndexableDocument, ScoredResult, SearchResult};
 
 #[cfg(test)]
 mod tests;
@@ -166,6 +169,40 @@ impl NativeGenerationSnapshot {
         &self.readers.metadata
     }
 
+    /// Recover the complete stored source cohort from this retained generation.
+    ///
+    /// Documents follow physical live FSVI row order; tombstones are omitted.
+    /// Each identifier is resolved directly against the retained Quill image,
+    /// and its stored identifier, full content, title and metadata must exist.
+    /// This route supports the shipping [`DEFAULT_SCHEMA`] and canonical string
+    /// metadata. It never reopens an artifact or original source pathname and
+    /// does not load a model or perform inference.
+    ///
+    /// Quill stores both an absent title and an explicitly empty title as empty
+    /// bytes. Both export as `None`; nonempty titles and document content are
+    /// preserved exactly. The native builder embeds document content only.
+    ///
+    /// `max_source_bytes` bounds the sum of the raw stored UTF-8 byte lengths of
+    /// `id`, `content`, `title` and `metadata_json` across all exported documents,
+    /// including JSON punctuation and escaping. Each field is charged before
+    /// decoding. This is a payload budget, not a bound on process RSS or peak
+    /// allocation: Quill materializes a field before its size can be checked,
+    /// and decoded documents require additional storage. Run large exports on
+    /// the caller's bounded blocking lane, as with admission.
+    ///
+    /// # Errors
+    ///
+    /// Refuses cancellation, budget exhaustion, unsupported schemas, missing or
+    /// invalid stored fields, noncanonical metadata, and any disagreement with
+    /// the admitted live cohort. Failure returns no partial source collection.
+    pub fn source_documents(
+        &self,
+        cx: &Cx,
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<IndexableDocument>> {
+        self.readers.source_documents(cx, max_source_bytes)
+    }
+
     /// Propose this retained generation as a rollback of `current`.
     ///
     /// Both handles must have been independently admitted from the same logical
@@ -291,6 +328,110 @@ fn same_anchor_security_identity(
 }
 
 impl CompositeReaders {
+    fn source_documents(
+        &self,
+        cx: &Cx,
+        max_source_bytes: usize,
+    ) -> SearchResult<Vec<IndexableDocument>> {
+        checkpoint(cx, "native_ann.generation.source")?;
+        let snapshot = self
+            .lexical
+            .snapshot()
+            .map_err(|_| refused("source", "lexical-snapshot"))?;
+        if snapshot.schema() != DEFAULT_SCHEMA {
+            return Err(refused("source", "unsupported-schema"));
+        }
+        let live_count = self.vector.owner_witness().live_count;
+        if snapshot.doc_count() != live_count || self.metadata.total_documents != live_count {
+            return Err(refused("source", "live-count-mismatch"));
+        }
+        let live_count =
+            usize::try_from(live_count).map_err(|_| refused("source", "live-count-overflow"))?;
+        // Every admitted FSVI identifier is nonempty. Reject an impossible
+        // budget before reserving the output collection.
+        if live_count > max_source_bytes {
+            return Err(refused("source", "stored-payload-limit"));
+        }
+        let mut documents = Vec::new();
+        documents
+            .try_reserve_exact(live_count)
+            .map_err(|_| refused("source", "allocation-failed"))?;
+        let mut field_ids = [0; 4];
+        for (field_id, name) in
+            field_ids
+                .iter_mut()
+                .zip(["id", "content", "title", "metadata_json"])
+        {
+            *field_id = DEFAULT_SCHEMA
+                .fields
+                .iter()
+                .find(|field| field.name == name && field.stored)
+                .ok_or_else(|| refused("source", "unsupported-schema"))?
+                .id;
+        }
+        let mut source_bytes = 0usize;
+        for physical_row in 0..self.vector.owner.record_count() {
+            checkpoint(cx, "native_ann.generation.source_row")?;
+            let row = self
+                .vector
+                .owner
+                .row(physical_row)
+                .map_err(|_| refused("source", "invalid-vector-row"))?;
+            if !row.flags().is_live() {
+                continue;
+            }
+            let resolved = snapshot
+                .resolve_document_id(row.doc_id())
+                .map_err(|_| refused("source", "invalid-lexical-identity"))?
+                .ok_or_else(|| refused("source", "missing-live-document"))?;
+            let mut values: [Vec<u8>; 4] = std::array::from_fn(|_| Vec::new());
+            for (value, field_id) in values.iter_mut().zip(field_ids) {
+                checkpoint(cx, "native_ann.generation.source_field")?;
+                let bytes = self
+                    .lexical
+                    .stored_field_value(field_id, resolved.global_docid)
+                    .map_err(|_| refused("source", "invalid-stored-field"))?
+                    .ok_or_else(|| refused("source", "missing-stored-field"))?;
+                source_bytes = source_bytes
+                    .checked_add(bytes.len())
+                    .filter(|total| *total <= max_source_bytes)
+                    .ok_or_else(|| refused("source", "stored-payload-limit"))?;
+                *value = bytes;
+            }
+            checkpoint(cx, "native_ann.generation.source_decode")?;
+            let [id, content, title, metadata_json] = values;
+            let id = String::from_utf8(id).map_err(|_| refused("source", "invalid-stored-utf8"))?;
+            if id != row.doc_id() {
+                return Err(refused("source", "stored-id-mismatch"));
+            }
+            let content =
+                String::from_utf8(content).map_err(|_| refused("source", "invalid-stored-utf8"))?;
+            let title =
+                String::from_utf8(title).map_err(|_| refused("source", "invalid-stored-utf8"))?;
+            let metadata: BTreeMap<String, String> = serde_json::from_slice(&metadata_json)
+                .map_err(|_| refused("source", "invalid-metadata"))?;
+            // The shipping writer emits sorted canonical string maps. Comparing
+            // their encoding also refuses duplicate JSON keys instead of
+            // silently discarding source values during deserialization.
+            if serde_json::to_vec(&metadata).map_err(|_| refused("source", "invalid-metadata"))?
+                != metadata_json
+            {
+                return Err(refused("source", "noncanonical-metadata"));
+            }
+            documents.push(IndexableDocument {
+                id,
+                content,
+                title: (!title.is_empty()).then_some(title),
+                metadata: metadata.into_iter().collect(),
+            });
+        }
+        if documents.len() != live_count {
+            return Err(refused("source", "live-count-mismatch"));
+        }
+        checkpoint(cx, "native_ann.generation.source_complete")?;
+        Ok(documents)
+    }
+
     async fn search_text(
         &self,
         cx: &Cx,

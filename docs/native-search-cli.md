@@ -120,7 +120,7 @@ responses report `retrieval: "exact"` or `retrieval: "hnsw"` for the actual read
 `authority-rebuild` replaces the complete source cohort in the existing root.
 It reads the selected generation from `--from-receipt`, retains that admitted
 reader, and captures its exact authority pair before reading input or loading a
-model. Supply the complete replacement JSONL corpus: omitted documents disappear
+model. By default, supply the complete replacement JSONL corpus: omitted documents disappear
 from the new generation, while readers already holding the old generation keep
 its original documents and metadata.
 
@@ -159,6 +159,48 @@ re-embeds the whole cohort and records the new producer; it does not relabel or
 reuse the old vectors. The tier stays fixed, including direct quality-only
 inference. Provider identity must remain stable throughout the build.
 
+To rebuild the selected generation's existing documents, supply
+`--retained-source`. This reads the complete stored cohort from its already
+admitted vector and Quill images, preserves the exact source checkpoint, and
+re-embeds every live document. Original JSONL files and build work directories
+are unnecessary. For example, this rebuild retains the documents while changing
+retrieval to HNSW:
+
+```sh
+./target/release/frankensearch-native authority-rebuild \
+  --from-receipt "$HOME/frankensearch-authority/g1.json" \
+  --work-dir "$HOME/frankensearch-authority/g2-work" \
+  --receipt "$HOME/frankensearch-authority/g2.json" \
+  --retained-source --retrieval hnsw \
+  --model-dir /absolute/path/to/installed/models
+```
+
+Combine `--retained-source` with `--migrate-model` and the new model's local
+options for a full-cohort model migration without resupplying the corpus.
+`--input`, `--source-low`, and `--source-high` are excluded in retained-source
+mode; it neither reads standard input nor assigns a new source checkpoint.
+An ordinary rebuild with replacement JSONL still requires explicit source
+boundaries.
+
+Retained export requires the shipping Quill schema, matching live vector,
+lexical, and metadata counts, and each document's exact stored identifier, full
+content, title, and canonical string-map metadata. Tombstones are omitted. Empty
+stored titles export as absent titles because Quill stores both forms as empty
+bytes; nonempty titles and content are preserved exactly. Embeddings consume
+document content. Missing or malformed fields refuse the whole rebuild before
+model loading, inference, or creation of the new work directory.
+
+`--max-source-bytes N` is available only with `--retained-source` and defaults to
+256 MiB. It bounds the sum of raw stored `id`, `content`, `title`, and
+`metadata_json` bytes, including JSON punctuation and escaping in the metadata
+field, checked before decoding each field. The budget does not bound process
+RSS: retained images, field materialization, and decoded documents also use
+memory. The separate encoded-image budget still applies during admission, and
+the CLI still requires at most 100,000 documents and a 16 MiB JSON-encoded record
+including its newline for each exported document. Library callers can obtain
+the same complete cohort through
+`NativeGenerationSnapshot::source_documents(&cx, max_source_bytes)`.
+
 Staging creates absent objects relative to the retained root descriptor. An
 existing content-addressed image is reused only after qualified admission
 verifies its security metadata, length, hash, and exact bytes. A partial,
@@ -173,8 +215,9 @@ without changing that winner's authority or owner evidence. It does not refresh
 its expectation and overwrite the winner. Rebuild explicitly from the winning
 receipt to try a new replacement. Successful output has `event: "rebuilt"`,
 `publication: "committed"`, `serving: "activated"`, the replaced authority, and
-whether the model identity changed. A later output failure still reports the
-known commit.
+whether the model identity changed. The `source` field is `"retained_generation"`
+for retained-source rebuilding and `"input"` for replacement JSONL. A later
+output failure still reports the known commit.
 
 ### Keep an authority generation warm across requests
 

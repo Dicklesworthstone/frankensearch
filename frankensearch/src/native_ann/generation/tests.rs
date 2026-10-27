@@ -12,7 +12,7 @@ use frankensearch_core::generation::{
 };
 use frankensearch_core::traits::{ModelCategory, SearchFuture};
 use frankensearch_index::VectorIndex;
-use frankensearch_quill::{DEFAULT_SCHEMA, QuillIndex};
+use frankensearch_quill::{CASS_SEMANTIC_SCHEMA, DEFAULT_SCHEMA, QuillIndex, SchemaDocument};
 
 const BUDGET: usize = 16 * 1024 * 1024;
 
@@ -298,6 +298,212 @@ async fn fixture(cx: &Cx, provider: &Provider, tier: EmbedderTierTag) -> Fixture
     }
 }
 
+fn source_ids(fixture: &Fixture) -> Vec<String> {
+    let owner =
+        ValidatedFsviBytes::from_arc(Arc::clone(&fixture.images[0]), &fixture.binding).unwrap();
+    (0..owner.record_count())
+        .filter_map(|index| {
+            let row = owner.row(index).unwrap();
+            row.flags().is_live().then(|| row.doc_id().to_owned())
+        })
+        .collect()
+}
+
+fn replace_source_image(cx: &Cx, fixture: &mut Fixture, writer: &QuillIndex) {
+    let image = writer
+        .snapshot()
+        .unwrap()
+        .export_exact_image(cx, source_cut(), BUDGET)
+        .unwrap();
+    fixture.images[1] = image.bytes();
+    fixture.metadata.lexical_artifacts[0].size_bytes = image.receipt().bytes.byte_len;
+    fixture.metadata.lexical_artifacts[0].checksum = lower_hex(&image.receipt().bytes.sha256);
+    fixture.reseal_metadata();
+}
+
+fn retained_lexical(cx: &Cx, snapshot: &KeeperSnapshot) -> QuillSnapshotIndex {
+    let image = snapshot
+        .export_exact_image(cx, source_cut(), BUDGET)
+        .unwrap();
+    let retained = KeeperSnapshot::from_exact_image(
+        cx,
+        image.bytes(),
+        snapshot.schema(),
+        source_cut(),
+        image.receipt(),
+        BUDGET,
+    )
+    .unwrap();
+    QuillSnapshotIndex::new(cx, retained, config()).unwrap()
+}
+
+fn assert_source_refused(result: SearchResult<Vec<IndexableDocument>>, expected_code: &str) {
+    let Err(SearchError::InvalidConfig { field, value, .. }) = result else {
+        panic!("expected bounded retained source refusal {expected_code}");
+    };
+    assert_eq!(field, "native_ann.generation.source");
+    assert_eq!(value, expected_code);
+}
+
+#[test]
+fn retained_source_preserves_full_payload_live_order_and_exact_byte_budget() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        for tier in [EmbedderTierTag::Fast, EmbedderTierTag::Quality] {
+            let provider = Provider::new();
+            let mut fixture = fixture(&cx, &provider, tier).await;
+            let ids = source_ids(&fixture);
+            let expected = vec![
+                IndexableDocument::new(&ids[0], "common 全文\nsecond line\t\"quoted\"")
+                    .with_title("完整 title\n")
+                    .with_metadata("z-last", "escaped \"value\"\n")
+                    .with_metadata("a-first", "日本語"),
+                IndexableDocument::new(&ids[1], "")
+                    .with_title("")
+                    .with_metadata("empty", ""),
+            ];
+            let writer = QuillIndex::in_memory(config()).unwrap();
+            writer.index_documents(&cx, &expected).await.unwrap();
+            writer.commit(&cx).await.unwrap();
+            replace_source_image(&cx, &mut fixture, &writer);
+            let exact = fixture.admit(&cx).unwrap();
+            let fixture = fixture.with_ann(&cx, HnswParams::default(), 21);
+            let ann = fixture.admit(&cx).unwrap();
+            let payload_bytes: usize = expected
+                .iter()
+                .map(|document| {
+                    let metadata: BTreeMap<_, _> = document.metadata.iter().collect();
+                    document.id.len()
+                        + document.content.len()
+                        + document.title.as_deref().unwrap_or("").len()
+                        + serde_json::to_vec(&metadata).unwrap().len()
+                })
+                .sum();
+            drop(writer);
+            std::fs::rename(
+                fixture.directory.path().join("source"),
+                fixture.directory.path().join("relocated"),
+            )
+            .unwrap();
+            drop(fixture);
+            for readers in [exact, ann] {
+                assert_source_refused(readers.source_documents(&cx, 0), "stored-payload-limit");
+                assert_source_refused(
+                    readers.source_documents(&cx, payload_bytes - 1),
+                    "stored-payload-limit",
+                );
+                let actual = readers.source_documents(&cx, payload_bytes).unwrap();
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(&expected) {
+                    assert_eq!(actual.id, expected.id);
+                    assert_eq!(actual.content, expected.content);
+                    assert_eq!(actual.metadata, expected.metadata);
+                    assert_eq!(
+                        actual.title.as_deref(),
+                        expected.title.as_deref().filter(|title| !title.is_empty())
+                    );
+                }
+            }
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        }
+    });
+}
+
+#[test]
+fn retained_source_refuses_missing_fields_wrong_ids_and_lossy_metadata() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let provider = Provider::new();
+        let mut fixture = fixture(&cx, &provider, EmbedderTierTag::Fast).await;
+        let ids = source_ids(&fixture);
+        for (fault, code) in [
+            ("missing-content", "missing-stored-field"),
+            ("missing-title", "missing-stored-field"),
+            ("missing-metadata", "missing-stored-field"),
+            ("wrong-id", "stored-id-mismatch"),
+            ("invalid-content", "invalid-stored-utf8"),
+            ("non-string-metadata", "invalid-metadata"),
+            ("invalid-metadata-utf8", "invalid-metadata"),
+            ("duplicate-metadata-keys", "noncanonical-metadata"),
+        ] {
+            let mut documents: Vec<_> = ids
+                .iter()
+                .map(|id| SchemaDocument {
+                    id: id.clone(),
+                    indexed: vec![
+                        (0, id.clone()),
+                        (1, "complete source".to_owned()),
+                        (2, "source title".to_owned()),
+                    ],
+                    stored: vec![(3, b"{}".to_vec())],
+                    ..SchemaDocument::default()
+                })
+                .collect();
+            let changed = &mut documents[0];
+            match fault {
+                "missing-content" => changed.indexed.retain(|(field, _)| *field != 1),
+                "missing-title" => changed.indexed.retain(|(field, _)| *field != 2),
+                "missing-metadata" => changed.stored.clear(),
+                "wrong-id" => changed.indexed[0].1 = "not-the-idmap-identity".to_owned(),
+                "invalid-content" => {
+                    changed.indexed.retain(|(field, _)| *field != 1);
+                    changed.stored.push((1, vec![0xff]));
+                }
+                "non-string-metadata" => changed.stored[0].1 = br#"{"count":42}"#.to_vec(),
+                "invalid-metadata-utf8" => changed.stored[0].1 = vec![0xff],
+                "duplicate-metadata-keys" => {
+                    changed.stored[0].1 = br#"{"key":"first","key":"second"}"#.to_vec();
+                }
+                _ => unreachable!(),
+            }
+            let writer = QuillIndex::in_memory(config()).unwrap();
+            writer
+                .index_schema_documents(&cx, &documents)
+                .await
+                .unwrap();
+            writer.commit(&cx).await.unwrap();
+            replace_source_image(&cx, &mut fixture, &writer);
+            let readers = fixture.admit(&cx).unwrap();
+            assert_source_refused(readers.source_documents(&cx, BUDGET), code);
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+fn retained_source_checks_schema_and_complete_cohort_without_text_queries() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let provider = Provider::new();
+        let fixture = fixture(&cx, &provider, EmbedderTierTag::Fast).await;
+        let ids = source_ids(&fixture);
+        // Keep the admitted vector/metadata fixed while exercising the export
+        // census independently of the earlier component admission gate.
+        let mut readers = fixture.admit(&cx).unwrap();
+        readers.lexical = retained_lexical(
+            &cx,
+            &KeeperSnapshot::in_memory(CASS_SEMANTIC_SCHEMA).unwrap(),
+        );
+        assert_source_refused(readers.source_documents(&cx, BUDGET), "unsupported-schema");
+        for foreign in [false, true] {
+            let writer = QuillIndex::in_memory(config()).unwrap();
+            let mut documents = vec![IndexableDocument::new(&ids[0], "")];
+            if foreign {
+                documents.push(IndexableDocument::new("foreign", "!!!"));
+            }
+            writer.index_documents(&cx, &documents).await.unwrap();
+            writer.commit(&cx).await.unwrap();
+            readers.lexical = retained_lexical(&cx, &writer.snapshot().unwrap());
+            assert_source_refused(
+                readers.source_documents(&cx, BUDGET),
+                if foreign {
+                    "missing-live-document"
+                } else {
+                    "live-count-mismatch"
+                },
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    });
+}
+
 #[test]
 fn actual_components_search_and_hydrate_fast_and_quality_with_tombstones() {
     asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -574,6 +780,13 @@ fn admitted_components_survive_source_successor_and_relocation() {
         let readmitted = fixture.admit(&cx).unwrap();
         drop(fixture);
         for readers in [retained, readmitted] {
+            let documents = readers.source_documents(&cx, BUDGET).unwrap();
+            assert_eq!(documents.len(), 2);
+            assert!(documents.iter().all(|document| document.id != "dead"
+                && document.id != "successor"
+                && document.content == "common retained document"
+                && document.title.is_none()
+                && document.metadata["version"] == "old"));
             let hits = readers
                 .search_text(&cx, &provider, "common", 10)
                 .await
@@ -731,6 +944,14 @@ fn zero_k_admits_producer_without_inference_and_cancellation_is_terminal() {
         ));
         assert!(matches!(
             readers.search_text(&cx, &provider, "common", 2).await,
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            readers.source_documents(&cx, BUDGET),
+            Err(SearchError::Cancelled { .. })
+        ));
+        assert!(matches!(
+            readers.source_documents(&cx, 0),
             Err(SearchError::Cancelled { .. })
         ));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
@@ -894,6 +1115,7 @@ mod qualified_rollback {
                 .with_fast_storage(NativeBuildPrecision::F32, original_retrieval)
                 .add_documents(
                     [IndexableDocument::new("original", "common retained source")
+                        .with_title("Retained original title")
                         .with_metadata("version", "original")],
                 )
                 .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 4 }, BUDGET)
@@ -1127,6 +1349,15 @@ mod qualified_rollback {
                 );
                 assert_eq!(fs::read(root_path.join("LOCK")).unwrap(), after_lock);
                 for snapshot in [&retained, &restored] {
+                    let documents = snapshot.source_documents(&cx, BUDGET).unwrap();
+                    assert_eq!(documents.len(), 1);
+                    assert_eq!(documents[0].id, "original");
+                    assert_eq!(documents[0].content, "common retained source");
+                    assert_eq!(
+                        documents[0].title.as_deref(),
+                        Some("Retained original title")
+                    );
+                    assert_eq!(documents[0].metadata["version"], "original");
                     let hits = snapshot
                         .search_text(&cx, original_provider.as_ref(), "common", 5)
                         .await
@@ -1145,9 +1376,17 @@ mod qualified_rollback {
                     .await
                     .unwrap();
                 assert_eq!(hits[0].doc_id, "successor");
+                assert_eq!(
+                    current.source_documents(&cx, BUDGET).unwrap()[0].id,
+                    "successor"
+                );
                 cx.set_cancel_requested(true);
                 assert!(matches!(
                     retained.rollback_candidate(&cx, &restored, [0x9b; 16], [0x9c; 32]),
+                    Err(SearchError::Cancelled { .. })
+                ));
+                assert!(matches!(
+                    retained.source_documents(&cx, BUDGET),
                     Err(SearchError::Cancelled { .. })
                 ));
                 cx.set_cancel_requested(false);

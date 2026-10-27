@@ -83,6 +83,93 @@ fn rebuild_arguments() -> Vec<&'static str> {
     ]
 }
 
+fn retained_rebuild_arguments() -> Vec<&'static str> {
+    vec![
+        "authority-rebuild",
+        "--from-receipt",
+        "selected.json",
+        "--work-dir",
+        "new-work",
+        "--receipt",
+        "new.json",
+        "--retained-source",
+    ]
+}
+
+#[test]
+fn retained_rebuild_options_preserve_the_selected_cut_and_bound_source_export() {
+    let arguments = retained_rebuild_arguments();
+    let options = parse(&arguments).unwrap().unwrap();
+    assert_eq!(options.command, Command::Rebuild);
+    assert!(options.retained_source);
+    assert!(options.input.is_none());
+    assert_eq!(options.max_source_bytes, crate::MAX_INPUT_BYTES);
+    let previous = CommitRange { low: 9, high: 37 };
+    assert_eq!(options.rebuild_source_cut(&previous).unwrap(), previous);
+    let supplied = parse(&rebuild_arguments()).unwrap().unwrap();
+    assert!(!supplied.retained_source);
+    assert_eq!(
+        supplied.rebuild_source_cut(&previous).unwrap(),
+        CommitRange { low: 1, high: 9 }
+    );
+
+    let mut bounded = arguments.clone();
+    bounded.extend([
+        "--max-source-bytes",
+        "4096",
+        "--migrate-model",
+        "--retrieval",
+        "hnsw",
+    ]);
+    let options = parse(&bounded).unwrap().unwrap();
+    assert_eq!(options.max_source_bytes, 4096);
+    assert!(options.migrate_model);
+    assert!(matches!(
+        options.build_retrieval(None),
+        NativeBuildRetrieval::Hnsw { .. }
+    ));
+    // The budget may precede the source-selection flag; admission depends on
+    // the complete option set, not argument order.
+    let mut reordered = arguments.clone();
+    reordered.pop();
+    reordered.extend(["--max-source-bytes", "4096", "--retained-source"]);
+    assert_eq!(parse(&reordered).unwrap().unwrap().max_source_bytes, 4096);
+
+    for extra in [
+        vec!["--input", "source.jsonl"],
+        vec!["--source-low", "1"],
+        vec!["--source-high", "9"],
+        vec!["--max-source-bytes", "0"],
+        vec!["--max-source-bytes", "-1"],
+        vec!["--retained-source"],
+    ] {
+        let mut rejected = arguments.clone();
+        rejected.extend(extra);
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
+    let mut unselected_budget = rebuild_arguments();
+    unselected_budget.extend(["--max-source-bytes", "4096"]);
+    assert!(parse(&unselected_budget).is_err());
+    let mut mixed_sources = rebuild_arguments();
+    mixed_sources.push("--retained-source");
+    assert!(parse(&mixed_sources).is_err());
+    for command in [
+        "authority-index",
+        "authority-search",
+        "authority-serve",
+        "authority-recover",
+    ] {
+        for extra in [
+            vec!["--retained-source"],
+            vec!["--max-source-bytes", "4096"],
+        ] {
+            let mut rejected = vec![command, "--receipt", "selected.json"];
+            rejected.extend(extra);
+            assert!(parse(&rejected).is_err(), "{rejected:?}");
+        }
+    }
+}
+
 #[test]
 fn authority_serve_options_select_one_warm_receipt_and_explicit_activation_grant() {
     let arguments = ["authority-serve", "--receipt", "selected.json"];
@@ -1478,6 +1565,266 @@ mod warm_authority {
             identity: identity().identity,
             calls: AtomicUsize::new(0),
         })
+    }
+
+    #[test]
+    fn retained_source_rebuild_preserves_the_cohort_migrates_the_producer_and_fences_stale_work() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier) in [
+                ("retained-fast", EmbedderTierTag::Fast),
+                ("retained-quality", EmbedderTierTag::Quality),
+            ] {
+                let parent = private_parent(label);
+                let root_path = parent.join("root");
+                let root = create_root(&root_path).expect("qualified Linux root is required");
+                let provider = provider();
+                let model: Arc<dyn Embedder> = provider.clone();
+                let mut retry =
+                    IndexableDocument::new("zeta", "retry network requests\nexact source")
+                        .with_metadata("version", "original")
+                        .with_metadata("quoted", "line one\n\"line two\" – λ");
+                retry.title = Some("Retries: λ and \"quoted\" text".to_owned());
+                let garden = IndexableDocument::new("alpha", "garden flowers")
+                    .with_metadata("kind", "guide");
+                let original_work = parent.join("original-work");
+                let first =
+                    NativeIndexBuilder::new(&original_work, new_generation(1).unwrap(), model)
+                        .unwrap()
+                        .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                        .add_documents([retry, garden])
+                        .build_exact_generation(
+                            &cx,
+                            tier,
+                            CommitRange { low: 2, high: 7 },
+                            DEFAULT_IMAGE_BYTES,
+                        )
+                        .await
+                        .unwrap();
+                let first_path = parent.join("first.json");
+                let selected = stage_and_publish(
+                    &cx,
+                    &root,
+                    &root_path,
+                    &first_path,
+                    &first,
+                    None,
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .unwrap();
+                drop(first);
+                let retained = selected
+                    .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                    .unwrap();
+                // Neither the original build directory nor a source JSONL
+                // pathname is available to this retained-source selection.
+                fs::rename(&original_work, parent.join("archived-original-work")).unwrap();
+                assert!(!original_work.exists());
+                let before = provider.calls.load(Ordering::Relaxed);
+                let authority_before = fs::read(root_path.join("AUTHORITY")).unwrap();
+                let source =
+                    retained_rebuild_documents(&cx, &retained, crate::MAX_INPUT_BYTES).unwrap();
+                assert_eq!(source.len(), 2);
+                assert_eq!(
+                    source
+                        .iter()
+                        .map(|doc| doc.id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["alpha", "zeta"])
+                );
+                let garden = source.iter().find(|doc| doc.id == "alpha").unwrap();
+                assert_eq!(garden.content, "garden flowers");
+                assert!(garden.title.is_none());
+                assert_eq!(garden.metadata.get("kind").unwrap(), "guide");
+                let retry = source.iter().find(|doc| doc.id == "zeta").unwrap();
+                assert_eq!(retry.content, "retry network requests\nexact source");
+                assert_eq!(
+                    retry.title.as_deref(),
+                    Some("Retries: λ and \"quoted\" text")
+                );
+                assert_eq!(retry.metadata.get("version").unwrap(), "original");
+                assert_eq!(
+                    retry.metadata.get("quoted").unwrap(),
+                    "line one\n\"line two\" – λ"
+                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+                let error = retained_rebuild_documents(&cx, &retained, 1).unwrap_err();
+                assert!(error.to_string().contains("stored-payload-limit"));
+
+                // Exercise the real CLI rebuild entry point. Its undersized
+                // retained payload budget must win over the missing model
+                // directory and must not create a build or publication.
+                let mut refused = parse(&retained_rebuild_arguments()).unwrap().unwrap();
+                refused.from_receipt = Some(first_path.clone());
+                let refused_work = parent.join("budget-refused-work");
+                let refused_receipt = parent.join("budget-refused.json");
+                refused.work = Some(refused_work.clone());
+                refused.receipt = refused_receipt.clone();
+                refused.models = Some(parent.join("absent-models"));
+                refused.max_source_bytes = 1;
+                let mut output = Vec::new();
+                let error = rebuild(&cx, &refused, &mut output, None).await.unwrap_err();
+                assert!(error.to_string().contains("stored-payload-limit"));
+                assert!(output.is_empty());
+                assert!(!refused_work.exists());
+                assert!(!refused_receipt.exists());
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_before
+                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+
+                let migrated = Arc::new(Provider {
+                    identity: {
+                        let mut identity = identity().identity;
+                        identity.producer.implementation_revision =
+                            "retained-source-migration".to_owned();
+                        identity
+                    },
+                    calls: AtomicUsize::new(0),
+                });
+                assert!(rebuild_identity(&selected, migrated.as_ref(), false).is_err());
+                assert_eq!(migrated.calls.load(Ordering::Relaxed), 0);
+                let admitted = rebuild_identity(&selected, migrated.as_ref(), true).unwrap();
+                let options = parse(&retained_rebuild_arguments()).unwrap().unwrap();
+                let source_cut = options
+                    .rebuild_source_cut(&retained.metadata().commit_range)
+                    .unwrap();
+                assert_eq!(source_cut, CommitRange { low: 2, high: 7 });
+                let migrated_model: Arc<dyn Embedder> = migrated.clone();
+                let successor = NativeIndexBuilder::new(
+                    parent.join("migrated-work"),
+                    new_generation(2).unwrap(),
+                    migrated_model,
+                )
+                .unwrap()
+                .with_fast_storage(
+                    NativeBuildPrecision::F32,
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams::default(),
+                        seed: 19,
+                    },
+                )
+                .add_documents(source)
+                .build_exact_generation(&cx, tier, source_cut, DEFAULT_IMAGE_BYTES)
+                .await
+                .unwrap();
+                assert_eq!(successor.binding().frozen_identity(), &admitted);
+                assert_eq!(migrated.calls.load(Ordering::Relaxed), 2);
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+
+                // A second captured rebuild is valid in isolation but loses
+                // publication after the migrated producer's successor wins.
+                let stale_model: Arc<dyn Embedder> = provider.clone();
+                let loser = NativeIndexBuilder::new(
+                    parent.join("stale-candidate-work"),
+                    new_generation(2).unwrap(),
+                    stale_model,
+                )
+                .unwrap()
+                .with_fast_storage(NativeBuildPrecision::F32, NativeBuildRetrieval::Exact)
+                .add_documents(
+                    retained_rebuild_documents(&cx, &retained, crate::MAX_INPUT_BYTES).unwrap(),
+                )
+                .build_exact_generation(
+                    &cx,
+                    tier,
+                    CommitRange { low: 2, high: 7 },
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .await
+                .unwrap();
+                let committed = stage_and_publish(
+                    &cx,
+                    &root,
+                    &root_path,
+                    &parent.join("migrated.json"),
+                    &successor,
+                    Some(&retained),
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .unwrap();
+                assert_eq!(committed.root_id, selected.root_id);
+                assert_eq!(committed.tier, tier);
+                assert_eq!(committed.documents, 2);
+                assert_eq!(committed.identity, admitted);
+                let authority_after = fs::read(root_path.join("AUTHORITY")).unwrap();
+                let error = stage_and_publish(
+                    &cx,
+                    &root,
+                    &root_path,
+                    &parent.join("stale-candidate.json"),
+                    &loser,
+                    Some(&retained),
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    publication_failure(error.as_ref()).unwrap()["publication"],
+                    "not_committed"
+                );
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_after
+                );
+
+                let active = committed
+                    .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                    .unwrap();
+                assert_eq!(
+                    active.metadata().commit_range,
+                    retained.metadata().commit_range
+                );
+                assert_eq!(active.retrieval_mode(), NativeRetrievalMode::Ann);
+                let current_source =
+                    retained_rebuild_documents(&cx, &active, crate::MAX_INPUT_BYTES).unwrap();
+                let old_source =
+                    retained_rebuild_documents(&cx, &retained, crate::MAX_INPUT_BYTES).unwrap();
+                assert_eq!(current_source.len(), old_source.len());
+                assert_eq!(current_source.len(), 2);
+                for (current, old) in current_source.iter().zip(&old_source) {
+                    assert_eq!(current.id, old.id);
+                    assert_eq!(current.content, old.content);
+                    assert_eq!(current.title, old.title);
+                    assert_eq!(current.metadata, old.metadata);
+                }
+                let old_calls = provider.calls.load(Ordering::Relaxed);
+                assert!(
+                    active
+                        .search_text(&cx, provider.as_ref(), "retry", 1)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), old_calls);
+                assert_eq!(
+                    active
+                        .search_text(&cx, migrated.as_ref(), "retry", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "zeta"
+                );
+                assert_eq!(
+                    retained
+                        .search_text(&cx, provider.as_ref(), "retry", 1)
+                        .await
+                        .unwrap()[0]
+                        .doc_id,
+                    "zeta"
+                );
+
+                refused.max_source_bytes = crate::MAX_INPUT_BYTES;
+                let error = rebuild(&cx, &refused, &mut Vec::new(), None)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("head differs"));
+                assert!(!refused_work.exists());
+                assert!(!refused_receipt.exists());
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_after
+                );
+            }
+        });
     }
 
     #[test]
