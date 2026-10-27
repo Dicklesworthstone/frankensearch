@@ -391,8 +391,8 @@ Activation admits the complete candidate through the root descriptor retained at
 startup and swaps readers only after all checks pass. A malformed, foreign,
 corrupt or stale activation reports a failed request and leaves the previous
 reader installed. Search requests cannot change activation permission, the image
-budget or the producer. Omitting `--allow-activation` keeps the session pinned to
-its startup generation.
+budget or the producer. With both activation and updates disabled, the session
+stays pinned to its startup generation.
 
 Input records are limited to 1 MiB. An oversized record stops the session without
 draining it; an ordinary invalid bounded request produces one failure response.
@@ -400,6 +400,84 @@ Responses are completely encoded under the existing native CLI output bound
 before emission. Output failure stops the session. Send `quit`, `exit`, or EOF
 to finish. As with the existing native stdio server, input reads block on the
 owning lane, and cancellation is observed between reads and requests.
+
+### Publish edits through the warm authority server
+
+Add `--allow-updates` to let the stdin controller apply durable incremental
+updates using the already loaded model:
+
+```sh
+./target/release/frankensearch-native authority-serve \
+  --receipt "$HOME/frankensearch-authority/g1.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --allow-updates --batch-size 64 --max-source-bytes 268435456
+```
+
+The `ready` response advertises `updates_enabled`, the mutation count limit,
+batch size and source-export budget. Each update is one JSON object with these
+fields:
+
+| Field | Value |
+|---|---|
+| `op` | `"update"` |
+| `id` | Optional request ID |
+| `expected_authority` | The exact byte array from the session's latest `ready`, `results`, `activated`, or `updated` response |
+| `work_dir` | A new absolute work-directory path |
+| `new_receipt` | A new absolute receipt-file path |
+| `source_low`, `source_high` | The explicit inclusive source checkpoint, with neither boundary moving backward |
+| `changes` | An array of the upsert/delete objects accepted by `authority-update` |
+
+An update contains at most 1,000 mutation records, counting overwritten edits,
+and must fit within the existing 1 MiB request limit. Every record is validated;
+the final operation for each ID wins. Empty `changes` may advance the checkpoint.
+The complete resulting cohort must remain nonempty and satisfy the same
+100,000-document, 16 MiB record and 256 MiB encoded-source limits as the one-shot
+command. Destinations must be UTF-8 paths of at most 4,096 bytes, outside the
+selected root and separate from each other. `--batch-size` on the server
+requires `--allow-updates`; `--max-source-bytes` also bounds filtered queries
+when writes are disabled.
+
+The server verifies that its retained authority pair is still current before
+source export or inference. It preserves that exact pair throughout the build.
+The original model, tier, F16/F32 encoding, retrieval policy and graph parameters
+remain fixed. Unchanged content, including metadata-only edits, reuses its stored
+vector. Complete successor images are built and admitted through the same path
+as `authority-update`.
+
+The new recovery receipt is synced before publication. A successful update
+installs the exact admitted reader returned by the publisher, then acknowledges
+`event: "updated"`, `publication: "committed"`, and `serving: "activated"`.
+The response includes the new `authority`, `selection`, `receipt`, final
+`documents` count, `edited_ids` count and `previous_authority`. Subsequent
+queries use that selection without reloading the model. Update requests are
+serialized with queries, so a long build occupies the request loop.
+
+When the session has a fixed filter, the complete successor source and its
+eligible membership are prepared before publication under the configured query
+source budget. The acknowledged update installs the new receipt, reader and
+scope together. Metadata-only changes can therefore move a document into or out
+of scope while reusing its vector. Empty membership stays restricted, and later
+updates can populate it again. A source-budget or predicate refusal preserves
+the old authority and scope; unfiltered sessions skip this scope preparation.
+
+Update permission includes installation of its own successful successor.
+`--allow-activation` independently permits selecting a receipt published
+elsewhere. A stale client, an externally advanced root, invalid edits or a
+losing publication preserves the current warm reader. After an external advance,
+explicitly activate the winning receipt before updating again.
+
+Failure responses keep the serving `authority` separate from any
+`candidate_authority`. They report `publication` as `not_committed`,
+`unknown`, or `committed`, and `serving` as `not_activated` when the
+candidate was not installed. A `receipt` is included only once its saved
+recovery attempt is known to be durable. If publication is uncertain, run
+`authority-recover` with that receipt before continuing. An unresolved attempt
+or stale base refuses further writes. Existing retained readers remain available.
+
+Cancellation after acknowledged publication does not erase its outcome, and a
+broken output stream ends the session while retaining the known publication and
+activation status in the terminal error. The server never retries an uncertain
+write automatically.
 
 ### Filter fixed-authority search and warm requests
 

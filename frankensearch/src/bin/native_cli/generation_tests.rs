@@ -452,6 +452,48 @@ fn authority_filters_are_bounded_and_only_apply_to_search_and_serve() {
 }
 
 #[test]
+fn authority_serve_requires_a_separate_grant_for_warm_updates_and_batch_limits() {
+    let base = ["authority-serve", "--receipt", "selected.json"];
+    let mut enabled = base.to_vec();
+    enabled.extend([
+        "--allow-updates",
+        "--batch-size",
+        "2",
+        "--max-source-bytes",
+        "4096",
+    ]);
+    let options = parse(&enabled).unwrap().unwrap();
+    assert_eq!(options.command, Command::Serve);
+    assert_eq!(options.batch_size, 2);
+    assert_eq!(options.max_source_bytes, 4096);
+    assert!(!options.allow_activation);
+    let mut reordered = base.to_vec();
+    reordered.extend(["--max-source-bytes", "4096", "--allow-updates"]);
+    assert_eq!(parse(&reordered).unwrap().unwrap().max_source_bytes, 4096);
+    for extra in [
+        vec!["--batch-size", "2"],
+        vec!["--allow-activation", "--batch-size", "2"],
+        vec!["--allow-updates", "--batch-size", "0"],
+        vec!["--allow-updates", "--max-source-bytes", "0"],
+        vec!["--allow-updates", "--allow-updates"],
+    ] {
+        let mut rejected = base.to_vec();
+        rejected.extend(extra);
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
+    for command in [
+        "authority-search",
+        "authority-recover",
+        "authority-rollback",
+        "authority-index",
+        "authority-rebuild",
+        "authority-update",
+    ] {
+        assert!(parse(&[command, "--receipt", "selected.json", "--allow-updates"]).is_err());
+    }
+}
+
+#[test]
 fn authority_serve_options_select_one_warm_receipt_and_explicit_activation_grant() {
     let arguments = ["authority-serve", "--receipt", "selected.json"];
     let options = parse(&arguments).unwrap().unwrap();
@@ -1280,9 +1322,10 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
                 &receipt_path,
                 &built,
                 None,
-                DEFAULT_IMAGE_BYTES,
+                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
             )
-            .unwrap();
+            .unwrap()
+            .receipt;
             let successor = built
                 .candidate(
                     new_generation(1).unwrap().nonce,
@@ -1502,9 +1545,10 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
                 &first_path,
                 &first,
                 None,
-                DEFAULT_IMAGE_BYTES,
+                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
             )
-            .unwrap();
+            .unwrap()
+            .receipt;
             let retained = selected
                 .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
                 .unwrap();
@@ -1548,9 +1592,10 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
                 &second_path,
                 &unchanged,
                 Some(&retained),
-                DEFAULT_IMAGE_BYTES,
+                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
             )
-            .unwrap();
+            .unwrap()
+            .receipt;
             assert_eq!(second.root_id, selected.root_id);
             assert_eq!(second.authority().unwrap().sequence, 2);
             assert_eq!(fs::metadata(&lexical_path).unwrap().ino(), original_inode);
@@ -1605,9 +1650,10 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
                 &winner_path,
                 &winner,
                 Some(&second_snapshot),
-                DEFAULT_IMAGE_BYTES,
+                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
             )
-            .unwrap();
+            .unwrap()
+            .receipt;
             let authority_after_winner = fs::read(root_path.join("AUTHORITY")).unwrap();
             let lock_after_winner = fs::read(root_path.join("LOCK")).unwrap();
             let loser_path = parent.join(format!("{name}-loser.json"));
@@ -1618,9 +1664,10 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
                 &loser_path,
                 &loser,
                 Some(&second_snapshot),
-                DEFAULT_IMAGE_BYTES,
+                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
             )
-            .unwrap_err();
+            .err()
+            .expect("the competing publication must lose");
             assert_eq!(
                 publication_failure(error.as_ref()).unwrap()["publication"],
                 "not_committed"
@@ -1785,9 +1832,10 @@ mod warm_authority {
             &parent.join(format!("{label}.json")),
             &built,
             previous,
-            DEFAULT_IMAGE_BYTES,
+            PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
         )
         .unwrap()
+        .receipt
     }
 
     fn open_session(
@@ -2700,9 +2748,10 @@ mod warm_authority {
                         &first_path,
                         &initial,
                         None,
-                        DEFAULT_IMAGE_BYTES,
+                        PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
                     )
-                    .unwrap();
+                    .unwrap()
+                    .receipt;
                     let retained = selected
                         .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
                         .unwrap();
@@ -3119,15 +3168,18 @@ mod warm_authority {
                         // The real command has already admitted its predecessor
                         // and inputs. Publish the competing complete candidate
                         // before allowing its model/load/build lane to proceed.
-                        winner = Some(stage_and_publish(
-                            &cx,
-                            &root,
-                            &root_path,
-                            &winner_path,
-                            &competitor,
-                            Some(&retained),
-                            DEFAULT_IMAGE_BYTES,
-                        )?);
+                        winner = Some(
+                            stage_and_publish(
+                                &cx,
+                                &root,
+                                &root_path,
+                                &winner_path,
+                                &competitor,
+                                Some(&retained),
+                                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                            )?
+                            .receipt,
+                        );
                         authority_after_winner = fs::read(root_path.join("AUTHORITY"))?;
                         Ok(model)
                     })
@@ -3229,9 +3281,10 @@ mod warm_authority {
                     &first_path,
                     &first,
                     None,
-                    DEFAULT_IMAGE_BYTES,
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
                 )
-                .unwrap();
+                .unwrap()
+                .receipt;
                 drop(first);
                 let retained = selected
                     .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
@@ -3361,9 +3414,10 @@ mod warm_authority {
                     &parent.join("migrated.json"),
                     &successor,
                     Some(&retained),
-                    DEFAULT_IMAGE_BYTES,
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
                 )
-                .unwrap();
+                .unwrap()
+                .receipt;
                 assert_eq!(committed.root_id, selected.root_id);
                 assert_eq!(committed.tier, tier);
                 assert_eq!(committed.documents, 2);
@@ -3376,9 +3430,10 @@ mod warm_authority {
                     &parent.join("stale-candidate.json"),
                     &loser,
                     Some(&retained),
-                    DEFAULT_IMAGE_BYTES,
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
                 )
-                .unwrap_err();
+                .err()
+                .expect("the competing publication must lose");
                 assert_eq!(
                     publication_failure(error.as_ref()).unwrap()["publication"],
                     "not_committed"
@@ -3445,6 +3500,1015 @@ mod warm_authority {
                     authority_after
                 );
             }
+        });
+    }
+
+    fn update_message(
+        parent: &Path,
+        label: &str,
+        previous: &Receipt,
+        source_high: u64,
+        changes: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "op": "update", "id": label, "expected_authority": previous.authority,
+            "work_dir": parent.join(format!("{label}-work")),
+            "new_receipt": parent.join(format!("{label}.json")),
+            "source_low": 1, "source_high": source_high, "changes": changes,
+        })
+    }
+
+    #[test]
+    fn warm_authority_updates_reuse_the_model_and_install_complete_successors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann) in [
+                ("update-fast-exact", EmbedderTierTag::Fast, false),
+                ("update-quality-exact", EmbedderTierTag::Quality, false),
+                ("update-fast-ann", EmbedderTierTag::Fast, true),
+                ("update-quality-ann", EmbedderTierTag::Quality, true),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let old = publish(&cx, &parent, None, &provider, tier, "old", ann).await;
+                let retained = old.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let original_receipt = fs::read(parent.join("old.json")).unwrap();
+                let mut session = open_session(&cx, old.clone(), &provider, false)
+                    .with_filter(&cx, None, 1)
+                    .unwrap()
+                    .with_updates(2, crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                let metadata = update_message(
+                    &parent,
+                    "metadata",
+                    &old,
+                    5,
+                    serde_json::json!([
+                        {"op":"upsert", "id":"retry-old", "content":"retry network requests",
+                         "title":"Unique refreshed title", "metadata":{"version":"new"}},
+                        {"op":"upsert", "id":"garden-old", "content":"garden flowers",
+                         "metadata":{"version":"old"}},
+                        {"op":"delete", "id":"absent"}
+                    ]),
+                );
+                let before = provider.calls.load(Ordering::Relaxed);
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        serde_json::json!({"id":"before", "query":"retry"}),
+                        metadata,
+                        serde_json::json!({"id":"after", "query":"Unique refreshed title", "limit":2}),
+                    ],
+                )
+                .await;
+                assert_eq!(output[0]["updates_enabled"], true);
+                assert_eq!(output[0]["activation_enabled"], false);
+                assert!(
+                    output.iter().all(|frame| frame.get("scope").is_none()),
+                    "unfiltered updates must not export a new query scope against its tiny source budget"
+                );
+                assert_eq!(output[1]["results"][0]["doc_id"], "retry-old");
+                assert_eq!(output[2]["event"], "updated");
+                assert_eq!(output[2]["publication"], "committed");
+                assert_eq!(output[2]["serving"], "activated");
+                assert_eq!(output[2]["documents"], 2);
+                assert_eq!(output[2]["edited_ids"], 3);
+                assert_eq!(
+                    output[2]["previous_authority"],
+                    serde_json::json!(old.authority)
+                );
+                assert_eq!(
+                    output[2]["receipt"],
+                    serde_json::json!(parent.join("metadata.json"))
+                );
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    before + 2,
+                    "only the two queries infer; metadata and no-op document edits reuse vectors"
+                );
+                let refreshed = output[3]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|hit| hit["doc_id"] == "retry-old")
+                    .unwrap();
+                assert!(
+                    refreshed["lexical_score"]
+                        .as_f64()
+                        .is_some_and(|score| score > 0.0)
+                );
+                let second = Receipt::read(&parent.join("metadata.json")).unwrap();
+                assert_eq!(session.receipt.authority, second.authority);
+                assert_eq!(session.receipt.identity, old.identity);
+                assert_eq!(session.snapshot.authority(), second.authority().unwrap());
+                let source = session
+                    .snapshot
+                    .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                let retry = source
+                    .iter()
+                    .find(|document| document.id == "retry-old")
+                    .unwrap();
+                assert_eq!(retry.title.as_deref(), Some("Unique refreshed title"));
+                assert_eq!(retry.metadata.get("version").unwrap(), "new");
+
+                let mixed = update_message(
+                    &parent,
+                    "mixed",
+                    &second,
+                    6,
+                    serde_json::json!([
+                        {"op":"upsert", "id":"garden-old", "content":"discarded input"},
+                        {"op":"upsert", "id":"fresh", "content":"discarded new input"},
+                        {"op":"delete", "id":"fresh"},
+                        {"op":"delete", "id":"retry-old"},
+                        {"op":"upsert", "id":"garden-old", "content":"retry revised garden"},
+                        {"op":"upsert", "id":"fresh", "content":"garden fresh flowers"}
+                    ]),
+                );
+                let before = provider.calls.load(Ordering::Relaxed);
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        mixed,
+                        serde_json::json!({"query":"retry revised", "limit":2}),
+                    ],
+                )
+                .await;
+                assert_eq!(output[1]["event"], "updated");
+                assert_eq!(output[1]["publication"], "committed");
+                assert_eq!(output[1]["edited_ids"], 3);
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    before + 3,
+                    "only two final document inputs and the following query infer"
+                );
+                assert_eq!(
+                    output[2]["results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|hit| hit["doc_id"].as_str().unwrap())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["fresh", "garden-old"])
+                );
+                assert_eq!(session.snapshot.tier(), tier);
+                assert_eq!(session.snapshot.retrieval_mode(), retained.retrieval_mode());
+                assert_eq!(session.receipt.identity, old.identity);
+                let third = Receipt::read(&parent.join("mixed.json")).unwrap();
+                let reopened = third.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(reopened.authority(), session.snapshot.authority());
+                assert_eq!(
+                    reopened.metadata().commit_range,
+                    CommitRange { low: 1, high: 6 }
+                );
+                assert_eq!(
+                    reopened
+                        .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                        .unwrap()
+                        .iter()
+                        .map(|document| document.id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["fresh", "garden-old"])
+                );
+                let old_source = retained
+                    .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                assert_eq!(
+                    old_source
+                        .iter()
+                        .map(|document| document.id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["garden-old", "retry-old"])
+                );
+                assert_eq!(
+                    old_source
+                        .iter()
+                        .find(|document| document.id == "retry-old")
+                        .unwrap()
+                        .metadata
+                        .get("version")
+                        .unwrap(),
+                    "old"
+                );
+                assert_eq!(fs::read(parent.join("old.json")).unwrap(), original_receipt);
+            }
+        });
+    }
+
+    #[test]
+    fn warm_updates_refresh_fixed_filter_membership_without_widening_retained_scopes() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier, ann) in [
+                ("warm-scoped-fast-exact", EmbedderTierTag::Fast, false),
+                ("warm-scoped-quality-hnsw", EmbedderTierTag::Quality, true),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let old = publish(&cx, &parent, None, &provider, tier, "old", ann).await;
+                let fixed =
+                    || crate::filter::Filter::parse(r#"{"metadata":{"version":"old"}}"#).unwrap();
+                let mut session = open_session(&cx, old.clone(), &provider, false)
+                    .with_filter(&cx, Some(fixed()), crate::MAX_INPUT_BYTES)
+                    .unwrap()
+                    .with_updates(2, crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                let mut retained = open_session(&cx, old.clone(), &provider, false)
+                    .with_filter(&cx, Some(fixed()), crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                let request = update_message(
+                    &parent,
+                    "scoped-next",
+                    &old,
+                    6,
+                    serde_json::json!([
+                        {"op":"upsert", "id":"retry-old", "content":"retry network requests",
+                         "metadata":{"version":"new"}},
+                        {"op":"delete", "id":"garden-old"},
+                        {"op":"upsert", "id":"garden-new", "content":"garden new flowers",
+                         "metadata":{"version":"old"}},
+                        {"op":"upsert", "id":"retry-new", "content":"retry outside the fixed filter",
+                         "metadata":{"version":"new"}}
+                    ]),
+                );
+                let before = provider.calls.load(Ordering::Relaxed);
+                let output = exchange(&cx, &mut session, &[
+                    request,
+                    serde_json::json!({"query":"retry", "limit":3, "filter":{}}),
+                    serde_json::json!({"query":"retry", "filter":{"ids":["retry-old"]}}),
+                    serde_json::json!({"query":"retry", "filter":{"metadata":{"version":"new"}}}),
+                ]).await;
+                assert_eq!(output[0]["scope"]["eligible_documents"], 2);
+                assert_eq!(output[1]["event"], "updated");
+                assert_eq!(output[1]["publication"], "committed");
+                assert_eq!(output[1]["serving"], "activated");
+                assert_eq!(output[1]["documents"], 3);
+                assert_eq!(output[1]["scope"]["eligible_documents"], 1);
+                assert_eq!(output[2]["event"], "results");
+                assert_eq!(output[2]["scope"]["eligible_documents"], 1);
+                assert_eq!(output[2]["results"].as_array().unwrap().len(), 1);
+                assert_eq!(output[2]["results"][0]["doc_id"], "garden-new");
+                for position in [3, 4] {
+                    assert_eq!(output[position]["event"], "results");
+                    assert_eq!(output[position]["scope"]["eligible_documents"], 0);
+                    assert!(output[position]["results"].as_array().unwrap().is_empty());
+                }
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    before + 3,
+                    "only two new document inputs and one nonempty scoped query infer"
+                );
+                let next = Receipt::read(&parent.join("scoped-next.json")).unwrap();
+                assert_eq!(session.receipt.authority, next.authority);
+                assert_eq!(output[2]["authority"], serde_json::json!(next.authority));
+                assert_eq!(
+                    next.open(&cx, DEFAULT_IMAGE_BYTES)
+                        .unwrap()
+                        .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                        .unwrap()
+                        .iter()
+                        .map(|document| document.id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["garden-new", "retry-new", "retry-old"])
+                );
+                let empty = update_message(
+                    &parent,
+                    "scope-empty",
+                    &next,
+                    7,
+                    serde_json::json!([
+                        {"op":"upsert", "id":"garden-new", "content":"garden new flowers",
+                         "metadata":{"version":"new"}}
+                    ]),
+                );
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[empty, serde_json::json!({"query":"retry", "limit":3})],
+                )
+                .await;
+                assert_eq!(output[1]["event"], "updated");
+                assert_eq!(output[1]["scope"]["eligible_documents"], 0);
+                assert_eq!(output[2]["scope"]["eligible_documents"], 0);
+                assert!(output[2]["results"].as_array().unwrap().is_empty());
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    before + 3,
+                    "an empty fixed scope remains a restriction and skips query inference"
+                );
+                let empty = Receipt::read(&parent.join("scope-empty.json")).unwrap();
+                let refill = update_message(
+                    &parent,
+                    "scope-refill",
+                    &empty,
+                    8,
+                    serde_json::json!([
+                        {"op":"upsert", "id":"retry-old", "content":"retry network requests",
+                         "metadata":{"version":"old"}}
+                    ]),
+                );
+                let output = exchange(
+                    &cx,
+                    &mut session,
+                    &[
+                        refill,
+                        serde_json::json!({"query":"retry", "limit":3}),
+                        serde_json::json!({"query":"retry", "filter":{"ids":["retry-old"]}}),
+                    ],
+                )
+                .await;
+                assert_eq!(output[1]["event"], "updated");
+                assert_eq!(output[1]["scope"]["eligible_documents"], 1);
+                for position in [2, 3] {
+                    assert_eq!(output[position]["scope"]["eligible_documents"], 1);
+                    assert_eq!(output[position]["results"].as_array().unwrap().len(), 1);
+                    assert_eq!(output[position]["results"][0]["doc_id"], "retry-old");
+                }
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    before + 5,
+                    "metadata-only membership transitions reuse the existing document vectors"
+                );
+                let held = exchange(
+                    &cx,
+                    &mut retained,
+                    &[serde_json::json!({"query":"retry", "limit":3, "filter":{}})],
+                )
+                .await;
+                assert_eq!(held[1]["authority"], serde_json::json!(old.authority));
+                assert_eq!(held[1]["scope"]["eligible_documents"], 2);
+                assert_eq!(held[1]["results"][0]["doc_id"], "retry-old");
+                assert_eq!(
+                    held[1]["results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|hit| hit["doc_id"].as_str().unwrap())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["garden-old", "retry-old"])
+                );
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 6);
+            }
+        });
+    }
+
+    #[test]
+    fn warm_update_scope_budget_refusal_precedes_publication_and_preserves_membership() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("warm-scoped-update-budget");
+            let provider = provider();
+            let old = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Quality,
+                "old",
+                true,
+            )
+            .await;
+            let filter = crate::filter::Filter::parse(r#"{"metadata":{"version":"old"}}"#).unwrap();
+            let mut session = open_session(&cx, old.clone(), &provider, false)
+                .with_filter(&cx, Some(filter), 256)
+                .unwrap()
+                .with_updates(2, crate::MAX_INPUT_BYTES)
+                .unwrap();
+            let head = fs::read(old.root.join("AUTHORITY")).unwrap();
+            let request = update_message(
+                &parent,
+                "too-large-scope",
+                &old,
+                6,
+                serde_json::json!([
+                    {"op":"upsert", "id":"retry-old", "content":"retry network requests",
+                     "metadata":{"version":"old", "note":"x".repeat(1_024)}}
+                ]),
+            );
+            let before = provider.calls.load(Ordering::Relaxed);
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[
+                    request,
+                    serde_json::json!({"query":"retry", "limit":2, "filter":{}}),
+                ],
+            )
+            .await;
+            assert_eq!(output[1]["event"], "failed");
+            assert_eq!(output[1]["publication"], "not_committed");
+            assert_eq!(output[1]["serving"], "not_activated");
+            assert_eq!(output[1]["authority"], serde_json::json!(old.authority));
+            assert_eq!(output[1]["scope"]["eligible_documents"], 2);
+            assert_eq!(session.receipt.authority, old.authority);
+            assert_eq!(fs::read(old.root.join("AUTHORITY")).unwrap(), head);
+            assert!(!parent.join("too-large-scope.json").exists());
+            assert_eq!(output[2]["event"], "results");
+            assert_eq!(output[2]["scope"]["eligible_documents"], 2);
+            assert_eq!(output[2]["results"][0]["doc_id"], "retry-old");
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                before + 1,
+                "a metadata-only update reuses document vectors even when its final scope is refused"
+            );
+            assert!(
+                !session
+                    .snapshot
+                    .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                    .unwrap()
+                    .iter()
+                    .find(|document| document.id == "retry-old")
+                    .unwrap()
+                    .metadata
+                    .contains_key("note")
+            );
+        });
+    }
+
+    #[test]
+    fn warm_update_refusals_preserve_the_session_and_reject_before_inference() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("warm-update-refusals");
+            let provider = provider();
+            let old = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Fast,
+                "old",
+                true,
+            )
+            .await;
+            let root_path = parent.join("root");
+            let original_authority = fs::read(root_path.join("AUTHORITY")).unwrap();
+            let before = provider.calls.load(Ordering::Relaxed);
+            let changes = serde_json::json!([
+                {"op":"upsert", "id":"retry-old", "content":"retry new content"}
+            ]);
+            let mut disabled = open_session(&cx, old.clone(), &provider, false);
+            let request = update_message(&parent, "disabled", &old, 6, changes.clone());
+            let output = exchange(&cx, &mut disabled, &[request]).await;
+            assert_eq!(output[0]["updates_enabled"], false);
+            assert_eq!(output[1]["event"], "failed");
+            assert_eq!(output[1]["code"], "updates_disabled");
+            assert!(!parent.join("disabled-work").exists());
+            assert!(!parent.join("disabled.json").exists());
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            let mut session = open_session(&cx, old.clone(), &provider, false)
+                .with_updates(2, crate::MAX_INPUT_BYTES)
+                .unwrap();
+            let mut stale = update_message(&parent, "stale", &old, 6, changes.clone());
+            stale["expected_authority"] = serde_json::json!(receipt().authority);
+            let mut backward = update_message(&parent, "backward", &old, 6, changes.clone());
+            backward["source_low"] = serde_json::json!(0);
+            let mut inverted = update_message(&parent, "inverted", &old, 8, changes.clone());
+            inverted["source_low"] = serde_json::json!(9);
+            let mut overflow = update_message(&parent, "overflow", &old, u64::MAX, changes.clone());
+            overflow["source_low"] = serde_json::json!(0);
+            let mut inside = update_message(&parent, "inside", &old, 6, changes.clone());
+            inside["work_dir"] = serde_json::json!(root_path.join("forbidden-work"));
+            let mut relative = update_message(&parent, "relative", &old, 6, changes.clone());
+            relative["work_dir"] = serde_json::json!("relative-work");
+            let delete_all = update_message(
+                &parent,
+                "delete-all",
+                &old,
+                6,
+                serde_json::json!([
+                    {"op":"delete", "id":"retry-old"}, {"op":"delete", "id":"garden-old"}
+                ]),
+            );
+            let too_many = update_message(
+                &parent,
+                "too-many",
+                &old,
+                6,
+                serde_json::Value::Array(vec![
+                    serde_json::json!({"op":"delete", "id":"absent"});
+                    1_001
+                ]),
+            );
+            for (label, request, code) in [
+                ("stale", stale, "stale_expected_authority"),
+                ("backward", backward, "backward_source_checkpoint"),
+                ("inverted", inverted, "invalid_source_checkpoint"),
+                ("overflow", overflow, "invalid_source_checkpoint"),
+                ("inside", inside, "update_refused"),
+                ("relative", relative, "invalid_update_request"),
+                ("delete-all", delete_all, "update_refused"),
+                ("too-many", too_many, "update_mutation_limit"),
+            ] {
+                let output = exchange(&cx, &mut session, &[request]).await;
+                assert_eq!(output[1]["event"], "failed", "{label}");
+                assert_eq!(output[1]["code"], code, "{label}");
+                assert_eq!(output[1]["publication"], "not_committed", "{label}");
+                assert_eq!(output[1]["serving"], "not_activated", "{label}");
+                assert_eq!(session.receipt.authority, old.authority, "{label}");
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before, "{label}");
+                assert!(!parent.join(format!("{label}-work")).exists(), "{label}");
+                assert!(!parent.join(format!("{label}.json")).exists(), "{label}");
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    original_authority
+                );
+            }
+            assert!(!root_path.join("forbidden-work").exists());
+            let invalid = update_message(
+                &parent,
+                "invalid-overwritten",
+                &old,
+                6,
+                serde_json::json!([
+                    {"op":"upsert", "id":"retry-old", "content":7},
+                    {"op":"upsert", "id":"retry-old", "content":"valid final replacement"}
+                ]),
+            );
+            let output = exchange(&cx, &mut session, &[invalid]).await;
+            assert_eq!(output[1]["event"], "failed");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            assert!(!parent.join("invalid-overwritten-work").exists());
+            assert!(!parent.join("invalid-overwritten.json").exists());
+            let mut bounded = open_session(&cx, old.clone(), &provider, false)
+                .with_updates(2, 1)
+                .unwrap();
+            let request = update_message(&parent, "bounded", &old, 6, changes.clone());
+            let output = exchange(&cx, &mut bounded, &[request]).await;
+            assert_eq!(output[1]["event"], "failed");
+            assert_eq!(output[1]["publication"], "not_committed");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            assert!(!parent.join("bounded-work").exists());
+            assert!(!parent.join("bounded.json").exists());
+
+            // A matching in-memory expectation is insufficient when another
+            // process has already published a different physical-root head.
+            let winner = publish(
+                &cx,
+                &parent,
+                Some(&session.snapshot),
+                &provider,
+                EmbedderTierTag::Fast,
+                "external",
+                true,
+            )
+            .await;
+            let head = fs::read(root_path.join("AUTHORITY")).unwrap();
+            let before = provider.calls.load(Ordering::Relaxed);
+            let request = update_message(&parent, "external-stale", &old, 6, changes);
+            let output = exchange(&cx, &mut session, &[request]).await;
+            assert_eq!(output[1]["event"], "failed");
+            assert_eq!(output[1]["publication"], "not_committed");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before);
+            assert_eq!(session.receipt.authority, old.authority);
+            assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), head);
+            assert!(!parent.join("external-stale-work").exists());
+            assert!(!parent.join("external-stale.json").exists());
+            assert_eq!(
+                winner.open(&cx, DEFAULT_IMAGE_BYTES).unwrap().authority(),
+                winner.authority().unwrap()
+            );
+            let output = exchange(&cx, &mut session, &[serde_json::json!({"query":"retry"})]).await;
+            assert_eq!(output[1]["results"][0]["doc_id"], "retry-old");
+        });
+    }
+
+    #[test]
+    fn warm_update_losing_publication_keeps_the_original_reader_and_recovery_receipt() {
+        use std::future::Future as _;
+        use std::sync::atomic::AtomicBool;
+        use std::task::Poll;
+
+        struct GatedProvider {
+            inner: Arc<Provider>,
+            started: AtomicBool,
+            released: AtomicBool,
+        }
+        impl Embedder for GatedProvider {
+            fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                self.inner.identity()
+            }
+            fn embed<'a>(&'a self, cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                self.started.store(true, Ordering::Relaxed);
+                let work = self.inner.embed(cx, text);
+                Box::pin(async move {
+                    std::future::poll_fn(|_| {
+                        if self.released.load(Ordering::Relaxed) {
+                            Poll::Ready(())
+                        } else {
+                            Poll::Pending
+                        }
+                    })
+                    .await;
+                    work.await
+                })
+            }
+            fn dimension(&self) -> usize {
+                self.inner.dimension()
+            }
+            fn id(&self) -> &str {
+                self.inner.id()
+            }
+            fn model_name(&self) -> &str {
+                self.inner.model_name()
+            }
+            fn is_semantic(&self) -> bool {
+                self.inner.is_semantic()
+            }
+            fn category(&self) -> ModelCategory {
+                self.inner.category()
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("warm-update-publication-race");
+            let provider = provider();
+            let old = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Quality,
+                "old",
+                true,
+            )
+            .await;
+            let root_path = parent.join("root");
+            let root = admit_root(&root_path).unwrap();
+            let retained = old.open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES).unwrap();
+            let model: Arc<dyn Embedder> = provider.clone();
+            let competitor = NativeIndexBuilder::new(
+                parent.join("winner-work"),
+                new_generation(2).unwrap(),
+                model,
+            )
+            .unwrap()
+            .with_fast_storage(
+                NativeBuildPrecision::F32,
+                retained.retrieval_configuration(),
+            )
+            .add_documents([IndexableDocument::new(
+                "external",
+                "retry concurrent publication",
+            )])
+            .build_exact_generation(
+                &cx,
+                EmbedderTierTag::Quality,
+                CommitRange { low: 1, high: 6 },
+                DEFAULT_IMAGE_BYTES,
+            )
+            .await
+            .unwrap();
+            let gated = Arc::new(GatedProvider {
+                inner: provider.clone(),
+                started: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+            });
+            let mut session = open_session(&cx, old.clone(), &provider, false)
+                .with_updates(2, crate::MAX_INPUT_BYTES)
+                .unwrap();
+            session.model = gated.clone();
+            let request = update_message(
+                &parent,
+                "loser",
+                &old,
+                7,
+                serde_json::json!([
+                    {"op":"upsert", "id":"loser", "content":"retry losing change"}
+                ]),
+            );
+            let mut input = serde_json::to_vec(&request).unwrap();
+            input.extend_from_slice(b"\n{\"query\":\"retry\",\"limit\":2}\n");
+            let mut input = Cursor::new(input);
+            let mut output = Vec::new();
+            let before = provider.calls.load(Ordering::Relaxed);
+            let mut serving = Box::pin(serve_session(&cx, &mut session, &mut input, &mut output));
+            std::future::poll_fn(|task| match serving.as_mut().poll(task) {
+                Poll::Ready(result) => panic!("update must wait in its provider: {result:?}"),
+                Poll::Pending if gated.started.load(Ordering::Relaxed) => Poll::Ready(()),
+                Poll::Pending => Poll::Pending,
+            })
+            .await;
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+            let winner = stage_and_publish(
+                &cx,
+                &root,
+                &root_path,
+                &parent.join("winner.json"),
+                &competitor,
+                Some(&retained),
+                PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+            )
+            .unwrap()
+            .receipt;
+            let winning_head = fs::read(root_path.join("AUTHORITY")).unwrap();
+            gated.released.store(true, Ordering::Relaxed);
+            serving.await.unwrap();
+            let output = frames(&output);
+            assert_eq!(output.len(), 3);
+            assert_eq!(output[1]["event"], "failed");
+            assert_eq!(output[1]["publication"], "not_committed");
+            assert_eq!(output[1]["serving"], "not_activated");
+            assert_eq!(output[1]["authority"], serde_json::json!(old.authority));
+            assert_eq!(
+                output[1]["receipt"],
+                serde_json::json!(parent.join("loser.json"))
+            );
+            assert_eq!(output[2]["event"], "results");
+            assert_eq!(session.receipt.authority, old.authority);
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before + 2);
+            assert_eq!(
+                output[2]["results"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|hit| hit["doc_id"].as_str().unwrap())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["garden-old", "retry-old"])
+            );
+            assert_eq!(fs::read(root_path.join("AUTHORITY")).unwrap(), winning_head);
+            let losing = Receipt::read(&parent.join("loser.json")).unwrap();
+            assert_eq!(
+                losing.recovery_attempt().unwrap().expected,
+                retained.retained_snapshot().authority_pair()
+            );
+            assert_ne!(losing.authority().unwrap(), winner.authority().unwrap());
+            assert_eq!(
+                winner
+                    .open(&cx, DEFAULT_IMAGE_BYTES)
+                    .unwrap()
+                    .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                    .unwrap()[0]
+                    .id,
+                "external"
+            );
+        });
+    }
+
+    #[test]
+    fn committed_warm_updates_preserve_their_effect_when_delivery_fails_or_is_cancelled() {
+        struct CancelAtUpdate<'a> {
+            cx: &'a Cx,
+            fail: bool,
+            bytes: Vec<u8>,
+            attempted_update: Option<serde_json::Value>,
+        }
+        impl Write for CancelAtUpdate<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let frame: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+                if frame["event"] == "updated" {
+                    self.attempted_update = Some(frame);
+                    self.cx.set_cancel_requested(true);
+                    if self.fail {
+                        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed"));
+                    }
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for fail in [false, true] {
+                let parent = private_parent(if fail {
+                    "warm-delivery-failure"
+                } else {
+                    "warm-delivery-cancel"
+                });
+                let provider = provider();
+                let old = publish(
+                    &cx,
+                    &parent,
+                    None,
+                    &provider,
+                    EmbedderTierTag::Fast,
+                    "old",
+                    false,
+                )
+                .await;
+                let retained = old.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let mut session = open_session(&cx, old.clone(), &provider, false)
+                    .with_updates(2, crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                let request = update_message(
+                    &parent,
+                    "committed",
+                    &old,
+                    6,
+                    serde_json::json!([
+                        {"op":"upsert", "id":"retry-old", "content":"retry committed replacement"}
+                    ]),
+                );
+                let mut input = serde_json::to_vec(&request).unwrap();
+                input.extend_from_slice(b"\n{\"query\":\"retry\"}\n");
+                let mut input = Cursor::new(input);
+                let mut output = CancelAtUpdate {
+                    cx: &cx,
+                    fail,
+                    bytes: Vec::new(),
+                    attempted_update: None,
+                };
+                let before = provider.calls.load(Ordering::Relaxed);
+                let error = serve_session(&cx, &mut session, &mut input, &mut output)
+                    .await
+                    .unwrap_err();
+                let acknowledgement = output.attempted_update.as_ref().unwrap();
+                assert_eq!(acknowledgement["publication"], "committed");
+                assert_eq!(acknowledgement["serving"], "activated");
+                assert_eq!(
+                    acknowledgement["authority"],
+                    serde_json::json!(session.receipt.authority)
+                );
+                assert_ne!(session.receipt.authority, old.authority);
+                assert_eq!(
+                    provider.calls.load(Ordering::Relaxed),
+                    before + 1,
+                    "delivery failure or cancellation stops before the next query"
+                );
+                let delivered = frames(&output.bytes);
+                if fail {
+                    let effect = publication_failure(error.as_ref()).unwrap();
+                    assert_eq!(effect["publication"], "committed");
+                    assert_eq!(effect["serving"], "activated");
+                    assert_eq!(effect["reason"], "result_delivery_failed");
+                    assert_eq!(
+                        effect["authority"],
+                        serde_json::json!(session.receipt.authority)
+                    );
+                    assert_eq!(
+                        effect["receipt"],
+                        serde_json::json!(parent.join("committed.json"))
+                    );
+                    assert_eq!(delivered.len(), 1);
+                } else {
+                    assert!(publication_failure(error.as_ref()).is_none());
+                    assert_eq!(delivered.len(), 2);
+                    assert_eq!(delivered[1], *acknowledgement);
+                }
+                assert_eq!(delivered[0]["event"], "ready");
+                // The writer sets cancellation at delivery, after installation.
+                // Clear it only to independently reopen the committed receipt.
+                cx.set_cancel_requested(false);
+                let committed = Receipt::read(&parent.join("committed.json")).unwrap();
+                let reopened = committed.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(reopened.authority(), session.snapshot.authority());
+                let source = reopened
+                    .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                assert_eq!(
+                    source
+                        .iter()
+                        .find(|document| document.id == "retry-old")
+                        .unwrap()
+                        .content,
+                    "retry committed replacement"
+                );
+                let old_source = retained
+                    .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                    .unwrap();
+                assert_eq!(
+                    old_source
+                        .iter()
+                        .find(|document| document.id == "retry-old")
+                        .unwrap()
+                        .content,
+                    "retry network requests"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn warm_updates_after_rollback_follow_the_restored_source_and_current_authority() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let parent = private_parent("warm-update-after-rollback");
+            let provider = provider();
+            let old = publish(
+                &cx,
+                &parent,
+                None,
+                &provider,
+                EmbedderTierTag::Quality,
+                "old",
+                true,
+            )
+            .await;
+            let mut session = open_session(&cx, old.clone(), &provider, true)
+                .with_updates(2, crate::MAX_INPUT_BYTES)
+                .unwrap();
+            let first = update_message(
+                &parent,
+                "before-rollback",
+                &old,
+                9,
+                serde_json::json!([
+                    {"op":"delete", "id":"retry-old"},
+                    {"op":"upsert", "id":"later", "content":"retry before rollback"}
+                ]),
+            );
+            let before = provider.calls.load(Ordering::Relaxed);
+            let output = exchange(&cx, &mut session, &[first]).await;
+            assert_eq!(output[1]["event"], "updated");
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+            let replaced = Receipt::read(&parent.join("before-rollback.json")).unwrap();
+            assert_eq!(session.receipt.authority, replaced.authority);
+            assert_eq!(
+                session.snapshot.metadata().commit_range,
+                CommitRange { low: 1, high: 9 }
+            );
+
+            let mut options = parse(&rollback_arguments()).unwrap().unwrap();
+            options.from_receipt = Some(parent.join("before-rollback.json"));
+            options.target_receipt = Some(parent.join("old.json"));
+            options.receipt = parent.join("restored.json");
+            rollback(&cx, &options, &mut Vec::new()).unwrap();
+            let restored = Receipt::read(&options.receipt).unwrap();
+            let restored_reader = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(restored.generation, old.generation);
+            assert!(
+                restored.authority().unwrap().sequence > replaced.authority().unwrap().sequence
+            );
+            assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+            let activate = serde_json::json!({
+                "op":"activate", "id":"restore", "receipt":options.receipt,
+                "expected_authority":replaced.authority,
+            });
+            // An empty change batch can advance the restored source checkpoint.
+            // Its cut may precede the rolled-back cut, but must extend the actual
+            // restored source and bind the fresh, advancing authority reference.
+            let checkpoint = update_message(
+                &parent,
+                "after-rollback",
+                &restored,
+                6,
+                serde_json::json!([]),
+            );
+            let output = exchange(
+                &cx,
+                &mut session,
+                &[
+                    activate,
+                    checkpoint,
+                    serde_json::json!({"query":"retry", "limit":2}),
+                ],
+            )
+            .await;
+            assert_eq!(output[1]["event"], "activated");
+            assert_eq!(
+                output[1]["authority"],
+                serde_json::json!(restored.authority)
+            );
+            assert_eq!(output[2]["event"], "updated");
+            assert_eq!(output[2]["publication"], "committed");
+            assert_eq!(output[2]["serving"], "activated");
+            assert_eq!(output[2]["edited_ids"], 0);
+            assert_eq!(
+                output[2]["previous_authority"],
+                serde_json::json!(restored.authority)
+            );
+            assert_eq!(output[3]["results"][0]["doc_id"], "retry-old");
+            assert_eq!(
+                provider.calls.load(Ordering::Relaxed),
+                before + 2,
+                "rollback, activation, and an empty update reuse the admitted document vectors"
+            );
+            let updated = Receipt::read(&parent.join("after-rollback.json")).unwrap();
+            assert_eq!(
+                updated.authority().unwrap().sequence,
+                restored.authority().unwrap().sequence + 1
+            );
+            assert_eq!(updated.generation.sequence, old.generation.sequence + 1);
+            assert_eq!(updated.generation.sequence, replaced.generation.sequence);
+            assert_ne!(
+                updated.generation, replaced.generation,
+                "artifact nonces prevent reuse after rollback"
+            );
+            assert_eq!(updated.identity, old.identity);
+            assert_eq!(
+                updated.recovery_attempt().unwrap().expected,
+                restored_reader.retained_snapshot().authority_pair()
+            );
+            let reopened = updated.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+            assert_eq!(reopened.authority(), session.snapshot.authority());
+            assert_eq!(
+                reopened.metadata().commit_range,
+                CommitRange { low: 1, high: 6 }
+            );
+            assert_eq!(
+                reopened
+                    .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                    .unwrap()
+                    .iter()
+                    .map(|document| document.id.as_str())
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from(["garden-old", "retry-old"])
+            );
+            assert_eq!(
+                restored_reader.metadata().commit_range,
+                CommitRange { low: 1, high: 5 }
+            );
         });
     }
 

@@ -55,6 +55,7 @@ use super::{
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
+const MAX_AUTHORITY_MUTATIONS: usize = 1_000;
 const PROFILE: GenerationRootSecurityProfileV1 = GenerationRootSecurityProfileV1::CooperativeLocal;
 const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
   authority-index --root NEW_ROOT --work-dir NEW_DIR --receipt NEW_JSON\n\
@@ -74,9 +75,9 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--filter JSON] [--max-source-bytes N] [--max-image-bytes N]\n\n\
-  authority-serve --receipt JSON [--limit N] [--allow-activation]\n\
+  authority-serve --receipt JSON [--limit N] [--allow-activation] [--allow-updates]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
-      [--filter JSON] [--max-source-bytes N] [--max-image-bytes N]\n\n\
+      [--filter JSON] [--max-source-bytes N] [--max-image-bytes N] [--batch-size N]\n\n\
   authority-recover --receipt JSON [--max-image-bytes N]\n\n\
   authority-rollback --from-receipt CURRENT_JSON --target-receipt PREDECESSOR_JSON\n\
       --receipt NEW_JSON [--max-image-bytes N]\n\n\
@@ -135,14 +136,25 @@ It admits the complete currently selected successor before swapping readers;\n\
 rejection retains the previous reader and returns a bounded failed response.\n\
 Authority sequence must advance, including rollback to older artifact generations.\n\
 Model migration requires restarting with the new receipt and local model options.\n\
+With --allow-updates, an explicit update request can publish and serve a successor\n\
+using the retained model: op=update, expected_authority, work_dir, new_receipt,\n\
+source_low, source_high, and changes (upsert/delete objects). Destinations must be\n\
+new absolute paths. At most 1000 mutations fit within the 1 MiB request budget;\n\
+an empty delta may advance the checkpoint. --batch-size requires this flag.\n\
+Updates retain producer, tier, precision and retrieval policy. They save a recovery\n\
+receipt before publication, compare the original authority pair, and install the\n\
+exact admitted successor. They report publication separately from reader activation.\n\
+Queries retain the old selection after refusal or unresolved publication; further\n\
+writes require the retained authority to remain current with no unresolved attempt.\n\
 Search/serve --filter accepts exact IDs, a literal id_prefix, and string-valued\n\
 metadata. Every present constraint must match the retained source document.\n\
 Search requests may include a filter object; it intersects the server's fixed\n\
 filter and cannot widen it. Membership filters vector and lexical candidates\n\
 before fusion. An empty scope still requires the selected producer identity.\n\
 Filtered source export is bounded by --max-source-bytes (default 256 MiB).\n\
-The fixed server scope stays on its retained generation; activation prepares\n\
-the new scope before swapping readers. Unfiltered queries do not export source.\n\
+The fixed server scope stays on its retained generation. Activation and updates\n\
+prepare its successor membership before changing selection or publication.\n\
+Unfiltered queries do not export source.\n\
 Requests are limited to 1 MiB; oversized input or output failure ends the session.\n\
 Send quit/exit or close stdin to stop. Reads block on the owning execution lane.\n\
 Work files remain available after completion or failure. Stdout is JSON.\n";
@@ -182,6 +194,7 @@ struct Options {
     migrate_model: bool,
     retained_source: bool,
     allow_activation: bool,
+    allow_updates: bool,
 }
 
 pub fn is_command(command: &str) -> bool {
@@ -234,6 +247,7 @@ impl Options {
             migrate_model: false,
             retained_source: false,
             allow_activation: false,
+            allow_updates: false,
         };
         let mut seen = BTreeSet::new();
         while let Some(flag) = args.next() {
@@ -274,6 +288,7 @@ impl Options {
                 "--allow-activation" if command == Command::Serve => {
                     options.allow_activation = true
                 }
+                "--allow-updates" if command == Command::Serve => options.allow_updates = true,
                 "--model-dir" if !matches!(command, Command::Recover | Command::Rollback) => {
                     options.models = Some(PathBuf::from(value(&mut args)?));
                 }
@@ -320,7 +335,10 @@ impl Options {
                     options.source_high = Some(source_sequence(&value(&mut args)?)?);
                 }
                 "--batch-size"
-                    if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
+                    if matches!(
+                        command,
+                        Command::Index | Command::Rebuild | Command::Update | Command::Serve
+                    ) =>
                 {
                     options.batch_size = number(&value(&mut args)?, MAX_DOCUMENTS)?;
                 }
@@ -405,7 +423,12 @@ impl Options {
                     ));
                 }
             }
-            Command::Serve | Command::Recover => {}
+            Command::Serve => {
+                if !options.allow_updates && seen.contains("--batch-size") {
+                    return Err(bad("authority-serve --batch-size requires --allow-updates"));
+                }
+            }
+            Command::Recover => {}
         }
         Ok(Some(options))
     }
@@ -795,6 +818,26 @@ fn publication_error(
     Box::new(PublicationFailure(payload))
 }
 
+struct PublishedGeneration {
+    receipt: Receipt,
+    snapshot: Arc<NativeGenerationSnapshot>,
+    scope: Option<NativeScopedGenerationSnapshot>,
+}
+
+struct PublicationOptions<'a> {
+    max_image_bytes: usize,
+    scope: Option<(&'a Filter, usize)>,
+}
+
+impl PublicationOptions<'_> {
+    fn unscoped(max_image_bytes: usize) -> Self {
+        Self {
+            max_image_bytes,
+            scope: None,
+        }
+    }
+}
+
 fn stage_and_publish(
     cx: &Cx,
     root: &QualifiedGenerationRoot,
@@ -802,10 +845,18 @@ fn stage_and_publish(
     receipt_path: &Path,
     built: &NativeBuiltExactGeneration,
     predecessor: Option<&NativeGenerationSnapshot>,
-    max_image_bytes: usize,
-) -> Result<Receipt> {
+    options: PublicationOptions<'_>,
+) -> Result<PublishedGeneration> {
+    let max_image_bytes = options.max_image_bytes;
     let (root_id, expected, previous) = match predecessor {
         Some(snapshot) => {
+            if snapshot
+                .retained_snapshot()
+                .selected_predecessor_of()
+                .is_some()
+            {
+                return Err(serve_refused("update_base_is_selected_predecessor"));
+            }
             validate_successor_source(
                 &snapshot.metadata().commit_range,
                 &built.metadata().commit_range,
@@ -850,7 +901,16 @@ fn stage_and_publish(
     if candidate.owned_image_bytes() > u64::try_from(max_image_bytes)? {
         return Err(bad("complete generation exceeds the encoded-image budget"));
     }
-    built.validate_candidate(cx, &candidate)?;
+    // Scope preparation uses the actual completed images, including stored
+    // metadata encoding. Any budget or predicate refusal precedes publication.
+    let prepared_scope = if let Some((filter, budget)) = options.scope {
+        Some(built.prepare_scope(cx, &candidate, budget, |document| {
+            Ok(filter.matches(document))
+        })?)
+    } else {
+        built.validate_candidate(cx, &candidate)?;
+        None
+    };
     let mut publisher = GenerationPublisherV1::new(root, root_id, writer.writer_id, PROFILE)?;
     let attempt = publisher.prepare_attempt(
         &candidate,
@@ -889,15 +949,46 @@ fn stage_and_publish(
     )?;
     root.revalidate()?;
     save_receipt(&receipt, receipt_path)?;
-    publish_and_admit(
+    let snapshot = publish_and_admit(
         cx,
         &mut publisher,
         &candidate,
         &attempt,
         &receipt,
         max_image_bytes,
-    )?;
-    Ok(receipt)
+    )
+    .map_err(|mut error| {
+        // Only this boundary follows a successfully synced recovery receipt.
+        // Earlier staging failures must not advertise a usable saved attempt.
+        if let Some(failure) = error.downcast_mut::<PublicationFailure>() {
+            failure.0["receipt"] = serde_json::json!(receipt_path);
+        }
+        error
+    })?;
+    let snapshot = Arc::new(snapshot);
+    // Binding only checks the sealed candidate identity; source, membership,
+    // budgets and predicates are already complete. It performs no checkpoint.
+    let scope = prepared_scope
+        .map(|prepared| prepared.bind(Arc::clone(&snapshot)))
+        .transpose()
+        .map_err(|_| {
+            let mut error = publication_error(
+                &receipt,
+                "committed",
+                "not_activated",
+                "prepared_scope_binding_refused",
+                None,
+            );
+            if let Some(failure) = error.downcast_mut::<PublicationFailure>() {
+                failure.0["receipt"] = serde_json::json!(receipt_path);
+            }
+            error
+        })?;
+    Ok(PublishedGeneration {
+        receipt,
+        snapshot,
+        scope,
+    })
 }
 
 fn publish_and_admit(
@@ -907,7 +998,7 @@ fn publish_and_admit(
     attempt: &AttemptPermitV1,
     receipt: &Receipt,
     max_image_bytes: usize,
-) -> Result<()> {
+) -> Result<NativeGenerationSnapshot> {
     let result = publisher
         .publish_prepared(
             cx,
@@ -955,16 +1046,17 @@ fn publish_and_admit(
             None,
         ));
     };
-    if receipt.admit_opened(cx, opened, max_image_bytes).is_err() {
-        return Err(publication_error(
-            receipt,
-            "committed",
-            "not_activated",
-            "engine_admission_refused",
-            None,
-        ));
-    }
-    Ok(())
+    receipt
+        .admit_opened(cx, opened, max_image_bytes)
+        .map_err(|_| {
+            publication_error(
+                receipt,
+                "committed",
+                "not_activated",
+                "engine_admission_refused",
+                None,
+            )
+        })
 }
 
 async fn index(
@@ -1002,14 +1094,14 @@ async fn index(
         .add_documents(documents)
         .build_exact_generation(cx, tier, options.source_cut()?, options.max_image_bytes)
         .await?;
-    let receipt = stage_and_publish(
+    let PublishedGeneration { receipt, .. } = stage_and_publish(
         cx,
         &root,
         &root_path,
         &receipt_path,
         &built,
         None,
-        options.max_image_bytes,
+        PublicationOptions::unscoped(options.max_image_bytes),
     )?;
     emit_indexed(output, &receipt, &receipt_path, built.retrieval_mode())
 }
@@ -1176,14 +1268,14 @@ async fn rebuild(
     if built.binding().frozen_identity() != &expected_identity {
         return Err(bad("the provider changed after rebuild identity admission"));
     }
-    let receipt = stage_and_publish(
+    let PublishedGeneration { receipt, .. } = stage_and_publish(
         cx,
         &root,
         &selected.root,
         &receipt_path,
         &built,
         Some(&snapshot),
-        options.max_image_bytes,
+        PublicationOptions::unscoped(options.max_image_bytes),
     )?;
     emit(
         output,
@@ -1231,6 +1323,151 @@ async fn update_generation(
     .await
 }
 
+#[derive(Clone, Copy)]
+struct AuthorityUpdateLimits {
+    batch_size: usize,
+    max_source_bytes: usize,
+}
+
+struct AuthorityUpdateSpec {
+    work: PathBuf,
+    receipt: PathBuf,
+    source: CommitRange,
+    limits: AuthorityUpdateLimits,
+    max_image_bytes: usize,
+}
+
+struct PreparedAuthorityUpdate {
+    spec: AuthorityUpdateSpec,
+    sequence: u64,
+    edits: mutations::Edits,
+    document_count: usize,
+}
+
+fn prepare_authority_update<F>(
+    cx: &Cx,
+    selected: &Receipt,
+    snapshot: &NativeGenerationSnapshot,
+    mut spec: AuthorityUpdateSpec,
+    read_edits: F,
+) -> Result<PreparedAuthorityUpdate>
+where
+    F: FnOnce() -> Result<mutations::Edits>,
+{
+    checkpoint(cx)?;
+    if snapshot
+        .retained_snapshot()
+        .selected_predecessor_of()
+        .is_some()
+        || snapshot.authority() != selected.authority()?
+    {
+        return Err(serve_refused("update_base_is_selected_predecessor"));
+    }
+    if spec.limits.batch_size == 0
+        || spec.limits.batch_size > MAX_DOCUMENTS
+        || spec.limits.max_source_bytes == 0
+        || spec.max_image_bytes == 0
+    {
+        return Err(serve_refused("invalid_update_limits"));
+    }
+    if spec
+        .source
+        .high
+        .checked_sub(spec.source.low)
+        .and_then(|span| span.checked_add(1))
+        .is_none()
+    {
+        return Err(serve_refused("invalid_source_checkpoint"));
+    }
+    snapshot.authority().next_sequence()?;
+    validate_successor_source(&snapshot.metadata().commit_range, &spec.source)
+        .map_err(|_| serve_refused("backward_source_checkpoint"))?;
+    let sequence = selected
+        .generation
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| bad("the artifact generation sequence is exhausted"))?;
+    spec.work = new_path(&spec.work)?;
+    spec.receipt = new_path(&spec.receipt)?;
+    separate_destinations(&[&selected.root, &spec.work, &spec.receipt])?;
+    let documents = retained_rebuild_documents(cx, snapshot, spec.limits.max_source_bytes)?;
+    let edits = read_edits()?;
+    let document_count = mutations::validate_final_source(cx, &documents, &edits)?;
+    if document_count == 0 {
+        return Err(bad("authority updates require a nonempty final cohort"));
+    }
+    // The library prepares reuse from the same immutable image. Let these
+    // preflight bodies go before loading a model or materializing that source.
+    checkpoint(cx)?;
+    Ok(PreparedAuthorityUpdate {
+        spec,
+        sequence,
+        edits,
+        document_count,
+    })
+}
+
+async fn build_and_publish_update(
+    cx: &Cx,
+    root: &QualifiedGenerationRoot,
+    selected: &Receipt,
+    snapshot: &NativeGenerationSnapshot,
+    prepared: PreparedAuthorityUpdate,
+    model: Arc<dyn Embedder>,
+    scope: Option<(&Filter, usize)>,
+) -> Result<PublishedGeneration> {
+    let PreparedAuthorityUpdate {
+        spec,
+        sequence,
+        edits,
+        document_count,
+    } = prepared;
+    let mut transaction = snapshot
+        .begin_update(
+            cx,
+            &spec.work,
+            new_generation(sequence)?,
+            model,
+            spec.limits.max_source_bytes,
+        )?
+        .with_batch_size(spec.limits.batch_size)?
+        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+    for (id, document) in edits {
+        checkpoint(cx)?;
+        transaction = match document {
+            Some(document) => transaction.upsert_document(document),
+            None => transaction.delete_document(id),
+        };
+    }
+    let built = Box::pin(transaction.build_exact_generation(
+        cx,
+        selected.tier,
+        spec.source,
+        spec.max_image_bytes,
+    ))
+    .await?;
+    if built.binding().frozen_identity() != &selected.identity {
+        return Err(bad("the provider changed after update identity admission"));
+    }
+    if built.metadata().total_documents != u64::try_from(document_count)? {
+        return Err(bad(
+            "the built update differs from its admitted source cohort",
+        ));
+    }
+    stage_and_publish(
+        cx,
+        root,
+        &selected.root,
+        &spec.receipt,
+        &built,
+        Some(snapshot),
+        PublicationOptions {
+            max_image_bytes: spec.max_image_bytes,
+            scope,
+        },
+    )
+}
+
 async fn update_generation_with_loader<F>(
     cx: &Cx,
     options: &Options,
@@ -1250,82 +1487,47 @@ where
     options
         .quality
         .validate_usage(selected.tier == EmbedderTierTag::Quality)?;
-    let work_path = new_path(
-        options
-            .work
-            .as_deref()
-            .ok_or_else(|| bad("missing work directory"))?,
-    )?;
-    let receipt_path = new_path(&options.receipt)?;
-    separate_destinations(&[&selected.root, &work_path, &receipt_path])?;
     let root = admit_root(&selected.root)?;
     // Admit the receipt's exact current selection before reading input or
     // loading a model, and retain that expected authority through publication.
     let snapshot = selected.open_on_root(cx, &root, options.max_image_bytes)?;
-    snapshot.authority().next_sequence()?;
-    let source = options.source_cut()?;
-    validate_successor_source(&snapshot.metadata().commit_range, &source)?;
-    let sequence = selected
-        .generation
-        .sequence
-        .checked_add(1)
-        .ok_or_else(|| bad("the artifact generation sequence is exhausted"))?;
-    let documents = retained_rebuild_documents(cx, &snapshot, options.max_source_bytes)?;
-    let edits = match &options.input {
-        Some(path) => mutations::read_edits(&mut BufReader::new(File::open(path)?))?,
-        None => mutations::read_edits(&mut io::stdin().lock())?,
-    };
-    let document_count = mutations::validate_final_source(cx, &documents, &edits)?;
-    if document_count == 0 {
-        return Err(bad("authority updates require a nonempty final cohort"));
-    }
-    // Preparation exports from the same retained immutable image. Release the
-    // preflight bodies first rather than holding two copies during inference.
-    drop(documents);
+    let prepared = prepare_authority_update(
+        cx,
+        &selected,
+        &snapshot,
+        AuthorityUpdateSpec {
+            work: options
+                .work
+                .clone()
+                .ok_or_else(|| bad("missing work directory"))?,
+            receipt: options.receipt.clone(),
+            source: options.source_cut()?,
+            limits: AuthorityUpdateLimits {
+                batch_size: options.batch_size,
+                max_source_bytes: options.max_source_bytes,
+            },
+            max_image_bytes: options.max_image_bytes,
+        },
+        || match &options.input {
+            Some(path) => mutations::read_edits(&mut BufReader::new(File::open(path)?)),
+            None => mutations::read_edits(&mut io::stdin().lock()),
+        },
+    )?;
+    let document_count = prepared.document_count;
+    let edit_count = prepared.edits.len();
+    let receipt_path = prepared.spec.receipt.clone();
     checkpoint(cx)?;
     let model = load_model(selected.tier)?;
-    let mut transaction = snapshot
-        .begin_update(
-            cx,
-            &work_path,
-            new_generation(sequence)?,
-            model,
-            options.max_source_bytes,
-        )?
-        .with_batch_size(options.batch_size)?
-        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
-    let edit_count = edits.len();
-    for (id, document) in edits {
-        checkpoint(cx)?;
-        transaction = match document {
-            Some(document) => transaction.upsert_document(document),
-            None => transaction.delete_document(id),
-        };
-    }
-    let built = Box::pin(transaction.build_exact_generation(
-        cx,
-        selected.tier,
-        source,
-        options.max_image_bytes,
+    let published = Box::pin(build_and_publish_update(
+        cx, &root, &selected, &snapshot, prepared, model, None,
     ))
     .await?;
-    if built.binding().frozen_identity() != &selected.identity {
-        return Err(bad("the provider changed after update identity admission"));
-    }
-    let receipt = stage_and_publish(
-        cx,
-        &root,
-        &selected.root,
-        &receipt_path,
-        &built,
-        Some(&snapshot),
-        options.max_image_bytes,
-    )?;
+    let receipt = published.receipt;
     emit(
         output,
         &serde_json::json!({
             "schema": SCHEMA, "ok": true, "event": "updated", "publication": "committed",
-            "serving": "activated", "retrieval": retrieval_name(built.retrieval_mode()),
+            "serving": "activated", "retrieval": retrieval_name(published.snapshot.retrieval_mode()),
             "receipt": receipt_path, "replaces": selected.authority,
             "documents": document_count, "edited_ids": edit_count, "selection": receipt,
         }),
@@ -1577,10 +1779,24 @@ struct AuthorityActivateRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityUpdateRequest {
+    op: String,
+    id: Option<String>,
+    expected_authority: Vec<u8>,
+    work_dir: PathBuf,
+    new_receipt: PathBuf,
+    source_low: u64,
+    source_high: u64,
+    changes: Vec<mutations::Mutation>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum AuthorityRequest {
     Search(AuthoritySearchRequest),
     Activate(AuthorityActivateRequest),
+    Update(AuthorityUpdateRequest),
 }
 
 #[derive(Debug)]
@@ -1653,6 +1869,7 @@ struct AuthoritySession {
     fixed_filter: Option<Filter>,
     scope: Option<NativeScopedGenerationSnapshot>,
     allow_activation: bool,
+    update_limits: Option<AuthorityUpdateLimits>,
 }
 
 impl AuthoritySession {
@@ -1685,6 +1902,7 @@ impl AuthoritySession {
             || limits.1 == 0
             || image_bytes.is_none_or(|bytes| bytes > budget || bytes > receipt.image_bytes)
             || retained.root_id() != receipt.root_id
+            || retained.selected_predecessor_of().is_some()
             || retained.profile().as_str() != receipt.profile
             || snapshot.authority() != receipt.authority()?
             || snapshot.tier() != receipt.tier
@@ -1709,7 +1927,19 @@ impl AuthoritySession {
             fixed_filter: None,
             scope: None,
             allow_activation,
+            update_limits: None,
         })
+    }
+
+    fn with_updates(mut self, batch_size: usize, max_source_bytes: usize) -> Result<Self> {
+        if batch_size == 0 || batch_size > MAX_DOCUMENTS || max_source_bytes == 0 {
+            return Err(serve_refused("invalid_update_limits"));
+        }
+        self.update_limits = Some(AuthorityUpdateLimits {
+            batch_size,
+            max_source_bytes,
+        });
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -1770,6 +2000,32 @@ impl AuthoritySession {
         response
     }
 
+    fn update_failure(
+        &self,
+        ordinal: u64,
+        id: Option<&str>,
+        error: &(dyn Error + 'static),
+    ) -> serde_json::Value {
+        let mut response = self.failure(ordinal, id, error, "update_refused");
+        response["publication"] = serde_json::json!("not_committed");
+        response["serving"] = serde_json::json!("not_activated");
+        if let Some(failure) = publication_failure(error) {
+            // This is the private publisher outcome, not provider/request text.
+            // Keep the retained serving authority separate from the candidate.
+            response["code"] = serde_json::json!("update_publication_failed");
+            response["publication"] = failure["publication"].clone();
+            response["serving"] = failure["serving"].clone();
+            response["candidate_authority"] = failure["authority"].clone();
+            if let Some(receipt) = failure.get("receipt") {
+                response["receipt"] = receipt.clone();
+            }
+            if let Some(attempt) = failure.get("attempt") {
+                response["attempt"] = attempt.clone();
+            }
+        }
+        response
+    }
+
     async fn query(
         &self,
         cx: &Cx,
@@ -1818,6 +2074,113 @@ impl AuthoritySession {
         };
         checkpoint(cx)?;
         Ok((results, scope.map(NativeScopedGenerationSnapshot::len)))
+    }
+
+    async fn update(
+        &mut self,
+        cx: &Cx,
+        request: AuthorityUpdateRequest,
+    ) -> Result<serde_json::Value> {
+        checkpoint(cx)?;
+        let limits = self
+            .update_limits
+            .ok_or_else(|| serve_refused("updates_disabled"))?;
+        super::serve::validate_id(request.id.as_deref())
+            .map_err(|_| serve_refused("invalid_request_id"))?;
+        if request.op != "update" {
+            return Err(serve_refused("invalid_update_request"));
+        }
+        for path in [&request.work_dir, &request.new_receipt] {
+            if !path.is_absolute()
+                || path
+                    .to_str()
+                    .is_none_or(|text| text.len() > 4096 || text.contains('\0'))
+            {
+                return Err(serve_refused("invalid_update_request"));
+            }
+        }
+        let expected = AuthorityRefV1::from_canonical_bytes(&request.expected_authority)
+            .map_err(|_| serve_refused("invalid_expected_authority"))?;
+        if expected != self.snapshot.authority() {
+            return Err(serve_refused("stale_expected_authority"));
+        }
+        if request.changes.len() > MAX_AUTHORITY_MUTATIONS {
+            return Err(serve_refused("update_mutation_limit"));
+        }
+        let edits = mutations::from_mutations(request.changes)
+            .map_err(|_| serve_refused("invalid_update_mutations"))?;
+        // A warm reader can intentionally outlive the head. Confirm that it is
+        // still the exact writable base without adopting any refreshed pair.
+        // The opener also refuses an unresolved previous publication attempt.
+        let current = self
+            .receipt
+            .open_on_root(cx, &self.root, self.max_image_bytes)
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<SearchError>()
+                    .is_some_and(|error| matches!(error, SearchError::Cancelled { .. }))
+                {
+                    error
+                } else {
+                    serve_refused("update_base_not_current")
+                }
+            })?;
+        if current
+            .retained_snapshot()
+            .selected_predecessor_of()
+            .is_some()
+            || current.retained_snapshot().authority_pair()
+                != self.snapshot.retained_snapshot().authority_pair()
+        {
+            return Err(serve_refused("update_base_changed"));
+        }
+        drop(current);
+        let prepared = prepare_authority_update(
+            cx,
+            &self.receipt,
+            &self.snapshot,
+            AuthorityUpdateSpec {
+                work: request.work_dir,
+                receipt: request.new_receipt,
+                source: CommitRange {
+                    low: request.source_low,
+                    high: request.source_high,
+                },
+                limits,
+                max_image_bytes: self.max_image_bytes,
+            },
+            || Ok(edits),
+        )?;
+        let document_count = prepared.document_count;
+        let edit_count = prepared.edits.len();
+        let receipt_path = prepared.spec.receipt.clone();
+        let published = Box::pin(build_and_publish_update(
+            cx,
+            &self.root,
+            &self.receipt,
+            &self.snapshot,
+            prepared,
+            Arc::clone(&self.model),
+            self.fixed_filter
+                .as_ref()
+                .map(|filter| (filter, self.max_source_bytes)),
+        ))
+        .await?;
+        // This is the exact admitted result returned by publication. Do not
+        // reopen the head, revalidate mutable paths, or checkpoint after commit.
+        // The request loop owns all three fields until terminal acknowledgement.
+        self.receipt = published.receipt;
+        self.snapshot = published.snapshot;
+        self.scope = published.scope;
+        let mut response = self.response("updated", true, None, request.id.as_deref());
+        response["publication"] = serde_json::json!("committed");
+        response["serving"] = serde_json::json!("activated");
+        response["previous_authority"] = serde_json::json!(expected.canonical_bytes().as_slice());
+        response["receipt"] = serde_json::json!(receipt_path);
+        response["selection"] = serde_json::json!(self.receipt);
+        response["documents"] = serde_json::json!(document_count);
+        response["edited_ids"] = serde_json::json!(edit_count);
+        Ok(response)
     }
 
     fn activate(&mut self, cx: &Cx, request: &AuthorityActivateRequest) -> Result<()> {
@@ -1881,6 +2244,21 @@ impl AuthoritySession {
     }
 }
 
+fn emit_authority_response(output: &mut impl Write, response: &serde_json::Value) -> Result<()> {
+    emit(output, response).map_err(|error| {
+        if response.get("publication").is_none() {
+            return error;
+        }
+        // A broken output channel ends the session. Preserve the known effect
+        // instead of replacing committed/unknown with an ordinary I/O failure.
+        let mut payload = response.clone();
+        payload["ok"] = serde_json::json!(false);
+        payload["event"] = serde_json::json!("publication");
+        payload["reason"] = serde_json::json!("result_delivery_failed");
+        Box::new(PublicationFailure(payload)) as Box<dyn Error + Send + Sync>
+    })
+}
+
 async fn serve_session(
     cx: &Cx,
     session: &mut AuthoritySession,
@@ -1892,6 +2270,12 @@ async fn serve_session(
     let mut ready = session.response("ready", true, None, None);
     ready["documents"] = serde_json::json!(session.receipt.documents);
     ready["activation_enabled"] = serde_json::json!(session.allow_activation);
+    ready["updates_enabled"] = serde_json::json!(session.update_limits.is_some());
+    if let Some(limits) = session.update_limits {
+        ready["max_mutations"] = serde_json::json!(MAX_AUTHORITY_MUTATIONS);
+        ready["update_batch_size"] = serde_json::json!(limits.batch_size);
+        ready["max_source_bytes"] = serde_json::json!(limits.max_source_bytes);
+    }
     ready["default_limit"] = serde_json::json!(session.default_limit);
     ready["max_source_bytes"] = serde_json::json!(session.max_source_bytes);
     ready["max_request_bytes"] = serde_json::json!(super::serve::MAX_REQUEST_BYTES);
@@ -1917,39 +2301,61 @@ async fn serve_session(
                 continue;
             }
         };
-        let (id, result) = match &request {
+        let (id, result, is_update) = match request {
             AuthorityRequest::Search(request) => {
                 let id = request
                     .id
-                    .as_deref()
+                    .clone()
                     .filter(|id| super::serve::validate_id(Some(id)).is_ok());
-                let result = session.query(cx, request).await.map(|(results, eligible)| {
-                    let mut response = session.response("results", true, Some(ordinal), id);
-                    response["results"] = serde_json::json!(results);
-                    annotate_scope(&mut response, eligible);
-                    response
-                });
-                (id, result)
+                let result = session
+                    .query(cx, &request)
+                    .await
+                    .map(|(results, eligible)| {
+                        let mut response =
+                            session.response("results", true, Some(ordinal), id.as_deref());
+                        response["results"] = serde_json::json!(results);
+                        annotate_scope(&mut response, eligible);
+                        response
+                    });
+                (id, result, false)
             }
             AuthorityRequest::Activate(request) => {
                 let id = request
                     .id
-                    .as_deref()
+                    .clone()
                     .filter(|id| super::serve::validate_id(Some(id)).is_ok());
                 let previous = session.snapshot.authority();
-                let result = session.activate(cx, request).map(|()| {
-                    let mut response = session.response("activated", true, Some(ordinal), id);
+                let result = session.activate(cx, &request).map(|()| {
+                    let mut response =
+                        session.response("activated", true, Some(ordinal), id.as_deref());
                     response["previous_authority"] =
                         serde_json::json!(previous.canonical_bytes().as_slice());
                     response["documents"] = serde_json::json!(session.receipt.documents);
                     response
                 });
-                (id, result)
+                (id, result, false)
+            }
+            AuthorityRequest::Update(request) => {
+                let id = request
+                    .id
+                    .clone()
+                    .filter(|id| super::serve::validate_id(Some(id)).is_ok());
+                let result = Box::pin(session.update(cx, request))
+                    .await
+                    .map(|mut response| {
+                        response["request"] = serde_json::json!(ordinal);
+                        response
+                    });
+                (id, result, true)
             }
         };
-        checkpoint(cx)?;
+        // Updates may already have committed, or returned a typed uncertain
+        // publication outcome. Neither can be erased by a late cancellation.
+        if !is_update {
+            checkpoint(cx)?;
+        }
         match result {
-            Ok(response) => emit(output, &response)?,
+            Ok(response) => emit_authority_response(output, &response)?,
             Err(error) => {
                 if error
                     .downcast_ref::<SearchError>()
@@ -1957,10 +2363,17 @@ async fn serve_session(
                 {
                     return Err(error);
                 }
-                emit(
-                    output,
-                    &session.failure(ordinal, id, error.as_ref(), "query_or_activation_refused"),
-                )?;
+                let response = if is_update {
+                    session.update_failure(ordinal, id.as_deref(), error.as_ref())
+                } else {
+                    session.failure(
+                        ordinal,
+                        id.as_deref(),
+                        error.as_ref(),
+                        "query_or_activation_refused",
+                    )
+                };
+                emit_authority_response(output, &response)?;
             }
         }
     }
@@ -2003,6 +2416,9 @@ async fn serve(
         (options.limit, options.max_image_bytes),
         options.allow_activation,
     )?;
+    if options.allow_updates {
+        session = session.with_updates(options.batch_size, options.max_source_bytes)?;
+    }
     session.scope = scope;
     session.fixed_filter = options.filter.clone();
     session.max_source_bytes = options.max_source_bytes;
