@@ -105,7 +105,8 @@ mkdir -m 700 "$HOME/frankensearch-authority"
   --query 'retry network requests' --limit 10
 ```
 
-`--cooperative-local` is required when publishing. It declares that the caller
+`--cooperative-local` is required by `authority-index` when creating the root.
+Rebuilds and updates inherit the recorded profile. It declares that the caller
 owns the local root and that this command supplies no external anti-rollback
 service. This choice is persisted in the receipt. Search cannot change the
 receipt's security profile, generation, authority, producer identity, or tier.
@@ -190,7 +191,7 @@ bytes; nonempty titles and content are preserved exactly. Embeddings consume
 document content. Missing or malformed fields refuse the whole rebuild before
 model loading, inference, or creation of the new work directory.
 
-`--max-source-bytes N` is available only with `--retained-source` and defaults to
+`--max-source-bytes N` on rebuild is available only with `--retained-source` and defaults to
 256 MiB. It bounds the sum of raw stored `id`, `content`, `title`, and
 `metadata_json` bytes, including JSON punctuation and escaping in the metadata
 field, checked before decoding each field. The budget does not bound process
@@ -218,6 +219,88 @@ receipt to try a new replacement. Successful output has `event: "rebuilt"`,
 whether the model identity changed. The `source` field is `"retained_generation"`
 for retained-source rebuilding and `"input"` for replacement JSONL. A later
 output failure still reports the known commit.
+
+### Incremental authority upserts and deletes
+
+`authority-update` applies a JSONL delta to the exact generation selected by
+`--from-receipt`. It recovers the complete source from the retained Quill image
+and reuses the stored vectors for unchanged document content. Title and metadata
+changes update the retained source and lexical image without document inference.
+Only the final new or changed content for each ID is embedded.
+
+An input file can contain:
+
+```jsonl
+{"op":"upsert","id":"retry-guide","content":"Retry transient failures with bounded exponential backoff.","title":"Retry guide","metadata":{"version":"2"}}
+{"op":"delete","id":"obsolete-guide"}
+{"op":"upsert","id":"new-guide","content":"Use jitter to spread retries across clients."}
+```
+
+An upsert replaces the complete document, including its title and metadata.
+Omitted optional fields use their empty defaults. The last operation for each
+ID wins, but every input record must still be valid, including records later
+overwritten by another edit. Deleting an absent ID has no effect.
+
+```sh
+./target/release/frankensearch-native authority-update \
+  --from-receipt "$HOME/frankensearch-authority/g2.json" \
+  --work-dir "$HOME/frankensearch-authority/g3-work" \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --source-low 1 --source-high 63 \
+  --input ./edits.jsonl \
+  --model-dir /absolute/path/to/installed/models
+./target/release/frankensearch-native authority-search \
+  --receipt "$HOME/frankensearch-authority/g3.json" \
+  --model-dir /absolute/path/to/installed/models \
+  --query 'retry transient failures' --limit 10
+```
+
+Omit `--input` to read bounded JSONL from standard input. Both source checkpoint
+boundaries are required and must be at least their selected predecessor values.
+An empty delta can advance the checkpoint with zero document inference. A delta
+that deletes the entire cohort is refused before model loading or creation of
+the new work directory because this generation metadata contract requires a
+nonempty cohort.
+
+The selected generation fixes the root, security profile, tier, complete
+producer identity, F16/F32 vector encoding, and retrieval policy, including all
+HNSW parameters and the seed. The matching local model is required even for
+metadata-only updates; quality-only generations load their quality model
+directly. Use `authority-rebuild` for an intentional producer migration or
+retrieval-policy change. Original input files and original build work
+directories are unnecessary.
+
+The input delta is limited to 256 MiB, with 16 MiB per encoded record and
+100,000 distinct edited IDs. The complete merged source is independently
+limited to 100,000 documents and 256 MiB of encoded JSONL, so repeated small
+updates cannot exceed the cohort limit. `--max-source-bytes` separately bounds
+raw source export from the predecessor, using the same 256 MiB default and
+field accounting described for retained-source rebuilds. Final source bounds,
+malformed input, stale receipt selection and backward checkpoints are checked
+before loading the model. `--batch-size` controls inference batches;
+`--max-image-bytes` bounds component admission.
+
+Vector reuse saves document inference. Every successor still writes and admits
+complete FSVI, Quill, metadata and optional HNSW images. The new work directory
+and receipt must be separate from each other and from the selected root.
+Existing snapshots retain their original source, vectors and graph throughout
+the update and after publication.
+
+Publication uses the exact authority pair captured before reading input or
+loading the model. A competing publication produces `not_committed`; the
+command retains the losing attempt's recovery receipt and preserves the
+winner. Retry from the winning receipt explicitly. A successful response has
+`event: "updated"`, `publication: "committed"`, `serving: "activated"`,
+the new `selection`, the replaced authority, the final `documents` count,
+and `edited_ids` after last-operation resolution. A result-output failure
+preserves known publication and activation status.
+
+Library callers can prepare the same transaction through
+`NativeGenerationSnapshot::begin_update(&cx, work_dir, generation, provider, max_source_bytes)`,
+apply `upsert_document` / `delete_document`, and call
+`NativeIndexUpdate::build_exact_generation(&cx, tier, source, max_image_bytes)`.
+The returned complete generation is ready for the ordinary expected-authority
+publisher; building it does not itself select a new authority.
 
 ### Keep an authority generation warm across requests
 

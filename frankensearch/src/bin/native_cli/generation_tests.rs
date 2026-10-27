@@ -83,6 +83,24 @@ fn rebuild_arguments() -> Vec<&'static str> {
     ]
 }
 
+fn update_arguments() -> Vec<&'static str> {
+    vec![
+        "authority-update",
+        "--from-receipt",
+        "selected.json",
+        "--work-dir",
+        "new-work",
+        "--receipt",
+        "new.json",
+        "--input",
+        "edits.jsonl",
+        "--source-low",
+        "2",
+        "--source-high",
+        "8",
+    ]
+}
+
 fn retained_rebuild_arguments() -> Vec<&'static str> {
     vec![
         "authority-rebuild",
@@ -94,6 +112,76 @@ fn retained_rebuild_arguments() -> Vec<&'static str> {
         "new.json",
         "--retained-source",
     ]
+}
+
+#[test]
+fn authority_update_requires_an_explicit_checkpoint_and_inherits_selected_policy() {
+    let arguments = update_arguments();
+    let options = parse(&arguments).unwrap().unwrap();
+    assert_eq!(options.command, Command::Update);
+    assert_eq!(
+        options.from_receipt.as_deref(),
+        Some(Path::new("selected.json"))
+    );
+    assert_eq!(options.input.as_deref(), Some(Path::new("edits.jsonl")));
+    assert_eq!(
+        options.source_cut().unwrap(),
+        CommitRange { low: 2, high: 8 }
+    );
+    assert_eq!(options.max_source_bytes, crate::MAX_INPUT_BYTES);
+    assert!(options.root.is_none());
+    assert!(options.tier.is_none());
+    assert!(options.retrieval.is_none());
+    assert!(!options.migrate_model);
+    assert!(!options.retained_source);
+    assert!(is_command("authority-update"));
+    assert!(parse(&["authority-update", "--help"]).unwrap().is_none());
+
+    let mut stdin = arguments.clone();
+    let input = stdin
+        .iter()
+        .position(|argument| *argument == "--input")
+        .unwrap();
+    stdin.drain(input..input + 2);
+    assert!(parse(&stdin).unwrap().unwrap().input.is_none());
+
+    let mut bounded = arguments.clone();
+    bounded.extend(["--max-source-bytes", "4096", "--batch-size", "2"]);
+    let options = parse(&bounded).unwrap().unwrap();
+    assert_eq!(options.max_source_bytes, 4096);
+    assert_eq!(options.batch_size, 2);
+    for required in [
+        "--from-receipt",
+        "--work-dir",
+        "--receipt",
+        "--source-low",
+        "--source-high",
+    ] {
+        let mut missing = arguments.clone();
+        let position = missing
+            .iter()
+            .position(|argument| *argument == required)
+            .unwrap();
+        missing.drain(position..position + 2);
+        assert!(parse(&missing).is_err(), "accepted missing {required}");
+    }
+    for extra in [
+        vec!["--root", "other-root"],
+        vec!["--tier", "quality"],
+        vec!["--retrieval", "exact"],
+        vec!["--retrieval", "hnsw"],
+        vec!["--migrate-model"],
+        vec!["--retained-source"],
+        vec!["--cooperative-local"],
+        vec!["--allow-activation"],
+        vec!["--max-source-bytes", "0"],
+        vec!["--batch-size", "0"],
+        vec!["--source-high", "9"],
+    ] {
+        let mut rejected = arguments.clone();
+        rejected.extend(extra);
+        assert!(parse(&rejected).is_err(), "{rejected:?}");
+    }
 }
 
 #[test]
@@ -1565,6 +1653,568 @@ mod warm_authority {
             identity: identity().identity,
             calls: AtomicUsize::new(0),
         })
+    }
+
+    fn update_options(parent: &Path, previous: &Path, label: &str, input: &Path) -> Options {
+        let mut options = parse(&update_arguments()).unwrap().unwrap();
+        options.from_receipt = Some(previous.to_path_buf());
+        options.work = Some(parent.join(format!("{label}-work")));
+        options.receipt = parent.join(format!("{label}.json"));
+        options.input = Some(input.to_path_buf());
+        options
+    }
+
+    #[test]
+    fn authority_updates_reuse_unchanged_documents_and_publish_complete_successors() {
+        use frankensearch_core::generation::GenerationComponentRole;
+        use frankensearch_index::generation_root::generation_reader::component_object_name_v1;
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (tier_name, tier) in [
+                ("fast", EmbedderTierTag::Fast),
+                ("quality", EmbedderTierTag::Quality),
+            ] {
+                for ann in [false, true] {
+                    let parent = private_parent(&format!("update-{tier_name}-{ann}"));
+                    let root_path = parent.join("root");
+                    let root = create_root(&root_path).expect("qualified Linux root is required");
+                    let provider = provider();
+                    let model: Arc<dyn Embedder> = provider.clone();
+                    let params = HnswParams {
+                        m: 4,
+                        m0: 8,
+                        ef_construction: 24,
+                        ef_search: 12,
+                    };
+                    let retrieval = if ann {
+                        NativeBuildRetrieval::Hnsw { params, seed: 671 }
+                    } else {
+                        NativeBuildRetrieval::Exact
+                    };
+                    let precision = if ann {
+                        NativeBuildPrecision::F16
+                    } else {
+                        NativeBuildPrecision::F32
+                    };
+                    let mut metadata =
+                        IndexableDocument::new("metadata", "retry persistent source")
+                            .with_metadata("version", "old");
+                    metadata.title = Some("Original title".to_owned());
+                    let initial_work = parent.join("initial-work");
+                    let initial =
+                        NativeIndexBuilder::new(&initial_work, new_generation(1).unwrap(), model)
+                            .unwrap()
+                            .with_fast_storage(precision, retrieval)
+                            .add_documents([
+                                IndexableDocument::new("keep", "garden flowers")
+                                    .with_metadata("version", "unchanged"),
+                                IndexableDocument::new("changed", "garden older chapter"),
+                                IndexableDocument::new("removed", "retry obsolete requests"),
+                                metadata,
+                            ])
+                            .build_exact_generation(
+                                &cx,
+                                tier,
+                                CommitRange { low: 2, high: 7 },
+                                DEFAULT_IMAGE_BYTES,
+                            )
+                            .await
+                            .unwrap();
+                    assert_eq!(provider.calls.load(Ordering::Relaxed), 4);
+                    let first_path = parent.join("initial.json");
+                    let selected = stage_and_publish(
+                        &cx,
+                        &root,
+                        &root_path,
+                        &first_path,
+                        &initial,
+                        None,
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .unwrap();
+                    let retained = selected
+                        .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                        .unwrap();
+                    let first_receipt_bytes = fs::read(&first_path).unwrap();
+                    let components = retained.retained_snapshot().manifest().components();
+                    let old_objects = [
+                        (GenerationComponentRole::Vector, components.vector),
+                        (GenerationComponentRole::Lexical, components.lexical),
+                    ]
+                    .map(|(role, receipt)| {
+                        let path = root_path.join(component_object_name_v1(role, receipt.sha256));
+                        let bytes = fs::read(&path).unwrap();
+                        (path, bytes)
+                    });
+                    drop(initial);
+                    fs::rename(&initial_work, parent.join("archived-initial-work")).unwrap();
+
+                    // These are document inference calls, not a claim that a
+                    // freshly loaded registered model skips its own self-test.
+                    let metadata_input = parent.join("metadata.jsonl");
+                    fs::write(
+                        &metadata_input,
+                        concat!(
+                            "{\"op\":\"upsert\",\"id\":\"metadata\",\"content\":\"retry persistent source\",",
+                            "\"title\":\"Refreshed unique title\",\"metadata\":{\"version\":\"new\"}}\n",
+                            "{\"op\":\"upsert\",\"id\":\"keep\",\"content\":\"garden flowers\",",
+                            "\"metadata\":{\"version\":\"unchanged\"}}\n",
+                            "{\"op\":\"delete\",\"id\":\"already-absent\"}\n",
+                        ),
+                    )
+                    .unwrap();
+                    let mut metadata_options =
+                        update_options(&parent, &first_path, "metadata", &metadata_input);
+                    metadata_options.source_high = Some(7);
+                    let before_metadata = provider.calls.load(Ordering::Relaxed);
+                    let model: Arc<dyn Embedder> = provider.clone();
+                    let mut output = Vec::new();
+                    update_generation_with_loader(
+                        &cx,
+                        &metadata_options,
+                        &mut output,
+                        |requested| {
+                            assert_eq!(requested, tier);
+                            Ok(model)
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(provider.calls.load(Ordering::Relaxed), before_metadata);
+                    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    assert_eq!(report["event"], "updated");
+                    assert_eq!(report["publication"], "committed");
+                    assert_eq!(report["serving"], "activated");
+                    let second = Receipt::read(&metadata_options.receipt).unwrap();
+                    assert_eq!(second.identity, selected.identity);
+                    let second_snapshot = second
+                        .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                        .unwrap();
+                    assert_eq!(
+                        second_snapshot.metadata().commit_range,
+                        CommitRange { low: 2, high: 7 }
+                    );
+                    let title_hits = second_snapshot
+                        .search_text(&cx, provider.as_ref(), "Refreshed unique title", 4)
+                        .await
+                        .unwrap();
+                    assert!(
+                        title_hits
+                            .iter()
+                            .find(|hit| hit.doc_id == "metadata")
+                            .unwrap()
+                            .lexical_score
+                            .is_some_and(|score| score > 0.0)
+                    );
+
+                    let edits = parent.join("mixed.jsonl");
+                    fs::write(
+                        &edits,
+                        concat!(
+                            "{\"op\":\"upsert\",\"id\":\"changed\",\"content\":\"superseded temporary body\"}\n",
+                            "{\"op\":\"upsert\",\"id\":\"fresh\",\"content\":\"superseded temporary new body\"}\n",
+                            "{\"op\":\"delete\",\"id\":\"fresh\"}\n",
+                            "{\"op\":\"delete\",\"id\":\"removed\"}\n",
+                            "{\"op\":\"upsert\",\"id\":\"changed\",\"content\":\"retry revised network\"}\n",
+                            "{\"op\":\"upsert\",\"id\":\"fresh\",\"content\":\"garden fresh flowers\"}\n",
+                        ),
+                    )
+                    .unwrap();
+                    let options =
+                        update_options(&parent, &metadata_options.receipt, "mixed", &edits);
+                    let before_mixed = provider.calls.load(Ordering::Relaxed);
+                    let model: Arc<dyn Embedder> = provider.clone();
+                    output.clear();
+                    update_generation_with_loader(&cx, &options, &mut output, |requested| {
+                        assert_eq!(requested, tier);
+                        Ok(model)
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(
+                        provider.calls.load(Ordering::Relaxed),
+                        before_mixed + 2,
+                        "only final changed/new bodies may be submitted to the provider"
+                    );
+                    let committed = Receipt::read(&options.receipt).unwrap();
+                    assert_eq!(committed.identity, selected.identity);
+                    assert_eq!(committed.tier, tier);
+                    assert_eq!(committed.documents, 4);
+                    assert_eq!(committed.authority().unwrap().sequence, 3);
+                    let active = committed.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(
+                        active.metadata().commit_range,
+                        CommitRange { low: 2, high: 8 }
+                    );
+                    match active.retrieval_configuration() {
+                        NativeBuildRetrieval::Hnsw {
+                            params: actual,
+                            seed,
+                        } => {
+                            assert!(ann);
+                            assert_eq!(actual, params);
+                            assert_eq!(seed, 671);
+                        }
+                        NativeBuildRetrieval::Exact => assert!(!ann),
+                    }
+                    let source = active
+                        .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                        .unwrap();
+                    assert_eq!(
+                        source
+                            .iter()
+                            .map(|document| document.id.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(["changed", "fresh", "keep", "metadata"])
+                    );
+                    let kept = source
+                        .iter()
+                        .find(|document| document.id == "keep")
+                        .unwrap();
+                    assert_eq!(kept.content, "garden flowers");
+                    assert_eq!(kept.metadata.get("version").unwrap(), "unchanged");
+                    let metadata = source
+                        .iter()
+                        .find(|document| document.id == "metadata")
+                        .unwrap();
+                    assert_eq!(metadata.content, "retry persistent source");
+                    assert_eq!(metadata.title.as_deref(), Some("Refreshed unique title"));
+                    assert_eq!(metadata.metadata.get("version").unwrap(), "new");
+                    assert_eq!(
+                        source
+                            .iter()
+                            .find(|document| document.id == "changed")
+                            .unwrap()
+                            .content,
+                        "retry revised network"
+                    );
+                    let current_hits = active
+                        .search_text(&cx, provider.as_ref(), "retry revised network", 4)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        current_hits
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(["changed", "fresh", "keep", "metadata"])
+                    );
+                    let changed = current_hits
+                        .iter()
+                        .find(|hit| hit.doc_id == "changed")
+                        .unwrap();
+                    let semantic_score = match tier {
+                        EmbedderTierTag::Fast => changed.fast_score,
+                        EmbedderTierTag::Quality => changed.quality_score,
+                    };
+                    assert_eq!(semantic_score, Some(1.0));
+                    assert!(changed.lexical_score.is_some_and(|score| score > 0.0));
+                    let old_hits = retained
+                        .search_text(&cx, provider.as_ref(), "retry revised network", 4)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        old_hits
+                            .iter()
+                            .map(|hit| hit.doc_id.as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(["changed", "keep", "metadata", "removed"])
+                    );
+                    let old_changed = old_hits.iter().find(|hit| hit.doc_id == "changed").unwrap();
+                    assert_eq!(
+                        match tier {
+                            EmbedderTierTag::Fast => old_changed.fast_score,
+                            EmbedderTierTag::Quality => old_changed.quality_score,
+                        },
+                        Some(0.0)
+                    );
+                    let old_source = retained
+                        .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                        .unwrap();
+                    let old_metadata = old_source
+                        .iter()
+                        .find(|document| document.id == "metadata")
+                        .unwrap();
+                    assert_eq!(old_metadata.title.as_deref(), Some("Original title"));
+                    assert_eq!(old_metadata.metadata.get("version").unwrap(), "old");
+                    assert_eq!(fs::read(&first_path).unwrap(), first_receipt_bytes);
+                    for (path, bytes) in &old_objects {
+                        assert_eq!(fs::read(path).unwrap(), *bytes);
+                    }
+
+                    // Superseded command receipts must fail before attempting
+                    // the deliberately missing delta or local model directory.
+                    let mut stale =
+                        update_options(&parent, &first_path, "stale", &parent.join("absent.jsonl"));
+                    stale.models = Some(parent.join("absent-models"));
+                    output.clear();
+                    let before_stale = provider.calls.load(Ordering::Relaxed);
+                    let authority_before = fs::read(root_path.join("AUTHORITY")).unwrap();
+                    let error = update_generation(&cx, &stale, &mut output, None)
+                        .await
+                        .unwrap_err();
+                    assert!(error.to_string().contains("head differs"));
+                    assert!(output.is_empty());
+                    assert!(!stale.work.as_ref().unwrap().exists());
+                    assert!(!stale.receipt.exists());
+                    assert_eq!(provider.calls.load(Ordering::Relaxed), before_stale);
+                    assert_eq!(
+                        fs::read(root_path.join("AUTHORITY")).unwrap(),
+                        authority_before
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn authority_update_preflight_preserves_selection_before_loading_models_or_staging() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier) in [
+                ("update-preflight-fast", EmbedderTierTag::Fast),
+                ("update-preflight-quality", EmbedderTierTag::Quality),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let selected =
+                    publish(&cx, &parent, None, &provider, tier, "baseline", false).await;
+                let first_path = parent.join("baseline.json");
+                let root_path = parent.join("root");
+                let authority_before = fs::read(root_path.join("AUTHORITY")).unwrap();
+                let receipt_before = fs::read(&first_path).unwrap();
+                let calls = provider.calls.load(Ordering::Relaxed);
+                let ordinary = parent.join("ordinary.jsonl");
+                fs::write(&ordinary, "{\"op\":\"delete\",\"id\":\"absent\"}\n").unwrap();
+                let deletes = parent.join("deletes.jsonl");
+                fs::write(
+                    &deletes,
+                    concat!(
+                        "{\"op\":\"upsert\",\"id\":\"retry-baseline\",\"content\":\"discarded\"}\n",
+                        "{\"op\":\"delete\",\"id\":\"retry-baseline\"}\n",
+                        "{\"op\":\"delete\",\"id\":\"garden-baseline\"}\n",
+                    ),
+                )
+                .unwrap();
+                let malformed = parent.join("malformed.jsonl");
+                fs::write(
+                    &malformed,
+                    concat!(
+                        "{\"op\":\"upsert\",\"id\":\"retry-baseline\",\"content\":7}\n",
+                        "{\"op\":\"upsert\",\"id\":\"retry-baseline\",\"content\":\"valid final edit\"}\n",
+                    ),
+                )
+                .unwrap();
+                let absent = parent.join("absent.jsonl");
+                for (name, input, low, high, budget, reason) in [
+                    (
+                        "backward",
+                        &absent,
+                        0,
+                        5,
+                        crate::MAX_INPUT_BYTES,
+                        "backward",
+                    ),
+                    ("source-budget", &ordinary, 1, 5, 1, "stored-payload-limit"),
+                    (
+                        "delete-all",
+                        &deletes,
+                        1,
+                        5,
+                        crate::MAX_INPUT_BYTES,
+                        "nonempty",
+                    ),
+                    (
+                        "invalid-overwritten",
+                        &malformed,
+                        1,
+                        5,
+                        crate::MAX_INPUT_BYTES,
+                        "invalid update",
+                    ),
+                ] {
+                    let mut options = update_options(&parent, &first_path, name, input);
+                    options.source_low = Some(low);
+                    options.source_high = Some(high);
+                    options.max_source_bytes = budget;
+                    let attempts = AtomicUsize::new(0);
+                    let mut output = Vec::new();
+                    let error = update_generation_with_loader(&cx, &options, &mut output, |_| {
+                        attempts.fetch_add(1, Ordering::Relaxed);
+                        Err(bad("preflight must finish before model loading"))
+                    })
+                    .await
+                    .unwrap_err();
+                    assert!(error.to_string().contains(reason), "{name}: {error}");
+                    assert_eq!(attempts.load(Ordering::Relaxed), 0, "{name}");
+                    assert_eq!(provider.calls.load(Ordering::Relaxed), calls, "{name}");
+                    assert!(output.is_empty(), "{name}");
+                    assert!(!options.work.as_ref().unwrap().exists(), "{name}");
+                    assert!(!options.receipt.exists(), "{name}");
+                    assert_eq!(
+                        fs::read(root_path.join("AUTHORITY")).unwrap(),
+                        authority_before
+                    );
+                    assert_eq!(fs::read(&first_path).unwrap(), receipt_before);
+                }
+
+                // A source checkpoint may advance without any document edits.
+                // The complete unchanged cohort still receives a new authority.
+                let empty = parent.join("empty.jsonl");
+                fs::write(&empty, b"\n \t\n").unwrap();
+                let mut options = update_options(&parent, &first_path, "checkpoint", &empty);
+                options.source_low = Some(1);
+                options.source_high = Some(6);
+                let model: Arc<dyn Embedder> = provider.clone();
+                update_generation_with_loader(&cx, &options, &mut Vec::new(), |_| Ok(model))
+                    .await
+                    .unwrap();
+                assert_eq!(provider.calls.load(Ordering::Relaxed), calls);
+                let advanced = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(advanced.identity, selected.identity);
+                assert_eq!(advanced.documents, 2);
+                assert_eq!(advanced.authority().unwrap().sequence, 2);
+                let snapshot = advanced.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    snapshot.metadata().commit_range,
+                    CommitRange { low: 1, high: 6 }
+                );
+                assert_eq!(
+                    snapshot
+                        .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                        .unwrap()
+                        .iter()
+                        .map(|document| document.id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["garden-baseline", "retry-baseline"])
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn authority_update_loses_to_publication_after_its_predecessor_was_admitted() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (label, tier) in [
+                ("update-race-fast", EmbedderTierTag::Fast),
+                ("update-race-quality", EmbedderTierTag::Quality),
+            ] {
+                let parent = private_parent(label);
+                let provider = provider();
+                let selected = publish(&cx, &parent, None, &provider, tier, "baseline", true).await;
+                let root_path = parent.join("root");
+                let root = admit_root(&root_path).unwrap();
+                let retained = selected
+                    .open_on_root(&cx, &root, DEFAULT_IMAGE_BYTES)
+                    .unwrap();
+                let model: Arc<dyn Embedder> = provider.clone();
+                let competitor = retained
+                    .begin_update(
+                        &cx,
+                        parent.join("winner-work"),
+                        new_generation(2).unwrap(),
+                        model,
+                        crate::MAX_INPUT_BYTES,
+                    )
+                    .unwrap()
+                    .upsert_document(IndexableDocument::new("winner", "retry concurrent winner"))
+                    .build_exact_generation(
+                        &cx,
+                        tier,
+                        CommitRange { low: 1, high: 6 },
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .await
+                    .unwrap();
+                let input = parent.join("loser.jsonl");
+                fs::write(
+                    &input,
+                    "{\"op\":\"upsert\",\"id\":\"loser\",\"content\":\"retry losing update\"}\n",
+                )
+                .unwrap();
+                let first_path = parent.join("baseline.json");
+                let receipt_before = fs::read(&first_path).unwrap();
+                let mut options = update_options(&parent, &first_path, "loser", &input);
+                options.source_low = Some(1);
+                options.source_high = Some(7);
+                let winner_path = parent.join("winner.json");
+                let mut winner = None;
+                let mut authority_after_winner = Vec::new();
+                let model: Arc<dyn Embedder> = provider.clone();
+                let mut output = Vec::new();
+                let before = provider.calls.load(Ordering::Relaxed);
+                let error =
+                    update_generation_with_loader(&cx, &options, &mut output, |requested| {
+                        assert_eq!(requested, tier);
+                        // The real command has already admitted its predecessor
+                        // and inputs. Publish the competing complete candidate
+                        // before allowing its model/load/build lane to proceed.
+                        winner = Some(stage_and_publish(
+                            &cx,
+                            &root,
+                            &root_path,
+                            &winner_path,
+                            &competitor,
+                            Some(&retained),
+                            DEFAULT_IMAGE_BYTES,
+                        )?);
+                        authority_after_winner = fs::read(root_path.join("AUTHORITY"))?;
+                        Ok(model)
+                    })
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    publication_failure(error.as_ref()).unwrap()["publication"],
+                    "not_committed"
+                );
+                assert!(output.is_empty());
+                assert_eq!(provider.calls.load(Ordering::Relaxed), before + 1);
+                assert_eq!(
+                    fs::read(root_path.join("AUTHORITY")).unwrap(),
+                    authority_after_winner
+                );
+                assert_eq!(fs::read(&first_path).unwrap(), receipt_before);
+                let losing_receipt = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(
+                    losing_receipt.recovery_attempt().unwrap().expected,
+                    retained.retained_snapshot().authority_pair()
+                );
+                let winner = winner.unwrap();
+                assert_ne!(
+                    losing_receipt.authority().unwrap(),
+                    winner.authority().unwrap()
+                );
+                let active = winner.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    active.metadata().commit_range,
+                    CommitRange { low: 1, high: 6 }
+                );
+                for snapshot in [&active, &retained] {
+                    let source = snapshot
+                        .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                        .unwrap();
+                    let hits = snapshot
+                        .search_text(&cx, provider.as_ref(), "retry", 10)
+                        .await
+                        .unwrap();
+                    assert!(source.iter().all(|document| document.id != "loser"));
+                    assert!(hits.iter().all(|hit| hit.doc_id != "loser"));
+                }
+                assert!(
+                    active
+                        .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                        .unwrap()
+                        .iter()
+                        .any(|document| document.id == "winner")
+                );
+                assert!(
+                    retained
+                        .source_documents(&cx, crate::MAX_INPUT_BYTES)
+                        .unwrap()
+                        .iter()
+                        .all(|document| document.id != "winner")
+                );
+            }
+        });
     }
 
     #[test]

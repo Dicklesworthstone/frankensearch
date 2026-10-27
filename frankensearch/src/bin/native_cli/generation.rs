@@ -46,8 +46,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::{
     MAX_DOCUMENTS, MAX_INPUT_BYTES, MAX_RECEIPT_BYTES, MAX_RECORD_BYTES, Result, SCHEMA, bad, emit,
-    encode, models, new_generation, new_path, positive as number, read_documents, validate_query,
-    value,
+    encode, execution_context, models, new_generation, new_path, positive as number,
+    read_documents, update as mutations, validate_query, value,
 };
 
 const RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v2";
@@ -65,6 +65,10 @@ const HELP: &str = "Fixed AUTHORITY search (one explicit semantic tier)\n\n\
       [--max-source-bytes N] [--batch-size N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--migrate-model] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
+  authority-update --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
+      --source-low N --source-high N [--input EDITS_JSONL]\n\
+      [--max-source-bytes N] [--batch-size N] [--max-image-bytes N]\n\
+      [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\n\
   authority-search --receipt JSON --query TEXT [--limit N]\n\
       [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
       [--max-image-bytes N]\n\n\
@@ -85,13 +89,20 @@ source cohort, and requires a new work directory and receipt outside the root.\n
 Source boundaries cannot regress. A different producer requires --migrate-model.\n\
 With --retained-source, rebuild reads complete stored documents from the admitted\n\
 generation and preserves its source checkpoint, without reading JSONL or stdin.\n\
-This excludes --input and --source-low/high. --max-source-bytes applies only to\n\
-this mode and defaults to 256 MiB of raw stored id/content/title/metadata bytes.\n\
+This excludes --input and --source-low/high. --max-source-bytes bounds retained\n\
+source for this mode and updates, defaulting to 256 MiB of raw stored source bytes.\n\
 The existing 100000-document and 16 MiB encoded-record limits still apply.\n\
 Rebuild inherits the admitted retrieval policy, including HNSW parameters and\n\
 seed, unless --retrieval explicitly selects exact or the default HNSW policy.\n\
 Concurrent publication refuses the captured old selection; retry explicitly\n\
 from the winning receipt. Rebuild never edits the old generation's images.\n\
+Update applies bounded upsert/delete JSONL to the retained source, with the last\n\
+operation for each ID winning. It reuses unchanged content vectors and preserves\n\
+the selected producer, tier, precision, and retrieval policy. Only changed or new\n\
+content is embedded; complete vector, graph, and Quill images are still produced.\n\
+The final cohort must be nonempty and satisfy the combined encoded-source limits.\n\
+Updates require nonbackward source checkpoints and a new work directory/receipt.\n\
+Use rebuild for producer or retrieval changes. Update never changes old images.\n\
 The root and its trusted parent must satisfy the qualified-root Linux ext4/btrfs\n\
 contract. Unsupported filesystems fail before indexing. Cooperative-local is\n\
 explicit: this command does not provide an external anti-rollback service.\n\
@@ -122,6 +133,7 @@ Work files remain available after completion or failure. Stdout is JSON.\n";
 enum Command {
     Index,
     Rebuild,
+    Update,
     Search,
     Serve,
     Recover,
@@ -156,6 +168,7 @@ pub fn is_command(command: &str) -> bool {
         command,
         "authority-index"
             | "authority-rebuild"
+            | "authority-update"
             | "authority-search"
             | "authority-serve"
             | "authority-recover"
@@ -168,6 +181,7 @@ impl Options {
         let command = match args.next().as_deref() {
             Some("authority-index") => Command::Index,
             Some("authority-rebuild") => Command::Rebuild,
+            Some("authority-update") => Command::Update,
             Some("authority-search") => Command::Search,
             Some("authority-serve") => Command::Serve,
             Some("authority-recover") => Command::Recover,
@@ -206,14 +220,14 @@ impl Options {
             }
             match flag.as_str() {
                 "--receipt" => options.receipt = PathBuf::from(value(&mut args)?),
-                "--from-receipt" if command == Command::Rebuild => {
+                "--from-receipt" if matches!(command, Command::Rebuild | Command::Update) => {
                     options.from_receipt = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--migrate-model" if command == Command::Rebuild => options.migrate_model = true,
                 "--retained-source" if command == Command::Rebuild => {
                     options.retained_source = true
                 }
-                "--max-source-bytes" if command == Command::Rebuild => {
+                "--max-source-bytes" if matches!(command, Command::Rebuild | Command::Update) => {
                     options.max_source_bytes = number(&value(&mut args)?, usize::MAX)?;
                 }
                 "--allow-activation" if command == Command::Serve => {
@@ -235,10 +249,14 @@ impl Options {
                 "--root" if command == Command::Index => {
                     options.root = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--work-dir" if matches!(command, Command::Index | Command::Rebuild) => {
+                "--work-dir"
+                    if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
+                {
                     options.work = Some(PathBuf::from(value(&mut args)?));
                 }
-                "--input" if matches!(command, Command::Index | Command::Rebuild) => {
+                "--input"
+                    if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
+                {
                     options.input = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--tier" if command == Command::Index => {
@@ -248,13 +266,19 @@ impl Options {
                         _ => return Err(bad("authority tier must be fast or quality")),
                     });
                 }
-                "--source-low" if matches!(command, Command::Index | Command::Rebuild) => {
+                "--source-low"
+                    if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
+                {
                     options.source_low = Some(source_sequence(&value(&mut args)?)?);
                 }
-                "--source-high" if matches!(command, Command::Index | Command::Rebuild) => {
+                "--source-high"
+                    if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
+                {
                     options.source_high = Some(source_sequence(&value(&mut args)?)?);
                 }
-                "--batch-size" if matches!(command, Command::Index | Command::Rebuild) => {
+                "--batch-size"
+                    if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
+                {
                     options.batch_size = number(&value(&mut args)?, MAX_DOCUMENTS)?;
                 }
                 "--retrieval" if matches!(command, Command::Index | Command::Rebuild) => {
@@ -322,6 +346,14 @@ impl Options {
                     }
                     options.source_cut()?;
                 }
+            }
+            Command::Update => {
+                if options.from_receipt.is_none() || options.work.is_none() {
+                    return Err(bad(
+                        "authority-update requires --from-receipt and --work-dir",
+                    ));
+                }
+                options.source_cut()?;
             }
             Command::Serve | Command::Recover => {}
         }
@@ -941,7 +973,7 @@ fn emit_indexed(
 fn validate_successor_source(previous: &CommitRange, source: &CommitRange) -> Result<()> {
     if source.low < previous.low || source.high < previous.high {
         return Err(bad(
-            "a rebuild cannot move either source checkpoint boundary backward; rollback requires a distinct activation",
+            "a successor cannot move either source checkpoint boundary backward; rollback requires a distinct activation",
         ));
     }
     Ok(())
@@ -1093,6 +1125,140 @@ async fn rebuild(
             "source": if options.retained_source { "retained_generation" } else { "input" },
             "replaces": selected.authority, "model_migrated": receipt.identity != selected.identity,
             "selection": receipt,
+        }),
+    )
+    .map_err(|_| {
+        publication_error(
+            &receipt,
+            "committed",
+            "activated",
+            "result_delivery_failed",
+            None,
+        )
+    })
+}
+
+async fn update_generation(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    pool: Option<BlockingPoolHandle>,
+) -> Result<()> {
+    let context = execution_context(cx, pool)?;
+    Box::pin(update_generation_with_loader(
+        &context,
+        options,
+        output,
+        |tier| {
+            models::load_single(
+                &context,
+                options.models.as_deref(),
+                tier,
+                &options.quality,
+                context.blocking_pool_handle(),
+            )
+        },
+    ))
+    .await
+}
+
+async fn update_generation_with_loader<F>(
+    cx: &Cx,
+    options: &Options,
+    output: &mut impl Write,
+    load_model: F,
+) -> Result<()>
+where
+    F: FnOnce(EmbedderTierTag) -> Result<Arc<dyn Embedder>>,
+{
+    checkpoint(cx)?;
+    let selected = Receipt::read(
+        options
+            .from_receipt
+            .as_deref()
+            .ok_or_else(|| bad("missing predecessor receipt"))?,
+    )?;
+    options
+        .quality
+        .validate_usage(selected.tier == EmbedderTierTag::Quality)?;
+    let work_path = new_path(
+        options
+            .work
+            .as_deref()
+            .ok_or_else(|| bad("missing work directory"))?,
+    )?;
+    let receipt_path = new_path(&options.receipt)?;
+    separate_destinations(&[&selected.root, &work_path, &receipt_path])?;
+    let root = admit_root(&selected.root)?;
+    // Admit the receipt's exact current selection before reading input or
+    // loading a model, and retain that expected authority through publication.
+    let snapshot = selected.open_on_root(cx, &root, options.max_image_bytes)?;
+    snapshot.authority().next_sequence()?;
+    let source = options.source_cut()?;
+    validate_successor_source(&snapshot.metadata().commit_range, &source)?;
+    let sequence = selected
+        .generation
+        .sequence
+        .checked_add(1)
+        .ok_or_else(|| bad("the artifact generation sequence is exhausted"))?;
+    let documents = retained_rebuild_documents(cx, &snapshot, options.max_source_bytes)?;
+    let edits = match &options.input {
+        Some(path) => mutations::read_edits(&mut BufReader::new(File::open(path)?))?,
+        None => mutations::read_edits(&mut io::stdin().lock())?,
+    };
+    let document_count = mutations::validate_final_source(cx, &documents, &edits)?;
+    if document_count == 0 {
+        return Err(bad("authority updates require a nonempty final cohort"));
+    }
+    // Preparation exports from the same retained immutable image. Release the
+    // preflight bodies first rather than holding two copies during inference.
+    drop(documents);
+    checkpoint(cx)?;
+    let model = load_model(selected.tier)?;
+    let mut transaction = snapshot
+        .begin_update(
+            cx,
+            &work_path,
+            new_generation(sequence)?,
+            model,
+            options.max_source_bytes,
+        )?
+        .with_batch_size(options.batch_size)?
+        .with_max_batch_input_bytes(MAX_RECORD_BYTES)?;
+    let edit_count = edits.len();
+    for (id, document) in edits {
+        checkpoint(cx)?;
+        transaction = match document {
+            Some(document) => transaction.upsert_document(document),
+            None => transaction.delete_document(id),
+        };
+    }
+    let built = Box::pin(transaction.build_exact_generation(
+        cx,
+        selected.tier,
+        source,
+        options.max_image_bytes,
+    ))
+    .await?;
+    if built.binding().frozen_identity() != &selected.identity {
+        return Err(bad("the provider changed after update identity admission"));
+    }
+    let receipt = stage_and_publish(
+        cx,
+        &root,
+        &selected.root,
+        &receipt_path,
+        &built,
+        Some(&snapshot),
+        options.max_image_bytes,
+    )?;
+    emit(
+        output,
+        &serde_json::json!({
+            "schema": SCHEMA, "ok": true, "event": "updated", "publication": "committed",
+            "serving": "activated", "retrieval": retrieval_name(built.retrieval_mode()),
+            "receipt": receipt_path, "replaces": selected.authority,
+            "documents": document_count, "edited_ids": edit_count, "selection": receipt,
         }),
     )
     .map_err(|_| {
@@ -1624,10 +1790,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
     let pool = runtime.blocking_handle();
     runtime.block_on(async move {
         let cx = Cx::current().ok_or_else(|| bad("runtime did not install a root context"))?;
+        let cx = execution_context(&cx, pool.clone())?;
         let mut output = io::stdout().lock();
         match options.command {
             Command::Index => Box::pin(index(&cx, &options, &mut output, pool)).await,
             Command::Rebuild => Box::pin(rebuild(&cx, &options, &mut output, pool)).await,
+            Command::Update => Box::pin(update_generation(&cx, &options, &mut output, pool)).await,
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,
             Command::Serve => Box::pin(serve(&cx, &options, &mut output, pool)).await,
             Command::Recover => recover(&cx, &options, &mut output),
