@@ -30,7 +30,7 @@ impl Provider {
     fn new() -> Self {
         let actual = EmbeddingIdentityBundleV1::explicit_test_model("actual-response", 3);
         Self {
-            advertised: EmbeddingIdentityBundleV1::explicit_test_model("advertised", 3),
+            advertised: actual.clone(),
             responses: Mutex::new(vec![
                 IdentityBoundEmbedding {
                     values: vec![0.0, -0.0, f32::from_bits(1)],
@@ -184,7 +184,7 @@ fn warm_raw_cache_cannot_supply_or_relabel_a_bound_batch() {
         cached.embed_batch(&cx, &["a", "b"]).await.unwrap();
         let before = cached.cache_stats();
         let expected = inner.responses.lock().unwrap().clone();
-        assert_ne!(&expected[0].identity, cached.identity().unwrap());
+        assert_eq!(&expected[0].identity, cached.identity().unwrap());
         for _ in 0..2 {
             let responses = cached
                 .embed_batch_bound(&cx, &["a", "a", "b"])
@@ -270,18 +270,56 @@ fn malformed_single_or_late_batch_response_is_rejected_without_disclosure() {
                 .embed_batch_bound(&cx, &["warm", "new", "new"])
                 .await
                 .unwrap_err();
-            assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            if mutation < 3 {
+                assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            } else {
+                assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+            }
             assert!(!error.to_string().contains("private-canary"));
             inner.responses.lock().unwrap()[0] = invalid;
             let error = cached.embed_bound(&cx, "warm").await.unwrap_err();
-            // Single-query admission rejects the foreign identity before
-            // inspecting its malformed, potentially sensitive response fields.
-            assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+            // Both paths inspect vector shape only after identity admission;
+            // foreign identity fields must never reach payload diagnostics.
+            if mutation < 3 {
+                assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            } else {
+                assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+            }
             assert!(!error.to_string().contains("private-canary"));
             assert_eq!(cached.cache_stats().entries, before.entries);
             assert_eq!(cached.cache_stats().hits, before.hits);
             assert_eq!(cached.cache_stats().misses, before.misses + 1);
         }
+    });
+}
+
+#[test]
+fn uniformly_foreign_batch_is_rejected_even_when_every_row_agrees() {
+    run_test_with_cx(|cx| async move {
+        let inner = Arc::new(Provider::new());
+        let foreign = EmbeddingIdentityBundleV1::explicit_test_model("private-canary", 3);
+        for response in inner.responses.lock().unwrap().iter_mut() {
+            response.identity = foreign.clone();
+        }
+        let cached = CachedEmbedder::new(inner.clone(), 4);
+        cached.embed(&cx, "warm").await.unwrap();
+        let before = cached.cache_stats();
+        let error = cached
+            .embed_batch_bound(&cx, &["warm", "new", "new"])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+        assert!(!error.to_string().contains("private-canary"));
+        assert_eq!(cached.cache_stats(), before);
+        let error = cached.embed_bound(&cx, "warm").await.unwrap_err();
+        assert!(matches!(error, SearchError::UnverifiableRemoteSpace { .. }));
+        assert!(!error.to_string().contains("private-canary"));
+        assert_eq!(cached.cache_stats().entries, before.entries);
+        assert_eq!(cached.cache_stats().hits, before.hits);
+        assert_eq!(cached.cache_stats().misses, before.misses + 1);
+        assert_eq!(inner.raw_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.batch_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.single_calls.load(Ordering::Relaxed), 1);
     });
 }
 
