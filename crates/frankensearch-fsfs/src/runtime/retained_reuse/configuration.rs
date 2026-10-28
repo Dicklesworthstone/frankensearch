@@ -87,6 +87,7 @@ pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
     // it does not change indexed bytes. The default is omitted by serde, so
     // normalizing also preserves the serialization predating this field.
     config.indexing.upgrade_reuse = UpgradeReusePolicy::SameExecutable;
+    config.search.ranking_priors = false;
 
     // These controls apply after query-time Initial publication, or to query
     // ranking. They do not select documents, producers or indexing coverage.
@@ -98,22 +99,10 @@ pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
     config.search.quality_timeout_ms = defaults.quality_timeout_ms;
     config.search.rerank_timeout_ms = defaults.rerank_timeout_ms;
 
-    let mut value =
-        serde_json::to_value(&config).map_err(|source| SearchError::SubsystemError {
-            subsystem: "fsfs.complete_generation.reuse_config",
-            source: Box::new(source),
-        })?;
-    // Query-time ranking policy also leaves persisted source/vector/lexical bytes unchanged.
-    value
-        .get_mut("search")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| SearchError::InvalidConfig {
-            field: "search".to_owned(),
-            value: "serialized configuration".to_owned(),
-            reason: "the serialized search configuration must be an object".to_owned(),
-        })?
-        .shift_remove("ranking_priors");
-    let bytes = serde_json::to_vec(&value).map_err(|source| SearchError::SubsystemError {
+    // Serialize typed fields directly, exactly as the pre-option algorithm did.
+    // A Value projection widens f32 to f64 (shadow_score_epsilon, for example),
+    // changing historical receipt bytes even when every setting is unchanged.
+    let bytes = serde_json::to_vec(&config).map_err(|source| SearchError::SubsystemError {
         subsystem: "fsfs.complete_generation.reuse_config",
         source: Box::new(source),
     })?;
@@ -131,15 +120,24 @@ mod tests {
     fn previous_digest(config: &FsfsConfig) -> String {
         let mut config = config.clone();
         config.indexing.watch_mode = false;
-        // The old configuration type had no ranking-prior key. Retain its original
-        // struct field order independently of the production removal method;
-        // swap-removing a key would silently change historical receipt bytes.
-        let mut value = serde_json::to_value(&config).unwrap();
-        value["search"]
-            .as_object_mut()
-            .unwrap()
-            .retain(|key, _| key != "ranking_priors");
-        content_sha256_hex(&serde_json::to_vec(&value).unwrap())
+        // The old configuration type had no ranking-prior key. False is omitted
+        // while the original typed serializer retains both field order and f32.
+        config.search.ranking_priors = false;
+        content_sha256_hex(&serde_json::to_vec(&config).unwrap())
+    }
+
+    #[test]
+    fn historical_f32_configuration_bytes_do_not_pass_through_a_value_projection() {
+        let config = FsfsConfig::default();
+        let typed = serde_json::to_vec(&config).unwrap();
+        let projected = serde_json::to_vec(&serde_json::to_value(&config).unwrap()).unwrap();
+        assert_ne!(typed, projected, "the old Value projection widens f32");
+        assert_eq!(digest(&config).unwrap(), content_sha256_hex(&typed));
+        assert!(!String::from_utf8(typed).unwrap().contains("ranking_priors"));
+        assert_eq!(
+            serde_json::to_vec(&config.search.shadow_score_epsilon).unwrap(),
+            b"0.00001"
+        );
     }
 
     #[test]

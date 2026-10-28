@@ -963,7 +963,9 @@ pub struct SearchConfig {
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
     /// Apply bounded path/module priors to code-navigation queries. Neutral by default.
-    #[serde(default)]
+    // Query policy is absent from historical indexing fingerprints. Omitting
+    // false lets the fingerprint serialize the original typed values directly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ranking_priors: bool,
     pub explain: bool,
     /// Opt in to the cross-encoder rerank stage over the REFINED head

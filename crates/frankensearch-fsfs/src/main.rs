@@ -932,6 +932,7 @@ fn flatten_config_values(config: &FsfsConfig) -> SearchResult<BTreeMap<String, V
             subsystem: CONFIG_SUBSYSTEM,
             source: Box::new(source),
         })?;
+    projected["search"]["ranking_priors"] = Value::Bool(config.search.ranking_priors);
     let mut out = BTreeMap::new();
     flatten_json_paths("", &projected, &mut out);
     Ok(out)
