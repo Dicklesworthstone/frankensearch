@@ -323,12 +323,14 @@ impl RecoveryPlan {
             return Err(unsupported("policy"));
         }
         binding.validate()?;
+        // ubs:ignore[rust.security.constant-time-compare] -- These are public retrieval-topology enum values, not secret credentials.
         if binding.topology()? != self.requested_topology {
             return Err(unsupported("requested_topology"));
         }
         let ImmutableReindexAuthorization {
             binding: authorized_scope,
         } = authorization;
+        // ubs:ignore[rust.security.constant-time-compare] -- Authorization clones this caller-visible generation/source/model scope; it contains no secret or bearer token.
         if authorized_scope != binding {
             return Err(RecoveryContractError::MismatchedImmutableReindexAuthorization);
         }
@@ -537,13 +539,13 @@ mod tests {
                     Some(scope.expected_authority.fingerprint());
             }),
             ("candidate authority", |scope| {
-                scope.candidate_authority.manifest_sha256 = [13; 32]
+                scope.candidate_authority.manifest_sha256 = [13; 32];
             }),
             ("old generation", |scope| {
-                scope.expected_generation.nonce = [14; 16]
+                scope.expected_generation.nonce = [14; 16];
             }),
             ("candidate generation", |scope| {
-                scope.candidate_generation.nonce = [15; 16]
+                scope.candidate_generation.nonce = [15; 16];
             }),
             ("old source", |scope| scope.previous_source.high = 4),
             ("new source", |scope| scope.source.high = 7),
@@ -555,7 +557,7 @@ mod tests {
                 scope.documents = scope.previous_documents;
             }),
             ("original request", |scope| {
-                scope.original_request_sha256 = [16; 32]
+                scope.original_request_sha256 = [16; 32];
             }),
             ("query policy", |scope| scope.query_policy_sha256 = [17; 32]),
             ("old fast identity", |scope| {
@@ -611,31 +613,32 @@ mod tests {
         let mutations: &[(&str, Mutation)] = &[
             ("root", |scope| scope.root_id = [0; 16]),
             ("old authority schema", |scope| {
-                scope.expected_authority.schema_version += 1
+                scope.expected_authority.schema_version += 1;
             }),
             ("candidate authority schema", |scope| {
-                scope.candidate_authority.schema_version += 1
+                scope.candidate_authority.schema_version += 1;
             }),
             ("authority sequence skip", |scope| {
-                scope.candidate_authority.sequence += 1
+                scope.candidate_authority.sequence += 1;
             }),
             ("authority predecessor", |scope| {
-                scope.candidate_authority.predecessor = Some([11; 32])
+                scope.candidate_authority.predecessor = Some([11; 32]);
             }),
             ("reused manifest object", |scope| {
-                scope.candidate_authority.object_id = scope.expected_authority.object_id
+                scope.candidate_authority.object_id = scope.expected_authority.object_id;
             }),
             ("reused manifest bytes", |scope| {
-                scope.candidate_authority.manifest_sha256 = scope.expected_authority.manifest_sha256
+                scope.candidate_authority.manifest_sha256 =
+                    scope.expected_authority.manifest_sha256;
             }),
             ("old generation", |scope| {
-                scope.expected_generation.nonce = [0; 16]
+                scope.expected_generation.nonce = [0; 16];
             }),
             ("candidate generation", |scope| {
-                scope.candidate_generation.nonce = [0; 16]
+                scope.candidate_generation.nonce = [0; 16];
             }),
             ("artifact sequence rollback", |scope| {
-                scope.candidate_generation.sequence = scope.expected_generation.sequence
+                scope.candidate_generation.sequence = scope.expected_generation.sequence;
             }),
             ("old source", |scope| scope.previous_source.low = 6),
             ("backward low", |scope| scope.source.low = 0),
@@ -648,10 +651,10 @@ mod tests {
             }),
             ("empty target", |scope| scope.documents = 0),
             ("missing request", |scope| {
-                scope.original_request_sha256 = [0; 32]
+                scope.original_request_sha256 = [0; 32];
             }),
             ("missing policy", |scope| {
-                scope.query_policy_sha256 = [0; 32]
+                scope.query_policy_sha256 = [0; 32];
             }),
             ("no topology", |scope| {
                 scope.fast = None;
@@ -862,7 +865,7 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .argv
-                    .push("unbound-command".to_owned())
+                    .push("unbound-command".to_owned());
             },
             |plan| plan.action.as_mut().unwrap().preserves_old_data = true,
             |plan| plan.action.as_mut().unwrap().prerequisites.clear(),

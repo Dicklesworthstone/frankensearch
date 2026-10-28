@@ -5882,8 +5882,8 @@ pub mod generation_reader {
     }
 
     fn same_snapshot_anchors(
-        first: GenerationRootAnchorWitness,
-        second: GenerationRootAnchorWitness,
+        first: &GenerationRootAnchorWitness,
+        second: &GenerationRootAnchorWitness,
     ) -> bool {
         first.root().same_directory_security_identity(second.root())
             && first.lock().same_control_anchor_identity(second.lock())
@@ -5895,8 +5895,8 @@ pub mod generation_reader {
     fn selected_predecessor_slot(
         current: &OpenedGenerationSnapshotV1,
         selected: AuthorityRefV1,
-        resolution: Resolution,
-        anchors: GenerationRootAnchorWitness,
+        resolution: &Resolution,
+        anchors: &GenerationRootAnchorWitness,
     ) -> Result<AuthoritySlotV1, SnapshotRefusalV1> {
         if resolution.pair != current.authority_pair()
             || resolution.head != current.head()
@@ -5905,7 +5905,7 @@ pub mod generation_reader {
         {
             return Err(SnapshotRefusalV1::ExpectedCurrentChanged);
         }
-        if !same_snapshot_anchors(anchors, current.anchor_witnesses()) {
+        if !same_snapshot_anchors(anchors, &current.anchor_witnesses()) {
             return Err(SnapshotRefusalV1::Closure(
                 GenerationRootErrorKind::ObjectChanged,
             ));
@@ -5922,7 +5922,7 @@ pub mod generation_reader {
         expected_current: AuthorityRefV1,
         current_manifest: &ActivationManifest,
         selected: AuthorityRefV1,
-        resolution: Resolution,
+        resolution: &Resolution,
     ) -> Result<AuthoritySlotV1, SnapshotRefusalV1> {
         if resolution.head.authority != expected_current {
             return Err(SnapshotRefusalV1::ExpectedCurrentChanged);
@@ -6148,7 +6148,7 @@ pub mod generation_reader {
             if !self
                 .witness()
                 .same_directory_security_identity(current.root_witness())
-                || !same_snapshot_anchors(self.anchor_witnesses(), current.anchor_witnesses())
+                || !same_snapshot_anchors(&self.anchor_witnesses(), &current.anchor_witnesses())
             {
                 return Ok(SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(
                     GenerationRootErrorKind::ObjectChanged,
@@ -6269,7 +6269,7 @@ pub mod generation_reader {
                 }
                 let (selected, recovery_manifest_file) = match predecessor {
                     Some(PredecessorSelection::Retained(current, target)) => {
-                        match selected_predecessor_slot(current, target, first, first_anchors) {
+                        match selected_predecessor_slot(current, target, &first, &first_anchors) {
                             Ok(slot) => (slot, None),
                             Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
                         }
@@ -6290,7 +6290,7 @@ pub mod generation_reader {
                                     SnapshotRefusalV1::ExpectedCurrentChanged,
                                 ));
                             }
-                            if !same_snapshot_anchors(first_anchors, captured_anchors) {
+                            if !same_snapshot_anchors(&first_anchors, &captured_anchors) {
                                 return Ok(SnapshotOpenOutcomeV1::Refused(
                                     SnapshotRefusalV1::Closure(
                                         GenerationRootErrorKind::ObjectChanged,
@@ -6342,7 +6342,7 @@ pub mod generation_reader {
                                 ),
                             ));
                         }
-                        match predecessor_slot_from_manifest(current, &manifest, target, first) {
+                        match predecessor_slot_from_manifest(current, &manifest, target, &first) {
                             Ok(slot) => (slot, Some(file)),
                             Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
                         }
@@ -6454,12 +6454,12 @@ pub mod generation_reader {
                 }
                 if let Some(PredecessorSelection::Retained(current, target)) = predecessor
                     && let Err(refusal) =
-                        selected_predecessor_slot(current, target, second, anchors)
+                        selected_predecessor_slot(current, target, &second, &anchors)
                 {
                     return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
                 }
                 if recovery_manifest_file.is_some()
-                    && !same_snapshot_anchors(first_anchors, anchors)
+                    && !same_snapshot_anchors(&first_anchors, &anchors)
                 {
                     return Ok(SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(
                         GenerationRootErrorKind::ObjectChanged,
