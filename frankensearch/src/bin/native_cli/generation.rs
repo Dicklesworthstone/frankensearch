@@ -996,10 +996,20 @@ impl Receipt {
         self.validate()?;
         checkpoint(cx)?;
         let budget = u64::try_from(max_image_bytes)?.min(self.image_bytes);
-        let opened =
-            root.open_generation_snapshot_with_budget(self.root_id, PROFILE, None, budget)?;
+        let opened = root.open_expected_generation_snapshot_with_budget(
+            self.root_id,
+            PROFILE,
+            None,
+            self.authority()?,
+            budget,
+        )?;
         checkpoint(cx)?;
         let SnapshotOpenOutcomeV1::Opened(opened) = opened else {
+            if matches!(opened, SnapshotOpenOutcomeV1::Refused(
+                frankensearch_index::generation_root::generation_reader::SnapshotRefusalV1::ExpectedCurrentChanged
+            )) {
+                return Err(bad("the fixed authority head differs from the trusted receipt"));
+            }
             return Err(bad(&format!(
                 "authority snapshot admission refused: {opened:?}"
             )));

@@ -2217,25 +2217,84 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
 
             // An unchanged full cohort shares its exact lexical object. A
             // create_new-only pathname writer would fail this valid successor.
-            let unchanged = NativeIndexBuilder::new(
-                parent.join(format!("{name}-unchanged-work")),
-                new_generation(2).unwrap(),
-                model.clone(),
-            )
-            .unwrap()
-            .add_documents(original_documents())
-            .build_exact_generation(
-                &cx,
-                tier,
-                CommitRange { low: 2, high: 7 },
-                DEFAULT_IMAGE_BYTES,
-            )
-            .await
-            .unwrap();
+            let unchanged = retained
+                .begin_model_migration(
+                    &cx,
+                    parent.join(format!("{name}-unchanged-work")),
+                    new_generation(2).unwrap(),
+                    model.clone(),
+                    None,
+                    crate::MAX_INPUT_BYTES,
+                )
+                .unwrap()
+                .build_exact_generation(
+                    &cx,
+                    tier,
+                    CommitRange { low: 2, high: 7 },
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .await
+                .unwrap();
             assert_eq!(
                 first.component_bytes(GenerationComponentRole::Lexical),
                 unchanged.component_bytes(GenerationComponentRole::Lexical)
             );
+            assert!(
+                !parent
+                    .join(format!("{name}-unchanged-work/lexical"))
+                    .exists(),
+                "unchanged source must use its admitted bytes without rebuilding Quill",
+            );
+            for change in ["content", "title", "metadata", "source-cut"] {
+                let mut document = original_documents()[0].clone();
+                match change {
+                    "content" => document.content.push_str(" changed"),
+                    "title" => document.title = Some("Changed title".to_owned()),
+                    "metadata" => {
+                        document
+                            .metadata
+                            .insert("version".to_owned(), "changed".to_owned());
+                    }
+                    "source-cut" => {}
+                    _ => unreachable!(),
+                }
+                let changed = retained
+                    .begin_model_migration(
+                        &cx,
+                        parent.join(format!("{name}-lexical-{change}")),
+                        new_generation(2).unwrap(),
+                        model.clone(),
+                        None,
+                        crate::MAX_INPUT_BYTES,
+                    )
+                    .unwrap()
+                    .upsert_document(document)
+                    .build_exact_generation(
+                        &cx,
+                        tier,
+                        CommitRange {
+                            low: 2,
+                            high: if change == "source-cut" { 8 } else { 7 },
+                        },
+                        DEFAULT_IMAGE_BYTES,
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    first.component_bytes(GenerationComponentRole::Lexical),
+                    changed.component_bytes(GenerationComponentRole::Lexical),
+                    "{name}: {change}"
+                );
+                let candidate = changed
+                    .candidate(
+                        new_generation(1).unwrap().nonce,
+                        Some(retained.authority()),
+                        GenerationAuthorityActionV1::Activate,
+                        [0x44; 32],
+                    )
+                    .unwrap();
+                changed.validate_candidate(&cx, &candidate).unwrap();
+            }
             let second_path = parent.join(format!("{name}-second.json"));
             let second = stage_and_publish(
                 &cx,
@@ -4522,16 +4581,47 @@ mod warm_authority {
                     },
                     calls: AtomicUsize::new(0),
                 });
-                let current = publish(
-                    &cx,
-                    &parent,
-                    Some(&old_reader),
-                    &current_provider,
-                    tier,
-                    "current",
-                    true,
+                // A producer-only change can legitimately reuse the exact ANN
+                // bytes. Add a current-only row so damaging this graph cannot
+                // also damage the retained predecessor's shared component.
+                let current_root = admit_root(&parent.join("root")).unwrap();
+                let built = NativeIndexBuilder::new(
+                    parent.join("current-work"),
+                    new_generation(old_reader.authority().sequence + 1).unwrap(),
+                    current_provider.clone(),
                 )
-                .await;
+                .unwrap()
+                .with_fast_storage(
+                    NativeBuildPrecision::F32,
+                    NativeBuildRetrieval::Hnsw {
+                        params: HnswParams::default(),
+                        seed: 17,
+                    },
+                )
+                .add_documents([
+                    IndexableDocument::new("retry-current", "retry network requests"),
+                    IndexableDocument::new("garden-current", "garden flowers"),
+                    IndexableDocument::new("current-only", "retry current graph membership"),
+                ])
+                .build_exact_generation(
+                    &cx,
+                    tier,
+                    CommitRange { low: 1, high: 6 },
+                    DEFAULT_IMAGE_BYTES,
+                )
+                .await
+                .unwrap();
+                let current = stage_and_publish(
+                    &cx,
+                    &current_root,
+                    &parent.join("root"),
+                    &parent.join("current.json"),
+                    &built,
+                    Some(&old_reader),
+                    PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
+                )
+                .unwrap()
+                .receipt;
                 let current_reader = current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
                 let expected_pair = current_reader.retained_snapshot().authority_pair();
                 let damaged = component_path(&current.root, &current_reader, damaged_role);
@@ -7430,7 +7520,7 @@ mod progressive_authority {
         label: &str,
     ) -> Receipt {
         let root = admit_root(&parent.join("root")).unwrap();
-        let built = NativeIndexBuilder::new(
+        let builder = NativeIndexBuilder::new(
             parent.join(format!("{label}-work")),
             new_generation(previous.authority().sequence + 1).unwrap(),
             provider.clone(),
@@ -7440,25 +7530,44 @@ mod progressive_authority {
         .add_documents([IndexableDocument::new(
             format!("live-{label}"),
             "retry current contents",
-        )])
-        .build_exact_generation(
-            cx,
-            EmbedderTierTag::Fast,
-            CommitRange {
-                low: 2,
-                high: previous.metadata().commit_range.high + 1,
-            },
-            DEFAULT_IMAGE_BYTES,
-        )
-        .await
-        .unwrap();
-        stage_and_publish(
+        )]);
+        let source = CommitRange {
+            low: 2,
+            high: previous.metadata().commit_range.high + 1,
+        };
+        let built = builder
+            .build_exact_generation(cx, EmbedderTierTag::Fast, source, DEFAULT_IMAGE_BYTES)
+            .await
+            .unwrap();
+        // Historical readers must accept a fully authenticated predecessor with
+        // a different topology. An ordinary CLI rebuild correctly refuses that
+        // change, so this fixture publishes through the lower-level authority
+        // API rather than pretending the rebuild grant authorizes it.
+        if previous.topology() != NativeGenerationTopology::FastOnly {
+            assert!(prepare_publication(&built, Some(previous), DEFAULT_IMAGE_BYTES).is_err());
+        }
+        let writer = WriterIdentityV1::for_current_process().unwrap();
+        let candidate = built
+            .candidate(
+                new_generation(1).unwrap().nonce,
+                Some(previous.authority()),
+                GenerationAuthorityActionV1::Activate,
+                [0x33; 32],
+            )
+            .unwrap();
+        let prepared = PreparedPublication {
+            candidate,
+            root_id: previous.retained_snapshot().root_id(),
+            expected: previous.retained_snapshot().authority_pair(),
+            writer,
+        };
+        stage_prepared_and_publish(
             cx,
             &root,
             &parent.join("root"),
             &parent.join(format!("{label}.json")),
             &built,
-            Some(previous),
+            prepared,
             PublicationOptions::unscoped(DEFAULT_IMAGE_BYTES),
         )
         .unwrap()

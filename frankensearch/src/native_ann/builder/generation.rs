@@ -163,6 +163,12 @@ impl NativeIndexBuilder {
         let started = timestamp_millis()?;
         let retrieval = self.fast.retrieval;
         let quality_retrieval = self.quality.as_ref().map(|quality| quality.retrieval);
+        let retained_lexical = self
+            .reuse
+            .as_ref()
+            .map(|reuse| reuse.unchanged_authority_lexical(cx, &self.documents, &source))
+            .transpose()?
+            .flatten();
         let vectors = Box::pin(self.build(cx)).await?;
         let (vector, owner) = capture_vector(cx, vectors.fast(), component_budget)?;
         let source_checkpoint = SourceCheckpointV1::derive(&source);
@@ -265,16 +271,48 @@ impl NativeIndexBuilder {
         };
         let lexical_budget =
             remaining_budget(after_vector, ann.as_ref().map_or(0, |bytes| bytes.len()))?;
-        let (writer, reader, _seal) =
-            hybrid::create_lexical(cx, &vectors.directory().join("lexical"), ordered).await?;
-        hybrid::cohort::validate(cx, &reader, vectors.documents())?;
-        checkpoint(cx, "native_ann.builder.generation_lexical")?;
-        let snapshot = writer.snapshot()?;
-        let image_result = snapshot.export_exact_image(cx, source_checkpoint, lexical_budget);
-        checkpoint(cx, "native_ann.builder.generation_lexical_complete")?;
-        let image = image_result
-            .map_err(|error| invalid("builder.generation.lexical", "image", &error.to_string()))?;
-        let lexical = image.bytes();
+        let (lexical, lexical_receipt) = if let Some(previous) = retained_lexical
+            && previous.manifest().document_set_sha256() == vector_receipt.docset_digest
+        {
+            // These exact bytes already passed full lexical/source admission.
+            // The complete source comparison above includes stored titles and
+            // metadata; equal ordered live IDs and checkpoint bind the new vector
+            // owner to that same cohort. Do not rewrite its freshness witness.
+            let bytes = previous
+                .closure()
+                .bytes(GenerationComponentRole::Lexical)
+                .ok_or_else(|| {
+                    invalid(
+                        "builder.generation.lexical",
+                        "missing",
+                        "retained lexical image is absent",
+                    )
+                })?;
+            if bytes.len() > lexical_budget {
+                return Err(image_budget_error());
+            }
+            let receipt = ExactComponentReceiptV1 {
+                role: GenerationComponentRole::Lexical,
+                bytes: previous.manifest().components().lexical,
+                docset_digest: vector_receipt.docset_digest,
+                live_document_count: vector_receipt.live_document_count,
+                source_checkpoint: source_checkpoint.to_bytes(),
+            };
+            checkpoint(cx, "native_ann.builder.generation_lexical_reused")?;
+            (bytes, receipt)
+        } else {
+            let (writer, reader, _seal) =
+                hybrid::create_lexical(cx, &vectors.directory().join("lexical"), ordered).await?;
+            hybrid::cohort::validate(cx, &reader, vectors.documents())?;
+            checkpoint(cx, "native_ann.builder.generation_lexical")?;
+            let snapshot = writer.snapshot()?;
+            let image_result = snapshot.export_exact_image(cx, source_checkpoint, lexical_budget);
+            checkpoint(cx, "native_ann.builder.generation_lexical_complete")?;
+            let image = image_result.map_err(|error| {
+                invalid("builder.generation.lexical", "image", &error.to_string())
+            })?;
+            (image.bytes(), image.receipt().clone())
+        };
         let binding = vectors.fast().binding().clone();
         let quality_binding = vectors.quality().map(|quality| quality.binding().clone());
         let mut metadata = build_metadata(
@@ -284,7 +322,7 @@ impl NativeIndexBuilder {
             started,
             owner.witness().record_count,
             &vector_receipt,
-            image.receipt(),
+            &lexical_receipt,
             native_ann.as_ref().map(|(_, receipt)| receipt),
         )?;
         if let (Some(cohort), Some(quality_binding)) = (&cohort, &quality_binding) {
@@ -357,7 +395,7 @@ impl NativeIndexBuilder {
             cohort
                 .as_ref()
                 .map_or(vector_receipt, |cohort| cohort.receipt().clone()),
-            image.receipt().clone(),
+            lexical_receipt,
             ann_receipt,
             metadata_receipt,
         )

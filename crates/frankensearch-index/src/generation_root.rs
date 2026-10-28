@@ -5519,7 +5519,7 @@ pub mod generation_reader {
             /// Rounds attempted before giving up.
             attempts: usize,
         },
-        /// Explicit predecessor admission observed a different current head
+        /// Explicit current or predecessor admission observed a different current head
         /// or physical slot pair from the caller's admitted selection. The
         /// caller must select again; no newer head is followed implicitly.
         ExpectedCurrentChanged,
@@ -6055,6 +6055,37 @@ pub mod generation_reader {
                 floor,
                 max_owned_image_bytes,
                 None,
+                None,
+            )
+        }
+
+        /// Open only the caller's exact expected current authority. A stale
+        /// receipt is refused before any manifest/component image or its budget
+        /// is consumed. Every retry retains the same expectation.
+        ///
+        /// # Errors
+        /// Returns ordinary snapshot infrastructure/refusal errors, including
+        /// `ExpectedCurrentChanged` when the resolved head differs.
+        pub fn open_expected_generation_snapshot_with_budget(
+            &self,
+            root_id: [u8; 16],
+            profile: GenerationRootSecurityProfileV1,
+            floor: Option<&dyn AntiRollbackFloorProviderV1>,
+            expected: AuthorityRefV1,
+            max_owned_image_bytes: u64,
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            if let Err(error) = expected.validate() {
+                return Ok(SnapshotOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::Authority(error),
+                ));
+            }
+            self.open_selected_generation_snapshot_with_budget(
+                root_id,
+                profile,
+                floor,
+                max_owned_image_bytes,
+                Some(expected),
+                None,
             )
         }
 
@@ -6133,6 +6164,7 @@ pub mod generation_reader {
                 current.profile(),
                 None,
                 max_owned_image_bytes,
+                None,
                 Some(PredecessorSelection::Retained(
                     current,
                     selected_predecessor,
@@ -6193,6 +6225,7 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::CooperativeLocal,
                 None,
                 max_owned_image_bytes,
+                None,
                 Some(PredecessorSelection::Recovery {
                     current: expected_current,
                     current_generation: expected_current_generation,
@@ -6207,6 +6240,7 @@ pub mod generation_reader {
             profile: GenerationRootSecurityProfileV1,
             floor: Option<&dyn AntiRollbackFloorProviderV1>,
             max_owned_image_bytes: u64,
+            expected: Option<AuthorityRefV1>,
             predecessor: Option<PredecessorSelection<'_>>,
         ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
             if root_id == [0; 16] {
@@ -6228,6 +6262,11 @@ pub mod generation_reader {
                     Round::Retry => continue,
                     Round::Refused(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
                 };
+                if expected.is_some_and(|expected| first.head.authority != expected) {
+                    return Ok(SnapshotOpenOutcomeV1::Refused(
+                        SnapshotRefusalV1::ExpectedCurrentChanged,
+                    ));
+                }
                 let (selected, recovery_manifest_file) = match predecessor {
                     Some(PredecessorSelection::Retained(current, target)) => {
                         match selected_predecessor_slot(current, target, first, first_anchors) {
@@ -6732,6 +6771,39 @@ pub mod generation_reader {
                 )
                 .expect("bounded open")
             };
+            let mut stale = authority;
+            stale.object_id[0] ^= 0x80;
+            assert_eq!(
+                refused(
+                    root.open_expected_generation_snapshot_with_budget(
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                        stale,
+                        0,
+                    )
+                    .expect("stale expected head")
+                ),
+                SnapshotRefusalV1::ExpectedCurrentChanged,
+                "a foreign head must be refused before manifest/budget admission",
+            );
+            assert_eq!(
+                refused(
+                    root.open_expected_generation_snapshot_with_budget(
+                        ROOT_ID,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None,
+                        authority,
+                        manifest_len - 1,
+                    )
+                    .expect("matching expected head")
+                ),
+                SnapshotRefusalV1::ImageBudget {
+                    required: manifest_len,
+                    limit: manifest_len - 1
+                },
+                "an exact match still enforces the original image budget",
+            );
             assert_eq!(
                 refused(open_with_budget(manifest_len - 1)),
                 SnapshotRefusalV1::ImageBudget {
@@ -15796,6 +15868,7 @@ mod tests {
         }
 
         fn run_bind_mount_fixture_command(program: &str, arguments: &[&OsStr]) {
+            // ubs:ignore[rust.security.command-executable] -- Private physical-fixture callers supply only the fixed mount/umount utility names, with fixture paths in argv.
             let output = Command::new(program)
                 .args(arguments)
                 .output()
@@ -16113,6 +16186,7 @@ mod tests {
         #[test]
         fn route_and_error_diagnostics_never_disclose_path_bytes() {
             let root_path = fixture_root("redaction");
+            // ubs:ignore[rust.security.hardcoded-secrets] -- Synthetic pathname canary for redaction assertions, not an authentication credential.
             let secret_component = "secret-customer-generation";
             let path = confined(secret_component);
             let error = QualifiedGenerationRoot::admit(Path::new("relative-root"))
@@ -17379,6 +17453,7 @@ print(json.dumps({
 if parent_self_route != parent_decoy_path or child_exit != 0:
     raise SystemExit(6)
 "#;
+            // ubs:ignore[rust.security.shell-command] -- Fixed Python fixture source above; dynamic paths are separate argv and never interpolated into the program.
             let output = Command::new("python3")
                 .arg("-c")
                 .arg(script)
@@ -17489,6 +17564,7 @@ print(json.dumps({
 if not close_only_contended or not explicit_unlock_released:
     raise SystemExit(2)
 "#;
+            // ubs:ignore[rust.security.shell-command] -- Fixed Python fork/OFD probe above; the lock path is a separate argv value, with no shell.
             let output = Command::new("python3")
                 .arg("-c")
                 .arg(script)
@@ -17567,6 +17643,7 @@ if not close_only_contended or not explicit_unlock_released:
             }
 
             fn spawn_inherited_fd_holder(alias: &rustix::fd::OwnedFd) -> FdHolder {
+                // ubs:ignore[rust.security.shell-command] -- Literal Python descriptor-holder probe; only the numeric descriptor is supplied separately as argv.
                 let mut child = Command::new("python3")
                     .arg("-c")
                     .arg(

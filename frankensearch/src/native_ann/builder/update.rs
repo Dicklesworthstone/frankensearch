@@ -777,6 +777,37 @@ pub(super) enum ReuseRole {
 }
 
 impl ReuseSource {
+    /// Retain exact lexical bytes only for an identical complete source and cut.
+    /// Provider migration may change vectors while these lexical inputs stay fixed.
+    #[cfg(feature = "quill")]
+    pub(super) fn unchanged_authority_lexical(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        source: &CommitRange,
+    ) -> SearchResult<Option<Arc<OpenedGenerationSnapshotV1>>> {
+        let Some(authority) = &self.authority else {
+            return Ok(None);
+        };
+        if &authority.source != source || self.documents().count() != documents.len() {
+            return Ok(None);
+        }
+        for document in documents {
+            checkpoint(cx, "native_ann.update.lexical_reuse_source")?;
+            let Some((partition, position)) = self.find(&document.id) else {
+                return Ok(None);
+            };
+            let previous = &partition.documents[position];
+            if document.content != previous.content
+                || document.title != previous.title
+                || document.metadata != previous.metadata
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some(Arc::clone(&authority.snapshot)))
+    }
+
     fn documents(&self) -> impl Iterator<Item = &IndexableDocument> {
         self.partitions
             .iter()
