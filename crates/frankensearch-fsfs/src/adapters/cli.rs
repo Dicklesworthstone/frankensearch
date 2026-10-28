@@ -558,6 +558,7 @@ where
             }
             "--watch" => {
                 input.watch = true;
+                input.overrides.allow_background_indexing = Some(true);
                 idx += 1;
             }
             "--model" => {
@@ -1776,6 +1777,23 @@ mod tests {
         assert_eq!(input.command, CliCommand::Index);
         assert!(input.full_reindex);
         assert!(input.watch);
+        assert_eq!(input.overrides.allow_background_indexing, Some(true));
+    }
+
+    #[test]
+    fn parse_index_watch_preserves_background_override_order() {
+        for (flags, expected) in [
+            (["--watch", "--no-watch-mode"], false),
+            (["--no-watch-mode", "--watch"], true),
+            (["--watch-mode", "--no-watch-mode"], false),
+            (["--no-watch-mode", "--watch-mode"], true),
+        ] {
+            let input = parse_cli_args(["index", "/tmp/corpus", flags[0], flags[1]])
+                .expect("parse ordered background request");
+            assert_eq!(input.command, CliCommand::Index);
+            assert_eq!(input.target_path, Some(PathBuf::from("/tmp/corpus")));
+            assert_eq!(input.overrides.allow_background_indexing, Some(expected));
+        }
     }
 
     #[test]

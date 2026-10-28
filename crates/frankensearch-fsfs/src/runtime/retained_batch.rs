@@ -535,6 +535,10 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         if documents.values().any(Option::is_some) {
             self.validate_content_upserts_allowed()?;
+            // Reject against the caller's admitted base before taking writer
+            // ownership. Admission is repeated against the selected predecessor
+            // below, so a concurrent publication cannot bypass this policy.
+            self.validate_deferred_quality_mutation(expected.path())?;
         }
         if documents.is_empty() {
             return Ok(RetainedBatchResult {

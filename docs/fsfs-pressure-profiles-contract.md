@@ -107,9 +107,46 @@ metadata-only completion receipts cannot stand in for completed content indexing
 active, so a supplied body cannot bypass the metadata-only policy. Search remains
 refused under the override; status and doctor remain available.
 
-Indexing does not yet defer embedding, so `force_embed_deferred` changes nothing
-and raises a `config.setting.no_effect` warning saying so. The same warning
-covers a `strict` or `degraded` profile (its quality ceiling applies; its
+`force_embed_deferred` keeps full-text lexical indexing and fast semantic
+indexing/search available while deferring the expensive quality tier. It does
+not inspect, provision, load or run the quality model during indexing or search,
+and it suppresses cross-encoder reranking. An explicit quality-only search is
+refused; ordinary hybrid searches run their lexical and fast stages. The effective
+profile reports quality disabled with
+`safety.clamp.embed_deferred.quality_enabled` when the override clamps a quality
+request, including an explicit `fast_only=false` request.
+
+A rebuild under this override publishes a complete fast-tier generation and
+records `vector.quality_tier.deferred.pressure_override` in its sentinel. It
+reports `quality_deferred_files` separately from failed or incomplete fast
+semantic work, with a `quality_index_deferred` completion warning. Status derives
+the pending count from the persisted policy and current file membership. It
+retires any old quality tier so stale quality rows cannot be searched. Appending
+or applying retained content upserts to a generation that still carries a
+quality tier is refused before mutation; rebuild with `fsfs index` under the
+override first. Fast-tier appends and watch updates then continue normally.
+Removing the override and running ordinary `fsfs index` rebuilds the quality
+tier when its configured model is available, including for unchanged sources.
+This mode defers quality work until that later indexing run; it does not create
+an automatic background embedding queue.
+
+Background-indexing permission is enforced independently of watch intent. The
+`strict` and `degraded` profiles, or `hard_pause_requested=true`, refuse source
+watching and the legacy background compaction daemon. This applies to `watch`,
+`index --watch`, configured watch mode, and direct retained-watch API calls,
+before initial indexing, index-directory creation or source notification
+registration. `force_full` cannot override these restrictions. The refusal
+identifies `pressure.profile` or `pressure.hard_pause_requested` and gives a
+one-shot or profile-selection remedy.
+
+The `performance` profile permits an explicit watch request without turning
+ordinary indexing into a watcher. CLI watch flags participate in normal override
+order, so `index --watch --no-watch-mode` remains a one-shot index request.
+`daemon --stop` remains available, and the complete-generation read-only query
+daemon does not require background-indexing permission.
+
+The `config.setting.no_effect` warning still covers a `strict` or `degraded`
+profile (its quality and background-indexing ceilings apply; its
 resolved concurrency and scheduler limits are not read yet) and non-default
 `cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and `load_ceiling_per_mille`,
 which no fsfs component reads yet (the shadow oracle samples CPU and I/O with

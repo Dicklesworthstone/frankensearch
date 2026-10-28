@@ -1075,6 +1075,28 @@ impl FsfsConfig {
         }
         toml::to_string_pretty(&file_config)
     }
+
+    /// Admit background indexing independently of whether it was requested.
+    /// Direct runtime callers must respect the same immutable profile ceiling
+    /// and hard pause as configurations resolved from CLI/environment/files.
+    pub(crate) fn validate_background_indexing(&self) -> SearchResult<()> {
+        if self.pressure.hard_pause_requested {
+            return Err(SearchError::InvalidConfig {
+                field: "pressure.hard_pause_requested".to_owned(),
+                value: "true".to_owned(),
+                reason: "background indexing is disabled while a hard pause is requested"
+                    .to_owned(),
+            });
+        }
+        if !self.pressure.profile.contract().allow_background_indexing {
+            return Err(SearchError::InvalidConfig {
+                field: "pressure.profile".to_owned(),
+                value: format!("{:?}", self.pressure.profile).to_ascii_lowercase(),
+                reason: "this pressure profile does not permit background indexing; use a one-shot index or select the performance profile".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -2139,6 +2161,19 @@ fn resolve_pressure_profile(
             field: PressureProfileField::QualityEnabled,
             clamped_to: "false".into(),
             reason_code: "safety.clamp.quality_circuit_open.quality_enabled".into(),
+        });
+    }
+
+    // The constrained stage keeps fast semantic and lexical work available,
+    // but an explicit quality request cannot re-enable expensive refinement.
+    if config.pressure.degradation_override == DegradationOverrideMode::ForceEmbedDeferred
+        && effective.quality_enabled
+    {
+        effective.quality_enabled = false;
+        safety_clamps.push(PressureProfileSafetyClamp {
+            field: PressureProfileField::QualityEnabled,
+            clamped_to: "false".into(),
+            reason_code: "safety.clamp.embed_deferred.quality_enabled".into(),
         });
     }
 
@@ -3315,27 +3350,6 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
             message: "this profile disables quality search, but its embedding/indexing concurrency and scheduler limits are not applied yet".into(),
         });
     }
-    // Searches and writes follow the override's stage contract; deferring
-    // embedding during indexing is not implemented yet.
-    let unwired_indexing = match config.pressure.degradation_override {
-        DegradationOverrideMode::ForceEmbedDeferred => Some(
-            "embedding is not deferred yet and search stays hybrid under force_embed_deferred, so this changes nothing",
-        ),
-        DegradationOverrideMode::Auto
-        | DegradationOverrideMode::ForceFull
-        | DegradationOverrideMode::ForceLexicalOnly
-        | DegradationOverrideMode::ForceMetadataOnly
-        | DegradationOverrideMode::ForcePaused => None,
-    };
-    if let Some(message) = unwired_indexing {
-        warnings.push(ConfigWarning {
-            severity: ConfigDiagnosticSeverity::Warn,
-            reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
-            field: "pressure.degradation_override".into(),
-            source: ConfigSource::Runtime,
-            message: message.into(),
-        });
-    }
     if config.tui.theme != TuiTheme::Dark {
         warnings.push(ConfigWarning {
             severity: ConfigDiagnosticSeverity::Warn,
@@ -4074,6 +4088,82 @@ mod tests {
     }
 
     #[test]
+    fn embed_deferred_clamps_quality_from_file_env_and_cli() {
+        for source in [
+            ProfileOverrideSource::Config,
+            ProfileOverrideSource::Env,
+            ProfileOverrideSource::Cli,
+        ] {
+            for requested_fast_only in [None, Some(false), Some(true)] {
+                let mut file = String::new();
+                let mut env = HashMap::new();
+                let mut cli = CliOverrides {
+                    fast_only: requested_fast_only,
+                    ..CliOverrides::default()
+                };
+                match source {
+                    ProfileOverrideSource::Config => {
+                        file.push_str(
+                            "[pressure]\ndegradation_override = \"force_embed_deferred\"\n",
+                        );
+                    }
+                    ProfileOverrideSource::Env => {
+                        env.insert(
+                            "FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE".into(),
+                            "force_embed_deferred".into(),
+                        );
+                    }
+                    ProfileOverrideSource::Cli => {
+                        cli.degradation_override =
+                            Some(super::DegradationOverrideMode::ForceEmbedDeferred);
+                    }
+                }
+                let result = load_from_str(Some(&file), None, &env, &cli, home()).unwrap();
+                assert!(
+                    result.config.search.fast_only,
+                    "{source:?}, {requested_fast_only:?}"
+                );
+                assert!(!result.pressure_profile_resolution.effective.quality_enabled);
+                assert!(!result.pressure_profile_resolution.conflict_detected);
+                assert!(!result.warnings.iter().any(|warning| {
+                    warning.reason_code == super::CONFIG_NO_EFFECT_WARNING_CODE
+                        && warning.field == "pressure.degradation_override"
+                }));
+                if requested_fast_only != Some(true) {
+                    assert!(
+                        result
+                            .pressure_profile_resolution
+                            .safety_clamps
+                            .iter()
+                            .any(|clamp| {
+                                clamp.field == PressureProfileField::QualityEnabled
+                                    && clamp.reason_code
+                                        == "safety.clamp.embed_deferred.quality_enabled"
+                            })
+                    );
+                }
+            }
+        }
+
+        // Returning to ordinary operation restores the requested quality tier.
+        let cli = CliOverrides {
+            fast_only: Some(false),
+            degradation_override: Some(super::DegradationOverrideMode::Auto),
+            ..CliOverrides::default()
+        };
+        let result = load_from_str(
+            Some("[pressure]\ndegradation_override = \"force_embed_deferred\"\n"),
+            None,
+            &HashMap::new(),
+            &cli,
+            home(),
+        )
+        .unwrap();
+        assert!(!result.config.search.fast_only);
+        assert!(result.pressure_profile_resolution.effective.quality_enabled);
+    }
+
+    #[test]
     fn profile_resolution_strict_profile_honors_the_fast_only_override() {
         // bd-k7x34, both directions: under `strict` the fast-only override is
         // admitted — the resolved search mode carries fast_only and the
@@ -4140,6 +4230,42 @@ mod tests {
             !result.config.indexing.watch_mode,
             "profile capability alone must not turn a one-shot index request into a watcher"
         );
+    }
+
+    #[test]
+    fn background_indexing_admission_enforces_capability_for_direct_configs() {
+        for profile in [
+            super::PressureProfile::Strict,
+            super::PressureProfile::Degraded,
+            super::PressureProfile::Performance,
+        ] {
+            for requested in [false, true] {
+                let mut config = FsfsConfig::default();
+                config.pressure.profile = profile;
+                config.indexing.watch_mode = requested;
+                let admission = config.validate_background_indexing();
+                if profile == super::PressureProfile::Performance {
+                    assert!(
+                        admission.is_ok(),
+                        "permission is independent of watch intent"
+                    );
+                } else {
+                    assert!(matches!(
+                        admission,
+                        Err(SearchError::InvalidConfig { field, value, .. })
+                            if field == "pressure.profile"
+                                && value == format!("{profile:?}").to_ascii_lowercase()
+                    ));
+                }
+                config.pressure.hard_pause_requested = true;
+                config.pressure.degradation_override = super::DegradationOverrideMode::ForceFull;
+                assert!(matches!(
+                    config.validate_background_indexing(),
+                    Err(SearchError::InvalidConfig { field, value, .. })
+                        if field == "pressure.hard_pause_requested" && value == "true"
+                ));
+            }
+        }
     }
 
     #[test]
@@ -4256,7 +4382,7 @@ mod tests {
         for (value, warns) in [
             ("auto", false),
             ("force_full", false),
-            ("force_embed_deferred", true),
+            ("force_embed_deferred", false),
             ("force_lexical_only", false),
             ("force_metadata_only", false),
             ("force_paused", false),

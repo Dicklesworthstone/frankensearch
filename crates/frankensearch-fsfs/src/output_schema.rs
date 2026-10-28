@@ -763,6 +763,8 @@ impl OutputWarningCode {
     pub const NO_VECTOR_INDEX: &str = "no_vector_index";
     /// Indexing preserved durable artifacts but left semantic rows deferred.
     pub const SEMANTIC_INDEX_DEFERRED: &str = "semantic_index_deferred";
+    /// Fast semantic indexing is complete; the pressure override deferred quality.
+    pub const QUALITY_INDEX_DEFERRED: &str = "quality_index_deferred";
     /// Schema version is newer than consumer expects.
     pub const SCHEMA_NEWER: &str = "schema_version_newer";
     /// `explain` could not split the BM25 score by query term (the lexical
@@ -784,6 +786,7 @@ pub const ALL_OUTPUT_WARNING_CODES: &[&str] = &[
     OutputWarningCode::HASH_FALLBACK,
     OutputWarningCode::NO_VECTOR_INDEX,
     OutputWarningCode::SEMANTIC_INDEX_DEFERRED,
+    OutputWarningCode::QUALITY_INDEX_DEFERRED,
     OutputWarningCode::SCHEMA_NEWER,
     OutputWarningCode::BM25_STATS_UNAVAILABLE,
     OutputWarningCode::EXPLANATION_UNAVAILABLE,

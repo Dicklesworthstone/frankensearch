@@ -168,12 +168,6 @@ impl FsfsRuntime {
         shutdown: Option<&ShutdownCoordinator>,
         initialize_store: bool,
     ) -> SearchResult<()> {
-        let Some(root) = self.complete_generation_command_root(initialize_store)? else {
-            return match shutdown {
-                Some(shutdown) => Box::pin(self.run_mode_with_shutdown(cx, mode, shutdown)).await,
-                None => Box::pin(self.run_mode(cx, mode)).await,
-            };
-        };
         let dashboard = mode == InterfaceMode::Tui || self.cli_input.command == CliCommand::Tui;
         let effective_command = if dashboard {
             CliCommand::Tui
@@ -181,6 +175,12 @@ impl FsfsRuntime {
             self.cli_input.command
         };
         self.validate_command_inputs(effective_command)?;
+        let Some(root) = self.complete_generation_command_root(initialize_store)? else {
+            return match shutdown {
+                Some(shutdown) => Box::pin(self.run_mode_with_shutdown(cx, mode, shutdown)).await,
+                None => Box::pin(self.run_mode(cx, mode)).await,
+            };
+        };
         let writes = !dashboard
             && (matches!(
                 effective_command,
@@ -208,7 +208,7 @@ impl FsfsRuntime {
         }
         let mut stdout = std::io::stdout();
         match self.cli_input.command {
-            CliCommand::Index if !self.cli_input.watch && !self.config.indexing.watch_mode => {
+            CliCommand::Index if !self.watch_requested(CliCommand::Index) => {
                 Box::pin(self.run_complete_generation_index_with_writer(cx, &root, &mut stdout))
                     .await
             }
@@ -455,12 +455,8 @@ impl FsfsRuntime {
         }
 
         let legacy = legacy_index_exists(&root)?;
-        let one_shot_index = self.cli_input.command == CliCommand::Index
-            && !self.cli_input.watch
-            && !self.config.indexing.watch_mode;
-        let watch_start = self.cli_input.command == CliCommand::Watch
-            || (self.cli_input.command == CliCommand::Index
-                && (self.cli_input.watch || self.config.indexing.watch_mode));
+        let watch_start = self.watch_requested(self.cli_input.command);
+        let one_shot_index = self.cli_input.command == CliCommand::Index && !watch_start;
         // On the default complete-generation policy, a completed legacy root
         // is converted before a watcher takes ownership. The generation build
         // later acquires this same root's publication lease, so a competing
