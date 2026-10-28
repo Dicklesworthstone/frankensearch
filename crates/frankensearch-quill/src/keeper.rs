@@ -95,9 +95,35 @@ pub const WRITER_LOCK_RECORD_BYTES: usize = 36;
 
 /// Current Quill crate version in the MANIFEST packed-semver representation.
 ///
-/// The build-time assertion in this module's tests intentionally forces this
-/// value to change when `Cargo.toml` changes.
-pub const CURRENT_ENGINE_VERSION: u32 = pack_engine_version(0, 4, 0);
+/// Derive the producer stamp from Cargo metadata so a package-version bump
+/// cannot leave it stale. Components outside the durable u8/u8/u16 fields
+/// fail during constant evaluation instead of being truncated.
+pub const CURRENT_ENGINE_VERSION: u32 =
+    (parse_engine_version_component(env!("CARGO_PKG_VERSION_MAJOR"), 255) << 24)
+        | (parse_engine_version_component(env!("CARGO_PKG_VERSION_MINOR"), 255) << 16)
+        | parse_engine_version_component(env!("CARGO_PKG_VERSION_PATCH"), 65_535);
+
+const fn parse_engine_version_component(component: &str, maximum: u32) -> u32 {
+    let bytes = component.as_bytes();
+    assert!(!bytes.is_empty(), "empty engine version component");
+    let mut value = 0_u32;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        assert!(
+            byte.is_ascii_digit(),
+            "non-decimal engine version component"
+        );
+        let digit = (byte - b'0') as u32;
+        assert!(
+            value < maximum / 10 || (value == maximum / 10 && digit <= maximum % 10),
+            "engine version component exceeds its durable field"
+        );
+        value = value * 10 + digit;
+        index += 1;
+    }
+    value
+}
 
 const MANIFEST_MIN_BYTES: usize = 8 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4 + 4;
 /// v2 images carry the additional `last_publish_unix_s` word after `flags`.
@@ -18054,6 +18080,53 @@ mod tests {
     }
 
     #[test]
+    fn engine_version_components_cover_durable_field_bounds() {
+        for value in [0_u32, 1, 9, 10, 99, 100, 254, 255] {
+            assert_eq!(
+                parse_engine_version_component(&value.to_string(), 255),
+                value
+            );
+        }
+        for value in [0_u32, 255, 256, 65_534, 65_535] {
+            assert_eq!(
+                parse_engine_version_component(&value.to_string(), 65_535),
+                value
+            );
+        }
+        assert_eq!(parse_engine_version_component("0", 0), 0);
+        assert_eq!(
+            (parse_engine_version_component("255", 255) << 24)
+                | (parse_engine_version_component("255", 255) << 16)
+                | parse_engine_version_component("65535", 65_535),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn engine_version_components_reject_malformed_or_overflowing_metadata() {
+        for (component, maximum) in [
+            ("", 255),
+            ("-1", 255),
+            ("+1", 255),
+            (" 1", 255),
+            ("1 ", 255),
+            ("1.0", 255),
+            ("0x10", 255),
+            ("４", 255),
+            ("1", 0),
+            ("256", 255),
+            ("65536", 65_535),
+            ("999999999999999999999999", 65_535),
+        ] {
+            assert!(
+                std::panic::catch_unwind(|| parse_engine_version_component(component, maximum))
+                    .is_err(),
+                "accepted {component:?} with maximum {maximum}"
+            );
+        }
+    }
+
+    #[test]
     fn referenced_segment_unknown_schema_maps_to_public_corruption() {
         let path = PathBuf::from("index/seg-0000000000000001.fslx");
         let error: SearchError = KeeperError::SegmentOpen {
@@ -18070,22 +18143,34 @@ mod tests {
 
     #[test]
     fn empty_manifest_has_stable_wire_golden() -> TestResult {
-        let manifest = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
+        let current = Manifest::empty(1, 0x1122_3344_5566_7788, 0);
+        assert_eq!(current.engine_version, CURRENT_ENGINE_VERSION);
+        let current_bytes = current.to_bytes()?;
+        assert_eq!(Manifest::from_bytes(&current_bytes)?, current);
+
+        // Keep the 0.4.0 producer's exact historical image independently of
+        // the current package version. Bytes 36..40 are its informational
+        // producer stamp; the last four bytes are the covering CRC32.
+        let mut manifest = current.clone();
+        manifest.engine_version = pack_engine_version(0, 4, 0);
         let bytes = manifest.to_bytes()?;
-        // GOLDEN-CHANGE: the 0.4.0 package release (the public API breaks:
-        // the CJK analyzer variant and the docid lease reports) advances
-        // producer metadata, not the wire format. Bytes 36..40 are
-        // `CURRENT_ENGINE_VERSION` (0.4.0 => `00 00 04 00`); the trailing CRC32
-        // (zlib, little-endian) covers all prior bytes, the method that
-        // reproduces every retained image below. The 0.3.5 image, written by
-        // main-built binaries and never published, joins the still-readable
-        // list.
         let expected = hex_bytes(
             "46534c584d414e0002000000010000000000000000000000000000008877665544332211\
              00000400000000000000000000000000000000000000000020d1b7d3",
         );
         assert_eq!(bytes, expected);
         assert_eq!(Manifest::from_bytes(&bytes)?, manifest);
+
+        // A package release may change the producer word and its checksum,
+        // but no other byte of this format. The roundtrip above verifies the
+        // current checksum while these comparisons retain the layout golden.
+        assert_eq!(current_bytes.len(), expected.len());
+        assert_eq!(&current_bytes[..36], &expected[..36]);
+        assert_eq!(
+            &current_bytes[36..40],
+            &CURRENT_ENGINE_VERSION.to_le_bytes()
+        );
+        assert_eq!(&current_bytes[40..60], &expected[40..60]);
 
         // Keep previous producers' exact wire images readable and writable;
         // only their engine-version word and the covering CRC differ.
@@ -18136,7 +18221,7 @@ mod tests {
             assert_eq!(previous.engine_version, version);
             assert_eq!(previous.to_bytes()?, previous_bytes);
             previous.engine_version = CURRENT_ENGINE_VERSION;
-            assert_eq!(previous, manifest);
+            assert_eq!(previous, current);
         }
         Ok(())
     }
