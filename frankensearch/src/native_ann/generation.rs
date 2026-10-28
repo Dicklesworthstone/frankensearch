@@ -160,7 +160,7 @@ impl NativeGenerationPreview {
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
-        self.require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
         self.readers.search_text(cx, embedder, text, k).await
     }
 
@@ -177,7 +177,7 @@ impl NativeGenerationPreview {
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
-        self.require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
         self.readers
             .search_quality_text(cx, embedder, text, k)
             .await
@@ -197,7 +197,7 @@ impl NativeGenerationPreview {
         text: &str,
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
-        self.require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
         self.readers
             .search_refined_text(cx, fast, quality, text, k)
             .await
@@ -217,13 +217,12 @@ impl NativeGenerationPreview {
         text: &'a str,
         k: usize,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        self.require_query(cx, text, k, self.readers.bounded_limit(k))?;
+        Self::require_query(cx, text, k, self.readers.bounded_limit(k))?;
         self.readers
             .search_progressive_with_quality(cx, fast, quality, text, k)
     }
 
     pub(in crate::native_ann) fn require_query(
-        &self,
         cx: &Cx,
         text: &str,
         k: usize,
@@ -260,7 +259,7 @@ impl NativeGenerationPreview {
         k: usize,
         allowed: Arc<BTreeSet<String>>,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
-        self.require_query(cx, text, k, allowed.len())?;
+        Self::require_query(cx, text, k, allowed.len())?;
         self.readers.scoped_progressive(
             cx,
             primary,

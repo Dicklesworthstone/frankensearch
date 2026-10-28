@@ -768,7 +768,7 @@ impl Embedder for Provider {
     fn dimension(&self) -> usize {
         2
     }
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "composite-test"
     }
     fn model_name(&self) -> &str {
@@ -1054,6 +1054,7 @@ fn retained_lexical(cx: &Cx, snapshot: &KeeperSnapshot) -> QuillSnapshotIndex {
 
 fn assert_source_refused<T>(result: SearchResult<T>, expected_code: &str) {
     let Err(SearchError::InvalidConfig { field, value, .. }) = result else {
+        // ubs:ignore[rust.ownership.panic-macro] -- This cfg(test)-only helper must fail when the retained-source refusal is absent or mistyped.
         panic!("expected bounded retained source refusal {expected_code}");
     };
     assert_eq!(field, "native_ann.generation.source");
@@ -1500,6 +1501,7 @@ fn assert_admission_refused(
     expected_code: &str,
 ) {
     let Err(SearchError::InvalidConfig { field, value, .. }) = result else {
+        // ubs:ignore[rust.ownership.panic-macro] -- This cfg(test)-only helper preserves the required typed-admission refusal assertion.
         panic!("expected bounded admission refusal {expected_field}/{expected_code}");
     };
     assert_eq!(field, format!("native_ann.generation.{expected_field}"));
@@ -2022,6 +2024,7 @@ mod qualified_rollback {
             PublicationOutcomeV1::Committed { .. }
         ));
         let Some(GenerationActivationV1::Installed(opened)) = result.activation else {
+            // ubs:ignore[rust.ownership.panic-macro] -- This cfg(test)-only fixture must reject a committed publication that failed to activate.
             panic!("known publication must activate its complete generation");
         };
         NativeGenerationSnapshot::admit_exact(cx, opened, binding, DEFAULT_SCHEMA, config(), BUDGET)
@@ -2108,6 +2111,7 @@ mod qualified_rollback {
             PublicationOutcomeV1::Committed { .. }
         ));
         let Some(GenerationActivationV1::Installed(opened)) = result.activation else {
+            // ubs:ignore[rust.ownership.panic-macro] -- This cfg(test)-only progressive fixture must fail if complete activation is absent.
             panic!("complete progressive publication must activate")
         };
         NativeGenerationSnapshot::admit_progressive(
@@ -3994,6 +3998,7 @@ mod qualified_rollback {
         expected_code: &str,
     ) {
         let Err(SearchError::InvalidConfig { field, value, .. }) = result else {
+            // ubs:ignore[rust.ownership.panic-macro] -- This cfg(test)-only helper must fail when selected-predecessor rollback is not refused.
             panic!("expected selected predecessor rollback refusal {expected_code}");
         };
         assert_eq!(field, "native_ann.generation.selected_rollback");

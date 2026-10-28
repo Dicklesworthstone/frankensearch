@@ -2244,7 +2244,7 @@ mod generation_tests {
         client.write_all(bytes.as_bytes()).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
         server.set_nonblocking(true).unwrap();
-        serve_peer::<serde_json::Value, _, _>(
+        Box::pin(serve_peer::<serde_json::Value, _, _>(
             cx,
             &mut server,
             Duration::from_secs(10),
@@ -2255,7 +2255,7 @@ mod generation_tests {
                     .await?;
                 Ok(None)
             },
-        )
+        ))
         .await
         .unwrap();
         drop(server);

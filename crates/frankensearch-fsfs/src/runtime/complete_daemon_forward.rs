@@ -1503,9 +1503,12 @@ mod generation_tests {
                 // Explanation is per request: this daemon started without it.
                 client.config.search.explain = true;
                 let mut output = Vec::new();
-                client
-                    .run_complete_generation_search_with_writer(&cx, &root, &mut output)
-                    .await?;
+                Box::pin(client.run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output,
+                ))
+                .await?;
                 let envelope: OutputEnvelope<SearchPayload> =
                     serde_json::from_slice(&output).unwrap();
                 assert!(envelope.ok);
@@ -1519,9 +1522,12 @@ mod generation_tests {
                 let mut direct = client.clone();
                 direct.cli_input.daemon = false;
                 let mut output = Vec::new();
-                direct
-                    .run_complete_generation_search_with_writer(&cx, &root, &mut output)
-                    .await?;
+                Box::pin(direct.run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output,
+                ))
+                .await?;
                 let direct: OutputEnvelope<SearchPayload> =
                     serde_json::from_slice(&output).unwrap();
                 let direct = direct.data.unwrap();

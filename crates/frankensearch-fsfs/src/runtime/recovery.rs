@@ -819,7 +819,11 @@ mod retained_recovery_tests {
                             .sealed_artifacts()
                             .unwrap()
                             .into_keys()
-                            .find(|path| path.ends_with(".fslx"))
+                            .find(|path| {
+                                Path::new(path)
+                                    .extension()
+                                    .is_some_and(|extension| extension.eq_ignore_ascii_case("fslx"))
+                            })
                             .expect("fixture has a Quill segment");
                         old.path().join(relative)
                     }

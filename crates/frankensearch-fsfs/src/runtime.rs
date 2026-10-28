@@ -5225,7 +5225,7 @@ impl DoctorSemanticProbe {
 }
 
 /// Readiness is derived from completed probe outcomes, never the prose in
-/// DoctorCheck. Each tier retains its own durability admission so an unused
+/// `DoctorCheck`. Each tier retains its own durability admission so an unused
 /// corrupt tier cannot invalidate an independently requested healthy tier.
 #[derive(Debug, Clone, Default)]
 struct DoctorSemanticFacts {
@@ -10489,7 +10489,7 @@ impl FsfsRuntime {
         writer: &mut W,
         stage_override: Option<(&str, &str, &str)>,
     ) -> SearchResult<()> {
-        let (stage, reason_code, message) = stage_override.unwrap_or(match payload.phase {
+        let (stage, reason_code, message) = stage_override.unwrap_or_else(|| match payload.phase {
             SearchOutputPhase::Initial
                 if payload.skip_reason.as_deref() == Some("quality_only") =>
             {
@@ -23420,7 +23420,7 @@ impl FsfsRuntime {
         limit: usize,
         resources: &mut SearchExecutionResources,
         flags: SearchExecutionFlags,
-        mut phase_sink: Option<SearchPhaseSink<'_>>,
+        phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
         let normalized_query = Self::normalize_search_query(query);
         let filter = SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
@@ -23570,7 +23570,7 @@ impl FsfsRuntime {
         };
         Self::semantic_retry_checkpoint(cx, "fsfs.quality_only.finalize")?;
         Self::validate_required_quality_resources(resources)?;
-        if let Some(sink) = phase_sink.as_deref_mut() {
+        if let Some(sink) = phase_sink {
             sink(&artifact.payload)?;
         }
         Self::semantic_retry_checkpoint(cx, "fsfs.quality_only.finalize")?;
@@ -33461,7 +33461,7 @@ mod tests {
                     && hit
                         .quality
                         .as_ref()
-                        .is_some_and(|quality| quality.weight == 1.0)
+                        .is_some_and(|quality| quality.weight.to_bits() == 1.0_f32.to_bits())
             }));
             assert_eq!(
                 fast.calls.load(Ordering::SeqCst),
@@ -33526,7 +33526,7 @@ mod tests {
                     }
                     "identity" => {
                         resources.quality_embedder =
-                            Some(admitted(BlendQueryEmbedder("wrong-quality-2")))
+                            Some(admitted(BlendQueryEmbedder("wrong-quality-2")));
                     }
                     "hash" => {
                         let path = temp.path().join("hash-quality.fsvi");
@@ -36381,9 +36381,9 @@ mod tests {
                 let shutdown = ShutdownCoordinator::new();
                 shutdown.request_shutdown(ShutdownReason::UserRequest);
                 assert!(!cx.is_cancel_requested());
-                let result = runtime
-                    .run_mode_with_shutdown(&cx, InterfaceMode::Cli, &shutdown)
-                    .await;
+                let result =
+                    Box::pin(runtime.run_mode_with_shutdown(&cx, InterfaceMode::Cli, &shutdown))
+                        .await;
                 assert!(
                     matches!(result, Err(SearchError::Cancelled { .. })),
                     "{command:?}: {result:?}"
@@ -42512,8 +42512,7 @@ mod tests {
                 true
             });
 
-            runtime
-                .run_mode_with_shutdown(&cx, InterfaceMode::Cli, &coordinator)
+            Box::pin(runtime.run_mode_with_shutdown(&cx, InterfaceMode::Cli, &coordinator))
                 .await
                 .expect("watch mode with shutdown");
 
@@ -42820,10 +42819,10 @@ mod tests {
                 coordinator_for_writer.request_shutdown(ShutdownReason::UserRequest);
             });
 
-            let error = runtime
-                .run_mode_with_shutdown(&cx, InterfaceMode::Cli, &coordinator)
-                .await
-                .expect_err("terminal watcher failure must escape after finalization");
+            let error =
+                Box::pin(runtime.run_mode_with_shutdown(&cx, InterfaceMode::Cli, &coordinator))
+                    .await
+                    .expect_err("terminal watcher failure must escape after finalization");
             mutator.join().expect("watcher mutation thread");
 
             assert!(
@@ -44271,8 +44270,7 @@ mod tests {
                 trigger.request_shutdown(ShutdownReason::UserRequest);
             });
 
-            runtime
-                .run_mode_with_shutdown(&cx, InterfaceMode::Tui, &coordinator)
+            Box::pin(runtime.run_mode_with_shutdown(&cx, InterfaceMode::Tui, &coordinator))
                 .await
                 .expect("tui mode with reload + shutdown");
 

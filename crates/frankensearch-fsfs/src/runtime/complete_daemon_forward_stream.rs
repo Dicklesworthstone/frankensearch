@@ -964,9 +964,12 @@ mod tests {
             // Deliberately no generation or model artifacts exist. A routing
             // regression into direct retrieval cannot satisfy this request.
             let mut output = Vec::new();
-            let result = runtime
-                .run_complete_generation_search_with_writer(&cx, &root, &mut output)
-                .await;
+            let result = Box::pin(runtime.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut output,
+            ))
+            .await;
             server.join().unwrap();
             result.unwrap();
             let output = String::from_utf8(output).unwrap();

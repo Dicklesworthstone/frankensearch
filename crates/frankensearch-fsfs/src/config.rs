@@ -867,6 +867,10 @@ pub enum UpgradeReusePolicy {
 
 impl UpgradeReusePolicy {
     // Omit the default to preserve the exact pre-policy receipt serialization.
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "Serde skip_serializing_if predicates require fn(&T) -> bool"
+    )]
     const fn is_same_executable(&self) -> bool {
         matches!(self, Self::SameExecutable)
     }

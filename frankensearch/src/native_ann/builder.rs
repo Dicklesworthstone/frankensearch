@@ -495,8 +495,7 @@ impl NativeIndexBuilder {
         };
         match pool {
             Some(pool) => {
-                NativeWorker::BUILD
-                    .run(cx, pool, move |worker| pending.finish(worker))
+                Box::pin(NativeWorker::BUILD.run(cx, pool, move |worker| pending.finish(worker)))
                     .await
             }
             None => pending.finish(cx),

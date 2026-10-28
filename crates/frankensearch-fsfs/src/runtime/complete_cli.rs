@@ -12,9 +12,9 @@ use frankensearch_core::{GenerationRootSecurityProfileV1, SearchError, SearchRes
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
-    SearchDashboardState, SearchExecutionFlags, SearchStreamResources,
-    canonical_store_root, degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms,
-    retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
+    SearchDashboardState, SearchExecutionFlags, SearchStreamResources, canonical_store_root,
+    degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms, retained_search_checkpoint,
+    store_overlaps_source, validate_retained_catalog_path,
 };
 #[cfg(unix)]
 use super::{FSFS_DAEMON_REQUEST_MAX_BYTES, SearchServeFrameBuffer};
@@ -2268,8 +2268,7 @@ mod tests {
             let mut search = search_runtime(&runtime);
             search.cli_input.daemon = true;
             let mut output = Vec::new();
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut output)
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut output))
                 .await
                 .expect("a stale default socket falls back to in-process search");
             let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
@@ -2284,10 +2283,13 @@ mod tests {
             // Named, the same stale socket gets a daemon started on it; with
             // none starting, the search fails closed instead of in process.
             search.cli_input.daemon_socket = Some(socket.clone());
-            let error = search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new())
-                .await
-                .unwrap_err();
+            let error = Box::pin(search.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await
+            .unwrap_err();
             assert!(
                 matches!(&error, SearchError::InvalidConfig { field, value, .. }
                     if field == "complete_generation.daemon_socket"
@@ -2524,10 +2526,13 @@ mod tests {
 
             let mut search = search_runtime(&runtime);
             search.cli_input.daemon = false;
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut Vec::new())
-                .await
-                .unwrap();
+            Box::pin(search.run_complete_generation_search_with_writer(
+                &cx,
+                &root,
+                &mut Vec::new(),
+            ))
+            .await
+            .unwrap();
             assert!(
                 spawns.lock().unwrap().is_empty(),
                 "--no-daemon starts nothing"
@@ -2535,8 +2540,7 @@ mod tests {
 
             search.cli_input.daemon = true;
             let mut output = Vec::new();
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut output)
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut output))
                 .await
                 .unwrap();
             let envelope: serde_json::Value = serde_json::from_slice(&output).unwrap();
@@ -3617,10 +3621,15 @@ mod tests {
                 second_receipt["data"]["generation_id"]
             );
             let mut output = Vec::new();
-            search_runtime(&runtime)
-                .run_complete_generation_search_with_writer(&cx, &root, &mut output)
-                .await
-                .unwrap();
+            Box::pin(
+                search_runtime(&runtime).run_complete_generation_search_with_writer(
+                    &cx,
+                    &root,
+                    &mut output,
+                ),
+            )
+            .await
+            .unwrap();
             let result: serde_json::Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(result["data"]["hits"].as_array().unwrap().len(), 2);
             let old_results = old.search(&cx, "sharedtoken", 10).await.unwrap();
@@ -3658,8 +3667,7 @@ mod tests {
             search.config.search.explain = true;
             search.cli_input.query = Some("how to find sharedtoken document content".to_owned());
             let mut buffered = Vec::new();
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut buffered)
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut buffered))
                 .await
                 .unwrap();
             let envelope: OutputEnvelope<crate::output_schema::SearchPayload> =
@@ -3699,8 +3707,7 @@ mod tests {
 
             search.cli_input.format = OutputFormat::Table;
             let mut table = Vec::new();
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut table)
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut table))
                 .await
                 .unwrap();
             let table = String::from_utf8(table).unwrap();
@@ -3710,8 +3717,7 @@ mod tests {
             search.cli_input.format = OutputFormat::Jsonl;
             search.cli_input.stream = true;
             let mut streamed = Vec::new();
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut streamed)
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut streamed))
                 .await
                 .unwrap();
             let frames: Vec<StreamFrame<SearchHitPayload>> = streamed
@@ -3745,8 +3751,7 @@ mod tests {
             search.config.search.explain = false;
             search.cli_input.stream = false;
             let mut ordinary = Vec::new();
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut ordinary)
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut ordinary))
                 .await
                 .unwrap();
             let ordinary: serde_json::Value = serde_json::from_slice(&ordinary).unwrap();
@@ -3832,7 +3837,7 @@ mod tests {
                 };
                 let mut output = Vec::new();
                 assert!(
-                    matches!(search.run_complete_generation_search_with_writer(&cx, &root, &mut output).await,
+                    matches!(Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut output)).await,
                     Err(SearchError::InvalidConfig { field, .. }) if field == "complete_generation.explain")
                 );
                 assert!(output.is_empty());
@@ -4078,8 +4083,7 @@ mod tests {
             search.cli_input.stream = true;
             search.cli_input.format = OutputFormat::Jsonl;
             let mut output = Vec::new();
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut output)
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut output))
                 .await
                 .unwrap();
             let frames: Vec<serde_json::Value> = String::from_utf8(output)
@@ -4111,8 +4115,7 @@ mod tests {
                 Some(root.clone())
             );
             let mut output = Vec::new();
-            search
-                .run_complete_generation_search_with_writer(&cx, &root, &mut output)
+            Box::pin(search.run_complete_generation_search_with_writer(&cx, &root, &mut output))
                 .await
                 .unwrap_err();
             assert!(output.is_empty());
