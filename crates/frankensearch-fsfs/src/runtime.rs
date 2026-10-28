@@ -506,6 +506,8 @@ const WATCH_OPEN_BUDGET: Duration = Duration::from_secs(30);
 /// Sentinel/checkpoint reason codes describing the quality tier of a generation.
 const REASON_VECTOR_QUALITY_TIER_BUILT: &str = "vector.quality_tier.built";
 const REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY: &str = "vector.quality_tier.skipped.fast_only";
+const REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE: &str =
+    "vector.quality_tier.deferred.pressure_override";
 const REASON_VECTOR_QUALITY_TIER_SKIPPED_MODEL_UNAVAILABLE: &str =
     "vector.quality_tier.skipped.model_unavailable";
 const REASON_VECTOR_QUALITY_TIER_ABANDONED_EMBEDDING_FAILED: &str =
@@ -957,9 +959,10 @@ impl SearchExecutionMode {
 
 /// `pressure.degradation_override` applied to a search, per the stage
 /// contracts in `pressure.rs`: lexical-only drops the semantic lanes, and
-/// metadata-only or paused refuse search. `auto`, `full` and `embed_deferred`
-/// keep the requested mode (their query contract is hybrid), except in a build
-/// without semantic loaders, whose only mode is lexical-only.
+/// metadata-only or paused refuse search. Embedding deferral preserves lexical
+/// and fast semantic search while shedding quality refinement. `auto` and
+/// `full` keep the requested mode, except in a build without semantic loaders,
+/// whose only mode is lexical-only.
 fn degraded_search_mode(
     override_mode: crate::config::DegradationOverrideMode,
     requested: SearchExecutionMode,
@@ -968,7 +971,8 @@ fn degraded_search_mode(
     if matches!(requested, SearchExecutionMode::QualityOnly) {
         if matches!(
             override_mode,
-            DegradationOverrideMode::ForceLexicalOnly
+            DegradationOverrideMode::ForceEmbedDeferred
+                | DegradationOverrideMode::ForceLexicalOnly
                 | DegradationOverrideMode::ForceMetadataOnly
                 | DegradationOverrideMode::ForcePaused
         ) {
@@ -983,13 +987,20 @@ fn degraded_search_mode(
         }
     }
     match override_mode {
+        DegradationOverrideMode::ForceEmbedDeferred => Ok(build_search_mode(
+            if matches!(requested, SearchExecutionMode::LexicalOnly) {
+                requested
+            } else {
+                SearchExecutionMode::FastOnly
+            },
+        )),
         DegradationOverrideMode::ForceLexicalOnly => Ok(SearchExecutionMode::LexicalOnly),
         DegradationOverrideMode::ForceMetadataOnly | DegradationOverrideMode::ForcePaused => {
             Err(degradation_refusal(override_mode, "search"))
         }
-        DegradationOverrideMode::Auto
-        | DegradationOverrideMode::ForceFull
-        | DegradationOverrideMode::ForceEmbedDeferred => Ok(build_search_mode(requested)),
+        DegradationOverrideMode::Auto | DegradationOverrideMode::ForceFull => {
+            Ok(build_search_mode(requested))
+        }
     }
 }
 
@@ -2389,6 +2400,9 @@ struct FsfsIndexPayload {
     unchanged_files: usize,
     semantic_indexed_files: usize,
     semantic_deferred_files: usize,
+    /// Fast vectors are complete; these source files await a later quality-tier
+    /// rebuild after the pressure override is cleared.
+    quality_deferred_files: usize,
     embedding_retries: usize,
     embedding_failures: usize,
     /// Absent for a lexical-only generation, which has no vector tiers.
@@ -2442,6 +2456,15 @@ impl FsfsIndexPayload {
                 format!(
                     "{} file(s) have deferred semantic embeddings. Durable lexical artifacts were preserved, but this generation is not admitted for semantic search; rerun `fsfs index {}`.",
                     self.semantic_deferred_files, self.generation.target_root,
+                ),
+            ));
+        }
+        if self.quality_deferred_files > 0 {
+            warnings.push(OutputWarning::new(
+                OutputWarningCode::QUALITY_INDEX_DEFERRED,
+                format!(
+                    "Quality embeddings for {} file(s) were deferred by pressure policy. Clear force_embed_deferred and rerun `fsfs index {}` to build the quality tier.",
+                    self.quality_deferred_files, self.generation.target_root,
                 ),
             ));
         }
@@ -4920,6 +4943,10 @@ struct FsfsIndexStatus {
     quality_generation_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quality_generation_dimension: Option<usize>,
+    /// Source files awaiting quality embedding after deliberate pressure
+    /// deferral, derived from the generation's recorded reason and manifest.
+    #[serde(default)]
+    quality_deferred_files: usize,
     /// The command that finishes an `fsfs index` run into this root that
     /// started but never published (interrupted, failed, or still running).
     /// Search refuses the root until that run finishes.
@@ -6459,6 +6486,25 @@ pub struct FsfsRuntime {
 pub const BUNDLED_MODEL_MATERIALIZER_FLAG: &str = "--internal-materialize-bundled-models";
 
 impl FsfsRuntime {
+    /// The pressure override sheds expensive quality embedding and reranking,
+    /// while fast semantic indexing and retrieval remain available.
+    const fn quality_work_deferred(&self) -> bool {
+        matches!(
+            self.config.pressure.degradation_override,
+            DegradationOverrideMode::ForceEmbedDeferred
+        )
+    }
+
+    /// Effective query/indexing quality policy, including runtimes constructed
+    /// directly or request overrides that bypass configuration resolution.
+    const fn quality_disabled_by_policy(&self) -> bool {
+        self.config.search.fast_only || self.quality_work_deferred()
+    }
+
+    const fn reranking_enabled_by_policy(&self) -> bool {
+        self.config.search.rerank && !self.quality_work_deferred()
+    }
+
     #[must_use]
     pub fn new(config: FsfsConfig) -> Self {
         let lexical_only_indexing = !SEMANTIC_LOADERS_COMPILED
@@ -6984,7 +7030,8 @@ impl FsfsRuntime {
     }
 
     fn resolve_vector_tier(&self, availability: EmbedderAvailability) -> VectorSchedulingTier {
-        if self.config.search.fast_only || self.config.indexing.quality_model.trim().is_empty() {
+        if self.quality_disabled_by_policy() || self.config.indexing.quality_model.trim().is_empty()
+        {
             return match availability {
                 EmbedderAvailability::None => VectorSchedulingTier::LexicalFallback,
                 EmbedderAvailability::Full | EmbedderAvailability::FastOnly => {
@@ -7037,7 +7084,9 @@ impl FsfsRuntime {
         let reason_code = match tier {
             VectorSchedulingTier::FastAndQuality => "vector.plan.fast_quality",
             VectorSchedulingTier::FastOnly => {
-                if self.config.search.fast_only {
+                if self.quality_work_deferred() {
+                    "vector.plan.quality_deferred"
+                } else if self.config.search.fast_only {
                     "vector.plan.fast_only_policy"
                 } else {
                     "vector.plan.fast_only_quality_unavailable"
@@ -8380,7 +8429,7 @@ impl FsfsRuntime {
                 .iter()
                 .any(|model| model.tier == "quality" && model.cached);
 
-            if fast_cached && quality_cached && !self.config.search.fast_only {
+            if fast_cached && quality_cached && !self.quality_disabled_by_policy() {
                 return Ok(Some((
                     "Search readiness: fast and quality model caches passed their registered manifests. Run `fsfs doctor` to exercise both compiled loaders before indexing. Full search fails before Initial if the fast lane is unavailable; a generation that carries a quality tier (`vector/quality.fsvi`) emits INITIAL then REFINED, and one without it serves INITIAL only. A quality-only failure preserves Initial and emits an actionable RefinementFailed phase."
                         .to_owned(),
@@ -8388,9 +8437,9 @@ impl FsfsRuntime {
                 )));
             }
             if fast_cached {
-                if self.config.search.fast_only {
+                if self.quality_disabled_by_policy() {
                     return Ok(Some((
-                        "Search readiness: the fast model cache passed its registered manifest and quality is disabled by `fast_only=true`. Run `fsfs doctor` to exercise the compiled fast loader before indexing."
+                        "Search readiness: the fast model cache passed its registered manifest and quality is disabled by the current search policy. Run `fsfs doctor` to exercise the compiled fast loader before indexing."
                             .to_owned(),
                         false,
                     )));
@@ -9344,7 +9393,7 @@ impl FsfsRuntime {
                 mode: mode.label().to_owned(),
                 limit: requested_limit,
                 filter: request.filter.clone(),
-                rerank: runtime.config.search.rerank,
+                rerank: runtime.reranking_enabled_by_policy(),
                 cached,
             })?;
         }
@@ -9725,12 +9774,12 @@ impl FsfsRuntime {
                 limit: Some(limit),
                 mode: Some(mode.label().to_owned()),
                 filter: self.cli_input.filter.clone(),
-                rerank: Some(self.config.search.rerank),
+                rerank: Some(self.reranking_enabled_by_policy()),
                 rerank_timeout_ms: Some(self.config.search.rerank_timeout_ms),
                 quality_weight: Some(self.config.search.quality_weight),
                 quality_timeout_ms: Some(self.config.search.quality_timeout_ms),
                 rrf_k: Some(self.config.search.rrf_k),
-                fast_only: Some(self.config.search.fast_only),
+                fast_only: Some(self.quality_disabled_by_policy()),
             };
             let mut request_value =
                 serde_json::to_value(&request).map_err(|source| SearchError::SubsystemError {
@@ -9754,7 +9803,7 @@ impl FsfsRuntime {
             let started = Instant::now();
             let budget = Self::search_daemon_delivery_budget(
                 self.config.search.quality_timeout_ms,
-                self.config.search.rerank,
+                self.reranking_enabled_by_policy(),
                 self.config.search.rerank_timeout_ms,
             );
             let mut written = 0;
@@ -11449,9 +11498,10 @@ impl FsfsRuntime {
                     "search",
                 ));
             }
-            DegradationOverrideMode::Auto
-            | DegradationOverrideMode::ForceFull
-            | DegradationOverrideMode::ForceEmbedDeferred => SearchExecutionMode::Full,
+            DegradationOverrideMode::ForceEmbedDeferred => SearchExecutionMode::FastOnly,
+            DegradationOverrideMode::Auto | DegradationOverrideMode::ForceFull => {
+                SearchExecutionMode::Full
+            }
         };
         self.execute_search_payloads_with_mode(cx, query, limit, mode)
             .await
@@ -12111,7 +12161,7 @@ impl FsfsRuntime {
     }
 
     fn selected_quality_model_id(&self) -> SearchResult<String> {
-        if self.config.search.fast_only {
+        if self.quality_disabled_by_policy() {
             return Ok(String::new());
         }
         Ok(select_quality_model(&self.config.indexing.quality_model)?
@@ -12227,13 +12277,13 @@ impl FsfsRuntime {
             requested_limit,
             mode: mode.label().to_owned(),
             filter: self.cli_input.filter.clone(),
-            fast_only: self.config.search.fast_only,
+            fast_only: self.quality_disabled_by_policy(),
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
             rerank_timeout_ms: self.config.search.rerank_timeout_ms,
-            rerank: self.config.search.rerank,
-            rerank_model: if self.config.search.rerank {
+            rerank: self.reranking_enabled_by_policy(),
+            rerank_model: if self.reranking_enabled_by_policy() {
                 self.reranker
                     .get()
                     .and_then(|slot| slot.0.as_ref())
@@ -12295,7 +12345,7 @@ impl FsfsRuntime {
             quality_timeout_ms: self.config.search.quality_timeout_ms,
             rerank_timeout_ms: self.config.search.rerank_timeout_ms,
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
-            fast_only: self.config.search.fast_only,
+            fast_only: self.quality_disabled_by_policy(),
         })
     }
 
@@ -13210,6 +13260,7 @@ impl FsfsRuntime {
         flags: SearchExecutionFlags,
         mut phase_sink: Option<SearchPhaseSink<'_>>,
     ) -> SearchResult<Vec<SearchPhaseArtifact>> {
+        let mode = degraded_search_mode(self.config.pressure.degradation_override, mode)?;
         self.validate_semantic_model_selection(mode)?;
         self.rebind_search_resources_if_generation_changed(cx, mode, resources)
             .await?;
@@ -13279,7 +13330,8 @@ impl FsfsRuntime {
         let planning_limit = Self::resolve_planning_limit(output_limit);
         let search_start = Instant::now();
 
-        let mut capabilities = resources.capabilities_for_mode(mode, self.config.search.fast_only);
+        let mut capabilities =
+            resources.capabilities_for_mode(mode, self.quality_disabled_by_policy());
         // The cross-encoder is a process resource, not an index resource: the
         // runtime owns it, so its capability is decided here. Nothing is
         // loaded unless the caller asked for the stage.
@@ -14436,7 +14488,7 @@ impl FsfsRuntime {
     /// The bare download command retains its separate bulk catalog semantics.
     fn configured_model_manifests(&self) -> SearchResult<Vec<ModelManifest>> {
         self.validate_registered_local_model_intent()?;
-        let quality = if self.config.search.fast_only {
+        let quality = if self.quality_disabled_by_policy() {
             None
         } else {
             select_quality_model(&self.config.indexing.quality_model)?
@@ -14453,13 +14505,13 @@ impl FsfsRuntime {
         {
             let fast = select_fast_model(&self.config.indexing.fast_model)?;
             let mut selected = vec![fast.download_manifest().clone()];
-            if !self.config.search.fast_only
+            if !self.quality_disabled_by_policy()
                 && let Some(quality) = quality
             {
                 Self::ensure_quality_backend(quality)?;
                 selected.push(quality.download_manifest());
             }
-            if self.config.search.rerank {
+            if self.reranking_enabled_by_policy() {
                 if !cfg!(feature = "rerank") {
                     return Err(SearchError::EmbedderUnavailable {
                         model: FSFS_RERANKER_MODEL_ID.to_owned(),
@@ -14739,11 +14791,29 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    /// A mutation cannot silently leave an existing quality tier stale. A
+    /// rebuild first retires it atomically with a complete fast generation.
+    fn validate_deferred_quality_mutation(&self, index_root: &Path) -> SearchResult<()> {
+        if self.quality_work_deferred()
+            && index_root
+                .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                .try_exists()?
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "pressure.degradation_override".to_owned(),
+                value: "force_embed_deferred".to_owned(),
+                reason: "this generation has a quality tier that must stay synchronized; run `fsfs index` under force_embed_deferred to rebuild it with the fast tier before appending or watching".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Appending cannot change a generation's retrieval topology: dropping only
     /// the new vectors would leave a partially updated semantic generation.
     /// A forced lexical-only rebuild selects that topology before later appends.
     fn validate_append_indexing_mode(&self, index_root: &Path) -> SearchResult<()> {
         self.validate_content_upserts_allowed()?;
+        self.validate_deferred_quality_mutation(index_root)?;
         if self.config.pressure.degradation_override
             == crate::config::DegradationOverrideMode::ForceLexicalOnly
             && !Self::is_lexical_only_generation(index_root)
@@ -14858,6 +14928,7 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         self.validate_content_upserts_allowed()?;
         let index_root = self.resolve_status_index_root()?;
+        self.validate_deferred_quality_mutation(&index_root)?;
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
         if !vector_path.exists() {
@@ -16355,14 +16426,23 @@ impl FsfsRuntime {
                 &mut fast_problem,
             ));
             semantic_facts.fast_generation = DoctorSemanticProbe::completed(fast_problem);
-            let mut quality_problem = None;
-            checks.push(Self::collect_quality_generation_doctor_check(
-                &index_root,
-                self.doctor_requested_mode(),
-                &mut quality_problem,
-                &mut semantic_coverage,
-            ));
-            semantic_facts.quality_generation = DoctorSemanticProbe::completed(quality_problem);
+            if self.quality_work_deferred() {
+                checks.push(DoctorCheck {
+                    name: "semantic.quality_generation".to_owned(),
+                    verdict: DoctorVerdict::Pass,
+                    detail: "not evaluated: force_embed_deferred disables quality work; fast semantic readiness is checked independently".to_owned(),
+                    suggestion: Some("clear force_embed_deferred and rerun `fsfs index <dir>` to build the quality tier".to_owned()),
+                });
+            } else {
+                let mut quality_problem = None;
+                checks.push(Self::collect_quality_generation_doctor_check(
+                    &index_root,
+                    self.doctor_requested_mode(),
+                    &mut quality_problem,
+                    &mut semantic_coverage,
+                ));
+                semantic_facts.quality_generation = DoctorSemanticProbe::completed(quality_problem);
+            }
             checks.push(Self::collect_vector_durability_doctor_check(
                 &index_root,
                 &mut semantic_facts.fast_durability,
@@ -16616,11 +16696,12 @@ impl FsfsRuntime {
     fn doctor_requested_mode(&self) -> SearchExecutionMode {
         if self.cli_input.quality_only {
             SearchExecutionMode::QualityOnly
-        } else if self
-            .cli_input
-            .overrides
-            .fast_only
-            .unwrap_or(self.config.search.fast_only)
+        } else if self.quality_work_deferred()
+            || self
+                .cli_input
+                .overrides
+                .fast_only
+                .unwrap_or(self.config.search.fast_only)
         {
             SearchExecutionMode::FastOnly
         } else {
@@ -18158,6 +18239,21 @@ impl FsfsRuntime {
         let stale_files = Self::count_stale_files(&index_root, sentinel.as_ref())?;
         let published_vector = Self::inspect_published_vector_generation(&index_root);
         let published_quality = Self::inspect_published_quality_generation(&index_root);
+        let quality_deferred_files = if published_quality.is_none()
+            && sentinel.as_ref().is_some_and(|value| {
+                value
+                    .reason_codes
+                    .iter()
+                    .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+            }) {
+            Self::read_index_manifest(&index_root)?
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.ingestion_class == "full_semantic_lexical")
+                .count()
+        } else {
+            0
+        };
 
         // Only a catalog that lives under the index root counts towards the
         // index's own bytes; the default global catalog is reported on its
@@ -18214,7 +18310,7 @@ impl FsfsRuntime {
             rrf_k: self.config.search.rrf_k,
             quality_weight: self.config.search.quality_weight,
             quality_timeout_ms: self.config.search.quality_timeout_ms,
-            fast_only: self.config.search.fast_only,
+            fast_only: self.quality_disabled_by_policy(),
             pressure_profile: format!("{:?}", self.config.pressure.profile).to_ascii_lowercase(),
         };
 
@@ -18264,6 +18360,7 @@ impl FsfsRuntime {
                 quality_generation_dimension: published_quality
                     .as_ref()
                     .map(|value| value.dimension),
+                quality_deferred_files,
                 unfinished_index_run: unfinished_index_run_command(&index_root),
                 lexical_rebuild_required,
                 vector_files_in_use: published_vector.is_none()
@@ -18473,14 +18570,21 @@ impl FsfsRuntime {
 
     fn collect_model_statuses(&self) -> SearchResult<Vec<FsfsModelStatus>> {
         let model_root = PathBuf::from(&self.config.indexing.model_dir);
-        Ok(vec![
-            Self::collect_model_status("fast", &self.config.indexing.fast_model, &model_root)?,
-            Self::collect_model_status(
+        let mut statuses = vec![Self::collect_model_status(
+            "fast",
+            &self.config.indexing.fast_model,
+            &model_root,
+        )?];
+        // Banner/progress/status collection must not inspect or hash an expensive
+        // quality cache merely to report an explicitly deferred operation.
+        if !self.quality_work_deferred() {
+            statuses.push(Self::collect_model_status(
                 "quality",
                 &self.config.indexing.quality_model,
                 &model_root,
-            )?,
-        ])
+            )?);
+        }
+        Ok(statuses)
     }
 
     fn collect_model_status(
@@ -20464,6 +20568,7 @@ impl FsfsRuntime {
         });
         // The generation records whether it carries a quality tier and, if
         // not, why; `fsfs doctor` and `fsfs status` read this back.
+        observed_reason_codes.retain(|reason| !reason.starts_with("vector.quality_tier."));
         observed_reason_codes.insert(quality_tier_reason.to_owned());
         let reason_codes = observed_reason_codes.into_iter().collect::<Vec<_>>();
 
@@ -20594,6 +20699,13 @@ impl FsfsRuntime {
                 .filter(|entry| entry.semantic_indexed)
                 .count(),
             semantic_deferred_files,
+            quality_deferred_files: if quality_tier_reason
+                == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE
+            {
+                semantic_doc_count
+            } else {
+                0
+            },
             embedding_retries,
             embedding_failures,
             vector_generation: published_vector,
@@ -21576,6 +21688,9 @@ impl FsfsRuntime {
         )
     )]
     fn resolve_quality_embedder(&self) -> SearchResult<Option<Arc<dyn Embedder>>> {
+        if self.quality_work_deferred() {
+            return Ok(None);
+        }
         if !self.config.indexing.quality_model.trim().is_empty() {
             self.validate_registered_local_model_intent()?;
         }
@@ -21682,7 +21797,7 @@ impl FsfsRuntime {
     /// A queued job can instead be cancelled, allowing the next query to retry.
     async fn prepared_reranker(&self, cx: &Cx) -> SearchResult<Option<Arc<dyn Reranker>>> {
         Self::semantic_retry_checkpoint(cx, "reranker_initialization")?;
-        if !self.config.search.rerank {
+        if !self.reranking_enabled_by_policy() {
             return Ok(None);
         }
         #[cfg(feature = "rerank")]
@@ -21864,7 +21979,13 @@ impl FsfsRuntime {
             fused,
             payload: RerankStagePayload::skipped(reason_code, budget),
         };
-        if !self.config.search.rerank {
+        if self.quality_work_deferred() {
+            return Ok(skipped(
+                fused,
+                "query.stage.rerank.deferred.pressure_override",
+            ));
+        }
+        if !self.reranking_enabled_by_policy() {
             return Ok(skipped(fused, REASON_RERANK_NOT_REQUESTED));
         }
         if !stage.enabled {
@@ -22155,7 +22276,13 @@ impl FsfsRuntime {
     /// records the reason code, builds the fast tier, and search serves
     /// INITIAL only until a re-index with the model present.
     fn resolve_indexing_quality_embedder(&self) -> (Option<Arc<dyn Embedder>>, &'static str) {
-        if self.config.search.fast_only || self.config.indexing.quality_model.trim().is_empty() {
+        if self.config.indexing.quality_model.trim().is_empty() {
+            return (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);
+        }
+        if self.quality_work_deferred() {
+            return (None, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+        }
+        if self.config.search.fast_only {
             return (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_FAST_ONLY);
         }
         match self.resolve_quality_embedder() {
@@ -22453,6 +22580,7 @@ impl FsfsRuntime {
         writer: &mut W,
     ) -> SearchResult<()> {
         self.validate_content_upserts_allowed()?;
+        self.validate_deferred_quality_mutation(index_root)?;
         let docs = retained_reuse::read_append_documents(cx, self).await?;
         if docs.is_empty() {
             return self.emit_append_batch_receipt(0, 0, false, writer);
@@ -22716,6 +22844,10 @@ impl FsfsRuntime {
         admission_mode: SearchExecutionMode,
         resource_mode: SearchExecutionMode,
     ) -> SearchResult<SearchExecutionResources> {
+        let admission_mode =
+            degraded_search_mode(self.config.pressure.degradation_override, admission_mode)?;
+        let resource_mode =
+            degraded_search_mode(self.config.pressure.degradation_override, resource_mode)?;
         self.validate_semantic_model_selection(admission_mode)?;
         self.rebuild_legacy_lexical_index_if_needed(cx, index_root)
             .await?;
@@ -22787,10 +22919,12 @@ impl FsfsRuntime {
         // A warm server also opens standalone quality stores for later requests.
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
         let quality_required = matches!(admission_mode, SearchExecutionMode::QualityOnly);
-        let quality_vector_index = if matches!(
-            resource_mode,
-            SearchExecutionMode::Full | SearchExecutionMode::QualityOnly
-        ) && (quality_required || quality_vector_path.exists())
+        let quality_vector_index = if !self.quality_work_deferred()
+            && matches!(
+                resource_mode,
+                SearchExecutionMode::Full | SearchExecutionMode::QualityOnly
+            )
+            && (quality_required || quality_vector_path.exists())
         {
             match VectorIndex::open_read_only(&quality_vector_path) {
                 Ok(index) => Some(index),
@@ -23526,7 +23660,7 @@ impl FsfsRuntime {
         cx: &Cx,
         resources: &mut SearchExecutionResources,
     ) -> SearchResult<()> {
-        if self.config.indexing.quality_model.trim().is_empty() {
+        if self.quality_work_deferred() || self.config.indexing.quality_model.trim().is_empty() {
             return Ok(());
         }
         if resources.quality_embedder.is_some() || resources.quality_embedder_attempted {
@@ -23632,6 +23766,7 @@ impl FsfsRuntime {
     ) -> SearchResult<(LiveIngestPipeline, Arc<std::sync::Mutex<VectorIndex>>)> {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        self.validate_deferred_quality_mutation(&index_root)?;
         if Self::is_lexical_only_generation(&index_root) {
             return Err(Self::lexical_only_generation_refusal(&index_root, "watch"));
         }
@@ -24711,10 +24846,16 @@ impl FsfsRuntime {
             no_color,
         );
         #[cfg(feature = "semantic-support")]
-        let mode_summary = if fast_cached && quality_cached && !self.config.search.fast_only {
+        let mode_summary = if fast_cached && quality_cached && !self.quality_disabled_by_policy() {
             paint(
                 "fast + quality manifest-verified (doctor probes loaders)",
                 "32",
+                no_color,
+            )
+        } else if fast_cached && self.quality_work_deferred() {
+            paint(
+                "fast manifest-verified; quality deferred by pressure policy",
+                "33",
                 no_color,
             )
         } else if fast_cached {
@@ -24891,7 +25032,7 @@ impl FsfsRuntime {
                 render_existing_index_dashboard_frame(
                     frame,
                     &payload,
-                    self.config.search.fast_only,
+                    self.quality_disabled_by_policy(),
                     no_color,
                 );
             })?;
@@ -25401,16 +25542,16 @@ impl FsfsRuntime {
                 let last = payloads.last();
                 let has_semantic_hits = last.is_some_and(payload_has_admitted_semantic_hits);
                 let has_hash_hits = last.is_some_and(payload_has_hash_control_hits);
-                let can_run_quality = !self.config.search.fast_only
+                let can_run_quality = !self.quality_disabled_by_policy()
                     && has_semantic_hits
                     && state.quality_model_cached()
-                    && resources.quality_stage_viable(self.config.search.fast_only);
+                    && resources.quality_stage_viable(self.quality_disabled_by_policy());
                 let stages = if can_run_quality {
                     vec![
                         DashboardSearchStage::Lexical,
                         DashboardSearchStage::SemanticFast,
                     ]
-                } else if has_semantic_hits && !self.config.search.fast_only {
+                } else if has_semantic_hits && !self.quality_disabled_by_policy() {
                     vec![
                         DashboardSearchStage::Lexical,
                         DashboardSearchStage::SemanticFast,
@@ -25489,7 +25630,7 @@ impl FsfsRuntime {
             }
             return;
         }
-        if !resources.quality_stage_viable(self.config.search.fast_only) {
+        if !resources.quality_stage_viable(self.quality_disabled_by_policy()) {
             return;
         }
 
@@ -29884,6 +30025,13 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
         truncate_middle(&status.index.path, width.saturating_sub(10))
     );
     let _ = writeln!(out, "  state: {index_exists}");
+    if status.index.quality_deferred_files > 0 {
+        let _ = writeln!(
+            out,
+            "  quality deferred: {} file(s); clear force_embed_deferred and run `fsfs index` to build the quality tier",
+            status.index.quality_deferred_files,
+        );
+    }
     if let Some(command) = status.index.unfinished_index_run.as_deref() {
         let _ = writeln!(
             out,
@@ -31987,6 +32135,94 @@ mod tests {
     }
 
     #[test]
+    fn deferred_quality_keeps_fast_and_lexical_modes_but_refuses_quality_only() {
+        for requested in [SearchExecutionMode::Full, SearchExecutionMode::FastOnly] {
+            assert_eq!(
+                super::degraded_search_mode(DegradationOverrideMode::ForceEmbedDeferred, requested)
+                    .unwrap(),
+                super::build_search_mode(SearchExecutionMode::FastOnly),
+            );
+        }
+        assert_eq!(
+            super::degraded_search_mode(
+                DegradationOverrideMode::ForceEmbedDeferred,
+                SearchExecutionMode::LexicalOnly,
+            )
+            .unwrap(),
+            SearchExecutionMode::LexicalOnly,
+        );
+        assert!(matches!(
+            super::degraded_search_mode(
+                DegradationOverrideMode::ForceEmbedDeferred,
+                SearchExecutionMode::QualityOnly,
+            ),
+            Err(SearchError::InvalidConfig { field, value, .. })
+                if field == "pressure.degradation_override" && value == "force_embed_deferred"
+        ));
+    }
+
+    #[test]
+    fn deferred_quality_policy_survives_request_overrides_and_cached_reranker() {
+        run_test_with_cx(|cx| async move {
+            let mut config = FsfsConfig::default();
+            config.pressure.degradation_override = DegradationOverrideMode::ForceEmbedDeferred;
+            config.search.fast_only = false;
+            config.search.rerank = true;
+            config.indexing.quality_model = "unknown-deferred-quality".to_owned();
+            let mut runtime = FsfsRuntime::new(config);
+            let reranker: Arc<dyn frankensearch_core::Reranker> =
+                Arc::new(frankensearch_core::SyncRerankerAdapter(ReverseReranker));
+            runtime.reranker = Arc::new(std::sync::OnceLock::from(super::RerankerSlot(Some(
+                reranker,
+            ))));
+
+            let request: SearchServeRequest = serde_json::from_value(serde_json::json!({
+                "query": "recover network", "mode": "full", "fast_only": false, "rerank": true,
+            }))
+            .unwrap();
+            let requested = runtime.with_search_serve_request_policy(&request).unwrap();
+            assert!(requested.quality_disabled_by_policy());
+            assert!(!requested.reranking_enabled_by_policy());
+            assert!(requested.prepared_reranker(&cx).await.unwrap().is_none());
+            assert!(requested.resolve_quality_embedder().unwrap().is_none());
+            let (quality, reason) = requested.resolve_indexing_quality_embedder();
+            assert!(quality.is_none());
+            assert_eq!(reason, super::REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+            assert_eq!(
+                requested.resolve_vector_tier(EmbedderAvailability::Full),
+                VectorSchedulingTier::FastOnly,
+            );
+            assert_eq!(
+                requested.doctor_requested_mode(),
+                SearchExecutionMode::FastOnly
+            );
+            let key = requested
+                .search_cache_key("recover network", 10, SearchExecutionMode::FastOnly)
+                .unwrap();
+            assert!(key.quality_model.is_empty());
+            assert!(key.fast_only);
+            assert!(!key.rerank);
+            assert!(key.rerank_model.is_none());
+            let policy = requested.search_serve_policy().unwrap();
+            assert!(policy.fast_only);
+            assert!(policy.quality_model.is_empty());
+            #[cfg(feature = "semantic-support")]
+            assert_eq!(
+                requested.configured_model_manifests().unwrap(),
+                vec![ModelManifest::potion_128m()]
+            );
+
+            let mut restored = requested;
+            restored.config.pressure.degradation_override = DegradationOverrideMode::Auto;
+            assert!(!restored.quality_disabled_by_policy());
+            assert!(restored.reranking_enabled_by_policy());
+            assert!(restored.prepared_reranker(&cx).await.unwrap().is_some());
+            assert!(matches!(restored.resolve_quality_embedder(),
+                Err(SearchError::InvalidConfig { field, .. }) if field == "indexing.quality_model"));
+        });
+    }
+
+    #[test]
     fn lexical_only_cache_and_daemon_ignore_unused_model_configuration() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().unwrap();
@@ -33229,6 +33465,7 @@ mod tests {
     fn quality_only_policy_never_downgrades_to_a_lite_or_pressure_fallback() {
         use crate::config::DegradationOverrideMode;
         for mode in [
+            DegradationOverrideMode::ForceEmbedDeferred,
             DegradationOverrideMode::ForceLexicalOnly,
             DegradationOverrideMode::ForceMetadataOnly,
             DegradationOverrideMode::ForcePaused,
@@ -37521,6 +37758,7 @@ mod tests {
                 vector_generation_is_hash: false,
                 quality_generation_id: None,
                 quality_generation_dimension: None,
+                quality_deferred_files: 0,
                 unfinished_index_run: None,
                 lexical_rebuild_required: false,
                 vector_files_in_use: false,
@@ -44873,6 +45111,185 @@ mod tests {
                     .any(|hit| hit.path.contains("auth") || hit.path.contains("README")),
                 "expected auth-related hit path in payload"
             );
+        });
+    }
+
+    #[cfg(all(unix, feature = "semantic-support", not(feature = "embedded-models")))]
+    #[test]
+    fn deferred_quality_keeps_fast_generation_and_backfills_after_override_removed() {
+        run_on_runtime_task(|cx| async move {
+            let _models = AppendEmbedderOverrides::install();
+            for complete in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let project = temp.path().join("project");
+                let root = temp.path().join("index");
+                fs::create_dir_all(&project).unwrap();
+                fs::write(
+                    project.join("alpha.md"),
+                    "quokka authentication guide with bounded retries and durable publication. "
+                        .repeat(300),
+                )
+                .unwrap();
+                let mut config = FsfsConfig::default();
+                config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+                config.indexing.model_dir =
+                    temp.path().join("no-model-cache").display().to_string();
+                config.indexing.offline = true;
+                config.indexing.fast_window_max_per_file = 4;
+                config.search.rerank = false;
+                let input = CliInput {
+                    command: CliCommand::Index,
+                    target_path: Some(project.clone()),
+                    index_dir: Some(root.clone()),
+                    format: OutputFormat::Json,
+                    quiet: true,
+                    ..CliInput::default()
+                };
+                let full = FsfsRuntime::new(config.clone()).with_cli_input(input.clone());
+                config.pressure.degradation_override = DegradationOverrideMode::ForceEmbedDeferred;
+                config.indexing.quality_model = "unknown-deferred-quality".to_owned();
+                config.search.rerank = true;
+                let deferred = FsfsRuntime::new(config).with_cli_input(input);
+                let selected_root = || {
+                    if complete {
+                        crate::generation_store::CompleteGenerationStore::open(&cx, &root)
+                            .unwrap()
+                            .active(&cx)
+                            .unwrap()
+                            .unwrap()
+                            .path()
+                            .to_path_buf()
+                    } else {
+                        root.clone()
+                    }
+                };
+
+                for replacing_quality in [false, true] {
+                    if replacing_quality {
+                        let selected = selected_root();
+                        let quality_before =
+                            fs::read(selected.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap();
+                        let mut mutation = deferred.clone();
+                        mutation.cli_input.index_dir = Some(selected.clone());
+                        mutation.cli_input.input_file =
+                            Some(temp.path().join("must-not-read.jsonl"));
+                        let error = mutation
+                            .run_append_batch_command_with_writer(&cx, &mut Vec::new())
+                            .await
+                            .unwrap_err();
+                        assert!(
+                            matches!(error, SearchError::InvalidConfig { field, value, .. }
+                            if field == "pressure.degradation_override" && value == "force_embed_deferred")
+                        );
+                        let Err(error) = mutation.build_live_ingest_pipeline(&cx).await else {
+                            panic!("watch must not load the quality producer under deferral");
+                        };
+                        assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                            if field == "pressure.degradation_override"));
+                        assert_eq!(
+                            fs::read(selected.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE)).unwrap(),
+                            quality_before
+                        );
+                    }
+                    deferred
+                        .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, complete)
+                        .await
+                        .expect("quality deferral preserves a complete fast generation");
+                    let selected = selected_root();
+                    assert!(
+                        !selected
+                            .join(super::FSFS_VECTOR_QUALITY_INDEX_FILE)
+                            .exists()
+                    );
+                    let fast =
+                        VectorIndex::open_read_only(&selected.join(super::FSFS_VECTOR_INDEX_FILE))
+                            .unwrap();
+                    assert_eq!(fast.embedder_id(), SemanticFastEmbedder.id());
+                    assert!(
+                        fast.live_doc_ids().unwrap().len() > 1,
+                        "fast windows stay indexed"
+                    );
+                    drop(fast);
+                    let sentinel = FsfsRuntime::read_index_sentinel(&selected)
+                        .unwrap()
+                        .unwrap();
+                    assert!(sentinel.generation_complete);
+                    assert!(sentinel.reason_codes.iter().any(
+                        |reason| reason == super::REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE
+                    ));
+                    assert!(
+                        !sentinel
+                            .reason_codes
+                            .iter()
+                            .any(|reason| reason == super::REASON_VECTOR_QUALITY_TIER_BUILT)
+                    );
+                    let mut search = deferred.clone();
+                    search.cli_input.index_dir = Some(selected);
+                    let status = search.collect_status_payload().unwrap();
+                    assert_eq!(status.index.quality_deferred_files, 1);
+                    assert!(status.config.fast_only);
+                    assert!(status.models.iter().all(|model| model.tier != "quality"));
+                    let payloads = search
+                        .execute_search_payloads_with_mode(
+                            &cx,
+                            "how to recover a disconnected network connection",
+                            10,
+                            SearchExecutionMode::Full,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(payloads.len(), 1);
+                    assert_eq!(payloads[0].phase, SearchOutputPhase::Initial);
+                    assert!(
+                        payloads[0]
+                            .hits
+                            .iter()
+                            .any(|hit| hit.semantic_rank.is_some()),
+                        "fast semantic retrieval survives quality deferral"
+                    );
+
+                    // No source timestamp changes: restoration must still build
+                    // the absent tier instead of carrying fast-only evidence.
+                    full.run_mode_with_complete_generations(
+                        &cx,
+                        InterfaceMode::Cli,
+                        None,
+                        complete,
+                    )
+                    .await
+                    .expect("ordinary indexing backfills quality");
+                    let selected = selected_root();
+                    let quality = VectorIndex::open_read_only(
+                        &selected.join(super::FSFS_VECTOR_QUALITY_INDEX_FILE),
+                    )
+                    .unwrap();
+                    assert_eq!(quality.embedder_id(), SemanticQualityStub.id());
+                    assert!(quality.live_doc_ids().unwrap().contains("alpha.md"));
+                    drop(quality);
+                    let sentinel = FsfsRuntime::read_index_sentinel(&selected)
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        sentinel
+                            .reason_codes
+                            .iter()
+                            .any(|reason| reason == super::REASON_VECTOR_QUALITY_TIER_BUILT)
+                    );
+                    assert!(!sentinel.reason_codes.iter().any(
+                        |reason| reason == super::REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE
+                    ));
+                    let mut restored = full.clone();
+                    restored.cli_input.index_dir = Some(selected);
+                    assert_eq!(
+                        restored
+                            .collect_status_payload()
+                            .unwrap()
+                            .index
+                            .quality_deferred_files,
+                        0
+                    );
+                }
+            }
         });
     }
 

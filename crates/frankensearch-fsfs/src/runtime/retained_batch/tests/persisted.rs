@@ -255,6 +255,103 @@ fn mixed_batch_publishes_once_and_preserves_untouched_documents_and_old_readers(
 }
 
 #[test]
+fn deferred_quality_refuses_upserts_before_store_work_but_allows_deletes() {
+    run_test_with_cx(|cx| async move {
+        let parent = tempfile::tempdir().unwrap();
+        let _restore = RestoreQuality(test_quality_embedder_override());
+        let quality = Arc::new(TestProducer::new(Reply::Good));
+        set_test_quality_embedder(Some(quality.clone()));
+        let (mut runtime, store, first) = fixture(&cx, parent.path(), 1).await;
+        runtime.config.pressure.degradation_override =
+            crate::config::DegradationOverrideMode::ForceEmbedDeferred;
+        let before = files(first.path());
+        quality.calls.store(0, Ordering::SeqCst);
+        let missing = parent.path().join("must-not-create-store");
+        for root in [missing.as_path(), store.root()] {
+            let error = runtime
+                .apply_retained_batch(
+                    &cx,
+                    root,
+                    &first,
+                    &[
+                        upsert("alpha.md", "deferred replacement"),
+                        delete("beta.md"),
+                    ],
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "pressure.degradation_override"
+                        && value == "force_embed_deferred"
+            ));
+        }
+        assert!(!missing.exists());
+        assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(files(first.path()), before);
+        assert_eq!(store.active(&cx).unwrap(), Some(first.clone()));
+
+        // No inference is needed to remove a row from both existing tiers.
+        let result = runtime
+            .apply_retained_batch(&cx, store.root(), &first, &[delete("beta.md")])
+            .await
+            .unwrap();
+        assert_eq!((result.upserted, result.deleted), (0, 1));
+        let next = durable(result);
+        assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+        for relative in [FSFS_VECTOR_INDEX_FILE, FSFS_VECTOR_QUALITY_INDEX_FILE] {
+            assert!(!ids(next.path(), relative).contains("beta.md"));
+            assert!(ids(next.path(), relative).contains("alpha.md"));
+        }
+        assert_eq!(files(first.path()), before);
+
+        // Rebuilding first makes subsequent content updates admissible without
+        // creating quality vectors or calling the configured quality producer.
+        let GenerationPublication::Durable(fast_only) = runtime
+            .rebuild_retained_generation(&cx, store.root())
+            .await
+            .unwrap()
+        else {
+            panic!("expected durable fast-tier rebuild");
+        }; // ubs:ignore — test assertion.
+        assert!(
+            !fast_only
+                .path()
+                .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                .exists()
+        );
+        let updated = durable(
+            runtime
+                .apply_retained_batch(
+                    &cx,
+                    store.root(),
+                    &fast_only,
+                    &[upsert("new.md", "noveltoken deferred fast body")],
+                )
+                .await
+                .unwrap(),
+        );
+        assert!(ids(updated.path(), FSFS_VECTOR_INDEX_FILE).contains("new.md"));
+        assert!(!updated.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists());
+        assert_eq!(quality.calls.load(Ordering::SeqCst), 0);
+        let reader = runtime
+            .open_retained_search(&cx, store.root())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_indexed_document_text(
+                &cx,
+                reader.resources.lexical_index.as_ref().unwrap(),
+                "new.md"
+            )
+            .unwrap(),
+            "noveltoken deferred fast body"
+        );
+    });
+}
+
+#[test]
 fn quality_failure_cannot_publish_deletions_or_a_valid_upsert_prefix() {
     run_test_with_cx(|cx| async move {
         let parent = tempfile::tempdir().unwrap();

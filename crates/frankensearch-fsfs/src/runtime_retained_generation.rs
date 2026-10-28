@@ -602,6 +602,15 @@ impl FsfsRuntime {
         retained_search_checkpoint(cx)?;
         self.validate_content_upserts_allowed()?;
         validate_retained_catalog_path(&self.config.storage.db_path)?;
+        if self.quality_work_deferred() {
+            // A supplied body must not cause quality inference or a partial
+            // tier update. Refuse before reading stdin/JSONL or owning a build;
+            // validate_append_indexing_mode rechecks the selected base later.
+            let store = CompleteGenerationStore::open(cx, store_root)?;
+            if let Some(predecessor) = store.active(cx)? {
+                self.validate_deferred_quality_mutation(predecessor.path())?;
+            }
+        }
         let documents = retained_reuse::read_append_documents(cx, self).await?;
         if documents.is_empty() {
             return Ok((None, 0));
@@ -2237,6 +2246,44 @@ mod retained_delete_tests {
                 publication,
                 Some(GenerationPublication::Durable(_))
             ));
+        });
+    }
+
+    #[test]
+    fn retained_append_deferred_quality_refuses_before_reading_input() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let _restore = RestoreQuality(test_quality_embedder_override());
+            let quality: Arc<dyn Embedder> = Arc::new(AppendQualityEmbedder {
+                changed_revision: false,
+            });
+            set_test_quality_embedder(Some(Arc::clone(&quality)));
+            let (mut runtime, _, root, predecessor) =
+                fixture_with_quality(&cx, parent.path(), false, Some(quality.as_ref())).await;
+            let before = file_bytes(predecessor.path());
+            runtime.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceEmbedDeferred;
+            runtime.cli_input.command = CliCommand::AppendBatch;
+            runtime.cli_input.input_file = Some(parent.path().join("must-not-read.jsonl"));
+            set_test_quality_embedder(None);
+            let error = runtime
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "pressure.degradation_override"
+                        && value == "force_embed_deferred"
+            ));
+            assert_eq!(file_bytes(predecessor.path()), before);
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(predecessor)
+            );
         });
     }
 
