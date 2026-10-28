@@ -688,6 +688,7 @@ mod tests {
         use frankensearch_embed::model_manifest::MODEL_CONFORMANCE_TEXTS_V1;
         use frankensearch_embed::{ModelFile, ModelTier};
         use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
 
         use super::*;
 
@@ -730,9 +731,16 @@ mod tests {
                 .into_iter()
                 .map(|name| {
                     let bytes = fs::read(source.path().join(name)).unwrap();
+                    let sha256 = Sha256::digest(&bytes).iter().fold(
+                        String::with_capacity(64),
+                        |mut hex, byte| {
+                            write!(hex, "{byte:02x}").unwrap();
+                            hex
+                        },
+                    );
                     ModelFile {
                         name: name.to_owned(),
-                        sha256: format!("{:x}", Sha256::digest(&bytes)),
+                        sha256,
                         size: u64::try_from(bytes.len()).unwrap(),
                         url: None,
                     }

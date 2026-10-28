@@ -445,8 +445,11 @@ mod tests {
             write(&cx, &path, &root, &report()).unwrap();
             let resumed = Options::parse(arguments(&root, &path, "--apply")).unwrap();
             assert_eq!(resumed.action, RecoveryAction::Apply);
-            assert_eq!(resumed.generation, report().generation_id);
-            assert_eq!(resumed.digest, report().manifest_sha256);
+            assert!(matches!(
+                &resumed.target,
+                crate::RecoveryTarget::Retained { generation, digest }
+                    if generation == &report().generation_id && digest == &report().manifest_sha256
+            ));
             assert_eq!(
                 resumed.expected_selection_sha256,
                 report().expected_selection_sha256
@@ -460,7 +463,11 @@ mod tests {
                 Options::parse(arguments(&root, &path, "--confirm-durability")).unwrap();
             assert_eq!(confirmation.action, RecoveryAction::ConfirmDurability);
             assert!(confirmation.expected_selection_sha256.is_none());
-            assert_eq!(confirmation.generation, report().generation_id);
+            assert!(matches!(
+                &confirmation.target,
+                crate::RecoveryTarget::Retained { generation, digest }
+                    if generation == &report().generation_id && digest == &report().manifest_sha256
+            ));
             for flags in [
                 vec![],
                 vec!["--prepare"],

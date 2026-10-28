@@ -65,7 +65,7 @@ impl Embedder for ReindexProvider {
 }
 
 fn reindex_provider(revision: &str) -> Arc<ReindexProvider> {
-    let mut identity = identity().identity;
+    let mut identity = provider_identity();
     identity.producer.implementation_revision = revision.to_owned();
     identity.validate().unwrap();
     Arc::new(ReindexProvider {

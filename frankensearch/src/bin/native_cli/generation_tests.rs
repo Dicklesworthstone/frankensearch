@@ -1057,7 +1057,7 @@ fn rebuild_source_boundaries_are_monotone_and_allow_an_unchanged_cut() {
 fn rebuild_requires_explicit_producer_migration_before_any_inference() {
     let selected = receipt();
     let mut provider = Provider {
-        identity: identity().identity,
+        identity: provider_identity(),
         calls: AtomicUsize::new(0),
     };
     assert_eq!(
@@ -1082,7 +1082,7 @@ fn rebuild_requires_explicit_producer_migration_before_any_inference() {
 fn retained_rebuild_migrates_producers_and_spaces_without_relabeling_prepared_input() {
     let expected = identity();
     let mut provider = Provider {
-        identity: expected.identity.clone(),
+        identity: provider_identity(),
         calls: AtomicUsize::new(0),
     };
     provider.identity.producer.implementation_revision = "replacement-producer".to_owned();
@@ -1229,7 +1229,7 @@ fn recovery_requires_only_the_saved_attempt_and_rejects_model_or_publish_options
     assert_eq!(parse(&arguments).unwrap().unwrap().max_image_bytes, 4096);
 }
 
-fn identity() -> FrozenEmbeddingIdentityBundleV1 {
+fn provider_identity() -> EmbeddingIdentityBundleV1 {
     let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("authority-cli-test", 2);
     // Synthetic semantic-shaped test provider; no production inference or
     // model-availability claim is made by these filesystem/identity tests.
@@ -1242,6 +1242,13 @@ fn identity() -> FrozenEmbeddingIdentityBundleV1 {
         size: 1,
     }];
     identity.producer.space_fingerprint = identity.space.fingerprint();
+    identity
+}
+
+fn identity() -> FrozenEmbeddingIdentityBundleV1 {
+    // Only the persisted receipt uses the on-disk storage contract. Providers
+    // return native f32 values; the builder binds their persisted encoding.
+    let mut identity = provider_identity();
     identity.storage.format = "fsvi-v2".to_owned();
     identity.storage.quantization = QuantizationFormat::F32;
     identity.storage.endianness = "little-endian".to_owned();
@@ -1939,7 +1946,7 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
             let work = parent.join(format!("{name}-work"));
             let receipt_path = parent.join(format!("{name}.json"));
             let provider = Arc::new(Provider {
-                identity: identity().identity,
+                identity: provider_identity(),
                 calls: AtomicUsize::new(0),
             });
             let model: Arc<dyn Embedder> = provider.clone();
@@ -2156,7 +2163,7 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
             let root_path = parent.join(format!("{name}-root"));
             let root = create_root(&root_path).expect("qualified Linux root is required");
             let provider = Arc::new(Provider {
-                identity: identity().identity,
+                identity: provider_identity(),
                 calls: AtomicUsize::new(0),
             });
             let model: Arc<dyn Embedder> = provider.clone();
@@ -2551,7 +2558,7 @@ mod warm_authority {
 
     fn provider() -> Arc<Provider> {
         Arc::new(Provider {
-            identity: identity().identity,
+            identity: provider_identity(),
             calls: AtomicUsize::new(0),
         })
     }
@@ -3785,7 +3792,7 @@ mod warm_authority {
                 MAX_INPUT_BYTES,
             )
             .unwrap();
-            let mut next_identity = identity().identity;
+            let mut next_identity = provider_identity();
             next_identity.producer.implementation_revision =
                 "next-keyword-only-producer".to_owned();
             let new_provider = Arc::new(Provider {
@@ -4047,7 +4054,7 @@ mod warm_authority {
             // Empty membership still requires the selected query producer.
             let wrong = Arc::new(Provider {
                 identity: {
-                    let mut identity = identity().identity;
+                    let mut identity = provider_identity();
                     identity.producer.implementation_revision = "wrong-filter-producer".to_owned();
                     identity
                 },
@@ -4314,7 +4321,7 @@ mod warm_authority {
                 let old_reader = old.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
                 let changed_provider = Arc::new(Provider {
                     identity: {
-                        let mut identity = identity().identity;
+                        let mut identity = provider_identity();
                         identity.producer.implementation_revision =
                             "before-rollback-migration".to_owned();
                         identity
@@ -4508,7 +4515,7 @@ mod warm_authority {
                 let old_reader = old.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
                 let current_provider = Arc::new(Provider {
                     identity: {
-                        let mut identity = identity().identity;
+                        let mut identity = provider_identity();
                         identity.producer.implementation_revision =
                             "damaged-current-migrated-producer".to_owned();
                         identity
@@ -5719,7 +5726,7 @@ mod warm_authority {
 
                 let migrated = Arc::new(Provider {
                     identity: {
-                        let mut identity = identity().identity;
+                        let mut identity = provider_identity();
                         identity.producer.implementation_revision =
                             "retained-source-migration".to_owned();
                         identity
@@ -7088,7 +7095,7 @@ mod warm_authority {
             let before = provider.calls.load(Ordering::Relaxed);
             let wrong = Arc::new(Provider {
                 identity: {
-                    let mut identity = identity().identity;
+                    let mut identity = provider_identity();
                     identity.producer.implementation_revision = "wrong-warm-producer".to_owned();
                     identity
                 },
@@ -7213,7 +7220,7 @@ mod progressive_authority {
     }
 
     fn provider(quality: bool) -> Arc<Provider> {
-        let mut identity = identity().identity;
+        let mut identity = provider_identity();
         if quality {
             identity.producer.implementation_revision = "independent-complete-quality".to_owned();
         }
@@ -7483,7 +7490,7 @@ mod progressive_authority {
         .await
         .unwrap();
         let target = Receipt::read(&options.receipt).unwrap();
-        let mut identity = identity().identity;
+        let mut identity = provider_identity();
         identity.producer.implementation_revision = "historical-current-producer".to_owned();
         let current_model = Arc::new(Provider {
             identity,

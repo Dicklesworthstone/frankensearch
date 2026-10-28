@@ -12997,9 +12997,7 @@ impl QuillIndex {
         };
         let index_future: std::pin::Pin<
             Box<dyn std::future::Future<Output = QuillObservedUpsert> + Send + '_>,
-        > = Box::pin(
-            writer.index_documents_batch_observed(cx, IngestBatch::Default(documents)),
-        );
+        > = Box::pin(writer.index_documents_batch_observed(cx, IngestBatch::Default(documents)));
         index_future.await
     }
 
@@ -38133,8 +38131,9 @@ mod tests {
                 // 4. Pre-driver early exit (pre-cancelled Cx before upsert_documents_observed).
                 let cancelled_cx = Cx::for_testing();
                 cancelled_cx.set_cancel_requested(true);
-                let mut observed_pre_cancel =
-                    index.upsert_documents_observed(&cancelled_cx, &batch3).await;
+                let mut observed_pre_cancel = index
+                    .upsert_documents_observed(&cancelled_cx, &batch3)
+                    .await;
                 assert!(!observed_pre_cancel.is_success());
                 assert!(observed_pre_cancel.run_seq().is_none());
                 assert!(observed_pre_cancel.witness().is_none());
@@ -38152,8 +38151,9 @@ mod tests {
                         )
                     })
                     .collect::<Vec<_>>();
-                let mut observed_mid_cancel =
-                    index.upsert_documents_observed(&mid_cancel_cx, &batch4).await;
+                let mut observed_mid_cancel = index
+                    .upsert_documents_observed(&mid_cancel_cx, &batch4)
+                    .await;
                 assert!(!observed_mid_cancel.is_success());
                 assert!(matches!(
                     observed_mid_cancel.result,
