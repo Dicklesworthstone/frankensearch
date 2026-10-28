@@ -3686,16 +3686,17 @@ mod loader_only {
         let temp = tempfile::tempdir().unwrap();
         let corpus = temp.path().join("corpus");
         fs::create_dir_all(corpus.join("src")).unwrap();
-        fs::write(corpus.join("a_notes.md"), "query_execution ".repeat(80)).unwrap();
-        fs::write(
-            corpus.join("src/query_execution.rs"),
-            "// garden flowers soil watering\n",
-        )
-        .unwrap();
+        fs::create_dir_all(corpus.join("docs")).unwrap();
+        // Equal relevant content holds semantic evidence constant. The lexical
+        // tie favors docs; the exact underscore module spelling has the stronger
+        // code-navigation prior. Both actual phases must change their winner.
+        let relevant = "query execution engine scheduling and request processing";
+        fs::write(corpus.join("docs/query-execution.md"), relevant).unwrap();
+        fs::write(corpus.join("src/query_execution.rs"), relevant).unwrap();
         for number in 0..6 {
             fs::write(
                 corpus.join(format!("notes-{number}.md")),
-                "query execution engine scheduling and request processing",
+                "garden flowers soil watering and sunlight",
             )
             .unwrap();
         }
@@ -3730,7 +3731,7 @@ mod loader_only {
         let mut reference = None;
         for transport in ["--no-daemon", "--daemon"] {
             for (label, flag, expected) in [
-                ("off", "--no-ranking-priors", "a_notes.md"),
+                ("off", "--no-ranking-priors", "docs/query-execution.md"),
                 ("on", "--ranking-priors", "src/query_execution.rs"),
             ] {
                 let outcome = fsfs.run(

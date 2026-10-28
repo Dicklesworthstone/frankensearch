@@ -177,12 +177,12 @@ impl SelectedModel {
         let quality = RegisteredQualityModel::from_name(name).ok_or_else(|| {
             invalid("model", "Select one exact registered semantic model; fuzzy, bulk and reranker selections are unsupported.")
         })?;
-        let available = if quality.is_native() {
-            cfg!(feature = "rerank")
-        } else {
-            cfg!(feature = "semantic-loaders")
-        };
-        if !available {
+        #[cfg(not(feature = "rerank"))]
+        if quality.is_native() {
+            return Err(backend_unavailable());
+        }
+        #[cfg(not(feature = "semantic-loaders"))]
+        if !quality.is_native() {
             return Err(backend_unavailable());
         }
         Ok(Self::Quality(quality))
@@ -305,6 +305,7 @@ fn invalid(field: &str, reason: &str) -> SearchError {
     }
 }
 
+#[cfg(any(not(feature = "rerank"), not(feature = "semantic-loaders")))]
 fn backend_unavailable() -> SearchError {
     SearchError::EmbedderUnavailable {
         model: "selected-semantic-model".to_owned(),
