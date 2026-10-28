@@ -15742,6 +15742,7 @@ impl FsfsRuntime {
         if self.cli_input.daemon_stop {
             return self.run_daemon_stop(&index_root);
         }
+        self.validate_background_indexing()?;
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
         if !vector_path.exists() {
@@ -23890,6 +23891,7 @@ impl FsfsRuntime {
     /// the owned ingest fixture; production always builds the durable ingest
     /// pipeline directly.
     async fn build_live_watcher_shutdown(&self, cx: &Cx) -> SearchResult<LiveWatchSession> {
+        self.validate_background_indexing()?;
         let target_root = self.resolve_target_root()?;
 
         #[cfg(test)]
@@ -24303,7 +24305,35 @@ impl FsfsRuntime {
         Ok(())
     }
 
+    /// Watch intent is separate from permission to run background indexing.
+    /// An explicit CLI request wins over the configured default, including an
+    /// explicit false that keeps `index` as a one-shot operation.
+    fn watch_requested(&self, command: CliCommand) -> bool {
+        command == CliCommand::Watch
+            || (command == CliCommand::Index
+                && self
+                    .cli_input
+                    .overrides
+                    .allow_background_indexing
+                    .unwrap_or(self.cli_input.watch || self.config.indexing.watch_mode))
+    }
+
+    fn validate_background_indexing(&self) -> SearchResult<()> {
+        if self.config.pressure.degradation_override == DegradationOverrideMode::ForcePaused {
+            return Err(degradation_refusal(
+                self.config.pressure.degradation_override,
+                "background indexing",
+            ));
+        }
+        self.config.validate_background_indexing()
+    }
+
     fn validate_command_inputs(&self, command: CliCommand) -> SearchResult<()> {
+        // Refuse before the initial scan/build, not merely before starting the
+        // watcher after that build has already changed the index.
+        if self.watch_requested(command) {
+            self.validate_background_indexing()?;
+        }
         match command {
             CliCommand::Search if self.cli_input.query.is_none() => {
                 Err(SearchError::InvalidConfig {
@@ -25820,11 +25850,7 @@ impl FsfsRuntime {
     ) -> SearchResult<()> {
         self.run_cli_inner(cx, Some(shutdown)).await?;
 
-        let watch_enabled_for_command = self.config.indexing.watch_mode
-            && matches!(
-                self.cli_input.command,
-                CliCommand::Index | CliCommand::Watch
-            );
+        let watch_enabled_for_command = self.watch_requested(self.cli_input.command);
 
         if watch_enabled_for_command {
             match self.build_live_watcher_shutdown(cx).await {
@@ -46718,6 +46744,196 @@ mod tests {
                 found.sort_unstable();
                 assert_eq!(found, expected, "lexical hits for {query:?}");
             }
+        });
+    }
+
+    #[test]
+    fn watch_intent_honors_explicit_cli_false_without_disabling_one_shot_indexing() {
+        let mut config = FsfsConfig::default();
+        config.pressure.profile = PressureProfile::Strict;
+        config.indexing.watch_mode = true;
+        let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Index,
+            watch: true,
+            ..CliInput::default()
+        });
+        assert!(runtime.validate_command_inputs(CliCommand::Index).is_err());
+        runtime.cli_input.overrides.allow_background_indexing = Some(false);
+        assert!(!runtime.watch_requested(CliCommand::Index));
+        runtime.validate_command_inputs(CliCommand::Index).unwrap();
+        assert!(runtime.watch_requested(CliCommand::Watch));
+        assert!(runtime.validate_command_inputs(CliCommand::Watch).is_err());
+        assert!(!runtime.watch_requested(CliCommand::Search));
+        assert!(!runtime.watch_requested(CliCommand::Daemon));
+
+        let mut performance = FsfsRuntime::new(FsfsConfig::default());
+        assert!(!performance.watch_requested(CliCommand::Index));
+        performance.cli_input.overrides.allow_background_indexing = Some(true);
+        assert!(performance.watch_requested(CliCommand::Index));
+        performance
+            .validate_command_inputs(CliCommand::Index)
+            .unwrap();
+    }
+
+    #[test]
+    fn disallowed_background_watch_refuses_before_initial_index_or_model_work() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let source = parent.path().join("source");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("alpha.md"), "background admission fixture").unwrap();
+            for (profile, hard_pause, override_mode, expected_field) in [
+                (
+                    PressureProfile::Strict,
+                    false,
+                    DegradationOverrideMode::Auto,
+                    "pressure.profile",
+                ),
+                (
+                    PressureProfile::Degraded,
+                    false,
+                    DegradationOverrideMode::Auto,
+                    "pressure.profile",
+                ),
+                (
+                    PressureProfile::Performance,
+                    true,
+                    DegradationOverrideMode::ForceFull,
+                    "pressure.hard_pause_requested",
+                ),
+                (
+                    PressureProfile::Performance,
+                    false,
+                    DegradationOverrideMode::ForcePaused,
+                    "pressure.degradation_override",
+                ),
+            ] {
+                for (command, raw_watch, configured_watch) in [
+                    (CliCommand::Watch, false, false),
+                    (CliCommand::Index, true, false),
+                    (CliCommand::Index, false, true),
+                ] {
+                    for complete in [false, true] {
+                        let root = parent.path().join("must-not-create-index");
+                        let models = parent.path().join("must-not-create-models");
+                        let mut config = FsfsConfig::default();
+                        config.pressure.profile = profile;
+                        config.pressure.hard_pause_requested = hard_pause;
+                        config.pressure.degradation_override = override_mode;
+                        config.indexing.watch_mode = configured_watch;
+                        config.indexing.fast_model = "must-not-resolve-fast-model".to_owned();
+                        config.indexing.model_dir = models.display().to_string();
+                        config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+                        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                            command,
+                            watch: raw_watch,
+                            target_path: Some(source.clone()),
+                            index_dir: Some(root.clone()),
+                            format: OutputFormat::Jsonl,
+                            quiet: true,
+                            ..CliInput::default()
+                        });
+                        let error = runtime
+                            .run_mode_with_complete_generations(
+                                &cx,
+                                InterfaceMode::Cli,
+                                None,
+                                complete,
+                            )
+                            .await
+                            .unwrap_err();
+                        assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                            if field == expected_field));
+                        let Err(error) = runtime.build_live_watcher_shutdown(&cx).await else {
+                            panic!("direct watcher admission bypassed background policy");
+                        };
+                        assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                            if field == expected_field));
+                        assert!(!root.exists());
+                        assert!(!models.exists());
+
+                        // Policy admission also precedes source-root resolution.
+                        let mut missing_source = runtime;
+                        missing_source.cli_input.target_path =
+                            Some(parent.path().join("missing-source"));
+                        let error = missing_source
+                            .run_mode_with_complete_generations(
+                                &cx,
+                                InterfaceMode::Cli,
+                                None,
+                                complete,
+                            )
+                            .await
+                            .unwrap_err();
+                        assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                            if field == expected_field));
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn background_policy_refuses_legacy_compaction_start_but_preserves_stop() {
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let root = parent.path().join("must-not-create-index");
+            for (profile, hard_pause, override_mode, expected_field) in [
+                (
+                    PressureProfile::Strict,
+                    false,
+                    DegradationOverrideMode::Auto,
+                    "pressure.profile",
+                ),
+                (
+                    PressureProfile::Degraded,
+                    false,
+                    DegradationOverrideMode::Auto,
+                    "pressure.profile",
+                ),
+                (
+                    PressureProfile::Performance,
+                    true,
+                    DegradationOverrideMode::ForceFull,
+                    "pressure.hard_pause_requested",
+                ),
+                (
+                    PressureProfile::Performance,
+                    false,
+                    DegradationOverrideMode::ForcePaused,
+                    "pressure.degradation_override",
+                ),
+            ] {
+                let mut config = FsfsConfig::default();
+                config.pressure.profile = profile;
+                config.pressure.hard_pause_requested = hard_pause;
+                config.pressure.degradation_override = override_mode;
+                let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    command: CliCommand::Daemon,
+                    index_dir: Some(root.clone()),
+                    ..CliInput::default()
+                });
+                let error = runtime.run_daemon_command(&cx).await.unwrap_err();
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == expected_field));
+                assert!(!root.exists());
+                runtime.cli_input.daemon_stop = true;
+                let error = runtime.run_daemon_command(&cx).await.unwrap_err();
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == "daemon.pid_file"));
+                assert!(!root.exists());
+            }
+
+            let permitted = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                command: CliCommand::Daemon,
+                index_dir: Some(root.clone()),
+                ..CliInput::default()
+            });
+            assert!(matches!(
+                permitted.run_daemon_command(&cx).await,
+                Err(SearchError::IndexNotFound { .. })
+            ));
+            assert!(!root.exists());
         });
     }
 

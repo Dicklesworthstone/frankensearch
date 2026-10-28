@@ -130,8 +130,23 @@ tier when its configured model is available, including for unchanged sources.
 This mode defers quality work until that later indexing run; it does not create
 an automatic background embedding queue.
 
+Background-indexing permission is enforced independently of watch intent. The
+`strict` and `degraded` profiles, or `hard_pause_requested=true`, refuse source
+watching and the legacy background compaction daemon. This applies to `watch`,
+`index --watch`, configured watch mode, and direct retained-watch API calls,
+before initial indexing, index-directory creation or source notification
+registration. `force_full` cannot override these restrictions. The refusal
+identifies `pressure.profile` or `pressure.hard_pause_requested` and gives a
+one-shot or profile-selection remedy.
+
+The `performance` profile permits an explicit watch request without turning
+ordinary indexing into a watcher. CLI watch flags participate in normal override
+order, so `index --watch --no-watch-mode` remains a one-shot index request.
+`daemon --stop` remains available, and the complete-generation read-only query
+daemon does not require background-indexing permission.
+
 The `config.setting.no_effect` warning still covers a `strict` or `degraded`
-profile (its quality ceiling applies; its
+profile (its quality and background-indexing ceilings apply; its
 resolved concurrency and scheduler limits are not read yet) and non-default
 `cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and `load_ceiling_per_mille`,
 which no fsfs component reads yet (the shadow oracle samples CPU and I/O with

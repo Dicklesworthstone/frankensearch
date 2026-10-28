@@ -150,6 +150,81 @@ fn complete_watch_binary_refuses_unframed_output_before_creating_store() {
     }
 }
 
+#[test]
+fn watch_binary_enforces_background_policy_before_creating_an_index() {
+    for complete in ["0", "1"] {
+        for command in ["watch", "index"] {
+            for (profile, hard_pause, expected_field) in [
+                ("strict", false, "pressure.profile"),
+                ("degraded", false, "pressure.profile"),
+                ("performance", true, "pressure.hard_pause_requested"),
+            ] {
+                let fixture = Fixture::new(None);
+                let mut invocation = fixture.command(command, "jsonl");
+                invocation
+                    .env("FSFS_COMPLETE_GENERATIONS", complete)
+                    .env("FRANKENSEARCH_PRESSURE_PROFILE", profile)
+                    // ForceFull must not override the independent background
+                    // capability ceiling or hard pause.
+                    .env("FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE", "force_full")
+                    .env(
+                        "FRANKENSEARCH_PRESSURE_HARD_PAUSE_REQUESTED",
+                        hard_pause.to_string(),
+                    );
+                if command == "index" {
+                    invocation.arg("--watch");
+                }
+                let output = Process::start(&mut invocation).finish(Duration::from_secs(10));
+                assert!(
+                    !output.status.success(),
+                    "{command}, complete={complete}, profile={profile}, pause={hard_pause}"
+                );
+                let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(result["ok"], false);
+                assert!(
+                    result["error"].to_string().contains(expected_field),
+                    "{command}, complete={complete}, profile={profile}, pause={hard_pause}: {result}"
+                );
+                assert!(
+                    !fixture.store.exists(),
+                    "policy refusal must precede the initial indexing run"
+                );
+                assert_eq!(
+                    fs::read_to_string(fixture.source.join("alpha.md")).unwrap(),
+                    "sharedtoken alpha document"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn later_no_watch_override_keeps_index_binary_one_shot() {
+    for complete in ["0", "1"] {
+        let fixture = Fixture::new(None);
+        let output = Process::start(
+            fixture
+                .command("index", "json")
+                .env("FSFS_COMPLETE_GENERATIONS", complete)
+                .env(
+                    "FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE",
+                    "force_lexical_only",
+                )
+                .args(["--watch", "--no-watch-mode"]),
+        )
+        .finish(Duration::from_secs(30));
+        assert!(
+            output.status.success(),
+            "complete={complete}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(fixture.store.exists());
+    }
+}
+
 #[cfg(feature = "semantic-support")]
 fn wait_for_visible_paths(fixture: &Fixture, watch: &mut Process, expected: &[&str]) -> PathBuf {
     let deadline = Instant::now() + Duration::from_secs(180);

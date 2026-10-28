@@ -276,10 +276,7 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     // What a complete-store publication does with superseded generations:
     // collect (default), report (dry run), or off.
     let generation_retention = parse_generation_retention(&env_map)?;
-    let mut resolved_config = loaded.config;
-    if runtime_cli_input.watch {
-        resolved_config.indexing.watch_mode = true;
-    }
+    let resolved_config = loaded.config;
     let resolved_offline = resolved_config.indexing.offline;
     let cli_quiet = runtime_cli_input.quiet;
     let app_runtime = FsfsRuntime::new(resolved_config)

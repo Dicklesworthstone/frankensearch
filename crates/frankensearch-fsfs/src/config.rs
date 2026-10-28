@@ -1075,6 +1075,28 @@ impl FsfsConfig {
         }
         toml::to_string_pretty(&file_config)
     }
+
+    /// Admit background indexing independently of whether it was requested.
+    /// Direct runtime callers must respect the same immutable profile ceiling
+    /// and hard pause as configurations resolved from CLI/environment/files.
+    pub(crate) fn validate_background_indexing(&self) -> SearchResult<()> {
+        if self.pressure.hard_pause_requested {
+            return Err(SearchError::InvalidConfig {
+                field: "pressure.hard_pause_requested".to_owned(),
+                value: "true".to_owned(),
+                reason: "background indexing is disabled while a hard pause is requested"
+                    .to_owned(),
+            });
+        }
+        if !self.pressure.profile.contract().allow_background_indexing {
+            return Err(SearchError::InvalidConfig {
+                field: "pressure.profile".to_owned(),
+                value: format!("{:?}", self.pressure.profile).to_ascii_lowercase(),
+                reason: "this pressure profile does not permit background indexing; use a one-shot index or select the performance profile".to_owned(),
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -4208,6 +4230,42 @@ mod tests {
             !result.config.indexing.watch_mode,
             "profile capability alone must not turn a one-shot index request into a watcher"
         );
+    }
+
+    #[test]
+    fn background_indexing_admission_enforces_capability_for_direct_configs() {
+        for profile in [
+            super::PressureProfile::Strict,
+            super::PressureProfile::Degraded,
+            super::PressureProfile::Performance,
+        ] {
+            for requested in [false, true] {
+                let mut config = FsfsConfig::default();
+                config.pressure.profile = profile;
+                config.indexing.watch_mode = requested;
+                let admission = config.validate_background_indexing();
+                if profile == super::PressureProfile::Performance {
+                    assert!(
+                        admission.is_ok(),
+                        "permission is independent of watch intent"
+                    );
+                } else {
+                    assert!(matches!(
+                        admission,
+                        Err(SearchError::InvalidConfig { field, value, .. })
+                            if field == "pressure.profile"
+                                && value == format!("{profile:?}").to_ascii_lowercase()
+                    ));
+                }
+                config.pressure.hard_pause_requested = true;
+                config.pressure.degradation_override = super::DegradationOverrideMode::ForceFull;
+                assert!(matches!(
+                    config.validate_background_indexing(),
+                    Err(SearchError::InvalidConfig { field, value, .. })
+                        if field == "pressure.hard_pause_requested" && value == "true"
+                ));
+            }
+        }
     }
 
     #[test]

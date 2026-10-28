@@ -23,9 +23,7 @@ use super::{
     retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
 use crate::OutputFormat;
-use crate::config::{
-    DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision, IngestionClass,
-};
+use crate::config::{DiscoveryCandidate, DiscoveryConfig, DiscoveryScopeDecision, IngestionClass};
 use crate::generation_store::{
     CompleteGenerationStore, GenerationPublication, PublishedGeneration,
 };
@@ -525,6 +523,7 @@ struct CompleteWatchSession {
 impl CompleteWatchSession {
     fn open(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> SearchResult<Self> {
         retained_search_checkpoint(cx)?;
+        runtime.validate_background_indexing()?;
         validate_retained_catalog_path(&runtime.config.storage.db_path)?;
         let mut source = SourceRoot::open(fs::canonicalize(runtime.resolve_target_root()?)?)?;
         let store_root = resolve_watch_store(&source.path, root)?;
@@ -730,27 +729,32 @@ impl CompleteWatchSession {
             check_watch_publication(cx, store_root, selected)?;
             let changes = lock_changes(changes)?;
             changes.check_backend()?;
-            if changes.dirty.as_ref().is_some_and(|hint| {
-                touches_observed_files(hint, &current, Some(expected))
-            }) {
+            if changes
+                .dirty
+                .as_ref()
+                .is_some_and(|hint| touches_observed_files(hint, &current, Some(expected)))
+            {
                 return Err(source_changed());
             }
             drop(changes);
             Ok(())
         };
-        if !force_rebuild && !self.runtime.cli_input.full_reindex
+        if !force_rebuild
+            && !self.runtime.cli_input.full_reindex
             && let (Some(baseline), Some(selected)) = (self.baseline.as_ref(), selected)
-            && let Some(batch) = delta::prepare(
-                cx, &self.runtime, source, baseline, &observed, pending,
-            ).await?
+            && let Some(batch) =
+                delta::prepare(cx, &self.runtime, source, baseline, &observed, pending).await?
         {
             // Preparation reads only the changed source bodies. Mutations use
             // one copied successor and the SAME post-seal source admission as
             // a rebuild. Inference, I/O and precommit errors propagate: none
             // may be retried as a weaker or partially successful rebuild.
-            let outcome = self.runtime.apply_retained_source_batch_with_precommit(
-                cx, store_root, selected, batch, &precommit,
-            ).await?;
+            let outcome = self
+                .runtime
+                .apply_retained_source_batch_with_precommit(
+                    cx, store_root, selected, batch, &precommit,
+                )
+                .await?;
             if let Some(publication) = outcome.publication {
                 return Ok(Some((observed, publication)));
             }
@@ -902,12 +906,7 @@ impl FsfsRuntime {
         self.watch_retained_generations(cx, root, |generation| {
             let retention = self.retire_superseded_generations(cx, root);
             self.emit_complete_generation_receipt(
-                root,
-                generation,
-                "watch",
-                &retention,
-                None,
-                writer,
+                root, generation, "watch", &retention, None, writer,
             )
         })
         .await
@@ -919,6 +918,87 @@ mod tests {
     use super::*;
     use asupersync::test_utils::run_test_with_cx;
     use notify::event::{AccessKind, DataChange, Flag, ModifyKind};
+
+    #[test]
+    fn public_retained_watch_enforces_background_policy_before_registering_or_building() {
+        use crate::config::{DegradationOverrideMode, PressureProfile};
+        use crate::{CliInput, FsfsConfig};
+
+        run_test_with_cx(|cx| async move {
+            let parent = tempfile::tempdir().unwrap();
+            let source = parent.path().join("source");
+            let root = parent.path().join("must-not-create-store");
+            fs::create_dir(&source).unwrap();
+            fs::write(source.join("alpha.md"), "watch policy fixture").unwrap();
+            for (profile, hard_pause, override_mode, expected_field) in [
+                (
+                    PressureProfile::Strict,
+                    false,
+                    DegradationOverrideMode::Auto,
+                    "pressure.profile",
+                ),
+                (
+                    PressureProfile::Degraded,
+                    false,
+                    DegradationOverrideMode::Auto,
+                    "pressure.profile",
+                ),
+                (
+                    PressureProfile::Performance,
+                    true,
+                    DegradationOverrideMode::ForceFull,
+                    "pressure.hard_pause_requested",
+                ),
+                (
+                    PressureProfile::Performance,
+                    false,
+                    DegradationOverrideMode::ForcePaused,
+                    "pressure.degradation_override",
+                ),
+            ] {
+                let mut config = FsfsConfig::default();
+                config.pressure.profile = profile;
+                config.pressure.hard_pause_requested = hard_pause;
+                config.pressure.degradation_override = override_mode;
+                config.indexing.watch_mode = true;
+                config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+                let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                    target_path: Some(source.clone()),
+                    index_dir: Some(root.clone()),
+                    ..CliInput::default()
+                });
+                let mut delivered = 0;
+                let error = runtime
+                    .watch_retained_generations(&cx, &root, |_| {
+                        delivered += 1;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == expected_field));
+                assert_eq!(delivered, 0);
+                assert!(!root.exists());
+            }
+
+            // The capability check must not mistake a false default watch-mode
+            // preference for a prohibition on this explicitly requested API.
+            let mut config = FsfsConfig::default();
+            config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+            assert!(!config.indexing.watch_mode);
+            let permitted = FsfsRuntime::new(config).with_cli_input(CliInput {
+                target_path: Some(source.clone()),
+                index_dir: Some(root.clone()),
+                ..CliInput::default()
+            });
+            let session = CompleteWatchSession::open(&permitted, &cx, &root).unwrap();
+            session.source.check().unwrap();
+            assert!(
+                !root.exists(),
+                "registering the watcher does not build an index"
+            );
+        });
+    }
 
     #[test]
     fn listed_path_order_is_path_order() {
@@ -1176,10 +1256,7 @@ mod tests {
             }
             let discovery = DiscoveryConfig::default();
             let before = source.observe(&cx, &discovery).unwrap();
-            assert_eq!(
-                before.stamps.keys().collect::<Vec<_>>(),
-                [&tracked]
-            );
+            assert_eq!(before.stamps.keys().collect::<Vec<_>>(), [&tracked]);
 
             for path in &ignored {
                 fs::write(path, "ignored v2, a different length").unwrap();
@@ -1269,9 +1346,15 @@ mod tests {
         assert!(!is_store_event(&event(&["/work/source/a.md"]), store));
         assert!(!is_store_event(&event(&[own, "/work/source/a.md"]), store));
         // A sibling sharing the store's name as a string prefix is a source.
-        assert!(!is_store_event(&event(&["/work/source/.frankensearch-notes.md"]), store));
+        assert!(!is_store_event(
+            &event(&["/work/source/.frankensearch-notes.md"]),
+            store
+        ));
         assert!(!is_store_event(&event(&[]), store));
-        assert!(!is_store_event(&event(&[own]).set_flag(Flag::Rescan), store));
+        assert!(!is_store_event(
+            &event(&[own]).set_flag(Flag::Rescan),
+            store
+        ));
     }
 
     #[test]
