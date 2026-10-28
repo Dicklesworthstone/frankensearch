@@ -22,6 +22,12 @@ Every stream frame MUST be one of:
 
 These names are stable and versioned by `schema_version = "fsfs.stream.query.v1"`.
 
+The Started frame's generation identity describes the inspected index;
+`semantic_admitted` is true only when the request already has an admitted
+semantic provider. A direct cold query starts before provider admission and
+reports false at that point. Its later result phases report actual execution.
+A readable non-hash vector file alone does not establish runnable semantics.
+
 ### Phase progress reason codes
 
 Each delivered result phase is announced by one `progress` frame before its
@@ -91,6 +97,9 @@ Rules:
 - `completed` MUST use `exit_code = 0`, and MUST NOT carry retry guidance
 - `cancelled` MUST use interrupted exit code (`130`) and retry `none`
 - `failed` MUST use non-zero exit code and include failure category + error payload
+- A terminal is the final record: no ordinary command envelope may follow it.
+- After a partial write or flush failure, stop writing and do not replay or
+  fall back to another query. A terminal cannot be guaranteed on a broken pipe.
 
 ## Exit/Fault Categorization Policy
 

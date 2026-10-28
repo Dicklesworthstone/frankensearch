@@ -73,6 +73,7 @@ struct ConfigStageSnapshot {
 struct ProcessErrorContext {
     command: String,
     format: OutputFormat,
+    stream: bool,
 }
 
 impl ProcessErrorContext {
@@ -85,11 +86,15 @@ impl ProcessErrorContext {
                     cli_input.format_explicit,
                     stdout_is_tty,
                 ),
+                stream: cli_input.command == CliCommand::Search
+                    && cli_input.stream
+                    && matches!(cli_input.format, OutputFormat::Jsonl | OutputFormat::Toon),
             };
         }
 
         Self {
             command: fallback_command_name(args),
+            stream: false,
             format: requested_output_format(args).unwrap_or_else(|| {
                 resolve_output_format(OutputFormat::Table, false, stdout_is_tty)
             }),
@@ -1093,13 +1098,53 @@ where
     WOut: Write,
     WErr: Write,
 {
+    let reported = frankensearch_fsfs::output_schema::reported_output_error(error);
     #[cfg(unix)]
-    let remote = FsfsRuntime::forwarded_search_error(error);
+    let remote = reported.or_else(|| FsfsRuntime::forwarded_search_error(error));
     #[cfg(not(unix))]
-    let remote: Option<&frankensearch_fsfs::output_schema::OutputError> = None;
+    let remote = reported;
     let code = remote.map_or_else(|| exit_code_for(error), |remote| remote.exit_code);
+    if reported.is_some() {
+        return code;
+    }
     #[cfg(unix)]
     if FsfsRuntime::forwarded_search_error_was_emitted(error) {
+        return code;
+    }
+    if context.stream {
+        use frankensearch_fsfs::adapters::format_emitter::emit_stream_frame;
+        use frankensearch_fsfs::stream_protocol::{
+            StreamEvent, StreamFrame, StreamStartedEvent, terminal_event_from_error,
+        };
+        // Preparation failed before the runtime acquired output ownership.
+        // Render the same stream protocol, with no speculative admission claim.
+        let stream_id = format!("search-error-{}", std::process::id());
+        let started = StreamFrame::new(
+            &stream_id,
+            0,
+            &timestamp,
+            "search",
+            StreamEvent::<()>::Started(StreamStartedEvent::new(
+                &stream_id,
+                "",
+                context.format.to_string(),
+            )),
+        );
+        let terminal = StreamFrame::new(
+            &stream_id,
+            1,
+            &timestamp,
+            "search",
+            StreamEvent::<()>::Terminal(terminal_event_from_error(error, 1, 1)),
+        );
+        if let Err(emission_error) = emit_stream_frame(&started, context.format, stdout)
+            .and_then(|()| emit_stream_frame(&terminal, context.format, stdout))
+        {
+            let _ = writeln!(
+                stderr,
+                "error: failed to render fsfs stream error: {emission_error}"
+            );
+        }
         return code;
     }
     let envelope: OutputEnvelope<()> = OutputEnvelope::error(
@@ -1401,6 +1446,7 @@ mod tests {
         let context = ProcessErrorContext {
             command: "search".to_owned(),
             format: OutputFormat::Json,
+            stream: false,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1435,6 +1481,33 @@ mod tests {
     }
 
     #[test]
+    fn process_error_preserves_reported_exit_without_writing_after_terminal() {
+        use frankensearch_fsfs::output_schema::mark_output_reported;
+        let error = mark_output_reported(output_error_from(&SearchError::ModelNotFound {
+            name: "potion-128m".to_owned(),
+        }));
+        let context = ProcessErrorContext {
+            command: "search".to_owned(),
+            format: OutputFormat::Jsonl,
+            stream: true,
+        };
+        let mut stdout = b"already emitted terminal\n".to_vec();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            report_process_error(
+                &error,
+                &context,
+                &mut stdout,
+                &mut stderr,
+                "2026-10-27T00:00:00Z".to_owned(),
+            ),
+            78
+        );
+        assert_eq!(stdout, b"already emitted terminal\n");
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
     fn recovery_contract_renders_human_model_error_to_stderr() {
         let error = SearchError::EmbedderUnavailable {
             model: "all-MiniLM-L6-v2".to_owned(),
@@ -1443,6 +1516,7 @@ mod tests {
         let context = ProcessErrorContext {
             command: "search".to_owned(),
             format: OutputFormat::Table,
+            stream: false,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();

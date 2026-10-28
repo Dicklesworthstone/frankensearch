@@ -229,6 +229,38 @@ pub struct OutputError {
     pub recovery_plan: Option<serde_json::Value>,
 }
 
+#[derive(Debug)]
+struct ReportedOutputError(OutputError);
+
+impl std::fmt::Display for ReportedOutputError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("fsfs output already owns this error")
+    }
+}
+
+impl std::error::Error for ReportedOutputError {}
+
+/// Retain an error's exit and recovery fields after its stream has emitted a
+/// terminal, or its writer has failed and must not receive another record.
+#[must_use]
+pub fn mark_output_reported(error: OutputError) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "fsfs.output.reported",
+        source: Box::new(ReportedOutputError(error)),
+    }
+}
+
+/// Recover a stream-owned error without replaying or rendering another record.
+#[must_use]
+pub fn reported_output_error(error: &SearchError) -> Option<&OutputError> {
+    match error {
+        SearchError::SubsystemError { source, .. } => source
+            .downcast_ref::<ReportedOutputError>()
+            .map(|reported| &reported.0),
+        _ => None,
+    }
+}
+
 impl OutputError {
     /// Create a new output error.
     #[must_use]
@@ -949,6 +981,9 @@ pub const fn exit_code_for(err: &frankensearch_core::SearchError) -> i32 {
 /// caller-authored `OutputError` values or the other structured diagnostic fields.
 #[must_use]
 pub fn output_error_from(err: &frankensearch_core::SearchError) -> OutputError {
+    if let Some(reported) = reported_output_error(err) {
+        return reported.clone();
+    }
     use frankensearch_core::SearchError;
 
     let code = error_code_for(err);

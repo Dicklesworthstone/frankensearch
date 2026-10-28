@@ -832,7 +832,7 @@ mod loader_only {
             let generation = active_generation_root(&index);
             assert!(generation.join("vector/index.fsvi").is_file());
             if label == "control" {
-                let quality = VectorIndex::open_read_only(generation.join("vector/quality.fsvi"))
+                let quality = VectorIndex::open_read_only(&generation.join("vector/quality.fsvi"))
                     .expect("the real MiniLM control must build a quality generation");
                 assert_eq!(quality.record_count(), 1);
                 assert!(
@@ -3362,6 +3362,95 @@ mod loader_only {
             assert!(!index.join("CURRENT").exists());
             assert!(!index.join("FSFS-CURRENT").exists());
             assert_eq!(fs::read_dir(&fsfs.model_root).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(feature = "semantic-loaders")]
+    #[test]
+    fn missing_models_stream_has_one_final_terminal_in_jsonl_and_toon() {
+        let temp = tempfile::tempdir().unwrap();
+        let index = temp.path().join("index");
+        fs::create_dir_all(index.join("vector")).unwrap();
+        // Storage/protocol fixture only: no semantic inference claim. The
+        // empty model cache must refuse before admitting or scoring any row.
+        let mut vectors = VectorIndex::create(
+            &index.join("vector/index.fsvi"),
+            "potion-multilingual-128M",
+            256,
+        )
+        .unwrap();
+        let mut row = vec![0.0; 256];
+        row[0] = 1.0;
+        vectors.write_record("one.md", &row).unwrap();
+        vectors.finish().unwrap();
+        let original = fs::read(index.join("vector/index.fsvi")).unwrap();
+        let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("empty-model-cache"));
+        for format in ["jsonl", "toon"] {
+            let outcome = fsfs.run(
+                temp.path(),
+                &format!("missing-model-stream-{format}"),
+                [
+                    "search",
+                    "network retries",
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--no-daemon",
+                    "--stream",
+                    "--format",
+                    format,
+                ],
+                FAILURE_TIMEOUT,
+            );
+            assert!(!outcome.timed_out, "{}", outcome.combined_output());
+            assert_eq!(
+                outcome.status.code(),
+                Some(78),
+                "{}",
+                outcome.combined_output()
+            );
+            let frames: Vec<Value> = if format == "jsonl" {
+                outcome
+                    .stdout
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect()
+            } else {
+                assert!(outcome.stdout.starts_with('\u{1e}'));
+                outcome
+                    .stdout
+                    .split('\u{1e}')
+                    .skip(1)
+                    .map(|record| {
+                        let frame: frankensearch_fsfs::stream_protocol::StreamFrame<Value> =
+                            frankensearch_fsfs::stream_protocol::decode_stream_frame_toon(
+                                record.trim(),
+                            )
+                            .unwrap();
+                        serde_json::to_value(frame).unwrap()
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                frames.len(),
+                2,
+                "no envelope may follow terminal: {}",
+                outcome.stdout
+            );
+            for (seq, frame) in frames.iter().enumerate() {
+                assert_eq!(frame["schema_version"], "fsfs.stream.query.v1");
+                assert_eq!(frame["seq"], seq);
+                assert_eq!(frame["stream_id"], frames[0]["stream_id"]);
+            }
+            assert_eq!(frames[0]["event"], "started");
+            assert_ne!(frames[0]["payload"]["semantic_admitted"], true);
+            assert_eq!(frames[1]["event"], "terminal");
+            assert_eq!(frames[1]["payload"]["status"], "failed");
+            assert_eq!(frames[1]["payload"]["exit_code"], 78);
+            assert_eq!(
+                frames[1]["payload"]["error"]["code"],
+                "embedder_unavailable"
+            );
+            assert_eq!(fs::read(index.join("vector/index.fsvi")).unwrap(), original);
         }
     }
 

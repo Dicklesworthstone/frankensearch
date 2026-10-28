@@ -5,7 +5,6 @@
 //! a bounded partial record, and one deadline across connect, send and receive.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -30,6 +29,8 @@ use super::{
 use crate::CliCommand;
 use crate::OutputFormat;
 use crate::adapters::format_emitter::emit_stream_frame;
+use crate::output_schema::mark_output_reported as already_reported;
+pub(super) use crate::output_schema::reported_output_error as reported_error;
 use crate::output_schema::{OutputError, SearchHitPayload, SearchPayload, output_error_from};
 use crate::stream_protocol::{
     StreamEvent, StreamFrame, StreamProgressEvent, StreamTerminalStatus, terminal_event_from_error,
@@ -43,33 +44,6 @@ type Frame = StreamFrame<SearchHitPayload>;
 struct StreamRequest {
     fsfs_complete_cli_stream: u32,
     request: ForwardedSearch,
-}
-
-#[derive(Debug)]
-struct ReportedFailure(OutputError);
-
-impl fmt::Display for ReportedFailure {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "forwarded stream ended: {:?}", self.0)
-    }
-}
-
-impl std::error::Error for ReportedFailure {}
-
-pub(super) fn reported_error(error: &SearchError) -> Option<&OutputError> {
-    match error {
-        SearchError::SubsystemError { source, .. } => source
-            .downcast_ref::<ReportedFailure>()
-            .map(|failure| &failure.0),
-        _ => None,
-    }
-}
-
-fn already_reported(error: OutputError) -> SearchError {
-    SearchError::SubsystemError {
-        subsystem: "fsfs.complete_generation.forwarded_stream",
-        source: Box::new(ReportedFailure(error)),
-    }
 }
 
 pub(super) fn is_streamed(bytes: &[u8]) -> bool {

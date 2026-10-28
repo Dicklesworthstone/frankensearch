@@ -12,7 +12,7 @@ use frankensearch_core::{GenerationRootSecurityProfileV1, SearchError, SearchRes
 use super::{
     FSFS_CHECKPOINT_FILE, FSFS_SEARCH_UNBOUNDED_LIMIT_SENTINEL, FSFS_SENTINEL_FILE,
     FSFS_TUI_INTERACTIVE_RESULT_LIMIT, FsfsIndexPayload, FsfsRuntime, FtuiSession, InterfaceMode,
-    SearchDashboardState, SearchExecutionFlags, SearchExecutionMode, SearchStreamResources,
+    SearchDashboardState, SearchExecutionFlags, SearchStreamResources,
     canonical_store_root, degraded_search_mode, iso_timestamp_now, pressure_timestamp_ms,
     retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
@@ -1045,7 +1045,12 @@ impl FsfsRuntime {
                         requested_mode: reader.runtime.requested_search_mode(),
                     }),
                 )
-                .await;
+                .await
+                .map_err(|error| {
+                    crate::output_schema::mark_output_reported(
+                        crate::output_schema::output_error_from(&error),
+                    )
+                });
         }
         let mode = reader.search_mode()?;
         let mut artifacts = reader

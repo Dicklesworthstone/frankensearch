@@ -1405,6 +1405,39 @@ struct SearchStreamResources<'a> {
     requested_mode: SearchExecutionMode,
 }
 
+/// A failed transport may already have exposed part of a frame. Never attempt
+/// a terminal, fallback, or another write after that failure.
+struct SearchStreamWriter<'a, W> {
+    inner: &'a mut W,
+    failed: bool,
+}
+
+impl<W: Write> Write for SearchStreamWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.failed {
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "stream writer failed",
+            ));
+        }
+        let result = self.inner.write(bytes);
+        self.failed = result.is_err() || matches!(result, Ok(0) if !bytes.is_empty());
+        result
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.failed {
+            return Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "stream writer failed",
+            ));
+        }
+        let result = self.inner.flush();
+        self.failed = result.is_err();
+        result
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SearchServeOptions {
     hot_cache_enabled: bool,
@@ -8454,6 +8487,7 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
         self.run_search_stream_command_with_writer(cx, query, limit, &stream_id, &mut stdout, None)
             .await
+            .map_err(|error| crate::output_schema::mark_output_reported(output_error_from(&error)))
     }
 
     async fn run_search_stream_command_with_writer<W: Write + Send>(
@@ -8465,18 +8499,32 @@ impl FsfsRuntime {
         writer: &mut W,
         mut resources_override: Option<SearchStreamResources<'_>>,
     ) -> SearchResult<()> {
+        let mut tracked = SearchStreamWriter {
+            inner: writer,
+            failed: false,
+        };
+        let writer = &mut tracked;
         let mut seq = 0_u64;
         let requested_mode = resources_override.as_ref().map_or_else(
             || self.requested_search_mode(),
             |execution| execution.requested_mode,
         );
         let mode = degraded_search_mode(self.config.pressure.degradation_override, requested_mode);
+        let semantic_admitted = resources_override.as_ref().is_some_and(|execution| {
+            let embedder = if matches!(mode, Ok(SearchExecutionMode::QualityOnly)) {
+                execution.resources.quality_embedder.as_ref()
+            } else {
+                execution.resources.fast_embedder.as_ref()
+            };
+            embedder.is_some_and(|embedder| embedder.embedder().is_semantic())
+        });
         // Keep Started followed by a typed terminal on refusal for existing
         // CLI callers. Raw daemon requests complete admission before this call.
         self.emit_search_stream_started_in_mode(
             query,
             stream_id,
             mode.as_ref().copied().unwrap_or(requested_mode),
+            semantic_admitted,
             &mut seq,
             writer,
         )?;
@@ -8579,7 +8627,9 @@ impl FsfsRuntime {
                 Ok(())
             }
             Err(error) => {
-                self.emit_search_stream_terminal_error(stream_id, &error, &mut seq, writer)?;
+                if !writer.failed {
+                    self.emit_search_stream_terminal_error(stream_id, &error, &mut seq, writer)?;
+                }
                 Err(error)
             }
         }
@@ -10324,6 +10374,7 @@ impl FsfsRuntime {
             query,
             stream_id,
             self.requested_search_mode(),
+            false,
             seq,
             writer,
         )
@@ -10334,17 +10385,18 @@ impl FsfsRuntime {
         query: &str,
         stream_id: &str,
         mode: SearchExecutionMode,
+        semantic_admitted: bool,
         seq: &mut u64,
         writer: &mut W,
     ) -> SearchResult<()> {
+        let mut started = self.search_stream_started_event_in_mode(query, stream_id, mode);
+        started.semantic_admitted &= semantic_admitted;
         let frame = StreamFrame::new(
             stream_id.to_owned(),
             *seq,
             iso_timestamp_now(),
             "search",
-            StreamEvent::<SearchHitPayload>::Started(
-                self.search_stream_started_event_in_mode(query, stream_id, mode),
-            ),
+            StreamEvent::<SearchHitPayload>::Started(started),
         );
         emit_stream_frame(&frame, self.cli_input.format, writer)?;
         *seq = seq.saturating_add(1);
