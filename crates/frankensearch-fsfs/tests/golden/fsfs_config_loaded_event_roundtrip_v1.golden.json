@@ -47,6 +47,7 @@
       "rrf_k": 60,
       "quality_timeout_ms": 500,
       "fast_only": true,
+      "ranking_priors": false,
       "explain": false,
       "shadow_mode": true,
       "shadow_sample_rate_basis_points": 2500,
