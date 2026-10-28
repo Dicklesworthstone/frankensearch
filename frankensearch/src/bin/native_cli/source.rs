@@ -58,7 +58,7 @@ impl DocumentRequest {
 }
 
 /// Validate the bounded windows before any retained source is materialized.
-pub(crate) fn validate_windows(documents: &[DocumentRequest]) -> Result<()> {
+pub fn validate_windows(documents: &[DocumentRequest]) -> Result<()> {
     if documents.is_empty() || documents.len() > MAX_DOCUMENTS {
         return Err(bad("fetch requires between 1 and 32 document windows"));
     }
@@ -221,7 +221,7 @@ fn render<'a>(
 /// Render borrowed source windows and their selection envelope in one bounded
 /// buffer. Both serving protocols validate their own generation/authority fence
 /// before calling this helper; no source body is cloned into a JSON value.
-pub(crate) fn render_documents<'a>(
+pub fn render_documents<'a>(
     cx: &Cx,
     documents: &'a [DocumentRequest],
     request_filter: Option<&filter::Filter>,

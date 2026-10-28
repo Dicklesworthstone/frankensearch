@@ -119,18 +119,20 @@ pub(super) async fn execute(
 
     // This proves a real query over exactly the frozen candidate, including
     // hydration and both producers for full topology, before staging AUTHORITY.
-    inputs.preview(cx, &prepared).await.map_err(|error| {
-        inputs.failure(
-            &recovery,
-            "not_attempted",
-            "previous_retained",
-            if cancelled(cx, error.as_ref()) {
-                "preview_cancelled"
-            } else {
-                "preview_refused"
-            },
-        )
-    })?;
+    Box::pin(inputs.preview(cx, &prepared))
+        .await
+        .map_err(|error| {
+            inputs.failure(
+                &recovery,
+                "not_attempted",
+                "previous_retained",
+                if cancelled(cx, error.as_ref()) {
+                    "preview_cancelled"
+                } else {
+                    "preview_refused"
+                },
+            )
+        })?;
     checkpoint(cx)?;
     inputs
         .binding(&prepared)
@@ -184,7 +186,7 @@ pub(super) async fn execute(
     // Buffer the requested answer until every required replay phase succeeds.
     // Full mode always consumes refinement, even for a nonstreaming response.
     let mut phases = Phases::new();
-    let replay = query_admitted(
+    let replay = Box::pin(query_admitted(
         cx,
         &published.snapshot,
         published.scope.as_ref(),
@@ -200,7 +202,7 @@ pub(super) async fn execute(
             phases.push((phase, results.to_vec()));
             Ok(())
         },
-    )
+    ))
     .await
     .and_then(|()| validate_phases(inputs.mode, &phases))
     .and_then(|()| checkpoint(cx));
@@ -238,19 +240,20 @@ pub(super) async fn execute(
                         "receipt": rollback_path, "selection": receipt,
                         "restores": selected.authority,
                     }),
-                    Err(error) => {
-                        if let Some(failed) = error.downcast_ref::<PublicationFailure>() {
-                            let mut rollback = failed.0.clone();
-                            rollback["status"] = rollback["publication"].clone();
-                            rollback
-                        } else {
+                    Err(error) => error.downcast_ref::<PublicationFailure>().map_or_else(
+                        || {
                             serde_json::json!({
                                 "status": "deferred", "reason": "rollback_preparation_refused",
                                 "target_receipt": options.from_receipt,
                                 "requested_receipt": rollback_path,
                             })
-                        }
-                    }
+                        },
+                        |failed| {
+                            let mut rollback = failed.0.clone();
+                            rollback["status"] = rollback["publication"].clone();
+                            rollback
+                        },
+                    ),
                 }
             };
         }
@@ -594,13 +597,13 @@ impl Inputs<'_> {
         if candidate.owned_image_bytes() > u64::try_from(self.options.max_image_bytes)? {
             return Err(bad("reindex rollback exceeds the encoded-image budget"));
         }
-        let mut publisher = GenerationPublisherV1::new(
+        let mut restoration = GenerationPublisherV1::new(
             self.root,
             self.selected.root_id,
             writer.writer_id,
             PROFILE,
         )?;
-        let attempt = publisher.prepare_attempt(
+        let attempt = restoration.prepare_attempt(
             &candidate,
             // The old retained target predates the rebuild. Only the actual
             // new selection supplies the pair this compensating CAS may change.
@@ -638,7 +641,7 @@ impl Inputs<'_> {
         save_receipt(&receipt, path)?;
         publish_and_admit_with_reconciliation(
             cx,
-            &mut publisher,
+            &mut restoration,
             &candidate,
             &attempt,
             &receipt,

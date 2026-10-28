@@ -263,6 +263,10 @@ impl QueryMode {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Mirrors independent CLI switches; parsing checks command and consent conflicts"
+)]
 struct Options {
     command: Command,
     root: Option<PathBuf>,
@@ -1267,6 +1271,7 @@ struct PublishedGeneration {
     scope: Option<NativeScopedGenerationSnapshot>,
 }
 
+#[derive(Clone, Copy)]
 struct PublicationOptions<'a> {
     max_image_bytes: usize,
     scope: Option<(&'a Filter, usize)>,

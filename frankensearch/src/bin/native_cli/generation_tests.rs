@@ -30,7 +30,7 @@ impl Embedder for Provider {
     fn dimension(&self) -> usize {
         2
     }
-    fn id(&self) -> &str {
+    fn id(&self) -> &'static str {
         "authority-cli-test"
     }
     fn model_name(&self) -> &str {
@@ -2102,10 +2102,10 @@ fn qualified_authority_cli_publishes_and_reopens_fast_and_quality_generations() 
                 successor.manifest_bytes(),
             )
             .unwrap();
-            let mut publisher =
+            let mut activation_writer =
                 GenerationPublisherV1::new(&root, selected.root_id, [0x72; 16], PROFILE).unwrap();
             assert!(matches!(
-                publisher
+                activation_writer
                     .publish(
                         &cx,
                         &successor,
@@ -2673,7 +2673,7 @@ mod warm_authority {
     fn fetch_message(
         selected: &Receipt,
         id: &str,
-        documents: serde_json::Value,
+        documents: &serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
             "op":"fetch", "id":id, "expected_authority":selected.authority,
@@ -2683,7 +2683,7 @@ mod warm_authority {
 
     #[test]
     fn authority_fetch_requests_require_an_exact_selection_and_strict_window_fields() {
-        let valid = fetch_message(&receipt(), "source", serde_json::json!([{"doc_id":"a"}]));
+        let valid = fetch_message(&receipt(), "source", &serde_json::json!([{"doc_id":"a"}]));
         assert!(matches!(
             serde_json::from_value::<AuthorityRequest>(valid.clone()).unwrap(),
             AuthorityRequest::Fetch(_)
@@ -2759,7 +2759,7 @@ mod warm_authority {
                 let request = fetch_message(
                     &selected,
                     "windows",
-                    serde_json::json!([
+                    &serde_json::json!([
                         {"doc_id":"unicode", "max_bytes":4, "include_metadata":true},
                         {"doc_id":"missing-first"},
                         {"doc_id":"unicode", "offset_bytes":4, "max_bytes":4},
@@ -2855,7 +2855,7 @@ mod warm_authority {
                 "deleted-source",
                 &old,
                 6,
-                serde_json::json!([{"op":"delete", "id":"deleted"}]),
+                &serde_json::json!([{"op":"delete", "id":"deleted"}]),
             );
             assert_eq!(
                 exchange(&cx, &mut writer, &[deletion]).await[1]["event"],
@@ -2873,10 +2873,10 @@ mod warm_authority {
                 {"doc_id":"allowed", "include_metadata":true},
                 {"doc_id":"allowed"}
             ]);
-            let ordinary = fetch_message(&selected, "fixed", windows.clone());
-            let mut narrow = fetch_message(&selected, "narrow", windows.clone());
+            let ordinary = fetch_message(&selected, "fixed", &windows);
+            let mut narrow = fetch_message(&selected, "narrow", &windows);
             narrow["filter"] = serde_json::json!({"ids":["excluded"]});
-            let mut broad = fetch_message(&selected, "broad", windows);
+            let mut broad = fetch_message(&selected, "broad", &windows);
             broad["filter"] = serde_json::json!({});
             let output = exchange(&cx, &mut session, &[ordinary, narrow, broad]).await;
             for position in [1, 3] {
@@ -2913,7 +2913,7 @@ mod warm_authority {
             let mut requested_filter = fetch_message(
                 &selected,
                 "request-filter",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"excluded", "offset_bytes":usize::MAX, "include_metadata":true},
                     {"doc_id":"allowed", "include_metadata":true}
                 ]),
@@ -2968,14 +2968,14 @@ mod warm_authority {
             let old_request = fetch_message(
                 &old,
                 "retained",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"retry-old", "include_metadata":true}, {"doc_id":"garden-old"}
                 ]),
             );
             let new_request = fetch_message(
                 &winner,
                 "wrong-owner",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"retry-winner"}
                 ]),
             );
@@ -3023,7 +3023,7 @@ mod warm_authority {
             let original_fetch = fetch_message(
                 &old,
                 "original-source",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"retry-old", "include_metadata":true}
                 ]),
             );
@@ -3044,7 +3044,7 @@ mod warm_authority {
                 "edited-source",
                 &old,
                 6,
-                serde_json::json!([
+                &serde_json::json!([
                     {"op":"upsert", "id":"retry-old", "content":"retry changed source",
                      "title":"Changed title", "metadata":{"version":"edited"}},
                     {"op":"delete", "id":"garden-old"}
@@ -3058,7 +3058,7 @@ mod warm_authority {
             let updated_fetch = fetch_message(
                 &edited,
                 "updated-source",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"retry-old", "include_metadata":true}, {"doc_id":"garden-old"}
                 ]),
             );
@@ -3102,7 +3102,7 @@ mod warm_authority {
             let external_fetch = fetch_message(
                 &external,
                 "external-source",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"retry-external", "include_metadata":true}
                 ]),
             );
@@ -3132,7 +3132,7 @@ mod warm_authority {
             let restored_fetch = fetch_message(
                 &restored,
                 "restored-source",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"retry-old", "include_metadata":true}
                 ]),
             );
@@ -3190,7 +3190,7 @@ mod warm_authority {
             let valid = fetch_message(
                 &selected,
                 "valid",
-                serde_json::json!([{"doc_id":"unicode"}]),
+                &serde_json::json!([{"doc_id":"unicode"}]),
             );
             let mut bad_authority = valid.clone();
             bad_authority["expected_authority"] = serde_json::json!([1, 2]);
@@ -3217,7 +3217,7 @@ mod warm_authority {
                 serde_json::json!([{"doc_id":"x".repeat(40_000)}, {"doc_id":"y".repeat(40_000)}]),
             ] {
                 rejected.push((
-                    fetch_message(&selected, "bad-windows", windows),
+                    fetch_message(&selected, "bad-windows", &windows),
                     "invalid_fetch_windows",
                 ));
             }
@@ -3228,7 +3228,7 @@ mod warm_authority {
                     fetch_message(
                         &selected,
                         "bad-offset",
-                        serde_json::json!([
+                        &serde_json::json!([
                             {"doc_id":"unicode"}, {"doc_id":"unicode", "offset_bytes":offset}
                         ]),
                     ),
@@ -3268,7 +3268,7 @@ mod warm_authority {
             let missing = fetch_message(
                 &selected,
                 "missing",
-                serde_json::json!([{"doc_id":"absent"}]),
+                &serde_json::json!([{"doc_id":"absent"}]),
             );
             let output = exchange(&cx, &mut bounded, &[stale, small_window, missing]).await;
             assert_eq!(
@@ -3334,14 +3334,14 @@ mod warm_authority {
             let single = fetch_message(
                 &selected,
                 "single",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"escaped", "max_bytes":65_536, "include_metadata":true}
                 ]),
             );
             let overflow = fetch_message(
                 &selected,
                 "overflow",
-                serde_json::json!(vec![
+                &serde_json::json!(vec![
                     serde_json::json!({"doc_id":"escaped", "max_bytes":65_536, "include_metadata":true});
                     3
                 ]),
@@ -3349,7 +3349,7 @@ mod warm_authority {
             let small = fetch_message(
                 &selected,
                 "small",
-                serde_json::json!([
+                &serde_json::json!([
                     {"doc_id":"escaped", "max_bytes":4}
                 ]),
             );
@@ -5978,7 +5978,7 @@ mod warm_authority {
         label: &str,
         previous: &Receipt,
         source_high: u64,
-        changes: serde_json::Value,
+        changes: &serde_json::Value,
     ) -> serde_json::Value {
         serde_json::json!({
             "op": "update", "id": label, "expected_authority": previous.authority,
@@ -6012,7 +6012,7 @@ mod warm_authority {
                     "metadata",
                     &old,
                     5,
-                    serde_json::json!([
+                    &serde_json::json!([
                         {"op":"upsert", "id":"retry-old", "content":"retry network requests",
                          "title":"Unique refreshed title", "metadata":{"version":"new"}},
                         {"op":"upsert", "id":"garden-old", "content":"garden flowers",
@@ -6087,7 +6087,7 @@ mod warm_authority {
                     "mixed",
                     &second,
                     6,
-                    serde_json::json!([
+                    &serde_json::json!([
                         {"op":"upsert", "id":"garden-old", "content":"discarded input"},
                         {"op":"upsert", "id":"fresh", "content":"discarded new input"},
                         {"op":"delete", "id":"fresh"},
@@ -6192,7 +6192,7 @@ mod warm_authority {
                     "scoped-next",
                     &old,
                     6,
-                    serde_json::json!([
+                    &serde_json::json!([
                         {"op":"upsert", "id":"retry-old", "content":"retry network requests",
                          "metadata":{"version":"new"}},
                         {"op":"delete", "id":"garden-old"},
@@ -6247,7 +6247,7 @@ mod warm_authority {
                     "scope-empty",
                     &next,
                     7,
-                    serde_json::json!([
+                    &serde_json::json!([
                         {"op":"upsert", "id":"garden-new", "content":"garden new flowers",
                          "metadata":{"version":"new"}}
                     ]),
@@ -6273,7 +6273,7 @@ mod warm_authority {
                     "scope-refill",
                     &empty,
                     8,
-                    serde_json::json!([
+                    &serde_json::json!([
                         {"op":"upsert", "id":"retry-old", "content":"retry network requests",
                          "metadata":{"version":"old"}}
                     ]),
@@ -6350,7 +6350,7 @@ mod warm_authority {
                 "too-large-scope",
                 &old,
                 6,
-                serde_json::json!([
+                &serde_json::json!([
                     {"op":"upsert", "id":"retry-old", "content":"retry network requests",
                      "metadata":{"version":"old", "note":"x".repeat(1_024)}}
                 ]),
@@ -6417,7 +6417,7 @@ mod warm_authority {
                 {"op":"upsert", "id":"retry-old", "content":"retry new content"}
             ]);
             let mut disabled = open_session(&cx, old.clone(), &provider, false);
-            let request = update_message(&parent, "disabled", &old, 6, changes.clone());
+            let request = update_message(&parent, "disabled", &old, 6, &changes);
             let output = exchange(&cx, &mut disabled, &[request]).await;
             assert_eq!(output[0]["updates_enabled"], false);
             assert_eq!(output[1]["event"], "failed");
@@ -6428,24 +6428,24 @@ mod warm_authority {
             let mut session = open_session(&cx, old.clone(), &provider, false)
                 .with_updates(2, crate::MAX_INPUT_BYTES)
                 .unwrap();
-            let mut stale = update_message(&parent, "stale", &old, 6, changes.clone());
+            let mut stale = update_message(&parent, "stale", &old, 6, &changes);
             stale["expected_authority"] = serde_json::json!(receipt().authority);
-            let mut backward = update_message(&parent, "backward", &old, 6, changes.clone());
+            let mut backward = update_message(&parent, "backward", &old, 6, &changes);
             backward["source_low"] = serde_json::json!(0);
-            let mut inverted = update_message(&parent, "inverted", &old, 8, changes.clone());
+            let mut inverted = update_message(&parent, "inverted", &old, 8, &changes);
             inverted["source_low"] = serde_json::json!(9);
-            let mut overflow = update_message(&parent, "overflow", &old, u64::MAX, changes.clone());
+            let mut overflow = update_message(&parent, "overflow", &old, u64::MAX, &changes);
             overflow["source_low"] = serde_json::json!(0);
-            let mut inside = update_message(&parent, "inside", &old, 6, changes.clone());
+            let mut inside = update_message(&parent, "inside", &old, 6, &changes);
             inside["work_dir"] = serde_json::json!(root_path.join("forbidden-work"));
-            let mut relative = update_message(&parent, "relative", &old, 6, changes.clone());
+            let mut relative = update_message(&parent, "relative", &old, 6, &changes);
             relative["work_dir"] = serde_json::json!("relative-work");
             let invalid_delete = update_message(
                 &parent,
                 "invalid-delete",
                 &old,
                 6,
-                serde_json::json!([
+                &serde_json::json!([
                     {"op":"delete", "id":" "}
                 ]),
             );
@@ -6454,7 +6454,7 @@ mod warm_authority {
                 "too-many",
                 &old,
                 6,
-                serde_json::Value::Array(vec![
+                &serde_json::Value::Array(vec![
                     serde_json::json!({"op":"delete", "id":"absent"});
                     1_001
                 ]),
@@ -6489,7 +6489,7 @@ mod warm_authority {
                 "invalid-overwritten",
                 &old,
                 6,
-                serde_json::json!([
+                &serde_json::json!([
                     {"op":"upsert", "id":"retry-old", "content":7},
                     {"op":"upsert", "id":"retry-old", "content":"valid final replacement"}
                 ]),
@@ -6502,7 +6502,7 @@ mod warm_authority {
             let mut bounded = open_session(&cx, old.clone(), &provider, false)
                 .with_updates(2, 1)
                 .unwrap();
-            let request = update_message(&parent, "bounded", &old, 6, changes.clone());
+            let request = update_message(&parent, "bounded", &old, 6, &changes);
             let output = exchange(&cx, &mut bounded, &[request]).await;
             assert_eq!(output[1]["event"], "failed");
             assert_eq!(output[1]["publication"], "not_committed");
@@ -6524,7 +6524,7 @@ mod warm_authority {
             .await;
             let head = fs::read(root_path.join("AUTHORITY")).unwrap();
             let before = provider.calls.load(Ordering::Relaxed);
-            let request = update_message(&parent, "external-stale", &old, 6, changes);
+            let request = update_message(&parent, "external-stale", &old, 6, &changes);
             let output = exchange(&cx, &mut session, &[request]).await;
             assert_eq!(output[1]["event"], "failed");
             assert_eq!(output[1]["publication"], "not_committed");
@@ -6646,7 +6646,7 @@ mod warm_authority {
                 "loser",
                 &old,
                 7,
-                serde_json::json!([
+                &serde_json::json!([
                     {"op":"upsert", "id":"loser", "content":"retry losing change"}
                 ]),
             );
@@ -6771,7 +6771,7 @@ mod warm_authority {
                     "committed",
                     &old,
                     6,
-                    serde_json::json!([
+                    &serde_json::json!([
                         {"op":"upsert", "id":"retry-old", "content":"retry committed replacement"}
                     ]),
                 );
@@ -6877,7 +6877,7 @@ mod warm_authority {
                 "before-rollback",
                 &old,
                 9,
-                serde_json::json!([
+                &serde_json::json!([
                     {"op":"delete", "id":"retry-old"},
                     {"op":"upsert", "id":"later", "content":"retry before rollback"}
                 ]),
@@ -6917,7 +6917,7 @@ mod warm_authority {
                 "after-rollback",
                 &restored,
                 6,
-                serde_json::json!([]),
+                &serde_json::json!([]),
             );
             let output = exchange(
                 &cx,
