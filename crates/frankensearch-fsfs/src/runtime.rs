@@ -114,7 +114,7 @@ use crate::agent_ergonomics::result_id;
 use crate::catalog::cleanup_tombstones_for_path;
 use crate::config::{
     DegradationOverrideMode, DiscoveryCandidate, DiscoveryDecision, DiscoveryScopeDecision,
-    FsfsConfig, IngestionClass, PressureProfile, RootDiscoveryDecision,
+    FsfsConfig, IngestionClass, PressureProfile, RootDiscoveryDecision, UpgradeReusePolicy,
     default_project_config_file_path, default_user_config_file_path,
 };
 use crate::degradation_advisor::{
@@ -6508,10 +6508,6 @@ pub struct FsfsRuntime {
     /// path/module signals + `ranking_priors` path proximity) are applied during
     /// RRF fusion for `Identifier` and `ShortKeyword` queries in `Normal` mode.
     enable_ranking_priors: bool,
-    /// Whether cross-process completion receipts with a different `executable_sha256`
-    /// may be reused when their `IndexingContractDigestV1` (`indexing_contract_sha256`),
-    /// `configuration_sha256`, and producer identities all match (`bd-ky0j2`).
-    allow_contract_upgrade_reuse: bool,
 }
 
 /// Private CLI entry point used to extract embedded weights in a short-lived process.
@@ -6567,7 +6563,6 @@ impl FsfsRuntime {
             seeded_from_receipt: false,
             discovery_excluded_root: None,
             enable_ranking_priors: false,
-            allow_contract_upgrade_reuse: false,
         }
     }
 
@@ -6591,14 +6586,21 @@ impl FsfsRuntime {
     /// producer model fingerprints match (`bd-ky0j2`).
     #[must_use]
     pub const fn with_contract_upgrade_reuse(mut self, allow: bool) -> Self {
-        self.allow_contract_upgrade_reuse = allow;
+        self.config.indexing.upgrade_reuse = if allow {
+            UpgradeReusePolicy::CompatibleContract
+        } else {
+            UpgradeReusePolicy::SameExecutable
+        };
         self
     }
 
     /// Whether `IndexingContractDigestV1`-gated warm reuse across binary upgrades is enabled.
     #[must_use]
     pub const fn contract_upgrade_reuse_enabled(&self) -> bool {
-        self.allow_contract_upgrade_reuse
+        matches!(
+            self.config.indexing.upgrade_reuse,
+            UpgradeReusePolicy::CompatibleContract
+        )
     }
 
     /// Name the source files observed unchanged since the generation a seeded
@@ -26409,6 +26411,11 @@ fn print_cli_help() {
     println!(
         "Index flags:  --watch --force/--full --roots <a,b> --exclude <glob,glob> --index-dir <dir>"
     );
+    println!("              --upgrade-reuse <same-executable|compatible-contract>");
+    println!(
+        "              Default: same-executable. Compatible-contract admits verified reuse across binary upgrades."
+    );
+    println!("              --full/--force always bypass retained reuse and rebuild from source.");
 }
 
 /// `pub(crate)` so the advertised-command census (bd-rh0t, `adapters::cli`
@@ -26416,16 +26423,36 @@ fn print_cli_help() {
 pub(crate) const fn completion_script(shell: CompletionShell) -> &'static str {
     match shell {
         CompletionShell::Bash => {
-            "complete -W \"search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon\" fsfs"
+            r#"_fsfs_complete() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    local choices="search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon --upgrade-reuse"
+    if (( COMP_CWORD > 0 )) && [[ "${COMP_WORDS[COMP_CWORD-1]}" == "--upgrade-reuse" ]]; then
+        choices="same-executable compatible-contract"
+    fi
+    COMPREPLY=( $(compgen -W "$choices" -- "$cur") )
+}
+complete -F _fsfs_complete fsfs"#
         }
         CompletionShell::Zsh => {
-            "compdef '_arguments \"1: :((search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon))\"' fsfs"
+            r#"compdef '_arguments "1: :((search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon))" "--upgrade-reuse[Executable upgrade reuse policy]:policy:(same-executable compatible-contract)"' fsfs"#
         }
         CompletionShell::Fish => {
-            "complete -c fsfs -f -a \"search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon\""
+            r#"complete -c fsfs -f -a "search serve index watch explain status flush config download-models download doctor update completions uninstall help tui version append-batch delete compact daemon"
+complete -c fsfs -l upgrade-reuse -x -a "same-executable compatible-contract" -d "Executable upgrade reuse policy""#
         }
         CompletionShell::PowerShell => {
-            "Register-ArgumentCompleter -CommandName fsfs -ScriptBlock { param($wordToComplete) 'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','update','completions','uninstall','help','tui','version','append-batch','delete','compact','daemon' | Where-Object { $_ -like \"$wordToComplete*\" } }"
+            r#"Register-ArgumentCompleter -Native -CommandName fsfs -ScriptBlock {
+    param($wordToComplete, $commandAst, $cursorPosition)
+    $previous = @($commandAst.CommandElements | Where-Object { $_.Extent.EndOffset -le ($cursorPosition - $wordToComplete.Length) })[-1]
+    $choices = if ($previous -and $previous.Extent.Text -eq '--upgrade-reuse') {
+        'same-executable','compatible-contract'
+    } else {
+        'search','serve','index','watch','explain','status','flush','config','download-models','download','doctor','update','completions','uninstall','help','tui','version','append-batch','delete','compact','daemon','--upgrade-reuse'
+    }
+    $choices | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
+        [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
+    }
+}"#
         }
     }
 }

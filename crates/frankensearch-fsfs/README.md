@@ -139,6 +139,36 @@ fsfs config show
 fsfs --tui
 ```
 
+## Reusing an index after a binary upgrade
+
+Complete-generation indexes can reuse verified indexing work across executable
+upgrades when the indexing contract, relevant configuration, source identity,
+and producer model fingerprints still match. Enable this policy explicitly:
+
+```bash
+fsfs index /path/to/project --upgrade-reuse compatible-contract
+```
+
+The default, `same-executable`, also requires the receipt's executable identity
+to match. A missing or incompatible receipt falls back to rebuilding. The
+`compatible-contract` policy retains the other integrity and compatibility
+checks; it does not admit arbitrary old index data. `--full` and its `--force`
+alias always bypass retained reuse and rebuild from source, including when
+compatible-contract reuse is enabled.
+
+To persist the policy, set it in the configuration file:
+
+```toml
+[indexing]
+upgrade_reuse = "compatible_contract"
+```
+
+`FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract` or its
+`FSFS_INDEXING_UPGRADE_REUSE` alias overrides the file. An explicit
+`--upgrade-reuse` flag takes precedence over both. The CLI accepts either
+hyphens or underscores in policy names. Use `--upgrade-reuse same-executable`
+to require an identical executable again.
+
 ## Retained-generation recovery (unreleased source)
 
 `fsfs-recover` exposes the existing retained recovery APIs without normal root
