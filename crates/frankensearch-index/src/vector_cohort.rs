@@ -833,6 +833,9 @@ mod tests {
             .input
             .doc_id_semantics
             .push_str("-another-cohort");
+        different_semantics.space.input_contract_fingerprint =
+            different_semantics.input.fingerprint();
+        different_semantics.producer.space_fingerprint = different_semantics.space.fingerprint();
         let different_semantics = FsviV2IdentityBinding::new(
             fixture.quality.generation(),
             different_semantics.freeze().unwrap(),

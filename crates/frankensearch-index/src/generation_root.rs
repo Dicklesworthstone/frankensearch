@@ -4580,9 +4580,9 @@ pub mod authority_publisher {
         ///
         /// Publisher A's genesis attempt goes unknown AFTER the slot write and
         /// floor advance (owner frame never lands), so A holds a bounded
-        /// permit for a candidate that is in fact durable. Publisher B then
-        /// resolves the live head and publishes sequence 2, advancing the
-        /// floor past A's candidate. A's fresh reconcile must recognize its
+        /// permit for a candidate that is in fact durable. Publisher B must
+        /// first reconcile that persisted attempt before publishing sequence 2,
+        /// advancing the floor past A's candidate. A's fresh reconcile recognizes its
         /// own candidate in the slot, observe the floor beyond it, resolve
         /// the pair, and report `CommittedThenSuperseded` carrying B's head —
         /// never `StillUnknown`, never a fork, and never a mutation.
@@ -4640,6 +4640,31 @@ pub mod authority_publisher {
             let genesis_slot = pair.second.expect("genesis slot is durable");
             assert_eq!(genesis_slot.authority, genesis);
             let successor = authority(2, Some(genesis.fingerprint()));
+            let pending_lock = fs::read(root_path.join("LOCK")).expect("pending lock");
+            let pending_floor = floor.load(ROOT_ID).expect("pending floor");
+            assert_eq!(
+                publisher_b
+                    .publish(successor, pair, Some(&floor), [0x52; 16])
+                    .expect("successor refuses unreconciled attempt"),
+                PublicationOutcomeV1::NotCommitted(NotCommittedV1::LockRefused(
+                    GenerationAuthorityErrorV1::UnresolvedAttempt,
+                )),
+            );
+            assert_eq!(authority_bytes(&root_path), bytes);
+            assert_eq!(
+                fs::read(root_path.join("LOCK")).expect("lock"),
+                pending_lock
+            );
+            assert_eq!(floor.load(ROOT_ID).expect("floor"), pending_floor);
+            let reconciled = publisher_b
+                .reconcile(&permit, Some(&floor))
+                .expect("fresh publisher completes the persisted attempt");
+            assert!(matches!(
+                reconciled,
+                ReconcileOutcomeV1::Committed { slot, .. } if slot == genesis_slot
+            ));
+            assert_eq!(authority_bytes(&root_path), bytes);
+            assert_eq!(floor.load(ROOT_ID).expect("floor"), pending_floor);
             let outcome_b = publisher_b
                 .publish(successor, pair, Some(&floor), [0x52; 16])
                 .expect("successor publication runs");

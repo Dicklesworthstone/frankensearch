@@ -5156,11 +5156,19 @@ mod tests {
         }
         let mut duplicated = rows.clone();
         duplicated.push(rows[2].clone());
-        let owner = admitted_fsvi_owner(directory.path(), "duplicate.fsvi", &binding, &duplicated);
+        // Identity-complete owners reject duplicates before graph admission.
+        let mut writer =
+            VectorIndex::create_v2(&directory.path().join("duplicate.fsvi"), binding.clone())
+                .expect("create duplicate-row fixture");
+        for (doc_id, vector) in &duplicated {
+            writer
+                .write_record(doc_id, vector)
+                .expect("write duplicate row");
+        }
         assert!(matches!(
-            previous.try_reuse_for_owner(&Cx::for_testing(), owner),
+            writer.finish(),
             Err(SearchError::InvalidConfig { field, .. })
-                if field == "native_hnsw_receipt.reuse.document_ids"
+                if field == "doc_id"
         ));
         let flagged: Vec<_> = rows
             .iter()
@@ -5200,7 +5208,11 @@ mod tests {
             identity.storage.endianness = "little-endian".to_owned();
             match drift {
                 1 => identity.producer.implementation_revision = "different-producer".to_owned(),
-                2 => identity.input.chunking = "different-input-chunking".to_owned(),
+                2 => {
+                    identity.input.chunking = "different-input-chunking".to_owned();
+                    identity.space.input_contract_fingerprint = identity.input.fingerprint();
+                    identity.producer.space_fingerprint = identity.space.fingerprint();
+                }
                 3 => identity.storage.quantization = QuantizationFormat::F32,
                 _ => {}
             }
@@ -5676,7 +5688,11 @@ mod tests {
         let original = std::fs::read(&path).expect("graph image");
         let (edge_offset, edge_owner) = first_persisted_neighbour(&original).expect("graph edge");
         for (offset, value, detail) in [
-            (NATIVE_HNSW_HEADER_LEN, 1, "more than one graph node"),
+            (
+                NATIVE_HNSW_HEADER_LEN,
+                1,
+                "source map repeats physical row 1",
+            ),
             (NATIVE_HNSW_HEADER_LEN, 32, "outside"),
             (edge_offset, edge_owner, "is its own neighbour"),
         ] {
@@ -7819,7 +7835,9 @@ mod tests {
                 .expect("build graph");
         bound.save(&path).expect("save v2 graph");
         let bytes = std::fs::read(&path).expect("v2 bytes");
-        for (physical_row, expected_detail) in [(1, "more than one graph node"), (8, "outside")] {
+        for (physical_row, expected_detail) in
+            [(1, "source map repeats physical row 1"), (8, "outside")]
+        {
             let mut malformed = bytes.clone();
             put_u32(&mut malformed, NATIVE_HNSW_HEADER_LEN, physical_row);
             reseal_persisted_checksums(&mut malformed);
