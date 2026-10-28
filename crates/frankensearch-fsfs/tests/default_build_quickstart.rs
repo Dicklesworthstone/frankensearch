@@ -765,9 +765,9 @@ mod loader_only {
                 let source = source_models.join(directory).join(&artifact.name);
                 let target = models.join(directory).join(&artifact.name);
                 fs::create_dir_all(target.parent().unwrap()).unwrap();
-                if fs::hard_link(&source, &target).is_err() {
-                    fs::copy(source, target).unwrap();
-                }
+                // Independent files keep this negative fixture from changing
+                // the source inode's ctime and invalidating its live receipt.
+                fs::copy(source, target).unwrap();
             }
             fs::copy(
                 source_models.join(directory).join(".verified"),
@@ -4420,6 +4420,7 @@ meta:
                     "jsonl",
                 ])
                 .env("RUST_LOG", "info")
+                .env("FSFS_COMPLETE_GENERATIONS", "0")
                 .stdout(File::create(&stdout_path).unwrap())
                 .stderr(File::create(&stderr_path).unwrap())
                 .spawn()
@@ -4979,6 +4980,21 @@ meta:
             let stale_revision = String::from_utf8(revision).expect("hex producer fingerprint");
             let isolated = temp.path().join(format!("doctor-{tier}"));
             fs::create_dir_all(isolated.join("vector")).expect("private vector directory");
+            // Full-mode doctor also admits cross-tier document membership.
+            // Keep the healthy counterpart so only the selected producer
+            // revision differs in this otherwise valid two-tier fixture.
+            let counterpart = if tier == "fast" {
+                "quality.fsvi"
+            } else {
+                "index.fsvi"
+            };
+            fs::copy(
+                active_generation_root(&index)
+                    .join("vector")
+                    .join(counterpart),
+                isolated.join("vector").join(counterpart),
+            )
+            .expect("preserve healthy counterpart tier");
             let candidate = isolated.join("vector").join(filename);
             // Use the normal writer so the stale identity has a valid header
             // checksum. A raw byte flip would only exercise corruption refusal.

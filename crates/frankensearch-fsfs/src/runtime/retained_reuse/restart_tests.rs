@@ -289,6 +289,24 @@ fn child_with_policy(
     label: &str,
     policy: Option<&str>,
 ) -> ChildReport {
+    let (status, report_path, log_path) =
+        child_with_policy_outcome(executable, parent, mode, label, policy);
+    assert!(
+        status.success(),
+        "restart child failed: {}",
+        fs::read_to_string(log_path).unwrap()
+    );
+    let report = fs::read(report_path).expect("child ran and produced its report");
+    serde_json::from_slice(&report).unwrap()
+}
+
+fn child_with_policy_outcome(
+    executable: &Path,
+    parent: &Path,
+    mode: &str,
+    label: &str,
+    policy: Option<&str>,
+) -> (std::process::ExitStatus, PathBuf, PathBuf) {
     let report_path = parent.join(format!("{label}.json"));
     let log_path = parent.join(format!("{label}.log"));
     let log = File::create(&log_path).unwrap();
@@ -329,13 +347,7 @@ fn child_with_policy(
         // This is a subprocess watchdog, not a timing-based correctness race.
         std::thread::sleep(Duration::from_millis(10));
     };
-    assert!(
-        status.success(),
-        "restart child failed: {}",
-        fs::read_to_string(log_path).unwrap()
-    );
-    let report = fs::read(report_path).expect("child ran and produced its report");
-    serde_json::from_slice(&report).unwrap()
+    (status, report_path, log_path)
 }
 
 fn source_fixture(parent: &Path) {
@@ -683,18 +695,35 @@ fn restart_cli_upgrade_policy_preserves_force_config_and_contract_refusals() {
         }
         fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
         let damaged = snapshot(&retained);
-        let refused = child_with_policy(
+        let pointer = fs::read(parent.join("store/FSFS-CURRENT")).unwrap();
+        let (status, report, log) = child_with_policy_outcome(
             &alternate,
             parent,
             "seed",
             mode,
             Some("compatible-contract"),
         );
-        assert_ne!(refused.executable, first.executable);
-        assert_eq!(refused.seeded, None, "{mode}");
-        assert_eq!(refused.generation, first.generation);
-        assert!(refused.embedded_inputs.is_empty());
-        assert_eq!(refused.hits, first.hits);
+        // The reuse receipt is sealed into this generation's inventory.
+        // Changing it after publication must fail generation admission before
+        // the child can select, seed, infer, or query that damaged generation.
+        assert!(!status.success(), "{mode}");
+        let diagnostic = fs::read_to_string(log).unwrap();
+        assert!(
+            diagnostic.contains("IndexCorrupted"),
+            "{mode}: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("bundle files differ from their sealed inventory"),
+            "{mode}: {diagnostic}"
+        );
+        assert!(
+            !report.exists(),
+            "a refused child must not report a successful run"
+        );
+        assert_eq!(
+            fs::read(parent.join("store/FSFS-CURRENT")).unwrap(),
+            pointer
+        );
         assert_eq!(snapshot(&retained), damaged);
     }
 }

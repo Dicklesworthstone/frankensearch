@@ -2355,13 +2355,20 @@ mod tests {
             .unwrap_err();
             assert!(refused_by_override(&refused), "{refused:?}");
 
-            // The library reader applies its opening runtime's override too.
+            // A paused runtime refuses admission before constructing a reader.
             let mut paused = search_runtime(&runtime);
             paused.config.pressure.degradation_override = DegradationOverrideMode::ForcePaused;
-            let refused = paused
+            let refused = paused.open_retained_search(&cx, &root).await.unwrap_err();
+            assert!(refused_by_override(&refused), "{refused:?}");
+
+            // An already admitted reader also applies a later search refusal.
+            let mut paused_reader = search_runtime(&runtime)
                 .open_retained_search(&cx, &root)
                 .await
-                .unwrap()
+                .unwrap();
+            paused_reader.runtime.config.pressure.degradation_override =
+                DegradationOverrideMode::ForcePaused;
+            let refused = paused_reader
                 .search(&cx, "sharedtoken", 10)
                 .await
                 .unwrap_err();

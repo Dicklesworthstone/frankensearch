@@ -549,6 +549,16 @@ impl FsfsRuntime {
             SearchExecutionMode::Full
         };
         Self::validate_search_generation_at_root(build.path(), candidate_mode)?;
+        if candidate.config.pressure.degradation_override
+            == crate::config::DegradationOverrideMode::ForceMetadataOnly
+        {
+            // This private runtime has already finished indexing and recorded
+            // the original metadata-only policy. Validate its path-only output
+            // as lexical data; no operator search is being admitted here.
+            // The caller's runtime still refuses metadata-only searches.
+            candidate.config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+        }
         let resources = Box::pin(
             candidate.prepare_search_execution_resources_at_root_with_modes(
                 cx,
@@ -1315,7 +1325,7 @@ mod retained_delete_tests {
         config.search.fast_only = true;
         config.search.rerank = false;
         "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
-        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+        let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
             command: CliCommand::Index,
             target_path: Some(source.clone()),
             index_dir: Some(root.clone()),
@@ -1401,6 +1411,13 @@ mod retained_delete_tests {
         let GenerationPublication::Durable(generation) = publication else {
             panic!("test fixture publication must be durable"); // ubs:ignore — cfg(test) assertion.
         };
+        if quality_embedder.is_some() {
+            // Keep the initial fast-only build and manual quality coverage,
+            // then enable mutations to resolve the injected producer through
+            // the ordinary registered-model selection.
+            "all-MiniLM-L6-v2".clone_into(&mut runtime.config.indexing.quality_model);
+            runtime.config.search.fast_only = false;
+        }
         (runtime, source, root, generation)
     }
 

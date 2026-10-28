@@ -428,6 +428,8 @@ The same opt-in is available as `[indexing] upgrade_reuse = "compatible_contract
 or `FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract`; disable it with
 `--upgrade-reuse same-executable`. Source, producer, topology and artifact checks
 still apply, and old receipts without the contract cannot use this path.
+Reuse skips document embedding; model verification and startup health probes
+still run.
 Exact JSON number parsing advances the indexing contract to v2. A v1 completion
 receipt starts cold once, including with this opt-in; later v2-compatible binary
 upgrades can reuse its work. Older query caches and daemons are also invalidated

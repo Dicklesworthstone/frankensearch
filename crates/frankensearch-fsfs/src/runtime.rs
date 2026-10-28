@@ -31697,8 +31697,15 @@ mod tests {
                     matches!(&error, SearchError::UnverifiableRemoteSpace { producer, .. } if producer == "environment")
                 );
             }
-            assert!(error.to_string().contains("FRANKENSEARCH_API_PROVIDER"));
-            assert!(error.to_string().contains("registered local"));
+            // UnverifiableRemoteSpace deliberately redacts its Display text.
+            // Inspect the typed diagnostic without weakening that redaction.
+            let reason = match &error {
+                SearchError::EmbedderUnavailable { reason, .. }
+                | SearchError::UnverifiableRemoteSpace { reason, .. } => reason.as_str(),
+                _ => "",
+            };
+            assert!(reason.contains("FRANKENSEARCH_API_PROVIDER"));
+            assert!(reason.contains("registered local"));
         }
     }
     #[cfg(unix)]
@@ -50411,7 +50418,18 @@ mod tests {
                 }),
             ));
 
-            let first_poll = poll_fn(|task_cx| Poll::Ready(search.as_mut().poll(task_cx))).await;
+            // Fast traversal now yields through the caller's blocking pool.
+            // Drive those real wakeups before observing the quality barrier;
+            // the very first Pending need not come from quality inference.
+            let first_poll = poll_fn(|task_cx| {
+                let polled = search.as_mut().poll(task_cx);
+                if polled.is_pending() && !barrier.entered() {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(polled)
+                }
+            })
+            .await;
             assert!(
                 first_poll.is_pending(),
                 "search must wait at the quality barrier after emitting Initial"
@@ -56132,17 +56150,23 @@ mod tests {
                 let mut writer =
                     VectorIndex::create(&path, "doctor-membership-semantic", 2).unwrap();
                 writer.write_record("healthy", &[1.0, 0.0]).unwrap();
-                writer
-                    .write_record(
-                        "other",
-                        if relative == affected {
-                            &[0.0, 0.0]
-                        } else {
-                            &[1.0, 0.0]
-                        },
-                    )
-                    .unwrap();
+                writer.write_record("other", &[1.0, 0.0]).unwrap();
                 writer.finish().unwrap();
+                if relative == affected {
+                    // Writers reject zero vectors. Inject the persisted
+                    // corruption after a valid write to exercise doctor,
+                    // without bypassing the production writer's admission.
+                    let index = VectorIndex::open_read_only(&path).unwrap();
+                    assert_eq!(
+                        index.metadata().quantization,
+                        frankensearch_index::Quantization::F16
+                    );
+                    let offset = usize::try_from(index.metadata().vectors_offset).unwrap() + 4;
+                    drop(index);
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes[offset..offset + 4].fill(0);
+                    fs::write(&path, bytes).unwrap();
+                }
             }
             let mut problem = None;
             if affected == super::FSFS_VECTOR_INDEX_FILE {
@@ -57516,13 +57540,17 @@ mod tests {
             super::SearchExecutionMode::FastOnly
         );
         assert_eq!(
+            super::parse_search_execution_mode(Some("quality_only")).unwrap(),
+            super::SearchExecutionMode::QualityOnly
+        );
+        assert_eq!(
             super::parse_search_execution_mode(Some("lexical_only")).unwrap(),
             super::SearchExecutionMode::LexicalOnly
         );
         let err = super::parse_search_execution_mode(Some("nope")).expect_err("must fail");
         assert!(
             err.to_string()
-                .contains("expected full|fast_only|lexical_only")
+                .contains("expected full|fast_only|quality_only|lexical_only")
         );
     }
 

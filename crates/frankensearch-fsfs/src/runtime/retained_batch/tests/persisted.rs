@@ -34,7 +34,7 @@ async fn fixture(
     config.search.rerank = false;
     "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
     let root = parent.join("store");
-    let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+    let mut runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
         command: CliCommand::Index,
         target_path: Some(source),
         index_dir: Some(root.clone()),
@@ -83,8 +83,14 @@ async fn fixture(
         })
         .unwrap()
     else {
+        // ubs:ignore[rust.ownership.panic-macro] -- This cfg(test)-only fixture must fail if publication is not durable; it is never a production panic path.
         panic!("fixture publication");
-    }; // ubs:ignore — test assertion.
+    };
+    // The seed remains fast-only with a manually added independent quality
+    // tier. Later mutations must enable quality before resolving its injected
+    // producer through the ordinary registered-model selection.
+    "all-MiniLM-L6-v2".clone_into(&mut runtime.config.indexing.quality_model);
+    runtime.config.search.fast_only = false;
     (runtime, store, generation)
 }
 
@@ -118,8 +124,9 @@ fn ids(root: &Path, relative: &str) -> BTreeSet<String> {
 
 fn durable(result: RetainedBatchResult) -> PublishedGeneration {
     let Some(GenerationPublication::Durable(generation)) = result.publication else {
+        // ubs:ignore[rust.ownership.panic-macro] -- This cfg(test)-only positive-path assertion must retain failure on an absent or uncertain batch publication.
         panic!("expected durable batch");
-    }; // ubs:ignore — test assertion.
+    };
     generation
 }
 

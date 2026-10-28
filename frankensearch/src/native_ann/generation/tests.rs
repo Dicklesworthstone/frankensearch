@@ -57,13 +57,17 @@ impl Embedder for ProgressiveProvider {
             Ok(if self.quality {
                 if special || text == "unmatched" {
                     vec![1.0, 0.0, 0.0]
+                } else if text == "fast-quality-ordinary" {
+                    vec![0.6, 0.8, 0.0]
                 } else {
                     vec![0.0, 1.0, 0.0]
                 }
-            } else if special {
+            } else if special || text == "fast-tail-ordinary" {
                 vec![0.0, 1.0]
-            } else {
+            } else if text == "unmatched" || text == "fast-quality-ordinary" {
                 vec![1.0, 0.0]
+            } else {
+                vec![0.8, 0.6]
             })
         })
     }
@@ -194,8 +198,16 @@ async fn progressive_fixture_with_retrieval(
         progressive_policy(quality_ann, true),
     )
     .unwrap()
+    // Distinct fast scores keep the lowest fast-only candidate from tying
+    // the quality-only winner under the union-preserving blend policy.
+    // The quality-only document still lies outside the three-result fast pool.
     .add_documents(["a", "b", "c", "d", "e"].into_iter().map(|id| {
-        IndexableDocument::new(id, "ordinary cohort document").with_metadata("version", "old")
+        let content = match id {
+            "d" => "fast-tail-ordinary",
+            "e" => "fast-quality-ordinary",
+            _ => "ordinary cohort document",
+        };
+        IndexableDocument::new(id, content).with_metadata("version", "old")
     }))
     .add_document(
         IndexableDocument::new("quality-only", "quality-special").with_metadata("version", "old"),
@@ -4197,7 +4209,7 @@ mod qualified_rollback {
                             SnapshotOpenOutcomeV1::Refused(_)
                         ));
                     }
-                    let SnapshotOpenOutcomeV1::Opened(opened) = root
+                    let recovered = root
                         .open_predecessor_generation_for_recovery_with_budget(
                             ROOT_ID,
                             second.authority(),
@@ -4205,10 +4217,10 @@ mod qualified_rollback {
                             first.authority(),
                             BUDGET as u64,
                         )
-                        .unwrap()
-                    else {
+                        .unwrap();
+                    let SnapshotOpenOutcomeV1::Opened(opened) = recovered else {
                         panic!(
-                            "healthy predecessor must recover independently of {damaged_role:?}"
+                            "healthy predecessor must recover independently of {damaged_role:?}: {recovered:?}"
                         );
                     };
                     assert_eq!(opened.head(), retained.retained_snapshot().head());

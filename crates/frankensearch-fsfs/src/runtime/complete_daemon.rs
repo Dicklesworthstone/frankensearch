@@ -2350,7 +2350,14 @@ mod generation_tests {
     #[cfg(feature = "semantic-support")]
     #[test]
     fn raw_stream_modes_select_their_own_primary_and_preserve_cached_full_answers() {
-        run_test_with_cx(|cx| async move {
+        // Quality retrieval uses the caller's blocking-work gateway even with
+        // deterministic providers; a synthetic test Cx cannot complete it.
+        let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 2)
+            .build()
+            .expect("build stream search runtime");
+        scheduler.block_on(async {
+            let cx = Cx::current().expect("runtime root installs a spawn-capable Cx");
             let directory = tempfile::tempdir().unwrap();
             let mut resources = crate::runtime::tests::published_blend_resources(directory.path());
             let fast_calls = count_stream_embeddings(&cx, &mut resources.fast_embedder);
@@ -2386,6 +2393,16 @@ mod generation_tests {
                 .unwrap();
             assert!(!cold.cached);
             assert_eq!(cold.payloads.len(), 2, "fixture must refine full search");
+            assert_eq!(
+                cold.payloads[0].phase,
+                crate::output_schema::SearchOutputPhase::Initial
+            );
+            assert_eq!(
+                cold.payloads[1].phase,
+                crate::output_schema::SearchOutputPhase::Refined,
+                "cache-positive fixture must complete quality retrieval: {:?}",
+                cold.payloads
+            );
             let cached_full = cold.payloads;
             assert_eq!(cache.len(), 1);
 

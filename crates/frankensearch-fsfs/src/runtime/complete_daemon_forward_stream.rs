@@ -1058,9 +1058,12 @@ mod generation_tests {
                     let mut refused = runtime.clone();
                     refused.config.pressure.degradation_override = mode;
                     refused.config.search.explain = explain;
-                    // Such readers admit their lexical resources for inspection;
-                    // the request itself must report the configured search refusal.
-                    let mut session = refused.open_live_retained_search(&cx, &root).await.unwrap();
+                    // Admit healthy resources first: a paused opener correctly
+                    // refuses before a stream exists. This test exercises the
+                    // request-time refusal on an already admitted session.
+                    let mut session = runtime.open_live_retained_search(&cx, &root).await.unwrap();
+                    session.reader.runtime.config.pressure.degradation_override = mode;
+                    session.reader.runtime.config.search.explain = explain;
                     // Construct the wire request independently of the client's
                     // pre-transport guard so this still exercises server refusal.
                     let mut forwarded = make_request(&runtime, &root, "sharedtoken", 10).unwrap();

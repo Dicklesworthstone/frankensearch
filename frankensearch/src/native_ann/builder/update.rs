@@ -2374,7 +2374,6 @@ mod tests {
                 .await
                 .unwrap();
                 let mut identity = fast.identity.clone();
-                identity.storage.quantization = QuantizationFormat::F16;
                 identity.storage.format = "another-provider-output-label".to_owned();
                 let equivalent = Provider::from_identity(identity);
                 let unchanged =
@@ -2404,6 +2403,29 @@ mod tests {
                 assert_eq!(equivalent.submitted.load(Ordering::SeqCst), 1);
                 assert_eq!(quality.submitted.load(Ordering::SeqCst), 6);
                 assert_eq!(changed.document("a").unwrap().content, "vertical");
+                assert_eq!(old.document("a").unwrap().content, "fractional");
+                // A provider returning Vec<f32> must still identify its actual
+                // output storage, even when the retained FSVI uses f16.
+                let mut incompatible_identity = fast.identity.clone();
+                incompatible_identity.storage.quantization = QuantizationFormat::F16;
+                let incompatible = Provider::from_identity(incompatible_identity);
+                let error = migration(
+                    &cx,
+                    &dir.path().join("misdeclared-output"),
+                    &old,
+                    &incompatible,
+                    &quality,
+                )
+                .unwrap()
+                .upsert_document(IndexableDocument::new("a", "vertical"))
+                .build(&cx)
+                .await
+                .err()
+                .expect("a Vec<f32> response cannot identify itself as f16");
+                assert!(
+                    matches!(error, crate::SearchError::InvalidConfig { field, .. }
+                    if field == "identity_bound_embedding.storage.quantization")
+                );
                 assert_eq!(old.document("a").unwrap().content, "fractional");
             });
         }

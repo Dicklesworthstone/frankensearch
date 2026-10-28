@@ -387,7 +387,9 @@ impl NativeScopedGenerationPreview {
 fn quality_provenance(cx: &Cx, results: &mut [ScoredResult]) -> SearchResult<()> {
     for result in results {
         checkpoint(cx, "native_ann.generation_scope.quality_result")?;
-        result.quality_score = result.fast_score.take();
+        if let Some(score) = result.fast_score.take() {
+            result.quality_score = Some(score);
+        }
         if result.source == ScoreSource::SemanticFast {
             result.source = ScoreSource::SemanticQuality;
         }
@@ -505,7 +507,9 @@ impl NativeScopedGenerationSnapshot {
         if self.snapshot.tier() == EmbedderTierTag::Quality {
             for result in &mut results {
                 checkpoint(cx, "native_ann.generation_scope.quality_result")?;
-                result.quality_score = result.fast_score.take();
+                if let Some(score) = result.fast_score.take() {
+                    result.quality_score = Some(score);
+                }
                 if result.source == ScoreSource::SemanticFast {
                     result.source = ScoreSource::SemanticQuality;
                 }
@@ -542,7 +546,9 @@ impl NativeScopedGenerationSnapshot {
         .await?;
         for result in &mut results {
             checkpoint(cx, "native_ann.generation_scope.quality_result")?;
-            result.quality_score = result.fast_score.take();
+            if let Some(score) = result.fast_score.take() {
+                result.quality_score = Some(score);
+            }
             if result.source == ScoreSource::SemanticFast {
                 result.source = ScoreSource::SemanticQuality;
             }
@@ -857,7 +863,9 @@ impl NativeScopedHybridIndex<'_> {
         let mut results = collect(self.primary(cx, text, k, true)?).await?;
         for result in &mut results {
             checkpoint(cx, "native_ann.scope.quality_result")?;
-            result.quality_score = result.fast_score.take();
+            if let Some(score) = result.fast_score.take() {
+                result.quality_score = Some(score);
+            }
             if result.source == ScoreSource::SemanticFast {
                 result.source = ScoreSource::SemanticQuality;
             }
@@ -879,7 +887,9 @@ impl NativeScopedHybridIndex<'_> {
         let mut results = collect(self.primary_with_pool(cx, text, k, true, pool)?).await?;
         for result in &mut results {
             checkpoint(cx, "native_ann.scope.quality_pool_result")?;
-            result.quality_score = result.fast_score.take();
+            if let Some(score) = result.fast_score.take() {
+                result.quality_score = Some(score);
+            }
             if result.source == ScoreSource::SemanticFast {
                 result.source = ScoreSource::SemanticQuality;
             }
