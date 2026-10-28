@@ -50,7 +50,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 14: checked registered model selection; no implicit quality-producer substitution.
 // 15: explicit quality-only retrieval travels with each request.
 // 16: explicit ranking-prior policy travels with every request and cache key.
-const VERSION: u32 = 16;
+// 17: exact JSON score parsing, including replies loaded from a cache.
+const VERSION: u32 = 17;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]

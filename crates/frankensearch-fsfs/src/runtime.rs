@@ -619,7 +619,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v18: cached answers bind the selected fast model and every registered producer.
 // v19: checked canonical quality selection; disabled tiers have no producer.
 // v20: explicit ranking-prior policy separates cached result orders.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v20";
+// v21: exact JSON number parsing; older cache hops could change score bits.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v21";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -636,8 +637,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v15 / stream v13: attest the checked, actually selected quality producer.
 // v16 / stream v14: require and attest the independent quality-only primary.
 // v17 / stream v15: carry and attest explicit code-navigation ranking priors.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v17";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v15";
+// v18 / stream v16: exact JSON score transport and cache parsing.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v18";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v16";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
