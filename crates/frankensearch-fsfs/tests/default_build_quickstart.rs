@@ -3857,6 +3857,70 @@ mod loader_only {
         assert_finished_successfully("stop prior test daemon", &stopped);
     }
 
+    fn assert_toon_stream_frame_root_fields(raw: &Value) {
+        assert!(
+            raw.as_object()
+                .expect("TOON stream frame object")
+                .keys()
+                .all(|key| {
+                    [
+                        "v",
+                        "schema_version",
+                        "stream_id",
+                        "seq",
+                        "ts",
+                        "command",
+                        "event",
+                        "payload",
+                    ]
+                    .contains(&key.as_str())
+                }),
+            "TOON record contains non-frame fields: {raw}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "TOON record contains non-frame fields")]
+    fn toon_stream_root_guard_rejects_appended_ordinary_envelope() {
+        // The old writer appended an ordinary envelope inside the terminal's
+        // RS record. Typed decoding accepts the merged object and drops the
+        // extra root fields, so inspect the raw object before that projection.
+        let record = r#"v: 1
+schema_version: fsfs.stream.query.v1
+stream_id: stream-envelope-negative
+seq: 1
+ts: "2026-10-28T01:26:27Z"
+command: search
+event: terminal
+payload:
+  status: failed
+  exit_code: 78
+  failure_category: model
+  error:
+    code: embedder_unavailable
+    message: No semantic models available
+    exit_code: 78
+  retry:
+    policy: none
+v: 1
+ts: "2026-10-28T01:26:27Z"
+ok: false
+error:
+  code: embedder_unavailable
+  message: No semantic models available
+  exit_code: 78
+meta:
+  command: search
+  format: toon
+"#;
+        let frame: frankensearch_fsfs::stream_protocol::StreamFrame<Value> =
+            frankensearch_fsfs::stream_protocol::decode_stream_frame_toon(record)
+                .expect("typed decoder accepts the appended ordinary envelope");
+        assert!(frankensearch_fsfs::stream_protocol::validate_stream_frame(&frame).valid);
+        let raw: Value = toon_format::decode_default(record).expect("decode planted TOON record");
+        assert_toon_stream_frame_root_fields(&raw);
+    }
+
     #[cfg(feature = "semantic-loaders")]
     #[test]
     fn missing_models_stream_has_one_final_terminal_in_jsonl_and_toon() {
@@ -3913,6 +3977,9 @@ mod loader_only {
                     .split('\u{1e}')
                     .skip(1)
                     .map(|record| {
+                        let raw: Value = toon_format::decode_default(record.trim())
+                            .expect("every TOON record is a complete object");
+                        assert_toon_stream_frame_root_fields(&raw);
                         let frame: frankensearch_fsfs::stream_protocol::StreamFrame<Value> =
                             frankensearch_fsfs::stream_protocol::decode_stream_frame_toon(
                                 record.trim(),

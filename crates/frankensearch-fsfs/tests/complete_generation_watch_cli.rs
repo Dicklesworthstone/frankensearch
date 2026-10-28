@@ -30,6 +30,27 @@ fn complete_stream_frames(output: &Output, format: &str) -> Vec<Value> {
             text.split('\u{001e}')
                 .skip(1)
                 .map(|record| {
+                    let raw: Value = toon_format::decode_default(record.trim())
+                        .expect("every TOON record is a complete object");
+                    assert!(
+                        raw.as_object()
+                            .expect("TOON stream frame object")
+                            .keys()
+                            .all(|key| {
+                                [
+                                    "v",
+                                    "schema_version",
+                                    "stream_id",
+                                    "seq",
+                                    "ts",
+                                    "command",
+                                    "event",
+                                    "payload",
+                                ]
+                                .contains(&key.as_str())
+                            }),
+                        "TOON record contains non-frame fields: {raw}"
+                    );
                     decode_stream_frame_toon(record.trim())
                         .expect("every TOON record is a stream frame")
                 })
