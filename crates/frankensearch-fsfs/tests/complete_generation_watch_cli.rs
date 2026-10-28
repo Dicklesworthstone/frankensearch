@@ -16,6 +16,36 @@ struct Fixture {
     config: PathBuf,
 }
 
+#[cfg(feature = "semantic-support")]
+fn complete_stream_frames(output: &Output, format: &str) -> Vec<Value> {
+    use frankensearch_fsfs::stream_protocol::{StreamFrame, decode_stream_frame_toon};
+    let text = std::str::from_utf8(&output.stdout).expect("UTF-8 stream");
+    let frames: Vec<StreamFrame<frankensearch_fsfs::output_schema::SearchHitPayload>> =
+        if format == "jsonl" {
+            text.lines()
+                .map(|line| serde_json::from_str(line).expect("every line is a stream frame"))
+                .collect()
+        } else {
+            assert!(text.starts_with('\u{001e}'), "TOON record separator");
+            text.split('\u{001e}')
+                .skip(1)
+                .map(|record| {
+                    decode_stream_frame_toon(record.trim())
+                        .expect("every TOON record is a stream frame")
+                })
+                .collect()
+        };
+    for (sequence, frame) in frames.iter().enumerate() {
+        assert!(frankensearch_fsfs::stream_protocol::validate_stream_frame(frame).valid);
+        assert_eq!(frame.seq, u64::try_from(sequence).unwrap());
+        assert_eq!(frame.stream_id, frames[0].stream_id);
+    }
+    frames
+        .into_iter()
+        .map(|frame| serde_json::to_value(frame).unwrap())
+        .collect()
+}
+
 impl Fixture {
     fn new(models: Option<&Path>) -> Self {
         let directory = tempfile::tempdir().unwrap();
@@ -443,47 +473,40 @@ fn complete_daemon_binary_serves_and_stops_with_corrupt_selection() {
             .ends_with("alpha.md")
     );
 
-    let streamed = Process::start(fixture.command("search", "jsonl").args([
-        "sharedtoken",
-        "--daemon",
-        "--stream",
-        "--limit",
-        "1",
-    ]))
-    .finish(Duration::from_secs(60));
-    assert!(
-        streamed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&streamed.stderr)
-    );
-    let frames: Vec<Value> = streamed
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let frame: Value = serde_json::from_slice(line).unwrap();
-            let _: frankensearch_fsfs::stream_protocol::StreamFrame<
-                frankensearch_fsfs::output_schema::SearchHitPayload,
-            > = serde_json::from_value(frame.clone()).unwrap();
-            frame
-        })
-        .collect();
-    assert_eq!(frames.first().unwrap()["event"], "started");
-    assert_eq!(frames.last().unwrap()["payload"]["status"], "completed");
-    assert_eq!(
-        frames
-            .iter()
-            .filter(|frame| frame["event"] == "result")
-            .count(),
-        1
-    );
-    assert_eq!(
-        frames
-            .iter()
-            .filter(|frame| frame["event"] == "terminal")
-            .count(),
-        1
-    );
+    for format in ["jsonl", "toon"] {
+        for transport in ["--no-daemon", "--daemon"] {
+            let streamed = Process::start(fixture.command("search", format).args([
+                "sharedtoken",
+                transport,
+                "--stream",
+                "--limit",
+                "1",
+            ]))
+            .finish(Duration::from_secs(60));
+            assert!(
+                streamed.status.success(),
+                "{}",
+                String::from_utf8_lossy(&streamed.stderr)
+            );
+            let frames = complete_stream_frames(&streamed, format);
+            assert_eq!(frames.first().unwrap()["event"], "started");
+            assert_eq!(frames.last().unwrap()["payload"]["status"], "completed");
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame["event"] == "result")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame["event"] == "terminal")
+                    .count(),
+                1
+            );
+        }
+    }
 
     // Stop dispatch must not first admit the selected generation or its models.
     let pointer = fixture
@@ -501,6 +524,31 @@ fn complete_daemon_binary_serves_and_stops_with_corrupt_selection() {
         fs::read(&pointer).unwrap(),
         b"corrupt selection for stop dispatch"
     );
+    for format in ["jsonl", "toon"] {
+        for transport in ["--no-daemon", "--daemon"] {
+            let refused = Process::start(fixture.command("search", format).args([
+                "sharedtoken",
+                transport,
+                "--stream",
+            ]))
+            .finish(Duration::from_secs(30));
+            assert!(!refused.status.success());
+            let frames = complete_stream_frames(&refused, format);
+            assert_eq!(frames.len(), 2, "one Started and final failure: {frames:?}");
+            assert_eq!(frames[0]["event"], "started");
+            assert_ne!(frames[0]["payload"]["semantic_admitted"], true);
+            assert_eq!(frames[1]["event"], "terminal");
+            assert_eq!(frames[1]["payload"]["status"], "failed");
+            assert_eq!(
+                frames[1]["payload"]["exit_code"],
+                refused.status.code().unwrap()
+            );
+            assert_eq!(
+                fs::read(&pointer).unwrap(),
+                b"corrupt selection for stop dispatch"
+            );
+        }
+    }
     daemon.assert_alive();
     let stopped = Process::start(fixture.command("daemon", "json").arg("--stop"))
         .finish(Duration::from_secs(10));

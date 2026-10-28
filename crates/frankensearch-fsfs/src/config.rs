@@ -852,6 +852,7 @@ impl Default for DiscoveryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Independent configuration switches, not state variants.
 pub struct IndexingConfig {
     pub fast_model: String,
     /// Quality model selection. Native-only builds default to verified English
@@ -863,6 +864,10 @@ pub struct IndexingConfig {
     /// implicit background release check while offline.
     #[serde(default)]
     pub offline: bool,
+    /// Permit executable changes only through the existing exact indexing-contract
+    /// reuse admission. Source, producer and artifact checks remain mandatory.
+    #[serde(default)]
+    pub allow_contract_upgrade_reuse: bool,
     pub embedding_batch_size: usize,
     /// Maximum fast-tier passages per source: overlapping windows cover up to
     /// this many 2,000-character spans of each file. One embeds only the
@@ -888,6 +893,7 @@ impl Default for IndexingConfig {
             .into(),
             model_dir: "~/.local/share/frankensearch/models".into(),
             offline: false,
+            allow_contract_upgrade_reuse: false,
             embedding_batch_size: 64,
             fast_window_max_per_file: default_fast_window_max_per_file(),
             reindex_on_change: true,
@@ -917,6 +923,9 @@ pub struct SearchConfig {
     /// work remains owned until completion; shutdown can outlast this budget.
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
+    /// Apply bounded path/module priors to code-navigation queries. Neutral by default.
+    #[serde(default)]
+    pub ranking_priors: bool,
     pub explain: bool,
     /// Opt in to the cross-encoder rerank stage over the REFINED head
     /// (`--rerank`). Needs the verified `ms-marco-minilm-l-6-v2` model in the
@@ -947,6 +956,7 @@ impl Default for SearchConfig {
             rrf_k: 60.0,
             quality_timeout_ms: 500,
             fast_only: false,
+            ranking_priors: false,
             explain: false,
             rerank: false,
             rerank_timeout_ms: DEFAULT_RERANK_TIMEOUT_MS,
@@ -1117,6 +1127,7 @@ struct IndexingConfigPatch {
     quality_model: Option<String>,
     model_dir: Option<String>,
     offline: Option<bool>,
+    allow_contract_upgrade_reuse: Option<bool>,
     embedding_batch_size: Option<usize>,
     fast_window_max_per_file: Option<usize>,
     reindex_on_change: Option<bool>,
@@ -1130,6 +1141,7 @@ struct SearchConfigPatch {
     rrf_k: Option<f64>,
     quality_timeout_ms: Option<u64>,
     fast_only: Option<bool>,
+    ranking_priors: Option<bool>,
     explain: Option<bool>,
     rerank: Option<bool>,
     rerank_timeout_ms: Option<u64>,
@@ -1266,12 +1278,15 @@ pub struct ContractDiscoveryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // Mirrors independent indexing switches in the public contract.
 pub struct ContractIndexingConfig {
     pub fast_model: String,
     pub quality_model: String,
     pub model_dir: String,
     #[serde(default)]
     pub offline: bool,
+    #[serde(default)]
+    pub allow_contract_upgrade_reuse: bool,
     pub embedding_batch_size: usize,
     #[serde(default = "default_fast_window_max_per_file")]
     pub fast_window_max_per_file: usize,
@@ -1319,6 +1334,8 @@ pub struct ContractSearchConfig {
     pub rrf_k: f64,
     pub quality_timeout_ms: u64,
     pub fast_only: bool,
+    #[serde(default)]
+    pub ranking_priors: bool,
     pub explain: bool,
     // The shadow-oracle keys arrived after v1 shipped. They default so that a
     // legacy v1 document that predates them stays readable and means exactly
@@ -1394,6 +1411,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                 quality_model: config.indexing.quality_model.clone(),
                 model_dir: config.indexing.model_dir.clone(),
                 offline: config.indexing.offline,
+                allow_contract_upgrade_reuse: config.indexing.allow_contract_upgrade_reuse,
                 embedding_batch_size: config.indexing.embedding_batch_size,
                 fast_window_max_per_file: config.indexing.fast_window_max_per_file,
                 reindex_on_change: config.indexing.reindex_on_change,
@@ -1410,6 +1428,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                     rrf_k,
                     quality_timeout_ms,
                     fast_only,
+                    ranking_priors,
                     explain,
                     rerank,
                     rerank_timeout_ms,
@@ -1424,6 +1443,7 @@ impl From<&FsfsConfig> for ConfigContractValues {
                     rrf_k,
                     quality_timeout_ms,
                     fast_only,
+                    ranking_priors,
                     explain,
                     shadow_mode,
                     shadow_sample_rate_basis_points,
@@ -1553,7 +1573,9 @@ pub struct CliOverrides {
     pub exclude_patterns: Option<Vec<String>>,
     pub limit: Option<usize>,
     pub fast_only: Option<bool>,
+    pub ranking_priors: Option<bool>,
     pub offline: Option<bool>,
+    pub allow_contract_upgrade_reuse: Option<bool>,
     pub allow_background_indexing: Option<bool>,
     pub explain: Option<bool>,
     pub rerank: Option<bool>,
@@ -1581,8 +1603,28 @@ impl CliOverrides {
         if self.fast_only.is_some() {
             flags.push("--fast-only".into());
         }
+        if let Some(enabled) = self.ranking_priors {
+            flags.push(
+                if enabled {
+                    "--ranking-priors"
+                } else {
+                    "--no-ranking-priors"
+                }
+                .into(),
+            );
+        }
         if let Some(offline) = self.offline {
             flags.push(if offline { "--offline" } else { "--online" }.into());
+        }
+        if let Some(allow) = self.allow_contract_upgrade_reuse {
+            flags.push(
+                if allow {
+                    "--allow-contract-upgrade-reuse"
+                } else {
+                    "--no-contract-upgrade-reuse"
+                }
+                .into(),
+            );
         }
         if self.allow_background_indexing.is_some() {
             flags.push("--watch-mode".into());
@@ -2331,6 +2373,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(offline) = indexing.offline {
             config.indexing.offline = offline;
         }
+        if let Some(allow) = indexing.allow_contract_upgrade_reuse {
+            config.indexing.allow_contract_upgrade_reuse = allow;
+        }
         if let Some(embedding_batch_size) = indexing.embedding_batch_size {
             config.indexing.embedding_batch_size = embedding_batch_size;
         }
@@ -2361,6 +2406,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         }
         if let Some(quality_timeout_ms) = search.quality_timeout_ms {
             config.search.quality_timeout_ms = quality_timeout_ms;
+        }
+        if let Some(enabled) = search.ranking_priors {
+            config.search.ranking_priors = enabled;
         }
         if let Some(fast_only) = search.fast_only {
             config.search.fast_only = fast_only;
@@ -2559,6 +2607,21 @@ fn apply_env_overrides(
 
     if let Some((key, value)) = env_override(env, "FRANKENSEARCH_OFFLINE", "FSFS_OFFLINE") {
         config.indexing.offline = parse_bool(value, "indexing.offline")?;
+        keys_used.push(key.into());
+    }
+    if let Some((key, value)) =
+        env_override(env, "FRANKENSEARCH_RANKING_PRIORS", "FSFS_RANKING_PRIORS")
+    {
+        config.search.ranking_priors = parse_bool(value, "search.ranking_priors")?;
+        keys_used.push(key.into());
+    }
+    if let Some((key, value)) = env_override(
+        env,
+        "FRANKENSEARCH_ALLOW_CONTRACT_UPGRADE_REUSE",
+        "FSFS_ALLOW_CONTRACT_UPGRADE_REUSE",
+    ) {
+        config.indexing.allow_contract_upgrade_reuse =
+            parse_bool(value, "indexing.allow_contract_upgrade_reuse")?;
         keys_used.push(key.into());
     }
 
@@ -2819,9 +2882,15 @@ fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) -> ProfileSo
     if let Some(fast_only) = cli.fast_only {
         config.search.fast_only = fast_only;
     }
+    if let Some(enabled) = cli.ranking_priors {
+        config.search.ranking_priors = enabled;
+    }
 
     if let Some(offline) = cli.offline {
         config.indexing.offline = offline;
+    }
+    if let Some(allow) = cli.allow_contract_upgrade_reuse {
+        config.indexing.allow_contract_upgrade_reuse = allow;
     }
 
     if let Some(allow_background_indexing) = cli.allow_background_indexing {
@@ -2928,6 +2997,7 @@ fn collect_unknown_key_warnings(
                 "quality_model",
                 "model_dir",
                 "offline",
+                "allow_contract_upgrade_reuse",
                 "embedding_batch_size",
                 "fast_window_max_per_file",
                 "reindex_on_change",
@@ -2941,6 +3011,7 @@ fn collect_unknown_key_warnings(
                 "rrf_k",
                 "quality_timeout_ms",
                 "fast_only",
+                "ranking_priors",
                 "explain",
                 "rerank",
                 "rerank_timeout_ms",
@@ -3708,7 +3779,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        CliOverrides, DiscoveryCandidate, DiscoveryScopeDecision, IngestionClass,
+        CliOverrides, DiscoveryCandidate, DiscoveryScopeDecision, FsfsConfig, IngestionClass,
         PRESSURE_PROFILE_VERSION, PressureProfileField, ProfileOverrideSource,
         default_config_file_path, default_project_config_file_path, default_user_config_file_path,
         load_from_layered_sources, load_from_sources, load_from_str, parse_bool, parse_csv,
@@ -3804,6 +3875,125 @@ mod tests {
             result
                 .env_keys_used
                 .contains(&"FRANKENSEARCH_OFFLINE".to_string())
+        );
+    }
+
+    #[test]
+    fn contract_upgrade_policy_resolves_precedence_and_reaches_the_runtime() {
+        let field = "indexing.allow_contract_upgrade_reuse";
+        let file = "[indexing]\nallow_contract_upgrade_reuse = true\n";
+        let defaults = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .unwrap();
+        assert!(!crate::FsfsRuntime::new(defaults.config).contract_upgrade_reuse_enabled());
+        let from_file = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .unwrap();
+        assert!(crate::FsfsRuntime::new(from_file.config).contract_upgrade_reuse_enabled());
+        let env = HashMap::from([(
+            "FSFS_ALLOW_CONTRACT_UPGRADE_REUSE".to_owned(),
+            "false".to_owned(),
+        )]);
+        let from_env =
+            load_from_str(Some(file), None, &env, &CliOverrides::default(), home()).unwrap();
+        assert!(!crate::FsfsRuntime::new(from_env.config).contract_upgrade_reuse_enabled());
+        let cli = CliOverrides {
+            allow_contract_upgrade_reuse: Some(true),
+            ..CliOverrides::default()
+        };
+        let from_cli = load_from_str(Some(file), None, &env, &cli, home()).unwrap();
+        assert!(
+            from_cli
+                .cli_flags_used
+                .contains(&"--allow-contract-upgrade-reuse".to_owned())
+        );
+        assert!(
+            from_cli
+                .to_effective_snapshot()
+                .values
+                .indexing
+                .allow_contract_upgrade_reuse
+        );
+        let runtime = crate::FsfsRuntime::new(from_cli.config);
+        assert!(runtime.clone().contract_upgrade_reuse_enabled());
+        assert!(
+            !runtime
+                .with_contract_upgrade_reuse(false)
+                .contract_upgrade_reuse_enabled()
+        );
+        let invalid = HashMap::from([(
+            "FSFS_ALLOW_CONTRACT_UPGRADE_REUSE".to_owned(),
+            "maybe".to_owned(),
+        )]);
+        assert!(
+            matches!(load_from_str(None, None, &invalid, &CliOverrides::default(), home()),
+            Err(SearchError::InvalidConfig { field: actual, .. }) if actual == field)
+        );
+        assert!(
+            load_from_str(
+                Some("[indexing]\nallow_contract_upgrade_reuse = 'yes'\n"),
+                None,
+                &HashMap::new(),
+                &CliOverrides::default(),
+                home()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ranking_prior_policy_resolves_explicit_false_and_rejects_invalid_values() {
+        let file = "[search]\nranking_priors = true\n";
+        let env = HashMap::from([("FSFS_RANKING_PRIORS".to_owned(), "false".to_owned())]);
+        let from_file = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .unwrap();
+        assert!(crate::FsfsRuntime::new(from_file.config).ranking_priors_enabled());
+        let from_env =
+            load_from_str(Some(file), None, &env, &CliOverrides::default(), home()).unwrap();
+        assert!(!crate::FsfsRuntime::new(from_env.config).ranking_priors_enabled());
+        let cli = CliOverrides {
+            ranking_priors: Some(true),
+            ..CliOverrides::default()
+        };
+        let from_cli = load_from_str(Some(file), None, &env, &cli, home()).unwrap();
+        assert!(
+            from_cli
+                .to_effective_snapshot()
+                .values
+                .search
+                .ranking_priors
+        );
+        assert!(crate::FsfsRuntime::new(from_cli.config).ranking_priors_enabled());
+        let invalid = HashMap::from([("FSFS_RANKING_PRIORS".to_owned(), "maybe".to_owned())]);
+        assert!(
+            matches!(load_from_str(None, None, &invalid, &CliOverrides::default(), home()),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "search.ranking_priors")
+        );
+        assert!(
+            load_from_str(
+                Some("[search]\nranking_priors = 'yes'\n"),
+                None,
+                &HashMap::new(),
+                &CliOverrides::default(),
+                home()
+            )
+            .is_err()
         );
     }
 
@@ -5938,7 +6128,9 @@ mod tests {
             exclude_patterns: Some(vec!["target".into()]),
             limit: Some(20),
             fast_only: Some(true),
+            ranking_priors: Some(true),
             offline: Some(true),
+            allow_contract_upgrade_reuse: Some(false),
             allow_background_indexing: Some(false),
             explain: Some(true),
             rerank: Some(true),
@@ -5950,7 +6142,9 @@ mod tests {
             config_path: Some(Path::new("/tmp/config.toml").to_path_buf()),
         };
         let flags = cli.used_flags();
-        assert_eq!(flags.len(), 14);
+        assert_eq!(flags.len(), 16);
+        assert!(flags.contains(&"--ranking-priors".to_string()));
+        assert!(flags.contains(&"--no-contract-upgrade-reuse".to_string()));
         assert!(flags.contains(&"--rerank".to_string()));
         assert!(flags.contains(&"--roots".to_string()));
         assert!(flags.contains(&"--exclude".to_string()));

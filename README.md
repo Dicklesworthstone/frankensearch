@@ -421,8 +421,14 @@ retries are exhausted, `semantic_deferred_files` and a warning explain why the
 published artifacts still need indexing resumed before semantic search.
 
 Completed ordinary index runs retain evidence for reusing their work on later
-runs. Reuse requires matching executable, configuration, producer identities
-and artifact bytes. A file whose device, inode, length and modification and
+runs. Reuse normally requires matching executable, configuration, producer identities
+and artifact bytes. `fsfs index <dir> --allow-contract-upgrade-reuse` explicitly
+permits a different executable when its versioned indexing contract also matches.
+The same opt-in is available as `[indexing] allow_contract_upgrade_reuse = true`
+or `FRANKENSEARCH_ALLOW_CONTRACT_UPGRADE_REUSE=true`; disable it with
+`--no-contract-upgrade-reuse`. Source, producer, topology and artifact checks
+still apply, and old receipts without the contract cannot use this path.
+A file whose device, inode, length and modification and
 change times still match the stamp recorded when it was read is reused without
 being opened (a stamp is recorded only once its change time is older than the
 filesystem's timestamp tick, as git does); a file whose stamp moved is reused
@@ -717,6 +723,15 @@ back to another tier. It conflicts with `--fast-only` or a resolved
 quality, with a pressure profile that permits it. Lite builds and forced
 lexical-only pressure mode refuse quality-only requests. Raw `fsfs serve`
 requests select it with `"mode":"quality_only"` (or `"quality"`).
+
+`fsfs search --ranking-priors "identifier"` opts into bounded path/module
+signals for identifier and short keyword queries. The equivalent config is
+`[search] ranking_priors = true`, or `FRANKENSEARCH_RANKING_PRIORS=true`;
+`--no-ranking-priors` explicitly restores neutral ranking. Natural-language
+queries and degraded retrieval keep neutral priors. The policy travels with
+daemon requests and separates result-cache entries. `--explain` reports an
+applied `fusion.prior_boost` before optional reranking. The default stays off;
+this opt-in does not establish a general relevance improvement.
 
 Common environment variables:
 

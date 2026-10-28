@@ -164,6 +164,8 @@ pub struct RankMovementRow {
 pub struct FusionRow {
     /// Fused score.
     pub fused_score: f64,
+    /// Additive code-navigation contribution at fusion, before reranking.
+    pub prior_boost: Option<f64>,
     /// Lexical rank (if present).
     pub lexical_rank: Option<usize>,
     /// Semantic rank (if present).
@@ -538,6 +540,7 @@ fn build_fusion_row(fusion: &FusionContext) -> FusionRow {
 
     FusionRow {
         fused_score: fusion.fused_score,
+        prior_boost: fusion.prior_boost,
         lexical_rank: fusion.lexical_rank,
         semantic_rank: fusion.semantic_rank,
         hash_rank: fusion.hash_rank,
@@ -620,6 +623,7 @@ mod tests {
             }),
             fusion: Some(FusionContext {
                 fused_score: 0.0234,
+                prior_boost: None,
                 lexical_rank: Some(3),
                 semantic_rank: Some(7),
                 hash_rank: None,
@@ -856,6 +860,7 @@ mod tests {
     fn fusion_row_both_sources() {
         let fusion = FusionContext {
             fused_score: 0.03,
+            prior_boost: None,
             lexical_rank: Some(3),
             semantic_rank: Some(7),
             hash_rank: None,
@@ -875,6 +880,7 @@ mod tests {
     fn fusion_row_lexical_only() {
         let fusion = FusionContext {
             fused_score: 0.02,
+            prior_boost: None,
             lexical_rank: Some(5),
             semantic_rank: None,
             hash_rank: None,
@@ -893,6 +899,7 @@ mod tests {
     fn fusion_row_semantic_only() {
         let fusion = FusionContext {
             fused_score: 0.01,
+            prior_boost: None,
             lexical_rank: None,
             semantic_rank: Some(10),
             hash_rank: None,
@@ -911,6 +918,7 @@ mod tests {
     fn fusion_row_hash_control_is_not_semantic() {
         let mut hash_only = FusionContext {
             fused_score: 0.01,
+            prior_boost: None,
             lexical_rank: None,
             semantic_rank: Some(10),
             hash_rank: None,
@@ -931,6 +939,7 @@ mod tests {
 
         let mut both = FusionContext {
             fused_score: 0.03,
+            prior_boost: None,
             lexical_rank: Some(3),
             semantic_rank: Some(7),
             hash_rank: None,

@@ -49,7 +49,8 @@ use crate::{CliCommand, FsfsConfig, OutputFormat};
 // 13: shared buffered/progressive cache and configured search delivery budgets.
 // 14: checked registered model selection; no implicit quality-producer substitution.
 // 15: explicit quality-only retrieval travels with each request.
-const VERSION: u32 = 15;
+// 16: explicit ranking-prior policy travels with every request and cache key.
+const VERSION: u32 = 16;
 static REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[path = "complete_daemon_forward_stream.rs"]
@@ -91,6 +92,7 @@ impl SearchRequest {
             quality_timeout_ms: None,
             rrf_k: None,
             fast_only: None,
+            ranking_priors: None,
         }
     }
 }
@@ -108,17 +110,19 @@ struct SearchPolicy {
     rrf_k: f64,
     quality_timeout_ms: u64,
     fast_only: bool,
+    ranking_priors: bool,
     rerank: bool,
     rerank_timeout_ms: u64,
 }
 
 impl SearchPolicy {
     /// The `[search]` keys this policy carries.
-    const KEYS: [&'static str; 6] = [
+    const KEYS: [&'static str; 7] = [
         "quality_weight",
         "rrf_k",
         "quality_timeout_ms",
         "fast_only",
+        "ranking_priors",
         "rerank",
         "rerank_timeout_ms",
     ];
@@ -129,6 +133,7 @@ impl SearchPolicy {
             rrf_k: config.search.rrf_k,
             quality_timeout_ms: config.search.quality_timeout_ms,
             fast_only: config.search.fast_only,
+            ranking_priors: config.search.ranking_priors,
             rerank: config.search.rerank,
             rerank_timeout_ms: config.search.rerank_timeout_ms,
         }
@@ -150,11 +155,13 @@ impl SearchPolicy {
         search.rrf_k = self.rrf_k;
         search.quality_timeout_ms = self.quality_timeout_ms;
         search.fast_only = self.fast_only;
+        search.ranking_priors = self.ranking_priors;
         search.rerank = self.rerank;
         search.rerank_timeout_ms = self.rerank_timeout_ms;
         crate::config::validate_search_policy(&search)?;
         runtime.config.search = search;
         runtime.cli_input.overrides.fast_only = Some(self.fast_only);
+        runtime.cli_input.overrides.ranking_priors = Some(self.ranking_priors);
         runtime.cli_input.overrides.rerank = Some(self.rerank);
         Ok(())
     }
@@ -915,6 +922,7 @@ mod tests {
         let mut second = first.clone();
         second.search.default_limit = 123;
         second.search.fast_only = !first.search.fast_only;
+        second.search.ranking_priors = !first.search.ranking_priors;
         second.search.rerank = !first.search.rerank;
         second.search.quality_weight = 0.25;
         second.search.rrf_k = 17.0;
@@ -942,12 +950,15 @@ mod tests {
         policy.quality_weight = 0.25;
         policy.rrf_k = 17.0;
         policy.fast_only = true;
+        policy.ranking_priors = true;
         policy.rerank = true;
         policy.quality_timeout_ms = 2_000;
         policy.rerank_timeout_ms = 10_000;
         policy.apply_to(&mut runtime).unwrap();
         assert_eq!(SearchPolicy::of(&runtime.config), policy);
         assert_eq!(runtime.cli_input.overrides.fast_only, Some(true));
+        assert_eq!(runtime.cli_input.overrides.ranking_priors, Some(true));
+        assert!(runtime.ranking_priors_enabled());
         assert_eq!(runtime.cli_input.overrides.rerank, Some(true));
         // Delivery includes both requested stages instead of inheriting the
         // five-second framing timeout. Disabled reranking contributes no wait.

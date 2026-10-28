@@ -94,7 +94,34 @@ pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
     config.search.quality_timeout_ms = defaults.quality_timeout_ms;
     config.search.rerank_timeout_ms = defaults.rerank_timeout_ms;
 
-    let bytes = serde_json::to_vec(&config).map_err(|source| SearchError::SubsystemError {
+    let mut value =
+        serde_json::to_value(&config).map_err(|source| SearchError::SubsystemError {
+            subsystem: "fsfs.complete_generation.reuse_config",
+            source: Box::new(source),
+        })?;
+    // Admission policy does not shape any indexed byte. Omit the new key
+    // entirely so receipts minted before this switch retain their exact digest;
+    // serializing a default `false` here would invalidate those receipts too.
+    value
+        .get_mut("indexing")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "indexing".to_owned(),
+            value: "serialized configuration".to_owned(),
+            reason: "the serialized indexing configuration must be an object".to_owned(),
+        })?
+        .shift_remove("allow_contract_upgrade_reuse");
+    // Query-time ranking policy also leaves persisted source/vector/lexical bytes unchanged.
+    value
+        .get_mut("search")
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "search".to_owned(),
+            value: "serialized configuration".to_owned(),
+            reason: "the serialized search configuration must be an object".to_owned(),
+        })?
+        .shift_remove("ranking_priors");
+    let bytes = serde_json::to_vec(&value).map_err(|source| SearchError::SubsystemError {
         subsystem: "fsfs.complete_generation.reuse_config",
         source: Box::new(source),
     })?;
@@ -112,7 +139,41 @@ mod tests {
     fn previous_digest(config: &FsfsConfig) -> String {
         let mut config = config.clone();
         config.indexing.watch_mode = false;
-        content_sha256_hex(&serde_json::to_vec(&config).unwrap())
+        // The old configuration type had neither key. Retain its original
+        // struct field order independently of the production removal method;
+        // swap-removing a key would silently change historical receipt bytes.
+        let mut value = serde_json::to_value(&config).unwrap();
+        value["indexing"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| key != "allow_contract_upgrade_reuse");
+        value["search"]
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| key != "ranking_priors");
+        content_sha256_hex(&serde_json::to_vec(&value).unwrap())
+    }
+
+    #[test]
+    fn upgrade_admission_switch_does_not_change_persisted_index_contract() {
+        let config = FsfsConfig::default();
+        let mut opted_in = config.clone();
+        opted_in.indexing.allow_contract_upgrade_reuse = true;
+        opted_in.search.ranking_priors = true;
+        assert_ne!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::to_value(&opted_in).unwrap()
+        );
+        assert_eq!(digest(&config).unwrap(), digest(&opted_in).unwrap());
+        assert_eq!(
+            contract_digest(&config).unwrap(),
+            contract_digest(&opted_in).unwrap()
+        );
+        opted_in.indexing.fast_window_max_per_file += 1;
+        assert_ne!(
+            contract_digest(&config).unwrap(),
+            contract_digest(&opted_in).unwrap()
+        );
     }
 
     #[test]

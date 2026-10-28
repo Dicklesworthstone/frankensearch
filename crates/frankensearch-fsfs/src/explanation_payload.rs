@@ -113,6 +113,17 @@ impl FsfsExplanationPayload {
             ));
         }
 
+        if let Some(boost) = self
+            .ranking
+            .fusion
+            .as_ref()
+            .and_then(|fusion| fusion.prior_boost)
+        {
+            lines.push(format!(
+                "  fusion_prior_boost: {boost:.6} (before reranking)"
+            ));
+        }
+
         for decision in &self.policy_decisions {
             lines.push(format!(
                 "  policy: domain={} decision={} reason={} confidence_per_mille={} summary={}",
@@ -272,6 +283,10 @@ impl From<&RankMovement> for RankMovementSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FusionContext {
     pub fused_score: f64,
+    /// Actual additive code-navigation boost at fusion, before optional reranking.
+    /// Omission means zero; no extra source work is performed for this evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_boost: Option<f64>,
     pub lexical_rank: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub semantic_rank: Option<usize>,
@@ -327,6 +342,8 @@ impl From<&FusedCandidate> for FusionContext {
     fn from(value: &FusedCandidate) -> Self {
         Self {
             fused_score: value.fused_score,
+            prior_boost: (value.prior_boost > 0.0 && value.prior_boost.is_finite())
+                .then_some(value.prior_boost),
             lexical_rank: value.lexical_rank,
             semantic_rank: value.semantic_rank,
             hash_rank: value.hash_rank,
@@ -707,7 +724,7 @@ mod tests {
     use crate::config::{DiscoveryDecision, DiscoveryScopeDecision, IngestionClass};
     use crate::query_execution::{
         CancellationAction, DegradationOverride, DegradationStatus, DegradationTransition,
-        DegradedRetrievalMode, QueryExecutionPlan, RetrievalStage, StagePlan,
+        DegradedRetrievalMode, FusedCandidate, QueryExecutionPlan, RetrievalStage, StagePlan,
     };
     use crate::query_planning::{
         QueryBudgetProfile, QueryFallbackPath, QueryIntentClass, QueryIntentDecision,
@@ -1132,6 +1149,7 @@ mod tests {
     fn fusion_context_hash_remap_omits_semantic_rank() {
         let mut fusion = FusionContext {
             fused_score: 0.01,
+            prior_boost: None,
             lexical_rank: None,
             semantic_rank: Some(2),
             hash_rank: None,
@@ -1155,6 +1173,31 @@ mod tests {
         assert!(
             json.contains("hash_score") && !json.contains("semantic_score"),
             "hash fusion must not use the semantic_score key: {json}"
+        );
+    }
+
+    #[test]
+    fn fusion_context_reports_only_the_actual_positive_prior_contribution() {
+        let mut candidate = FusedCandidate {
+            doc_id: "src/query_execution.rs".to_owned(),
+            fused_score: 0.04,
+            prior_boost: 0.007,
+            lexical_rank: Some(1),
+            semantic_rank: Some(0),
+            hash_rank: None,
+            lexical_score: Some(2.0),
+            semantic_score: Some(0.8),
+            hash_score: None,
+            in_both_sources: true,
+        };
+        let fusion = FusionContext::from(&candidate);
+        assert_eq!(serde_json::to_value(&fusion).unwrap()["prior_boost"], 0.007);
+        candidate.prior_boost = 0.0;
+        assert!(
+            serde_json::to_value(FusionContext::from(&candidate))
+                .unwrap()
+                .get("prior_boost")
+                .is_none()
         );
     }
 

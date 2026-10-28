@@ -62,6 +62,14 @@ Path expansion rule:
 - `model_dir: string`
 - `offline: bool` (default `false`; `--offline` forbids model acquisition,
   including a forced refresh. `--online` explicitly permits acquisition.)
+- `allow_contract_upgrade_reuse: bool` (default `false`; opt in with
+  `--allow-contract-upgrade-reuse`, `FRANKENSEARCH_ALLOW_CONTRACT_UPGRADE_REUSE=true`,
+  or this config key. `--no-contract-upgrade-reuse` explicitly disables it.)
+  This permits a different executable only when the existing versioned indexing
+  contract, producer identities, complete source and artifact admission all match.
+  Missing or incompatible receipts still rebuild. The admission switch itself
+  does not change the semantic indexing fingerprint. It does not permit model
+  migration or bypass an artifact check.
 - `embedding_batch_size: int` (`1..4096`, default `64`; bounds document batches in
   one-shot indexing and the watch vector pipeline. Smaller batches reduce working
   memory and the time between batch checkpoints; they do not reduce model size.)
@@ -135,7 +143,14 @@ and model diagnostics remain available.
 - `rrf_k: number` (`>=1.0`)
 - `quality_timeout_ms: int` (`>=50`)
 - `fast_only: bool`
-- `explain: bool` (`--explain`/`-e`: JSON, JSONL and TOON output carry `explanations`, the ranking `fsfs explain R<n>` prints, per returned hit path; the table prints each hit's explanation after the results; refused with `--stream`, `--compact`, `--format csv` and complete-generation stores)
+- `ranking_priors: bool` (default `false`; `--ranking-priors` /
+  `FRANKENSEARCH_RANKING_PRIORS=true`; `--no-ranking-priors` explicitly disables).
+  Uses the existing bounded path/module policy for identifier and short-keyword
+  queries in normal retrieval only. Natural-language and degraded retrieval stay
+  neutral. The effective value is carried and acknowledged per daemon request
+  and separates result-cache entries, while leaving the indexing contract intact.
+  Explanations expose a positive `fusion.prior_boost` before optional reranking.
+- `explain: bool` (`--explain`/`-e`: JSON, JSONL and TOON output carry `explanations`, the ranking `fsfs explain R<n>` prints, per returned hit path; the table prints each hit's explanation after the results; refused with `--stream`, `--compact` and `--format csv`)
 - `rerank: bool` (default `false`; `--rerank` / `FRANKENSEARCH_RERANK`. Re-scores the REFINED head with the `ms-marco-minilm-l-6-v2` cross-encoder when that model is verified in the cache; otherwise the search payload's `rerank` block reports `query.stage.rerank.disabled.unavailable` and the fused order stands)
 - `rerank_timeout_ms: int` (`50..120000`, default `300`; `FRANKENSEARCH_RERANK_TIMEOUT_MS`). Deadline for the rerank stage; when it expires the payload reports `query.stage.rerank.timeout` and the fused order stands. The head is up to 30 documents, so abstract-length documents need seconds; the 300 ms default only fits short documents.
 

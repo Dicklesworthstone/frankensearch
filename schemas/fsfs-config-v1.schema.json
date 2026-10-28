@@ -123,6 +123,10 @@
             "offline": {
               "type": "boolean"
             },
+            "allow_contract_upgrade_reuse": {
+              "type": "boolean",
+              "default": false
+            },
             "embedding_batch_size": {
               "type": "integer",
               "minimum": 1,
@@ -168,6 +172,10 @@
             },
             "fast_only": {
               "type": "boolean"
+            },
+            "ranking_priors": {
+              "type": "boolean",
+              "default": false
             },
             "explain": {
               "type": "boolean"

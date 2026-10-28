@@ -473,6 +473,14 @@ where
                 input.overrides.fast_only = Some(false);
                 idx += 1;
             }
+            "--ranking-priors" => {
+                input.overrides.ranking_priors = Some(true);
+                idx += 1;
+            }
+            "--no-ranking-priors" => {
+                input.overrides.ranking_priors = Some(false);
+                idx += 1;
+            }
             "--quality-only" => {
                 if command != CliCommand::Search {
                     return Err(SearchError::InvalidConfig {
@@ -498,6 +506,14 @@ where
             }
             "--online" => {
                 input.overrides.offline = Some(false);
+                idx += 1;
+            }
+            "--allow-contract-upgrade-reuse" => {
+                input.overrides.allow_contract_upgrade_reuse = Some(true);
+                idx += 1;
+            }
+            "--no-contract-upgrade-reuse" => {
+                input.overrides.allow_contract_upgrade_reuse = Some(false);
                 idx += 1;
             }
             "--watch-mode" => {
@@ -1134,11 +1150,15 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "-f"
             | "--fast-only"
             | "--no-fast-only"
+            | "--ranking-priors"
+            | "--no-ranking-priors"
             | "--quality-only"
             | "--rerank"
             | "--no-rerank"
             | "--offline"
             | "--online"
+            | "--allow-contract-upgrade-reuse"
+            | "--no-contract-upgrade-reuse"
             | "--watch-mode"
             | "--no-watch-mode"
             | "--explain"
@@ -1325,6 +1345,48 @@ mod tests {
 
         let online = parse_cli_args(["search", "query", "--offline", "--online"]).expect("online");
         assert_eq!(online.overrides.offline, Some(false));
+    }
+
+    #[test]
+    fn upgrade_reuse_flags_are_explicit_and_last_writer_wins() {
+        let enabled = parse_cli_args(["index", ".", "--allow-contract-upgrade-reuse"]).unwrap();
+        assert_eq!(enabled.overrides.allow_contract_upgrade_reuse, Some(true));
+        let disabled = parse_cli_args([
+            "index",
+            ".",
+            "--allow-contract-upgrade-reuse",
+            "--no-contract-upgrade-reuse",
+        ])
+        .unwrap();
+        assert_eq!(disabled.overrides.allow_contract_upgrade_reuse, Some(false));
+        assert_eq!(
+            parse_cli_args(["index", "."])
+                .unwrap()
+                .overrides
+                .allow_contract_upgrade_reuse,
+            None
+        );
+    }
+
+    #[test]
+    fn ranking_prior_flags_are_explicit_and_last_writer_wins() {
+        let enabled = parse_cli_args(["search", "identifier", "--ranking-priors"]).unwrap();
+        assert_eq!(enabled.overrides.ranking_priors, Some(true));
+        let disabled = parse_cli_args([
+            "search",
+            "identifier",
+            "--ranking-priors",
+            "--no-ranking-priors",
+        ])
+        .unwrap();
+        assert_eq!(disabled.overrides.ranking_priors, Some(false));
+        assert_eq!(
+            parse_cli_args(["search", "identifier"])
+                .unwrap()
+                .overrides
+                .ranking_priors,
+            None
+        );
     }
 
     #[test]

@@ -618,7 +618,8 @@ const FSFS_TUI_INTERACTIVE_RESULT_LIMIT: usize = 500;
 // v17: snippets mask credential tokens and private-key material.
 // v18: cached answers bind the selected fast model and every registered producer.
 // v19: checked canonical quality selection; disabled tiers have no producer.
-const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v19";
+// v20: explicit ranking-prior policy separates cached result orders.
+const FSFS_SEARCH_CACHE_SCHEMA_VERSION: &str = "fsfs.search.cache.v20";
 const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // A retained older daemon must not attest results from the previous ranking
 // policy even when its generation and configured search options still match.
@@ -634,8 +635,9 @@ const FSFS_SEARCH_CACHE_DIR_NAME: &str = "query_cache";
 // v14 / stream v12: attest the selected fast model before any cached phase.
 // v15 / stream v13: attest the checked, actually selected quality producer.
 // v16 / stream v14: require and attest the independent quality-only primary.
-const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v16";
-const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v14";
+// v17 / stream v15: carry and attest explicit code-navigation ranking priors.
+const FSFS_SEARCH_SERVE_SCHEMA_VERSION: &str = "fsfs.search.serve.v17";
+const FSFS_SEARCH_SERVE_STREAM_VERSION: &str = "fsfs.search.serve.stream.v15";
 #[cfg(unix)]
 const FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN: usize = 16;
 #[cfg(unix)]
@@ -697,6 +699,7 @@ fn spawn_verifying_executable(
     const ETXTBSY_RETRY_DELAY: Duration = Duration::from_millis(10);
     let mut attempt = 0usize;
     loop {
+        // ubs:ignore[rust.security.command-executable] -- Private callers pass current_exe after checked update/restore, or their own test executable; arguments stay separate from the executable.
         match Command::new(binary).args(args).output() {
             Err(error)
                 if error.kind() == ErrorKind::ExecutableFileBusy
@@ -1470,6 +1473,7 @@ struct SearchCacheKey {
     mode: String,
     filter: Option<String>,
     fast_only: bool,
+    ranking_priors: bool,
     rrf_k_bits: u64,
     /// Exact bits of the f32 policy consumed by the shared blend kernel.
     quality_weight_bits: u32,
@@ -1527,6 +1531,9 @@ struct SearchServeRequest {
     rrf_k: Option<f64>,
     #[serde(default)]
     fast_only: Option<bool>,
+    /// Omission preserves the server configuration; CLI forwarding always sends its policy.
+    #[serde(default)]
+    ranking_priors: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1539,6 +1546,7 @@ struct SearchServePolicy {
     rerank_timeout_ms: u64,
     rrf_k_bits: u64,
     fast_only: bool,
+    ranking_priors: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3128,6 +3136,8 @@ struct ExplainSessionHit {
     rank: usize,
     path: String,
     final_score: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prior_boost: Option<f64>,
     lexical_rank: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     semantic_rank: Option<usize>,
@@ -3216,6 +3226,8 @@ impl ExplainSession {
                 rank: idx.saturating_add(1),
                 path: candidate.doc_id.clone(),
                 final_score: sanitize_explain_score(candidate.fused_score),
+                prior_boost: (candidate.prior_boost > 0.0 && candidate.prior_boost.is_finite())
+                    .then_some(candidate.prior_boost),
                 lexical_rank: candidate.lexical_rank,
                 semantic_rank: candidate.semantic_rank,
                 hash_rank: candidate.hash_rank,
@@ -6504,14 +6516,6 @@ pub struct FsfsRuntime {
     /// sits beneath a hidden directory the walker skips, but a `.gitignore`
     /// whitelist can unhide that directory.
     discovery_excluded_root: Option<PathBuf>,
-    /// Whether zero-I/O code-navigation ranking priors (`code_structure_sidecar`
-    /// path/module signals + `ranking_priors` path proximity) are applied during
-    /// RRF fusion for `Identifier` and `ShortKeyword` queries in `Normal` mode.
-    enable_ranking_priors: bool,
-    /// Whether cross-process completion receipts with a different `executable_sha256`
-    /// may be reused when their `IndexingContractDigestV1` (`indexing_contract_sha256`),
-    /// `configuration_sha256`, and producer identities all match (`bd-ky0j2`).
-    allow_contract_upgrade_reuse: bool,
 }
 
 /// Private CLI entry point used to extract embedded weights in a short-lived process.
@@ -6566,8 +6570,6 @@ impl FsfsRuntime {
             unchanged_sources: None,
             seeded_from_receipt: false,
             discovery_excluded_root: None,
-            enable_ranking_priors: false,
-            allow_contract_upgrade_reuse: false,
         }
     }
 
@@ -6576,14 +6578,14 @@ impl FsfsRuntime {
     /// `Identifier` and `ShortKeyword` queries in `Normal` retrieval mode.
     #[must_use]
     pub const fn with_ranking_priors(mut self, enabled: bool) -> Self {
-        self.enable_ranking_priors = enabled;
+        self.config.search.ranking_priors = enabled;
         self
     }
 
     /// Whether zero-I/O code-navigation ranking priors are enabled on this runtime.
     #[must_use]
     pub const fn ranking_priors_enabled(&self) -> bool {
-        self.enable_ranking_priors
+        self.config.search.ranking_priors
     }
 
     /// Enable or disable `IndexingContractDigestV1`-gated warm reuse across `fsfs`
@@ -6591,14 +6593,14 @@ impl FsfsRuntime {
     /// producer model fingerprints match (`bd-ky0j2`).
     #[must_use]
     pub const fn with_contract_upgrade_reuse(mut self, allow: bool) -> Self {
-        self.allow_contract_upgrade_reuse = allow;
+        self.config.indexing.allow_contract_upgrade_reuse = allow;
         self
     }
 
     /// Whether `IndexingContractDigestV1`-gated warm reuse across binary upgrades is enabled.
     #[must_use]
     pub const fn contract_upgrade_reuse_enabled(&self) -> bool {
-        self.allow_contract_upgrade_reuse
+        self.config.indexing.allow_contract_upgrade_reuse
     }
 
     /// Name the source files observed unchanged since the generation a seeded
@@ -9299,6 +9301,7 @@ impl FsfsRuntime {
                 quality_timeout_ms: None,
                 rrf_k: None,
                 fast_only: None,
+                ranking_priors: None,
             })
         }
     }
@@ -9375,6 +9378,9 @@ impl FsfsRuntime {
             runtime.config.search.rrf_k = k;
         }
         runtime.config.search.fast_only = request.fast_only.unwrap_or(self.config.search.fast_only);
+        runtime.config.search.ranking_priors = request
+            .ranking_priors
+            .unwrap_or(self.config.search.ranking_priors);
         crate::config::validate_search_policy(&runtime.config.search)?;
         Ok(runtime)
     }
@@ -9834,6 +9840,7 @@ impl FsfsRuntime {
                 quality_timeout_ms: Some(self.config.search.quality_timeout_ms),
                 rrf_k: Some(self.config.search.rrf_k),
                 fast_only: Some(self.quality_disabled_by_policy()),
+                ranking_priors: Some(self.config.search.ranking_priors),
             };
             let mut request_value =
                 serde_json::to_value(&request).map_err(|source| SearchError::SubsystemError {
@@ -10169,6 +10176,7 @@ impl FsfsRuntime {
         use std::os::unix::process::CommandExt;
 
         let binary_path = std::env::current_exe().map_err(SearchError::Io)?;
+        // ubs:ignore[rust.security.command-executable] -- The OS supplies this running executable; query/config values are separate argv, never an executable selector.
         let mut command = Command::new(binary_path);
         command
             .args(args)
@@ -11110,6 +11118,7 @@ impl FsfsRuntime {
         );
         let mut fusion = FusionContext {
             fused_score: hit.final_score,
+            prior_boost: hit.prior_boost,
             lexical_rank: hit.lexical_rank,
             semantic_rank: hit.semantic_rank,
             hash_rank: hit.hash_rank,
@@ -11376,6 +11385,7 @@ impl FsfsRuntime {
             rank: hit.rank,
             path: hit.path.clone(),
             final_score: ranking.final_score,
+            prior_boost: fusion.prior_boost,
             lexical_rank: fusion.lexical_rank,
             semantic_rank: fusion.semantic_rank,
             hash_rank: fusion.hash_rank,
@@ -12334,6 +12344,7 @@ impl FsfsRuntime {
             mode: mode.label().to_owned(),
             filter: self.cli_input.filter.clone(),
             fast_only: self.quality_disabled_by_policy(),
+            ranking_priors: self.config.search.ranking_priors,
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
             quality_weight_bits: self.effective_quality_weight().to_bits(),
             quality_timeout_ms: self.config.search.quality_timeout_ms,
@@ -12364,6 +12375,7 @@ impl FsfsRuntime {
         hasher.update(key.mode.as_bytes());
         hasher.update(key.filter.as_deref().unwrap_or("").as_bytes());
         hasher.update([u8::from(key.fast_only)]);
+        hasher.update([u8::from(key.ranking_priors)]);
         hasher.update(key.rrf_k_bits.to_le_bytes());
         hasher.update(key.quality_weight_bits.to_le_bytes());
         hasher.update(key.quality_timeout_ms.to_le_bytes());
@@ -12402,6 +12414,7 @@ impl FsfsRuntime {
             rerank_timeout_ms: self.config.search.rerank_timeout_ms,
             rrf_k_bits: self.config.search.rrf_k.to_bits(),
             fast_only: self.quality_disabled_by_policy(),
+            ranking_priors: self.config.search.ranking_priors,
         })
     }
 
@@ -13851,10 +13864,12 @@ impl FsfsRuntime {
                     | crate::query_planning::QueryExecutionMode::Empty
             ) {
             crate::query_execution::DegradedRetrievalMode::LexicalOnly
+        } else if self.quality_work_deferred() {
+            crate::query_execution::DegradedRetrievalMode::EmbedDeferred
         } else {
             crate::query_execution::DegradedRetrievalMode::Normal
         };
-        let fused_initial_head = if self.enable_ranking_priors {
+        let fused_initial_head = if self.config.search.ranking_priors {
             orchestrator.fuse_code_navigation_rankings(
                 plan.intent.intent,
                 retrieval_degradation_mode,
@@ -14020,7 +14035,7 @@ impl FsfsRuntime {
                         .len()
                         .saturating_add(blended_candidates.len())
                         .max(planning_limit);
-                    let fused_refined_head = if self.enable_ranking_priors {
+                    let fused_refined_head = if self.config.search.ranking_priors {
                         orchestrator.fuse_code_navigation_rankings(
                             plan.intent.intent,
                             retrieval_degradation_mode,
@@ -21330,6 +21345,9 @@ impl FsfsRuntime {
             }
 
             let embed_start = Instant::now();
+            debug!(target: "frankensearch_fsfs::indexing",
+                model = admitted.embedder().id(), inputs = texts.len(),
+                "fsfs admitted indexing embedding batch");
             let embeddings_result = admitted.embed_batch_admitted(cx, texts).await;
             embedding_elapsed_ms =
                 embedding_elapsed_ms.saturating_add(embed_start.elapsed().as_millis());
@@ -26365,6 +26383,9 @@ fn print_cli_help() {
         "  serve [--daemon] [--idle-timeout-ms <ms>]  Run long-lived query server (stdio by default, socket daemon with --daemon; daemon exits after <ms> idle, 0 = never)"
     );
     println!("  index [path]              Build/update index");
+    println!(
+        "    --allow-contract-upgrade-reuse  Reuse across executable changes only when the indexing contract, producers, source and artifacts match (default off)"
+    );
     println!("  watch [path]              Alias for index --watch");
     println!(
         "  explain <rank|R-id|path>  Explain one hit of the last search (rank as printed, R0-style id, or path)"
@@ -26401,7 +26422,7 @@ fn print_cli_help() {
         "Global flags: --verbose/-v --quiet/-q --no-color --format --config --offline --online"
     );
     println!(
-        "Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --quality-only --rerank --expand"
+        "Search flags: --limit/-l <n|all> --filter \"lang:rust path:src\" --fast-only --quality-only --ranking-priors --no-ranking-priors --rerank --expand"
     );
     println!(
         "              --explain/-e --stream --compact --index-dir <dir> --daemon --no-daemon --daemon-socket <path>"
@@ -26549,6 +26570,11 @@ fn render_explain_table(
         );
     }
     lines.push(format!("Reranker: {rerank_score}"));
+    if let Some(prior_boost) = hit.prior_boost {
+        lines.push(format!(
+            "Code-navigation prior at fusion: +{prior_boost:.6} (before reranking)"
+        ));
+    }
     if hit.lexical_fallback_tail {
         lines.push(
             "Lexical fallback tail: raw BM25 score retained; RRF was not applied to this hit."
@@ -31801,6 +31827,35 @@ mod tests {
         "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_OPERATION";
 
     #[test]
+    fn ranking_prior_policy_separates_cache_identity_and_is_applied_per_serve_request() {
+        let plain = FsfsRuntime::new(FsfsConfig::default());
+        assert!(!plain.ranking_priors_enabled());
+        let enabled = plain.clone().with_ranking_priors(true);
+        let mode = SearchExecutionMode::LexicalOnly;
+        let first = plain.search_cache_key("identifier", 5, mode).unwrap();
+        let second = enabled.search_cache_key("identifier", 5, mode).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(
+            FsfsRuntime::search_cache_key_hash(&first),
+            FsfsRuntime::search_cache_key_hash(&second)
+        );
+        assert_ne!(
+            plain.search_serve_policy_for_mode(mode).unwrap(),
+            enabled.search_serve_policy_for_mode(mode).unwrap()
+        );
+        let request = FsfsRuntime::parse_search_serve_request(
+            r#"{"query":"identifier","ranking_priors":true}"#,
+        )
+        .unwrap();
+        let selected = plain.with_search_serve_request_policy(&request).unwrap();
+        assert!(selected.ranking_priors_enabled());
+        assert!(
+            !plain.ranking_priors_enabled(),
+            "request selection must not mutate server defaults"
+        );
+    }
+
+    #[test]
     fn quality_blend_disagreeing_pools_use_effective_weight_and_source_fallback() {
         let fast = vec![
             SemanticCandidate::new("a", 8.0),
@@ -33044,6 +33099,7 @@ mod tests {
                 quality_timeout_ms: Some(5_000),
                 rrf_k: None,
                 fast_only: None,
+                ranking_priors: None,
             };
             let foreign = || {
                 admitted(ScriptedBoundEmbedder::new(BoundScript::Identity(Box::new(
@@ -33932,6 +33988,7 @@ mod tests {
                 quality_timeout_ms: None,
                 rrf_k: None,
                 fast_only: Some(true),
+                ranking_priors: None,
             };
             let mut cache = std::collections::HashMap::new();
             let cold = runtime
@@ -33992,6 +34049,7 @@ mod tests {
                     quality_timeout_ms: Some(5_000),
                     rrf_k: None,
                     fast_only: None,
+                    ranking_priors: None,
                 };
                 let cold = runtime
                     .execute_search_serve_request(&cx, request(), &mut resources, &mut cache, true)
@@ -34351,6 +34409,7 @@ mod tests {
                             quality_timeout_ms: None,
                             rrf_k: None,
                             fast_only: Some(true),
+                            ranking_priors: None,
                         },
                         &mut resources,
                         &mut cache,
@@ -34405,6 +34464,7 @@ mod tests {
                     quality_timeout_ms: None,
                     rrf_k: None,
                     fast_only: None,
+                    ranking_priors: None,
                 };
                 let mut frames = Vec::new();
                 let result = runtime
@@ -34477,6 +34537,18 @@ mod tests {
         assert!(
             serde_json::from_value::<super::SearchServeResponse>(unbound).is_err(),
             "an omitted deadline cannot acknowledge a current request"
+        );
+        response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.policy.as_mut().unwrap().ranking_priors = true;
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "the daemon must acknowledge the requested ranking-prior policy"
+        );
+        response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v16".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon that cannot attest ranking priors cannot satisfy the request"
         );
         response.schema_version = "fsfs.search.serve.v15".to_owned();
         assert!(
@@ -34858,6 +34930,7 @@ mod tests {
                             quality_timeout_ms: None,
                             rrf_k: None,
                             fast_only: None,
+                            ranking_priors: None,
                         },
                         &mut resources,
                         &mut cache,
@@ -34902,6 +34975,7 @@ mod tests {
                 quality_timeout_ms: None,
                 rrf_k: None,
                 fast_only: None,
+                ranking_priors: None,
             };
             let mut cache = std::collections::HashMap::new();
 
@@ -35094,6 +35168,7 @@ mod tests {
                             quality_timeout_ms: Some(50),
                             rrf_k: None,
                             fast_only: None,
+                            ranking_priors: None,
                         },
                         &mut resources,
                         &mut cache,
@@ -35287,6 +35362,7 @@ mod tests {
         // weight; v3 blends quality discoveries without fast scores; v2
         // predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v14",
             "fsfs.search.serve.stream.v13",
             "fsfs.search.serve.stream.v12",
             "fsfs.search.serve.stream.v11",
@@ -35315,6 +35391,20 @@ mod tests {
             );
             assert!(!state.attested, "{version} cannot admit any phase");
         }
+        let mut bad = header();
+        if let SearchServeFrame::Attested { policy, .. } = &mut bad {
+            policy.ranking_priors = true;
+        }
+        assert!(
+            accept(bad, &mut state)
+                .unwrap_err()
+                .to_string()
+                .contains("search policy")
+        );
+        assert!(
+            !state.attested,
+            "a different ranking policy must admit no phase"
+        );
         let mut bad = header();
         if let SearchServeFrame::Attested { policy, .. } = &mut bad {
             policy.quality_weight_bits = 0;
@@ -35350,7 +35440,9 @@ mod tests {
                 .to_string()
                 .contains("producer disagreement")
         );
+        // ubs:ignore[rust.security.response-header] -- This is an in-memory SearchServeFrame attestation test, with no HTTP response or header sink.
         accept(header(), &mut state).unwrap();
+        // ubs:ignore[rust.security.response-header] -- The assertion tests duplicate daemon attestation refusal; it performs no HTTP operation.
         assert!(
             accept(header(), &mut state)
                 .unwrap_err()
@@ -37760,6 +37852,7 @@ mod tests {
         let (_fixture_dir, binary, writer) = write_busy_executable("etxtbsy_retry");
 
         // Prove the fixture reproduces the race before trusting the retry.
+        // ubs:ignore[rust.security.command-executable] -- write_busy_executable just created this fixed local script under its private test directory.
         let busy = Command::new(&binary).output();
         assert!(
             matches!(&busy, Err(error) if error.kind() == ErrorKind::ExecutableFileBusy),
@@ -38441,6 +38534,7 @@ mod tests {
             quality_timeout_ms: None,
             rrf_k: None,
             fast_only: None,
+            ranking_priors: None,
         }
     }
 
@@ -40588,6 +40682,7 @@ mod tests {
                 quality_timeout_ms: None,
                 rrf_k: None,
                 fast_only: None,
+                ranking_priors: None,
             };
 
             let first = runtime
@@ -50120,6 +50215,103 @@ mod tests {
     }
 
     #[test]
+    fn runtime_stream_never_retries_a_partial_frame_or_failed_flush() {
+        struct FailingTransport {
+            bytes: Vec<u8>,
+            flushes: usize,
+            fail_flush: bool,
+            partial: bool,
+            failed: bool,
+            calls_after_failure: usize,
+        }
+        impl std::io::Write for FailingTransport {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.failed {
+                    self.calls_after_failure += 1;
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                if self.flushes == 1 && !self.fail_flush {
+                    if self.partial {
+                        self.failed = true;
+                        return Err(std::io::ErrorKind::BrokenPipe.into());
+                    }
+                    self.partial = true;
+                    let count = bytes.len().min(7);
+                    self.bytes.extend_from_slice(&bytes[..count]);
+                    return Ok(count);
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                if self.failed {
+                    self.calls_after_failure += 1;
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                if self.flushes == 1 && self.fail_flush {
+                    self.failed = true;
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let lexical_path = temp.path().join("lexical");
+            drop(create_test_quill(&cx, &lexical_path).await);
+            let mut config = FsfsConfig::default();
+            config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+            let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                command: CliCommand::Search,
+                stream: true,
+                format: OutputFormat::Jsonl,
+                index_dir: Some(temp.path().to_path_buf()),
+                daemon: false,
+                ..CliInput::default()
+            });
+            for fail_flush in [false, true] {
+                let mut writer = FailingTransport {
+                    bytes: Vec::new(),
+                    flushes: 0,
+                    fail_flush,
+                    partial: false,
+                    failed: false,
+                    calls_after_failure: 0,
+                };
+                runtime
+                    .run_search_stream_command_with_writer(
+                        &cx,
+                        "query",
+                        5,
+                        "damaged-transport",
+                        &mut writer,
+                        None,
+                    )
+                    .await
+                    .expect_err("transport failure must propagate");
+                assert!(writer.failed, "the planted transport failure must execute");
+                assert_eq!(writer.flushes, 1, "Started was flushed before the failure");
+                assert_eq!(
+                    writer.calls_after_failure, 0,
+                    "no terminal or replay after failure"
+                );
+                let text = String::from_utf8(writer.bytes).expect("utf8 frame prefix");
+                let started = decode_stream_frame_ndjson::<SearchHitPayload>(
+                    text.lines().next().expect("Started frame"),
+                )
+                .expect("complete Started");
+                assert_eq!(started.event.kind(), StreamEventKind::Started);
+                assert!(
+                    !text.contains("\"terminal\""),
+                    "no appended terminal: {text}"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn runtime_stream_exposes_initial_before_quality_barrier_release() {
         run_on_runtime_task(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -54027,6 +54219,7 @@ mod tests {
                 rank: 1,
                 path: "src/lib.rs".to_owned(),
                 final_score: 0.1,
+                prior_boost: None,
                 lexical_rank: None,
                 semantic_rank: Some(0),
                 hash_rank: None,
@@ -54085,6 +54278,7 @@ mod tests {
                 rank: 1,
                 path: doc_id.to_owned(),
                 final_score: 0.1,
+                prior_boost: None,
                 lexical_rank: Some(0),
                 semantic_rank: None,
                 hash_rank: None,
@@ -58019,6 +58213,7 @@ mod tests {
                         quality_timeout_ms: None,
                         rrf_k: None,
                         fast_only: None,
+                        ranking_priors: None,
                     },
                     &mut resources,
                     &mut hot_cache,
@@ -58043,6 +58238,7 @@ mod tests {
                             quality_timeout_ms: None,
                             rrf_k: None,
                             fast_only: None,
+                            ranking_priors: None,
                         },
                         &mut resources,
                         &mut hot_cache,
@@ -58129,6 +58325,7 @@ mod tests {
                         quality_timeout_ms: None,
                         rrf_k: None,
                         fast_only: None,
+                        ranking_priors: None,
                     },
                     &mut resources,
                     &mut hot_cache,
@@ -58168,6 +58365,7 @@ mod tests {
                         quality_timeout_ms: None,
                         rrf_k: None,
                         fast_only: None,
+                        ranking_priors: None,
                     },
                     &mut resources,
                     &mut hot_cache,

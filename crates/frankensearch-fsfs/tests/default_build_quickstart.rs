@@ -177,6 +177,10 @@ mod loader_only {
                 .env_remove("FRANKENSEARCH_INDEX_DIR")
                 .env_remove("FSFS_STORAGE_INDEX_DIR")
                 .env_remove("FRANKENSEARCH_STORAGE_INDEX_DIR")
+                .env_remove("FRANKENSEARCH_RANKING_PRIORS")
+                .env_remove("FSFS_RANKING_PRIORS")
+                .env_remove("FRANKENSEARCH_ALLOW_CONTRACT_UPGRADE_REUSE")
+                .env_remove("FSFS_ALLOW_CONTRACT_UPGRADE_REUSE")
                 .env_remove("FSFS_DISABLE_QUERY_CACHE")
                 .env_remove("FRANKENSEARCH_API_PROVIDER")
                 .env_remove("FRANKENSEARCH_API_MODEL")
@@ -1243,6 +1247,47 @@ mod loader_only {
             }
             assert!(owner.child.try_wait().unwrap().is_none());
         }
+        // The same generation/query under two explicit ranking policies must
+        // occupy separate cache entries. This prose query also checks the
+        // existing neutral natural-language policy with actual producers.
+        let mut neutral_hits = None;
+        for (number, (priors, cached)) in
+            [(false, false), (true, false), (false, true), (true, true)]
+                .into_iter()
+                .enumerate()
+        {
+            let mut socket = UnixStream::connect(&owner.socket).unwrap();
+            socket.set_read_timeout(Some(QUICKSTART_TIMEOUT)).unwrap();
+            writeln!(
+                socket,
+                "{}",
+                serde_json::json!({
+                    "query":"How should clients recover after temporary connection failures?",
+                    "limit":3, "quality_timeout_ms":5000, "stream":true, "ranking_priors":priors,
+                })
+            )
+            .unwrap();
+            socket.shutdown(std::net::Shutdown::Write).unwrap();
+            let frames: Vec<Value> = std::io::BufReader::new(socket)
+                .lines()
+                .map(|line| serde_json::from_str(&line.unwrap()).unwrap())
+                .collect();
+            assert_eq!(frames.len(), 4, "{frames:?}");
+            assert_eq!(frames[0]["policy"]["ranking_priors"], priors);
+            assert_eq!(frames[0]["cached"], cached, "policy entry {number}");
+            assert_eq!(frames[1]["payload"]["phase"], "initial");
+            assert_eq!(frames[2]["payload"]["phase"], "refined");
+            assert_eq!(frames[3]["ok"], true);
+            let hits = (
+                frames[1]["payload"]["hits"].clone(),
+                frames[2]["payload"]["hits"].clone(),
+            );
+            if let Some(expected) = &neutral_hits {
+                assert_eq!(&hits, expected);
+            } else {
+                neutral_hits = Some(hits);
+            }
+        }
         // Drop a real connection immediately after Initial, then prove the
         // same process remains usable before exercising signal shutdown.
         let mut disconnected = UnixStream::connect(&owner.socket).unwrap();
@@ -1310,11 +1355,11 @@ mod loader_only {
             .collect::<Vec<_>>();
         assert_eq!(initialization.len(), 1, "{diagnostics}");
         eprintln!(
-            "[default-build-e2e] stage=progressive-daemon cold_initialization={} distinct_completed_queries=2 load_amortization_denominator=2",
+            "[default-build-e2e] stage=progressive-daemon cold_initialization={} distinct_completed_query_texts=3 uncached_policy_executions=4 load_amortization_denominator=4",
             initialization[0]
         );
         eprintln!(
-            "[default-build-e2e] stage=progressive-daemon event=verified pid={pid} uncached_queries=2 quality_loads=1 ordered_phases=true direct_parity=true jsonl=true toon=true disconnect=true signal_shutdown=true functional_only=true"
+            "[default-build-e2e] stage=progressive-daemon event=verified pid={pid} uncached_policy_executions=4 quality_loads=1 ordered_phases=true direct_parity=true ranking_policy_cache_separation=true prose_neutral=true jsonl=true toon=true disconnect=true signal_shutdown=true functional_only=true"
         );
     }
 
@@ -3363,6 +3408,435 @@ mod loader_only {
             assert!(!index.join("FSFS-CURRENT").exists());
             assert_eq!(fs::read_dir(&fsfs.model_root).unwrap().count(), 0);
         }
+    }
+
+    #[test]
+    fn upgrade_reuse_policy_is_discoverable_and_explicit_in_the_actual_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("empty-model-cache"));
+        for (label, flags, expected) in [
+            ("default", vec![], false),
+            ("enabled", vec!["--allow-contract-upgrade-reuse"], true),
+            (
+                "disabled",
+                vec![
+                    "--allow-contract-upgrade-reuse",
+                    "--no-contract-upgrade-reuse",
+                ],
+                false,
+            ),
+        ] {
+            let mut args = vec![
+                "config",
+                "get",
+                "indexing.allow_contract_upgrade_reuse",
+                "--format",
+                "json",
+            ];
+            args.extend(flags);
+            let outcome = fsfs.run(temp.path(), label, args, FAILURE_TIMEOUT);
+            assert!(!outcome.timed_out, "{}", outcome.combined_output());
+            assert!(outcome.status.success(), "{}", outcome.combined_output());
+            let envelope: Value = serde_json::from_str(&outcome.stdout).unwrap();
+            assert_eq!(envelope["data"]["value"], expected, "{}", outcome.stdout);
+        }
+    }
+
+    #[cfg(feature = "semantic-loaders")]
+    #[test]
+    #[ignore = "requires two source-bound executables and pinned real models; explicit upgrade lifecycle"]
+    fn two_executables_reuse_only_an_unchanged_admitted_indexing_contract() {
+        use sha2::Digest as _;
+        let previous = PathBuf::from(
+            std::env::var_os("FSFS_UPGRADE_REUSE_PREVIOUS_BINARY")
+                .expect("supply the source-bound previous fsfs executable"),
+        );
+        assert!(previous.is_absolute() && previous.is_file());
+        let current = fsfs_binary();
+        let previous_sha = sha2::Sha256::digest(fs::read(&previous).unwrap());
+        let current_sha = sha2::Sha256::digest(fs::read(&current).unwrap());
+        assert_ne!(
+            previous_sha, current_sha,
+            "two genuinely different executables are required"
+        );
+        let models = configured_model_root();
+        verify_pinned_model_cache(&models).expect("verified pinned real producers");
+        let temp = tempfile::tempdir().unwrap();
+        let mut old = IsolatedFsfs::new(temp.path(), models.clone());
+        old.binary = previous;
+        let current = IsolatedFsfs::new(temp.path(), models);
+        let observe = [
+            ("RUST_LOG", "frankensearch_fsfs::indexing=debug"),
+            ("FSFS_COMPLETE_GENERATIONS", "1"),
+        ];
+        // A separate incumbent per control prevents an earlier B run from
+        // replacing the A receipt and accidentally turning upgrade into same-ELF reuse.
+        for (control, flags, expected_carried) in [
+            (
+                "compatible",
+                vec!["--allow-contract-upgrade-reuse"],
+                QUICKSTART_DOCUMENT_COUNT,
+            ),
+            ("disabled", vec!["--no-contract-upgrade-reuse"], 0),
+            ("window-drift", vec!["--allow-contract-upgrade-reuse"], 0),
+            (
+                "source-drift",
+                vec!["--allow-contract-upgrade-reuse"],
+                QUICKSTART_DOCUMENT_COUNT - 1,
+            ),
+            ("artifact-drift", vec!["--allow-contract-upgrade-reuse"], 0),
+            ("producer-drift", vec!["--allow-contract-upgrade-reuse"], 0),
+        ] {
+            let corpus = temp.path().join(format!("{control}-corpus"));
+            write_quickstart_corpus(&corpus);
+            let index = temp.path().join(control);
+            let base = [
+                "index",
+                corpus.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--format",
+                "json",
+            ];
+            let first = old.run_with_env(
+                temp.path(),
+                &format!("{control}-A"),
+                base,
+                QUICKSTART_TIMEOUT,
+                &observe,
+            );
+            assert_finished_successfully("previous executable", &first);
+            let prior_root = active_generation_root(&index);
+            let prior_fast = fs::read(prior_root.join("vector/index.fsvi")).unwrap();
+            let prior_quality = fs::read(prior_root.join("vector/quality.fsvi")).unwrap();
+            let prior_receipt = fs::read(prior_root.join("FSFS-REUSE.json")).unwrap();
+            let query = [
+                "search",
+                "network retries",
+                "--no-daemon",
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--format",
+                "json",
+            ];
+            let before = old.run(
+                temp.path(),
+                &format!("{control}-A-search"),
+                query,
+                QUICKSTART_TIMEOUT,
+            );
+            assert_finished_successfully("previous admitted search", &before);
+            let before_page = parse_success_envelope(control, &before);
+            let prior_selection = fs::read(index.join("FSFS-CURRENT")).unwrap();
+            if control == "source-drift" {
+                fs::write(
+                    corpus.join("gardening.md"),
+                    "Plant spring bulbs after preparing loose soil and adding compost.",
+                )
+                .unwrap();
+            }
+            if control == "artifact-drift" {
+                let mut corrupted = prior_fast.clone();
+                let last = corrupted.last_mut().expect("nonempty vector artifact");
+                *last ^= 0xff;
+                fs::write(prior_root.join("vector/index.fsvi"), corrupted).unwrap();
+            }
+            let mut args = base.to_vec();
+            args.extend(flags);
+            let producer_config = temp.path().join("unavailable-producer.toml");
+            if control == "producer-drift" {
+                fs::write(
+                    &producer_config,
+                    "[indexing]\nfast_model = 'potion-base-8m'\n",
+                )
+                .unwrap();
+                args.extend(["--config", producer_config.to_str().unwrap()]);
+            }
+            let mut env = observe.to_vec();
+            if control == "window-drift" {
+                env.push(("FSFS_INDEXING_FAST_WINDOW_MAX_PER_FILE", "1"));
+            }
+            // A selected, unavailable producer must refuse before indexing,
+            // rather than reuse rows from the old producer by matching dimension.
+            let result = current.run_with_env(
+                temp.path(),
+                &format!("{control}-B"),
+                args,
+                QUICKSTART_TIMEOUT,
+                &env,
+            );
+            if matches!(control, "artifact-drift" | "producer-drift") {
+                assert!(!result.timed_out, "{}", result.combined_output());
+                assert!(!result.status.success(), "{}", result.combined_output());
+                assert_eq!(
+                    fs::read(index.join("FSFS-CURRENT")).unwrap(),
+                    prior_selection,
+                    "failed admission must preserve the incumbent selection"
+                );
+                assert_eq!(
+                    fs::read(prior_root.join("FSFS-REUSE.json")).unwrap(),
+                    prior_receipt
+                );
+                assert!(
+                    !result
+                        .stderr
+                        .contains("fsfs admitted indexing embedding batch"),
+                    "refusal precedes embedding: {}",
+                    result.stderr
+                );
+                eprintln!(
+                    "[upgrade-reuse] control={control} source_documents={QUICKSTART_DOCUMENT_COUNT} refused=true incumbent_selection_preserved=true exit={:?}",
+                    result.status.code()
+                );
+                continue;
+            }
+            assert_finished_successfully("current executable", &result);
+            let envelope = parse_success_envelope(control, &result);
+            assert_eq!(
+                envelope["data"]["unchanged_files"],
+                expected_carried,
+                "{}",
+                result.combined_output()
+            );
+            let calls = result
+                .stderr
+                .matches("fsfs admitted indexing embedding batch")
+                .count();
+            if control == "compatible" {
+                assert_eq!(
+                    calls, 0,
+                    "no new indexing embedding admission: {}",
+                    result.stderr
+                );
+                let next_root = active_generation_root(&index);
+                assert_eq!(
+                    fs::read(next_root.join("vector/index.fsvi")).unwrap(),
+                    prior_fast
+                );
+                assert_eq!(
+                    fs::read(next_root.join("vector/quality.fsvi")).unwrap(),
+                    prior_quality
+                );
+            } else {
+                assert!(
+                    calls > 0,
+                    "cold control must exercise the observation point: {}",
+                    result.stderr
+                );
+            }
+            assert_eq!(
+                fs::read(prior_root.join("FSFS-REUSE.json")).unwrap(),
+                prior_receipt,
+                "a successor must preserve the incumbent receipt"
+            );
+            let query = [
+                "search",
+                "network retries",
+                "--no-daemon",
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--format",
+                "json",
+            ];
+            let searched = current.run(
+                temp.path(),
+                &format!("{control}-search"),
+                query,
+                QUICKSTART_TIMEOUT,
+            );
+            assert_finished_successfully("admitted successor search", &searched);
+            let page = parse_success_envelope(control, &searched);
+            assert!(!page["data"]["hits"].as_array().unwrap().is_empty());
+            if control == "compatible" {
+                assert_eq!(
+                    page["data"]["hits"], before_page["data"]["hits"],
+                    "unchanged rankings, scores and source snippets"
+                );
+            }
+            eprintln!(
+                "[upgrade-reuse] control={control} source_documents={QUICKSTART_DOCUMENT_COUNT} carried={expected_carried} indexing_embedding_admissions={calls} previous_sha={previous_sha:?} current_sha={current_sha:?} functional_only=true"
+            );
+        }
+    }
+
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[test]
+    #[ignore = "requires pinned real models; explicit ranking-prior product lifecycle"]
+    fn ranking_prior_cli_opt_in_reorders_both_real_phases_and_explains_the_boost() {
+        let models = configured_model_root();
+        verify_pinned_model_cache(&models).expect("verified real models");
+        let temp = tempfile::tempdir().unwrap();
+        let corpus = temp.path().join("corpus");
+        fs::create_dir_all(corpus.join("src")).unwrap();
+        fs::write(corpus.join("a_notes.md"), "query_execution ".repeat(80)).unwrap();
+        fs::write(
+            corpus.join("src/query_execution.rs"),
+            "// garden flowers soil watering\n",
+        )
+        .unwrap();
+        for number in 0..6 {
+            fs::write(
+                corpus.join(format!("notes-{number}.md")),
+                "query execution engine scheduling and request processing",
+            )
+            .unwrap();
+        }
+        let config = temp.path().join("fsfs.toml");
+        fs::write(&config, "[search]\nquality_timeout_ms = 10000\n").unwrap();
+        let index = temp.path().join("index");
+        let fsfs = IsolatedFsfs::new(temp.path(), models);
+        let indexed = fsfs.run_with_env(
+            temp.path(),
+            "prior-index",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &[("FSFS_COMPLETE_GENERATIONS", "1")],
+        );
+        assert_finished_successfully("prior fixture index", &indexed);
+        struct StopDaemon(PathBuf);
+        impl Drop for StopDaemon {
+            fn drop(&mut self) {
+                request_daemon_stop(&self.0, true);
+            }
+        }
+        let _daemon_owner = StopDaemon(index.join("fsfs-query.sock"));
+        let mut reference = None;
+        for transport in ["--no-daemon", "--daemon"] {
+            for (label, flag, expected) in [
+                ("off", "--no-ranking-priors", "a_notes.md"),
+                ("on", "--ranking-priors", "src/query_execution.rs"),
+            ] {
+                let outcome = fsfs.run(
+                    temp.path(),
+                    &format!("prior-{transport}-{label}"),
+                    [
+                        "search",
+                        "query_execution",
+                        transport,
+                        flag,
+                        "--index-dir",
+                        index.to_str().unwrap(),
+                        "--config",
+                        config.to_str().unwrap(),
+                        "--limit",
+                        "5",
+                        "--stream",
+                        "--format",
+                        "jsonl",
+                    ],
+                    QUICKSTART_TIMEOUT,
+                );
+                assert_finished_successfully("prior stream", &outcome);
+                let frames: Vec<Value> = outcome
+                    .stdout
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(frames.last().unwrap()["payload"]["status"], "completed");
+                let mut phases = [Vec::new(), Vec::new()];
+                let mut selected = None;
+                let mut seen = [false, false];
+                for frame in &frames {
+                    if frame["event"] == "progress" {
+                        selected = match frame["payload"]["reason_code"].as_str() {
+                            Some("query.stream.initial_ready") => Some(0),
+                            Some("query.stream.refined_ready") => Some(1),
+                            _ => selected,
+                        };
+                        if let Some(phase) = selected {
+                            seen[phase] = true;
+                        }
+                    } else if frame["event"] == "result" {
+                        phases[selected.expect("phase precedes results")]
+                            .push(frame["payload"]["item"].clone());
+                    }
+                }
+                assert_eq!(
+                    seen,
+                    [true, true],
+                    "both actual semantic phases: {}",
+                    outcome.stdout
+                );
+                for hits in &phases {
+                    assert!(
+                        hits[0]["path"].as_str().unwrap().ends_with(expected),
+                        "discriminating {label} control: {}",
+                        outcome.stdout
+                    );
+                }
+                if transport == "--no-daemon" && label == "on" {
+                    reference = Some(phases.clone());
+                }
+                if transport == "--daemon" && label == "on" {
+                    assert_eq!(Some(&phases), reference.as_ref());
+                }
+                let explained = fsfs.run(
+                    temp.path(),
+                    &format!("prior-explain-{transport}-{label}"),
+                    [
+                        "search",
+                        "query_execution",
+                        transport,
+                        flag,
+                        "--index-dir",
+                        index.to_str().unwrap(),
+                        "--config",
+                        config.to_str().unwrap(),
+                        "--limit",
+                        "5",
+                        "--explain",
+                        "--format",
+                        "json",
+                    ],
+                    QUICKSTART_TIMEOUT,
+                );
+                assert_finished_successfully("actual prior explanation", &explained);
+                let page = parse_success_envelope(label, &explained);
+                let explanations = page["data"]["explanations"].as_object().unwrap();
+                let code = explanations
+                    .iter()
+                    .find(|(path, _)| path.ends_with("src/query_execution.rs"))
+                    .unwrap()
+                    .1;
+                if label == "on" {
+                    assert!(
+                        code["fusion"]["prior_boost"]
+                            .as_f64()
+                            .is_some_and(|boost| boost > 0.0 && boost <= 0.01)
+                    );
+                } else {
+                    assert!(code["fusion"].get("prior_boost").is_none());
+                }
+                eprintln!(
+                    "[ranking-priors] transport={transport} policy={label} corpus_documents=8 phase_denominator=2 phases={phases:?} functional_only=true"
+                );
+            }
+        }
+        let stopped = fsfs.run(
+            temp.path(),
+            "prior-daemon-stop",
+            [
+                "daemon",
+                "--stop",
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--config",
+                config.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            FAILURE_TIMEOUT,
+        );
+        assert_finished_successfully("stop prior test daemon", &stopped);
     }
 
     #[cfg(feature = "semantic-loaders")]

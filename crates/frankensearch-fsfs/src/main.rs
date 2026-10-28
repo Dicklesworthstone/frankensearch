@@ -1480,7 +1480,7 @@ mod tests {
     #[test]
     fn process_error_preserves_reported_exit_without_writing_after_terminal() {
         use frankensearch_fsfs::output_schema::mark_output_reported;
-        let error = mark_output_reported(output_error_from(&SearchError::ModelNotFound {
+        let error = mark_output_reported(super::output_error_from(&SearchError::ModelNotFound {
             name: "potion-128m".to_owned(),
         }));
         let context = ProcessErrorContext {
@@ -1502,6 +1502,54 @@ mod tests {
         );
         assert_eq!(stdout, b"already emitted terminal\n");
         assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn preparation_failure_uses_the_requested_stream_protocol() {
+        use frankensearch_fsfs::stream_protocol::{StreamEvent, StreamFrame};
+        for format in ["jsonl", "toon"] {
+            let args = ["search", "query", "--stream", "--format", format].map(str::to_owned);
+            let context = ProcessErrorContext::from_args(&args, false);
+            let error = SearchError::ModelNotFound {
+                name: "potion-128m".to_owned(),
+            };
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            assert_eq!(
+                report_process_error(
+                    &error,
+                    &context,
+                    &mut stdout,
+                    &mut stderr,
+                    "2026-10-27T00:00:00Z".to_owned()
+                ),
+                78
+            );
+            assert!(stderr.is_empty());
+            let text = String::from_utf8(stdout).expect("utf8 stream");
+            let frames: Vec<StreamFrame<serde_json::Value>> = if format == "jsonl" {
+                text.lines()
+                    .map(|line| serde_json::from_str(line).expect("stream frame"))
+                    .collect()
+            } else {
+                text.split('\u{001e}')
+                    .filter(|record| !record.trim().is_empty())
+                    .map(|record| {
+                        frankensearch_fsfs::stream_protocol::decode_stream_frame_toon(record.trim())
+                            .expect("TOON stream frame")
+                    })
+                    .collect()
+            };
+            assert_eq!(frames.len(), 2, "Started and one final terminal only");
+            assert!(matches!(frames[0].event, StreamEvent::Started(_)));
+            assert_eq!(frames[0].seq, 0);
+            assert_eq!(frames[1].seq, 1);
+            assert_eq!(frames[0].stream_id, frames[1].stream_id);
+            match &frames[1].event {
+                StreamEvent::Terminal(terminal) => assert_eq!(terminal.exit_code, 78),
+                event => panic!("expected terminal, got {event:?}"),
+            }
+        }
     }
 
     #[test]
