@@ -34576,6 +34576,11 @@ mod tests {
             "the daemon must acknowledge the requested ranking-prior policy"
         );
         response.policy = Some(runtime.search_serve_policy().unwrap());
+        response.schema_version = "fsfs.search.serve.v17".to_owned();
+        assert!(
+            runtime.validate_search_serve_policy(&response).is_err(),
+            "a daemon using inexact JSON score parsing cannot satisfy the request"
+        );
         response.schema_version = "fsfs.search.serve.v16".to_owned();
         assert!(
             runtime.validate_search_serve_policy(&response).is_err(),
@@ -35393,6 +35398,7 @@ mod tests {
         // weight; v3 blends quality discoveries without fast scores; v2
         // predates the WAL top-k repair; v1 an older ranking policy.
         for version in [
+            "fsfs.search.serve.stream.v15",
             "fsfs.search.serve.stream.v14",
             "fsfs.search.serve.stream.v13",
             "fsfs.search.serve.stream.v12",
@@ -57761,6 +57767,10 @@ mod tests {
                 "fsfs.search.cache.v17",
                 // Accepted malformed quality selections through normalization.
                 "fsfs.search.cache.v18",
+                // Predated the explicit ranking-prior cache policy.
+                "fsfs.search.cache.v19",
+                // Could lose score bits while parsing a cached JSON answer.
+                "fsfs.search.cache.v20",
             ] {
                 old_record["schema_version"] = old_schema.into();
                 fs::write(&cache_path, serde_json::to_vec(&old_record).unwrap()).unwrap();

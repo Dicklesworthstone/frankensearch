@@ -171,7 +171,7 @@ fn model_activation_installs_the_whole_selection_and_updates_use_the_new_produce
                 "after-model-change",
                 &next,
                 8,
-                serde_json::json!([
+                &serde_json::json!([
                     {"op":"upsert", "id":"retry-next", "content":"retry with new producer", "metadata":{"version":"updated"}}
                 ]),
             );
@@ -848,7 +848,7 @@ fn full_model_activation_validates_both_independent_producers_before_installing_
             "full-after-model-change",
             &next,
             8,
-            serde_json::json!([
+            &serde_json::json!([
                 {"op":"upsert", "id":"retry-next", "content":"retry with both new producers", "metadata":{"tenant":"blue"}}
             ]),
         );

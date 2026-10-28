@@ -3728,7 +3728,7 @@ mod loader_only {
             }
         }
         let _daemon_owner = StopDaemon(index.join("fsfs-query.sock"));
-        let mut reference = None;
+        let mut reference = [None, None];
         for transport in ["--no-daemon", "--daemon"] {
             for (label, flag, expected) in [
                 ("off", "--no-ranking-priors", "docs/query-execution.md"),
@@ -3792,11 +3792,12 @@ mod loader_only {
                         outcome.stdout
                     );
                 }
-                if transport == "--no-daemon" && label == "on" {
-                    reference = Some(phases.clone());
+                let policy_index = usize::from(label == "on");
+                if transport == "--no-daemon" {
+                    reference[policy_index] = Some(phases.clone());
                 }
-                if transport == "--daemon" && label == "on" {
-                    assert_eq!(Some(&phases), reference.as_ref());
+                if transport == "--daemon" {
+                    assert_eq!(Some(&phases), reference[policy_index].as_ref());
                 }
                 let explained = fsfs.run(
                     temp.path(),

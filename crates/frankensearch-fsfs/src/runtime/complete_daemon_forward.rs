@@ -733,6 +733,64 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_replies_and_phase_value_hops_preserve_score_bits() {
+        use crate::output_schema::{SearchHitPayload, SearchOutputPhase};
+
+        let root = tempfile::tempdir().unwrap();
+        let (_, request) = request(root.path());
+        let scores = [1.0_f64 / 65.0, 1.0 / 67.0, 1.0 / 61.0 + 1.0 / 62.0];
+        let expected = scores.map(f64::to_bits);
+        let hits = scores
+            .iter()
+            .enumerate()
+            .map(|(index, &score)| SearchHitPayload {
+                rank: index + 1,
+                path: format!("result-{index}.rs"),
+                line: None,
+                score,
+                snippet: None,
+                lexical_rank: Some(index),
+                semantic_rank: None,
+                hash_rank: None,
+                in_both_sources: false,
+            })
+            .collect();
+        let mut payload = SearchPayload::new(
+            request.search.query.clone(),
+            SearchOutputPhase::Refined,
+            scores.len(),
+            hits,
+        );
+        for hop in 0..4 {
+            let reply = Reply {
+                fsfs_complete_cli: VERSION,
+                request_id: request.request_id.clone(),
+                query: request.search.query.clone(),
+                result: OutputEnvelope::success(
+                    payload,
+                    meta_for_format("search", OutputFormat::Json),
+                    super::super::super::iso_timestamp_now(),
+                ),
+            };
+            payload = decode_reply(&encode_response(&reply).unwrap(), &request).unwrap();
+            // Progressive delivery also decodes a JSON Value before projecting
+            // typed hits. A cache/peer round trip must preserve the same bits.
+            let phase: serde_json::Value =
+                serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
+            payload = serde_json::from_value(phase).unwrap();
+            assert_eq!(
+                payload
+                    .hits
+                    .iter()
+                    .map(|hit| hit.score.to_bits())
+                    .collect::<Vec<_>>(),
+                expected,
+                "score bits changed at transport hop {hop}"
+            );
+        }
+    }
+
+    #[test]
     fn forwarded_request_has_no_legacy_query_and_preserves_filter_and_limit() {
         let root = tempfile::tempdir().unwrap();
         let (mut runtime, _) = request(root.path());
