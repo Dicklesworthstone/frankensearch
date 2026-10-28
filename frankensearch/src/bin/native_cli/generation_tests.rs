@@ -5356,7 +5356,7 @@ mod warm_authority {
                     let error = update_generation(&cx, &stale, &mut output, None)
                         .await
                         .unwrap_err();
-                    assert!(error.to_string().contains("head differs"));
+                    assert!(error.to_string().contains("head differs"), "{error}");
                     assert!(output.is_empty());
                     assert!(!stale.work.as_ref().unwrap().exists());
                     assert!(!stale.receipt.exists());
@@ -5872,7 +5872,7 @@ mod warm_authority {
                 let error = rebuild(&cx, &refused, &mut Vec::new(), None)
                     .await
                     .unwrap_err();
-                assert!(error.to_string().contains("head differs"));
+                assert!(error.to_string().contains("head differs"), "{error}");
                 assert!(!refused_work.exists());
                 assert!(!refused_receipt.exists());
                 assert_eq!(

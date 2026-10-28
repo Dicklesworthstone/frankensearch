@@ -1,7 +1,7 @@
 use super::*;
 
 fn replacement_provider(change_space: bool) -> Arc<Provider> {
-    let mut identity = identity().identity;
+    let mut identity = provider_identity();
     identity.producer.implementation_revision = "authority-activated-producer".to_owned();
     if change_space {
         identity.space.immutable_revision = "authority-activated-weights".to_owned();
