@@ -1261,12 +1261,19 @@ GitHub Actions is not used as a gate for this repository: every CI workflow unde
 before any release lives in the repository and runs on a real host:
 
 ```bash
+export FSFS_UPGRADE_REUSE_PREVIOUS_BINARY=/absolute/path/to/previous/fsfs
 scripts/quality-gate.sh                     # fmt, check, clippy -D warnings, lib tests,
                                             # Quill/Tantivy witness, fsfs tests, real-model e2e,
                                             # executable quick-start gate
 dsr quality --tool frankensearch            # the same gate plus the packaging/installer
                                             # contract checks, driven by dsr
 ```
+
+The full `e2e` stage runs the two-executable upgrade-reuse regression. Supply a
+previous `fsfs` built from a different source revision with the same registered
+producer protocols and indexing contract, and retain its source and SHA-256
+receipt. The test requires a different executable hash and exercises compatible
+reuse, default cold rebuilding, and independent source, producer, and artifact drift.
 
 Stages can be selected with `QUALITY_GATE_STAGES=fmt,check,clippy,tests` and
 the registered model cache with `QUALITY_GATE_MODEL_DIR`. The end-to-end stage
