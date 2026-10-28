@@ -8487,7 +8487,11 @@ impl FsfsRuntime {
         let mut stdout = std::io::stdout();
         self.run_search_stream_command_with_writer(cx, query, limit, &stream_id, &mut stdout, None)
             .await
-            .map_err(|error| crate::output_schema::mark_output_reported(output_error_from(&error)))
+            .map_err(|error| {
+                crate::output_schema::mark_output_reported(crate::output_schema::output_error_from(
+                    &error,
+                ))
+            })
     }
 
     async fn run_search_stream_command_with_writer<W: Write + Send>(

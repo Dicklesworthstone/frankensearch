@@ -1979,8 +1979,13 @@ mod retained_delete_tests {
                 4
             );
             assert_eq!(
-                FsfsRuntime::collect_quality_generation_doctor_check(long_generation.path())
-                    .verdict,
+                FsfsRuntime::collect_quality_generation_doctor_check(
+                    long_generation.path(),
+                    crate::runtime::SearchExecutionMode::Full,
+                    &mut None,
+                    &mut None,
+                )
+                .verdict,
                 DoctorVerdict::Pass
             );
 
