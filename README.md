@@ -422,11 +422,11 @@ published artifacts still need indexing resumed before semantic search.
 
 Completed ordinary index runs retain evidence for reusing their work on later
 runs. Reuse normally requires matching executable, configuration, producer identities
-and artifact bytes. `fsfs index <dir> --allow-contract-upgrade-reuse` explicitly
+and artifact bytes. `fsfs index <dir> --upgrade-reuse compatible-contract` explicitly
 permits a different executable when its versioned indexing contract also matches.
-The same opt-in is available as `[indexing] allow_contract_upgrade_reuse = true`
-or `FRANKENSEARCH_ALLOW_CONTRACT_UPGRADE_REUSE=true`; disable it with
-`--no-contract-upgrade-reuse`. Source, producer, topology and artifact checks
+The same opt-in is available as `[indexing] upgrade_reuse = "compatible_contract"`
+or `FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract`; disable it with
+`--upgrade-reuse same-executable`. Source, producer, topology and artifact checks
 still apply, and old receipts without the contract cannot use this path.
 A file whose device, inode, length and modification and
 change times still match the stamp recorded when it was read is reused without

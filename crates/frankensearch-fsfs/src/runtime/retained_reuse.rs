@@ -1662,7 +1662,7 @@ mod copy_tests {
 mod generation_tests {
     use super::super::{CheckpointReuse, IndexCandidate, checkpoint_entry_reuse};
     use super::*;
-    use crate::config::IngestionClass;
+    use crate::config::{IngestionClass, UpgradeReusePolicy};
     use crate::generation_store::{GenerationPublication, PublishedGeneration};
     use crate::{CliInput, FsfsConfig};
     use asupersync::test_utils::run_test_with_cx;
@@ -3172,6 +3172,26 @@ mod generation_tests {
                 Some(predecessor)
             );
         });
+    }
+
+    #[test]
+    fn upgrade_reuse_runtime_uses_resolved_config_and_keeps_builder_coherent() {
+        let mut config = FsfsConfig::default();
+        config.indexing.upgrade_reuse = UpgradeReusePolicy::CompatibleContract;
+        let runtime = FsfsRuntime::new(config);
+        assert!(runtime.contract_upgrade_reuse_enabled());
+        let disabled = runtime.with_contract_upgrade_reuse(false);
+        assert!(!disabled.contract_upgrade_reuse_enabled());
+        assert_eq!(
+            disabled.config().indexing.upgrade_reuse,
+            UpgradeReusePolicy::SameExecutable
+        );
+        let enabled = disabled.with_contract_upgrade_reuse(true);
+        assert!(enabled.contract_upgrade_reuse_enabled());
+        assert_eq!(
+            enabled.config().indexing.upgrade_reuse,
+            UpgradeReusePolicy::CompatibleContract
+        );
     }
 
     #[test]

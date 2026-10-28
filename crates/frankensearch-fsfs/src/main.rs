@@ -924,6 +924,14 @@ fn flatten_config_values(config: &FsfsConfig) -> SearchResult<BTreeMap<String, V
     if config.search.default_limit == usize::MAX {
         projected["search"]["default_limit"] = Value::from(0);
     }
+    // Internal serialization omits the conservative default to preserve old
+    // indexing receipts. Operator diagnostics must still name the resolved
+    // policy, including when the user explicitly selects that default.
+    projected["indexing"]["upgrade_reuse"] = serde_json::to_value(config.indexing.upgrade_reuse)
+        .map_err(|source| SearchError::SubsystemError {
+            subsystem: CONFIG_SUBSYSTEM,
+            source: Box::new(source),
+        })?;
     let mut out = BTreeMap::new();
     flatten_json_paths("", &projected, &mut out);
     Ok(out)

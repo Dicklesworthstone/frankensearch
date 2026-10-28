@@ -123,10 +123,6 @@
             "offline": {
               "type": "boolean"
             },
-            "allow_contract_upgrade_reuse": {
-              "type": "boolean",
-              "default": false
-            },
             "embedding_batch_size": {
               "type": "integer",
               "minimum": 1,
@@ -137,6 +133,12 @@
             },
             "watch_mode": {
               "type": "boolean"
+            },
+            "upgrade_reuse": {
+              "type": "string",
+              "enum": ["same_executable", "compatible_contract"],
+              "default": "same_executable",
+              "description": "Admission policy for completed indexing work across executable upgrades. Omission preserves the conservative same-executable default; all source, artifact, model and indexing-contract checks still apply."
             }
           }
         },

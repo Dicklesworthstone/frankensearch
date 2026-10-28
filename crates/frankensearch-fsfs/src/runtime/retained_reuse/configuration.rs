@@ -8,7 +8,7 @@
 use frankensearch_core::{DefaultCanonicalizer, SearchError, SearchResult};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{FsfsConfig, SearchConfig};
+use crate::config::{FsfsConfig, SearchConfig, UpgradeReusePolicy};
 
 use super::content_sha256_hex;
 
@@ -83,6 +83,10 @@ pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
     let mut config = config.clone();
     // Keeping the command alive after indexing does not change indexed bytes.
     config.indexing.watch_mode = false;
+    // This admission policy chooses which already-proven receipts we may try;
+    // it does not change indexed bytes. The default is omitted by serde, so
+    // normalizing also preserves the serialization predating this field.
+    config.indexing.upgrade_reuse = UpgradeReusePolicy::SameExecutable;
 
     // These controls apply after query-time Initial publication, or to query
     // ranking. They do not select documents, producers or indexing coverage.
@@ -99,18 +103,6 @@ pub(super) fn digest(config: &FsfsConfig) -> SearchResult<String> {
             subsystem: "fsfs.complete_generation.reuse_config",
             source: Box::new(source),
         })?;
-    // Admission policy does not shape any indexed byte. Omit the new key
-    // entirely so receipts minted before this switch retain their exact digest;
-    // serializing a default `false` here would invalidate those receipts too.
-    value
-        .get_mut("indexing")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| SearchError::InvalidConfig {
-            field: "indexing".to_owned(),
-            value: "serialized configuration".to_owned(),
-            reason: "the serialized indexing configuration must be an object".to_owned(),
-        })?
-        .shift_remove("allow_contract_upgrade_reuse");
     // Query-time ranking policy also leaves persisted source/vector/lexical bytes unchanged.
     value
         .get_mut("search")
@@ -139,14 +131,10 @@ mod tests {
     fn previous_digest(config: &FsfsConfig) -> String {
         let mut config = config.clone();
         config.indexing.watch_mode = false;
-        // The old configuration type had neither key. Retain its original
+        // The old configuration type had no ranking-prior key. Retain its original
         // struct field order independently of the production removal method;
         // swap-removing a key would silently change historical receipt bytes.
         let mut value = serde_json::to_value(&config).unwrap();
-        value["indexing"]
-            .as_object_mut()
-            .unwrap()
-            .retain(|key, _| key != "allow_contract_upgrade_reuse");
         value["search"]
             .as_object_mut()
             .unwrap()
@@ -158,7 +146,7 @@ mod tests {
     fn upgrade_admission_switch_does_not_change_persisted_index_contract() {
         let config = FsfsConfig::default();
         let mut opted_in = config.clone();
-        opted_in.indexing.allow_contract_upgrade_reuse = true;
+        opted_in.indexing.upgrade_reuse = UpgradeReusePolicy::CompatibleContract;
         opted_in.search.ranking_priors = true;
         assert_ne!(
             serde_json::to_value(&config).unwrap(),
@@ -248,6 +236,64 @@ mod tests {
             config.indexing.watch_mode = watch;
             assert_eq!(digest(&config).unwrap(), previous_digest(&config));
         }
+    }
+
+    #[test]
+    fn upgrade_reuse_policy_preserves_preexisting_indexing_serialization() {
+        // Pin the old field order and shape independently of IndexingConfig's
+        // new derive. Merely comparing two new fingerprints would miss a new
+        // default field that invalidates every existing completion receipt.
+        #[derive(Serialize)]
+        struct BeforeUpgradeReuse<'a> {
+            fast_model: &'a str,
+            quality_model: &'a str,
+            model_dir: &'a str,
+            offline: bool,
+            embedding_batch_size: usize,
+            fast_window_max_per_file: usize,
+            reindex_on_change: bool,
+            watch_mode: bool,
+        }
+
+        let config = FsfsConfig::default();
+        let indexing = &config.indexing;
+        let before = BeforeUpgradeReuse {
+            fast_model: &indexing.fast_model,
+            quality_model: &indexing.quality_model,
+            model_dir: &indexing.model_dir,
+            offline: indexing.offline,
+            embedding_batch_size: indexing.embedding_batch_size,
+            fast_window_max_per_file: indexing.fast_window_max_per_file,
+            reindex_on_change: indexing.reindex_on_change,
+            watch_mode: indexing.watch_mode,
+        };
+        assert_eq!(
+            serde_json::to_vec(indexing).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+        assert_eq!(digest(&config).unwrap(), previous_digest(&config));
+    }
+
+    #[test]
+    fn upgrade_reuse_policy_toggles_do_not_change_the_indexing_contract() {
+        let config = FsfsConfig::default();
+        let expected = digest(&config).unwrap();
+        let expected_contract = contract_digest(&config).unwrap();
+        let mut enabled = config.clone();
+        enabled.indexing.upgrade_reuse = UpgradeReusePolicy::CompatibleContract;
+        // Ordinary effective configuration must still expose the opt-in.
+        assert_eq!(
+            serde_json::to_value(&enabled).unwrap()["indexing"]["upgrade_reuse"],
+            "compatible_contract"
+        );
+        assert_ne!(previous_digest(&enabled), previous_digest(&config));
+        let before = enabled.clone();
+        assert_eq!(digest(&enabled).unwrap(), expected);
+        assert_eq!(contract_digest(&enabled).unwrap(), expected_contract);
+        assert_eq!(enabled, before);
+        enabled.indexing.upgrade_reuse = UpgradeReusePolicy::SameExecutable;
+        assert_eq!(digest(&enabled).unwrap(), expected);
+        assert_eq!(contract_digest(&enabled).unwrap(), expected_contract);
     }
 
     #[test]

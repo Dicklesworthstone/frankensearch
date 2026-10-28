@@ -3,7 +3,7 @@ use std::str::FromStr;
 
 use frankensearch_core::{SearchError, SearchResult};
 
-use crate::config::{CliOverrides, PressureProfile, TuiTheme};
+use crate::config::{CliOverrides, PressureProfile, TuiTheme, UpgradeReusePolicy};
 
 // ─── Exit Codes ──────────────────────────────────────────────────────────────
 
@@ -508,14 +508,6 @@ where
                 input.overrides.offline = Some(false);
                 idx += 1;
             }
-            "--allow-contract-upgrade-reuse" => {
-                input.overrides.allow_contract_upgrade_reuse = Some(true);
-                idx += 1;
-            }
-            "--no-contract-upgrade-reuse" => {
-                input.overrides.allow_contract_upgrade_reuse = Some(false);
-                idx += 1;
-            }
             "--watch-mode" => {
                 input.overrides.allow_background_indexing = Some(true);
                 idx += 1;
@@ -626,6 +618,19 @@ where
             "--force" | "--full" => {
                 input.full_reindex = true;
                 idx += 1;
+            }
+            "--upgrade-reuse" => {
+                let value = expect_value(&tokens, idx, "--upgrade-reuse")?;
+                input.overrides.upgrade_reuse =
+                    Some(UpgradeReusePolicy::from_str(value).map_err(|()| {
+                        SearchError::InvalidConfig {
+                            field: "cli.indexing.upgrade_reuse".into(),
+                            value: value.into(),
+                            reason: "--upgrade-reuse expects same-executable|compatible-contract"
+                                .into(),
+                        }
+                    })?);
+                idx += 2;
             }
             "--check" => {
                 if command != CliCommand::Update {
@@ -1157,8 +1162,6 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--no-rerank"
             | "--offline"
             | "--online"
-            | "--allow-contract-upgrade-reuse"
-            | "--no-contract-upgrade-reuse"
             | "--watch-mode"
             | "--no-watch-mode"
             | "--explain"
@@ -1174,6 +1177,7 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--output"
             | "--force"
             | "--full"
+            | "--upgrade-reuse"
             | "--check"
             | "--purge"
             | "--yes"
@@ -1349,21 +1353,30 @@ mod tests {
 
     #[test]
     fn upgrade_reuse_flags_are_explicit_and_last_writer_wins() {
-        let enabled = parse_cli_args(["index", ".", "--allow-contract-upgrade-reuse"]).unwrap();
-        assert_eq!(enabled.overrides.allow_contract_upgrade_reuse, Some(true));
+        let enabled =
+            parse_cli_args(["index", ".", "--upgrade-reuse", "compatible-contract"]).unwrap();
+        assert_eq!(
+            enabled.overrides.upgrade_reuse,
+            Some(UpgradeReusePolicy::CompatibleContract)
+        );
         let disabled = parse_cli_args([
             "index",
             ".",
-            "--allow-contract-upgrade-reuse",
-            "--no-contract-upgrade-reuse",
+            "--upgrade-reuse",
+            "compatible-contract",
+            "--upgrade-reuse",
+            "same-executable",
         ])
         .unwrap();
-        assert_eq!(disabled.overrides.allow_contract_upgrade_reuse, Some(false));
+        assert_eq!(
+            disabled.overrides.upgrade_reuse,
+            Some(UpgradeReusePolicy::SameExecutable)
+        );
         assert_eq!(
             parse_cli_args(["index", "."])
                 .unwrap()
                 .overrides
-                .allow_contract_upgrade_reuse,
+                .upgrade_reuse,
             None
         );
     }
@@ -1879,6 +1892,143 @@ mod tests {
     fn parse_force_alias_for_full_reindex() {
         let input = parse_cli_args(["index", "--force"]).unwrap();
         assert!(input.full_reindex);
+    }
+
+    #[test]
+    fn parse_upgrade_reuse_policy_spellings_and_equals_form() {
+        for command in ["index", "watch", "daemon"] {
+            assert_eq!(
+                parse_cli_args([command]).unwrap().overrides.upgrade_reuse,
+                None,
+                "omitting the flag must preserve file and environment policy"
+            );
+            for (value, expected) in [
+                ("same-executable", UpgradeReusePolicy::SameExecutable),
+                ("same_executable", UpgradeReusePolicy::SameExecutable),
+                (
+                    "compatible-contract",
+                    UpgradeReusePolicy::CompatibleContract,
+                ),
+                (
+                    "compatible_contract",
+                    UpgradeReusePolicy::CompatibleContract,
+                ),
+            ] {
+                for args in [
+                    vec![
+                        command.to_owned(),
+                        "--upgrade-reuse".to_owned(),
+                        value.to_owned(),
+                    ],
+                    vec![command.to_owned(), format!("--upgrade-reuse={value}")],
+                ] {
+                    let input = parse_cli_args(args).expect("parse upgrade reuse policy");
+                    assert_eq!(input.overrides.upgrade_reuse, Some(expected));
+                    assert!(!input.full_reindex);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_upgrade_reuse_rejects_missing_and_invalid_policy() {
+        let missing = parse_cli_args(["index", "--upgrade-reuse"])
+            .expect_err("a reuse policy must be explicit");
+        assert!(matches!(
+            missing,
+            SearchError::InvalidConfig { field, value, reason }
+                if field == "cli.flag" && value == "--upgrade-reuse" && reason == "missing value"
+        ));
+        for value in ["", "always", "compatible", "--full"] {
+            let error = parse_cli_args(["index", "--upgrade-reuse", value])
+                .expect_err("invalid reuse policy must fail closed");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value: actual, reason }
+                    if field == "cli.indexing.upgrade_reuse"
+                        && actual == value
+                        && reason.contains("same-executable|compatible-contract")
+            ));
+        }
+    }
+
+    #[test]
+    fn parse_upgrade_reuse_last_value_wins_without_disabling_full_reindex() {
+        for (first, last, expected) in [
+            (
+                "same-executable",
+                "compatible-contract",
+                UpgradeReusePolicy::CompatibleContract,
+            ),
+            (
+                "compatible-contract",
+                "same-executable",
+                UpgradeReusePolicy::SameExecutable,
+            ),
+        ] {
+            let input =
+                parse_cli_args(["index", "--upgrade-reuse", first, "--upgrade-reuse", last])
+                    .expect("last explicit policy wins");
+            assert_eq!(input.overrides.upgrade_reuse, Some(expected));
+        }
+        for rebuild_flag in ["--full", "--force"] {
+            for args in [
+                [
+                    "index",
+                    rebuild_flag,
+                    "--upgrade-reuse",
+                    "compatible-contract",
+                ],
+                [
+                    "index",
+                    "--upgrade-reuse",
+                    "compatible-contract",
+                    rebuild_flag,
+                ],
+            ] {
+                let input = parse_cli_args(args).expect("full rebuild with reuse configured");
+                assert!(
+                    input.full_reindex,
+                    "explicit rebuild must remain authoritative"
+                );
+                assert_eq!(
+                    input.overrides.upgrade_reuse,
+                    Some(UpgradeReusePolicy::CompatibleContract)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_upgrade_reuse_overrides_file_and_environment() {
+        for (requested, other, expected) in [
+            (
+                "same-executable",
+                "compatible_contract",
+                UpgradeReusePolicy::SameExecutable,
+            ),
+            (
+                "compatible-contract",
+                "same_executable",
+                UpgradeReusePolicy::CompatibleContract,
+            ),
+        ] {
+            let input = parse_cli_args(["index", "--upgrade-reuse", requested]).unwrap();
+            let file = format!("[indexing]\nupgrade_reuse = \"{other}\"\n");
+            let env = std::collections::HashMap::from([(
+                "FRANKENSEARCH_INDEXING_UPGRADE_REUSE".to_owned(),
+                other.to_owned(),
+            )]);
+            let loaded = crate::config::load_from_str(
+                Some(&file),
+                None,
+                &env,
+                &input.overrides,
+                Path::new("/home/tester"),
+            )
+            .expect("resolve parsed policy over file and environment");
+            assert_eq!(loaded.config.indexing.upgrade_reuse, expected);
+        }
     }
 
     #[test]
@@ -2541,6 +2691,24 @@ mod tests {
                     !script.contains(fictional),
                     "{shell:?} completion advertises fictional command {fictional}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn completion_scripts_advertise_upgrade_reuse_values() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+            CompletionShell::PowerShell,
+        ] {
+            let script = crate::runtime::completion_script(shell);
+            assert!(script.contains("upgrade-reuse"), "{shell:?}");
+            for value in ["same-executable", "compatible-contract"] {
+                assert!(script.contains(value), "{shell:?} is missing {value}");
+                parse_cli_args(["index", "--upgrade-reuse", value])
+                    .expect("completed policy must parse");
             }
         }
     }

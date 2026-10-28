@@ -851,8 +851,40 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// Admission policy for reusing completed indexing work after an executable
+/// change. Neither choice relaxes source, artifact, model or contract checks.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum UpgradeReusePolicy {
+    /// Require the executable fingerprint recorded by the completion receipt.
+    #[default]
+    #[serde(alias = "same-executable")]
+    SameExecutable,
+    /// Permit a different executable only when its indexing contract matches.
+    #[serde(alias = "compatible-contract")]
+    CompatibleContract,
+}
+
+impl UpgradeReusePolicy {
+    // Omit the default to preserve the exact pre-policy receipt serialization.
+    const fn is_same_executable(&self) -> bool {
+        matches!(self, Self::SameExecutable)
+    }
+}
+
+impl FromStr for UpgradeReusePolicy {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "same_executable" | "same-executable" => Ok(Self::SameExecutable),
+            "compatible_contract" | "compatible-contract" => Ok(Self::CompatibleContract),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)] // Independent configuration switches, not state variants.
 pub struct IndexingConfig {
     pub fast_model: String,
     /// Quality model selection. Native-only builds default to verified English
@@ -864,10 +896,6 @@ pub struct IndexingConfig {
     /// implicit background release check while offline.
     #[serde(default)]
     pub offline: bool,
-    /// Permit executable changes only through the existing exact indexing-contract
-    /// reuse admission. Source, producer and artifact checks remain mandatory.
-    #[serde(default)]
-    pub allow_contract_upgrade_reuse: bool,
     pub embedding_batch_size: usize,
     /// Maximum fast-tier passages per source: overlapping windows cover up to
     /// this many 2,000-character spans of each file. One embeds only the
@@ -876,6 +904,13 @@ pub struct IndexingConfig {
     pub fast_window_max_per_file: usize,
     pub reindex_on_change: bool,
     pub watch_mode: bool,
+    /// Opt in to completed-work reuse across compatible executable upgrades.
+    /// This controls admission, not the bytes or coverage produced by indexing.
+    #[serde(
+        default,
+        skip_serializing_if = "UpgradeReusePolicy::is_same_executable"
+    )]
+    pub upgrade_reuse: UpgradeReusePolicy,
 }
 
 impl Default for IndexingConfig {
@@ -893,11 +928,11 @@ impl Default for IndexingConfig {
             .into(),
             model_dir: "~/.local/share/frankensearch/models".into(),
             offline: false,
-            allow_contract_upgrade_reuse: false,
             embedding_batch_size: 64,
             fast_window_max_per_file: default_fast_window_max_per_file(),
             reindex_on_change: true,
             watch_mode: false,
+            upgrade_reuse: UpgradeReusePolicy::SameExecutable,
         }
     }
 }
@@ -1127,11 +1162,11 @@ struct IndexingConfigPatch {
     quality_model: Option<String>,
     model_dir: Option<String>,
     offline: Option<bool>,
-    allow_contract_upgrade_reuse: Option<bool>,
     embedding_batch_size: Option<usize>,
     fast_window_max_per_file: Option<usize>,
     reindex_on_change: Option<bool>,
     watch_mode: Option<bool>,
+    upgrade_reuse: Option<UpgradeReusePolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -1278,20 +1313,22 @@ pub struct ContractDiscoveryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)] // Mirrors independent indexing switches in the public contract.
 pub struct ContractIndexingConfig {
     pub fast_model: String,
     pub quality_model: String,
     pub model_dir: String,
     #[serde(default)]
     pub offline: bool,
-    #[serde(default)]
-    pub allow_contract_upgrade_reuse: bool,
     pub embedding_batch_size: usize,
     #[serde(default = "default_fast_window_max_per_file")]
     pub fast_window_max_per_file: usize,
     pub reindex_on_change: bool,
     pub watch_mode: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "UpgradeReusePolicy::is_same_executable"
+    )]
+    pub upgrade_reuse: UpgradeReusePolicy,
 }
 
 /// Contract defaults for the shadow-oracle fields.
@@ -1411,11 +1448,11 @@ impl From<&FsfsConfig> for ConfigContractValues {
                 quality_model: config.indexing.quality_model.clone(),
                 model_dir: config.indexing.model_dir.clone(),
                 offline: config.indexing.offline,
-                allow_contract_upgrade_reuse: config.indexing.allow_contract_upgrade_reuse,
                 embedding_batch_size: config.indexing.embedding_batch_size,
                 fast_window_max_per_file: config.indexing.fast_window_max_per_file,
                 reindex_on_change: config.indexing.reindex_on_change,
                 watch_mode: config.indexing.watch_mode,
+                upgrade_reuse: config.indexing.upgrade_reuse,
             },
             // Destructured, not field-accessed: adding a public `SearchConfig`
             // field must fail THIS build until the contract, schema, fixtures
@@ -1575,7 +1612,7 @@ pub struct CliOverrides {
     pub fast_only: Option<bool>,
     pub ranking_priors: Option<bool>,
     pub offline: Option<bool>,
-    pub allow_contract_upgrade_reuse: Option<bool>,
+    pub upgrade_reuse: Option<UpgradeReusePolicy>,
     pub allow_background_indexing: Option<bool>,
     pub explain: Option<bool>,
     pub rerank: Option<bool>,
@@ -1616,15 +1653,8 @@ impl CliOverrides {
         if let Some(offline) = self.offline {
             flags.push(if offline { "--offline" } else { "--online" }.into());
         }
-        if let Some(allow) = self.allow_contract_upgrade_reuse {
-            flags.push(
-                if allow {
-                    "--allow-contract-upgrade-reuse"
-                } else {
-                    "--no-contract-upgrade-reuse"
-                }
-                .into(),
-            );
+        if self.upgrade_reuse.is_some() {
+            flags.push("--upgrade-reuse".into());
         }
         if self.allow_background_indexing.is_some() {
             flags.push("--watch-mode".into());
@@ -2373,9 +2403,6 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         if let Some(offline) = indexing.offline {
             config.indexing.offline = offline;
         }
-        if let Some(allow) = indexing.allow_contract_upgrade_reuse {
-            config.indexing.allow_contract_upgrade_reuse = allow;
-        }
         if let Some(embedding_batch_size) = indexing.embedding_batch_size {
             config.indexing.embedding_batch_size = embedding_batch_size;
         }
@@ -2387,6 +2414,9 @@ fn apply_patch(config: &mut FsfsConfig, patch: FsfsConfigPatch) {
         }
         if let Some(watch_mode) = indexing.watch_mode {
             config.indexing.watch_mode = watch_mode;
+        }
+        if let Some(upgrade_reuse) = indexing.upgrade_reuse {
+            config.indexing.upgrade_reuse = upgrade_reuse;
         }
     }
 
@@ -2615,13 +2645,18 @@ fn apply_env_overrides(
         config.search.ranking_priors = parse_bool(value, "search.ranking_priors")?;
         keys_used.push(key.into());
     }
+
     if let Some((key, value)) = env_override(
         env,
-        "FRANKENSEARCH_ALLOW_CONTRACT_UPGRADE_REUSE",
-        "FSFS_ALLOW_CONTRACT_UPGRADE_REUSE",
+        "FRANKENSEARCH_INDEXING_UPGRADE_REUSE",
+        "FSFS_INDEXING_UPGRADE_REUSE",
     ) {
-        config.indexing.allow_contract_upgrade_reuse =
-            parse_bool(value, "indexing.allow_contract_upgrade_reuse")?;
+        config.indexing.upgrade_reuse =
+            UpgradeReusePolicy::from_str(value).map_err(|()| SearchError::InvalidConfig {
+                field: "indexing.upgrade_reuse".into(),
+                value: value.clone(),
+                reason: "expected same_executable|compatible_contract".into(),
+            })?;
         keys_used.push(key.into());
     }
 
@@ -2889,8 +2924,9 @@ fn apply_cli_overrides(config: &mut FsfsConfig, cli: &CliOverrides) -> ProfileSo
     if let Some(offline) = cli.offline {
         config.indexing.offline = offline;
     }
-    if let Some(allow) = cli.allow_contract_upgrade_reuse {
-        config.indexing.allow_contract_upgrade_reuse = allow;
+
+    if let Some(upgrade_reuse) = cli.upgrade_reuse {
+        config.indexing.upgrade_reuse = upgrade_reuse;
     }
 
     if let Some(allow_background_indexing) = cli.allow_background_indexing {
@@ -2997,11 +3033,11 @@ fn collect_unknown_key_warnings(
                 "quality_model",
                 "model_dir",
                 "offline",
-                "allow_contract_upgrade_reuse",
                 "embedding_batch_size",
                 "fast_window_max_per_file",
                 "reindex_on_change",
                 "watch_mode",
+                "upgrade_reuse",
             ]
             .into_iter()
             .collect(),
@@ -3880,8 +3916,9 @@ mod tests {
 
     #[test]
     fn contract_upgrade_policy_resolves_precedence_and_reaches_the_runtime() {
-        let field = "indexing.allow_contract_upgrade_reuse";
-        let file = "[indexing]\nallow_contract_upgrade_reuse = true\n";
+        use super::UpgradeReusePolicy::CompatibleContract;
+        let field = "indexing.upgrade_reuse";
+        let file = "[indexing]\nupgrade_reuse = 'compatible_contract'\n";
         let defaults = load_from_str(
             None,
             None,
@@ -3901,28 +3938,29 @@ mod tests {
         .unwrap();
         assert!(crate::FsfsRuntime::new(from_file.config).contract_upgrade_reuse_enabled());
         let env = HashMap::from([(
-            "FSFS_ALLOW_CONTRACT_UPGRADE_REUSE".to_owned(),
-            "false".to_owned(),
+            "FSFS_INDEXING_UPGRADE_REUSE".to_owned(),
+            "same_executable".to_owned(),
         )]);
         let from_env =
             load_from_str(Some(file), None, &env, &CliOverrides::default(), home()).unwrap();
         assert!(!crate::FsfsRuntime::new(from_env.config).contract_upgrade_reuse_enabled());
         let cli = CliOverrides {
-            allow_contract_upgrade_reuse: Some(true),
+            upgrade_reuse: Some(CompatibleContract),
             ..CliOverrides::default()
         };
         let from_cli = load_from_str(Some(file), None, &env, &cli, home()).unwrap();
         assert!(
             from_cli
                 .cli_flags_used
-                .contains(&"--allow-contract-upgrade-reuse".to_owned())
+                .contains(&"--upgrade-reuse".to_owned())
         );
-        assert!(
+        assert_eq!(
             from_cli
                 .to_effective_snapshot()
                 .values
                 .indexing
-                .allow_contract_upgrade_reuse
+                .upgrade_reuse,
+            CompatibleContract
         );
         let runtime = crate::FsfsRuntime::new(from_cli.config);
         assert!(runtime.clone().contract_upgrade_reuse_enabled());
@@ -3931,17 +3969,15 @@ mod tests {
                 .with_contract_upgrade_reuse(false)
                 .contract_upgrade_reuse_enabled()
         );
-        let invalid = HashMap::from([(
-            "FSFS_ALLOW_CONTRACT_UPGRADE_REUSE".to_owned(),
-            "maybe".to_owned(),
-        )]);
+        let invalid =
+            HashMap::from([("FSFS_INDEXING_UPGRADE_REUSE".to_owned(), "maybe".to_owned())]);
         assert!(
             matches!(load_from_str(None, None, &invalid, &CliOverrides::default(), home()),
             Err(SearchError::InvalidConfig { field: actual, .. }) if actual == field)
         );
         assert!(
             load_from_str(
-                Some("[indexing]\nallow_contract_upgrade_reuse = 'yes'\n"),
+                Some("[indexing]\nupgrade_reuse = 'yes'\n"),
                 None,
                 &HashMap::new(),
                 &CliOverrides::default(),
@@ -5992,6 +6028,128 @@ mod tests {
         assert_eq!(cfg.fast_window_max_per_file, 128);
         assert!(cfg.reindex_on_change);
         assert!(!cfg.watch_mode);
+        assert_eq!(cfg.upgrade_reuse, super::UpgradeReusePolicy::SameExecutable);
+    }
+
+    #[test]
+    fn upgrade_reuse_policy_loads_with_precedence_and_reports_sources() {
+        use super::UpgradeReusePolicy::{CompatibleContract, SameExecutable};
+
+        let file = "[indexing]\nupgrade_reuse = \"compatible_contract\"\n";
+        let from_file = load_from_str(
+            Some(file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("file opt-in");
+        assert_eq!(from_file.config.indexing.upgrade_reuse, CompatibleContract);
+        assert!(
+            from_file
+                .warnings
+                .iter()
+                .all(|warning| { !warning.message.contains("upgrade_reuse") })
+        );
+
+        for env_key in [
+            "FSFS_INDEXING_UPGRADE_REUSE",
+            "FRANKENSEARCH_INDEXING_UPGRADE_REUSE",
+        ] {
+            let env = HashMap::from([(env_key.to_owned(), "same-executable".to_owned())]);
+            let from_env = load_from_str(Some(file), None, &env, &CliOverrides::default(), home())
+                .expect("environment overrides file opt-in");
+            assert_eq!(from_env.config.indexing.upgrade_reuse, SameExecutable);
+            assert!(from_env.env_keys_used.iter().any(|key| key == env_key));
+
+            let cli = CliOverrides {
+                upgrade_reuse: Some(CompatibleContract),
+                ..CliOverrides::default()
+            };
+            let from_cli = load_from_str(Some(file), None, &env, &cli, home())
+                .expect("CLI overrides environment");
+            assert_eq!(from_cli.config.indexing.upgrade_reuse, CompatibleContract);
+            assert!(from_cli.cli_flags_used.contains(&"--upgrade-reuse".into()));
+        }
+
+        let env = HashMap::from([
+            (
+                "FSFS_INDEXING_UPGRADE_REUSE".into(),
+                "compatible_contract".into(),
+            ),
+            (
+                "FRANKENSEARCH_INDEXING_UPGRADE_REUSE".into(),
+                "same_executable".into(),
+            ),
+        ]);
+        let resolved = load_from_str(None, None, &env, &CliOverrides::default(), home())
+            .expect("canonical environment prefix wins");
+        assert_eq!(resolved.config.indexing.upgrade_reuse, SameExecutable);
+        assert_eq!(
+            resolved.env_keys_used,
+            vec!["FRANKENSEARCH_INDEXING_UPGRADE_REUSE"]
+        );
+    }
+
+    #[test]
+    fn upgrade_reuse_policy_rejects_unknown_values() {
+        for invalid in ["", "always", "compatible", "true", "COMPATIBLE_CONTRACT"] {
+            let env =
+                HashMap::from([("FSFS_INDEXING_UPGRADE_REUSE".to_owned(), invalid.to_owned())]);
+            let error = load_from_str(None, None, &env, &CliOverrides::default(), home())
+                .expect_err("unknown environment policy must fail closed");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field, value, .. }
+                    if field == "indexing.upgrade_reuse" && value == invalid
+            ));
+            let file = format!("[indexing]\nupgrade_reuse = {invalid:?}\n");
+            assert!(
+                load_from_str(
+                    Some(&file),
+                    None,
+                    &HashMap::new(),
+                    &CliOverrides::default(),
+                    home(),
+                )
+                .is_err(),
+                "unknown file policy {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn upgrade_reuse_policy_serialization_preserves_legacy_defaults_and_exposes_opt_in() {
+        use super::UpgradeReusePolicy::{CompatibleContract, SameExecutable};
+
+        let mut config = super::FsfsConfig::default();
+        let old_json = serde_json::to_string(&config).expect("encode defaults");
+        let old_toml = config.to_toml().expect("encode file defaults");
+        assert!(!old_json.contains("upgrade_reuse"));
+        assert!(!old_toml.contains("upgrade_reuse"));
+        let restored: super::FsfsConfig = serde_json::from_str(&old_json).unwrap();
+        assert_eq!(restored.indexing.upgrade_reuse, SameExecutable);
+        let old_contract =
+            serde_json::to_string(&super::ConfigContractValues::from(&config)).unwrap();
+        assert!(!old_contract.contains("upgrade_reuse"));
+        let restored: super::ConfigContractValues = serde_json::from_str(&old_contract).unwrap();
+        assert_eq!(restored.indexing.upgrade_reuse, SameExecutable);
+
+        config.indexing.upgrade_reuse = CompatibleContract;
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["indexing"]["upgrade_reuse"], "compatible_contract");
+        let contract = serde_json::to_value(super::ConfigContractValues::from(&config)).unwrap();
+        assert_eq!(contract["indexing"]["upgrade_reuse"], "compatible_contract");
+        let file = config.to_toml().expect("encode opt-in");
+        let restored = load_from_str(
+            Some(&file),
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("opt-in TOML roundtrip");
+        assert_eq!(restored.config.indexing.upgrade_reuse, CompatibleContract);
     }
 
     #[test]
@@ -6130,7 +6288,7 @@ mod tests {
             fast_only: Some(true),
             ranking_priors: Some(true),
             offline: Some(true),
-            allow_contract_upgrade_reuse: Some(false),
+            upgrade_reuse: Some(super::UpgradeReusePolicy::SameExecutable),
             allow_background_indexing: Some(false),
             explain: Some(true),
             rerank: Some(true),
@@ -6144,7 +6302,7 @@ mod tests {
         let flags = cli.used_flags();
         assert_eq!(flags.len(), 16);
         assert!(flags.contains(&"--ranking-priors".to_string()));
-        assert!(flags.contains(&"--no-contract-upgrade-reuse".to_string()));
+        assert!(flags.contains(&"--upgrade-reuse".to_string()));
         assert!(flags.contains(&"--rerank".to_string()));
         assert!(flags.contains(&"--roots".to_string()));
         assert!(flags.contains(&"--exclude".to_string()));

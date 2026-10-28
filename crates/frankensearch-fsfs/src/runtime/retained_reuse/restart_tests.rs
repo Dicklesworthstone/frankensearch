@@ -2,7 +2,7 @@
 //! The counted hash producer is an explicit non-semantic control: these tests
 //! establish reuse and invalidation, not real-model relevance or performance.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,12 +22,14 @@ use super::super::{
     CompleteGenerationStore, FsfsRuntime, LEGACY_RECEIPT_FILE, LegacyReuseReceipt, RECEIPT_FILE,
     ReuseReceipt, proven, read_json, seed_candidate, session_id,
 };
+use crate::config::load_from_str;
 use crate::generation_store::{GenerationPublication, PublishedGeneration};
-use crate::{CliCommand, CliInput, FsfsConfig};
+use crate::{CliCommand, parse_cli_args};
 
 const CHILD_ROOT: &str = "FSFS_REUSE_CHILD_ROOT";
 const CHILD_MODE: &str = "FSFS_REUSE_CHILD_MODE";
 const CHILD_REPORT: &str = "FSFS_REUSE_CHILD_REPORT";
+const CHILD_UPGRADE_POLICY: &str = "FSFS_REUSE_CHILD_UPGRADE_POLICY";
 
 struct CountedHash {
     inner: HashEmbedder,
@@ -93,21 +95,34 @@ struct ChildReport {
     hits: Vec<String>,
 }
 
-fn configured(parent: &Path) -> FsfsRuntime {
-    let mut config = FsfsConfig::default();
-    config.indexing.offline = true;
-    config.indexing.quality_model.clear();
-    config.indexing.embedding_batch_size = 1;
-    config.search.fast_only = true;
-    config.search.rerank = false;
-    "{index_dir}/catalog.sqlite".clone_into(&mut config.storage.db_path);
-    FsfsRuntime::new(config).with_cli_input(CliInput {
-        command: CliCommand::Index,
-        target_path: Some(parent.join("source")),
-        index_dir: Some(parent.join("store")),
-        quiet: true,
-        ..CliInput::default()
-    })
+fn configured(parent: &Path, mode: &str) -> FsfsRuntime {
+    // Exercise the production parser, precedence resolution and constructor;
+    // the test must not enable reuse through its library-only builder.
+    let mut args = vec!["index".to_owned(), "--quiet".to_owned()];
+    if let Ok(policy) = std::env::var(CHILD_UPGRADE_POLICY) {
+        args.extend(["--upgrade-reuse".to_owned(), policy]);
+    }
+    if mode == "seed_full" {
+        args.push("--full".to_owned());
+    } else if mode == "seed_force" {
+        args.push("--force".to_owned());
+    }
+    let mut input = parse_cli_args(args).unwrap();
+    let loaded = load_from_str(
+        Some(
+            "[indexing]\noffline = true\nquality_model = \"\"\nembedding_batch_size = 1\n\
+             [search]\nfast_only = true\nrerank = false\n\
+             [storage]\ndb_path = \"{index_dir}/catalog.sqlite\"\n",
+        ),
+        None,
+        &HashMap::new(),
+        &input.overrides,
+        parent,
+    )
+    .unwrap();
+    input.target_path = Some(parent.join("source"));
+    input.index_dir = Some(parent.join("store"));
+    FsfsRuntime::new(loaded.config).with_cli_input(input)
 }
 
 async fn rebuild(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> PublishedGeneration {
@@ -115,6 +130,7 @@ async fn rebuild(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> PublishedGenera
     match publication {
         GenerationPublication::Durable(generation) => generation,
         other @ GenerationPublication::VisibleButDurabilityUncertain { .. } => {
+            // ubs:ignore[rust.ownership.panic-macro] -- This cfg(test)-only restart fixture must fail if publication durability is uncertain; preserve the positive-path assertion.
             panic!("fixture publication is not durable: {other:?}")
         }
     }
@@ -144,7 +160,7 @@ fn restart_child() {
         let executable = super::fingerprint()
             .expect("Linux restart test requires a provable executing image")
             .to_owned();
-        let mut runtime = configured(&parent);
+        let mut runtime = configured(&parent, &mode);
         let root = parent.join("store");
         if mode == "legacy_rebuild" {
             let payload = runtime
@@ -202,8 +218,8 @@ fn restart_child() {
                 // The default limit is unlimited (usize::MAX); any finite value
                 // changes the configuration without overflowing.
                 runtime.config.search.default_limit = 17;
-            } else if mode == "seed_full" {
-                runtime.cli_input.full_reindex = true;
+            } else if matches!(mode.as_str(), "seed_full" | "seed_force") {
+                assert!(runtime.cli_input.full_reindex);
             } else {
                 assert_eq!(mode, "seed");
             }
@@ -263,6 +279,16 @@ impl Drop for OwnedChild {
 }
 
 fn child(executable: &Path, parent: &Path, mode: &str, label: &str) -> ChildReport {
+    child_with_policy(executable, parent, mode, label, None)
+}
+
+fn child_with_policy(
+    executable: &Path,
+    parent: &Path,
+    mode: &str,
+    label: &str,
+    policy: Option<&str>,
+) -> ChildReport {
     let report_path = parent.join(format!("{label}.json"));
     let log_path = parent.join(format!("{label}.log"));
     let log = File::create(&log_path).unwrap();
@@ -270,24 +296,26 @@ fn child(executable: &Path, parent: &Path, mode: &str, label: &str) -> ChildRepo
         "{}::restart_child",
         module_path!().split_once("::").unwrap().1
     );
-    let mut child = OwnedChild(
-        Command::new(executable)
-            .args([
-                "--exact",
-                &test_name,
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD_ROOT, parent)
-            .env(CHILD_MODE, mode)
-            .env(CHILD_REPORT, &report_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap(),
-    );
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "--exact",
+            &test_name,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_ROOT, parent)
+        .env(CHILD_MODE, mode)
+        .env(CHILD_REPORT, &report_path)
+        .env_remove(CHILD_UPGRADE_POLICY)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().unwrap()))
+        .stderr(Stdio::from(log));
+    if let Some(policy) = policy {
+        command.env(CHILD_UPGRADE_POLICY, policy);
+    }
+    let mut child = OwnedChild(command.spawn().unwrap());
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
@@ -381,6 +409,17 @@ fn restart_completed_legacy_reuses_inputs_and_rejects_changed_executable() {
     assert_ne!(changed.executable, first.executable);
     assert_eq!(source_inputs(&changed).len(), 4);
     assert_eq!(changed.hits, first.hits);
+    let opted_in = child_with_policy(
+        &executable,
+        parent,
+        "legacy_rebuild",
+        "compatible-image",
+        Some("compatible-contract"),
+    );
+    assert_ne!(opted_in.executable, changed.executable);
+    assert_eq!(opted_in.eligible, 4);
+    assert!(source_inputs(&opted_in).is_empty());
+    assert_eq!(opted_in.hits, first.hits);
 }
 
 #[test]
@@ -502,6 +541,162 @@ fn restart_changed_executable_bytes_cannot_reuse_a_same_version_receipt() {
     assert_eq!(refused.hits, first.hits);
     assert!(refused.embedded_inputs.is_empty());
     assert_eq!(snapshot(&retained), before);
+}
+
+fn upgrade_test_image(executable: &Path, parent: &Path) -> PathBuf {
+    let alternate = parent.join("upgrade-test-image");
+    fs::copy(executable, &alternate).unwrap();
+    // Change the actual executing-image hash, never the recorded hash. This
+    // exercises image-bound admission, not compatibility of different source
+    // implementations or real-model semantic qualification.
+    let mut file = OpenOptions::new().append(true).open(&alternate).unwrap();
+    file.write_all(b"\nfsfs contract upgrade executable control\n")
+        .unwrap();
+    file.sync_all().unwrap();
+    alternate
+}
+
+#[test]
+fn restart_cli_upgrade_policy_reuses_changed_image_and_survives_policy_toggle() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path();
+    source_fixture(parent);
+    let executable = std::env::current_exe().unwrap();
+    let first = child(&executable, parent, "rebuild", "first");
+    assert_eq!(source_inputs(&first).len(), 4);
+    let retained = generation_path(parent, &first);
+    let before = snapshot(&retained);
+    let alternate = upgrade_test_image(&executable, parent);
+    let refused = child_with_policy(
+        &alternate,
+        parent,
+        "seed",
+        "explicit-conservative",
+        Some("same-executable"),
+    );
+    assert_ne!(refused.executable, first.executable);
+    assert_eq!(refused.seeded, None);
+    assert!(refused.embedded_inputs.is_empty());
+
+    let seeded = child_with_policy(
+        &alternate,
+        parent,
+        "seed",
+        "compatible-seed",
+        Some("compatible-contract"),
+    );
+    assert_ne!(seeded.executable, first.executable);
+    assert_ne!(seeded.session, first.session);
+    assert_eq!(seeded.receipt_session, first.session);
+    assert_eq!(seeded.seeded, Some(4));
+    assert!(seeded.embedded_inputs.is_empty());
+
+    let second = child_with_policy(
+        &alternate,
+        parent,
+        "rebuild",
+        "compatible-rebuild",
+        Some("compatible-contract"),
+    );
+    assert_ne!(second.executable, first.executable);
+    assert_ne!(second.generation, first.generation);
+    assert!(source_inputs(&second).is_empty());
+    assert_eq!(second.hits, first.hits);
+    assert_eq!(snapshot(&retained), before);
+
+    // A receipt produced while opted in is also reusable under the default
+    // same-image policy. The admission toggle cannot poison its config hash.
+    let toggled_off = child(&alternate, parent, "seed", "default-after-upgrade");
+    assert_eq!(toggled_off.executable, second.executable);
+    assert_eq!(toggled_off.seeded, Some(4));
+    assert!(toggled_off.embedded_inputs.is_empty());
+    assert_eq!(toggled_off.hits, first.hits);
+
+    // Cross-image admission must still hash source bytes, even when size and
+    // mtime agree with the completed receipt.
+    let changed = parent.join("source/doc-0.md");
+    let modified = fs::metadata(&changed).unwrap().modified().unwrap();
+    fs::write(&changed, "sharedtoken document Z").unwrap();
+    File::options()
+        .write(true)
+        .open(&changed)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let updated = child_with_policy(
+        &executable,
+        parent,
+        "rebuild",
+        "changed-source",
+        Some("compatible-contract"),
+    );
+    assert_ne!(updated.executable, second.executable);
+    let inputs = source_inputs(&updated);
+    assert_eq!(inputs.len(), 1, "unexpected source inference: {inputs:?}");
+    assert!(inputs[0].contains("document Z"));
+    assert_eq!(updated.hits, first.hits);
+    assert_eq!(snapshot(&retained), before);
+}
+
+#[test]
+fn restart_cli_upgrade_policy_preserves_force_config_and_contract_refusals() {
+    let directory = tempfile::tempdir().unwrap();
+    let parent = directory.path();
+    source_fixture(parent);
+    let executable = std::env::current_exe().unwrap();
+    let first = child(&executable, parent, "rebuild", "first");
+    let retained = generation_path(parent, &first);
+    let before = snapshot(&retained);
+    let alternate = upgrade_test_image(&executable, parent);
+    for mode in ["seed_full", "seed_force", "seed_changed_config"] {
+        let refused =
+            child_with_policy(&alternate, parent, mode, mode, Some("compatible-contract"));
+        assert_ne!(refused.executable, first.executable);
+        assert_eq!(refused.seeded, None, "{mode}");
+        assert_eq!(refused.generation, first.generation);
+        assert!(refused.embedded_inputs.is_empty());
+        assert_eq!(refused.hits, first.hits);
+        assert_eq!(snapshot(&retained), before);
+    }
+
+    let receipt_path = retained.join(RECEIPT_FILE);
+    let original = fs::read(&receipt_path).unwrap();
+    for mode in [
+        "contract-missing",
+        "contract-drift",
+        "executable-missing",
+        "executable-malformed",
+    ] {
+        let mut receipt: ReuseReceipt = serde_json::from_slice(&original).unwrap();
+        match mode {
+            "contract-missing" => receipt.indexing_contract_sha256 = None,
+            "contract-drift" => {
+                let current = receipt.indexing_contract_sha256.as_ref().unwrap();
+                let other = if current.starts_with('a') { 'b' } else { 'a' };
+                receipt.indexing_contract_sha256 = Some(other.to_string().repeat(64));
+            }
+            "executable-missing" => receipt.executable_sha256 = None,
+            "executable-malformed" => {
+                receipt.executable_sha256 = Some("invalid-executable-proof".to_owned());
+            }
+            _ => unreachable!(),
+        }
+        fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let damaged = snapshot(&retained);
+        let refused = child_with_policy(
+            &alternate,
+            parent,
+            "seed",
+            mode,
+            Some("compatible-contract"),
+        );
+        assert_ne!(refused.executable, first.executable);
+        assert_eq!(refused.seeded, None, "{mode}");
+        assert_eq!(refused.generation, first.generation);
+        assert!(refused.embedded_inputs.is_empty());
+        assert_eq!(refused.hits, first.hits);
+        assert_eq!(snapshot(&retained), damaged);
+    }
 }
 
 #[test]

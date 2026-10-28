@@ -179,8 +179,8 @@ mod loader_only {
                 .env_remove("FRANKENSEARCH_STORAGE_INDEX_DIR")
                 .env_remove("FRANKENSEARCH_RANKING_PRIORS")
                 .env_remove("FSFS_RANKING_PRIORS")
-                .env_remove("FRANKENSEARCH_ALLOW_CONTRACT_UPGRADE_REUSE")
-                .env_remove("FSFS_ALLOW_CONTRACT_UPGRADE_REUSE")
+                .env_remove("FRANKENSEARCH_INDEXING_UPGRADE_REUSE")
+                .env_remove("FSFS_INDEXING_UPGRADE_REUSE")
                 .env_remove("FSFS_DISABLE_QUERY_CACHE")
                 .env_remove("FRANKENSEARCH_API_PROVIDER")
                 .env_remove("FRANKENSEARCH_API_MODEL")
@@ -3415,21 +3415,27 @@ mod loader_only {
         let temp = tempfile::tempdir().unwrap();
         let fsfs = IsolatedFsfs::new(temp.path(), temp.path().join("empty-model-cache"));
         for (label, flags, expected) in [
-            ("default", vec![], false),
-            ("enabled", vec!["--allow-contract-upgrade-reuse"], true),
+            ("default", vec![], "same_executable"),
+            (
+                "enabled",
+                vec!["--upgrade-reuse", "compatible-contract"],
+                "compatible_contract",
+            ),
             (
                 "disabled",
                 vec![
-                    "--allow-contract-upgrade-reuse",
-                    "--no-contract-upgrade-reuse",
+                    "--upgrade-reuse",
+                    "compatible-contract",
+                    "--upgrade-reuse",
+                    "same-executable",
                 ],
-                false,
+                "same_executable",
             ),
         ] {
             let mut args = vec![
                 "config",
                 "get",
-                "indexing.allow_contract_upgrade_reuse",
+                "indexing.upgrade_reuse",
                 "--format",
                 "json",
             ];
@@ -3474,18 +3480,30 @@ mod loader_only {
         for (control, flags, expected_carried) in [
             (
                 "compatible",
-                vec!["--allow-contract-upgrade-reuse"],
+                vec!["--upgrade-reuse", "compatible-contract"],
                 QUICKSTART_DOCUMENT_COUNT,
             ),
-            ("disabled", vec!["--no-contract-upgrade-reuse"], 0),
-            ("window-drift", vec!["--allow-contract-upgrade-reuse"], 0),
+            ("disabled", vec!["--upgrade-reuse", "same-executable"], 0),
+            (
+                "window-drift",
+                vec!["--upgrade-reuse", "compatible-contract"],
+                0,
+            ),
             (
                 "source-drift",
-                vec!["--allow-contract-upgrade-reuse"],
+                vec!["--upgrade-reuse", "compatible-contract"],
                 QUICKSTART_DOCUMENT_COUNT - 1,
             ),
-            ("artifact-drift", vec!["--allow-contract-upgrade-reuse"], 0),
-            ("producer-drift", vec!["--allow-contract-upgrade-reuse"], 0),
+            (
+                "artifact-drift",
+                vec!["--upgrade-reuse", "compatible-contract"],
+                0,
+            ),
+            (
+                "producer-drift",
+                vec!["--upgrade-reuse", "compatible-contract"],
+                0,
+            ),
         ] {
             let corpus = temp.path().join(format!("{control}-corpus"));
             write_quickstart_corpus(&corpus);

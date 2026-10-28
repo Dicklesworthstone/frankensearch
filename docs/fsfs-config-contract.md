@@ -62,24 +62,51 @@ Path expansion rule:
 - `model_dir: string`
 - `offline: bool` (default `false`; `--offline` forbids model acquisition,
   including a forced refresh. `--online` explicitly permits acquisition.)
-- `allow_contract_upgrade_reuse: bool` (default `false`; opt in with
-  `--allow-contract-upgrade-reuse`, `FRANKENSEARCH_ALLOW_CONTRACT_UPGRADE_REUSE=true`,
-  or this config key. `--no-contract-upgrade-reuse` explicitly disables it.)
-  This permits a different executable only when the existing versioned indexing
-  contract, producer identities, complete source and artifact admission all match.
-  Missing or incompatible receipts still rebuild. The admission switch itself
-  does not change the semantic indexing fingerprint. It does not permit model
-  migration or bypass an artifact check.
 - `embedding_batch_size: int` (`1..4096`, default `64`; bounds document batches in
   one-shot indexing and the watch vector pipeline. Smaller batches reduce working
   memory and the time between batch checkpoints; they do not reduce model size.)
 - `reindex_on_change: bool` (default `true`; `fsfs index` and watch always re-index changed files, so `false` changes nothing and loading it warns `config.setting.no_effect`)
 - `watch_mode: bool`
+- `upgrade_reuse: "same_executable" | "compatible_contract"` (default
+  `same_executable`; optional in v1 snapshots and omitted when at its default)
 
 Model upgrades must pass the stored producer-revision check, even if the
 embedding space and output vectors are unchanged. The Model2Vec adapter bump
 from `frankensearch-embed` 0.2.6 to 0.2.7 changes that revision; rebuild with
 `fsfs index` before searching or watching an index produced by 0.2.6.
+
+### Reusing completed work after an executable upgrade
+
+By default, a changed executable invalidates completed-work reuse. To let an
+upgraded executable reuse a previous index when the indexing contract still
+matches, opt in for the indexing pass:
+
+```bash
+fsfs index /path/to/project --upgrade-reuse compatible-contract
+```
+
+The persistent equivalent is `[indexing] upgrade_reuse = "compatible_contract"`.
+`FRANKENSEARCH_INDEXING_UPGRADE_REUSE` and `FSFS_INDEXING_UPGRADE_REUSE` override
+the file; the CLI flag overrides either environment variable. The canonical
+`FRANKENSEARCH_` prefix wins when both are present. CLI and environment values
+accept hyphens or underscores. Unknown policies fail configuration loading.
+Use `--upgrade-reuse same-executable` to restore the conservative policy for a run.
+
+This opt-in only removes the requirement for identical executable fingerprints
+when a completion receipt contains the matching versioned indexing contract.
+It preserves configuration, target-root, checkpoint, artifact-integrity,
+source-content and producer-identity checks. Changed source files still require
+indexing, and a changed model or indexing contract cannot reuse incompatible
+work. Complete-generation rebuilds seed an independently verified staging copy,
+leaving the selected predecessor intact until publication. Legacy-layout
+indexing uses the same receipt admission policy.
+
+`--full` and `--force` still bypass completed-work reuse. The upgrade policy is
+excluded from the indexing configuration fingerprint because it changes
+admission, not indexed bytes. Its default is omitted from serialization so that
+introducing the setting does not invalidate existing completion receipts.
+`fsfs config get indexing.upgrade_reuse` reports the resolved policy even when
+that default is omitted from the internal serialized representation.
 
 ### Registered model selection and first-run acquisition
 
