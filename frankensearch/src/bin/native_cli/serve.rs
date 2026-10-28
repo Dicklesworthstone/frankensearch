@@ -258,9 +258,10 @@ async fn phases<W: Write>(
         }))
         .await
         .map_err(Failure::Query)?;
-        let Some(phase) = phase else {
+        let Some(mut phase) = phase else {
             break;
         };
+        phase.hydrate_metadata(index, cx).map_err(Failure::Query)?;
         let mut payload = match phase {
             NativeSearchPhase::Initial {
                 results,

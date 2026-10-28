@@ -166,7 +166,8 @@ pub async fn buffered<'i>(
         let scoped = cohort::Prepared::prepare(index, cx, filters)?;
         let mut stream = policy.progressive(&scoped, cx, text, limit)?;
         let mut final_page = None;
-        while let Some(phase) = stream.next_phase().await? {
+        while let Some(mut phase) = stream.next_phase().await? {
+            phase.hydrate_metadata(index, cx)?;
             let (phase, results, evaluated) = match phase {
                 NativeSearchPhase::Initial { results, .. } => ("initial", results, 0),
                 NativeSearchPhase::Refined { results, .. } => ("refined", results, 0),

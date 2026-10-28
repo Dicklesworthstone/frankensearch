@@ -103,6 +103,35 @@ impl<'a> Index<'a> {
             payload["partitions"] = serde_json::json!(index.vectors().partitions().len());
         }
     }
+
+    /// Vector-only winners have no lexical hydration row. The executable owns
+    /// a complete immutable source cohort, so fill their metadata from that
+    /// same selection before delivery, never from a refreshed/current path.
+    pub fn hydrate_metadata(self, cx: &Cx, rows: &mut Rows) -> Result<()> {
+        let hydrate = |result: &mut ScoredResult| -> Result<()> {
+            cx.checkpoint().map_err(|error| SearchError::Cancelled {
+                phase: "native_cli.metadata".to_owned(),
+                reason: error.to_string(),
+            })?;
+            if result.metadata.is_none() {
+                let document = match self {
+                    Self::Single(index) => index.vectors().document(result.doc_id.as_str()),
+                    Self::Sharded(index) => index.vectors().document(result.doc_id.as_str()),
+                }
+                .ok_or_else(|| super::bad("native result is absent from its retained source"))?;
+                result.metadata = Some(std::sync::Arc::new(serde_json::to_value(
+                    &document.metadata,
+                )?));
+            }
+            Ok(())
+        };
+        match rows {
+            Rows::Single(results) => results.iter_mut().try_for_each(hydrate),
+            Rows::Sharded(results) => results
+                .iter_mut()
+                .try_for_each(|hit| hydrate(&mut hit.result)),
+        }
+    }
 }
 
 pub enum Prepared<'a> {
@@ -418,6 +447,23 @@ pub enum Phase {
         previous_results: Rows,
         error: SearchError,
     },
+}
+
+impl Phase {
+    pub fn hydrate_metadata(&mut self, index: Index<'_>, cx: &Cx) -> Result<()> {
+        let rows = match self {
+            Self::Initial { results, .. }
+            | Self::Refined { results, .. }
+            | Self::Reranked { results, .. } => results,
+            Self::RefinementFailed {
+                initial_results, ..
+            } => initial_results,
+            Self::RerankFailed {
+                previous_results, ..
+            } => previous_results,
+        };
+        index.hydrate_metadata(cx, rows)
+    }
 }
 
 impl From<NativeSearchPhase> for Phase {
