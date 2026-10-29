@@ -1,5 +1,21 @@
 # Changelog
 
+### Unreleased — Quill 0.4.2 producer metadata (#68, 2026-10-28)
+
+- Quill derives its durable producer version from Cargo's package metadata
+  during constant evaluation. Invalid or unrepresentable version components
+  fail the build. The existing semver assertion and every historical manifest
+  golden image remain enforced; durable format versions are unchanged.
+- The corrected hotfix source is
+  `150c159460d94ca3f304afc156ffc0dcb539483a`, derived from the preserved
+  `7307e621b429f92f816db67390a7352bd3599b37` release preparation with only
+  `keeper.rs` changed. The validated sealing implementation remains `scribe.rs`
+  blob `caf92bc19e4277786a1f1fb82171036e19bc07af`.
+- Correctly stamped 0.4.2 output has new producer metadata and corresponding
+  segment identities/checksums. The sealing optimization's byte-identity
+  evidence applies to equal explicit input metadata. Package publication,
+  registry-artifact verification, and CASS's dependency uptake remain pending.
+
 ### Unreleased — Honor configured models and offline acquisition (2026-10-24)
 
 - First-run consent now selects the configured fast producer and enabled
