@@ -682,7 +682,7 @@ mod loader_only {
         let mut records = matching_records();
         assert_eq!(records.len(), 1, "the real query must persist one answer");
         let (cache_path, cache_bytes, record) = records.pop().unwrap();
-        assert_eq!(record["schema_version"], "fsfs.search.cache.v19");
+        assert_eq!(record["schema_version"], "fsfs.search.cache.v21");
         assert_eq!(record["key"]["fast_model"], "potion-multilingual-128m");
 
         let warm = search("fast-model-cache-warm", &selected);
@@ -2937,7 +2937,14 @@ mod loader_only {
         let appended_id = corpus.join(appended_name).display().to_string();
         let append_path = temp.path().join("append.jsonl");
         let content = "数据库事务发生死锁后，回滚事务并按固定顺序重试锁操作。";
-        fs::write(&append_path, format!("{}\n", serde_json::json!({"id": appended_id, "text": content}))).unwrap();
+        fs::write(
+            &append_path,
+            format!(
+                "{}\n",
+                serde_json::json!({"id": appended_id, "text": content})
+            ),
+        )
+        .unwrap();
         let predecessor_bytes = fs::read(&quality_path).unwrap();
         let append = fsfs.run(
             temp.path(),
