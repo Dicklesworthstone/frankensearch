@@ -57,14 +57,14 @@ impl Embedder for ProgressiveProvider {
             Ok(if self.quality {
                 if special || text == "unmatched" {
                     vec![1.0, 0.0, 0.0]
-                } else if text == "fast-quality-ordinary" {
+                } else if text == "fast-quality-ordinary cohort" {
                     vec![0.6, 0.8, 0.0]
                 } else {
                     vec![0.0, 1.0, 0.0]
                 }
-            } else if special || text == "fast-tail-ordinary" {
+            } else if special || text == "fast-tail-ordinary cohort" {
                 vec![0.0, 1.0]
-            } else if text == "unmatched" || text == "fast-quality-ordinary" {
+            } else if text == "unmatched" || text == "fast-quality-ordinary cohort" {
                 vec![1.0, 0.0]
             } else {
                 vec![0.8, 0.6]
@@ -203,8 +203,8 @@ async fn progressive_fixture_with_retrieval(
     // The quality-only document still lies outside the three-result fast pool.
     .add_documents(["a", "b", "c", "d", "e"].into_iter().map(|id| {
         let content = match id {
-            "d" => "fast-tail-ordinary",
-            "e" => "fast-quality-ordinary",
+            "d" => "fast-tail-ordinary cohort",
+            "e" => "fast-quality-ordinary cohort",
             _ => "ordinary cohort document",
         };
         IndexableDocument::new(id, content).with_metadata("version", "old")
