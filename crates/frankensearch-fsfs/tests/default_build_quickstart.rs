@@ -2934,9 +2934,11 @@ mod loader_only {
         drop(daemon);
 
         let appended_name = "retry-locks.md";
+        let appended_id = corpus.join(appended_name).display().to_string();
         let append_path = temp.path().join("append.jsonl");
         let content = "数据库事务发生死锁后，回滚事务并按固定顺序重试锁操作。";
-        fs::write(&append_path, format!("{}\n", serde_json::json!({"id": corpus.join(appended_name).display().to_string(), "text": content}))).unwrap();
+        fs::write(&append_path, format!("{}\n", serde_json::json!({"id": appended_id, "text": content}))).unwrap();
+        let predecessor_bytes = fs::read(&quality_path).unwrap();
         let append = fsfs.run(
             temp.path(),
             "multilingual-append",
@@ -2953,8 +2955,25 @@ mod loader_only {
             ],
             QUICKSTART_TIMEOUT,
         );
-        parse_success_envelope("multilingual append", &append);
-        let quality = VectorIndex::open_read_only(&quality_path).unwrap();
+        let receipt = parse_success_envelope("multilingual append", &append);
+        let successor_quality_path = active_generation_root(&index).join("vector/quality.fsvi");
+        let complete = is_complete_store(&index);
+        if complete {
+            assert_eq!(receipt["data"]["appended"], 1);
+            assert_eq!(receipt["data"]["publication"], "durable");
+            assert_eq!(receipt["data"]["generation_changed"], true);
+            assert_ne!(successor_quality_path, quality_path);
+            assert_eq!(
+                successor_quality_path,
+                Path::new(receipt["data"]["generation_path"].as_str().unwrap())
+                    .join("vector/quality.fsvi")
+            );
+            assert_eq!(fs::read(&quality_path).unwrap(), predecessor_bytes);
+            let predecessor = VectorIndex::open_read_only(&quality_path).unwrap();
+            assert_eq!(predecessor.record_count(), 6);
+            assert!(!predecessor.live_doc_ids().unwrap().contains(&appended_id));
+        }
+        let quality = VectorIndex::open_read_only(&successor_quality_path).unwrap();
         assert_eq!(quality.embedder_revision(), fingerprint);
         assert_eq!(
             quality.quantization(),
@@ -2970,17 +2989,29 @@ mod loader_only {
         expected_writer.finish().unwrap();
         let expected_index = VectorIndex::open_read_only(&expected_path).unwrap();
         let expected_persisted = expected_index.vector_at_f32(0).unwrap();
-        let (_, persisted) = quality
-            .wal_records()
-            .find(|(id, _)| id.ends_with(appended_name))
-            .expect("the acknowledged append must persist a quality vector");
+        let hits = quality.search_top_k(&expected_vector, 10, None).unwrap();
+        let appended = hits
+            .iter()
+            .find(|hit| hit.doc_id == appended_id)
+            .expect("the acknowledged append must be searchable in the selected image");
+        let persisted = if complete {
+            // Complete publication seals both tiers without pending WAL rows.
+            assert_eq!(quality.record_count(), 7);
+            assert_eq!(quality.wal_record_count(), 0);
+            quality.vector_at_f32(appended.index as usize).unwrap()
+        } else {
+            quality
+                .wal_records()
+                .find(|(id, _)| *id == appended_id)
+                .expect("the legacy append must persist a quality WAL row")
+                .1
+                .to_vec()
+        };
         assert_eq!(
-            persisted,
+            persisted.as_slice(),
             expected_persisted.as_slice(),
             "append must embed content with the selected native producer, including F16 persistence"
         );
-        let hits = quality.search_top_k(&expected_vector, 10, None).unwrap();
-        assert!(hits.iter().any(|hit| hit.doc_id.ends_with(appended_name)));
         eprintln!(
             "[multilingual-cli] real cross-language search/cache/daemon/append and incompatible producer refusal verified"
         );
