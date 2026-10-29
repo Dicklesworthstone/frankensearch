@@ -11,7 +11,7 @@ use sha2::{Digest as _, Sha256};
 use super::super::tests::{Provider, Reply, documents, generation};
 use crate::native_ann::NativeAnnIndex;
 use crate::native_ann::builder::NativeBuildPrecision;
-use crate::{Embedder, IndexableDocument, SearchError, SearchFuture};
+use crate::{Embedder, IndexableDocument, ScoreSource, SearchError, SearchFuture};
 
 const BUDGET: usize = 16 * 1024 * 1024;
 const SOURCE: CommitRange = CommitRange { low: 4, high: 9 };
@@ -981,8 +981,11 @@ fn unpublished_candidate_previews_execute_every_tier_and_retain_original_images(
             assert_eq!(scoped.len(), 1);
             assert_eq!(scoped[0].doc_id, "b");
             if tier == EmbedderTierTag::Quality {
+                assert_eq!(scoped[0].source, ScoreSource::Hybrid);
+                assert!(scoped[0].index.is_some());
+                assert!(scoped[0].lexical_score.is_some());
                 assert!(scoped[0].fast_score.is_none());
-                assert!(scoped[0].quality_score.is_some());
+                assert!(scoped[0].quality_score.is_none());
                 let quality_only = scope
                     .search_quality_text(&cx, primary.as_ref(), "vertical", 10)
                     .await
@@ -1000,20 +1003,33 @@ fn unpublished_candidate_previews_execute_every_tier_and_retain_original_images(
                     .unwrap();
                 assert_eq!(primary.queries.load(Ordering::SeqCst), before);
                 assert_eq!(quality_hits[0].doc_id, "b");
+                assert_eq!(quality_hits[0].source, ScoreSource::Hybrid);
+                assert!(quality_hits[0].index.is_some());
+                assert!(quality_hits[0].lexical_score.is_some());
                 assert!(quality_hits[0].fast_score.is_none());
-                assert!(quality_hits[0].quality_score.is_some());
+                assert!(quality_hits[0].quality_score.is_none());
                 let refined = preview
                     .search_refined_text(&cx, primary.as_ref(), quality.as_ref(), "vertical", 1)
                     .await
                     .unwrap();
                 assert_eq!(refined[0].doc_id, "b");
-                assert!(refined[0].fast_score.is_some());
-                assert!(refined[0].quality_score.is_some());
+                // Both admitted providers are hash controls. Their merged
+                // result has no semantic scores or unambiguous tier row.
+                assert_eq!(refined[0].source, ScoreSource::Hybrid);
+                assert!(refined[0].index.is_none());
+                assert!(refined[0].lexical_score.is_some());
+                assert!(refined[0].fast_score.is_none());
+                assert!(refined[0].quality_score.is_none());
                 let scoped = scope
                     .search_refined_text(&cx, primary.as_ref(), quality.as_ref(), "vertical", 1)
                     .await
                     .unwrap();
                 assert_eq!(scoped[0].doc_id, "b");
+                assert_eq!(scoped[0].source, ScoreSource::Hybrid);
+                assert!(scoped[0].index.is_none());
+                assert!(scoped[0].lexical_score.is_some());
+                assert!(scoped[0].fast_score.is_none());
+                assert!(scoped[0].quality_score.is_none());
                 assert_eq!(quality.queries.load(Ordering::SeqCst), 3);
             } else if tier == EmbedderTierTag::Fast {
                 assert!(
@@ -1285,7 +1301,11 @@ fn full_candidate_preview_rejects_failed_drifted_cancelled_and_abandoned_refinem
             .await
             .unwrap();
         assert_eq!(hits[0].doc_id, "b");
-        assert!(hits[0].quality_score.is_some());
+        assert_eq!(hits[0].source, ScoreSource::Hybrid);
+        assert!(hits[0].index.is_none());
+        assert!(hits[0].lexical_score.is_some());
+        assert!(hits[0].fast_score.is_none());
+        assert!(hits[0].quality_score.is_none());
         assert_eq!(preview.candidate_authority(), candidate.authority());
         assert!(!directory.path().join("AUTHORITY").exists());
     });

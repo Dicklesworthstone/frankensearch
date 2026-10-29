@@ -2373,8 +2373,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                let old_fast_bytes = std::fs::read(old.fast.vector_path()).unwrap();
+                let old_quality_bytes =
+                    std::fs::read(old.quality().unwrap().vector_path()).unwrap();
                 let mut identity = fast.identity.clone();
-                identity.storage.format = "another-provider-output-label".to_owned();
+                identity.storage.format = "in-memory-another-provider-output-v1".to_owned();
                 let equivalent = Provider::from_identity(identity);
                 let unchanged =
                     migration(&cx, &dir.path().join("same"), &old, &equivalent, &quality)
@@ -2407,7 +2410,9 @@ mod tests {
                 // A provider returning Vec<f32> must still identify its actual
                 // output storage, even when the retained FSVI uses f16.
                 let mut incompatible_identity = fast.identity.clone();
+                "fsvi-v2".clone_into(&mut incompatible_identity.storage.format);
                 incompatible_identity.storage.quantization = QuantizationFormat::F16;
+                "little-endian".clone_into(&mut incompatible_identity.storage.endianness);
                 let incompatible = Provider::from_identity(incompatible_identity);
                 let error = migration(
                     &cx,
@@ -2426,7 +2431,42 @@ mod tests {
                     matches!(error, crate::SearchError::InvalidConfig { field, .. }
                     if field == "identity_bound_embedding.storage.quantization")
                 );
+                assert_eq!(incompatible.submitted.load(Ordering::SeqCst), 1);
+                // A distinct F32 output label can normalize for retained-vector
+                // reuse, but actual Vec<f32> inference still needs an in-memory
+                // format. A changed source must reach this response check.
+                let mut invalid_format_identity = fast.identity.clone();
+                invalid_format_identity.storage.format = "another-provider-output-label".to_owned();
+                let invalid_format = Provider::from_identity(invalid_format_identity);
+                let error = migration(
+                    &cx,
+                    &dir.path().join("misdeclared-format"),
+                    &old,
+                    &invalid_format,
+                    &quality,
+                )
+                .unwrap()
+                .upsert_document(IndexableDocument::new("a", "vertical"))
+                .build(&cx)
+                .await
+                .err()
+                .expect("a Vec<f32> response requires an in-memory format");
+                assert!(
+                    matches!(error, crate::SearchError::InvalidConfig { field, value, .. }
+                    if field == "identity_bound_embedding.storage.format"
+                        && value == "another-provider-output-label")
+                );
+                assert_eq!(invalid_format.submitted.load(Ordering::SeqCst), 1);
+                assert_eq!(quality.submitted.load(Ordering::SeqCst), 6);
                 assert_eq!(old.document("a").unwrap().content, "fractional");
+                assert_eq!(
+                    std::fs::read(old.fast.vector_path()).unwrap(),
+                    old_fast_bytes
+                );
+                assert_eq!(
+                    std::fs::read(old.quality().unwrap().vector_path()).unwrap(),
+                    old_quality_bytes
+                );
             });
         }
 

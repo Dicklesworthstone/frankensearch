@@ -1081,6 +1081,7 @@ impl CompositeReaders {
                 text,
                 self.bounded_limit(k).min(allowed.len()),
             )?
+            .with_retained_metadata(self)
             .with_allowed_documents_arc(allowed)
     }
 
@@ -1186,6 +1187,67 @@ impl CompositeReaders {
                 .id;
         }
         Ok((snapshot, live_count, field_ids))
+    }
+
+    // Generic lexical hydration intentionally ignores vector-only winners.
+    // This closed reader also owns the admitted common source cohort, so it
+    // can recover their metadata without inventing a lexical rank or reopening
+    // a component path. Read only the winning metadata column, not source bodies.
+    pub(in crate::native_ann) fn hydrate_vector_metadata(
+        &self,
+        cx: &Cx,
+        results: &mut [ScoredResult],
+    ) -> SearchResult<()> {
+        if results.iter().all(|result| result.lexical_score.is_some()) {
+            return Ok(());
+        }
+        let (snapshot, _, fields) = self.source_context(cx)?;
+        let mut staged = Vec::new();
+        for (position, result) in results.iter().enumerate() {
+            if result.lexical_score.is_some() {
+                continue;
+            }
+            checkpoint(cx, "native_ann.generation.vector_metadata")?;
+            if self
+                .vector
+                .owner
+                .find_live_row_by_doc_id(result.doc_id.as_str())
+                .map_err(|_| refused("source", "invalid-vector-row"))?
+                .is_none()
+            {
+                return Err(refused("source", "missing-live-document"));
+            }
+            let document = snapshot
+                .resolve_document_id(result.doc_id.as_str())
+                .map_err(|_| refused("source", "invalid-lexical-identity"))?
+                .ok_or_else(|| refused("source", "missing-live-document"))?;
+            let bytes = self
+                .lexical
+                .stored_field_value(fields[3], document.global_docid)
+                .map_err(|_| refused("source", "invalid-stored-field"))?
+                .ok_or_else(|| refused("source", "missing-stored-field"))?;
+            let metadata: BTreeMap<String, String> = serde_json::from_slice(&bytes)
+                .map_err(|_| refused("source", "invalid-metadata"))?;
+            if serde_json::to_vec(&metadata).map_err(|_| refused("source", "invalid-metadata"))?
+                != bytes
+            {
+                return Err(refused("source", "noncanonical-metadata"));
+            }
+            let metadata = if metadata.is_empty() {
+                None
+            } else {
+                Some(Arc::new(
+                    serde_json::to_value(metadata)
+                        .map_err(|_| refused("source", "invalid-metadata"))?,
+                ))
+            };
+            staged.push((position, metadata));
+        }
+        checkpoint(cx, "native_ann.generation.vector_metadata_commit")?;
+        for (position, metadata) in staged {
+            results[position].metadata = metadata;
+        }
+        Ok(())
     }
 
     pub(super) fn source_documents(
@@ -1330,7 +1392,7 @@ impl CompositeReaders {
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.search")?;
         let k = self.bounded_limit(k);
-        match self.tier {
+        let mut results = match self.tier {
             EmbedderTierTag::Fast => {
                 self.vector
                     .search_hybrid_text(cx, embedder, &self.lexical, text, k)
@@ -1341,7 +1403,9 @@ impl CompositeReaders {
                     .search_hybrid_quality_text(cx, embedder, &self.lexical, text, k)
                     .await
             }
-        }
+        }?;
+        self.hydrate_vector_metadata(cx, &mut results)?;
+        Ok(results)
     }
 
     async fn search_quality_text(
@@ -1357,9 +1421,11 @@ impl CompositeReaders {
         } else {
             self.full_quality()?
         };
-        quality
+        let mut results = quality
             .search_hybrid_quality_text(cx, embedder, &self.lexical, text, self.bounded_limit(k))
-            .await
+            .await?;
+        self.hydrate_vector_metadata(cx, &mut results)?;
+        Ok(results)
     }
 
     async fn search_refined_text(
@@ -1371,7 +1437,8 @@ impl CompositeReaders {
         k: usize,
     ) -> SearchResult<Vec<ScoredResult>> {
         checkpoint(cx, "native_ann.generation.refined_search")?;
-        self.vector
+        let mut results = self
+            .vector
             .search_hybrid_refined_text(
                 cx,
                 fast,
@@ -1380,7 +1447,9 @@ impl CompositeReaders {
                 text,
                 self.bounded_limit(k),
             )
-            .await
+            .await?;
+        self.hydrate_vector_metadata(cx, &mut results)?;
+        Ok(results)
     }
 
     fn search_progressive_with_quality<'a>(
@@ -1392,14 +1461,17 @@ impl CompositeReaders {
         k: usize,
     ) -> SearchResult<NativeProgressiveSearch<'a>> {
         checkpoint(cx, "native_ann.generation.progressive_search")?;
-        self.vector.search_hybrid_progressive(
-            cx,
-            fast,
-            Some((self.full_quality()?.as_ref(), quality)),
-            &self.lexical,
-            text,
-            self.bounded_limit(k),
-        )
+        Ok(self
+            .vector
+            .search_hybrid_progressive(
+                cx,
+                fast,
+                Some((self.full_quality()?.as_ref(), quality)),
+                &self.lexical,
+                text,
+                self.bounded_limit(k),
+            )?
+            .with_retained_metadata(self))
     }
 }
 

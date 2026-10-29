@@ -454,6 +454,13 @@ fn progressive_authority_retrieves_quality_beyond_fast_window_and_defers_quality
             .await
             .unwrap();
         assert!(fast.iter().all(|hit| hit.doc_id != "quality-only"));
+        assert!(fast.iter().all(|hit| {
+            hit.lexical_score.is_none()
+                && hit
+                    .metadata
+                    .as_deref()
+                    .is_some_and(|metadata| metadata["version"] == "old")
+        }));
         let refined = readers
             .search_refined_text(
                 &cx,
@@ -465,6 +472,7 @@ fn progressive_authority_retrieves_quality_beyond_fast_window_and_defers_quality
             .await
             .unwrap();
         assert_eq!(refined[0].doc_id, "quality-only");
+        assert!(refined[0].lexical_score.is_none());
         assert_eq!(refined[0].metadata.as_ref().unwrap()["version"], "old");
         let fast_before = fixture.fast.calls.load(Ordering::SeqCst);
         let quality_before = fixture.quality.calls.load(Ordering::SeqCst);

@@ -60,6 +60,8 @@ impl NativeAnnIndex {
             k,
             reranker: None,
             allowed_documents: None,
+            #[cfg(feature = "quill")]
+            retained_metadata: None,
             candidate_multiplier: 3,
             rrf: RrfConfig::default(),
             quality_weight: 0.7,
@@ -112,6 +114,8 @@ impl NativeAnnIndex {
             k,
             reranker: None,
             allowed_documents: None,
+            #[cfg(feature = "quill")]
+            retained_metadata: None,
             candidate_multiplier: 3,
             rrf: RrfConfig::default(),
             quality_weight: 0.7,
@@ -240,10 +244,23 @@ pub struct NativeProgressiveSearch<'a> {
     // Installed only by the built-cohort scope adapter, together with its
     // filtered lexical reader. None preserves the ordinary unscoped path.
     allowed_documents: Option<Arc<BTreeSet<String>>>,
+    // Only the admitted composite-generation reader can supply source metadata
+    // for vector-only winners. A generic lexical scoring pin cannot do so.
+    #[cfg(feature = "quill")]
+    retained_metadata: Option<&'a crate::native_ann::generation::CompositeReaders>,
     state: State,
 }
 
 impl<'a> NativeProgressiveSearch<'a> {
+    #[cfg(feature = "quill")]
+    pub(in crate::native_ann) fn with_retained_metadata(
+        mut self,
+        source: &'a crate::native_ann::generation::CompositeReaders,
+    ) -> Self {
+        self.retained_metadata = Some(source);
+        self
+    }
+
     /// Set the fusion policy for BOTH Initial and Refined before either starts.
     ///
     /// Defaults are the existing RRF policy and 0.7 quality blend. `rrf` is
@@ -607,6 +624,10 @@ impl<'a> NativeProgressiveSearch<'a> {
             is_hash,
         );
         let mut results = hydrate_winners(self.cx, self.lexical, fused, &batch).await?;
+        #[cfg(feature = "quill")]
+        if let Some(source) = self.retained_metadata {
+            source.hydrate_vector_metadata(self.cx, &mut results)?;
+        }
         checkpoint(self.cx, "native_ann.progressive_initial_complete")?;
         if self.quality.is_some() {
             self.state = State::Refine(PendingRefinement {
@@ -685,6 +706,14 @@ impl<'a> NativeProgressiveSearch<'a> {
             },
         )
         .await?;
+        #[cfg(feature = "quill")]
+        let results = {
+            let mut results = results;
+            if let Some(source) = self.retained_metadata {
+                source.hydrate_vector_metadata(self.cx, &mut results)?;
+            }
+            results
+        };
         checkpoint(self.cx, "native_ann.progressive_refined_complete")?;
         Ok((results, candidates))
     }
