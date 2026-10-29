@@ -1615,6 +1615,7 @@ mod lifecycle_tests {
                 rss_bytes: 0,
                 io_read_bytes: 0,
                 io_write_bytes: 0,
+                io_counters_available: true,
                 load_avg_1m: Some(0.0),
             };
             session.pressure.observe(&sample, now);

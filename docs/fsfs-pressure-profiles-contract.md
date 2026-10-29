@@ -155,6 +155,13 @@ actual elapsed time. Other platforms currently have no disk-I/O counter in this
 sampler; CPU and load admission still apply. Shadow-oracle sampling remains
 separate.
 
+Unavailable process I/O counters emit `pressure.sensor.io_unavailable` at normal
+verbosity, including on unsupported platforms. A recovered counter establishes
+a fresh baseline; unobserved bytes are not counted as a burst of current I/O.
+Entering a pressure pause also emits a normal-verbosity warning on stderr,
+without adding records to machine-readable stdout. Cancellation remains
+available during the wait.
+
 New model loads and bounded indexing, append and retained-mutation inference
 wait while the controller is degraded or in emergency. Complete watching also
 pauses before consuming dirty hints or allocating a candidate; a later quiet

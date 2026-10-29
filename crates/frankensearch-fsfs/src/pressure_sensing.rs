@@ -78,6 +78,9 @@ pub struct PressureSample {
     pub io_read_bytes: u64,
     /// Cumulative I/O write bytes since process start.
     pub io_write_bytes: u64,
+    /// Whether both cumulative I/O counters were read successfully.
+    /// Unavailable counters must not be interpreted as observed idle I/O.
+    pub io_counters_available: bool,
     /// 1-minute load average, if available.
     pub load_avg_1m: Option<f64>,
 }
@@ -114,7 +117,11 @@ impl SmoothedReadings {
 
         // IO rate: delta bytes since last sample. On first sample, 0.
         let io_total = sample.io_read_bytes.saturating_add(sample.io_write_bytes);
-        let io_rate = prev_io_total.map_or(0.0, |prev| io_total.saturating_sub(prev) as f64);
+        let io_rate = if sample.io_counters_available {
+            prev_io_total.map_or(0.0, |prev| io_total.saturating_sub(prev) as f64)
+        } else {
+            0.0
+        };
 
         if self.samples_processed == 0 {
             // First sample: initialize directly, no smoothing.
@@ -249,7 +256,9 @@ impl PressureSensor {
     pub fn process_sample(&mut self, sample: &PressureSample) -> Option<PressureTransition> {
         // Update EWMA smoothed readings.
         self.smoothed.update(sample, self.alpha, self.prev_io_total);
-        self.prev_io_total = Some(sample.io_read_bytes.saturating_add(sample.io_write_bytes));
+        self.prev_io_total = sample
+            .io_counters_available
+            .then_some(sample.io_read_bytes.saturating_add(sample.io_write_bytes));
 
         debug!(
             target: "frankensearch.fsfs.pressure",
@@ -409,13 +418,13 @@ impl PressureSensor {
 /// On Linux, also reads `/proc/self/io` for cumulative I/O counters.
 pub struct HostSampler {
     system: System,
-    prev_io: Option<(u64, u64)>,
+    io_available: Option<bool>,
 }
 
 impl std::fmt::Debug for HostSampler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostSampler")
-            .field("prev_io", &self.prev_io)
+            .field("io_available", &self.io_available)
             .finish_non_exhaustive()
     }
 }
@@ -435,7 +444,7 @@ impl HostSampler {
         system.refresh_memory();
         Self {
             system,
-            prev_io: None,
+            io_available: None,
         }
     }
 
@@ -458,7 +467,23 @@ impl HostSampler {
             .unwrap_or(0);
 
         // I/O counters from /proc/self/io on Linux.
-        let (io_read, io_write) = read_proc_self_io().unwrap_or((0, 0));
+        let io = read_proc_self_io();
+        let io_available = io.is_some();
+        if !io_available && self.io_available != Some(false) {
+            warn!(
+                target: "frankensearch.fsfs.pressure",
+                reason_code = "pressure.sensor.io_unavailable",
+                "process disk-I/O counters are unavailable; the I/O ceiling cannot be enforced, while CPU and load admission remain active"
+            );
+        } else if io_available && self.io_available == Some(false) {
+            info!(
+                target: "frankensearch.fsfs.pressure",
+                reason_code = "pressure.sensor.io_recovered",
+                "process disk-I/O counters are available again; establishing a fresh rate baseline"
+            );
+        }
+        self.io_available = Some(io_available);
+        let (io_read, io_write) = io.unwrap_or((0, 0));
 
         let load_avg_1m = {
             let load = System::load_average();
@@ -474,6 +499,7 @@ impl HostSampler {
             rss_bytes,
             io_read_bytes: io_read,
             io_write_bytes: io_write,
+            io_counters_available: io_available,
             load_avg_1m,
         }
     }
@@ -518,7 +544,7 @@ pub(crate) struct IndexPressureMonitor {
     config: PressureConfig,
     cpu_slots: usize,
     started: Instant,
-    previous_sample: Option<(Instant, u64, u64)>,
+    previous_sample: Option<(Instant, Option<(u64, u64)>)>,
 }
 
 impl IndexPressureMonitor {
@@ -563,7 +589,7 @@ impl IndexPressureMonitor {
 
     pub(crate) fn paused(&mut self) -> bool {
         let now = Instant::now();
-        let due = self.previous_sample.is_none_or(|(previous, _, _)| {
+        let due = self.previous_sample.is_none_or(|(previous, _)| {
             now.saturating_duration_since(previous)
                 >= Duration::from_millis(self.config.sample_interval_ms)
         });
@@ -579,18 +605,27 @@ impl IndexPressureMonitor {
 
     #[allow(clippy::cast_precision_loss)]
     pub(crate) fn observe(&mut self, sample: &PressureSample, now: Instant) {
-        let io_rate = self.previous_sample.map_or(0.0, |(previous, read, write)| {
-            let seconds = now.saturating_duration_since(previous).as_secs_f64();
-            if seconds <= f64::EPSILON {
-                return 0.0;
-            }
-            // Keep independent deltas so overflow or a reset of one counter
-            // cannot erase the other counter's newly observed work.
-            (sample.io_read_bytes.saturating_sub(read) as f64
-                + sample.io_write_bytes.saturating_sub(write) as f64)
-                / seconds
-        });
-        self.previous_sample = Some((now, sample.io_read_bytes, sample.io_write_bytes));
+        let counters = sample
+            .io_counters_available
+            .then_some((sample.io_read_bytes, sample.io_write_bytes));
+        let previous_counters = self
+            .previous_sample
+            .and_then(|(previous, counters)| counters.map(|(read, write)| (previous, read, write)));
+        let io_rate = counters.zip(previous_counters).map_or(
+            0.0,
+            |((read, write), (previous, previous_read, previous_write))| {
+                let seconds = now.saturating_duration_since(previous).as_secs_f64();
+                if seconds <= f64::EPSILON {
+                    return 0.0;
+                }
+                // Keep independent deltas so overflow or a reset of one counter
+                // cannot erase the other counter's newly observed work.
+                (read.saturating_sub(previous_read) as f64
+                    + write.saturating_sub(previous_write) as f64)
+                    / seconds
+            },
+        );
+        self.previous_sample = Some((now, counters));
         let signal = PressureSignal::new(
             sample.cpu_pct / f64::from(self.config.cpu_ceiling_pct) * 100.0,
             0.0,
@@ -604,6 +639,20 @@ impl IndexPressureMonitor {
             .unwrap_or(u64::MAX);
         let transition = self.controller.observe(signal, timestamp_ms);
         if transition.changed {
+            if matches!(
+                transition.to,
+                PressureState::Degraded | PressureState::Emergency
+            ) && !matches!(
+                transition.from,
+                PressureState::Degraded | PressureState::Emergency
+            ) {
+                warn!(
+                    target: "frankensearch.fsfs.pressure",
+                    reason_code = transition.reason_code,
+                    state = ?transition.to,
+                    "indexing is paused by host pressure; waiting for pressure to settle, cancellation remains available"
+                );
+            }
             info!(
                 target: "frankensearch.fsfs.pressure",
                 reason_code = transition.reason_code,
@@ -652,6 +701,7 @@ mod tests {
             rss_bytes: rss_mb * 1024 * 1024,
             io_read_bytes: io_read,
             io_write_bytes: io_write,
+            io_counters_available: true,
             load_avg_1m: Some(load),
         }
     }
@@ -741,6 +791,59 @@ mod tests {
             limited.paused(),
             "the configured I/O ceiling must change admission"
         );
+    }
+
+    #[test]
+    fn indexing_missing_io_counters_keep_cadence_and_rebaseline_on_recovery() {
+        let now = Instant::now();
+        let mut monitor = index_monitor();
+        monitor.observe(&make_sample(0.0, 0, 1_000_000, 2_000_000, 0.0), now);
+        let mut unavailable = make_sample(0.0, 0, 0, 0, 0.0);
+        unavailable.io_counters_available = false;
+        monitor.observe(&unavailable, now + Duration::from_secs(1));
+        assert_eq!(
+            monitor.previous_sample,
+            Some((now + Duration::from_secs(1), None)),
+            "missing I/O must keep the sampling cadence without inventing counters"
+        );
+        assert!(!monitor.paused());
+        monitor.observe(
+            &make_sample(0.0, 0, 2_000_000, 3_000_000, 0.0),
+            now + Duration::from_secs(2),
+        );
+        assert!(
+            !monitor.paused(),
+            "unobserved work must not become a false recovery burst"
+        );
+        monitor.observe(
+            &make_sample(0.0, 0, 2_000_500, 3_000_500, 0.0),
+            now + Duration::from_secs(3),
+        );
+        assert!(
+            monitor.paused(),
+            "new observed I/O still enforces the ceiling"
+        );
+        unavailable.cpu_pct = 100.0;
+        monitor.observe(&unavailable, now + Duration::from_secs(4));
+        assert!(
+            monitor.paused(),
+            "unavailable I/O must not disable CPU admission"
+        );
+    }
+
+    #[test]
+    fn shadow_sensor_missing_io_does_not_invent_recovered_work() {
+        let mut sensor = PressureSensor::new(PressureThresholds::default(), 1.0, 1);
+        let _ = sensor.process_sample(&make_sample(0.0, 0, 1_000, 2_000, 0.0));
+        let mut missing = make_sample(0.0, 0, 0, 0, 0.0);
+        missing.io_counters_available = false;
+        let _ = sensor.process_sample(&missing);
+        assert!(sensor.prev_io_total.is_none());
+        let _ = sensor.process_sample(&make_sample(0.0, 0, 1_000_000_000, 2_000_000_000, 0.0));
+        assert_eq!(sensor.current_state(), ControlState::Normal);
+        assert!(sensor.smoothed_readings().io_bytes_per_sec.abs() < f64::EPSILON);
+        let _ = sensor.process_sample(&make_sample(0.0, 0, 1_000_000_500, 2_000_000_500, 0.0));
+        assert!((sensor.smoothed_readings().io_bytes_per_sec - 1_000.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -987,6 +1090,7 @@ mod tests {
         let sample = sampler.sample();
         // CPU should be non-negative (may be 0 on first call).
         assert!(sample.cpu_pct >= 0.0);
+        assert_eq!(sample.io_counters_available, read_proc_self_io().is_some());
         // RSS should be > 0 for our running process.
         // Note: on some CI environments sysinfo may not find our process.
         // We just verify it doesn't panic.
@@ -1020,6 +1124,7 @@ mod tests {
             rss_bytes: 0,
             io_read_bytes: 0,
             io_write_bytes: 0,
+            io_counters_available: true,
             load_avg_1m: Some(0.0),
         };
         for _ in 0..5 {
@@ -1036,6 +1141,7 @@ mod tests {
             rss_bytes: 0,
             io_read_bytes: 0,
             io_write_bytes: 0,
+            io_counters_available: true,
             load_avg_1m: Some(f64::NAN),
         };
         // NaN should be clamped to 0, not cause panics or transitions.
