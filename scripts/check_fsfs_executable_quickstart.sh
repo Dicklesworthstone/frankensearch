@@ -441,7 +441,16 @@ def artifacts(root):
 def phases(raw):
     frames = [json.loads(line) for line in raw.splitlines()]
     require(len(frames) >= 4 and frames[0].get('event') == 'started', 'MISSING-PHASE', 'stream start')
-    require(frames[0].get('payload', {}).get('semantic_admitted') is True, 'HASH-DEGRADATION', 'stream producer')
+    started = frames[0].get('payload', {})
+    # This checker uses a fresh direct cold query. Started describes the
+    # inspected generation; admission is established by the result phases.
+    require(started.get('semantic_admitted', False) is False,
+            'SEMANTIC-ADMISSION', 'cold Started must not claim an admitted provider')
+    producer = str(started.get('vector_generation_id') or '').lower()
+    require(started.get('vector_generation_is_hash', False) is False
+            and not any(name in producer for name in ('hash', 'fnv'))
+            and any(name in producer for name in ('potion', 'model2vec')),
+            'HASH-DEGRADATION', 'stream producer')
     require([f.get('seq') for f in frames] == list(range(len(frames)))
             and len({f.get('stream_id') for f in frames}) == 1, 'MISSING-PHASE', 'stream identity or sequence')
     codes = [x.get('payload', {}).get('reason_code') for x in frames]
@@ -450,6 +459,8 @@ def phases(raw):
     for code in required:
         require(codes.count(code) == 1, 'MISSING-PHASE', f'{code}: {codes}')
         positions.append(codes.index(code))
+    require([frames[position].get('payload', {}).get('stage') for position in positions]
+            == ['retrieve.fast', 'retrieve.quality'], 'HASH-DEGRADATION', 'stream retrieval stages')
     require(positions == sorted(positions), 'MISSING-PHASE', 'phase order')
     terminals = [i for i, frame in enumerate(frames) if frame.get('event') == 'terminal']
     require(terminals == [len(frames)-1], 'MISSING-PHASE', 'exactly one final terminal')
@@ -574,6 +585,18 @@ try:
         def encode_frames(frames):
             return '\n'.join(json.dumps(dict(frame, seq=i)) for i, frame in enumerate(frames))
         reject('missing-refined', 'MISSING-PHASE', lambda: phases(encode_frames(bad_stream)), 'output-validator-mutation')
+        premature = copy.deepcopy(stream)
+        premature[0]['payload']['semantic_admitted'] = True
+        reject('premature-semantic-admission', 'SEMANTIC-ADMISSION', lambda: phases(encode_frames(premature)), 'output-validator-mutation')
+        hash_stream = copy.deepcopy(stream)
+        hash_stream[0]['payload']['vector_generation_id'] = 'hash-fnv'
+        hash_stream[0]['payload']['vector_generation_is_hash'] = True
+        reject('hash-stream-producer', 'HASH-DEGRADATION', lambda: phases(encode_frames(hash_stream)), 'output-validator-mutation')
+        hash_phase = copy.deepcopy(stream)
+        for frame in hash_phase:
+            if frame.get('payload', {}).get('reason_code') == 'query.stream.initial_ready':
+                frame['payload']['stage'] = 'retrieve.hash_control'
+        reject('hash-stream-stage', 'HASH-DEGRADATION', lambda: phases(encode_frames(hash_phase)), 'output-validator-mutation')
         empty_phases = [f for f in stream if f.get('event') != 'result']
         reject('empty-phase-results', 'MISSING-PHASE', lambda: phases(encode_frames(empty_phases)), 'output-validator-mutation')
         false_source = dict(receipt, binary_source=checker, origin='supplied-binary')

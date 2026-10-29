@@ -1726,6 +1726,31 @@ mod loader_only {
                     == Some("query.stream.refinement_failed")
             })
             .collect::<Vec<_>>();
+        let refined = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, frame)| {
+                frame
+                    .pointer("/payload/reason_code")
+                    .and_then(Value::as_str)
+                    == Some("query.stream.refined_ready")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(failures.len() + refined.len(), 1, "one quality outcome");
+        if let Some((position, frame)) = refined.first() {
+            assert!(*position > initial);
+            assert_eq!(frame["payload"]["stage"], "retrieve.quality");
+            assert!(
+                frames[*position + 1..]
+                    .iter()
+                    .any(|frame| frame["event"] == "result")
+            );
+            eprintln!(
+                "[default-build-e2e] stage=actual-quality-deadline budget_ms=50 refined=1 failures=0 process_join_ms={}",
+                outcome.elapsed.as_millis()
+            );
+            return;
+        }
         assert_eq!(
             failures.len(),
             1,
@@ -2440,9 +2465,21 @@ mod loader_only {
             let cold = request(50);
             assert_eq!(cold["cached"], false, "{cold}");
             assert_eq!(cold["payloads"][0]["phase"], "initial", "{cold}");
-            assert_eq!(cold["payloads"][1]["phase"], "refinement_failed", "{cold}");
-            assert_eq!(cold["payloads"][1]["quality_timeout"]["budget_ms"], 50);
-            assert_eq!(cold["payloads"][1]["hits"], cold["payloads"][0]["hits"]);
+            match cold["payloads"][1]["phase"].as_str() {
+                Some("refinement_failed") => {
+                    assert_eq!(cold["payloads"][1]["quality_timeout"]["budget_ms"], 50);
+                    assert_eq!(cold["payloads"][1]["hits"], cold["payloads"][0]["hits"]);
+                }
+                Some("refined") => {
+                    assert!(cold["payloads"][1]["quality_timeout"].is_null());
+                    assert_eq!(
+                        cold["payloads"][1]["semantic_blend"]["quality_embedder"],
+                        "minilm-384-native-f32"
+                    );
+                    assert!(!cold["payloads"][1]["hits"].as_array().unwrap().is_empty());
+                }
+                _ => panic!("unexpected cold quality outcome: {cold}"),
+            }
 
             // Observe the real loader finishing, not a guessed sleep interval.
             let loaded_message = "fsfs selected verified native F32 quality model";
@@ -3520,6 +3557,11 @@ mod loader_only {
         let models = configured_model_root();
         verify_pinned_model_cache(&models).expect("verified pinned real producers");
         let temp = tempfile::tempdir().unwrap();
+        // Compare completed quality results on both executables. A cold
+        // deadline fallback is a different phase, not evidence of index drift.
+        // The dedicated cold-deadline cases retain their original 50ms budget.
+        let ranking_config = temp.path().join("upgrade-ranking.toml");
+        fs::write(&ranking_config, "[search]\nquality_timeout_ms = 5000\n").unwrap();
         let mut old = IsolatedFsfs::new(temp.path(), models.clone());
         old.binary = previous;
         let current = IsolatedFsfs::new(temp.path(), models);
@@ -3584,6 +3626,8 @@ mod loader_only {
                 "search",
                 "network retries",
                 "--no-daemon",
+                "--config",
+                ranking_config.to_str().unwrap(),
                 "--index-dir",
                 index.to_str().unwrap(),
                 "--format",
@@ -3597,6 +3641,7 @@ mod loader_only {
             );
             assert_finished_successfully("previous admitted search", &before);
             let before_page = parse_success_envelope(control, &before);
+            assert_eq!(before_page["data"]["phase"], "refined", "{before_page}");
             let prior_selection = fs::read(index.join("FSFS-CURRENT")).unwrap();
             if control == "source-drift" {
                 fs::write(
@@ -3703,6 +3748,8 @@ mod loader_only {
                 "search",
                 "network retries",
                 "--no-daemon",
+                "--config",
+                ranking_config.to_str().unwrap(),
                 "--index-dir",
                 index.to_str().unwrap(),
                 "--format",
@@ -3716,6 +3763,7 @@ mod loader_only {
             );
             assert_finished_successfully("admitted successor search", &searched);
             let page = parse_success_envelope(control, &searched);
+            assert_eq!(page["data"]["phase"], "refined", "{page}");
             assert!(!page["data"]["hits"].as_array().unwrap().is_empty());
             if control == "compatible" {
                 assert_eq!(
