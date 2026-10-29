@@ -4001,7 +4001,7 @@ mod tests {
             pressure_cfg.pressure.memory_ceiling_mb = 128;
             let pressure_error = runtime
                 .rebuild_retained_generation_with_precommit(&cx, &root, |_| {
-                    super::super::IndexRunControl::new(&pressure_cfg)
+                    super::super::IndexRunControl::new(&pressure_cfg)?
                         .admit_memory(100.0, "index.semantic_batch")
                 })
                 .await

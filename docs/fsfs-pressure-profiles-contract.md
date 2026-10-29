@@ -145,12 +145,29 @@ order, so `index --watch --no-watch-mode` remains a one-shot index request.
 `daemon --stop` remains available, and the complete-generation read-only query
 daemon does not require background-indexing permission.
 
+Ordinary indexing reads `cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and
+`load_ceiling_per_mille` at cooperative admission boundaries. The existing
+pressure controller applies the configured profile thresholds, EWMA and
+consecutive-reading hysteresis to each signal relative to its ceiling. CPU is
+host utilization; load is the one-minute host load per available CPU. Linux
+process disk-I/O rates use independent read/write counter deltas divided by
+actual elapsed time. Other platforms currently have no disk-I/O counter in this
+sampler; CPU and load admission still apply. Shadow-oracle sampling remains
+separate.
+
+New model loads and bounded indexing, append and retained-mutation inference
+wait while the controller is degraded or in emergency. Complete watching also
+pauses before consuming dirty hints or allocating a candidate; a later quiet
+sample resumes owed work without requiring another filesystem event. Existing
+selected generations and pinned readers remain available. Waiting yields in
+sleeps of at most 100 ms and checks cancellation on each iteration. These are cooperative controls:
+already running synchronous work can overshoot a threshold. The separate RSS
+boundary continues to return its typed memory-pressure error.
+
 The `config.setting.no_effect` warning still covers a `strict` or `degraded`
-profile (its quality and background-indexing ceilings apply; its
-resolved concurrency and scheduler limits are not read yet) and non-default
-`cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and `load_ceiling_per_mille`,
-which no fsfs component reads yet (the shadow oracle samples CPU and I/O with
-its own thresholds).
+profile because its resolved concurrency and scheduler limits are not read yet;
+its quality and background-indexing ceilings do apply. Automatic durable
+background resumption of deferred quality embedding remains unimplemented.
 
 The `performance` profile allows either `fast_only` value. The `strict` and
 `degraded` profiles disable quality: `fast_only=true` is accepted, while a winning

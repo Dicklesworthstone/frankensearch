@@ -28,6 +28,7 @@ use crate::generation_store::{
     CompleteGenerationStore, GenerationPublication, PublishedGeneration,
 };
 use crate::mount_info::{MountTable, read_system_mounts};
+use crate::pressure_sensing::IndexPressureMonitor;
 use crate::watcher::DEFAULT_DEBOUNCE_MS;
 
 // This module's parent is loaded through #[path] in the runtime include.
@@ -507,6 +508,7 @@ struct SettleWindow {
 
 struct CompleteWatchSession {
     runtime: FsfsRuntime,
+    pressure: IndexPressureMonitor,
     store_root: PathBuf,
     source: SourceRoot,
     changes: Arc<Mutex<Changes>>,
@@ -524,6 +526,7 @@ impl CompleteWatchSession {
     fn open(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> SearchResult<Self> {
         retained_search_checkpoint(cx)?;
         runtime.validate_background_indexing()?;
+        let pressure = IndexPressureMonitor::new(&runtime.config.pressure)?;
         validate_retained_catalog_path(&runtime.config.storage.db_path)?;
         let mut source = SourceRoot::open(fs::canonicalize(runtime.resolve_target_root()?)?)?;
         let store_root = resolve_watch_store(&source.path, root)?;
@@ -565,6 +568,7 @@ impl CompleteWatchSession {
         runtime.cli_input.target_path = Some(source.path.clone());
         Ok(Self {
             runtime,
+            pressure,
             store_root,
             source,
             changes,
@@ -791,6 +795,11 @@ impl CompleteWatchSession {
         check_backend(&self.changes)?;
         self.source.check()?;
         check_watch_publication(cx, &self.store_root, self.publication.as_ref())?;
+        if self.pressure.paused() {
+            // Keep notifications and the reconciliation deadline owed. A quiet
+            // pressure sample resumes the same source/producer-fenced builder.
+            return Ok(None);
+        }
         if self.settling.is_some() {
             self.probe_settling_source(cx, now)?;
             return Ok(None);
@@ -1582,6 +1591,104 @@ mod lifecycle_tests {
 
     fn candidate_count(root: &Path) -> usize {
         fs::read_dir(root.join("generations")).unwrap().count()
+    }
+
+    #[test]
+    fn complete_watch_pressure_preserves_dirty_work_and_resumes_without_an_event() {
+        use crate::pressure_sensing::PressureSample;
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            runtime.config.pressure.ewma_alpha_per_mille = 1_000;
+            runtime.config.pressure.anti_flap_readings = 1;
+            runtime.config.pressure.sample_interval_ms = 60_000;
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let before = publish_tick(&mut session, &cx).await;
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let before_bytes = fs::read(before.path().join("FSFS-BUNDLE.json")).unwrap();
+            let allocated = candidate_count(&root);
+            let now = Instant::now();
+            let mut sample = PressureSample {
+                cpu_pct: 100.0,
+                rss_bytes: 0,
+                io_read_bytes: 0,
+                io_write_bytes: 0,
+                load_avg_1m: Some(0.0),
+            };
+            session.pressure.observe(&sample, now);
+            assert!(session.pressure.paused());
+            fs::write(source.join("beta.md"), "sharedtoken beta after pressure").unwrap();
+            lock_changes(&session.changes).unwrap().record(now, false);
+            assert!(
+                session
+                    .advance(&cx, now + MAX_DEBOUNCE)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(candidate_count(&root), allocated);
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_some());
+            assert_eq!(
+                CompleteGenerationStore::open(&cx, &root)
+                    .unwrap()
+                    .active(&cx)
+                    .unwrap(),
+                Some(before.clone())
+            );
+
+            cx.set_cancel_requested(true);
+            let cancelled = session.advance(&cx, now + MAX_DEBOUNCE).await;
+            cx.set_cancel_requested(false);
+            assert!(matches!(cancelled, Err(SearchError::Cancelled { .. })));
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_some());
+            assert_eq!(candidate_count(&root), allocated);
+
+            // No new notification: recovery must consume the original owed hint.
+            sample.cpu_pct = 0.0;
+            session
+                .pressure
+                .observe(&sample, now + Duration::from_secs(1));
+            assert!(!session.pressure.paused());
+            let after = require_durable_publication(
+                session
+                    .advance(&cx, now + MAX_DEBOUNCE)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(before, after);
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_none());
+            let mut fresh = runtime.open_retained_search(&cx, &root).await.unwrap();
+            assert_eq!(
+                fresh
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                2
+            );
+            assert_eq!(
+                pinned
+                    .search(&cx, "sharedtoken", 10)
+                    .await
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .hits
+                    .len(),
+                1
+            );
+            assert_eq!(
+                fs::read(before.path().join("FSFS-BUNDLE.json")).unwrap(),
+                before_bytes
+            );
+        });
     }
 
     #[test]

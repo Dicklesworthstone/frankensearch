@@ -16,6 +16,15 @@ use serde::{Deserialize, Serialize};
 use sysinfo::System;
 use tracing::{debug, info, warn};
 
+use std::time::{Duration, Instant};
+
+use frankensearch_core::{SearchError, SearchResult};
+
+use crate::config::PressureConfig;
+use crate::pressure::{
+    PressureController, PressureControllerConfig, PressureSignal, PressureState,
+};
+
 // ─── Control State ──────────────────────────────────────────────────────────
 
 /// Runtime control state derived from smoothed host signals.
@@ -499,6 +508,118 @@ fn read_proc_self_io() -> Option<(u64, u64)> {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
+/// Ordinary indexing admission, using the configured ceilings and real elapsed
+/// time. RSS admission remains with the indexing run's immediate memory guard.
+/// This observes host load; it does not preempt synchronous inference or cap the
+/// process's CPU usage at the operating-system level.
+pub(crate) struct IndexPressureMonitor {
+    sampler: HostSampler,
+    controller: PressureController,
+    config: PressureConfig,
+    cpu_slots: usize,
+    started: Instant,
+    previous_sample: Option<(Instant, u64, u64)>,
+}
+
+impl IndexPressureMonitor {
+    pub(crate) fn new(config: &PressureConfig) -> SearchResult<Self> {
+        for (field, value) in [
+            (
+                "pressure.cpu_ceiling_pct",
+                u64::from(config.cpu_ceiling_pct),
+            ),
+            (
+                "pressure.io_ceiling_bytes_per_sec",
+                config.io_ceiling_bytes_per_sec,
+            ),
+            (
+                "pressure.load_ceiling_per_mille",
+                u64::from(config.load_ceiling_per_mille),
+            ),
+            ("pressure.sample_interval_ms", config.sample_interval_ms),
+        ] {
+            if value == 0 {
+                return Err(SearchError::InvalidConfig {
+                    field: field.to_owned(),
+                    value: value.to_string(),
+                    reason: "ordinary indexing admission requires a positive ceiling and sampling interval".to_owned(),
+                });
+            }
+        }
+        Ok(Self {
+            sampler: HostSampler::new(),
+            controller: PressureController::new(PressureControllerConfig {
+                profile: config.profile,
+                ewma_alpha: f64::from(config.ewma_alpha_per_mille) / 1_000.0,
+                consecutive_required: config.anti_flap_readings,
+                ..PressureControllerConfig::default()
+            })?,
+            config: config.clone(),
+            cpu_slots: std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
+            started: Instant::now(),
+            previous_sample: None,
+        })
+    }
+
+    pub(crate) fn paused(&mut self) -> bool {
+        let now = Instant::now();
+        let due = self.previous_sample.is_none_or(|(previous, _, _)| {
+            now.saturating_duration_since(previous)
+                >= Duration::from_millis(self.config.sample_interval_ms)
+        });
+        if due {
+            let sample = self.sampler.sample();
+            self.observe(&sample, now);
+        }
+        matches!(
+            self.controller.state(),
+            PressureState::Degraded | PressureState::Emergency
+        )
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    pub(crate) fn observe(&mut self, sample: &PressureSample, now: Instant) {
+        let io_rate = self.previous_sample.map_or(0.0, |(previous, read, write)| {
+            let seconds = now.saturating_duration_since(previous).as_secs_f64();
+            if seconds <= f64::EPSILON {
+                return 0.0;
+            }
+            // Keep independent deltas so overflow or a reset of one counter
+            // cannot erase the other counter's newly observed work.
+            (sample.io_read_bytes.saturating_sub(read) as f64
+                + sample.io_write_bytes.saturating_sub(write) as f64)
+                / seconds
+        });
+        self.previous_sample = Some((now, sample.io_read_bytes, sample.io_write_bytes));
+        let signal = PressureSignal::new(
+            sample.cpu_pct / f64::from(self.config.cpu_ceiling_pct) * 100.0,
+            0.0,
+            io_rate / self.config.io_ceiling_bytes_per_sec as f64 * 100.0,
+            sample.load_avg_1m.unwrap_or(0.0)
+                / self.cpu_slots as f64
+                / (f64::from(self.config.load_ceiling_per_mille) / 1_000.0)
+                * 100.0,
+        );
+        let timestamp_ms = u64::try_from(now.saturating_duration_since(self.started).as_millis())
+            .unwrap_or(u64::MAX);
+        let transition = self.controller.observe(signal, timestamp_ms);
+        if transition.changed {
+            info!(
+                target: "frankensearch.fsfs.pressure",
+                reason_code = transition.reason_code,
+                state = ?transition.to,
+                cpu_pct = sample.cpu_pct,
+                io_bytes_per_sec = io_rate,
+                load_avg_1m = ?sample.load_avg_1m,
+                cpu_ceiling_pct = self.config.cpu_ceiling_pct,
+                io_ceiling_bytes_per_sec = self.config.io_ceiling_bytes_per_sec,
+                load_ceiling_per_mille = self.config.load_ceiling_per_mille,
+                "fsfs indexing pressure admission changed"
+            );
+        }
+    }
+}
+
 /// EWMA: `alpha * new + (1 - alpha) * old`.
 fn ewma(old: f64, new: f64, alpha: f64) -> f64 {
     alpha.mul_add(new, (1.0 - alpha) * old)
@@ -537,6 +658,147 @@ mod tests {
 
     fn idle_sample() -> PressureSample {
         make_sample(5.0, 100, 0, 0, 0.5)
+    }
+
+    fn index_monitor() -> IndexPressureMonitor {
+        IndexPressureMonitor::new(&PressureConfig {
+            cpu_ceiling_pct: 100,
+            io_ceiling_bytes_per_sec: 1_000,
+            load_ceiling_per_mille: 1_000,
+            ewma_alpha_per_mille: 1_000,
+            anti_flap_readings: 1,
+            ..PressureConfig::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn indexing_ceilings_change_admission_for_the_same_observed_work() {
+        let sample = make_sample(50.0, 0, 0, 0, 0.0);
+        let mut normal = index_monitor();
+        normal.observe(&sample, Instant::now());
+        assert!(!normal.paused());
+        let mut limited = IndexPressureMonitor::new(&PressureConfig {
+            cpu_ceiling_pct: 40,
+            ..normal.config.clone()
+        })
+        .unwrap();
+        limited.observe(&sample, Instant::now());
+        assert!(limited.paused());
+
+        let sample = make_sample(0.0, 0, 0, 0, 1.0);
+        let mut normal = index_monitor();
+        normal.cpu_slots = 2;
+        normal.observe(&sample, Instant::now());
+        assert!(!normal.paused());
+        let mut limited = IndexPressureMonitor::new(&PressureConfig {
+            load_ceiling_per_mille: 500,
+            ..normal.config.clone()
+        })
+        .unwrap();
+        limited.cpu_slots = 2;
+        limited.observe(&sample, Instant::now());
+        assert!(limited.paused());
+    }
+
+    #[test]
+    fn indexing_io_admission_uses_elapsed_time_and_preserves_independent_deltas() {
+        let now = Instant::now();
+        for (seconds, paused) in [(1, true), (2, false)] {
+            let mut monitor = index_monitor();
+            monitor.observe(&make_sample(0.0, 0, 10_000, 20_000, 0.0), now);
+            assert!(
+                !monitor.paused(),
+                "the first sample only establishes counters"
+            );
+            monitor.observe(
+                &make_sample(0.0, 0, 10_500, 20_500, 0.0),
+                now + Duration::from_secs(seconds),
+            );
+            assert_eq!(monitor.paused(), paused);
+        }
+        let mut monitor = index_monitor();
+        monitor.observe(&make_sample(0.0, 0, u64::MAX, 0, 0.0), now);
+        monitor.observe(
+            &make_sample(0.0, 0, 0, 1_000, 0.0),
+            now + Duration::from_secs(1),
+        );
+        assert!(
+            monitor.paused(),
+            "a reset read counter cannot hide new writes"
+        );
+        let mut limited = IndexPressureMonitor::new(&PressureConfig {
+            io_ceiling_bytes_per_sec: 500,
+            ..index_monitor().config
+        })
+        .unwrap();
+        limited.observe(&make_sample(0.0, 0, 0, 0, 0.0), now);
+        limited.observe(
+            &make_sample(0.0, 0, 500, 500, 0.0),
+            now + Duration::from_secs(2),
+        );
+        assert!(
+            limited.paused(),
+            "the configured I/O ceiling must change admission"
+        );
+    }
+
+    #[test]
+    fn indexing_pressure_requires_sustained_samples_and_recovers_without_new_work() {
+        let now = Instant::now();
+        let mut monitor = IndexPressureMonitor::new(&PressureConfig {
+            anti_flap_readings: 3,
+            ..index_monitor().config
+        })
+        .unwrap();
+        for reading in 0..3 {
+            monitor.observe(
+                &make_sample(100.0, 0, 0, 0, 0.0),
+                now + Duration::from_secs(reading),
+            );
+            assert_eq!(monitor.paused(), reading == 2);
+        }
+        for reading in 0..3 {
+            monitor.observe(
+                &make_sample(0.0, 0, 0, 0, 0.0),
+                now + Duration::from_secs(3 + reading),
+            );
+            assert_eq!(monitor.paused(), reading < 2);
+        }
+        monitor.observe(
+            &make_sample(100.0, 0, 0, 0, 0.0),
+            now + Duration::from_secs(6),
+        );
+        monitor.observe(
+            &make_sample(0.0, 0, 0, 0, 0.0),
+            now + Duration::from_secs(7),
+        );
+        assert!(
+            !monitor.paused(),
+            "a transient spike must not pause indexing"
+        );
+    }
+
+    #[test]
+    fn indexing_pressure_rejects_zero_ceilings_before_sampling() {
+        for field in [
+            "pressure.cpu_ceiling_pct",
+            "pressure.io_ceiling_bytes_per_sec",
+            "pressure.load_ceiling_per_mille",
+            "pressure.sample_interval_ms",
+        ] {
+            let mut config = PressureConfig::default();
+            match field {
+                "pressure.cpu_ceiling_pct" => config.cpu_ceiling_pct = 0,
+                "pressure.io_ceiling_bytes_per_sec" => config.io_ceiling_bytes_per_sec = 0,
+                "pressure.load_ceiling_per_mille" => config.load_ceiling_per_mille = 0,
+                _ => config.sample_interval_ms = 0,
+            }
+            assert!(matches!(
+                IndexPressureMonitor::new(&config),
+                Err(SearchError::InvalidConfig { field: actual, .. }) if actual == field
+            ));
+        }
     }
 
     // ── ControlState ──

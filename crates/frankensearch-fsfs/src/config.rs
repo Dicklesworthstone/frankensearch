@@ -1012,12 +1012,15 @@ impl Default for SearchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PressureConfig {
     pub profile: PressureProfile,
+    /// Host CPU utilization used for cooperative indexing admission.
     pub cpu_ceiling_pct: u8,
     pub memory_ceiling_mb: usize,
     pub sample_interval_ms: u64,
     pub ewma_alpha_per_mille: u16,
     pub anti_flap_readings: u8,
+    /// Process disk I/O bytes per second; OS counters are available on Linux.
     pub io_ceiling_bytes_per_sec: u64,
+    /// One-minute host load per available CPU, in thousandths.
     pub load_ceiling_per_mille: u16,
     pub degradation_override: DegradationOverrideMode,
     pub hard_pause_requested: bool,
@@ -3422,36 +3425,6 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
             message: "fsfs stores no summaries to expire, so this changes nothing".into(),
         });
     }
-    // The pressure state machine that would read these ceilings has no
-    // production caller; the shadow oracle samples CPU and I/O on its own.
-    let defaults = PressureConfig::default();
-    let ceilings = [
-        (
-            config.pressure.cpu_ceiling_pct != defaults.cpu_ceiling_pct
-                && !cfg!(feature = "shadow-oracle"),
-            "pressure.cpu_ceiling_pct",
-        ),
-        (
-            config.pressure.io_ceiling_bytes_per_sec != defaults.io_ceiling_bytes_per_sec
-                && !cfg!(feature = "shadow-oracle"),
-            "pressure.io_ceiling_bytes_per_sec",
-        ),
-        (
-            config.pressure.load_ceiling_per_mille != defaults.load_ceiling_per_mille,
-            "pressure.load_ceiling_per_mille",
-        ),
-    ];
-    for (changed, field) in ceilings {
-        if changed {
-            warnings.push(ConfigWarning {
-                severity: ConfigDiagnosticSeverity::Warn,
-                reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
-                field: field.into(),
-                source: ConfigSource::Runtime,
-                message: "no fsfs component reads this ceiling yet, so it changes nothing".into(),
-            });
-        }
-    }
     // A profile's quality ceiling applies (search.fast_only); its resolved
     // concurrency and scheduler limits have no reader yet.
     if config.pressure.profile != PressureProfile::Performance {
@@ -4661,7 +4634,7 @@ mod tests {
 [privacy]\nredact_file_contents_in_logs = false\nredact_paths_in_telemetry = false\n\
 [storage]\nsummary_retention_days = 120\n\
 [tui]\ntheme = \"light\"\n\
-[pressure]\nload_ceiling_per_mille = 1500\nprofile = \"strict\"\n";
+[pressure]\ncpu_ceiling_pct = 50\nio_ceiling_bytes_per_sec = 500000\nload_ceiling_per_mille = 1500\nprofile = \"strict\"\n";
         let turned_off = load_from_str(
             Some(file),
             None,
@@ -4670,13 +4643,15 @@ mod tests {
             home(),
         )
         .expect("load");
+        assert_eq!(turned_off.config.pressure.cpu_ceiling_pct, 50);
+        assert_eq!(turned_off.config.pressure.io_ceiling_bytes_per_sec, 500_000);
+        assert_eq!(turned_off.config.pressure.load_ceiling_per_mille, 1_500);
         let mut fields = no_effect(&turned_off);
         fields.sort();
         assert_eq!(
             fields,
             [
                 "indexing.reindex_on_change",
-                "pressure.load_ceiling_per_mille",
                 "pressure.profile",
                 "privacy.redact_file_contents_in_logs",
                 "privacy.redact_paths_in_telemetry",

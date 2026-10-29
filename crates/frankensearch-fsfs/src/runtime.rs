@@ -150,6 +150,7 @@ use crate::pressure::{
     HostPressureCollector, PressureController, PressureControllerConfig, PressureSignal,
     PressureState, PressureTransition,
 };
+use crate::pressure_sensing::IndexPressureMonitor;
 use crate::query_execution::{
     FusedCandidate, FusionPolicy as QueryFusionPolicy, LexicalCandidate,
     QueryExecutionOrchestrator, SemanticCandidate,
@@ -2176,19 +2177,37 @@ struct IndexDiscoveryStats {
 /// loaders can exceed the threshold before returning; this is not an OS cap.
 struct IndexRunControl {
     collector: HostPressureCollector,
+    pressure: IndexPressureMonitor,
     sample_interval: Duration,
     last_sample: Instant,
     memory_ceiling_mb: usize,
 }
 
 impl IndexRunControl {
-    fn new(config: &FsfsConfig) -> Self {
-        Self {
+    fn new(config: &FsfsConfig) -> SearchResult<Self> {
+        Ok(Self {
             collector: HostPressureCollector::default(),
+            pressure: IndexPressureMonitor::new(&config.pressure)?,
             sample_interval: Duration::from_millis(config.pressure.sample_interval_ms.max(1)),
             last_sample: Instant::now(),
             memory_ceiling_mb: config.pressure.memory_ceiling_mb,
+        })
+    }
+
+    /// Wait before admitting another bounded batch. The selected generation
+    /// and unfinished checkpoint remain owned while pressure settles; a model
+    /// call already running still finishes synchronously before this boundary.
+    async fn admit_work(&mut self, cx: &Cx, phase: &'static str) -> SearchResult<()> {
+        self.checkpoint(cx, phase, true)?;
+        while self.pressure.paused() {
+            self.checkpoint(cx, phase, false)?;
+            asupersync::time::sleep(
+                cx.now(),
+                self.sample_interval.min(Duration::from_millis(100)),
+            )
+            .await;
         }
+        self.checkpoint(cx, phase, false)
     }
 
     fn checkpoint(&mut self, cx: &Cx, phase: &'static str, force: bool) -> SearchResult<()> {
@@ -15033,6 +15052,8 @@ impl FsfsRuntime {
             );
         }
         self.validate_append_indexing_mode(&index_root)?;
+        let mut control = IndexRunControl::new(&self.config)?;
+        control.admit_work(cx, "append.start").await?;
         let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         {
@@ -15078,6 +15099,7 @@ impl FsfsRuntime {
             }
         }
 
+        control.admit_work(cx, "append.fast_model_load").await?;
         let embedder = self.resolve_fast_embedder()?;
         let fast_identity = {
             // Admit against a shared reader so we do not hold a write mapping
@@ -15101,6 +15123,7 @@ impl FsfsRuntime {
         // let the tiers diverge.
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
         let quality = if quality_vector_path.exists() {
+            control.admit_work(cx, "append.quality_model_load").await?;
             let quality_embedder = self.resolve_quality_embedder()?.ok_or_else(|| {
                 SearchError::EmbedderUnavailable {
                     model: self.config.indexing.quality_model.clone(),
@@ -15135,7 +15158,7 @@ impl FsfsRuntime {
                 None => vec![document.embedding_text.as_str()],
             };
             for (ordinal, text) in texts.into_iter().enumerate() {
-                retained_search_checkpoint(cx)?;
+                control.admit_work(cx, "append.fast_embedding").await?;
                 let response =
                     with_cancellation(cx, "fsfs.append_batch.fast", embedder.embed_bound(cx, text))
                         .await;
@@ -15153,6 +15176,7 @@ impl FsfsRuntime {
                 entries.push((semantic_windows::row_id(id, ordinal), embedding.values));
             }
             if let Some((quality_embedder, identity)) = quality.as_ref() {
+                control.admit_work(cx, "append.quality_embedding").await?;
                 let response = with_cancellation(
                     cx,
                     "fsfs.append_batch.quality",
@@ -18838,8 +18862,8 @@ impl FsfsRuntime {
             self.validate_semantic_model_selection(SearchExecutionMode::Full)?;
         }
         let batch_size = self.effective_embedding_batch_size();
-        let mut control = IndexRunControl::new(&self.config);
-        control.checkpoint(cx, "index.start", true)?;
+        let mut control = IndexRunControl::new(&self.config)?;
+        control.admit_work(cx, "index.start").await?;
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
@@ -19011,9 +19035,9 @@ impl FsfsRuntime {
         let embedder = if lexical_only {
             None
         } else {
-            control.checkpoint(cx, "index.model_provisioning", true)?;
+            control.admit_work(cx, "index.model_provisioning").await?;
             self.maybe_offer_interactive_model_provisioning(cx).await?;
-            control.checkpoint(cx, "index.fast_model_load", true)?;
+            control.admit_work(cx, "index.fast_model_load").await?;
             let embedder = self.resolve_fast_embedder()?;
             control.checkpoint(cx, "index.fast_model_loaded", true)?;
             Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
@@ -19032,6 +19056,7 @@ impl FsfsRuntime {
         let (quality_embedder, mut quality_tier_reason) = if lexical_only {
             (None, REASON_VECTOR_QUALITY_TIER_SKIPPED_LEXICAL_ONLY)
         } else {
+            control.admit_work(cx, "index.quality_model_load").await?;
             self.resolve_indexing_quality_embedder()
         };
         control.checkpoint(cx, "index.quality_model_loaded", true)?;
@@ -19702,7 +19727,7 @@ impl FsfsRuntime {
 
         // 3. Process in batches
         for chunk in reading.chunks(batch_size) {
-            control.checkpoint(cx, "index.batch", true)?;
+            control.admit_work(cx, "index.batch").await?;
             if checkpoint_durable_on_disk {
                 checkpoint.artifacts_durable = false;
                 checkpoint.updated_at_ms = pressure_timestamp_ms();
@@ -20030,7 +20055,7 @@ impl FsfsRuntime {
                 const WINDOW_RETRY_BACKOFFS_MS: [u64; EMBEDDING_BATCH_MAX_ATTEMPTS - 1] =
                     [200, 400];
                 for batch in windows.chunks(batch_size) {
-                    control.checkpoint(cx, "index.fast_window_batch", true)?;
+                    control.admit_work(cx, "index.fast_window_batch").await?;
                     let live = batch
                         .iter()
                         .filter(|(source, _)| !deferred[*source])
@@ -20143,7 +20168,7 @@ impl FsfsRuntime {
                     }
                 }
             } else if !semantic_docs.is_empty() {
-                control.checkpoint(cx, "index.semantic_batch", true)?;
+                control.admit_work(cx, "index.semantic_batch").await?;
                 let semantic_texts = semantic_docs
                     .iter()
                     .map(|pending| pending.document.content.as_str())
@@ -20278,7 +20303,7 @@ impl FsfsRuntime {
                     })
                     .collect::<Vec<_>>();
                 if !quality_docs.is_empty() {
-                    control.checkpoint(cx, "index.quality_batch", true)?;
+                    control.admit_work(cx, "index.quality_batch").await?;
                     let quality_texts = quality_docs
                         .iter()
                         .map(|pending| pending.document.content.as_str())
@@ -22672,6 +22697,8 @@ impl FsfsRuntime {
         for id in docs.keys() {
             semantic_windows::validate_source_id(id)?;
         }
+        let mut control = IndexRunControl::new(&self.config)?;
+        control.admit_work(cx, "append.lexical_start").await?;
         let publication_lease = crate::lifecycle::PublicationLease::acquire(index_root)?;
         let (Some(mut manifests), Some(sentinel)) = (
             Self::read_matching_manifest_generation(index_root)?,
@@ -44582,10 +44609,53 @@ mod tests {
     }
 
     #[test]
+    fn indexing_pressure_wait_yields_and_preserves_cancellation() {
+        use std::future::poll_fn;
+        use std::task::Poll;
+
+        use crate::pressure_sensing::PressureSample;
+
+        run_test_with_cx(|cx| async move {
+            let mut config = FsfsConfig::default();
+            config.pressure.ewma_alpha_per_mille = 1_000;
+            config.pressure.anti_flap_readings = 1;
+            config.pressure.sample_interval_ms = 60_000;
+            let mut control = super::IndexRunControl::new(&config).unwrap();
+            let mut sample = PressureSample {
+                cpu_pct: 0.0,
+                rss_bytes: 0,
+                io_read_bytes: 0,
+                io_write_bytes: 0,
+                load_avg_1m: Some(0.0),
+            };
+            control.pressure.observe(&sample, Instant::now());
+            control.admit_work(&cx, "healthy.batch").await.unwrap();
+            sample.cpu_pct = 100.0;
+            control.pressure.observe(&sample, Instant::now());
+            let result = {
+                let mut pending = Box::pin(control.admit_work(&cx, "paused.batch"));
+                poll_fn(|task| {
+                    assert!(std::future::Future::poll(pending.as_mut(), task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                cx.set_cancel_requested(true);
+                pending.await
+            };
+            cx.set_cancel_requested(false);
+            assert!(matches!(result, Err(SearchError::Cancelled { .. })));
+            assert!(
+                control.pressure.paused(),
+                "cancellation cannot clear pressure"
+            );
+        });
+    }
+
+    #[test]
     fn gh43_memory_threshold_stops_at_boundary_with_typed_error() {
         let mut config = FsfsConfig::default();
         config.pressure.memory_ceiling_mb = 128;
-        let control = super::IndexRunControl::new(&config);
+        let control = super::IndexRunControl::new(&config).unwrap();
         control.admit_memory(99.9, "test").expect("below ceiling");
         for pct in [100.0, 125.0] {
             let error = control

@@ -548,6 +548,8 @@ impl FsfsRuntime {
             });
         }
         validate_retained_catalog_path(&self.config.storage.db_path)?;
+        let mut control = super::IndexRunControl::new(&self.config)?;
+        control.admit_work(cx, "retained_batch.start").await?;
         let store = CompleteGenerationStore::open(cx, store_root)?;
         let build = store.begin(cx)?;
         let predecessor = store
@@ -598,6 +600,9 @@ impl FsfsRuntime {
         let fast = if lexical_only || !semantic_upserts {
             None
         } else {
+            control
+                .admit_work(cx, "retained_batch.fast_model_load")
+                .await?;
             Some(Producer::admit(self, predecessor.path(), false)?)
         };
         let quality = if semantic_upserts
@@ -606,6 +611,9 @@ impl FsfsRuntime {
                 .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
                 .try_exists()?
         {
+            control
+                .admit_work(cx, "retained_batch.quality_model_load")
+                .await?;
             Some(Producer::admit(self, predecessor.path(), true)?)
         } else {
             None
@@ -652,21 +660,35 @@ impl FsfsRuntime {
                             "document ID leaves insufficient room for window IDs",
                         ));
                     }
+                    control
+                        .admit_work(cx, "retained_batch.fast_embedding")
+                        .await?;
                     batch.push(cx, row, text, &mut vector_bytes).await?;
                 }
             }
             if let Some(batch) = &mut quality_batch {
+                control
+                    .admit_work(cx, "retained_batch.quality_embedding")
+                    .await?;
                 batch
                     .push(cx, id.clone(), &body.embedding, &mut vector_bytes)
                     .await?;
             }
         }
         let fast_entries = match fast_batch {
-            Some(batch) => batch.finish(cx, &mut vector_bytes).await?,
+            Some(batch) => {
+                control.admit_work(cx, "retained_batch.fast_flush").await?;
+                batch.finish(cx, &mut vector_bytes).await?
+            }
             None => Vec::new(),
         };
         let quality_entries = match quality_batch {
-            Some(batch) => batch.finish(cx, &mut vector_bytes).await?,
+            Some(batch) => {
+                control
+                    .admit_work(cx, "retained_batch.quality_flush")
+                    .await?;
+                batch.finish(cx, &mut vector_bytes).await?
+            }
             None => Vec::new(),
         };
         retained_search_checkpoint(cx)?;
