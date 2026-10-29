@@ -7,6 +7,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use frankensearch_fsfs::FsfsConfig;
+#[cfg(feature = "semantic-support")]
+use frankensearch_fsfs::generation_store::{CompleteGenerationStore, PublishedGeneration};
 use serde_json::Value;
 
 struct Fixture {
@@ -277,7 +279,15 @@ fn later_no_watch_override_keeps_index_binary_one_shot() {
 }
 
 #[cfg(feature = "semantic-support")]
-fn wait_for_visible_paths(fixture: &Fixture, watch: &mut Process, expected: &[&str]) -> PathBuf {
+fn wait_for_visible_paths(
+    fixture: &Fixture,
+    watch: &mut Process,
+    expected: &[&str],
+) -> PublishedGeneration {
+    let reader_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .build()
+        .unwrap();
+    let cx = reader_runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
     let deadline = Instant::now() + Duration::from_secs(180);
     let mut last_generation = String::new();
     loop {
@@ -296,6 +306,14 @@ fn wait_for_visible_paths(fixture: &Fixture, watch: &mut Process, expected: &[&s
         if let Some(receipt) = receipt {
             let generation = receipt["data"]["generation_id"].as_str().unwrap();
             if generation != last_generation {
+                // Admit and pin the exact selected image before querying. A
+                // pathname alone is not a reader and cannot fence collection.
+                let store = CompleteGenerationStore::open(&cx, &fixture.store).unwrap();
+                let selected = store.active(&cx).unwrap().unwrap();
+                if selected.id() != generation {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
                 generation.clone_into(&mut last_generation);
                 let output = Process::start(fixture.command("search", "json").args([
                     "sharedtoken",
@@ -321,8 +339,13 @@ fn wait_for_visible_paths(fixture: &Fixture, watch: &mut Process, expected: &[&s
                                 .is_some_and(|filename| filename == std::ffi::OsStr::new(name))
                         })
                     })
+                    && store.is_selected(&cx, &selected).unwrap()
                 {
-                    return PathBuf::from(receipt["data"]["generation_path"].as_str().unwrap());
+                    assert_eq!(
+                        selected.path(),
+                        Path::new(receipt["data"]["generation_path"].as_str().unwrap())
+                    );
+                    return selected;
                 }
             }
         }
@@ -346,7 +369,7 @@ fn complete_watch_binary_keeps_search_available() {
             .env("FSFS_COMPLETE_GENERATIONS", "1"),
     );
     let first = wait_for_visible_paths(&fixture, &mut watch, &["alpha.md"]);
-    let original_manifest = fs::read(first.join("FSFS-BUNDLE.json")).unwrap();
+    let original_manifest = fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap();
     fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
     let second = wait_for_visible_paths(&fixture, &mut watch, &["alpha.md", "beta.md"]);
     assert_ne!(first, second);
@@ -360,10 +383,31 @@ fn complete_watch_binary_keeps_search_available() {
     wait_for_visible_paths(&fixture, &mut watch, &["renamed.md"]);
     watch.assert_alive();
     assert_eq!(
-        fs::read(first.join("FSFS-BUNDLE.json")).unwrap(),
+        fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap(),
         original_manifest
     );
-    assert!(second.is_dir());
+    assert!(second.path().is_dir());
+
+    // The same default collector must reclaim old images after their actual
+    // readers release them. Disabling collection cannot satisfy this test.
+    let first_path = first.path().to_path_buf();
+    let second_path = second.path().to_path_buf();
+    drop(first);
+    drop(second);
+    fs::write(
+        fixture.source.join("gamma.md"),
+        "sharedtoken gamma document",
+    )
+    .unwrap();
+    let _after_release = wait_for_visible_paths(&fixture, &mut watch, &["renamed.md", "gamma.md"]);
+    for path in [&first_path, &second_path] {
+        assert_eq!(
+            fs::symlink_metadata(path).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+            "released old generation must be collected: {}",
+            path.display()
+        );
+    }
     // Drop bounds cleanup; it is not a graceful-SIGINT assertion.
 }
 
