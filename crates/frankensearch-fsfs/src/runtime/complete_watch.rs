@@ -1605,19 +1605,23 @@ mod lifecycle_tests {
             runtime.config.pressure.sample_interval_ms = 60_000;
             let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
             controlled_notifications(&mut session);
-            let before = publish_tick(&mut session, &cx).await;
-            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
-            let before_bytes = fs::read(before.path().join("FSFS-BUNDLE.json")).unwrap();
-            let allocated = candidate_count(&root);
-            let now = Instant::now();
+            // Control the initial admission sample too: a busy host must not
+            // pause the baseline publication before this test injects pressure.
             let mut sample = PressureSample {
-                cpu_pct: 100.0,
+                cpu_pct: 0.0,
                 rss_bytes: 0,
                 io_read_bytes: 0,
                 io_write_bytes: 0,
                 io_counters_available: true,
                 load_avg_1m: Some(0.0),
             };
+            session.pressure.observe(&sample, Instant::now());
+            let before = publish_tick(&mut session, &cx).await;
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            let before_bytes = fs::read(before.path().join("FSFS-BUNDLE.json")).unwrap();
+            let allocated = candidate_count(&root);
+            let now = Instant::now();
+            sample.cpu_pct = 100.0;
             session.pressure.observe(&sample, now);
             assert!(session.pressure.paused());
             fs::write(source.join("beta.md"), "sharedtoken beta after pressure").unwrap();
