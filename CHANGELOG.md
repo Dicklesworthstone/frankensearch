@@ -6,15 +6,21 @@
   during constant evaluation. Invalid or unrepresentable version components
   fail the build. The existing semver assertion and every historical manifest
   golden image remain enforced; durable format versions are unchanged.
+- Successor manifests refresh the producer version during ordinary
+  publication, compaction, concatenation merge, and quarantine recovery.
+  No-op maintenance, retained snapshots, and exact-byte durability repair
+  preserve historical metadata and bytes.
 - The corrected hotfix source is
-  `150c159460d94ca3f304afc156ffc0dcb539483a`, derived from the preserved
+  `2767eef0aff05ecbda1604debe48e4ff7959b9bb`, following
+  `150c159460d94ca3f304afc156ffc0dcb539483a` and derived from the preserved
   `7307e621b429f92f816db67390a7352bd3599b37` release preparation with only
   `keeper.rs` changed. The validated sealing implementation remains `scribe.rs`
   blob `caf92bc19e4277786a1f1fb82171036e19bc07af`.
 - Correctly stamped 0.4.2 output has new producer metadata and corresponding
   segment identities/checksums. The sealing optimization's byte-identity
-  evidence applies to equal explicit input metadata. Package publication,
-  registry-artifact verification, and CASS's dependency uptake remain pending.
+  evidence applies to equal explicit input metadata. Full package
+  qualification, publication, registry-artifact verification, and CASS's
+  dependency uptake remain pending.
 
 ### Unreleased — Honor configured models and offline acquisition (2026-10-24)
 
