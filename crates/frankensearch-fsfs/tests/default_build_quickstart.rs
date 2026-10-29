@@ -401,10 +401,15 @@ mod loader_only {
             .unwrap();
             if format == "table" {
                 assert!(outcome.stdout.starts_with("Discovered 10 file(s)"));
+                // JSONL already indexed the same corpus above. The next format
+                // must report carrying all ten files, rather than rebuilding
+                // their document embeddings just to change presentation.
                 assert!(
-                    outcome
-                        .stdout
-                        .contains("Indexed 10 file(s) (discovered 10, skipped 0)")
+                    outcome.stdout.contains(
+                        "Indexed 10 file(s) (discovered 10, skipped 0; 10 unchanged, not reread)"
+                    ),
+                    "warm table output must retain the file counts and report reuse: {}",
+                    outcome.stdout
                 );
                 continue;
             }
