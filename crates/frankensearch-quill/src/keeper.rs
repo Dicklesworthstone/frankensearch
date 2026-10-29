@@ -4218,6 +4218,9 @@ impl KeeperSnapshot {
 
     /// Clone exactly one next-generation MANIFEST for staged writer changes.
     ///
+    /// The successor carries the current producer version; the retained
+    /// snapshot and its historical producer metadata remain unchanged.
+    ///
     /// # Errors
     ///
     /// Returns a typed generation-exhaustion failure.
@@ -4230,6 +4233,7 @@ impl KeeperSnapshot {
                 .ok_or(KeeperError::GenerationExhausted {
                     current: manifest.generation,
                 })?;
+        manifest.engine_version = CURRENT_ENGINE_VERSION;
         Ok(manifest)
     }
 
@@ -5838,6 +5842,7 @@ fn build_compaction(
         })?;
     let mut manifest = snapshot.loaded.manifest.clone();
     manifest.generation = generation_after;
+    manifest.engine_version = CURRENT_ENGINE_VERSION;
     manifest.last_publish_unix_s = 0;
 
     for index in eligible {
@@ -7031,6 +7036,7 @@ fn build_concat_merge(
             .ok_or(ConcatMergeError::ArithmeticOverflow {
                 field: "manifest generation",
             })?;
+    manifest.engine_version = CURRENT_ENGINE_VERSION;
     manifest.last_publish_unix_s = 0;
     manifest.segments.splice(start..end, [replacement]);
     manifest
@@ -9349,6 +9355,7 @@ fn recover_durable_writer_files(
             .ok_or(KeeperError::GenerationExhausted {
                 current: successor.generation,
             })?;
+    successor.engine_version = CURRENT_ENGINE_VERSION;
     successor.last_publish_unix_s = 0;
     successor.segments = retained;
     successor.field_stats = field_stats;
@@ -20131,6 +20138,177 @@ mod tests {
     }
 
     #[test]
+    fn next_manifest_stamps_current_producer_and_preserves_history() -> TestResult {
+        for producer in [pack_engine_version(0, 3, 5), pack_engine_version(0, 4, 0)] {
+            let genesis = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+            let mut historical = genesis.next_manifest()?;
+            historical.engine_version = producer;
+            historical.docid_high_watermark = 65_536;
+            historical.flags = MANIFEST_FLAG_BULK_MODE_IN_PROGRESS;
+            historical.last_publish_unix_s = 1_700_000_000;
+            let historical_bytes = historical.to_bytes()?;
+            let predecessor = genesis.publish_owned_segments(&historical, Vec::new())?;
+
+            let mut successor = predecessor.next_manifest()?;
+            let mut expected = historical.clone();
+            expected.generation += 1;
+            expected.engine_version = CURRENT_ENGINE_VERSION;
+            assert_eq!(successor, expected);
+            // Staged mutations accept the producer change without changing
+            // the inherited schema, watermark, flags, or publication time.
+            assert!(!predecessor.delete_document(&mut successor, "absent")?);
+            assert_eq!(successor, expected);
+            let published = predecessor.publish_owned_segments(&successor, Vec::new())?;
+            assert_eq!(published.loaded_manifest().manifest, expected);
+            assert_eq!(predecessor.loaded_manifest().manifest, historical);
+            assert_eq!(
+                predecessor.loaded_manifest().manifest.to_bytes()?,
+                historical_bytes
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn next_manifest_generation_exhaustion_preserves_history() -> TestResult {
+        let penultimate =
+            KeeperSnapshot::in_memory_with_generation_for_test(DEFAULT_SCHEMA, u64::MAX - 1)?;
+        let mut historical = penultimate.next_manifest()?;
+        historical.engine_version = pack_engine_version(0, 3, 5);
+        let historical_bytes = historical.to_bytes()?;
+        let final_snapshot = penultimate.publish_owned_segments(&historical, Vec::new())?;
+
+        assert!(matches!(
+            final_snapshot.next_manifest(),
+            Err(KeeperError::GenerationExhausted { current: u64::MAX })
+        ));
+        assert_eq!(final_snapshot.loaded_manifest().manifest, historical);
+        assert_eq!(
+            final_snapshot.loaded_manifest().manifest.to_bytes()?,
+            historical_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn maintenance_stamps_new_generations_and_preserves_no_op_history() -> TestResult {
+        use crate::scribe::{
+            ColumnarAccumulator, FlushDocumentInput, FlushSegmentInput, IndexedFieldValue,
+            flush_accumulator,
+        };
+
+        let producer = pack_engine_version(0, 3, 5);
+        let genesis = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let mut historical = genesis.next_manifest()?;
+        historical.engine_version = producer;
+        historical.docid_high_watermark = 2;
+        let mut encoded_segments = Vec::new();
+        let mut source_stats = Vec::new();
+        for (doc_ord, document_id) in [(0, "historical-a"), (1, "historical-b")] {
+            let mut accumulator = ColumnarAccumulator::new(DEFAULT_SCHEMA)?;
+            accumulator.add_document(
+                doc_ord,
+                &[
+                    IndexedFieldValue::new(0, document_id),
+                    IndexedFieldValue::new(1, "common"),
+                ],
+            )?;
+            let documents = [FlushDocumentInput::from_canonical_content(
+                doc_ord,
+                document_id,
+                b"common",
+            )];
+            let encoded = flush_accumulator(
+                &accumulator,
+                FlushSegmentInput {
+                    segment_id: u64::from(doc_ord) + 1,
+                    lease_docid_base: 0,
+                    created_unix_s: 1_700_000_000,
+                    engine_version: producer,
+                    documents: &documents,
+                },
+            )?;
+            let reader = SegmentReader::from_bytes(encoded.as_bytes(), DEFAULT_SCHEMA)?;
+            source_stats.push(StatsSection::parse(
+                reader
+                    .section(SectionKind::STATS)?
+                    .ok_or_else(|| io::Error::other("sealed fixture is missing STATS"))?,
+                &[0, 1, 2],
+                1,
+            )?);
+            historical
+                .segments
+                .push(manifest_segment(&encoded, u64::from(doc_ord) + 1));
+            encoded_segments.push(encoded);
+        }
+        for stats in aggregate_field_stats(source_stats.iter())? {
+            historical.field_stats.push(ManifestFieldStats {
+                field_ord: stats.field_ord,
+                total_tokens: stats.total_tokens,
+                doc_count: u32::try_from(stats.doc_count)?,
+            });
+        }
+        let snapshot = genesis.publish_owned_segments(&historical, encoded_segments)?;
+        let historical_bytes = historical.to_bytes()?;
+        let (unchanged, no_op) = snapshot.compact_owned(CompactionPolicy::default(), 0)?;
+        assert!(!no_op.changed());
+        assert_eq!(
+            unchanged.loaded_manifest().manifest.to_bytes()?,
+            historical_bytes
+        );
+
+        let merged = snapshot.concat_merge_owned(&[1, 2], 3, 1_700_000_001)?;
+        assert_eq!(
+            merged.loaded_manifest().manifest.engine_version,
+            CURRENT_ENGINE_VERSION
+        );
+        assert_eq!(
+            merged.loaded_manifest().manifest.generation,
+            historical.generation + 1
+        );
+        assert_eq!(merged.doc_count(), 2);
+        assert_eq!(
+            merged.materialize_document_id(0),
+            Some(DocId::new("historical-a"))
+        );
+        assert_eq!(
+            merged.materialize_document_id(1),
+            Some(DocId::new("historical-b"))
+        );
+
+        let mut deleted = snapshot.next_manifest()?;
+        assert!(snapshot.delete_document(&mut deleted, "historical-a")?);
+        deleted.engine_version = producer;
+        let tombstoned = snapshot.publish_owned_segments(&deleted, Vec::new())?;
+        let deleted_bytes = deleted.to_bytes()?;
+        let (compacted, report) = tombstoned.compact_owned(CompactionPolicy::default(), 0)?;
+        assert!(report.changed());
+        assert_eq!(
+            compacted.loaded_manifest().manifest.engine_version,
+            CURRENT_ENGINE_VERSION
+        );
+        assert_eq!(
+            compacted.loaded_manifest().manifest.generation,
+            deleted.generation + 1
+        );
+        assert_eq!(compacted.doc_count(), 1);
+        assert_eq!(compacted.materialize_document_id(0), None);
+        assert_eq!(
+            compacted.materialize_document_id(1),
+            Some(DocId::new("historical-b"))
+        );
+        assert_eq!(
+            tombstoned.loaded_manifest().manifest.to_bytes()?,
+            deleted_bytes
+        );
+        assert_eq!(
+            snapshot.loaded_manifest().manifest.to_bytes()?,
+            historical_bytes
+        );
+        Ok(())
+    }
+
+    #[test]
     fn keeper_create_is_create_or_open_and_in_memory_creates_no_files() {
         let memory = KeeperSnapshot::in_memory(DEFAULT_SCHEMA).expect("in-memory genesis");
         assert_eq!(memory.directory(), None);
@@ -25194,10 +25372,13 @@ mod tests {
                 .map_err(|error| error.to_string())?;
             next.docid_high_watermark = manifest_segment.docid_hi;
             next.segments.push(manifest_segment);
+            next.engine_version = pack_engine_version(0, 3, 5);
             writer
                 .publish(&cx, &next)
                 .await
                 .map_err(|error| error.to_string())?;
+            let historical_bytes =
+                std::fs::read(directory.join("MANIFEST")).map_err(|error| error.to_string())?;
             drop(writer);
 
             let mut corrupt = std::fs::read(&published).map_err(|error| error.to_string())?;
@@ -25229,6 +25410,14 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
             let snapshot = writer.retained_snapshot_for_bookkeeping();
+            if snapshot.loaded_manifest().manifest.engine_version != CURRENT_ENGINE_VERSION {
+                return Err("quarantine successor retained the historical producer".to_owned());
+            }
+            if std::fs::read(directory.join("MANIFEST.prev")).map_err(|error| error.to_string())?
+                != historical_bytes
+            {
+                return Err("quarantine changed the previous manifest bytes".to_owned());
+            }
             if snapshot.loaded_manifest().manifest.generation != 3
                 || !snapshot.loaded_manifest().manifest.segments.is_empty()
                 || !snapshot.is_degraded()
@@ -26388,8 +26577,10 @@ mod tests {
                 .publish_segment(&cx, pending)
                 .await
                 .map_err(|error| error.to_string())?;
+            let mut historical = durable_test_manifest(2, vec![setup_manifest]);
+            historical.engine_version = pack_engine_version(0, 3, 5);
             writer
-                .publish(&cx, &durable_test_manifest(2, vec![setup_manifest]))
+                .publish(&cx, &historical)
                 .await
                 .map_err(|error| error.to_string())?;
             Ok(())
@@ -26422,6 +26613,14 @@ mod tests {
                     .manifest
                     .generation,
                 2
+            );
+            assert_eq!(
+                writer
+                    .retained_snapshot_for_bookkeeping()
+                    .loaded_manifest()
+                    .manifest
+                    .engine_version,
+                pack_engine_version(0, 3, 5)
             );
             Ok(())
         });
