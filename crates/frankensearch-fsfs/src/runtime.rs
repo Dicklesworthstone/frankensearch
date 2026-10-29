@@ -6439,6 +6439,9 @@ impl std::fmt::Debug for RerankerSlot {
 #[derive(Default)]
 struct QualityEmbedderSlot(Option<Arc<dyn Embedder>>);
 
+type QualityInitialization =
+    asupersync::runtime::TaskHandle<SearchResult<Option<Arc<dyn Embedder>>>>;
+
 impl std::fmt::Debug for QualityEmbedderSlot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -13726,12 +13729,22 @@ impl FsfsRuntime {
             return Err(Self::semantic_index_unavailable_error(resources));
         }
 
+        // Cold fast-model loading can take much longer than quality loading.
+        // Use the caller's existing bounded pool to overlap those independent
+        // loads; Initial never waits for the optional quality job. Its result
+        // is consumed only inside the unchanged post-Initial quality deadline.
+        let quality_initialization = if plan.quality_stage.enabled {
+            self.prefetch_quality_initialization(cx, resources)
+        } else {
+            None
+        };
+
         if semantic_readiness_required
             && resources.vector_index.is_some()
             && resources.fast_embedder.is_none()
             && !resources.fast_embedder_attempted
         {
-            self.maybe_prepare_fast_embedder(cx, resources)?;
+            self.maybe_prepare_fast_embedder(cx, resources).await?;
         }
         if semantic_readiness_required
             && resources.vector_index.is_some()
@@ -14025,8 +14038,11 @@ impl FsfsRuntime {
             // independent quality retrieval. Optional reranking has its own
             // existing stage policy and is outside this window.
             let quality_outcome = self
-                .with_quality_deadline(
-                    cx,
+                .with_quality_deadline(cx, async {
+                    if let Some(initialization) = quality_initialization {
+                        let resolved = Self::join_search_worker(cx, initialization?).await?;
+                        Self::admit_prepared_quality_embedder(cx, resources, resolved)?;
+                    }
                     self.quality_candidates(
                         cx,
                         resources,
@@ -14035,8 +14051,9 @@ impl FsfsRuntime {
                         filter_expr.as_ref(),
                         excluded_doc_ids.clone(),
                         &semantic_candidates,
-                    ),
-                )
+                    )
+                    .await
+                })
                 .await;
 
             match quality_outcome {
@@ -23266,7 +23283,7 @@ impl FsfsRuntime {
         None
     }
 
-    fn maybe_prepare_fast_embedder(
+    async fn maybe_prepare_fast_embedder(
         &self,
         cx: &Cx,
         resources: &mut SearchExecutionResources,
@@ -23274,9 +23291,27 @@ impl FsfsRuntime {
         if resources.fast_embedder.is_some() || resources.fast_embedder_attempted {
             return Ok(());
         }
+        let resolved = if cx.blocking_pool_handle().is_some() {
+            let runtime = self.clone();
+            #[cfg(test)]
+            let selected_test_provider = runtime.resolve_fast_embedder();
+            Self::search_blocking(cx, move || {
+                #[cfg(not(test))]
+                {
+                    runtime.resolve_fast_embedder()
+                }
+                #[cfg(test)]
+                {
+                    selected_test_provider
+                }
+            })
+            .await?
+        } else {
+            self.resolve_fast_embedder()
+        };
         resources.fast_embedder_attempted = true;
 
-        match self.resolve_fast_embedder() {
+        match resolved {
             Ok(embedder) => {
                 if let Some(index) = resources.vector_index.as_ref()
                     && let Err(error) = Self::validate_fast_embedder_for_vector_index(
@@ -23329,33 +23364,40 @@ impl FsfsRuntime {
         }
     }
 
-    async fn quality_blocking<F, T>(cx: &Cx, work: F) -> SearchResult<T>
+    async fn search_blocking<F, T>(cx: &Cx, work: F) -> SearchResult<T>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let mut worker = cx
+        let worker = cx
             .spawn_blocking(move |child| {
                 child.checkpoint().map_err(|_| SearchError::Cancelled {
-                    phase: "quality_worker".to_owned(),
-                    reason: "quality worker cancelled before execution".to_owned(),
+                    phase: "search_worker".to_owned(),
+                    reason: "search worker cancelled before execution".to_owned(),
                 })?;
                 Ok(work())
             })
             .map_err(|error| SearchError::SubsystemError {
-                subsystem: "fsfs.quality.worker",
+                subsystem: "fsfs.search.worker",
                 source: Box::new(error),
             })?;
+        Self::join_search_worker(cx, worker).await?
+    }
+
+    async fn join_search_worker<T: Send + 'static>(
+        cx: &Cx,
+        mut worker: asupersync::runtime::TaskHandle<T>,
+    ) -> SearchResult<T> {
         worker.join(cx).await.map_err(|error| match error {
             asupersync::runtime::JoinError::Cancelled(_) => SearchError::Cancelled {
-                phase: "quality_worker".to_owned(),
-                reason: "quality worker cancelled".to_owned(),
+                phase: "search_worker".to_owned(),
+                reason: "search worker cancelled".to_owned(),
             },
             error => SearchError::SubsystemError {
-                subsystem: "fsfs.quality.worker",
+                subsystem: "fsfs.search.worker",
                 source: Box::new(error),
             },
-        })?
+        })
     }
 
     async fn with_quality_deadline<F, T>(&self, cx: &Cx, work: F) -> SearchResult<T>
@@ -23638,7 +23680,7 @@ impl FsfsRuntime {
             .map(|candidate| candidate.doc_id.clone())
             .collect::<HashSet<_>>();
         let work_cx = cx.clone();
-        let hits = Self::quality_blocking(cx, move || {
+        let hits = Self::search_blocking(cx, move || {
             let path_filter = filter_expr
                 .as_ref()
                 .map(|filter| filter as &dyn SearchFilter);
@@ -23791,34 +23833,93 @@ impl FsfsRuntime {
             drop(permit);
             Ok(Some(embedder))
         } else {
-            let runtime = self.clone();
-            // Test providers are thread-local fixtures. Capture their selection
-            // on the owning test thread; production loads on the actual worker.
-            #[cfg(test)]
-            let selected_test_provider = runtime.resolve_quality_embedder();
-            Self::quality_blocking(cx, move || {
-                // The actual job owns both the permit and successful model,
-                // including when its original query has already timed out.
-                let mut slot = permit;
-                let initialization_started = Instant::now();
-                #[cfg(not(test))]
-                let resolved = runtime.resolve_quality_embedder();
-                #[cfg(test)]
-                let resolved = selected_test_provider;
-                if let Ok(Some(embedder)) = &resolved {
-                    slot.0 = Some(Arc::clone(embedder));
-                }
-                info!(
-                    phase = "quality_initialization",
-                    elapsed_us = u64::try_from(initialization_started.elapsed().as_micros())
-                        .unwrap_or(u64::MAX),
-                    loaded = resolved.as_ref().is_ok_and(Option::is_some),
-                    "fsfs quality model initialization completed"
-                );
-                resolved
-            })
-            .await?
+            let initialization = self.start_quality_initialization(cx, permit)?;
+            Self::join_search_worker(cx, initialization).await?
         };
+        Self::admit_prepared_quality_embedder(cx, resources, resolved)
+    }
+
+    fn prefetch_quality_initialization(
+        &self,
+        cx: &Cx,
+        resources: &SearchExecutionResources,
+    ) -> Option<SearchResult<QualityInitialization>> {
+        let pool = cx.blocking_pool_handle()?;
+        if pool.is_shutdown()
+            || pool.pending_count() != 0
+            || pool
+                .current_max_threads()
+                .saturating_sub(pool.busy_threads())
+                < 2
+            || self.quality_disabled_by_policy()
+            || self.config.indexing.quality_model.trim().is_empty()
+            || resources.fast_embedder.is_some()
+            || resources.fast_embedder_attempted
+            || resources.quality_embedder.is_some()
+            || resources.quality_embedder_attempted
+            || Self::vector_generation_is_hash_control(resources)
+        {
+            return None;
+        }
+        let index = resources.quality_vector_index.as_ref()?;
+        if let Err(error) = self.preflight_native_quality_generation(index) {
+            return Some(Err(error));
+        }
+        // Never wait for model capacity before Initial, or start a duplicate
+        // loader when another query already owns this runtime's initialization.
+        let permit = self.quality_load_gate.try_lock_owned().ok()?;
+        if permit.0.is_some() {
+            return None;
+        }
+        Some(self.start_quality_initialization(cx, permit))
+    }
+
+    fn start_quality_initialization(
+        &self,
+        cx: &Cx,
+        permit: asupersync::sync::OwnedMutexGuard<QualityEmbedderSlot>,
+    ) -> SearchResult<QualityInitialization> {
+        let runtime = self.clone();
+        // Test providers are thread-local fixtures. Capture their selection
+        // on the owning test thread; production loads on the actual worker.
+        #[cfg(test)]
+        let selected_test_provider = runtime.resolve_quality_embedder();
+        cx.spawn_blocking(move |child| {
+            child.checkpoint().map_err(|_| SearchError::Cancelled {
+                phase: "quality_initialization".to_owned(),
+                reason: "quality initialization cancelled before execution".to_owned(),
+            })?;
+            // The actual job owns both the permit and successful model,
+            // including when its original query has already timed out.
+            let mut slot = permit;
+            let initialization_started = Instant::now();
+            #[cfg(not(test))]
+            let resolved = runtime.resolve_quality_embedder();
+            #[cfg(test)]
+            let resolved = selected_test_provider;
+            if let Ok(Some(embedder)) = &resolved {
+                slot.0 = Some(Arc::clone(embedder));
+            }
+            info!(
+                phase = "quality_initialization",
+                elapsed_us =
+                    u64::try_from(initialization_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                loaded = resolved.as_ref().is_ok_and(Option::is_some),
+                "fsfs quality model initialization completed"
+            );
+            resolved
+        })
+        .map_err(|error| SearchError::SubsystemError {
+            subsystem: "fsfs.search.worker",
+            source: Box::new(error),
+        })
+    }
+
+    fn admit_prepared_quality_embedder(
+        cx: &Cx,
+        resources: &mut SearchExecutionResources,
+        resolved: SearchResult<Option<Arc<dyn Embedder>>>,
+    ) -> SearchResult<()> {
         resources.quality_embedder_attempted = true;
         match resolved {
             Ok(Some(embedder)) => {
@@ -34752,7 +34853,7 @@ mod tests {
                 let calls = Arc::clone(&self.calls);
                 let completed = Arc::clone(&self.completed);
                 let hold = self.hold;
-                FsfsRuntime::quality_blocking(cx, move || {
+                FsfsRuntime::search_blocking(cx, move || {
                     let _permit = permit;
                     calls.fetch_add(1, Ordering::SeqCst);
                     // A real blocking pool operation. No timing/quality claim
@@ -34857,6 +34958,89 @@ mod tests {
                     resources.quality_vector_index.as_ref().unwrap(),
                 )
                 .unwrap();
+        });
+    }
+
+    #[test]
+    fn quality_prefetch_owns_one_loader_and_rechecks_producer_admission() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let mut resources = disagreeing_blend_resources(temp.path());
+            resources.fast_embedder = None;
+            resources.fast_embedder_attempted = false;
+            resources.quality_embedder = None;
+            resources.quality_embedder_attempted = false;
+            let provider: Arc<dyn Embedder> = Arc::new(BlendQueryEmbedder("blend-quality-2"));
+            super::set_test_quality_embedder(Some(Arc::clone(&provider)));
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            assert!(
+                runtime
+                    .prefetch_quality_initialization(&Cx::for_testing(), &resources)
+                    .is_none(),
+                "a caller without bounded blocking capacity must retain lazy loading"
+            );
+            let single_worker = asupersync::runtime::blocking_pool::BlockingPool::new(0, 1);
+            let single_worker_cx = cx
+                .clone()
+                .with_blocking_pool_handle(Some(single_worker.handle()));
+            assert!(
+                runtime
+                    .prefetch_quality_initialization(&single_worker_cx, &resources)
+                    .is_none(),
+                "optional loading must not get ahead of fast work on a single-worker pool"
+            );
+            let mut fast_only = runtime.clone();
+            fast_only.config.search.fast_only = true;
+            assert!(
+                fast_only
+                    .prefetch_quality_initialization(&cx, &resources)
+                    .is_none()
+            );
+            let worker = runtime
+                .prefetch_quality_initialization(&cx, &resources)
+                .expect("cold full search starts optional initialization")
+                .unwrap();
+            assert!(
+                runtime
+                    .prefetch_quality_initialization(&cx, &resources)
+                    .is_none(),
+                "another query must not duplicate the active initializer"
+            );
+            let resolved = FsfsRuntime::join_search_worker(&cx, worker).await.unwrap();
+            FsfsRuntime::admit_prepared_quality_embedder(&cx, &mut resources, resolved).unwrap();
+            assert!(Arc::ptr_eq(
+                &resources.quality_embedder.as_ref().unwrap().embedder,
+                &provider
+            ));
+
+            let foreign = temp.path().join("foreign-prefetch.fsvi");
+            VectorIndex::create_with_revision(
+                &foreign,
+                provider.id(),
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                provider.dimension(),
+                frankensearch_index::Quantization::F16,
+            )
+            .unwrap()
+            .finish()
+            .unwrap();
+            resources.quality_embedder = None;
+            resources.quality_embedder_attempted = false;
+            resources.quality_vector_index =
+                Some(Arc::new(VectorIndex::open_read_only(&foreign).unwrap()));
+            assert!(
+                runtime
+                    .prefetch_quality_initialization(&cx, &resources)
+                    .is_none()
+            );
+            assert!(matches!(
+                runtime
+                    .maybe_prepare_quality_embedder(&cx, &mut resources)
+                    .await,
+                Err(SearchError::UnverifiableRemoteSpace { .. })
+            ));
+            assert!(resources.quality_embedder.is_none());
+            super::set_test_quality_embedder(None);
         });
     }
 
