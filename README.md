@@ -1232,11 +1232,13 @@ Use this as a pragmatic hardening pass before rollout:
 
 Publication runs on a real host with configured Cargo registry credentials.
 GitHub Actions does not publish this repository. The two release lines are
-versioned independently: `v*` tags identify fsfs binary releases. As of
-2026-09-21, the latest downloadable binary is **fsfs 1.10.0** (September 8),
-while crates.io carries **frankensearch 0.6.1** and **frankensearch-fsfs 1.11.0**
-(September 19). That crate family is tagged `frankensearch-v0.6.1`; earlier
-library bundles used `crates-v*` tags. The next binary release is still pending.
+versioned independently: `v*` tags identify fsfs binary releases. Verified on
+2026-10-29, the latest downloadable binary is
+[**fsfs 1.12.3**](https://github.com/Dicklesworthstone/frankensearch/releases/tag/v1.12.3)
+(October 5), while crates.io carries
+[**frankensearch 0.7.1**](https://crates.io/crates/frankensearch/0.7.1)
+(October 3) and [**frankensearch-fsfs 1.12.3**](https://crates.io/crates/frankensearch-fsfs/1.12.3)
+(October 5). The 0.7.1 library bundle is tagged `crates-v0.7.1`.
 The [changelog](CHANGELOG.md) lists every member, source revision and semantic
 index rebuild requirement. A crate publication or git tag does not establish
 cross-platform binary qualification.

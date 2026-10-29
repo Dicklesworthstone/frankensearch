@@ -2280,11 +2280,29 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
                     )
                     .await
                     .unwrap();
-                assert_ne!(
-                    first.component_bytes(GenerationComponentRole::Lexical),
-                    changed.component_bytes(GenerationComponentRole::Lexical),
-                    "{name}: {change}"
+                assert!(
+                    parent
+                        .join(format!("{name}-lexical-{change}/lexical"))
+                        .is_dir(),
+                    "{name}: {change} must rebuild Quill rather than reuse the retained image"
                 );
+                assert_eq!(
+                    changed.metadata().commit_range,
+                    CommitRange {
+                        low: 2,
+                        high: if change == "source-cut" { 8 } else { 7 },
+                    }
+                );
+                // The source checkpoint is bound by the component receipt,
+                // outside the lexical payload. Unchanged documents may encode
+                // identically when both rebuilds share a wall-clock second.
+                if change != "source-cut" {
+                    assert_ne!(
+                        first.component_bytes(GenerationComponentRole::Lexical),
+                        changed.component_bytes(GenerationComponentRole::Lexical),
+                        "{name}: {change}"
+                    );
+                }
                 let candidate = changed
                     .candidate(
                         new_generation(1).unwrap().nonce,
@@ -2293,6 +2311,16 @@ fn qualified_rebuild_reuses_images_replaces_the_cohort_and_fences_a_losing_publi
                         [0x44; 32],
                     )
                     .unwrap();
+                if change == "source-cut" {
+                    assert_ne!(
+                        candidate.manifest().source_checkpoint_sha256(),
+                        retained
+                            .retained_snapshot()
+                            .manifest()
+                            .source_checkpoint_sha256(),
+                        "{name}: the rebuilt generation must bind the new source cut"
+                    );
+                }
                 changed.validate_candidate(&cx, &candidate).unwrap();
             }
             let second_path = parent.join(format!("{name}-second.json"));
