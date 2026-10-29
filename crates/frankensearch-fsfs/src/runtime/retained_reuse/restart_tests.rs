@@ -341,8 +341,10 @@ fn child_with_policy_outcome(
         }
         assert!(
             started.elapsed() < Duration::from_secs(120),
-            "restart child timed out; log at {}",
-            log_path.display()
+            "restart child timed out; log at {}:\n{}",
+            log_path.display(),
+            fs::read_to_string(&log_path)
+                .unwrap_or_else(|error| format!("could not read child log: {error}"))
         );
         // This is a subprocess watchdog, not a timing-based correctness race.
         std::thread::sleep(Duration::from_millis(10));
