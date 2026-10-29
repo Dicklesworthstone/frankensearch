@@ -4754,8 +4754,8 @@ meta:
             "the complete-generation layout was selected"
         );
 
-        let stdout_path = fsfs.log_root.join("complete-watch.stdout.log");
-        let stderr_path = fsfs.log_root.join("complete-watch.stderr.log");
+        let mut stdout_path = fsfs.log_root.join("complete-watch.stdout.log");
+        let mut stderr_path = fsfs.log_root.join("complete-watch.stderr.log");
         let mut watch = WatchChild(
             fsfs.command(temp.path())
                 .args([
@@ -4817,7 +4817,12 @@ meta:
                 .map(|hit| hit["path"].as_str().expect("hit path").to_owned())
                 .collect()
         };
-        let mut await_search = |label: &str, query: &str, path: &str, present: bool, forwarded| {
+        let await_search = |watch: &mut WatchChild,
+                            label: &str,
+                            query: &str,
+                            path: &str,
+                            present: bool,
+                            forwarded| {
             let started = Instant::now();
             loop {
                 let paths = lexical_paths(label, query, forwarded);
@@ -4867,8 +4872,16 @@ meta:
             );
             thread::sleep(Duration::from_millis(50));
         }
-        await_search("during-watch", "Oldquartz", "database.md", true, false);
         await_search(
+            &mut watch,
+            "during-watch",
+            "Oldquartz",
+            "database.md",
+            true,
+            false,
+        );
+        await_search(
+            &mut watch,
             "during-watch-daemon",
             "Oldquartz",
             "database.md",
@@ -4880,25 +4893,207 @@ meta:
             "Liveamber handles transient failures with bounded retries and exponential backoff.",
         )
         .unwrap();
-        await_search("live-create", "Liveamber", "live.md", true, false);
+        await_search(
+            &mut watch,
+            "live-create",
+            "Liveamber",
+            "live.md",
+            true,
+            false,
+        );
         fs::write(corpus.join("live.md"), "Livemalachite restores service after failures using bounded retries and exponential backoff.").unwrap();
-        await_search("live-modify", "Livemalachite", "live.md", true, false);
-        await_search("live-modify-old-text", "Liveamber", "live.md", false, false);
+        await_search(
+            &mut watch,
+            "live-modify",
+            "Livemalachite",
+            "live.md",
+            true,
+            false,
+        );
+        await_search(
+            &mut watch,
+            "live-modify-old-text",
+            "Liveamber",
+            "live.md",
+            false,
+            false,
+        );
         // The deletion check below is only meaningful if this query finds
         // the file while it exists.
-        await_search("delete-control", "Astronomers", "astronomy.md", true, false);
+        await_search(
+            &mut watch,
+            "delete-control",
+            "Astronomers",
+            "astronomy.md",
+            true,
+            false,
+        );
         fs::remove_file(corpus.join("astronomy.md")).unwrap();
-        await_search("live-delete", "Astronomers", "astronomy.md", false, false);
+        await_search(
+            &mut watch,
+            "live-delete",
+            "Astronomers",
+            "astronomy.md",
+            false,
+            false,
+        );
         fs::write(
             corpus.join("moved.md"),
             "Livecobalt notes keep their rows when the watcher sees them renamed.",
         )
         .unwrap();
-        await_search("rename-control", "Livecobalt", "moved.md", true, true);
+        await_search(
+            &mut watch,
+            "rename-control",
+            "Livecobalt",
+            "moved.md",
+            true,
+            true,
+        );
         fs::rename(corpus.join("moved.md"), corpus.join("renamed.md")).unwrap();
-        await_search("rename-new-path", "Livecobalt", "renamed.md", true, true);
-        await_search("rename-old-path", "Livecobalt", "moved.md", false, true);
-        await_search("rename-direct", "Livecobalt", "renamed.md", true, false);
+        await_search(
+            &mut watch,
+            "rename-new-path",
+            "Livecobalt",
+            "renamed.md",
+            true,
+            true,
+        );
+        await_search(
+            &mut watch,
+            "rename-old-path",
+            "Livecobalt",
+            "moved.md",
+            false,
+            true,
+        );
+        await_search(
+            &mut watch,
+            "rename-direct",
+            "Livecobalt",
+            "renamed.md",
+            true,
+            false,
+        );
+
+        // A killed watcher must leave a complete readable generation. Keep an
+        // actual old reader and the already-warm daemon alive while an edit
+        // arrives with no watcher, then require restart to catch it up.
+        await_search(
+            &mut watch,
+            "restart-cache-prime",
+            "Livemalachite",
+            "live.md",
+            true,
+            true,
+        );
+        let reader_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .unwrap();
+        let reader_cx = reader_runtime.request_cx_with_budget(asupersync::types::Budget::INFINITE);
+        let reader_store =
+            frankensearch_fsfs::generation_store::CompleteGenerationStore::open(&reader_cx, &index)
+                .unwrap();
+        let old_reader = reader_store.active(&reader_cx).unwrap().unwrap();
+        let old_manifest = fs::read(old_reader.path().join("FSFS-BUNDLE.json")).unwrap();
+        let original_daemon_pid = live_daemon.0.id();
+        watch.0.kill().expect("kill only this owned watcher");
+        let killed_started = Instant::now();
+        let killed_status = loop {
+            if let Some(status) = watch.0.try_wait().expect("poll killed watcher") {
+                break status;
+            }
+            assert!(
+                killed_started.elapsed() < QUICKSTART_TIMEOUT,
+                "killed watcher did not exit"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&killed_status),
+            Some(libc::SIGKILL),
+            "watcher must actually stop without graceful teardown"
+        );
+        let old_selection = fs::read(index.join("FSFS-CURRENT")).unwrap();
+        assert!(reader_store.active(&reader_cx).unwrap().is_some());
+        fs::write(corpus.join("live.md"), "Restartsapphire restores service after failures using bounded retries and exponential backoff.").unwrap();
+        assert_eq!(fs::read(index.join("FSFS-CURRENT")).unwrap(), old_selection);
+        assert_eq!(
+            fs::read(old_reader.path().join("FSFS-BUNDLE.json")).unwrap(),
+            old_manifest
+        );
+        assert!(
+            lexical_paths("stopped-watch-old", "Livemalachite", true)
+                .iter()
+                .any(|path| path == "live.md")
+        );
+        assert!(
+            !lexical_paths("stopped-watch-new", "Restartsapphire", true)
+                .iter()
+                .any(|path| path == "live.md")
+        );
+
+        stdout_path = fsfs.log_root.join("complete-watch-restart.stdout.log");
+        stderr_path = fsfs.log_root.join("complete-watch-restart.stderr.log");
+        watch = WatchChild(
+            fsfs.command(temp.path())
+                .args([
+                    "index",
+                    corpus_arg,
+                    "--watch",
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "jsonl",
+                ])
+                .env("FSFS_COMPLETE_GENERATIONS", "1")
+                .env("RUST_LOG", "info")
+                .stdout(File::create(&stdout_path).unwrap())
+                .stderr(File::create(&stderr_path).unwrap())
+                .spawn()
+                .expect("restart watcher over its existing complete store"),
+        );
+        await_search(
+            &mut watch,
+            "restart-daemon-new",
+            "Restartsapphire",
+            "live.md",
+            true,
+            true,
+        );
+        await_search(
+            &mut watch,
+            "restart-daemon-old",
+            "Livemalachite",
+            "live.md",
+            false,
+            true,
+        );
+        await_search(
+            &mut watch,
+            "restart-direct-new",
+            "Restartsapphire",
+            "live.md",
+            true,
+            false,
+        );
+        await_search(
+            &mut watch,
+            "restart-direct-old",
+            "Livemalachite",
+            "live.md",
+            false,
+            false,
+        );
+        assert_ne!(active_generation_root(&index).as_path(), old_reader.path());
+        assert_eq!(
+            fs::read(old_reader.path().join("FSFS-BUNDLE.json")).unwrap(),
+            old_manifest,
+            "the old reader must retain its immutable generation across restart"
+        );
+        assert_eq!(live_daemon.0.id(), original_daemon_pid);
+        assert!(live_daemon.0.try_wait().unwrap().is_none());
+        drop(old_reader);
         let status = terminate_and_wait(&mut live_daemon, "complete daemon during the watch");
         assert!(
             status.success(),
@@ -5013,7 +5208,7 @@ meta:
         assert!(!socket.exists(), "the daemon removes its own socket");
         drop(daemon);
         eprintln!(
-            "[default-build-e2e] stage=complete-watch event=verified search_during_watch=true live_create=true live_modify=true live_delete=true live_rename=true daemon_during_watch=true fast=true quality=true post_exit=true daemon=true"
+            "[default-build-e2e] stage=complete-watch event=verified search_during_watch=true live_create=true live_modify=true live_delete=true live_rename=true daemon_during_watch=true hard_watch_restart=true restart_pending_edit=true retained_reader=true stable_daemon=true fast=true quality=true post_exit=true daemon=true"
         );
         Ok(())
     }
