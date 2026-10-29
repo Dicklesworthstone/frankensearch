@@ -1531,7 +1531,7 @@ mod loader_only {
                     let mut raw = String::new();
                     socket.read_to_string(&mut raw).unwrap();
                     let response: Value = serde_json::from_str(&raw).unwrap();
-                    assert_eq!(response["schema_version"], "fsfs.search.serve.v16");
+                    assert_eq!(response["schema_version"], "fsfs.search.serve.v18");
                     use frankensearch_embed::model_manifest::ModelArtifactManifestV1;
                     let mut contracts = sha2::Sha256::new();
                     for manifest in [
@@ -2888,12 +2888,21 @@ mod loader_only {
             !wrong.timed_out && !wrong.status.success(),
             "policy refusal must reach the caller: {wrong:?}"
         );
-        assert!(
-            wrong
-                .combined_output()
-                .contains("did not acknowledge requested search policy"),
-            "{wrong:?}"
-        );
+        // Complete-store clients bind the whole daemon configuration before
+        // searching; legacy clients check the returned search policy instead.
+        let refusal = if daemon.complete {
+            let envelope: Value = serde_json::from_str(&wrong.stdout).unwrap();
+            assert_eq!(envelope["ok"], false, "{envelope}");
+            assert_eq!(envelope["error"]["code"], "invalid_config", "{envelope}");
+            assert_eq!(
+                envelope["error"]["field"], "complete_generation.daemon_config",
+                "{envelope}"
+            );
+            "client and daemon configurations differ"
+        } else {
+            "did not acknowledge requested search policy"
+        };
+        assert!(wrong.combined_output().contains(refusal), "{wrong:?}");
         assert!(
             !wrong
                 .stderr
