@@ -2034,6 +2034,7 @@ dependencies = [
  "fastembed",
  "frankensearch-core",
  "frankensearch-embed",
+ "frankensearch-index",
  "frankentorch-api",
  "frankentorch-autograd",
  "frankentorch-core",

@@ -13,6 +13,7 @@ fastembed-reranker = ["dep:fastembed"]
 native = [
     "dep:bytemuck",
     "dep:frankensearch-embed",
+    "dep:frankensearch-index",
     "dep:ft-api",
     "dep:ft-autograd",
     "dep:ft-core",
@@ -23,6 +24,8 @@ native = [
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true, default-features = false, optional = true }
+# Reuse the published exact AVX2 integer dot kernel for native linear layers.
+frankensearch-index = { workspace = true, optional = true }
 asupersync = { workspace = true }
 bytemuck = { workspace = true, optional = true }
 tokenizers = { workspace = true }

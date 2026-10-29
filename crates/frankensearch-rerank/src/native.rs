@@ -825,6 +825,36 @@ struct QLinear {
     packed: bool,
 }
 
+/// Use the index's exact integer SIMD reduction on AVX2 hosts without VNNI.
+/// Activation quantization is the same public frankentorch per-row operation:
+/// its weight and activation helpers use identical max/scale/ties-even rules.
+/// Keep the original dequantization order, including the separate bias add.
+#[cfg(target_arch = "x86_64")]
+#[allow(clippy::cast_precision_loss)] // Same i32 -> f32 conversion as the incumbent kernel.
+fn linear_int8_exact_dots(x: &[f32], m: usize, q: &QLinear) -> Vec<f32> {
+    use rayon::prelude::*;
+
+    let (activations, scales) = quantize_per_output_channel_i8(x, m, q.in_);
+    let mut output = vec![0.0; m * q.out];
+    output
+        .par_chunks_mut(q.out)
+        .zip(activations.par_chunks(q.in_))
+        .zip(scales.par_iter())
+        .for_each(|((output_row, activation_row), &activation_scale)| {
+            for ((value, weights), (&weight_scale, &bias)) in output_row
+                .iter_mut()
+                .zip(q.w_i8.chunks_exact(q.in_))
+                .zip(q.w_scales.iter().zip(q.bias.iter()))
+            {
+                let sum = frankensearch_index::simd::dot_i8_i8(weights, activation_row);
+                let mut dequantized = sum as f32 * activation_scale * weight_scale;
+                dequantized += bias;
+                *value = dequantized;
+            }
+        });
+    output
+}
+
 /// Precision is selected at load time and belongs to the embedding producer's
 /// identity. Reranking and the original native embedder keep their int8 path.
 #[derive(Debug, Clone, Copy)]
@@ -899,6 +929,18 @@ impl LinearWeights {
             Self::Int8(q) => {
                 if m.checked_mul(q.in_) != Some(x.len()) {
                     return Err(rerank_err("linear.int8", "input dimensions disagree"));
+                }
+                #[cfg(target_arch = "x86_64")]
+                if !q.packed
+                    // Even all -128 products fit i32 below this bound. The
+                    // registered BERT linears use widths 384 and 1536.
+                    && q.in_ <= 131_071
+                    && std::is_x86_feature_detected!("avx2")
+                    && !(std::is_x86_feature_detected!("avx512vnni")
+                        && std::is_x86_feature_detected!("avx512bw")
+                        && std::is_x86_feature_detected!("avx512f"))
+                {
+                    return Ok(linear_int8_exact_dots(x, m, q));
                 }
                 Ok(if q.packed {
                     ft_api::linear_int8_dynamic_prepacked_f32(
@@ -2967,6 +3009,162 @@ mod tests {
             assert_eq!(decode_f32_le(&bytes[..4 + len])[0].to_bits(), bits[0]);
             assert_eq!(decode_f32_le(&bytes[..4 + len]).len(), 1);
         }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn exact_int8_dot_linear_matches_frankentorch_bits() {
+        for k in [1, 7, 8, 31, 32, 33, 384, 1536] {
+            for m in [0, 1, 3] {
+                let n = 9;
+                let mut input = (0..m * k)
+                    .map(|i| f32::from(i16::try_from(i * 17 % 255).unwrap() - 127) / 3.0)
+                    .collect::<Vec<_>>();
+                if input.len() >= 8 {
+                    input[..8].copy_from_slice(&[0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 127.0, -127.0]);
+                }
+                let q = QLinear {
+                    w_i8: Arc::new(
+                        (0..n * k)
+                            .map(|i| {
+                                i8::try_from(i16::try_from(i * 37 % 255).unwrap() - 127).unwrap()
+                            })
+                            .collect(),
+                    ),
+                    w_scales: Arc::new(
+                        (0..n)
+                            .map(|i| f32::from(u16::try_from(i + 1).unwrap()) / 127.0)
+                            .collect(),
+                    ),
+                    bias: Arc::new(
+                        (0..n)
+                            .map(|i| f32::from(u16::try_from(i).unwrap()) / 16.0 - 0.25)
+                            .collect(),
+                    ),
+                    out: n,
+                    in_: k,
+                    packed: false,
+                };
+                for values in [input, vec![0.0; m * k]] {
+                    let expected = ft_api::linear_int8_dynamic_f32(
+                        &values,
+                        m,
+                        k,
+                        &q.w_i8,
+                        &q.w_scales,
+                        n,
+                        Some(&q.bias),
+                    )
+                    .into_iter()
+                    .map(f32::to_bits)
+                    .collect::<Vec<_>>();
+                    assert_eq!(
+                        linear_int8_exact_dots(&values, m, &q)
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "direct exact SIMD: m={m} k={k}"
+                    );
+                    assert_eq!(
+                        LinearWeights::Int8(q.clone())
+                            .forward(&values, m)
+                            .unwrap()
+                            .into_iter()
+                            .map(f32::to_bits)
+                            .collect::<Vec<_>>(),
+                        expected,
+                        "production dispatch: m={m} k={k}"
+                    );
+                }
+            }
+        }
+        let q = QLinear {
+            w_i8: Arc::new(vec![i8::MIN; 1536]),
+            w_scales: Arc::new(vec![1.0]),
+            bias: Arc::new(vec![0.125]),
+            out: 1,
+            in_: 1536,
+            packed: false,
+        };
+        let input = vec![127.0; 1536];
+        assert_eq!(
+            linear_int8_exact_dots(&input, 1, &q)[0].to_bits(),
+            ft_api::linear_int8_dynamic_f32(
+                &input,
+                1,
+                1536,
+                &q.w_i8,
+                &q.w_scales,
+                1,
+                Some(&q.bias),
+            )[0]
+            .to_bits()
+        );
+        assert!(LinearWeights::Int8(q).forward(&input[..1535], 1).is_err());
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "same-invocation native linear cost diagnosis; run explicitly with --nocapture"]
+    fn exact_int8_dot_linear_paired_cost_control() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap()
+            .install(|| {
+                for (m, k, n) in [(1, 384, 384), (32, 384, 1152), (32, 384, 1536), (32, 1536, 384)] {
+                    let input = (0..m * k)
+                        .map(|i| f32::from(i16::try_from(i * 17 % 255).unwrap() - 127) / 3.0)
+                        .collect::<Vec<_>>();
+                    let q = QLinear {
+                        w_i8: Arc::new(
+                            (0..n * k)
+                                .map(|i| {
+                                    i8::try_from(i16::try_from(i * 37 % 255).unwrap() - 127).unwrap()
+                                })
+                                .collect(),
+                        ),
+                        w_scales: Arc::new(vec![0.125; n]),
+                        bias: Arc::new(vec![0.25; n]),
+                        out: n,
+                        in_: k,
+                        packed: false,
+                    };
+                    let incumbent = || {
+                        ft_api::linear_int8_dynamic_f32(
+                            black_box(&input), m, k, &q.w_i8, &q.w_scales, n, Some(&q.bias),
+                        )
+                    };
+                    let candidate = || linear_int8_exact_dots(black_box(&input), m, &q);
+                    let mut samples = [Vec::new(), Vec::new()];
+                    for round in 0..23 {
+                        let mut outputs = [Vec::new(), Vec::new()];
+                        for arm in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                            let started = Instant::now();
+                            outputs[arm] = black_box(if arm == 0 { incumbent() } else { candidate() });
+                            if round >= 3 {
+                                samples[arm].push(started.elapsed().as_nanos());
+                            }
+                        }
+                        assert_eq!(
+                            outputs[0].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                            outputs[1].iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                            "m={m} k={k} n={n} round={round}"
+                        );
+                    }
+                    for (arm, values) in samples.iter_mut().enumerate() {
+                        values.sort_unstable();
+                        println!(
+                            "native_linear_cost arm={arm} m={m} k={k} n={n} threads=1 samples=20 p50_ns={} p95_ns={} max_ns={} exact_bits=true",
+                            values[10], values[18], values[19]
+                        );
+                    }
+                }
+            });
     }
 
     #[test]
