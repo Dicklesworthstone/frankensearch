@@ -635,7 +635,7 @@ try:
         endpoint = Path('/tmp') / f'fsfs-a5-{os.getpid()}.sock'
         run('leaked-listener', ['serve', '--daemon', '--daemon-socket', endpoint,
                                '--index-dir', index], cap=60, listener=endpoint)
-        require(len(controls) == 18, 'NEGATIVE-INVENTORY', len(controls))
+        require(len(controls) == 21, 'NEGATIVE-INVENTORY', len(controls))
     require(sha(binary) == binary_sha, 'BINARY-PROVENANCE', 'executable changed during run')
     receipt['result'] = 'PASS'
 except (Refusal, OSError, ValueError, KeyError, struct.error) as error:
