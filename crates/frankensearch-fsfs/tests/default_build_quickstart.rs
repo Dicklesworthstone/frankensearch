@@ -4795,12 +4795,17 @@ meta:
         // than once, so receipt counts cannot say which edit a search sees.
         // A forwarded search goes through the store's daemon, which a plain
         // search uses whenever its socket exists, with no fallback.
+        let config = temp.path().join("complete-watch-search.toml");
+        // Functional coverage uses an explicit budget, not a latency claim.
+        fs::write(&config, "[search]\nquality_timeout_ms = 5000\n").unwrap();
         let lexical_paths = |label: &str, query: &str, forwarded: bool| -> Vec<String> {
             let mut args = vec!["search", query, "--fast-only"];
             if !forwarded {
                 args.push("--no-daemon");
             }
             args.extend([
+                "--config",
+                config.to_str().unwrap(),
                 "--index-dir",
                 index_arg,
                 "--format",
@@ -4850,6 +4855,7 @@ meta:
         let mut live_daemon = WatchChild(
             fsfs.command(temp.path())
                 .args(["daemon", "--index-dir", index_arg, "--idle-timeout-ms", "0"])
+                .args(["--config", config.to_str().unwrap()])
                 .stdout(
                     File::create(fsfs.log_root.join("complete-live-daemon.stdout.log")).unwrap(),
                 )
@@ -4987,6 +4993,37 @@ meta:
             true,
             true,
         );
+        let require_refined = |label: &str, marker: &str| {
+            let outcome = fsfs.run(
+                temp.path(),
+                label,
+                [
+                    "search",
+                    "how livemalachite restores service after failures",
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index_arg,
+                    "--format",
+                    "json",
+                    "--limit",
+                    "10",
+                ],
+                QUICKSTART_TIMEOUT,
+            );
+            let result = parse_success_envelope(label, &outcome);
+            assert_eq!(result["data"]["phase"], "refined", "{result}");
+            let hit = result["data"]["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|hit| hit["path"] == "live.md")
+                .expect("live document in the daemon's refined page");
+            assert!(hit["lexical_rank"].is_number(), "{hit}");
+            assert!(hit["semantic_rank"].is_number(), "{hit}");
+            assert!(hit["snippet"].as_str().unwrap().contains(marker), "{hit}");
+        };
+        require_refined("restart-quality-prime", "Livemalachite");
         let reader_runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .unwrap();
@@ -5016,7 +5053,7 @@ meta:
         );
         let old_selection = fs::read(index.join("FSFS-CURRENT")).unwrap();
         assert!(reader_store.active(&reader_cx).unwrap().is_some());
-        fs::write(corpus.join("live.md"), "Restartsapphire restores service after failures using bounded retries and exponential backoff.").unwrap();
+        fs::write(corpus.join("live.md"), "Restartsapphire restores service after failures by replaying database transaction checkpoints and durable journals.").unwrap();
         assert_eq!(fs::read(index.join("FSFS-CURRENT")).unwrap(), old_selection);
         assert_eq!(
             fs::read(old_reader.path().join("FSFS-BUNDLE.json")).unwrap(),
@@ -5085,6 +5122,7 @@ meta:
             false,
             false,
         );
+        require_refined("restart-quality-refreshed", "Restartsapphire");
         assert_ne!(active_generation_root(&index).as_path(), old_reader.path());
         assert_eq!(
             fs::read(old_reader.path().join("FSFS-BUNDLE.json")).unwrap(),
@@ -5119,15 +5157,12 @@ meta:
             &corpus,
             &["database.md", "live.md", "renamed.md"],
         );
-        let config = temp.path().join("complete-watch-search.toml");
-        // Functional coverage uses an explicit budget, not a latency claim.
-        fs::write(&config, "[search]\nquality_timeout_ms = 5000\n").unwrap();
         let outcome = fsfs.run(
             temp.path(),
             "complete-watch-refined",
             [
                 "search",
-                "how livemalachite restores service after failures",
+                "how restartsapphire restores service after failures",
                 "--no-daemon",
                 "--config",
                 config.to_str().unwrap(),
@@ -5181,7 +5216,7 @@ meta:
             "complete-daemon-search",
             [
                 "search",
-                "how livemalachite restores service after failures",
+                "how restartsapphire restores service after failures",
                 "--index-dir",
                 index_arg,
                 "--format",
@@ -5208,7 +5243,7 @@ meta:
         assert!(!socket.exists(), "the daemon removes its own socket");
         drop(daemon);
         eprintln!(
-            "[default-build-e2e] stage=complete-watch event=verified search_during_watch=true live_create=true live_modify=true live_delete=true live_rename=true daemon_during_watch=true hard_watch_restart=true restart_pending_edit=true retained_reader=true stable_daemon=true fast=true quality=true post_exit=true daemon=true"
+            "[default-build-e2e] stage=complete-watch event=verified search_during_watch=true live_create=true live_modify=true live_delete=true live_rename=true daemon_during_watch=true hard_watch_restart=true restart_pending_edit=true retained_reader=true stable_daemon=true warm_quality_restart=true fast=true quality=true post_exit=true daemon=true"
         );
         Ok(())
     }
