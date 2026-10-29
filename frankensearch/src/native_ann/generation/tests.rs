@@ -4078,6 +4078,8 @@ mod qualified_rollback {
                 .add_documents([
                     IndexableDocument::new("successor", "common later generation")
                         .with_metadata("version", "successor"),
+                    IndexableDocument::new("successor-extra", "distinct graph membership")
+                        .with_metadata("version", "successor"),
                 ])
                 .build_exact_generation(&cx, tier, CommitRange { low: 1, high: 9 }, BUDGET)
                 .await
@@ -4090,6 +4092,18 @@ mod qualified_rollback {
                         [0xba; 32],
                     )
                     .unwrap();
+
+                if ann {
+                    assert_ne!(
+                        original
+                            .component_bytes(GenerationComponentRole::Ann)
+                            .unwrap(),
+                        rebuilt
+                            .component_bytes(GenerationComponentRole::Ann)
+                            .unwrap(),
+                        "fault injection requires distinct predecessor and successor graph objects"
+                    );
+                }
 
                 for damaged_role in [
                     GenerationComponentRole::Vector,
