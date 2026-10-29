@@ -289,7 +289,7 @@ strip = false
 # the default opt-level=0 a single corpus embedding takes minutes and the
 # resulting timings violate the "optimized inference" evidence criterion
 # (bd-tqhy). Dependencies get optimized; first-party test drivers stay at
-# opt-level 0. The native encoder uses the development override below.
+# opt-level 0. Native inference and shared integer SIMD use the overrides below.
 [profile.test.package."*"]
 opt-level = 2
 # Dependencies keep file:line for backtraces but not full DWARF. With full
@@ -310,4 +310,10 @@ opt-level = 3
 # Optimize the same inference implementation in development and inherited
 # test builds, retaining the existing quality deadlines and vector certificates.
 [profile.dev.package.frankensearch-rerank]
+opt-level = 2
+
+# Native int8 linears share the index's exact AVX2 dot kernels. Workspace
+# members are excluded from the dependency wildcard above; leaving these
+# intrinsics unoptimized makes the shared path slower than the scalar kernel.
+[profile.dev.package.frankensearch-index]
 opt-level = 2
