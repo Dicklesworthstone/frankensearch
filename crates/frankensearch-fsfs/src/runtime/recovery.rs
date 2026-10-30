@@ -33,6 +33,10 @@ pub struct PreparedRetainedRecovery {
     // Set false before any await so dropping a polled future cannot authorize a
     // restore, including when an earlier preview completed successfully.
     preview_ready: bool,
+    // Replacing source-derived data needs a query that actually exercises the
+    // candidate. Receipt-directed restoration can intentionally select an empty
+    // generation and does not inherit this source-rebuild requirement.
+    require_searchable_preview: bool,
 }
 
 impl std::fmt::Debug for PreparedRetainedRecovery {
@@ -90,6 +94,11 @@ impl PreparedRetainedRecovery {
     /// block without rebasing the captured selection. Merely constructing an
     /// unpolled future has no effect. A nonblank query and positive limit are
     /// required: a no-op query cannot establish a successful recovery preview.
+    /// Source rebuilds additionally require a returned hit and successful
+    /// execution of the requested semantic tiers. An empty source, unmatched
+    /// filter, lexical fallback or skipped required refinement cannot certify
+    /// a rebuilt semantic generation. Use a query that exercises the candidate;
+    /// receipt-directed recovery can still intentionally restore empty data.
     /// Returned progressive payloads are unchanged.
     ///
     /// # Errors
@@ -111,7 +120,7 @@ impl PreparedRetainedRecovery {
         let result = self.reader.search(cx, query, limit).await;
         retained_search_checkpoint(cx)?;
         let payloads = result?;
-        self.preview_ready = match payloads.as_slice() {
+        let completed = match payloads.as_slice() {
             [initial] => initial.phase == SearchOutputPhase::Initial,
             [initial, refined] => {
                 initial.phase == SearchOutputPhase::Initial
@@ -119,7 +128,59 @@ impl PreparedRetainedRecovery {
             }
             _ => false,
         };
+        if completed && self.require_searchable_preview {
+            self.validate_rebuild_preview(&payloads)?;
+        }
+        self.preview_ready = completed;
         Ok(payloads)
+    }
+
+    fn validate_rebuild_preview(&self, payloads: &[SearchPayload]) -> SearchResult<()> {
+        let (Some(initial), Some(last)) = (payloads.first(), payloads.last()) else {
+            return Err(retained_recovery_error(
+                "source rebuild preview produced no search phase",
+            ));
+        };
+        if last.hits.is_empty() {
+            return Err(retained_recovery_error(
+                "source rebuild preview returned no hits; verify the source and use a query and filters that exercise the rebuilt generation",
+            ));
+        }
+        let mode = self.reader.search_mode()?;
+        if mode == SearchExecutionMode::LexicalOnly {
+            return Ok(());
+        }
+        if !payload_has_admitted_semantic_hits(initial) {
+            return Err(retained_recovery_error(
+                "source rebuild preview did not exercise its required semantic tier; lexical or hash-control results cannot authorize semantic recovery",
+            ));
+        }
+        let quality_required = mode == SearchExecutionMode::QualityOnly
+            || (mode == SearchExecutionMode::Full
+                && !self.reader.runtime.quality_disabled_by_policy()
+                && !self
+                    .reader
+                    .runtime
+                    .config
+                    .indexing
+                    .quality_model
+                    .trim()
+                    .is_empty());
+        if quality_required {
+            let quality_executed = last
+                .semantic_blend
+                .as_ref()
+                .is_some_and(|blend| blend.hits.iter().any(|hit| hit.quality.is_some()));
+            if (mode != SearchExecutionMode::QualityOnly
+                && last.phase != SearchOutputPhase::Refined)
+                || !quality_executed
+            {
+                return Err(retained_recovery_error(
+                    "source rebuild preview did not exercise the required quality tier; use a semantic query that completes quality retrieval before restoring",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Abandon restoration and keep only the explicitly admitted reader.
@@ -193,6 +254,8 @@ impl FsfsRuntime {
     /// publication is refused, never automatically rebased. Dropping or failing
     /// this future leaves its unselected candidate intact. Reopening the store
     /// after restore uses the exact sealed candidate, not a second source scan.
+    /// The preview must return a hit and exercise the requested semantic tiers;
+    /// rebuilding an empty or fully filtered source cannot authorize replacement.
     ///
     /// This is a cooperative-store source rebuild, not an executor for the
     /// core planner's capability-blocked model-acquisition/authority actions.
@@ -227,6 +290,7 @@ impl FsfsRuntime {
             plan,
             reader,
             preview_ready: false,
+            require_searchable_preview: true,
         })
     }
 
@@ -274,6 +338,7 @@ impl FsfsRuntime {
             plan,
             reader,
             preview_ready: true,
+            require_searchable_preview: false,
         })
     }
 
@@ -312,6 +377,7 @@ impl FsfsRuntime {
             plan,
             reader,
             preview_ready: true,
+            require_searchable_preview: false,
         })
     }
 
@@ -361,6 +427,7 @@ impl FsfsRuntime {
             plan,
             reader,
             preview_ready: true,
+            require_searchable_preview: false,
         })
     }
 
@@ -525,12 +592,15 @@ mod retained_recovery_tests {
     };
     use frankensearch_core::EmbeddingIdentityBundleV1;
 
+    const REBUILD_QUERY: &str = "how does sharedtoken recovery preserve source documents";
+
     // Distinct deterministic providers test both-tier admission and lifecycle,
     // not real-model semantic quality or cross-platform numerical conformance.
     struct RecoveryProducer {
         identity: EmbeddingIdentityBundleV1,
         changed_identity: EmbeddingIdentityBundleV1,
         changed: AtomicBool,
+        zero_signal: AtomicBool,
         category: ModelCategory,
     }
 
@@ -546,6 +616,7 @@ mod retained_recovery_tests {
                 identity,
                 changed_identity,
                 changed: AtomicBool::new(false),
+                zero_signal: AtomicBool::new(false),
                 category,
             }
         }
@@ -565,7 +636,13 @@ mod retained_recovery_tests {
             _cx: &'a Cx,
             _text: &'a str,
         ) -> frankensearch_core::SearchFuture<'a, Vec<f32>> {
-            Box::pin(async { Ok(vec![1.0, 0.0, 0.0]) })
+            Box::pin(async move {
+                Ok(if self.zero_signal.load(Ordering::Relaxed) {
+                    vec![0.0; 3]
+                } else {
+                    vec![1.0, 0.0, 0.0]
+                })
+            })
         }
 
         fn dimension(&self) -> usize {
@@ -721,7 +798,7 @@ mod retained_recovery_tests {
             assert!(plan.expected_selection_sha256(&cx).is_err());
             assert!(plan.reader.resources.fast_embedder.is_some());
             assert!(plan.reader.resources.quality_embedder.is_some());
-            let preview = plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            let preview = plan.search(&cx, REBUILD_QUERY, 10).await.unwrap();
             assert_eq!(preview.last().unwrap().hits.len(), 2);
             assert!(plan.expected_selection_sha256(&cx).is_ok());
             // Preview/restore serves the sealed source snapshot, even when the
@@ -774,6 +851,249 @@ mod retained_recovery_tests {
     }
 
     #[test]
+    fn empty_source_rebuild_cannot_authorize_replacement_but_explicit_empty_restore_can() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut pinned = runtime.open_retained_search(&cx, &root).await.unwrap();
+            // Preserve the source bytes while simulating an accidentally empty
+            // source directory, such as an unmounted or incorrectly chosen root.
+            fs::rename(
+                source.join("alpha.md"),
+                directory.path().join("saved-alpha.md"),
+            )
+            .unwrap();
+            let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            let empty = plan.generation().clone();
+            assert!(plan.search(&cx, REBUILD_QUERY, 10).await.is_err());
+            assert!(plan.expected_selection_sha256(&cx).is_err());
+            assert!(plan.restore(&cx).is_err());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+            assert_eq!(
+                pinned.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
+                1
+            );
+
+            // Empty data remains a supported intentional state. The operator
+            // must select its exact receipt rather than certify an empty rebuild
+            // through a no-op preview. Neither the old nor the new bytes change.
+            let empty_bytes = file_bytes(empty.path());
+            let mut restore = runtime
+                .prepare_retained_recovery(&cx, &root, empty.id(), empty.manifest_sha256())
+                .await
+                .unwrap();
+            let preview = restore.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            assert!(preview.iter().all(|phase| phase.hits.is_empty()));
+            assert!(restore.expected_selection_sha256(&cx).is_ok());
+            let (publication, _) = restore.restore(&cx).unwrap();
+            assert!(
+                matches!(publication, GenerationPublication::Durable(ref value) if value == &empty)
+            );
+            assert_eq!(file_bytes(empty.path()), empty_bytes);
+            assert_eq!(file_bytes(old.path()), old_bytes);
+            assert_eq!(
+                pinned.search(&cx, "sharedtoken", 10).await.unwrap()[0]
+                    .hits
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn source_rebuild_preview_must_match_filters_and_can_retry_without_rebasing() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut filtered = runtime.clone();
+            filtered.cli_input.filter = Some("path:missing-source-file".to_owned());
+            let mut plan = filtered.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            let target = plan.generation().clone();
+            assert!(plan.search(&cx, REBUILD_QUERY, 10).await.is_err());
+            assert!(plan.expected_selection_sha256(&cx).is_err());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+
+            // This tests the same preparation's retry barrier directly. Public
+            // callers choose their query/filters before preparing recovery.
+            plan.reader.runtime.cli_input.filter = None;
+            let preview = plan.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            assert_eq!(preview.last().unwrap().hits.len(), 1);
+            assert!(plan.expected_selection_sha256(&cx).is_ok());
+            let (publication, _) = plan.restore(&cx).unwrap();
+            assert!(
+                matches!(publication, GenerationPublication::Durable(ref value) if value == &target)
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+        });
+    }
+
+    #[test]
+    fn lexical_source_rebuild_requires_a_matching_query_without_requiring_semantic_models() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let mut config = runtime.config().clone();
+            config.pressure.degradation_override =
+                crate::config::DegradationOverrideMode::ForceLexicalOnly;
+            let runtime = FsfsRuntime::new(config).with_cli_input(runtime.cli_input.clone());
+            let old = publish(&runtime, &cx, &root).await;
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            assert!(plan.reader.resources.vector_index.is_none());
+            assert!(plan.reader.resources.quality_vector_index.is_none());
+            let error = plan
+                .search(&cx, "unmatchedrecoverytoken", 10)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
+                if field == "complete_generation.recovery"));
+            assert!(plan.expected_selection_sha256(&cx).is_err());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            let preview = plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            assert_eq!(preview.len(), 1);
+            assert_eq!(preview[0].hits.len(), 1);
+            assert_eq!(preview[0].skip_reason.as_deref(), Some("lexical_only"));
+            assert!(!payload_has_admitted_semantic_hits(&preview[0]));
+            let target = plan.generation().clone();
+            assert!(matches!(plan.restore(&cx).unwrap().0,
+                GenerationPublication::Durable(ref value) if value == &target));
+            assert_ne!(old, target);
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn semantic_source_rebuild_preview_refuses_zero_signal_in_either_required_tier() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            plan.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            assert!(plan.expected_selection_sha256(&cx).is_ok());
+            for producer in [&models.fast, &models.quality] {
+                producer.zero_signal.store(true, Ordering::Relaxed);
+                assert!(plan.search(&cx, REBUILD_QUERY, 10).await.is_err());
+                producer.zero_signal.store(false, Ordering::Relaxed);
+                assert!(plan.expected_selection_sha256(&cx).is_err());
+                assert_eq!(
+                    fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                    pointer
+                );
+                assert_eq!(file_bytes(old.path()), old_bytes);
+            }
+            let preview = plan.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            assert_eq!(preview.len(), 2);
+            assert!(payload_has_admitted_semantic_hits(&preview[0]));
+            assert_eq!(preview[1].phase, SearchOutputPhase::Refined);
+            assert!(
+                preview[1]
+                    .semantic_blend
+                    .as_ref()
+                    .unwrap()
+                    .hits
+                    .iter()
+                    .any(|hit| hit.quality.is_some())
+            );
+            let target = plan.generation().clone();
+            assert!(matches!(plan.restore(&cx).unwrap().0,
+                GenerationPublication::Durable(ref value) if value == &target));
+            assert_eq!(file_bytes(old.path()), old_bytes);
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn source_rebuild_cannot_silently_drop_required_quality_but_explicit_fast_policies_work() {
+        on_runtime(|cx| async move {
+            let _models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, _, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let old_bytes = file_bytes(old.path());
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            set_test_quality_embedder(None);
+            let mut unavailable = fresh_runtime(&runtime);
+            unavailable.config.indexing.model_dir = directory
+                .path()
+                .join("absent-model-cache")
+                .display()
+                .to_string();
+            let mut plan = unavailable
+                .prepare_retained_rebuild(&cx, &root)
+                .await
+                .unwrap();
+            assert!(plan.reader.resources.vector_index.is_some());
+            assert!(plan.reader.resources.quality_vector_index.is_none());
+            // Ordinary indexing/search intentionally allows fast-only operation
+            // when an optional model is absent. It is not a successful preview
+            // of a source rebuild that was asked to restore both tiers.
+            let ordinary = plan.reader.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            assert_eq!(ordinary.len(), 1);
+            assert!(payload_has_admitted_semantic_hits(&ordinary[0]));
+            let error = plan.search(&cx, REBUILD_QUERY, 10).await.unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { ref field, .. }
+                if field == "complete_generation.recovery"));
+            assert!(plan.expected_selection_sha256(&cx).is_err());
+            assert!(plan.restore(&cx).is_err());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(file_bytes(old.path()), old_bytes);
+
+            for policy in ["fast_only", "embed_deferred", "quality_disabled"] {
+                let mut explicit = fresh_runtime(&unavailable);
+                match policy {
+                    "fast_only" => explicit.config.search.fast_only = true,
+                    "embed_deferred" => {
+                        explicit.config.pressure.degradation_override =
+                            crate::config::DegradationOverrideMode::ForceEmbedDeferred
+                    }
+                    _ => explicit.config.indexing.quality_model.clear(),
+                }
+                let mut plan = explicit.prepare_retained_rebuild(&cx, &root).await.unwrap();
+                let preview = plan.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+                assert_eq!(preview.len(), 1, "{policy}");
+                assert!(payload_has_admitted_semantic_hits(&preview[0]), "{policy}");
+                assert!(plan.expected_selection_sha256(&cx).is_ok(), "{policy}");
+                let target = plan.generation().clone();
+                assert!(
+                    matches!(plan.restore(&cx).unwrap().0,
+                    GenerationPublication::Durable(ref value) if value == &target),
+                    "{policy}"
+                );
+                assert_eq!(file_bytes(old.path()), old_bytes, "{policy}");
+            }
+        });
+    }
+
+    #[test]
     fn prepared_source_rebuild_refuses_skipped_cancelled_and_stale_previews() {
         on_runtime(|cx| async move {
             let _models = RecoveryModels::install();
@@ -794,7 +1114,7 @@ mod retained_recovery_tests {
             assert!(plan.restore(&cx).is_err());
             assert_eq!(store.active(&cx).unwrap(), Some(old));
             let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
-            plan.search(&cx, "sharedtoken", 10).await.unwrap();
+            plan.search(&cx, REBUILD_QUERY, 10).await.unwrap();
             fs::write(source.join("winner.md"), "sharedtoken concurrent winner").unwrap();
             let winner = publish(&runtime, &cx, &root).await;
             assert!(plan.restore(&cx).is_err());
@@ -839,7 +1159,7 @@ mod retained_recovery_tests {
                 let mut plan = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
                 assert_eq!(fs::read(&pointer).unwrap(), expected_selection, "{damage}");
                 assert_eq!(file_bytes(old.path()), old_bytes, "{damage}");
-                let preview = plan.search(&cx, "sharedtoken", 10).await.unwrap();
+                let preview = plan.search(&cx, REBUILD_QUERY, 10).await.unwrap();
                 assert_eq!(preview.last().unwrap().hits.len(), 2, "{damage}");
                 let target = plan.generation().clone();
                 let (publication, mut reader) = plan.restore(&cx).unwrap();

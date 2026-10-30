@@ -152,8 +152,21 @@ sources, refuses inherited hardlinked artifacts, and retains the damaged bytes.
 Unsafe selection objects (such as symlinks) and oversized descriptors still fail.
 
 Failed indexing, producer admission, cancellation or a failed preview leaves
-the previous generation selected. A successful preview is required before
-exporting its selection guard or publishing. Preview releases publication
+the previous generation selected. A successful source-rebuild preview must
+return at least one hit from the sealed candidate before exporting its selection
+guard or publishing. Semantic recovery must also exercise the requested semantic
+tier; full search with quality enabled and configured must contain that tier and
+complete quality refinement. A missing quality model cannot silently turn a
+requested full recovery into a fast-only replacement. Explicit fast-only,
+quality-deferred, and lexical-only policies keep their respective requirements.
+An empty source, an unmatched filter, lexical fallback, or skipped required
+refinement cannot establish a usable semantic rebuild. Use a query that matches
+the candidate and exercises its semantic models. A failed preview can be retried
+against the same preparation without changing its original selection guard.
+Receipt-directed restoration can still deliberately select an empty historical
+generation; the nonempty requirement applies to source rebuilding.
+
+Preview releases publication
 ownership, so another indexer can proceed; if it publishes first, applying the
 old preparation fails instead of replacing its work. Existing readers keep
 their pinned generation after a successful publication.

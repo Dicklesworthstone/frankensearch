@@ -79,7 +79,9 @@ Any requested preview must succeed before a prepare report is emitted or selecti
 --rebuild-source requires --query and --prepare or --apply; all input is reindexed offline.
 It cannot mix with target receipts, resume/guard fields or vector-repair options.
 It can replace a damaged selected bundle or malformed bounded descriptor, without reusing old artifacts.
-Its preview must finish successfully before export or publication; the old selection remains usable.
+Its preview must return hits and exercise the requested semantic tiers before export or publication.
+Empty sources, unmatched filters, lexical fallback and skipped required quality cannot certify a rebuild.
+Choose a query that exercises the candidate; the old selection remains usable after a refusal.
 The store must be outside SOURCE. Source changes after preparation do not change the sealed target.
 Save the prepared receipt to resume without rescanning sources; a competing publication is refused.
 --save-preparation requires --prepare or --apply and an existing trusted parent outside STORE.
