@@ -8451,6 +8451,12 @@ impl FsfsRuntime {
             self.run_daemon_command(cx).await?;
             return Ok(());
         }
+        if self.cli_input.complete_quality {
+            return Err(complete_cli::complete_cli_error(
+                "quality_completion",
+                "quality completion requires an existing complete-generation store; use run_mode_with_complete_generations or complete_retained_quality",
+            ));
+        }
         std::future::ready(()).await;
         let root_plan = self.discovery_root_plan();
         let accepted_roots = root_plan
@@ -20206,6 +20212,8 @@ impl FsfsRuntime {
                 });
             }
 
+            deferred_quality::capture_index_batch(cx, self, &chunk_docs)?;
+
             // Lexical Indexing
             control.checkpoint(cx, "index.lexical_batch", true)?;
             let lexical_start = Instant::now();
@@ -21092,6 +21100,7 @@ impl FsfsRuntime {
             policy_skipped_files: stats.skipped_files,
             input_checkpoint: checkpoint,
         };
+        deferred_quality::finish_index(cx, self, &payload)?;
         if retain_legacy_reuse && generation_complete {
             // Release the Quill writer before hashing the completed artifact
             // state: releasing its admission record is itself a file change.
@@ -24776,13 +24785,14 @@ impl FsfsRuntime {
     /// An explicit CLI request wins over the configured default, including an
     /// explicit false that keeps `index` as a one-shot operation.
     fn watch_requested(&self, command: CliCommand) -> bool {
-        command == CliCommand::Watch
-            || (command == CliCommand::Index
-                && self
-                    .cli_input
-                    .overrides
-                    .allow_background_indexing
-                    .unwrap_or(self.cli_input.watch || self.config.indexing.watch_mode))
+        !self.cli_input.complete_quality
+            && (command == CliCommand::Watch
+                || (command == CliCommand::Index
+                    && self
+                        .cli_input
+                        .overrides
+                        .allow_background_indexing
+                        .unwrap_or(self.cli_input.watch || self.config.indexing.watch_mode)))
     }
 
     fn validate_background_indexing(&self) -> SearchResult<()> {
@@ -24796,6 +24806,7 @@ impl FsfsRuntime {
     }
 
     fn validate_command_inputs(&self, command: CliCommand) -> SearchResult<()> {
+        self.cli_input.validate_quality_completion()?;
         // Refuse before the initial scan/build, not merely before starting the
         // watcher after that build has already changed the index.
         if self.watch_requested(command) {
@@ -26825,6 +26836,12 @@ fn print_cli_help() {
         "              Default: same-executable. Compatible-contract admits verified reuse across binary upgrades."
     );
     println!("              --full/--force always bypass retained reuse and rebuild from source.");
+    println!(
+        "              --complete-quality --index-dir STORE finishes deferred quality from retained inputs."
+    );
+    println!(
+        "              Quality completion is one-shot and requires no source path or discovery flags."
+    );
 }
 
 /// `pub(crate)` so the advertised-command census (bd-rh0t, `adapters::cli`

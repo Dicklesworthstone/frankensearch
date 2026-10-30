@@ -127,8 +127,42 @@ quality tier is refused before mutation; rebuild with `fsfs index` under the
 override first. Fast-tier appends and watch updates then continue normally.
 Removing the override and running ordinary `fsfs index` rebuilds the quality
 tier when its configured model is available, including for unchanged sources.
-This mode defers quality work until that later indexing run; it does not create
-an automatic background embedding queue.
+
+For complete-generation stores, deferred builds with a registered quality
+producer also retain the exact canonical embedding input and durable jobs in
+the existing catalog. These jobs bind the source revision, canonical content
+digest, selected generation and full quality producer identity. They do not
+reconstruct embedding input from lexical text, whose code handling differs.
+Metadata-only files never enter this queue, and legacy mutable indexing keeps
+its existing queue behavior.
+
+After clearing `force_embed_deferred` and any fast-only policy, finish a selected
+store's pending quality tier without rescanning the original source:
+
+```sh
+fsfs index --complete-quality --index-dir /path/to/store --no-fast-only
+```
+
+This explicit one-shot operation works after a process restart or source-tree
+removal. It copies the selected generation into a private candidate, uses the
+configured bounded model pool, and claims only that generation's quality jobs.
+The fast vectors and retained lexical data are reused. Every quality input and
+output must match its captured producer and source before a complete successor
+can be published against the original selection. The command reports the new
+generation receipt, completed document count, source hash and producer fingerprint.
+It refuses source paths, watch/full-reindex flags and discovery overrides.
+
+A failure or cancellation leaves the incumbent generation and pending queue
+intact. A retry recomputes from that queue; it does not resume a partially
+computed unselected candidate. An unknown quality selection or an older build
+without exact retained input still permits ordinary deferred indexing, but
+requires a full source reindex before explicit quality completion. Successors
+created by append, delete, compaction or retained-watch deltas preserve their
+existing behavior and invalidate the inherited backlog's generation scope;
+an ordinary source reindex establishes fresh work, including when a compaction
+did not change document content.
+This provides durable explicit completion, without automatic background execution
+or a claim that a partially built quality tier is complete.
 
 Background-indexing permission is enforced independently of watch intent. The
 `strict` and `degraded` profiles, or `hard_pause_requested=true`, refuse source

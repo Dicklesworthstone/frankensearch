@@ -341,6 +341,28 @@ impl PersistentJobQueue {
     }
 
     pub fn claim_batch(&self, worker_id: &str, batch_size: usize) -> SearchResult<Vec<ClaimedJob>> {
+        self.claim_batch_matching(worker_id, batch_size, None)
+    }
+
+    /// Claim only work for one exact producer key, leaving other tiers and
+    /// generations pending. Claim epochs, priorities, and revision fencing use
+    /// the same transaction as an unrestricted claim.
+    pub fn claim_batch_for_embedder(
+        &self,
+        worker_id: &str,
+        batch_size: usize,
+        embedder_id: &str,
+    ) -> SearchResult<Vec<ClaimedJob>> {
+        ensure_non_empty(embedder_id, "embedder_id")?;
+        self.claim_batch_matching(worker_id, batch_size, Some(embedder_id))
+    }
+
+    fn claim_batch_matching(
+        &self,
+        worker_id: &str,
+        batch_size: usize,
+        embedder_id: Option<&str>,
+    ) -> SearchResult<Vec<ClaimedJob>> {
         ensure_non_empty(worker_id, "worker_id")?;
         if batch_size == 0 {
             return Ok(Vec::new());
@@ -361,11 +383,18 @@ impl PersistentJobQueue {
         // PersistentJobQueue instance backed by one Storage connection to
         // prevent duplicate assignments.
         let claimed = self.storage.immediate_transaction(|conn| {
-            let claim_params = [SqliteValue::Integer(now_ms), SqliteValue::Integer(limit)];
+            let claim_params = [
+                SqliteValue::Integer(now_ms),
+                SqliteValue::Integer(limit),
+                embedder_id.map_or(SqliteValue::Null, |id| {
+                    SqliteValue::Text(id.to_owned().into())
+                }),
+            ];
             let candidates = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id, priority, retry_count, max_retries, content_hash, submitted_at, claim_epoch \
              FROM embedding_jobs \
              WHERE status = 'pending' \
                AND submitted_at <= ?1 \
+               AND (?3 IS NULL OR embedder_id = ?3) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM embedding_jobs active \
                    WHERE active.doc_id = embedding_jobs.doc_id \
@@ -2170,6 +2199,76 @@ mod tests {
         let depth = queue.queue_depth().expect("queue depth should load");
         assert_eq!(depth.pending, 0);
         assert_eq!(depth.processing, 3);
+    }
+
+    #[test]
+    fn producer_scoped_claim_keeps_other_generations_pending_and_preserves_fences() {
+        let (queue, storage) = queue_fixture(JobQueueConfig {
+            batch_size: 2,
+            ..JobQueueConfig::default()
+        });
+        for (id, hash) in [("same", 41), ("second", 42), ("third", 43)] {
+            insert_document(&storage, id, hash);
+            queue
+                .enqueue(id, "quality-generation-a", &[hash; 32], 0)
+                .unwrap();
+        }
+        // Higher-priority work for another tier must not steal this worker's
+        // capacity, including the same document under another generation key.
+        queue.enqueue("same", "fast", &[41; 32], 100).unwrap();
+        queue
+            .enqueue("same", "quality-generation-b", &[41; 32], 99)
+            .unwrap();
+        let before = queue_rows(&storage);
+        assert!(
+            queue
+                .claim_batch_for_embedder("worker", 8, "absent")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(queue.claim_batch_for_embedder("worker", 8, " ").is_err());
+        assert_eq!(queue_rows(&storage), before);
+
+        let first = queue
+            .claim_batch_for_embedder("worker-a", 8, "quality-generation-a")
+            .unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(
+            first
+                .iter()
+                .all(|claim| claim.embedder_id == "quality-generation-a" && claim.claim_epoch == 1)
+        );
+        let second = queue
+            .claim_batch_for_embedder("worker-b", 8, "quality-generation-a")
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(first.iter().all(|claim| claim.job_id != second[0].job_id));
+        assert_eq!(queue.queue_depth().unwrap().pending, 2);
+
+        let mut forged = first[0].clone();
+        forged.embedder_id = "quality-generation-b".to_owned();
+        assert_eq!(
+            queue
+                .complete(&forged, forged.content_hash.as_ref().unwrap())
+                .unwrap(),
+            ClaimOutcome::LostClaim
+        );
+        for claim in first.iter().chain(&second) {
+            assert_eq!(
+                queue
+                    .complete(claim, claim.content_hash.as_ref().unwrap())
+                    .unwrap(),
+                ClaimOutcome::Applied(())
+            );
+        }
+        let other = queue.claim_batch("other-worker", 8).unwrap();
+        assert_eq!(
+            other
+                .iter()
+                .map(|claim| claim.embedder_id.as_str())
+                .collect::<Vec<_>>(),
+            ["fast", "quality-generation-b"]
+        );
     }
 
     #[test]

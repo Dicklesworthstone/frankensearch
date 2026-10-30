@@ -208,6 +208,10 @@ impl FsfsRuntime {
         }
         let mut stdout = std::io::stdout();
         match self.cli_input.command {
+            CliCommand::Index if self.cli_input.complete_quality => {
+                Box::pin(self.run_complete_generation_quality_with_writer(cx, &root, &mut stdout))
+                    .await
+            }
             CliCommand::Index if !self.watch_requested(CliCommand::Index) => {
                 Box::pin(self.run_complete_generation_index_with_writer(cx, &root, &mut stdout))
                     .await
@@ -412,7 +416,12 @@ impl FsfsRuntime {
         ) {
             return Ok(None);
         }
-        let root = if matches!(
+        let root = if self.cli_input.complete_quality {
+            self.cli_input.validate_quality_completion()?;
+            super::absolutize_path(self.cli_input.index_dir.as_deref().ok_or_else(|| {
+                complete_cli_error("quality_completion", "an explicit --index-dir is required")
+            })?)?
+        } else if matches!(
             self.cli_input.command,
             CliCommand::Index | CliCommand::Watch
         ) {
@@ -436,6 +445,12 @@ impl FsfsRuntime {
             || complete_entry_exists(&root.join("generations"))?
         {
             return Ok(Some(root));
+        }
+        if self.cli_input.complete_quality {
+            return Err(complete_cli_error(
+                "quality_completion",
+                "quality completion requires an existing complete-generation store with durable deferred inputs; run an ordinary index build first",
+            ));
         }
 
         // Only a build may choose a new layout.
@@ -507,6 +522,70 @@ impl FsfsRuntime {
             let envelope = OutputEnvelope::success(
                 payload,
                 meta_for_format("flush", self.cli_input.format),
+                iso_timestamp_now(),
+            );
+            emit_envelope(&envelope, self.cli_input.format, writer)?;
+            if !matches!(
+                self.cli_input.format,
+                OutputFormat::Jsonl | OutputFormat::Csv
+            ) {
+                writer.write_all(b"\n")?;
+            }
+        }
+        writer.flush().map_err(SearchError::Io)
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn run_complete_generation_quality_with_writer<W: Write>(
+        &self,
+        cx: &Cx,
+        root: &Path,
+        writer: &mut W,
+    ) -> SearchResult<()> {
+        let started = Instant::now();
+        let store = CompleteGenerationStore::open(cx, root)?;
+        let expected = store.active(cx)?.ok_or_else(|| {
+            complete_cli_error("quality_completion", "no complete generation is selected")
+        })?;
+        let completed = self.complete_retained_quality(cx, root, &expected).await?;
+        let generation = require_durable_publication(completed.publication)?;
+        let retention = self.retire_superseded_generations(cx, root);
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if self.cli_input.format == OutputFormat::Table {
+            writeln!(
+                writer,
+                "Completed quality embeddings for {} retained document(s) in {elapsed_ms} ms",
+                completed.completed_documents,
+            )?;
+            writeln!(
+                writer,
+                "Published complete generation {} at {} (durable; {})",
+                generation.id(),
+                generation.path().display(),
+                retention.summary(),
+            )?;
+        } else {
+            let payload = serde_json::json!({
+                "operation": "complete_quality",
+                "generation_id": generation.id(),
+                "generation_path": generation.path(),
+                "index_root": generation.path(),
+                "store_root": root,
+                "manifest_sha256": generation.manifest_sha256(),
+                "completed_from": expected.id(),
+                "completed_documents": completed.completed_documents,
+                "source_hash": completed.source_hash,
+                "producer_fingerprint": completed.producer_fingerprint,
+                "publication": "durable",
+                "security_profile": GenerationRootSecurityProfileV1::CooperativeLocal.as_str(),
+                "generation_complete": true,
+                "vector_generation": Self::inspect_published_vector_generation(generation.path()),
+                "quality_generation": Self::inspect_published_quality_generation(generation.path()),
+                "retention": retention.to_json(),
+            });
+            let envelope = OutputEnvelope::success(
+                payload,
+                meta_for_format("index", self.cli_input.format).with_duration_ms(elapsed_ms),
                 iso_timestamp_now(),
             );
             emit_envelope(&envelope, self.cli_input.format, writer)?;
@@ -3286,6 +3365,44 @@ mod tests {
             search.complete_generation_command_root(false).unwrap(),
             Some(root)
         );
+    }
+
+    #[test]
+    fn quality_completion_routes_only_retained_work_and_ignores_configured_watch() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut runtime, source, root) = fixture(directory.path());
+        runtime.cli_input.complete_quality = true;
+        runtime.cli_input.target_path = None;
+        runtime.config.indexing.watch_mode = true;
+        runtime.config.discovery.roots = vec![source.join("absent-source").display().to_string()];
+        runtime.validate_command_inputs(CliCommand::Index).unwrap();
+        assert!(!runtime.watch_requested(CliCommand::Index));
+        for initialize in [false, true] {
+            assert!(
+                runtime
+                    .complete_generation_command_root(initialize)
+                    .is_err()
+            );
+        }
+        assert!(!root.exists(), "completion must not initialize a new store");
+
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("vector")).unwrap();
+        assert!(runtime.complete_generation_command_root(true).is_err());
+        assert!(!root.join("generations").exists());
+
+        fs::write(root.join(COMPLETE_GENERATION_POINTER), b"damaged-selection").unwrap();
+        assert_eq!(
+            runtime.complete_generation_command_root(false).unwrap(),
+            Some(root.clone()),
+            "a damaged selection must stay on the retained-store route",
+        );
+        assert_eq!(
+            fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+            b"damaged-selection",
+        );
+        runtime.cli_input.watch = true;
+        assert!(runtime.validate_command_inputs(CliCommand::Index).is_err());
     }
 
     #[test]

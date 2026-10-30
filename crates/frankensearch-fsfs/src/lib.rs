@@ -58,6 +58,7 @@ pub mod redaction;
 pub mod repro;
 pub mod root_discovery;
 pub mod runtime {
+    pub mod deferred_quality;
     pub mod retained_batch;
     include!("runtime_retained_generation.rs");
     include!("runtime/recovery.rs");

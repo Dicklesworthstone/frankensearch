@@ -227,6 +227,8 @@ pub struct CliInput {
     pub watch: bool,
     /// Whether `--full` was requested (for index command).
     pub full_reindex: bool,
+    /// Complete durable quality work from one selected retained generation.
+    pub complete_quality: bool,
     /// Target model name (for download command).
     pub model_name: Option<String>,
     /// Whether `--list` was requested (for download command).
@@ -273,6 +275,34 @@ pub struct CliInput {
     /// Whether `daemon --stop` was requested: signal the compaction daemon
     /// recorded under the index root instead of starting one.
     pub daemon_stop: bool,
+}
+
+impl CliInput {
+    pub(crate) fn validate_quality_completion(&self) -> SearchResult<()> {
+        if !self.complete_quality {
+            return Ok(());
+        }
+        if self.command != CliCommand::Index
+            || self
+                .index_dir
+                .as_ref()
+                .is_none_or(|root| root.as_os_str().is_empty())
+            || self.target_path.is_some()
+            || self.full_reindex
+            || self.watch
+            || self.overrides.allow_background_indexing == Some(true)
+            || self.overrides.roots.is_some()
+            || self.overrides.exclude_patterns.is_some()
+            || self.overrides.upgrade_reuse.is_some()
+        {
+            return Err(SearchError::InvalidConfig {
+                field: "cli.index.complete_quality".into(),
+                value: "--complete-quality".into(),
+                reason: "use `fsfs index --complete-quality --index-dir STORE` without a source path, --full, --watch, discovery overrides or --upgrade-reuse; quality completion uses the selected generation's retained inputs".into(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Config subcommand actions.
@@ -619,6 +649,10 @@ where
                 input.full_reindex = true;
                 idx += 1;
             }
+            "--complete-quality" => {
+                input.complete_quality = true;
+                idx += 1;
+            }
             "--upgrade-reuse" => {
                 let value = expect_value(&tokens, idx, "--upgrade-reuse")?;
                 input.overrides.upgrade_reuse =
@@ -896,6 +930,7 @@ fn apply_daemon_settings(input: &mut CliInput, daemon_preference: Option<bool>) 
 }
 
 fn validate_required_args(input: &CliInput) -> SearchResult<()> {
+    input.validate_quality_completion()?;
     if input.quality_only && input.overrides.fast_only == Some(true) {
         return Err(SearchError::InvalidConfig {
             field: "cli.quality_only".into(),
@@ -1177,6 +1212,7 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "--output"
             | "--force"
             | "--full"
+            | "--complete-quality"
             | "--upgrade-reuse"
             | "--check"
             | "--purge"
@@ -1518,6 +1554,52 @@ mod tests {
                 "operator guidance must not advertise unsupported {unsupported}"
             );
         }
+    }
+
+    #[test]
+    fn quality_completion_requires_an_explicit_store_and_no_source_work() {
+        let input = parse_cli_args([
+            "index",
+            "--complete-quality",
+            "--index-dir",
+            "/retained-store",
+            "--no-watch-mode",
+            "--format",
+            "json",
+        ])
+        .expect("retained quality completion");
+        assert!(input.complete_quality);
+        assert_eq!(input.command, CliCommand::Index);
+        assert!(input.target_path.is_none());
+        assert_eq!(
+            input.index_dir.as_deref(),
+            Some(Path::new("/retained-store"))
+        );
+        assert_eq!(input.format, OutputFormat::Json);
+
+        for arguments in [
+            vec!["index", "--complete-quality"],
+            vec!["index", "--complete-quality", "--index-dir", ""],
+            vec!["status", "--complete-quality", "--index-dir", "/store"],
+            vec!["watch", "--complete-quality", "--index-dir", "/store"],
+            vec!["index", ".", "--complete-quality", "--index-dir", "/store"],
+        ] {
+            assert!(parse_cli_args(arguments).is_err());
+        }
+        for incompatible in [
+            vec!["--full"],
+            vec!["--force"],
+            vec!["--watch"],
+            vec!["--watch-mode"],
+            vec!["--roots", "/source"],
+            vec!["--exclude", "*.md"],
+            vec!["--upgrade-reuse", "compatible-contract"],
+        ] {
+            let mut arguments = vec!["index", "--complete-quality", "--index-dir", "/store"];
+            arguments.extend(incompatible);
+            assert!(parse_cli_args(arguments).is_err());
+        }
+        assert!(!parse_cli_args(["index", "."]).unwrap().complete_quality);
     }
 
     #[test]
