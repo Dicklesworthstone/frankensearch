@@ -66,6 +66,7 @@ const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selecti
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_AUTHORITY_MUTATIONS: usize = 1_000;
+const MAX_HISTORY_HOPS: u64 = 1_024;
 const PROFILE: GenerationRootSecurityProfileV1 = GenerationRootSecurityProfileV1::CooperativeLocal;
 const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topology)\n\n\
   authority-index --root NEW_ROOT --work-dir NEW_DIR --receipt NEW_JSON\n\
@@ -142,15 +143,16 @@ The receipt is durably written before publication and selects exactly one\n\
 authority; its existence alone is not proof that publication committed.\n\
 It also preserves the complete original attempt for recovery after a crash.\n\
 authority-recover reconciles that attempt without republishing or loading models.\n\
-authority-rollback restores the immediate authenticated predecessor of a healthy\n\
+authority-rollback restores an authenticated retained ancestor of a healthy\n\
 current generation. It publishes a new higher authority sequence using the\n\
 target's original images, producer and source checkpoint, without inference.\n\
 Both receipts must name the same root, security profile and topology. The target\n\
-must still occupy the predecessor slot; arbitrary history is not discovered.\n\
+must be linked by exact retained manifests, with at most 1024 predecessor links.\n\
 The new receipt is outside the root and supports authority-recover after a crash.\n\
 Rollback normally admits the complete current generation. Explicit\n\
 --allow-damaged-current instead authenticates its exact control state and\n\
-activation manifest, then fully admits the selected predecessor. This recovers\n\
+activation manifest, then fully admits the immediate predecessor still in its\n\
+physical slot. Damaged-current recovery does not traverse older history. It recovers\n\
 from damaged or missing current component images without serving them. Corrupt\n\
 control anchors, current manifests, unsafe root entries, or pending publication\n\
 still refuse. Its image budget covers both manifests and the target components.\n\
@@ -164,9 +166,11 @@ keeps its actual outcome and receipts; neither grants permission to republish.\n
 Publication failures report not_committed, unknown, or committed separately\n\
 from serving activation. Existing roots and authority heads are never replaced\n\
 by authority-index. Search refuses a head different from the receipt.\n\
-Search/fetch/serve may explicitly read the immediate authenticated predecessor\n\
-with --receipt PREDECESSOR_JSON --current-receipt CURRENT_JSON. Both complete\n\
-generations are admitted on the same root within the combined image budget.\n\
+Search/fetch/serve may explicitly read an authenticated retained ancestor\n\
+with --receipt HISTORICAL_JSON --current-receipt CURRENT_JSON. Both complete\n\
+generations and intermediate manifests share the combined image budget.\n\
+Traversal follows exact predecessor references for at most 1024 links; missing\n\
+or corrupt ancestry refuses, without affecting ordinary current-head reads.\n\
 The target may have different producers or topology; semantic reads load its\n\
 models. Historical sessions are read-only and exclude every activation/update\n\
 grant. Responses identify the retained target and its authenticating current\n\
@@ -1066,8 +1070,8 @@ impl Receipt {
 }
 
 /// Admit one explicit read selection through a single qualified physical root.
-/// A historical target is authorized by the complete current closure and the
-/// fixed authority pair, never by possession of an old receipt alone.
+/// A historical target is authorized by the complete current closure, fixed
+/// authority pair and exact manifest ancestry, never by an old receipt alone.
 fn open_read_selection(
     cx: &Cx,
     receipt: &Receipt,
@@ -1098,35 +1102,44 @@ fn open_read_selection(
     // count shared images in each independently admitted closure.
     let current = current.open_on_root(cx, &root, max_image_bytes)?;
     let retained = current.retained_snapshot();
-    let current_bytes = retained.manifest().components().iter().try_fold(
-        u64::try_from(retained.manifest_bytes().len())?,
-        |total, (_, component)| total.checked_add(component.byte_len),
-    );
-    let remaining = current_bytes
-        .and_then(|used| u64::try_from(max_image_bytes).ok()?.checked_sub(used))
-        .filter(|remaining| *remaining > 0)
-        .ok_or_else(|| serve_refused("historical_image_budget_exceeded"))?;
+    let remaining = history_image_budget(&current, max_image_bytes)?;
     let target_budget = remaining.min(receipt.image_bytes);
     checkpoint(cx)?;
-    let opened = root.open_predecessor_generation_snapshot_with_budget(
+    let opened = root.open_historical_generation_snapshot_with_budget(
         retained,
         receipt.authority()?,
-        target_budget,
+        MAX_HISTORY_HOPS,
+        remaining,
     )?;
     checkpoint(cx)?;
     let SnapshotOpenOutcomeV1::Opened(opened) = opened else {
-        return Err(serve_refused("historical_predecessor_unavailable"));
+        return Err(serve_refused("historical_target_unavailable"));
     };
     let snapshot = receipt.admit_opened(cx, opened, usize::try_from(target_budget)?)?;
     checkpoint(cx)?;
     Ok((root, Arc::new(snapshot)))
 }
 
+fn history_image_budget(current: &NativeGenerationSnapshot, max_image_bytes: usize) -> Result<u64> {
+    let retained = current.retained_snapshot();
+    retained
+        .retained_image_bytes()
+        .and_then(|used| u64::try_from(max_image_bytes).ok()?.checked_sub(used))
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| serve_refused("historical_image_budget_exceeded"))
+}
+
 fn annotate_selection(response: &mut serde_json::Value, snapshot: &NativeGenerationSnapshot) {
-    if let Some(current) = snapshot.retained_snapshot().selected_predecessor_of() {
-        response["selection_kind"] = serde_json::json!("retained_predecessor");
-        response["selected_predecessor_of"] =
-            serde_json::json!(current.canonical_bytes().as_slice());
+    let retained = snapshot.retained_snapshot();
+    if let Some(current) = retained.selected_history_of() {
+        response["selected_history_of"] = serde_json::json!(current.canonical_bytes().as_slice());
+        if retained.selected_predecessor_of().is_some() {
+            response["selection_kind"] = serde_json::json!("retained_predecessor");
+            response["selected_predecessor_of"] =
+                serde_json::json!(current.canonical_bytes().as_slice());
+        } else {
+            response["selection_kind"] = serde_json::json!("retained_ancestor");
+        }
     }
 }
 
@@ -1315,11 +1328,7 @@ fn prepare_publication(
 ) -> Result<PreparedPublication> {
     let (root_id, expected, previous) = match predecessor {
         Some(snapshot) => {
-            if snapshot
-                .retained_snapshot()
-                .selected_predecessor_of()
-                .is_some()
-            {
+            if snapshot.retained_snapshot().selected_history_of().is_some() {
                 return Err(serve_refused("update_base_is_selected_predecessor"));
             }
             validate_successor_source(
@@ -2112,10 +2121,7 @@ where
     F: FnOnce() -> Result<mutations::Edits>,
 {
     checkpoint(cx)?;
-    if snapshot
-        .retained_snapshot()
-        .selected_predecessor_of()
-        .is_some()
+    if snapshot.retained_snapshot().selected_history_of().is_some()
         || snapshot.authority() != selected.authority()?
     {
         return Err(serve_refused("update_base_is_selected_predecessor"));
@@ -2362,10 +2368,11 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     checkpoint(cx)?;
     let target_budget = u64::try_from(options.max_image_bytes)?.min(target.image_bytes);
     let opened = match &current {
-        Some(current) => root.open_predecessor_generation_snapshot_with_budget(
+        Some(current) => root.open_historical_generation_snapshot_with_budget(
             current.retained_snapshot(),
             target.authority()?,
-            target_budget,
+            MAX_HISTORY_HOPS,
+            history_image_budget(current, options.max_image_bytes)?,
         )?,
         None => {
             // The recovery opener charges the current control manifest as well
@@ -2388,7 +2395,7 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
     checkpoint(cx)?;
     let SnapshotOpenOutcomeV1::Opened(opened) = opened else {
         return Err(bad(&format!(
-            "rollback predecessor admission refused: {opened:?}"
+            "rollback target admission refused: {opened:?}"
         )));
     };
     let predecessor = target.admit_opened(cx, opened, usize::try_from(target_budget)?)?;
@@ -3083,9 +3090,12 @@ impl AuthoritySession {
         if limits.0 == 0
             || limits.0 > 1_000
             || limits.1 == 0
-            || image_bytes.is_none_or(|bytes| bytes > budget || bytes > receipt.image_bytes)
+            || image_bytes.is_none_or(|bytes| bytes > receipt.image_bytes)
+            || retained
+                .retained_image_bytes()
+                .is_none_or(|bytes| bytes > budget)
             || retained.root_id() != receipt.root_id
-            || (retained.selected_predecessor_of().is_some() && allow_activation)
+            || (retained.selected_history_of().is_some() && allow_activation)
             || retained.profile().as_str() != receipt.profile
             || snapshot.authority() != receipt.authority()?
             || snapshot.topology() != receipt.topology()
@@ -3135,7 +3145,7 @@ impl AuthoritySession {
         if self
             .snapshot
             .retained_snapshot()
-            .selected_predecessor_of()
+            .selected_history_of()
             .is_some()
         {
             return Err(serve_refused("historical_selection_read_only"));
@@ -3426,10 +3436,7 @@ impl AuthoritySession {
                     serve_refused("update_base_not_current")
                 }
             })?;
-        if current
-            .retained_snapshot()
-            .selected_predecessor_of()
-            .is_some()
+        if current.retained_snapshot().selected_history_of().is_some()
             || current.retained_snapshot().authority_pair()
                 != self.snapshot.retained_snapshot().authority_pair()
         {

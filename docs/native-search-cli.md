@@ -482,10 +482,10 @@ Both tiers retain their independent exact/HNSW configuration. Declared graphs
 are rebuilt against the successor vector owners even when unchanged document
 vectors can be reused without inference.
 
-### Roll back the most recent authority publication
+### Roll back to an authenticated retained authority
 
-`authority-rollback` restores the immediate predecessor still held by the
-authenticated authority slots. It works after a process restart and uses the
+`authority-rollback` restores an ancestor authenticated by the current authority
+and its retained activation-manifest chain. It works after a process restart and uses the
 existing component images without loading a model or re-embedding documents:
 
 ```sh
@@ -501,11 +501,13 @@ existing component images without loading a model or re-embedding documents:
 
 The current and target receipts must identify the same root, cooperative-local
 security profile, and topology. By default, both complete generations must pass
-bounded admission. The target must be the current manifest's exact predecessor
-and must still occupy the other authenticated physical slot. A receipt for an
-arbitrary older generation is insufficient. Ordinary rollback requires a healthy
-current closure; it does not repair corrupt component files or discover
-historical targets.
+bounded admission. Each consecutive predecessor link must bind the exact next
+manifest, down to the selected target. The target may be older than both current
+physical slots; a receipt without the authenticated chain is insufficient.
+Traversal permits at most 1,024 links. The image budget includes both complete
+generations and all intermediate manifests. Ordinary rollback requires a healthy
+current closure and does not repair corrupt component files or discover targets
+by scanning the directory.
 
 Rollback publishes a new `Rollback` activation at the current authority sequence
 plus one. The target's artifact generation, source checkpoint, producer identities,
@@ -515,7 +517,7 @@ subsequent search requires the target producers' local models. Full rollback
 restores both original vector images and their independent identities. No model, source,
 input, retrieval, or work-directory options are accepted by the rollback command.
 
-Predecessor admission is pinned to the captured current authority pair. A
+Historical admission is pinned to the captured current authority pair. A
 concurrent publication refuses admission or loses the normal exclusive
 publication fence. It never selects the winner as a replacement expectation.
 Only a fresh activation manifest is staged, and the new receipt must be outside
@@ -530,7 +532,7 @@ be reconciled with:
 
 Successful output reports `event: "rolled_back"`, `publication: "committed"`,
 `serving: "activated"`, the restored retrieval mode, `replaces` for the old
-current authority, and `restores` for the selected predecessor. The new receipt
+current authority, and `restores` for the selected ancestor. The new receipt
 selects the higher authority sequence. Output failure after publication still
 reports the known committed state. An already running authority server keeps
 its retained generation until explicit activation; a producer-changing rollback
@@ -556,7 +558,8 @@ activation manifest. It checks both predecessor links, requires the target's
 actual other slot, and fully admits the target's vector, lexical, metadata, and
 optional ANN images. Two shared-lock resolutions must agree on the captured
 current pair. It never follows a new winner or creates a searchable handle for
-the damaged current generation.
+the damaged current generation. This explicit damaged-current mode remains
+limited to the immediate physical predecessor; it does not traverse older history.
 
 The mode does not bypass corrupt control anchors or a corrupt current activation
 manifest. Pending publication still requires reconciliation; a corrupt target,
@@ -578,11 +581,11 @@ reports what was validated; it does not claim that skipped current components
 were examined or healthy. The restored generation always passes complete
 admission before the command reports `serving: "activated"`.
 
-### Read the authenticated predecessor without rolling back
+### Read an authenticated ancestor without rolling back
 
 `authority-search`, `authority-fetch`, and `authority-serve` accept
-`--current-receipt CURRENT_JSON` to select the immediate retained predecessor
-named by `--receipt`. This lets you inspect or serve the preceding generation
+`--current-receipt CURRENT_JSON` to select a retained ancestor named by
+`--receipt`. This lets you inspect or serve an earlier generation
 while leaving the live authority unchanged:
 
 ```sh
@@ -603,12 +606,14 @@ while leaving the live authority unchanged:
 Both receipts must name the same physical root, root ID, and security profile.
 The current receipt must select the actual current authority, and both complete
 generations must pass admission on the same qualified root capability. The
-target must still be the current manifest's immediate predecessor in the other
-authenticated authority slot. An old receipt alone, a matching artifact count,
-or an arbitrary older ancestor cannot authorize access. Current and target may
+target must be reached through exact, consecutive predecessor references in the
+authenticated manifest chain, with at most 1,024 links. Missing or altered
+intermediate manifests refuse history; ordinary current reads do not traverse
+that chain and remain independent of its availability. An old receipt alone or
+a matching artifact count cannot authorize access. Current and target may
 have different producers, dimensions, or tier topologies; each is checked against
 its own complete identity. After a rollback, authority lineage still determines
-the predecessor, even if artifact-generation numbers run in the opposite order.
+ancestry, even if artifact-generation numbers run in the opposite order.
 
 For semantic search or serving, supply the target generation's matching local
 models and quality options. The current generation's models are never loaded.
@@ -618,16 +623,20 @@ fixed/request filters use the same retained readers as ordinary current search.
 
 `--max-image-bytes` bounds the **combined encoded images** of current and target
 at startup: each activation manifest plus its declared vector, lexical, metadata,
-and optional ANN components. Shared images count in both independently admitted
+and optional ANN components, together with all intermediate manifests. Shared images count in both independently admitted
 closures. The default is 256 MiB; increase it explicitly when the pair requires
 more. Source limits remain separate. Corrupt or missing current components,
 stale current receipts, and changed control anchors refuse the read. A change to
-the captured authority pair during predecessor admission also refuses the read.
+the captured authority pair during historical admission also refuses the read.
 This route does not use damaged-current recovery admission.
 
 Historical responses keep the target in `authority` and `generation`, and add
-`selection_kind: "retained_predecessor"` plus `selected_predecessor_of`, the
-authority byte array that authenticated the target at admission. In warm fetch
+`selected_history_of`, the current authority byte array that authenticated the
+target at admission. An immediate predecessor reports
+`selection_kind: "retained_predecessor"` and `selected_predecessor_of`; an older
+ancestor reports `selection_kind: "retained_ancestor"`. Its reader retains the
+complete current snapshot, intermediate manifest descriptors and target images,
+without inventing a physical slot for an overwritten authority. In warm fetch
 requests, `expected_authority` must match the target. A later publication does
 not change that retained reader, its source scope, or its recorded provenance.
 Fresh processes must authenticate the target against the then-current pair again.
@@ -962,7 +971,7 @@ loading an embedding model or starting a warm server:
 ```
 
 The receipt selects the exact current authority by default. A newer publication
-refuses that fresh open. To read the immediate authenticated predecessor, add
+refuses that fresh open. To read an authenticated retained ancestor, add
 `--current-receipt` as described above; an already running retained server also
 keeps its original selection. The command reads the admitted vector and Quill images,
 never the original document path. It rejects model, quality-backend, and writer

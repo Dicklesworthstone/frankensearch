@@ -91,10 +91,11 @@ pub enum NativeGenerationTopology {
 /// bytes. Publishing or rolling back another generation does not change an
 /// in-flight or intentionally retained old reader. Obtain a fresh admitted root
 /// snapshot and construct another handle to observe a new generation.
-/// Explicit predecessor selection also admits a queryable handle, carrying the
+/// Explicit historical selection also admits a queryable handle, carrying the
 /// current authority that authorized that selection as separate provenance. Such
 /// a handle may be a rollback target, but cannot act as the current head when
-/// proposing a rollback.
+/// proposing a rollback or an update. Older ancestors retain their authenticated
+/// manifest chain and current snapshot without inventing a physical slot.
 pub struct NativeGenerationSnapshot {
     authority: Arc<OpenedGenerationSnapshotV1>,
     readers: CompositeReaders,
@@ -674,7 +675,7 @@ impl NativeGenerationSnapshot {
     /// fence, just as for a newly built candidate.
     ///
     /// `current` must come from ordinary current-head admission. An explicitly
-    /// selected predecessor is usable as `self`, including after the process
+    /// selected ancestor is usable as `self`, including after the process
     /// that originally selected it has exited, but its selection provenance is
     /// not authority to act as the current head.
     ///
@@ -696,7 +697,7 @@ impl NativeGenerationSnapshot {
     ///
     /// Refuses cancellation, a foreign or replaced root/anchor, a security
     /// profile change, read-only or pending authority, an explicitly selected
-    /// predecessor used as `current`, a target that is not older than `current`,
+    /// historical selection used as `current`, a target that is not older than `current`,
     /// sequence exhaustion, or invalid candidate ids.
     pub fn rollback_candidate(
         &self,
@@ -708,7 +709,7 @@ impl NativeGenerationSnapshot {
         checkpoint(cx, "native_ann.generation.rollback")?;
         let target = self.retained_snapshot();
         let expected = current.retained_snapshot();
-        if expected.selected_predecessor_of().is_some() {
+        if expected.selected_history_of().is_some() {
             return Err(refused("rollback", "current-is-selected-predecessor"));
         }
         if target.root_id() != expected.root_id()
@@ -813,9 +814,13 @@ impl NativeGenerationSnapshot {
         let head = resolve_authority_slots_v1(pair.first, pair.second)
             .map_err(|_| refused("selected_rollback", "invalid-authority-pair"))?
             .ok_or_else(|| refused("selected_rollback", "incomplete-authority-pair"))?;
+        let target_slot = target
+            .head()
+            .slot
+            .ok_or_else(|| refused("selected_rollback", "predecessor-slot-missing"))?;
         if head.authority != current
-            || head.slot_index == target.head().slot_index
-            || ![first, second].contains(&target.head())
+            || head.slot_index == target_slot.slot_index
+            || ![first, second].contains(&target_slot)
             || self.authority().sequence.checked_add(1) != Some(current.sequence)
             || current.predecessor != Some(self.authority().fingerprint())
         {

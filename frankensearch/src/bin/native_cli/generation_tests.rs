@@ -4546,19 +4546,35 @@ mod warm_authority {
                     "retry-current"
                 );
 
-                // The original authority is no longer an immediate physical
-                // predecessor after rollback, although its old reader lives.
+                // The original authority is no longer in either physical
+                // slot, but its authenticated manifest ancestry still permits
+                // a new higher-sequence rollback without reembedding.
                 let authority_after = fs::read(old.root.join("AUTHORITY")).unwrap();
                 let lock_after = fs::read(old.root.join("LOCK")).unwrap();
                 options.from_receipt = Some(options.receipt.clone());
-                options.receipt = parent.join("out-of-window.json");
-                assert!(rollback(&cx, &options, &mut Vec::new()).is_err());
-                assert!(!options.receipt.exists());
+                options.receipt = parent.join("historical-again.json");
+                let before_repeat = (
+                    old_provider.calls.load(Ordering::Relaxed),
+                    changed_provider.calls.load(Ordering::Relaxed),
+                );
+                rollback(&cx, &options, &mut Vec::new()).unwrap();
+                let historical = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(historical.authority().unwrap().sequence, 4);
+                assert_eq!(historical.generation, old.generation);
+                assert_eq!(historical.identity, old.identity);
                 assert_eq!(
+                    before_repeat,
+                    (
+                        old_provider.calls.load(Ordering::Relaxed),
+                        changed_provider.calls.load(Ordering::Relaxed),
+                    )
+                );
+                assert_eq!(fs::read(parent.join("old.json")).unwrap(), original_receipt);
+                assert_ne!(
                     fs::read(old.root.join("AUTHORITY")).unwrap(),
                     authority_after
                 );
-                assert_eq!(fs::read(old.root.join("LOCK")).unwrap(), lock_after);
+                assert_ne!(fs::read(old.root.join("LOCK")).unwrap(), lock_after);
             }
         });
     }
@@ -7850,7 +7866,7 @@ mod progressive_authority {
             for label in [
                 "stale-current",
                 "same-head",
-                "ancient-target",
+                "ancestor-chain-budget",
                 "target-root",
                 "current-root-id",
                 "target-documents",
@@ -7870,7 +7886,10 @@ mod progressive_authority {
                         current = fixture.current.clone();
                     }
                     "same-head" => target = latest.clone(),
-                    "ancient-target" => target = fixture.target.clone(),
+                    "ancestor-chain-budget" => {
+                        target = fixture.target.clone();
+                        budget = usize::try_from(target.image_bytes + current.image_bytes).unwrap();
+                    }
                     "target-root" => target.root = fixture.parent.join("unrelated-root"),
                     "current-root-id" => current.root_id[0] ^= 1,
                     "target-documents" => target.documents = 0,
@@ -8051,6 +8070,211 @@ mod progressive_authority {
                 response["selected_predecessor_of"],
                 serde_json::json!(rolled_back.authority)
             );
+        });
+    }
+
+    #[test]
+    fn historical_ancestors_reopen_serve_and_rollback_after_both_slots_are_reused() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for mode in [QueryMode::Fast, QueryMode::Full] {
+                let fixture = historical_fixture(&cx, mode, false).await;
+                let current = fixture.current.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let latest = publish_history_successor(
+                    &cx,
+                    &fixture.parent,
+                    &current,
+                    &fixture.current_model,
+                    "latest",
+                )
+                .await;
+                drop(current);
+                let target_path = fixture.parent.join("initial.json");
+                let latest_path = fixture.parent.join("latest.json");
+                let combined = usize::try_from(
+                    fixture.target.image_bytes
+                        + latest.image_bytes
+                        + fixture.current.authority().unwrap().manifest_len,
+                )
+                .unwrap();
+                let before = root_file_bytes(&latest.root);
+                let current_calls = fixture.current_model.calls.load(Ordering::Relaxed);
+                let mut options = parse(&[
+                    "authority-search",
+                    "--receipt",
+                    "unused",
+                    "--query",
+                    "retry",
+                ])
+                .unwrap()
+                .unwrap();
+                options.receipt = target_path.clone();
+                options.current_receipt = Some(latest_path.clone());
+                options.max_image_bytes = combined;
+                options.mode = Some(mode);
+                options.stream = true;
+                let mut output = Vec::new();
+                search_with_loader(&cx, &options, &mut output, |tier| {
+                    Ok(match tier {
+                        EmbedderTierTag::Fast => fixture.fast.clone(),
+                        EmbedderTierTag::Quality => fixture.quality.clone(),
+                    })
+                })
+                .await
+                .unwrap();
+                let responses = frames(&output);
+                assert_eq!(responses.len(), if mode == QueryMode::Full { 2 } else { 1 });
+                for response in responses {
+                    assert_eq!(
+                        response["authority"],
+                        serde_json::json!(fixture.target.authority)
+                    );
+                    assert_eq!(response["selection_kind"], "retained_ancestor");
+                    assert_eq!(
+                        response["selected_history_of"],
+                        serde_json::json!(latest.authority)
+                    );
+                    assert!(response.get("selected_predecessor_of").is_none());
+                    assert!(!response["results"].as_array().unwrap().is_empty());
+                    assert!(
+                        response["results"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|hit| { hit["doc_id"] == "zeta" || hit["doc_id"] == "alpha" })
+                    );
+                }
+                assert_eq!(
+                    fixture.current_model.calls.load(Ordering::Relaxed),
+                    current_calls
+                );
+                let mut source =
+                    parse(&["authority-fetch", "--receipt", "unused", "--doc-id", "zeta"])
+                        .unwrap()
+                        .unwrap();
+                source.receipt = target_path.clone();
+                source.current_receipt = Some(latest_path.clone());
+                source.max_image_bytes = combined;
+                output.clear();
+                fetch(&cx, &source, &mut output).unwrap();
+                assert_eq!(
+                    frames(&output)[0]["documents"][0]["content"],
+                    "retry café archived notes"
+                );
+                assert_eq!(
+                    root_file_bytes(&latest.root),
+                    before,
+                    "history reads never publish"
+                );
+
+                let (root, snapshot) =
+                    open_read_selection(&cx, &fixture.target, Some(&latest_path), combined)
+                        .unwrap();
+                assert_eq!(snapshot.retained_snapshot().head().slot, None);
+                assert_eq!(snapshot.retained_snapshot().history_manifests().len(), 1);
+                assert!(
+                    AuthoritySession::new(
+                        &cx,
+                        admit_root(&latest.root).unwrap(),
+                        fixture.target.clone(),
+                        Arc::clone(&snapshot),
+                        topology_models(mode, &fixture.fast, &fixture.quality),
+                        (2, combined),
+                        true,
+                    )
+                    .is_err()
+                );
+                assert!(
+                    snapshot
+                        .begin_update(
+                            &cx,
+                            fixture.parent.join("forbidden-history-update"),
+                            new_generation(4).unwrap(),
+                            fixture.fast.clone(),
+                            MAX_INPUT_BYTES,
+                        )
+                        .is_err()
+                );
+                let mut session = AuthoritySession::new(
+                    &cx,
+                    root,
+                    fixture.target.clone(),
+                    snapshot,
+                    topology_models(mode, &fixture.fast, &fixture.quality),
+                    (2, combined),
+                    false,
+                )
+                .unwrap();
+                let latest_reader = latest.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let future = publish_history_successor(
+                    &cx,
+                    &fixture.parent,
+                    &latest_reader,
+                    &fixture.current_model,
+                    "future",
+                )
+                .await;
+                let held = exchange(&cx, &mut session, &[
+                    serde_json::json!({"query":"retry", "mode":"lexical"}),
+                    serde_json::json!({"op":"fetch", "expected_authority":fixture.target.authority,
+                        "documents":[{"doc_id":"zeta"},{"doc_id":"live-future"}]}),
+                ]).await;
+                for frame in &held {
+                    assert_eq!(
+                        frame["authority"],
+                        serde_json::json!(fixture.target.authority)
+                    );
+                    assert_eq!(
+                        frame["selected_history_of"],
+                        serde_json::json!(latest.authority)
+                    );
+                }
+                assert_eq!(
+                    held[2]["documents"][0]["content"],
+                    "retry café archived notes"
+                );
+                assert_eq!(held[2]["documents"][1]["status"], "unavailable");
+                assert!(
+                    open_read_selection(&cx, &fixture.target, Some(&latest_path), combined)
+                        .is_err()
+                );
+                if mode == QueryMode::Fast {
+                    let inference_before = (
+                        calls(&fixture.fast, &fixture.quality),
+                        fixture.current_model.calls.load(Ordering::Relaxed),
+                    );
+                    let mut rollback_options = parse(&rollback_arguments()).unwrap().unwrap();
+                    rollback_options.from_receipt = Some(fixture.parent.join("future.json"));
+                    rollback_options.target_receipt = Some(target_path);
+                    rollback_options.receipt = fixture.parent.join("ancestor-rollback.json");
+                    output.clear();
+                    rollback(&cx, &rollback_options, &mut output).unwrap();
+                    let restored = Receipt::read(&rollback_options.receipt).unwrap();
+                    assert_eq!(
+                        restored.authority().unwrap().sequence,
+                        future.authority().unwrap().sequence + 1
+                    );
+                    assert_eq!(restored.generation, fixture.target.generation);
+                    assert_eq!(restored.identity, fixture.target.identity);
+                    assert_eq!(
+                        inference_before,
+                        (
+                            calls(&fixture.fast, &fixture.quality),
+                            fixture.current_model.calls.load(Ordering::Relaxed),
+                        )
+                    );
+                    assert_eq!(frames(&output)[0]["event"], "rolled_back");
+                    let restored = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    assert_eq!(restored.authority().sequence, 5);
+                    assert!(
+                        restored
+                            .search_text(&cx, fixture.fast.as_ref(), "retry", 2)
+                            .await
+                            .unwrap()
+                            .iter()
+                            .all(|hit| hit.doc_id == "zeta" || hit.doc_id == "alpha")
+                    );
+                }
+            }
         });
     }
 

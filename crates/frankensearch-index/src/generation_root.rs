@@ -5551,6 +5551,16 @@ pub mod generation_reader {
         /// The explicitly requested target is not the current manifest's
         /// immediate predecessor retained in the other authenticated slot.
         PredecessorNotRetained,
+        /// The selected authority is not an exact ancestor of the admitted
+        /// current head. Possessing a receipt alone never authorizes a read.
+        HistoryNotRetained,
+        /// The selected ancestor exceeds the caller's manifest traversal bound.
+        HistoryDepth {
+            /// Required number of consecutive predecessor links.
+            required: u64,
+            /// Caller-selected maximum number of predecessor links.
+            limit: u64,
+        },
         /// A persisted publication attempt has no completing owner frame; the
         /// outcome must be reconciled by the publisher before any read.
         PendingReconciliation,
@@ -5598,6 +5608,28 @@ pub mod generation_reader {
         Refused(SnapshotRefusalV1),
     }
 
+    /// The exact authority selected for a snapshot and its physical provenance.
+    ///
+    /// Current and immediate-predecessor selections retain their real slot.
+    /// An older authenticated ancestor has no slot in the current pair; its
+    /// authority comes from retained, verified activation-manifest ancestry.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GenerationSnapshotSelectionV1 {
+        /// Exact selected authority, including for historical reads.
+        pub authority: AuthorityRefV1,
+        /// Actual physical slot observed at admission, if still retained.
+        pub slot: Option<AuthoritySlotV1>,
+    }
+
+    impl GenerationSnapshotSelectionV1 {
+        const fn from_slot(slot: AuthoritySlotV1) -> Self {
+            Self {
+                authority: slot.authority,
+                slot: Some(slot),
+            }
+        }
+    }
+
     /// One admitted generation: exact authority, floor receipt, manifest
     /// bytes, and the retained manifest descriptor.
     ///
@@ -5609,13 +5641,15 @@ pub mod generation_reader {
         root_id: [u8; 16],
         profile: GenerationRootSecurityProfileV1,
         pair: ExpectedAuthorityPairV1,
-        head: AuthoritySlotV1,
+        head: GenerationSnapshotSelectionV1,
         floor: Option<AntiRollbackFloorRecordV1>,
         manifest_file: QualifiedGenerationFile,
         manifest: ActivationManifest,
         closure: GenerationClosureV1,
         health: SnapshotHealthV1,
         selected_predecessor_of: Option<AuthorityRefV1>,
+        history_current: Option<Arc<OpenedGenerationSnapshotV1>>,
+        history_manifests: Vec<QualifiedGenerationFile>,
     }
 
     impl OpenedGenerationSnapshotV1 {
@@ -5655,13 +5689,15 @@ pub mod generation_reader {
             self.pair
         }
 
-        /// The selected slot whose manifest this snapshot retains.
+        /// The selected authority whose manifest this snapshot retains.
         ///
         /// Ordinary opening selects the current head. Explicit predecessor
-        /// opening selects its actual older physical slot; consult
-        /// [`Self::selected_predecessor_of`] for that admission provenance.
+        /// opening selects its actual older physical slot. Historical opening
+        /// can select an ancestor no longer present in either physical slot;
+        /// its `slot` is `None`, never a fabricated frame. Consult
+        /// [`Self::selected_history_of`] for the authorizing current head.
         #[must_use]
-        pub const fn head(&self) -> AuthoritySlotV1 {
+        pub const fn head(&self) -> GenerationSnapshotSelectionV1 {
             self.head
         }
 
@@ -5675,6 +5711,58 @@ pub mod generation_reader {
         #[must_use]
         pub const fn selected_predecessor_of(&self) -> Option<AuthorityRefV1> {
             self.selected_predecessor_of
+        }
+
+        /// Current head that authorized an explicit historical selection.
+        ///
+        /// Includes both immediate-predecessor and older-ancestor admission.
+        /// A historical snapshot is a read/rollback target, never a current
+        /// publication base, even if its artifact generation matches the head.
+        #[must_use]
+        pub fn selected_history_of(&self) -> Option<AuthorityRefV1> {
+            self.history_current
+                .as_ref()
+                .map(|current| current.head().authority)
+                .or(self.selected_predecessor_of)
+        }
+
+        /// Retained current snapshot anchoring an authenticated history walk.
+        /// Immediate-predecessor-only admission does not need a manifest walk.
+        #[must_use]
+        pub const fn history_current(&self) -> Option<&Arc<OpenedGenerationSnapshotV1>> {
+            self.history_current.as_ref()
+        }
+
+        /// Exact intermediate manifest descriptors retained by history admission.
+        /// The target manifest and current snapshot are retained separately.
+        #[must_use]
+        pub fn history_manifests(&self) -> &[QualifiedGenerationFile] {
+            &self.history_manifests
+        }
+
+        /// Total encoded images retained by this snapshot and its history anchor.
+        ///
+        /// Includes every intermediate manifest and the complete retained
+        /// current snapshot. Shared component bytes are charged in each admitted
+        /// closure, as they are during opening. Parsed engines and process RSS
+        /// are outside this count. Arithmetic overflow returns `None`.
+        #[must_use]
+        pub fn retained_image_bytes(&self) -> Option<u64> {
+            let selected = self.manifest.components().iter().try_fold(
+                self.manifest_file.witness().byte_len(),
+                |sum, (_, receipt)| sum.checked_add(receipt.byte_len),
+            )?;
+            let with_history = self
+                .history_manifests
+                .iter()
+                .try_fold(selected, |sum, file| {
+                    sum.checked_add(file.witness().byte_len())
+                })?;
+            let current = match &self.history_current {
+                Some(current) => current.retained_image_bytes()?,
+                None => 0,
+            };
+            with_history.checked_add(current)
         }
 
         /// External floor record observed at admission, when a provider was given.
@@ -5715,13 +5803,15 @@ pub mod generation_reader {
                 .field("root", &self.root)
                 .field("profile", &self.profile)
                 .field("head_sequence", &self.head.authority.sequence)
-                .field("head_slot", &self.head.slot_index)
+                .field("head_slot", &self.head.slot.map(|slot| slot.slot_index))
                 .field(
                     "floor_cas_version",
                     &self.floor.map(|record| record.cas_version),
                 )
                 .field("health", &self.health)
                 .field("selected_predecessor_of", &self.selected_predecessor_of)
+                .field("selected_history_of", &self.selected_history_of())
+                .field("history_manifest_count", &self.history_manifests.len())
                 .finish_non_exhaustive()
         }
     }
@@ -5923,8 +6013,22 @@ pub mod generation_reader {
         resolution: &Resolution,
         anchors: &GenerationRootAnchorWitness,
     ) -> Result<AuthoritySlotV1, SnapshotRefusalV1> {
+        require_selected_current(current, resolution, anchors)?;
+        predecessor_slot_from_manifest(
+            current.head().authority,
+            current.manifest(),
+            selected,
+            resolution,
+        )
+    }
+
+    fn require_selected_current(
+        current: &OpenedGenerationSnapshotV1,
+        resolution: &Resolution,
+        anchors: &GenerationRootAnchorWitness,
+    ) -> Result<(), SnapshotRefusalV1> {
         if resolution.pair != current.authority_pair()
-            || resolution.head != current.head()
+            || Some(resolution.head) != current.head().slot
             || resolution.floor != current.floor()
             || resolution.health != current.health()
         {
@@ -5935,12 +6039,7 @@ pub mod generation_reader {
                 GenerationRootErrorKind::ObjectChanged,
             ));
         }
-        predecessor_slot_from_manifest(
-            current.head().authority,
-            current.manifest(),
-            selected,
-            resolution,
-        )
+        Ok(())
     }
 
     fn predecessor_slot_from_manifest(
@@ -5970,6 +6069,11 @@ pub mod generation_reader {
     #[derive(Clone, Copy)]
     enum PredecessorSelection<'a> {
         Retained(&'a OpenedGenerationSnapshotV1, AuthorityRefV1),
+        History {
+            current: &'a Arc<OpenedGenerationSnapshotV1>,
+            target: AuthorityRefV1,
+            max_hops: u64,
+        },
         Recovery {
             current: AuthorityRefV1,
             current_generation: ArtifactGenerationIdentityV1,
@@ -5978,11 +6082,104 @@ pub mod generation_reader {
     }
 
     impl PredecessorSelection<'_> {
-        const fn current_authority(self) -> AuthorityRefV1 {
+        fn current_authority(self) -> AuthorityRefV1 {
             match self {
                 Self::Retained(current, _) => current.head().authority,
+                Self::History { current, .. } => current.head().authority,
                 Self::Recovery { current, .. } => current,
             }
+        }
+    }
+
+    struct HistoryPath {
+        selected: GenerationSnapshotSelectionV1,
+        manifests: Vec<QualifiedGenerationFile>,
+        manifest_bytes: u64,
+    }
+
+    fn admit_history_path(
+        root: &QualifiedGenerationRoot,
+        current: &OpenedGenerationSnapshotV1,
+        target: AuthorityRefV1,
+        resolution: &Resolution,
+        max_hops: u64,
+        max_owned_image_bytes: u64,
+    ) -> GenerationRootResult<Result<HistoryPath, SnapshotRefusalV1>> {
+        let Some(distance) = current
+            .head()
+            .authority
+            .sequence
+            .checked_sub(target.sequence)
+            .filter(|distance| *distance > 0)
+        else {
+            return Ok(Err(SnapshotRefusalV1::HistoryNotRetained));
+        };
+        if distance > max_hops {
+            return Ok(Err(SnapshotRefusalV1::HistoryDepth {
+                required: distance,
+                limit: max_hops,
+            }));
+        }
+        let mut parent = current.head().authority;
+        let mut next = current.manifest().predecessor();
+        let mut manifests = Vec::new();
+        let mut manifest_bytes = 0_u64;
+        loop {
+            let Some(authority) = next else {
+                return Ok(Err(SnapshotRefusalV1::HistoryNotRetained));
+            };
+            if authority.sequence.checked_add(1) != Some(parent.sequence)
+                || parent.predecessor != Some(authority.fingerprint())
+                || authority.sequence < target.sequence
+            {
+                return Ok(Err(SnapshotRefusalV1::HistoryNotRetained));
+            }
+            if authority.sequence == target.sequence {
+                if authority != target {
+                    return Ok(Err(SnapshotRefusalV1::HistoryNotRetained));
+                }
+                return Ok(Ok(HistoryPath {
+                    selected: GenerationSnapshotSelectionV1 {
+                        authority,
+                        slot: [resolution.pair.first, resolution.pair.second]
+                            .into_iter()
+                            .flatten()
+                            .find(|slot| slot.authority == authority),
+                    },
+                    manifests,
+                    manifest_bytes,
+                }));
+            }
+            if let Err(refusal) = check_image_budget(
+                target.manifest_len,
+                [manifest_bytes, authority.manifest_len],
+                max_owned_image_bytes,
+            ) {
+                return Ok(Err(refusal));
+            }
+            let path = activation_manifest_path_v1(authority.object_id)?;
+            let expectation = GenerationFileExpectation::immutable(
+                authority.manifest_len,
+                authority.manifest_sha256,
+            )?;
+            let file = match root.admit_file(&path, expectation) {
+                Ok(file) => file,
+                Err(error) => return Ok(Err(SnapshotRefusalV1::Closure(error.kind()))),
+            };
+            let manifest = match ActivationManifest::from_canonical_bytes(file.as_bytes()).and_then(
+                |manifest| {
+                    verify_authority_manifest_reference(&authority, &manifest).map(|()| manifest)
+                },
+            ) {
+                Ok(manifest) => manifest,
+                Err(error) => return Ok(Err(SnapshotRefusalV1::Manifest(error))),
+            };
+            // The preceding budget check proved this addition fits. Retain the
+            // exact descriptor as well as its bytes until the reader is dropped.
+            manifest_bytes += authority.manifest_len;
+            parent = authority;
+            next = manifest.predecessor();
+            manifests.push(file);
         }
     }
 
@@ -6163,7 +6360,7 @@ pub mod generation_reader {
                     }),
                 ));
             }
-            if current.selected_predecessor_of().is_some() {
+            if current.selected_history_of().is_some() {
                 return Ok(SnapshotOpenOutcomeV1::Refused(
                     SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::InvalidField {
                         field: "generation_reader.predecessor.current_selection",
@@ -6194,6 +6391,90 @@ pub mod generation_reader {
                     current,
                     selected_predecessor,
                 )),
+            )
+        }
+
+        /// Admit an explicit retained ancestor through authenticated manifest links.
+        ///
+        /// The current snapshot must be an ordinary, fully admitted
+        /// [`GenerationRootSecurityProfileV1::CooperativeLocal`] selection from
+        /// this exact root and its control anchors, without an external floor.
+        /// Its exact physical pair must remain unchanged across admission.
+        /// No newer current head is followed, directory inventory is never used
+        /// to discover history, and possession of an old receipt is insufficient.
+        ///
+        /// Every intermediate manifest is opened descriptor-relatively at the
+        /// exact length and digest authenticated by its successor. Each link
+        /// must decrease authority sequence by exactly one. The selected
+        /// target receives normal complete component admission. No intermediate
+        /// generation's vector, lexical, ANN or metadata image is required.
+        /// Missing/tampered ancestry refuses this read while ordinary current
+        /// reads remain independent of history availability.
+        ///
+        /// The returned snapshot retains `current`, all intermediate manifest
+        /// descriptors, and the target's complete closure. Its selection carries
+        /// an actual physical slot only if the target still occupies one.
+        /// Historical selection never changes AUTHORITY and cannot be used as a
+        /// current publication base. A rollback must publish a new higher
+        /// sequence against the exact authorizing current pair.
+        ///
+        /// `max_history_hops` bounds predecessor traversal before any history
+        /// object is read. `max_owned_image_bytes` covers all newly retained
+        /// intermediate manifests, the target manifest and its components;
+        /// it excludes the already retained current snapshot and parsed engine
+        /// memory. Callers bounding their total images must account for current
+        /// separately. The existing immediate-predecessor recovery API remains
+        /// the explicit route when current components are damaged.
+        ///
+        /// # Errors
+        /// Returns typed stale-head, history-depth, unretained-history, image
+        /// budget, manifest/closure, unsupported-profile and infrastructure errors.
+        pub fn open_historical_generation_snapshot_with_budget(
+            &self,
+            current: &Arc<OpenedGenerationSnapshotV1>,
+            target: AuthorityRefV1,
+            max_history_hops: u64,
+            max_owned_image_bytes: u64,
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            if current.profile() != GenerationRootSecurityProfileV1::CooperativeLocal
+                || current.floor().is_some()
+                || current.health()
+                    != (SnapshotHealthV1::Unanchored {
+                        profile: GenerationRootSecurityProfileV1::CooperativeLocal,
+                    })
+                || current.selected_history_of().is_some()
+            {
+                return Ok(SnapshotOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::Authority(GenerationAuthorityErrorV1::InvalidField {
+                        field: "generation_reader.history.current_selection",
+                    }),
+                ));
+            }
+            if !self
+                .witness()
+                .same_directory_security_identity(current.root_witness())
+                || !same_snapshot_anchors(&self.anchor_witnesses(), &current.anchor_witnesses())
+            {
+                return Ok(SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(
+                    GenerationRootErrorKind::ObjectChanged,
+                )));
+            }
+            if let Err(error) = target.validate() {
+                return Ok(SnapshotOpenOutcomeV1::Refused(
+                    SnapshotRefusalV1::Authority(error),
+                ));
+            }
+            self.open_selected_generation_snapshot_with_budget(
+                current.root_id(),
+                current.profile(),
+                None,
+                max_owned_image_bytes,
+                None,
+                Some(PredecessorSelection::History {
+                    current,
+                    target,
+                    max_hops: max_history_hops,
+                }),
             )
         }
 
@@ -6292,10 +6573,38 @@ pub mod generation_reader {
                         SnapshotRefusalV1::ExpectedCurrentChanged,
                     ));
                 }
+                let mut history_manifests = Vec::new();
+                let mut history_manifest_bytes = 0_u64;
                 let (selected, recovery_manifest_file) = match predecessor {
                     Some(PredecessorSelection::Retained(current, target)) => {
                         match selected_predecessor_slot(current, target, &first, &first_anchors) {
-                            Ok(slot) => (slot, None),
+                            Ok(slot) => (GenerationSnapshotSelectionV1::from_slot(slot), None),
+                            Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
+                        }
+                    }
+                    Some(PredecessorSelection::History {
+                        current,
+                        target,
+                        max_hops,
+                    }) => {
+                        if let Err(refusal) =
+                            require_selected_current(current, &first, &first_anchors)
+                        {
+                            return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
+                        }
+                        match admit_history_path(
+                            self,
+                            current,
+                            target,
+                            &first,
+                            max_hops,
+                            max_owned_image_bytes,
+                        )? {
+                            Ok(path) => {
+                                history_manifests = path.manifests;
+                                history_manifest_bytes = path.manifest_bytes;
+                                (path.selected, None)
+                            }
                             Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
                         }
                     }
@@ -6368,11 +6677,13 @@ pub mod generation_reader {
                             ));
                         }
                         match predecessor_slot_from_manifest(current, &manifest, target, &first) {
-                            Ok(slot) => (slot, Some(file)),
+                            Ok(slot) => {
+                                (GenerationSnapshotSelectionV1::from_slot(slot), Some(file))
+                            }
                             Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
                         }
                     }
-                    None => (first.head, None),
+                    None => (GenerationSnapshotSelectionV1::from_slot(first.head), None),
                 };
                 let recovery_manifest_len = recovery_manifest_file
                     .as_ref()
@@ -6383,7 +6694,9 @@ pub mod generation_reader {
                 let authority = selected.authority;
                 if let Err(refusal) = check_image_budget(
                     authority.manifest_len,
-                    recovery_manifest_len,
+                    recovery_manifest_len
+                        .into_iter()
+                        .chain([history_manifest_bytes]),
                     max_owned_image_bytes,
                 ) {
                     return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
@@ -6423,7 +6736,8 @@ pub mod generation_reader {
                     receipts
                         .iter()
                         .map(|(_, receipt)| receipt.byte_len)
-                        .chain(recovery_manifest_len),
+                        .chain(recovery_manifest_len)
+                        .chain([history_manifest_bytes]),
                     max_owned_image_bytes,
                 ) {
                     return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
@@ -6483,6 +6797,11 @@ pub mod generation_reader {
                 {
                     return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
                 }
+                if let Some(PredecessorSelection::History { current, .. }) = predecessor
+                    && let Err(refusal) = require_selected_current(current, &second, &anchors)
+                {
+                    return Ok(SnapshotOpenOutcomeV1::Refused(refusal));
+                }
                 if recovery_manifest_file.is_some()
                     && !same_snapshot_anchors(&first_anchors, &anchors)
                 {
@@ -6497,7 +6816,9 @@ pub mod generation_reader {
                     PredecessorSelection::Recovery { current, .. } => {
                         Some(activation_manifest_name_v1(current.object_id))
                     }
-                    PredecessorSelection::Retained(_, _) => None,
+                    PredecessorSelection::Retained(_, _) | PredecessorSelection::History { .. } => {
+                        None
+                    }
                 });
                 let component_names: Vec<_> = receipts
                     .iter()
@@ -6533,8 +6854,18 @@ pub mod generation_reader {
                         manifest,
                         closure,
                         health: second.health,
-                        selected_predecessor_of: predecessor
-                            .map(PredecessorSelection::current_authority),
+                        selected_predecessor_of: predecessor.and_then(|selection| {
+                            let current = selection.current_authority();
+                            (selected.authority.sequence.checked_add(1) == Some(current.sequence))
+                                .then_some(current)
+                        }),
+                        history_current: predecessor.and_then(|selection| match selection {
+                            PredecessorSelection::History { current, .. } => {
+                                Some(Arc::clone(current))
+                            }
+                            _ => None,
+                        }),
+                        history_manifests,
                     },
                 )));
             }
@@ -7173,6 +7504,283 @@ pub mod generation_reader {
             (path, root, current, predecessor)
         }
 
+        fn historical_root(
+            label: &str,
+            with_ann: bool,
+        ) -> (
+            PathBuf,
+            QualifiedGenerationRoot,
+            Arc<OpenedGenerationSnapshotV1>,
+            AuthorityRefV1,
+        ) {
+            let (path, root, mut current, first) = predecessor_root(label, with_ann, None);
+            for sequence in 3..=4 {
+                publish_manifest(
+                    &path,
+                    &publisher(&root),
+                    &manifest_v2(sequence, Some(current.head().authority), with_ann),
+                    current.authority_pair(),
+                    None,
+                );
+                current = opened(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None,
+                ));
+            }
+            drop(current);
+            drop(root);
+            let root = admit(&path);
+            let current = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            (path, root, current, first.authority)
+        }
+
+        #[test]
+        fn history_reopens_ancestors_after_slots_are_reused_and_pins_exact_images() {
+            for with_ann in [false, true] {
+                let (path, root, current, first) = historical_root("history-restart", with_ann);
+                let anchors = (
+                    fs::read(path.join("AUTHORITY")).unwrap(),
+                    fs::read(path.join("LOCK")).unwrap(),
+                );
+                let history = opened(
+                    root.open_historical_generation_snapshot_with_budget(
+                        &current,
+                        first,
+                        3,
+                        u64::MAX,
+                    )
+                    .expect("authenticated ancestor"),
+                );
+                assert_eq!(history.head().authority, first);
+                assert_eq!(history.head().slot, None, "no historical slot is invented");
+                assert_eq!(history.selected_predecessor_of(), None);
+                assert_eq!(
+                    history.selected_history_of(),
+                    Some(current.head().authority)
+                );
+                assert!(Arc::ptr_eq(history.history_current().unwrap(), &current));
+                assert_eq!(history.history_manifests().len(), 2);
+                assert_eq!(history.authority_pair(), current.authority_pair());
+                for (role, receipt) in history.manifest().components().iter() {
+                    let file = history.closure().file(role).unwrap();
+                    assert_eq!(file.as_bytes(), component_bytes(role, 1));
+                    assert_eq!(file.sha256(), receipt.sha256);
+                }
+                assert_eq!(fs::read(path.join("AUTHORITY")).unwrap(), anchors.0);
+                assert_eq!(fs::read(path.join("LOCK")).unwrap(), anchors.1);
+                let exact_budget = history
+                    .manifest()
+                    .components()
+                    .iter()
+                    .fold(first.manifest_len, |sum, (_, receipt)| {
+                        sum + receipt.byte_len
+                    })
+                    + history
+                        .history_manifests()
+                        .iter()
+                        .map(|file| file.witness().byte_len())
+                        .sum::<u64>();
+                assert!(matches!(
+                    root.open_historical_generation_snapshot_with_budget(
+                        &current,
+                        first,
+                        3,
+                        exact_budget,
+                    )
+                    .unwrap(),
+                    SnapshotOpenOutcomeV1::Opened(_)
+                ));
+                assert_eq!(
+                    refused(
+                        root.open_historical_generation_snapshot_with_budget(
+                            &current,
+                            first,
+                            3,
+                            exact_budget - 1,
+                        )
+                        .unwrap()
+                    ),
+                    SnapshotRefusalV1::ImageBudget {
+                        required: exact_budget,
+                        limit: exact_budget - 1,
+                    }
+                );
+                assert!(matches!(
+                    root.open_historical_generation_snapshot_with_budget(
+                        &history,
+                        first,
+                        3,
+                        u64::MAX,
+                    )
+                    .unwrap(),
+                    SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Authority(_))
+                ));
+                publish_manifest(
+                    &path,
+                    &publisher(&root),
+                    &manifest_v2(5, Some(current.head().authority), !with_ann),
+                    current.authority_pair(),
+                    None,
+                );
+                assert_eq!(
+                    refused(
+                        root.open_historical_generation_snapshot_with_budget(
+                            &current,
+                            first,
+                            3,
+                            u64::MAX,
+                        )
+                        .unwrap()
+                    ),
+                    SnapshotRefusalV1::ExpectedCurrentChanged,
+                );
+                drop(current);
+                drop(root);
+                assert_eq!(
+                    history.history_current().unwrap().head().authority.sequence,
+                    4
+                );
+                assert_eq!(history.head().authority, first);
+                for (role, _) in history.manifest().components().iter() {
+                    assert_eq!(
+                        history.closure().file(role).unwrap().as_bytes(),
+                        component_bytes(role, 1)
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn history_limits_and_broken_ancestry_never_affect_current_admission() {
+            let (path, root, current, first) = historical_root("history-bounds", true);
+            let second_path = path.join(activation_manifest_name_v1(object_id(2)));
+            let preserved_path = path.with_extension("history-second-manifest");
+            fs::rename(&second_path, &preserved_path).unwrap();
+            assert_eq!(
+                refused(
+                    root.open_historical_generation_snapshot_with_budget(
+                        &current,
+                        first,
+                        2,
+                        u64::MAX,
+                    )
+                    .unwrap()
+                ),
+                SnapshotRefusalV1::HistoryDepth {
+                    required: 3,
+                    limit: 2
+                },
+                "depth refusal precedes history I/O"
+            );
+            assert!(matches!(
+                root.open_historical_generation_snapshot_with_budget(&current, first, 3, u64::MAX,)
+                    .unwrap(),
+                SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(_))
+            ));
+            let fresh = opened(open(
+                &root,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+            ));
+            assert_eq!(fresh.head(), current.head());
+            fs::rename(&preserved_path, &second_path).unwrap();
+            let mut forged = first;
+            forged.object_id[0] ^= 0x10;
+            for target in [forged, current.head().authority] {
+                assert_eq!(
+                    refused(
+                        root.open_historical_generation_snapshot_with_budget(
+                            &current,
+                            target,
+                            3,
+                            u64::MAX,
+                        )
+                        .unwrap()
+                    ),
+                    SnapshotRefusalV1::HistoryNotRetained,
+                );
+            }
+            let mut damaged = fs::read(&second_path).unwrap();
+            damaged[0] ^= 0x80;
+            fs::rename(&second_path, &preserved_path).unwrap();
+            write_sealed_object(&path, &activation_manifest_name_v1(object_id(2)), &damaged);
+            assert_eq!(
+                refused(
+                    root.open_historical_generation_snapshot_with_budget(
+                        &current,
+                        first,
+                        3,
+                        u64::MAX,
+                    )
+                    .unwrap()
+                ),
+                SnapshotRefusalV1::Closure(GenerationRootErrorKind::HashMismatch),
+            );
+            assert_eq!(
+                opened(open(
+                    &root,
+                    GenerationRootSecurityProfileV1::CooperativeLocal,
+                    None
+                ))
+                .head(),
+                current.head(),
+                "current readers do not traverse historical manifests"
+            );
+        }
+
+        #[test]
+        fn history_refuses_a_publication_between_ancestry_and_final_resolution() {
+            let (path, root, current, first) = historical_root("history-concurrent", false);
+            let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let root = &root;
+                let current = &current;
+                let reader = scope.spawn(move || {
+                    let mut locks = 0;
+                    let _hook = platform::install_test_hook(move |boundary| {
+                        if boundary == platform::TestBoundary::BeforeLock {
+                            locks += 1;
+                            if locks == 2 {
+                                observed_tx.send(()).unwrap();
+                                resume_rx
+                                    .recv_timeout(std::time::Duration::from_secs(30))
+                                    .unwrap();
+                            }
+                        }
+                        Ok(())
+                    });
+                    root.open_historical_generation_snapshot_with_budget(
+                        current,
+                        first,
+                        3,
+                        u64::MAX,
+                    )
+                    .unwrap()
+                });
+                observed_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap();
+                publish_manifest(
+                    &path,
+                    &publisher(root),
+                    &manifest_v2(5, Some(current.head().authority), false),
+                    current.authority_pair(),
+                    None,
+                );
+                resume_tx.send(()).unwrap();
+                assert_eq!(
+                    refused(reader.join().unwrap()),
+                    SnapshotRefusalV1::ExpectedCurrentChanged
+                );
+            });
+        }
+
         #[test]
         fn explicit_predecessor_retains_actual_slots_and_complete_images_after_restart() {
             for with_ann in [false, true] {
@@ -7189,7 +7797,7 @@ pub mod generation_reader {
                     )
                     .expect("explicit predecessor open"),
                 );
-                assert_eq!(previous.head(), previous_slot);
+                assert_eq!(previous.head().slot, Some(previous_slot));
                 assert_eq!(previous.authority_pair(), current.authority_pair());
                 assert_eq!(
                     previous.selected_predecessor_of(),
@@ -7475,7 +8083,7 @@ pub mod generation_reader {
                         &*vector,
                         &component_bytes(GenerationComponentRole::Vector, 1)
                     );
-                    assert_eq!(retained.head(), previous_slot);
+                    assert_eq!(retained.head().slot, Some(previous_slot));
                     assert_eq!(current.head().authority.sequence, 2);
                 }
             }
@@ -7613,7 +8221,7 @@ pub mod generation_reader {
                 )
                 .expect("reconciled exact selection"),
             );
-            assert_eq!(target.head(), previous);
+            assert_eq!(target.head().slot, Some(previous));
             assert_eq!(
                 opened(
                     root.open_predecessor_generation_for_recovery_with_budget(
@@ -7625,8 +8233,9 @@ pub mod generation_reader {
                     )
                     .expect("reconciled recovery selection")
                 )
-                .head(),
-                previous,
+                .head()
+                .slot,
+                Some(previous),
             );
         }
 
@@ -7686,7 +8295,7 @@ pub mod generation_reader {
                             )
                             .expect("explicit recovery from damaged current component"),
                         );
-                        assert_eq!(recovered.head(), previous);
+                        assert_eq!(recovered.head().slot, Some(previous));
                         assert_eq!(recovered.authority_pair(), pair);
                         assert_eq!(recovered.selected_predecessor_of(), Some(expected));
                         assert_eq!(recovered.floor(), None);
@@ -8035,7 +8644,7 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::RequiredExternal,
                 Some(&floor),
             ));
-            assert_eq!(snapshot.head(), genesis_slot);
+            assert_eq!(snapshot.head().slot, Some(genesis_slot));
             assert_eq!(snapshot.head().authority, genesis);
             assert_eq!(snapshot.manifest(), &genesis_manifest);
             assert_eq!(
@@ -8064,7 +8673,7 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::CooperativeLocal,
                 None,
             ));
-            assert_eq!(local.head(), genesis_slot);
+            assert_eq!(local.head().slot, Some(genesis_slot));
             assert_eq!(
                 local.health(),
                 SnapshotHealthV1::Unanchored {
@@ -8152,7 +8761,7 @@ pub mod generation_reader {
             );
 
             // The retained snapshot is untouched by the publication.
-            assert_eq!(old.head(), genesis_slot);
+            assert_eq!(old.head().slot, Some(genesis_slot));
             assert_eq!(old.manifest(), &genesis_manifest);
             assert_eq!(&*old.manifest_bytes(), &*old_bytes);
             assert_eq!(old.manifest_file().witness(), old_witness);
@@ -8167,7 +8776,7 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::RequiredExternal,
                 Some(&floor),
             ));
-            assert_eq!(new.head(), successor_slot);
+            assert_eq!(new.head().slot, Some(successor_slot));
             assert_eq!(new.head().authority, successor);
             assert_eq!(new.manifest(), &successor_manifest);
             assert_eq!(
@@ -8295,7 +8904,7 @@ pub mod generation_reader {
             );
 
             // Through all of it the earlier snapshot is exactly what it was.
-            assert_eq!(retained.head(), genesis_slot);
+            assert_eq!(retained.head().slot, Some(genesis_slot));
             assert_eq!(retained.manifest().authority_sequence(), 1);
         }
 
@@ -8403,7 +9012,7 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::RequiredExternal,
                 Some(&floor),
             ));
-            assert_eq!(restored.head(), genesis_slot);
+            assert_eq!(restored.head().slot, Some(genesis_slot));
             assert_eq!(
                 restored.health(),
                 SnapshotHealthV1::ExternallyAnchored { cas_version: 1 }
@@ -8421,7 +9030,7 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::RequiredExternal,
                 Some(&floor),
             ));
-            assert_eq!(snapshot.head(), slot);
+            assert_eq!(snapshot.head().slot, Some(slot));
             assert_eq!(snapshot.manifest(), &successor_manifest);
             assert_eq!(
                 snapshot.health(),
@@ -8499,8 +9108,8 @@ pub mod generation_reader {
                 Some(&floor),
             ));
             assert_eq!(
-                snapshot.head(),
-                genesis_slot,
+                snapshot.head().slot,
+                Some(genesis_slot),
                 "the externally proven head is served, not the unproven successor"
             );
             assert_eq!(snapshot.manifest(), &genesis_manifest);
@@ -8517,7 +9126,7 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::RequiredExternal,
                 Some(&floor),
             ));
-            assert_eq!(caught_up.head(), successor_slot);
+            assert_eq!(caught_up.head().slot, Some(successor_slot));
             assert_eq!(
                 caught_up.health(),
                 SnapshotHealthV1::ExternallyAnchored { cas_version: 2 }
@@ -8718,7 +9327,7 @@ pub mod generation_reader {
                 GenerationRootSecurityProfileV1::CooperativeLocal,
                 None,
             ));
-            assert_eq!(snapshot.head(), slot);
+            assert_eq!(snapshot.head().slot, Some(slot));
             let receipts = snapshot.manifest().components();
             assert!(matches!(snapshot.manifest(), ActivationManifest::V1(_)));
             for (role, receipt) in receipts.iter() {
@@ -8794,7 +9403,7 @@ pub mod generation_reader {
                     GenerationRootSecurityProfileV1::RequiredExternal,
                     Some(&floor),
                 ));
-                assert_eq!(snapshot.head(), slot);
+                assert_eq!(snapshot.head().slot, Some(slot));
                 assert_eq!(snapshot.manifest(), &selected);
                 assert_eq!(
                     snapshot.manifest_bytes().as_ref(),
@@ -9387,7 +9996,7 @@ pub mod generation_reader {
             let installed = opened(outcome);
             let loaded = cell.load().expect("installed");
             assert!(Arc::ptr_eq(&installed, &loaded));
-            assert_eq!(loaded.head(), slot);
+            assert_eq!(loaded.head().slot, Some(slot));
             let bytes_before = loaded
                 .closure()
                 .bytes(GenerationComponentRole::Vector)
@@ -9471,7 +10080,7 @@ pub mod generation_reader {
                 &cell.load().expect("old still installed"),
                 &old
             ));
-            assert_eq!(old.head(), genesis_slot);
+            assert_eq!(old.head().slot, Some(genesis_slot));
             assert_eq!(
                 &*old_bytes,
                 &component_bytes(GenerationComponentRole::Vector, 1)
@@ -9492,7 +10101,7 @@ pub mod generation_reader {
                 &*old_bytes,
                 &component_bytes(GenerationComponentRole::Vector, 1)
             );
-            assert_eq!(old.head(), genesis_slot);
+            assert_eq!(old.head().slot, Some(genesis_slot));
         }
 
         #[test]
@@ -9772,7 +10381,7 @@ pub mod generation_reader {
                         )
                         .expect("refresh runs"),
                     );
-                    assert_eq!(fresh.head(), slot);
+                    assert_eq!(fresh.head().slot, Some(slot));
                     assert_eq!(
                         fresh.health(),
                         SnapshotHealthV1::ExternallyAnchored {
@@ -9805,7 +10414,7 @@ pub mod generation_reader {
                 genesis_manifest.canonical_bytes().as_slice()
             );
             let latest = cell.load().expect("installed");
-            assert_eq!(latest.head(), previous_slot);
+            assert_eq!(latest.head().slot, Some(previous_slot));
             assert!(!Arc::ptr_eq(&latest, &old));
             // Every generation's objects are still retained beside each other.
             let inventory = root.inventory().expect("inventory");
@@ -9884,7 +10493,7 @@ pub mod generation_reader {
                 }
             }
             let snapshot = opened(admitted.expect("the lock frees after the holder dies"));
-            assert_eq!(snapshot.head(), slot);
+            assert_eq!(snapshot.head().slot, Some(slot));
             assert!(Arc::ptr_eq(&cell.load().expect("installed"), &snapshot));
         }
 
@@ -9973,7 +10582,7 @@ pub mod generation_reader {
                 );
                 if crash_at == B::BeforePublishAttemptFrame {
                     let snapshot = opened(fresh);
-                    assert_eq!(snapshot.head(), genesis_slot, "{crash_at:?}");
+                    assert_eq!(snapshot.head().slot, Some(genesis_slot), "{crash_at:?}");
                     assert_eq!(
                         snapshot.health(),
                         SnapshotHealthV1::ExternallyAnchored { cas_version: 1 }
@@ -9994,7 +10603,7 @@ pub mod generation_reader {
                     }
                 }
                 // The retained reader is untouched by any of it.
-                assert_eq!(old.head(), genesis_slot);
+                assert_eq!(old.head().slot, Some(genesis_slot));
                 assert_eq!(old.manifest(), &genesis_manifest);
                 assert_eq!(
                     &*old
@@ -10023,7 +10632,7 @@ pub mod generation_reader {
                         SnapshotRefusalV1::PendingReconciliation,
                         "{crash_at:?}"
                     );
-                    assert_eq!(old.head(), genesis_slot);
+                    assert_eq!(old.head().slot, Some(genesis_slot));
                     continue;
                 }
                 if slot_written {
@@ -10041,7 +10650,11 @@ pub mod generation_reader {
                         GenerationRootSecurityProfileV1::RequiredExternal,
                         Some(&floor),
                     ));
-                    assert_eq!(after_reconcile.head(), genesis_slot, "{crash_at:?}");
+                    assert_eq!(
+                        after_reconcile.head().slot,
+                        Some(genesis_slot),
+                        "{crash_at:?}"
+                    );
                     assert_eq!(
                         after_reconcile.health(),
                         SnapshotHealthV1::ExternallyAnchored { cas_version: 1 },
@@ -10074,7 +10687,7 @@ pub mod generation_reader {
                         .expect("mandatory vector"),
                     component_bytes(GenerationComponentRole::Vector, 2).as_slice()
                 );
-                assert_eq!(old.head(), genesis_slot, "{crash_at:?}");
+                assert_eq!(old.head().slot, Some(genesis_slot), "{crash_at:?}");
             }
         }
     }
