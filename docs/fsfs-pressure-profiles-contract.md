@@ -171,10 +171,21 @@ sleeps of at most 100 ms and checks cancellation on each iteration. These are co
 already running synchronous work can overshoot a threshold. The separate RSS
 boundary continues to return its typed memory-pressure error.
 
+The profile also sizes the caller-owned blocking pool used for model loading and
+blocking inference: `strict` permits two workers, `performance` six, and
+`degraded` one. The CLI, recovery and live-search entry points attach this pool to
+their request contexts and native models. Daemon requests share one pool across
+runtime clones, so repeated timeouts or multiple clients cannot multiply its
+worker capacity. A timed-out caller releases no worker capacity until its
+already-running native call actually finishes; shutdown drains those calls.
+These limits bound pool jobs, not internal model threads or all synchronous
+embedding and indexing operations.
+
 The `config.setting.no_effect` warning still covers a `strict` or `degraded`
-profile because its resolved concurrency and scheduler limits are not read yet;
-its quality and background-indexing ceilings do apply. Automatic durable
-background resumption of deferred quality embedding remains unimplemented.
+profile because its separate indexing concurrency and workload scheduler limits
+are not applied yet; its blocking-worker, quality and background-indexing ceilings
+do apply. Automatic durable background resumption of deferred quality embedding
+remains unimplemented.
 
 The `performance` profile allows either `fast_only` value. The `strict` and
 `degraded` profiles disable quality: `fast_only=true` is accepted, while a winning

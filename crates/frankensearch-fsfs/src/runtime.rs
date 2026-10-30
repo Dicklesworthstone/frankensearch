@@ -6470,6 +6470,20 @@ impl Default for SearchBlockingPool {
 }
 
 impl SearchBlockingPool {
+    /// Bound actual model-worker execution by the selected pressure profile.
+    ///
+    /// The pool owns running work until completion, even after a query times
+    /// out or drops its join. Queued cancellation releases no running capacity.
+    /// This limits blocking workers, not native libraries' internal threads,
+    /// synchronous indexing, or the profile's separate scheduling policy.
+    #[must_use]
+    pub fn for_profile(profile: crate::config::PressureProfile) -> Self {
+        Self(asupersync::runtime::blocking_pool::BlockingPool::new(
+            0,
+            usize::from(profile.embedding_worker_limit()),
+        ))
+    }
+
     /// Capacity for models that require an explicit caller-owned worker pool.
     #[must_use]
     pub fn handle(&self) -> asupersync::runtime::blocking_pool::BlockingPoolHandle {
@@ -6511,6 +6525,9 @@ pub struct FsfsRuntime {
     /// A raw quality-only stream shares this request-local budget across
     /// pre-Started producer admission and retrieval. Never stored on the daemon.
     quality_budget_started_at: Option<asupersync::types::Time>,
+    /// One caller-owned capacity shared by daemon requests and runtime clones.
+    /// Only the handle lives here: the caller drains the owner after all users.
+    search_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
     #[cfg(feature = "rerank")]
     native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
     #[cfg(feature = "embedded-models")]
@@ -6584,6 +6601,7 @@ impl FsfsRuntime {
                 QualityEmbedderSlot::default(),
             )),
             quality_budget_started_at: None,
+            search_blocking_pool: None,
             #[cfg(feature = "rerank")]
             native_blocking_pool: None,
             #[cfg(feature = "embedded-models")]
@@ -6683,7 +6701,44 @@ impl FsfsRuntime {
         self
     }
 
-    /// Attach the caller's existing pool for native quality and reranking.
+    /// Attach one caller-owned pool for model work across requests and clones.
+    ///
+    /// Keep its [`SearchBlockingPool`] owner alive until every runtime clone
+    /// exits. The owner then drains timed-out workers before shutdown returns.
+    /// Native quality and reranking use the same capacity when compiled in.
+    #[must_use]
+    pub fn with_search_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        #[cfg(feature = "rerank")]
+        {
+            self = self.with_native_blocking_pool(pool.clone());
+        }
+        self.search_blocking_pool = Some(pool);
+        self
+    }
+
+    /// Use caller capacity or retain a scoped owner for a standalone handler.
+    /// A daemon installs one owner before accepting clients, so its requests
+    /// never multiply the configured worker limit by their number of clients.
+    #[cfg(unix)]
+    fn search_blocking_capacity(
+        &self,
+    ) -> (
+        Option<SearchBlockingPool>,
+        asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) {
+        if let Some(pool) = &self.search_blocking_pool {
+            return (None, pool.clone());
+        }
+        let owner = SearchBlockingPool::for_profile(self.config.pressure.profile);
+        let handle = owner.handle();
+        (Some(owner), handle)
+    }
+
+    /// Attach the caller's existing pool for native quality and reranking,
+    /// and use that same capacity for shared daemon search workers.
     /// The caller retains the owner and drains it after all runtime clones exit.
     #[cfg(feature = "rerank")]
     #[must_use]
@@ -6691,6 +6746,9 @@ impl FsfsRuntime {
         mut self,
         pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
     ) -> Self {
+        // Both entry points select one capacity. Rebinding the native backend
+        // must not leave daemon requests on a different, older worker pool.
+        self.search_blocking_pool = Some(pool.clone());
         self.native_blocking_pool = Some(pool);
         // A retained native model belongs to the pool supplied when it loaded.
         // Runtime clones using the previous pool keep their own shared slot.
@@ -8839,7 +8897,17 @@ impl FsfsRuntime {
             path: socket_path.clone(),
         };
 
-        let resources = self.prepare_search_serve_resources(cx).await?;
+        // One capacity belongs to the daemon, not to each accepted client.
+        // A timed-out client's still-running model keeps occupying this same
+        // pool while subsequent clients wait for real worker completion.
+        let (_blocking_pool, pool_handle) = self.search_blocking_capacity();
+        let runtime = if self.search_blocking_pool.is_some() {
+            self.clone()
+        } else {
+            self.clone().with_search_blocking_pool(pool_handle.clone())
+        };
+        let serving_cx = cx.clone().with_blocking_pool_handle(Some(pool_handle));
+        let resources = runtime.prepare_search_serve_resources(&serving_cx).await?;
         let ready = Self::search_serve_ready_event(self.cli_input.format.to_string(), &resources);
         if let Err(error) = Self::emit_search_serve_json_line(&ready) {
             warn!(
@@ -8963,7 +9031,7 @@ impl FsfsRuntime {
                 }
                 let shared = Arc::clone(&shared);
                 let stop_requested = Arc::clone(&stop_requested);
-                let runtime = self.clone();
+                let runtime = runtime.clone();
                 let in_flight = Arc::clone(&in_flight);
                 in_flight.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 scope.spawn(move || {
@@ -9055,14 +9123,14 @@ impl FsfsRuntime {
         // Keep the pool alive until the response is flushed and its write side
         // closes. Joining a timed-out backend before writing would hide the
         // deadline from clients which read the response through EOF.
-        let blocking_pool = Arc::new(SearchBlockingPool::default());
+        let (blocking_pool, pool_handle) = runtime.search_blocking_capacity();
         let mut request_scheduler = None;
         let response = match Self::parse_search_serve_request(raw) {
             Ok(request) => {
                 let request_query = request.query.clone();
                 let request_mode = request.mode.clone().unwrap_or_else(|| "full".to_owned());
                 let scheduler = match RuntimeBuilder::current_thread()
-                    .blocking_threads(0, 2)
+                    .blocking_threads(0, pool_handle.current_max_threads())
                     .build()
                 {
                     Ok(scheduler) => scheduler,
@@ -9075,11 +9143,10 @@ impl FsfsRuntime {
                     }
                 };
                 let scheduler = request_scheduler.insert(scheduler);
-                let request_pool = Arc::clone(&blocking_pool);
                 let execute_task = scheduler.handle().spawn(async move {
-                    let cx = request_pool.context(
-                        Cx::current().expect("asupersync runtime installs a request context"),
-                    );
+                    let cx = Cx::current()
+                        .expect("asupersync runtime installs a request context")
+                        .with_blocking_pool_handle(Some(pool_handle));
                     let mut guard =
                         asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), &cx)
                             .await
@@ -9120,8 +9187,9 @@ impl FsfsRuntime {
                 "fsfs daemon failed to write socket response"
             );
         }
-        // Stop scheduler admission, then fully drain the explicitly owned pool
-        // after the client can receive its result, even for calls over five seconds.
+        // Stop scheduler admission. A standalone handler drains its fallback
+        // owner after delivering the result; normal daemon clients share the
+        // daemon's owner, which retains timed-out jobs until daemon shutdown.
         drop(request_scheduler);
         drop(blocking_pool);
     }
@@ -9182,8 +9250,7 @@ impl FsfsRuntime {
                 return;
             }
         };
-        let blocking_pool = SearchBlockingPool::default();
-        let pool_handle = blocking_pool.handle();
+        let (blocking_pool, pool_handle) = runtime.search_blocking_capacity();
         let request_context = Arc::new(asupersync::sync::OnceCell::<Cx>::new());
         let task_context = Arc::clone(&request_context);
         let disconnected = Arc::new(AtomicBool::new(false));
@@ -9203,7 +9270,7 @@ impl FsfsRuntime {
         std::thread::scope(|scope| {
             let compute = scope.spawn(move || -> SearchResult<()> {
                 let scheduler = RuntimeBuilder::current_thread()
-                    .blocking_threads(0, 2)
+                    .blocking_threads(0, pool_handle.current_max_threads())
                     .build()
                     .map_err(|error| {
                         Self::search_daemon_error(format!("request scheduler: {error}"))
@@ -35487,6 +35554,188 @@ mod tests {
             assert_eq!(refined.query, "replacement query after timeout");
             assert_eq!(completed.load(Ordering::SeqCst), 2);
         });
+    }
+
+    #[test]
+    fn pressure_profile_worker_capacity_bounds_actual_execution() {
+        use crate::config::PressureProfile;
+
+        for (profile, expected) in [
+            (PressureProfile::Degraded, 1),
+            (PressureProfile::Strict, 2),
+            (PressureProfile::Performance, 6),
+        ] {
+            let pool = super::SearchBlockingPool::for_profile(profile);
+            let handle = pool.handle();
+            assert_eq!(handle.current_max_threads(), expected);
+            let active = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let (started, starts) = std::sync::mpsc::channel();
+            let mut jobs = Vec::new();
+            for _ in 0..expected {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let release = Arc::clone(&release);
+                let started = started.clone();
+                jobs.push(handle.spawn(move || {
+                    let running = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(running, Ordering::SeqCst);
+                    started.send(()).unwrap();
+                    let (lock, wake) = &*release;
+                    let (released, timeout) = wake
+                        .wait_timeout_while(
+                            lock.lock().unwrap(),
+                            Duration::from_secs(5),
+                            |released| !*released,
+                        )
+                        .unwrap();
+                    assert!(*released && !timeout.timed_out(), "caller releases workers");
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+                starts.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            assert_eq!(active.load(Ordering::SeqCst), expected);
+            let (extra_started, extra_starts) = std::sync::mpsc::channel();
+            let extra_active = Arc::clone(&active);
+            let extra_peak = Arc::clone(&peak);
+            jobs.push(handle.spawn(move || {
+                let running = extra_active.fetch_add(1, Ordering::SeqCst) + 1;
+                extra_peak.fetch_max(running, Ordering::SeqCst);
+                extra_started.send(()).unwrap();
+                extra_active.fetch_sub(1, Ordering::SeqCst);
+            }));
+            assert!(matches!(
+                extra_starts.recv_timeout(Duration::from_millis(30)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            let (lock, wake) = &*release;
+            *lock.lock().unwrap() = true;
+            wake.notify_all();
+            extra_starts.recv_timeout(Duration::from_secs(5)).unwrap();
+            for job in jobs {
+                assert!(job.wait_timeout(Duration::from_secs(5)));
+            }
+            assert_eq!(peak.load(Ordering::SeqCst), expected);
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[cfg(feature = "rerank")]
+    #[test]
+    fn pressure_profile_pool_rebinding_keeps_native_and_search_owners_together() {
+        use crate::config::PressureProfile;
+
+        for replace_via_native in [false, true] {
+            let original_pool = super::SearchBlockingPool::for_profile(PressureProfile::Strict);
+            let replacement_pool =
+                super::SearchBlockingPool::for_profile(PressureProfile::Performance);
+            let original = FsfsRuntime::new(FsfsConfig::default())
+                .with_search_blocking_pool(original_pool.handle());
+            {
+                let mut slot = original.quality_load_gate.try_lock_owned().unwrap();
+                slot.0 = Some(Arc::new(SemanticQualityStub));
+            }
+            original.reranker.get_or_init(|| super::RerankerSlot(None));
+            let rebound = if replace_via_native {
+                original
+                    .clone()
+                    .with_native_blocking_pool(replacement_pool.handle())
+            } else {
+                original
+                    .clone()
+                    .with_search_blocking_pool(replacement_pool.handle())
+            };
+            let native = rebound.native_blocking_pool.as_ref().unwrap();
+            assert_eq!(native.current_max_threads(), 6);
+            // Changing one live handle proves both routes share the actual
+            // pool, rather than merely advertising the same configured limit.
+            assert_eq!(native.set_max_threads(1), 1);
+            assert_eq!(
+                rebound
+                    .search_blocking_pool
+                    .as_ref()
+                    .unwrap()
+                    .current_max_threads(),
+                1
+            );
+            assert_eq!(original_pool.handle().current_max_threads(), 2);
+            assert!(
+                original
+                    .quality_load_gate
+                    .try_lock_owned()
+                    .unwrap()
+                    .0
+                    .is_some()
+            );
+            assert!(
+                rebound
+                    .quality_load_gate
+                    .try_lock_owned()
+                    .unwrap()
+                    .0
+                    .is_none()
+            );
+            assert!(original.reranker.get().is_some());
+            assert!(rebound.reranker.get().is_none());
+            assert!(!Arc::ptr_eq(
+                &original.reranker_load_gate,
+                &rebound.reranker_load_gate
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pressure_profile_worker_capacity_is_shared_until_cancelled_work_finishes() {
+        use crate::config::PressureProfile;
+
+        let mut config = FsfsConfig::default();
+        config.pressure.profile = PressureProfile::Degraded;
+        let pool = super::SearchBlockingPool::for_profile(config.pressure.profile);
+        let runtime = FsfsRuntime::new(config).with_search_blocking_pool(pool.handle());
+        let other = runtime.clone();
+        let (first_owner, first_pool) = runtime.search_blocking_capacity();
+        let (second_owner, second_pool) = other.search_blocking_capacity();
+        assert!(first_owner.is_none() && second_owner.is_none());
+        let (started, starts) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let first = first_pool.spawn(move || {
+            started.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        starts.recv_timeout(Duration::from_secs(5)).unwrap();
+        first.cancel();
+        assert!(first.is_cancelled());
+        assert!(
+            !first.wait_timeout(Duration::from_millis(30)),
+            "cancelled callers do not release an executing worker's capacity"
+        );
+
+        let (next_started, next_starts) = std::sync::mpsc::channel();
+        let next = second_pool.spawn(move || next_started.send(()).unwrap());
+        let cancelled_ran = Arc::new(AtomicBool::new(false));
+        let cancelled_flag = Arc::clone(&cancelled_ran);
+        let cancelled = second_pool.spawn(move || cancelled_flag.store(true, Ordering::SeqCst));
+        cancelled.cancel();
+        assert!(matches!(
+            next_starts.recv_timeout(Duration::from_millis(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(second_pool.busy_threads(), 1);
+        release.send(()).unwrap();
+        assert!(first.wait_timeout(Duration::from_secs(5)));
+        next_starts.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(next.wait_timeout(Duration::from_secs(5)));
+        assert!(cancelled.wait_timeout(Duration::from_secs(5)));
+        assert!(!cancelled_ran.load(Ordering::SeqCst));
+
+        // Capacity is reusable after real completion, including cancelled
+        // queued jobs. A clone must neither leak nor create a second pool.
+        let (resumed, resume) = std::sync::mpsc::channel();
+        let resumed_job = first_pool.spawn(move || resumed.send(()).unwrap());
+        resume.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(resumed_job.wait_timeout(Duration::from_secs(5)));
     }
 
     #[test]

@@ -757,11 +757,16 @@ fn run(options: Options) -> SearchResult<Report> {
     } else {
         Some(configured_runtime(&options)?)
     };
-    let pool = Arc::new(SearchBlockingPool::default());
-    #[cfg(feature = "rerank")]
-    let runtime = runtime.map(|runtime| runtime.with_native_blocking_pool(pool.handle()));
+    let pool = Arc::new(
+        runtime
+            .as_ref()
+            .map_or_else(SearchBlockingPool::default, |runtime| {
+                SearchBlockingPool::for_profile(runtime.config().pressure.profile)
+            }),
+    );
+    let runtime = runtime.map(|runtime| runtime.with_search_blocking_pool(pool.handle()));
     let scheduler = RuntimeBuilder::current_thread()
-        .blocking_threads(0, 2)
+        .blocking_threads(0, pool.handle().current_max_threads())
         .build()
         .map_err(|source| SearchError::SubsystemError {
             subsystem: "fsfs.recovery.runtime",

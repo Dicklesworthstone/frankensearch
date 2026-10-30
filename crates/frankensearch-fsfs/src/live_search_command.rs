@@ -448,12 +448,17 @@ fn run(options: Options) -> SearchResult<u64> {
     // thread. There are no interactive/request tasks sharing its synchronous
     // filesystem/query/output lane. Quill's async admission uses this same
     // runtime and the established host-owned blocking pool; no nested runtime.
-    let pool = Arc::new(SearchBlockingPool::default());
     let app_runtime = hybrid::configured_runtime(&options)?;
-    #[cfg(feature = "rerank")]
-    let app_runtime = app_runtime.map(|runtime| runtime.with_native_blocking_pool(pool.handle()));
+    let pool = Arc::new(
+        app_runtime
+            .as_ref()
+            .map_or_else(SearchBlockingPool::default, |runtime| {
+                SearchBlockingPool::for_profile(runtime.config().pressure.profile)
+            }),
+    );
+    let app_runtime = app_runtime.map(|runtime| runtime.with_search_blocking_pool(pool.handle()));
     let scheduler = RuntimeBuilder::current_thread()
-        .blocking_threads(0, 2)
+        .blocking_threads(0, pool.handle().current_max_threads())
         .build()
         .map_err(|error| SearchError::SubsystemError {
             subsystem: "fsfs.live_search.runtime",

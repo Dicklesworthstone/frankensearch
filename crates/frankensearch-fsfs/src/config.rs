@@ -348,6 +348,14 @@ impl PressureProfileContract {
 }
 
 impl PressureProfile {
+    /// Maximum simultaneously executing model workers for this profile.
+    ///
+    /// This is a cooperative blocking-pool limit, not an OS thread or CPU cap.
+    #[must_use]
+    pub(crate) const fn embedding_worker_limit(self) -> u8 {
+        self.contract().max_embed_concurrency
+    }
+
     #[must_use]
     const fn contract(self) -> PressureProfileContract {
         match self {
@@ -3425,15 +3433,15 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
             message: "fsfs stores no summaries to expire, so this changes nothing".into(),
         });
     }
-    // A profile's quality ceiling applies (search.fast_only); its resolved
-    // concurrency and scheduler limits have no reader yet.
+    // The product's caller-owned model worker pool and quality ceiling apply.
+    // Indexing concurrency and scheduler policy still have no reader.
     if config.pressure.profile != PressureProfile::Performance {
         warnings.push(ConfigWarning {
             severity: ConfigDiagnosticSeverity::Warn,
             reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
             field: "pressure.profile".into(),
             source: ConfigSource::Runtime,
-            message: "this profile disables quality search, but its embedding/indexing concurrency and scheduler limits are not applied yet".into(),
+            message: "this profile limits blocking model workers and disables quality search, but its indexing concurrency and scheduler limits are not applied yet".into(),
         });
     }
     if config.tui.theme != TuiTheme::Dark {

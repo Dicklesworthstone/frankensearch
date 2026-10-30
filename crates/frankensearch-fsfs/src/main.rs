@@ -302,13 +302,14 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         "fsfs command parsed and runtime wired"
     );
 
-    let blocking_pool = Arc::new(SearchBlockingPool::default());
-    #[cfg(feature = "rerank")]
-    let app_runtime = app_runtime.with_native_blocking_pool(blocking_pool.handle());
+    let blocking_pool = Arc::new(SearchBlockingPool::for_profile(
+        app_runtime.config().pressure.profile,
+    ));
+    let app_runtime = app_runtime.with_search_blocking_pool(blocking_pool.handle());
     let scheduler = RuntimeBuilder::current_thread()
         // ONNX calls and quality index scans must not block the executor
         // that publishes Initial and drives the refinement deadline.
-        .blocking_threads(0, 2)
+        .blocking_threads(0, blocking_pool.handle().current_max_threads())
         .build()
         .map_err(|error| SearchError::SubsystemError {
             subsystem: "fsfs",
