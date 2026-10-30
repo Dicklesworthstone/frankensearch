@@ -62,6 +62,9 @@ mod model_activation;
 #[path = "authority_reindex.rs"]
 mod reindex;
 
+#[path = "authority_quality_completion.rs"]
+mod quality_completion;
+
 const PROGRESSIVE_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v3";
 const SELECTION_ONLY_RECEIPT_SCHEMA: &str = "frankensearch.native.authority-selection.v1";
 const DEFAULT_IMAGE_BYTES: usize = 256 * 1024 * 1024;
@@ -74,6 +77,10 @@ const HELP: &str = "Fixed AUTHORITY search (explicit fast, quality, or full topo
       [--input JSONL] [--model-dir DIR] [--batch-size N]\n\
       [--quality-backend onnx|native-int8|native-f32|native-multilingual]\n\
       [--quality-model-dir DIR] [--retrieval exact|hnsw] [--max-image-bytes N]\n\n\
+  authority-complete-quality --from-receipt FAST_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
+      [--model-dir DIR] [--quality-backend BACKEND] [--quality-model-dir DIR]\n\
+      [--retrieval exact|hnsw] [--batch-size N] [--max-source-bytes N]\n\
+      [--max-image-bytes N]\n\n\
   authority-rebuild --from-receipt OLD_JSON --work-dir NEW_DIR --receipt NEW_JSON\n\
       (--source-low N --source-high N [--input JSONL] | --retained-source)\n\
       [--max-source-bytes N] [--batch-size N]\n\
@@ -151,11 +158,11 @@ must be linked by exact retained manifests, with at most 1024 predecessor links.
 The new receipt is outside the root and supports authority-recover after a crash.\n\
 Rollback normally admits the complete current generation. Explicit\n\
 --allow-damaged-current instead authenticates its exact control state and\n\
-activation manifest, then fully admits the immediate predecessor still in its\n\
-physical slot. Damaged-current recovery does not traverse older history. It recovers\n\
-from damaged or missing current component images without serving them. Corrupt\n\
-control anchors, current manifests, unsafe root entries, or pending publication\n\
-still refuse. Its image budget covers both manifests and the target components.\n\
+manifest ancestry, then fully admits the selected healthy ancestor. It recovers\n\
+from damaged or missing current and intermediate component images without serving\n\
+them. Corrupt control anchors, ancestry manifests, unsafe root entries, or pending\n\
+publication still refuse. Its image budget covers every retained manifest and\n\
+the target components; the ancestry walk remains bounded to 1024 links.\n\
 Recovery reports commit knowledge separately from bounded reader admission.\n\
 Rebuild --query requires --migrate-model and --rollback-receipt. This offline\n\
 identity-recovery path binds a typed RecoveryPlan to the exact old/candidate\n\
@@ -238,6 +245,7 @@ Work files remain available after completion or failure. Stdout is JSON.\n";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
     Index,
+    CompleteQuality,
     Rebuild,
     Update,
     Search,
@@ -314,6 +322,7 @@ pub fn is_command(command: &str) -> bool {
     matches!(
         command,
         "authority-index"
+            | "authority-complete-quality"
             | "authority-rebuild"
             | "authority-update"
             | "authority-search"
@@ -329,6 +338,7 @@ impl Options {
         let mut args = args.into_iter();
         let command = match args.next().as_deref() {
             Some("authority-index") => Command::Index,
+            Some("authority-complete-quality") => Command::CompleteQuality,
             Some("authority-rebuild") => Command::Rebuild,
             Some("authority-update") => Command::Update,
             Some("authority-search") => Command::Search,
@@ -394,7 +404,10 @@ impl Options {
                 "--from-receipt"
                     if matches!(
                         command,
-                        Command::Rebuild | Command::Update | Command::Rollback
+                        Command::Rebuild
+                            | Command::CompleteQuality
+                            | Command::Update
+                            | Command::Rollback
                     ) =>
                 {
                     options.from_receipt = Some(PathBuf::from(value(&mut args)?));
@@ -416,6 +429,7 @@ impl Options {
                     if matches!(
                         command,
                         Command::Rebuild
+                            | Command::CompleteQuality
                             | Command::Update
                             | Command::Search
                             | Command::Fetch
@@ -474,7 +488,13 @@ impl Options {
                     options.root = Some(PathBuf::from(value(&mut args)?));
                 }
                 "--work-dir"
-                    if matches!(command, Command::Index | Command::Rebuild | Command::Update) =>
+                    if matches!(
+                        command,
+                        Command::Index
+                            | Command::CompleteQuality
+                            | Command::Rebuild
+                            | Command::Update
+                    ) =>
                 {
                     options.work = Some(PathBuf::from(value(&mut args)?));
                 }
@@ -507,12 +527,21 @@ impl Options {
                 "--batch-size"
                     if matches!(
                         command,
-                        Command::Index | Command::Rebuild | Command::Update | Command::Serve
+                        Command::Index
+                            | Command::CompleteQuality
+                            | Command::Rebuild
+                            | Command::Update
+                            | Command::Serve
                     ) =>
                 {
                     options.batch_size = number(&value(&mut args)?, MAX_DOCUMENTS)?;
                 }
-                "--retrieval" if matches!(command, Command::Index | Command::Rebuild) => {
+                "--retrieval"
+                    if matches!(
+                        command,
+                        Command::Index | Command::CompleteQuality | Command::Rebuild
+                    ) =>
+                {
                     options.retrieval = Some(match value(&mut args)?.as_str() {
                         "exact" => NativeBuildRetrieval::Exact,
                         "hnsw" => NativeBuildRetrieval::Hnsw {
@@ -614,6 +643,14 @@ impl Options {
             )?,
             Command::Fetch => {
                 options.fetch_document()?;
+            }
+            Command::CompleteQuality => {
+                if options.from_receipt.is_none() || options.work.is_none() {
+                    return Err(bad(
+                        "authority-complete-quality requires --from-receipt and --work-dir",
+                    ));
+                }
+                options.quality.validate_usage(true)?;
             }
             Command::Rebuild => {
                 if options.from_receipt.is_none() || options.work.is_none() {
@@ -1326,6 +1363,31 @@ fn prepare_publication(
     predecessor: Option<&NativeGenerationSnapshot>,
     max_image_bytes: usize,
 ) -> Result<PreparedPublication> {
+    prepare_publication_with_intent(
+        built,
+        predecessor,
+        max_image_bytes,
+        PublicationIntent::PreserveTopology,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationIntent {
+    PreserveTopology,
+    CompleteQuality,
+}
+
+fn prepare_publication_with_intent(
+    built: &NativeBuiltExactGeneration,
+    predecessor: Option<&NativeGenerationSnapshot>,
+    max_image_bytes: usize,
+    intent: PublicationIntent,
+) -> Result<PreparedPublication> {
+    if intent == PublicationIntent::CompleteQuality && predecessor.is_none() {
+        return Err(bad(
+            "quality completion requires a selected fast-only predecessor",
+        ));
+    }
     let (root_id, expected, previous) = match predecessor {
         Some(snapshot) => {
             if snapshot.retained_snapshot().selected_history_of().is_some() {
@@ -1335,6 +1397,22 @@ fn prepare_publication(
                 &snapshot.metadata().commit_range,
                 &built.metadata().commit_range,
             )?;
+            let topology_matches = match intent {
+                PublicationIntent::PreserveTopology => {
+                    built.quality_binding().is_some()
+                        == (snapshot.topology() == NativeGenerationTopology::FullProgressive)
+                }
+                PublicationIntent::CompleteQuality => {
+                    snapshot.topology() == NativeGenerationTopology::FastOnly
+                        && built.quality_binding().is_some()
+                        && built.binding().frozen_identity()
+                            == snapshot.metadata().embedders.get("fast").ok_or_else(|| {
+                                bad("quality completion requires the retained fast identity")
+                            })?
+                        && built.metadata().commit_range == snapshot.metadata().commit_range
+                        && built.metadata().total_documents == snapshot.metadata().total_documents
+                }
+            };
             if built.binding().generation().sequence
                 <= snapshot
                     .retained_snapshot()
@@ -1342,8 +1420,7 @@ fn prepare_publication(
                     .generation()
                     .sequence
                 || built.metadata().vector_artifacts[0].embedder_tier != snapshot.tier()
-                || built.quality_binding().is_some()
-                    != (snapshot.topology() == NativeGenerationTopology::FullProgressive)
+                || !topology_matches
             {
                 return Err(bad(
                     "a rebuild must advance the artifact generation and preserve its tier",
@@ -1374,6 +1451,19 @@ fn prepare_publication(
         GenerationAuthorityActionV1::Activate,
         hasher.finalize().into(),
     )?;
+    if intent == PublicationIntent::CompleteQuality {
+        let previous = predecessor
+            .ok_or_else(|| bad("quality completion requires its selected predecessor"))?
+            .retained_snapshot()
+            .manifest();
+        if candidate.manifest().document_set_sha256() != previous.document_set_sha256()
+            || candidate.manifest().components().lexical != previous.components().lexical
+        {
+            return Err(bad(
+                "quality completion must preserve the exact source cohort and lexical image",
+            ));
+        }
+    }
     if candidate.owned_image_bytes() > u64::try_from(max_image_bytes)? {
         return Err(bad("complete generation exceeds the encoded-image budget"));
     }
@@ -2375,20 +2465,16 @@ fn rollback(cx: &Cx, options: &Options, output: &mut impl Write) -> Result<()> {
             history_image_budget(current, options.max_image_bytes)?,
         )?,
         None => {
-            // The recovery opener charges the current control manifest as well
-            // as the target's complete image set. Keep the target receipt's
-            // narrower bound without allowing either sum to exceed the CLI cap.
-            let recovery_budget = u64::try_from(options.max_image_bytes)?.min(
-                target
-                    .image_bytes
-                    .saturating_add(expected_current.manifest_len),
-            );
-            root.open_predecessor_generation_for_recovery_with_budget(
+            // Charge the current and intermediate control manifests plus the
+            // target's complete images against one cap. The target receipt's
+            // narrower image bound is independently enforced during admission.
+            root.open_historical_generation_for_recovery_with_budget(
                 selected.root_id,
                 expected_current,
                 selected.generation,
                 target.authority()?,
-                recovery_budget,
+                MAX_HISTORY_HOPS,
+                u64::try_from(options.max_image_bytes)?,
             )?
         }
     };
@@ -3927,6 +4013,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
         let mut output = io::stdout().lock();
         match options.command {
             Command::Index => Box::pin(index(&cx, &options, &mut output, pool)).await,
+            Command::CompleteQuality => {
+                Box::pin(quality_completion::run(&cx, &options, &mut output, pool)).await
+            }
             Command::Rebuild => Box::pin(rebuild(&cx, &options, &mut output, pool)).await,
             Command::Update => Box::pin(update_generation(&cx, &options, &mut output, pool)).await,
             Command::Search => Box::pin(search(&cx, &options, &mut output, pool)).await,

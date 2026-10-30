@@ -48,6 +48,8 @@ pub mod sharded;
 
 mod update;
 pub use update::NativeIndexUpdate;
+#[cfg(feature = "quill")]
+pub use update::NativeQualityCompletion;
 use update::{ReuseRole, ReuseSource};
 
 #[cfg(feature = "quill")]
@@ -475,10 +477,7 @@ impl NativeIndexBuilder {
                 )
                 .await?;
             if let (Some(tier), Some(writer)) = (&self.quality, &mut quality_writer) {
-                let reuse = self
-                    .reuse
-                    .as_deref()
-                    .map(|source| (source, ReuseRole::Quality));
+                let reuse = self.reuse.as_deref().and_then(ReuseSource::quality_reuse);
                 tier.write_batch_reusing(cx, writer, batch, reuse).await?;
             }
             batch_start = batch_end;
@@ -563,7 +562,7 @@ impl PendingBuild {
                 self.builder
                     .reuse
                     .as_deref()
-                    .map(|source| (source, ReuseRole::Quality)),
+                    .and_then(ReuseSource::quality_reuse),
             )?),
             (None, None) => None,
             _ => {

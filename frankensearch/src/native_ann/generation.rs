@@ -34,7 +34,7 @@ use frankensearch_quill::{
 };
 use sha2::Digest as _;
 
-use super::builder::{NativeBuildRetrieval, NativeIndexUpdate};
+use super::builder::{NativeBuildRetrieval, NativeIndexUpdate, NativeQualityCompletion};
 use super::{
     NativeAnnIndex, NativeBackend, NativeProgressiveSearch, NativeRetrievalMode, checkpoint,
     invalid, lower_hex,
@@ -577,6 +577,44 @@ impl NativeGenerationSnapshot {
         )
     }
 
+    /// Complete the quality tier of this selected fast-only generation.
+    ///
+    /// The fast producer must match its full retained identity, but no fast
+    /// document inference is performed. All quality inputs come from this
+    /// snapshot's authenticated Quill source; original input files are unnecessary.
+    /// The quality provider may have a different model and dimension while
+    /// preserving the stored prepared-input contract and semantic/control kind.
+    ///
+    /// The returned plan cannot edit sources, replace the fast model or change
+    /// its precision. It builds a complete independently bound two-tier successor
+    /// at the same source checkpoint. Publish it with this reader's expected
+    /// authority pair; a competing writer is never adopted as a new update base.
+    ///
+    /// # Errors
+    /// Refuses non-fast-only topology, historical selection, non-newer generation,
+    /// identity/input drift, source-budget exhaustion or cancellation before work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_quality_completion(
+        &self,
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        fast_provider: Arc<dyn Embedder>,
+        quality_provider: Arc<dyn Embedder>,
+        max_source_bytes: usize,
+    ) -> SearchResult<NativeQualityCompletion> {
+        NativeQualityCompletion::from_authority(
+            cx,
+            directory,
+            generation,
+            fast_provider,
+            quality_provider,
+            self,
+            max_source_bytes,
+            Arc::clone(&self.readers.vector),
+        )
+    }
+
     /// Prepare complete two-tier edits with independent retained-vector reuse.
     ///
     /// Both providers are admitted before source export or inference. Each tier
@@ -752,9 +790,9 @@ impl NativeGenerationSnapshot {
         .map_err(|_| refused("rollback", "invalid-candidate"))
     }
 
-    /// Propose a rollback from an explicitly admitted predecessor selection.
+    /// Propose a rollback from an explicitly admitted predecessor or ancestor.
     ///
-    /// The retained snapshot must carry opaque predecessor-selection provenance
+    /// The retained snapshot must carry opaque historical-selection provenance
     /// from the qualified root. That admission authenticates the exact current
     /// authority and activation manifest, plus this target's complete healthy
     /// closure. The current generation's components may be unavailable; they
@@ -762,14 +800,16 @@ impl NativeGenerationSnapshot {
     /// snapshots cannot use this route.
     ///
     /// This method derives the expected current authority from that provenance,
-    /// rechecks its consecutive predecessor link and actual two-slot pair, and
+    /// rechecks the actual two-slot pair and retained ancestry provenance, and
     /// permits only the cooperative local profile without an external floor.
     /// It retains the target's exact images, source checkpoint, producer and
     /// artifact generation while proposing a higher authority sequence. It
     /// performs no inference, file access, repair, or publication.
     ///
     /// Publish using this target's `retained_snapshot().authority_pair()`, which
-    /// captures the newer current head as well as the selected predecessor.
+    /// captures the newer current head and its physical predecessor. An older
+    /// selected target need not occupy either slot; its exact manifest chain
+    /// remains retained by the admitted snapshot.
     /// Persist the prepared attempt before publishing and reconcile unknown
     /// outcomes through the ordinary publisher. A competing publication causes
     /// the existing expected-pair fence to refuse this proposal; it never
@@ -777,8 +817,8 @@ impl NativeGenerationSnapshot {
     ///
     /// # Errors
     ///
-    /// Refuses cancellation, absent predecessor provenance, unsupported security
-    /// posture, inconsistent physical slots or predecessor links, authority
+    /// Refuses cancellation, absent historical provenance, unsupported security
+    /// posture, inconsistent physical slots or ancestry provenance, authority
     /// sequence exhaustion, and invalid candidate identities.
     pub fn rollback_selected_predecessor_candidate(
         &self,
@@ -789,7 +829,7 @@ impl NativeGenerationSnapshot {
         checkpoint(cx, "native_ann.generation.selected_rollback")?;
         let target = self.retained_snapshot();
         let current = target
-            .selected_predecessor_of()
+            .selected_history_of()
             .ok_or_else(|| refused("selected_rollback", "missing-selection-provenance"))?;
         if target.profile() != GenerationRootSecurityProfileV1::CooperativeLocal
             || target.floor().is_some()
@@ -814,17 +854,27 @@ impl NativeGenerationSnapshot {
         let head = resolve_authority_slots_v1(pair.first, pair.second)
             .map_err(|_| refused("selected_rollback", "invalid-authority-pair"))?
             .ok_or_else(|| refused("selected_rollback", "incomplete-authority-pair"))?;
-        let target_slot = target
-            .head()
-            .slot
-            .ok_or_else(|| refused("selected_rollback", "predecessor-slot-missing"))?;
-        if head.authority != current
-            || head.slot_index == target_slot.slot_index
-            || ![first, second].contains(&target_slot)
-            || self.authority().sequence.checked_add(1) != Some(current.sequence)
-            || current.predecessor != Some(self.authority().fingerprint())
-        {
+        if head.authority != current || self.authority().sequence >= current.sequence {
             return Err(refused("selected_rollback", "selection-pair-mismatch"));
+        }
+        if target.selected_predecessor_of().is_some() {
+            let target_slot = target
+                .head()
+                .slot
+                .ok_or_else(|| refused("selected_rollback", "predecessor-slot-missing"))?;
+            if head.slot_index == target_slot.slot_index
+                || ![first, second].contains(&target_slot)
+                || self.authority().sequence.checked_add(1) != Some(current.sequence)
+                || current.predecessor != Some(self.authority().fingerprint())
+            {
+                return Err(refused("selected_rollback", "selection-pair-mismatch"));
+            }
+        } else if target.head().slot.is_some()
+            || (target.history_current().is_none() && target.recovery_current_manifest().is_none())
+            || u64::try_from(target.history_manifests().len()).ok()
+                != current.sequence.checked_sub(self.authority().sequence + 1)
+        {
+            return Err(refused("selected_rollback", "missing-ancestry-provenance"));
         }
         current
             .next_sequence()

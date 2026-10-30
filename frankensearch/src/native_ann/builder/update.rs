@@ -66,6 +66,169 @@ pub struct NativeIndexUpdate {
     edits: BTreeMap<String, Option<IndexableDocument>>,
 }
 
+/// Complete a fast-only authority generation's missing quality tier.
+///
+/// This owns the selected source and fast-vector pins. It cannot edit documents,
+/// change fast precision or replace the fast producer. Only the new quality tier
+/// performs document inference; the successor preserves the source checkpoint
+/// and reuses the exact Quill image. No authority changes until the caller
+/// publishes the fully admitted result with the predecessor's expected pair.
+#[cfg(feature = "quill")]
+pub struct NativeQualityCompletion {
+    update: NativeIndexUpdate,
+    source: CommitRange,
+}
+
+#[cfg(feature = "quill")]
+impl NativeQualityCompletion {
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::native_ann) fn from_authority(
+        cx: &Cx,
+        directory: impl AsRef<Path>,
+        generation: ArtifactGenerationIdentityV1,
+        fast_provider: Arc<dyn crate::Embedder>,
+        quality_provider: Arc<dyn crate::Embedder>,
+        snapshot: &NativeGenerationSnapshot,
+        max_source_bytes: usize,
+        index: Arc<NativeAnnIndex>,
+    ) -> SearchResult<Self> {
+        checkpoint(cx, "native_ann.quality_completion.prepare")?;
+        if snapshot.topology() != crate::native_ann::NativeGenerationTopology::FastOnly {
+            return Err(invalid(
+                "quality_completion.topology",
+                "fast-only-required",
+                "quality completion requires one complete retained fast tier",
+            ));
+        }
+        // Retained source is already prepared input. A newly selected model
+        // cannot reinterpret its content selection or canonicalization contract.
+        let quality = TierPlan::new(quality_provider)?;
+        let fast_identity = snapshot.metadata().embedders.get("fast").ok_or_else(|| {
+            invalid(
+                "quality_completion.identity",
+                "missing",
+                "the selected fast tier must retain its authenticated identity",
+            )
+        })?;
+        if quality.identity.input != fast_identity.identity.input
+            || quality.identity.space.kind != fast_identity.identity.space.kind
+        {
+            return Err(invalid(
+                "quality_completion.input",
+                "changed",
+                "quality completion must preserve the retained prepared-input contract",
+            ));
+        }
+        let mut update = NativeIndexUpdate::from_authority(
+            cx,
+            directory,
+            generation,
+            fast_provider,
+            snapshot,
+            max_source_bytes,
+            index,
+            None,
+        )?;
+        quality.binding(&generation)?;
+        update.builder.quality = Some(quality);
+        let authority = update
+            .builder
+            .reuse
+            .as_mut()
+            .and_then(Arc::get_mut)
+            .and_then(|source| source.authority.as_mut())
+            .ok_or_else(|| {
+                invalid(
+                    "quality_completion.source",
+                    "unavailable",
+                    "quality completion requires its newly retained authority source",
+                )
+            })?;
+        // Missing quality is an explicit build intent, never a failed lookup
+        // silently converted into re-embedding during an ordinary update.
+        authority.completing_quality = true;
+        checkpoint(cx, "native_ann.quality_completion.prepared")?;
+        Ok(Self {
+            update,
+            source: snapshot.metadata().commit_range.clone(),
+        })
+    }
+
+    /// Bound the new quality model's inference batch size.
+    ///
+    /// # Errors
+    /// Refuses a zero batch size.
+    pub fn with_batch_size(mut self, batch_size: usize) -> SearchResult<Self> {
+        self.update = self.update.with_batch_size(batch_size)?;
+        Ok(self)
+    }
+
+    /// Bound prepared content bytes submitted in each quality inference batch.
+    ///
+    /// # Errors
+    /// Refuses a zero byte limit.
+    pub fn with_max_batch_input_bytes(mut self, max_bytes: usize) -> SearchResult<Self> {
+        self.update = self.update.with_max_batch_input_bytes(max_bytes)?;
+        Ok(self)
+    }
+
+    /// Select the new quality tier's precision and exact/native ANN retrieval.
+    /// The inherited fast encoding and graph policy cannot be changed here.
+    ///
+    /// # Errors
+    /// Propagates invalid quality storage configuration.
+    pub fn with_quality_storage(
+        mut self,
+        precision: NativeBuildPrecision,
+        retrieval: NativeBuildRetrieval,
+    ) -> SearchResult<Self> {
+        self.update = self.update.with_quality_storage(precision, retrieval)?;
+        Ok(self)
+    }
+
+    /// Finalize new vectors and graphs on the caller's existing blocking pool.
+    #[must_use]
+    pub fn with_blocking_pool(
+        mut self,
+        pool: asupersync::runtime::blocking_pool::BlockingPoolHandle,
+    ) -> Self {
+        self.update = self.update.with_blocking_pool(pool);
+        self
+    }
+
+    /// Build a full fast/quality successor at the unchanged retained source cut.
+    ///
+    /// The fast provider is admitted but receives no document inference request.
+    /// Every quality row must succeed before a publishable candidate exists.
+    /// Failure, cancellation, or dropping this future leaves the incumbent usable.
+    ///
+    /// # Errors
+    /// Refuses producer drift, invalid bound quality output, image/source budget
+    /// exhaustion, filesystem failures and cancellation. Never publishes a prefix.
+    pub async fn build(
+        self,
+        cx: &Cx,
+        max_image_bytes: usize,
+    ) -> SearchResult<NativeBuiltExactGeneration> {
+        checkpoint(cx, "native_ann.quality_completion.build")?;
+        let authority_pin = self
+            .update
+            .builder
+            .reuse
+            .as_ref()
+            .and_then(|reuse| reuse.authority.as_ref())
+            .map(|authority| Arc::clone(&authority.snapshot));
+        let result = Box::pin(self.update.prepare(cx)?.build_progressive_generation(
+            cx,
+            self.source,
+            max_image_bytes,
+        ))
+        .await;
+        drop(authority_pin);
+        result
+    }
+}
+
 #[cfg(feature = "quill")]
 #[derive(Clone, Copy)]
 enum AuthorityUpdateIntent {
@@ -389,6 +552,7 @@ impl NativeIndexUpdate {
                 snapshot: Arc::clone(snapshot.retained_snapshot()),
                 tier,
                 progressive,
+                completing_quality: false,
                 source: snapshot.metadata().commit_range.clone(),
             }),
         }));
@@ -757,6 +921,7 @@ struct AuthorityReuse {
     snapshot: Arc<OpenedGenerationSnapshotV1>,
     tier: EmbedderTierTag,
     progressive: bool,
+    completing_quality: bool,
     source: CommitRange,
 }
 
@@ -773,6 +938,19 @@ pub(super) enum ReuseRole {
 }
 
 impl ReuseSource {
+    #[cfg_attr(not(feature = "quill"), allow(clippy::unnecessary_wraps))]
+    pub(super) fn quality_reuse(&self) -> Option<(&Self, ReuseRole)> {
+        #[cfg(feature = "quill")]
+        if self
+            .authority
+            .as_ref()
+            .is_some_and(|authority| authority.completing_quality)
+        {
+            return None;
+        }
+        Some((self, ReuseRole::Quality))
+    }
+
     /// Retain exact lexical bytes only for an identical complete source and cut.
     /// Provider migration may change vectors while these lexical inputs stay fixed.
     #[cfg(feature = "quill")]

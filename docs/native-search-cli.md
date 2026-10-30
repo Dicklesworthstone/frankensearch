@@ -183,6 +183,37 @@ The optional full ANN image similarly retains each tier's original native graph
 with an independent metadata receipt. A graph for one tier cannot be reinterpreted
 as the other tier's graph, even when the dimensions agree.
 
+### Complete quality for an existing fast-only generation
+
+`authority-complete-quality` adds a complete, independently bound quality tier
+to the selected fast-only generation. It reads the authenticated retained source,
+reuses the fast vectors and exact lexical image, and publishes a full successor
+at the same source checkpoint. Original JSONL files are unnecessary, and the
+fast model performs no document inference.
+
+```sh
+./target/release/frankensearch-native authority-complete-quality \
+  --from-receipt "$HOME/frankensearch-authority/fast.json" \
+  --work-dir "$HOME/frankensearch-authority/full-work" \
+  --receipt "$HOME/frankensearch-authority/full.json" \
+  --quality-backend native-int8 \
+  --retrieval hnsw
+```
+
+The configured fast provider must still match its retained identity. Choose the
+quality provider with the usual local model-directory and quality-backend flags.
+`--retrieval` applies to the new quality tier; the existing fast precision and
+retrieval configuration stay bound to their retained artifacts. The command
+accepts the ordinary batch, source-byte and image-byte limits, but refuses
+replacement source input, source-cut overrides and model-migration flags.
+
+Publication requires the entire quality tier to be built and admitted, with the
+same document set, source checkpoint, fast identity and lexical receipt. A
+cancelled or failed build leaves the incumbent selected. A competing publication
+refuses the original expected-authority pair instead of rebasing. Work files
+remain available after failure. This route produces a complete two-tier
+generation; partial quality coverage is not exposed as complete.
+
 ### Rebuild an existing authority generation
 
 `authority-rebuild` replaces the complete source cohort in the existing root.
@@ -542,7 +573,7 @@ requires restarting that server with the restored model.
 
 If the current vector, lexical, metadata, or ANN image is missing or corrupt,
 normal search and ordinary rollback refuse it. Explicit
-`--allow-damaged-current` restores the healthy immediate predecessor without
+`--allow-damaged-current` restores a healthy authenticated ancestor without
 opening or serving the current component images:
 
 ```sh
@@ -554,12 +585,16 @@ opening or serving the current component images:
 ```
 
 This mode still authenticates the exact current `LOCK`/`AUTHORITY` state and
-activation manifest. It checks both predecessor links, requires the target's
-actual other slot, and fully admits the target's vector, lexical, metadata, and
-optional ANN images. Two shared-lock resolutions must agree on the captured
-current pair. It never follows a new winner or creates a searchable handle for
-the damaged current generation. This explicit damaged-current mode remains
-limited to the immediate physical predecessor; it does not traverse older history.
+activation manifest. It follows only the exact predecessor references sealed
+into successive manifests, checking each manifest's length, digest and consecutive
+authority sequence. This can restore an older target after both physical slots
+have been reused. It retains the authenticated manifest chain and fully admits
+the target's vector, lexical, metadata, and optional ANN images. Intermediate
+component images may also be missing or corrupt; they are never opened. Two
+shared-lock resolutions must agree on the captured current pair. The command
+never follows a new winner or creates a searchable handle for the damaged
+current generation. An old receipt alone does not authorize recovery: every
+manifest link from the current head to that target must survive and verify.
 
 The mode does not bypass corrupt control anchors or a corrupt current activation
 manifest. Pending publication still requires reconciliation; a corrupt target,
@@ -568,9 +603,11 @@ recovery. If a damaged object is also used by the target, that target cannot pas
 complete admission. The command remains limited to the cooperative-local
 profile recorded in both receipts.
 
-The configured `--max-image-bytes` budget covers the current activation manifest
-plus the predecessor's manifest and component images. The target receipt's own
-image limit also remains enforced. No model loads, source scans, or document
+The ancestry walk is bounded to 1,024 hops. The configured `--max-image-bytes`
+budget covers the current activation manifest, every intermediate manifest,
+and the target's manifest and component images; each object is charged before
+its bytes are read. The target receipt's own image limit also remains enforced.
+No model loads, source scans, or document
 inference run. Only the new rollback activation manifest and external receipt are
 created; damaged objects remain untouched. Publication uses the captured pair
 and the existing durable attempt and `authority-recover` reconciliation path.

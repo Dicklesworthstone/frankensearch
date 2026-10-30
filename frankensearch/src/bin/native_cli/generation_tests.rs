@@ -4896,7 +4896,7 @@ mod warm_authority {
                 );
             };
             for label in [
-                "not-immediate",
+                "unauthenticated-ancestor",
                 "same-head",
                 "stale-current",
                 "current-generation",
@@ -4908,8 +4908,14 @@ mod warm_authority {
                 options.max_image_bytes = DEFAULT_IMAGE_BYTES;
                 options.receipt = parent.join(format!("refused-{label}.json"));
                 match label {
-                    "not-immediate" => {
-                        options.target_receipt = Some(parent.join("ancient.json"));
+                    "unauthenticated-ancestor" => {
+                        let mut wrong = ancient.clone();
+                        let mut authority = wrong.authority().unwrap();
+                        authority.object_id[0] ^= 0xff;
+                        wrong.authority = authority.canonical_bytes().to_vec();
+                        let path = parent.join("wrong-ancestor.json");
+                        fs::write(&path, serde_json::to_vec(&wrong).unwrap()).unwrap();
+                        options.target_receipt = Some(path);
                     }
                     "same-head" => options.target_receipt = Some(parent.join("current.json")),
                     "stale-current" => {
@@ -8273,6 +8279,162 @@ mod progressive_authority {
                             .iter()
                             .all(|hit| hit.doc_id == "zeta" || hit.doc_id == "alpha")
                     );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn damaged_current_historical_rollback_restores_exact_and_progressive_ancestors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (mode, ann) in [
+                (QueryMode::Fast, false),
+                (QueryMode::Quality, true),
+                (QueryMode::Full, true),
+            ] {
+                let parent = private_parent();
+                let fast = provider(false);
+                let quality = provider(true);
+                let input = parent.join("original.jsonl");
+                fs::write(
+                    &input,
+                    concat!(
+                        "{\"id\":\"retry-original\",\"content\":\"retry archived requests\"}\n",
+                        "{\"id\":\"garden-original\",\"content\":\"garden flowers\"}\n",
+                    ),
+                )
+                .unwrap();
+                let initial_options = empty_lifecycle_index_options(&parent, mode, ann, &input);
+                index_with_loader(&cx, &initial_options, &mut Vec::new(), |requested| {
+                    Ok(topology_models(requested, &fast, &quality))
+                })
+                .await
+                .unwrap();
+                let target = Receipt::read(&initial_options.receipt).unwrap();
+                let target_reader = target.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                let target_vector = target_reader
+                    .retained_snapshot()
+                    .manifest()
+                    .components()
+                    .vector
+                    .sha256;
+                drop(target_reader);
+                let mut previous_path = initial_options.receipt.clone();
+                let mut newer = Vec::new();
+                let mut total_images = target.image_bytes;
+                for (label, high) in [("middle", 8), ("current", 9)] {
+                    let input = parent.join(format!("{label}.jsonl"));
+                    fs::write(&input, format!(
+                        "{{\"id\":\"retry-{label}\",\"content\":\"retry newer {label} requests\"}}\n"
+                    )).unwrap();
+                    let mut options = parse(&rebuild_arguments()).unwrap().unwrap();
+                    options.from_receipt = Some(previous_path);
+                    options.input = Some(input);
+                    options.work = Some(parent.join(format!("{label}-work")));
+                    options.receipt = parent.join(format!("{label}.json"));
+                    options.source_low = Some(2);
+                    options.source_high = Some(high);
+                    rebuild_with_loader(&cx, &options, &mut Vec::new(), |requested| {
+                        assert_eq!(requested, mode);
+                        Ok(topology_models(requested, &fast, &quality))
+                    })
+                    .await
+                    .unwrap();
+                    let receipt = Receipt::read(&options.receipt).unwrap();
+                    let reader = receipt.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                    let vector = reader.retained_snapshot().manifest().components().vector;
+                    assert_ne!(vector.sha256, target_vector);
+                    let path = receipt.root.join(component_object_name_v1(
+                        GenerationComponentRole::Vector,
+                        vector.sha256,
+                    ));
+                    total_images += receipt.authority().unwrap().manifest_len;
+                    newer.push((receipt, path, reader.retained_snapshot().authority_pair()));
+                    previous_path = options.receipt;
+                }
+                let (current, _, expected_pair) = newer.last().unwrap();
+                let current = current.clone();
+                let expected_pair = *expected_pair;
+                for (index, (_, path, _)) in newer.iter().enumerate() {
+                    fs::rename(path, parent.join(format!("retained-newer-vector-{index}")))
+                        .unwrap();
+                    write_immutable(&cx, path, b"damaged-newer-vector-evidence").unwrap();
+                }
+                assert!(current.open(&cx, DEFAULT_IMAGE_BYTES).is_err());
+                let before = root_file_bytes(&target.root);
+                let inference_before = calls(&fast, &quality);
+                let mut options = parse(&rollback_arguments()).unwrap().unwrap();
+                options.from_receipt = Some(previous_path);
+                options.target_receipt = Some(initial_options.receipt.clone());
+                options.receipt = parent.join("restored-ancestor.json");
+                let mut output = Vec::new();
+                assert!(rollback(&cx, &options, &mut output).is_err());
+                assert!(output.is_empty());
+                assert!(!options.receipt.exists());
+                assert_eq!(root_file_bytes(&target.root), before);
+                options.allow_damaged_current = true;
+                options.max_image_bytes = usize::try_from(total_images - 1).unwrap();
+                assert!(rollback(&cx, &options, &mut output).is_err());
+                assert!(output.is_empty());
+                assert!(!options.receipt.exists());
+                assert_eq!(root_file_bytes(&target.root), before);
+                options.max_image_bytes = usize::try_from(total_images).unwrap();
+                rollback(&cx, &options, &mut output).unwrap();
+                let report = &frames(&output)[0];
+                assert_eq!(report["event"], "rolled_back");
+                assert_eq!(report["publication"], "committed");
+                assert_eq!(report["serving"], "activated");
+                assert_eq!(report["current_admission"], "control_manifest_only");
+                assert_eq!(report["replaces"], serde_json::json!(current.authority));
+                assert_eq!(report["restores"], serde_json::json!(target.authority));
+                assert_eq!(calls(&fast, &quality), inference_before);
+                for (_, path, _) in &newer {
+                    assert_eq!(fs::read(path).unwrap(), b"damaged-newer-vector-evidence");
+                }
+                let restored = Receipt::read(&options.receipt).unwrap();
+                assert_eq!(restored.authority().unwrap().sequence, 4);
+                assert_eq!(restored.generation, target.generation);
+                assert_eq!(restored.identity, target.identity);
+                assert_eq!(restored.quality_identity, target.quality_identity);
+                assert_eq!(restored.documents, target.documents);
+                assert_eq!(restored.recovery_attempt().unwrap().expected, expected_pair);
+                let reopened = restored.open(&cx, DEFAULT_IMAGE_BYTES).unwrap();
+                assert_eq!(
+                    reopened.retained_snapshot().manifest().predecessor(),
+                    Some(current.authority().unwrap())
+                );
+                assert!(reopened.retained_snapshot().selected_history_of().is_none());
+                drop(reopened);
+                let mut search = parse(&[
+                    "authority-search",
+                    "--receipt",
+                    "unused",
+                    "--query",
+                    "retry",
+                ])
+                .unwrap()
+                .unwrap();
+                search.receipt = options.receipt;
+                search.mode = Some(mode);
+                search.stream = true;
+                output.clear();
+                search_with_loader(&cx, &search, &mut output, |tier| {
+                    Ok(match tier {
+                        EmbedderTierTag::Fast => fast.clone(),
+                        EmbedderTierTag::Quality => quality.clone(),
+                    })
+                })
+                .await
+                .unwrap();
+                let responses = frames(&output);
+                assert_eq!(responses.len(), if mode == QueryMode::Full { 2 } else { 1 });
+                for response in responses {
+                    assert_eq!(response["event"], "results");
+                    assert_eq!(response["authority"], serde_json::json!(restored.authority));
+                    assert!(!response["results"].as_array().unwrap().is_empty());
+                    assert!(response["results"].as_array().unwrap().iter().all(|hit| {
+                        hit["doc_id"] == "retry-original" || hit["doc_id"] == "garden-original"
+                    }));
                 }
             }
         });
