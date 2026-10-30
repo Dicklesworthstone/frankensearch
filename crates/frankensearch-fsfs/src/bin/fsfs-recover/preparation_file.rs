@@ -1,7 +1,8 @@
 //! Persistent preparation handoff for the recovery executable.
 //!
-//! Files contain only a target, its original selection guard and optional repair
-//! origin, never query text, previews, model credentials or a final outcome.
+//! Files contain a target, its original selection guard, exact preview-policy
+//! digest and optional repair origin, never query text, filters, previews,
+//! model credentials or a final outcome.
 //! They are trusted operator records, not signatures or persistent reader pins.
 //! A later process must re-admit the target and producers through the runtime.
 
@@ -13,7 +14,9 @@ use frankensearch_storage::ContentHasher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Cx, RecoveryState, RepairSource, Report, SearchError, SearchResult, invalid};
+use super::{
+    Cx, PreviewRequirement, RecoveryState, RepairSource, Report, SearchError, SearchResult, invalid,
+};
 
 const FORMAT: &str = "fsfs.recovery.preparation";
 const MAX_BYTES: u64 = 8192;
@@ -29,6 +32,9 @@ pub struct SavedPreparation {
     pub generation_id: String,
     pub manifest_sha256: String,
     pub expected_selection_sha256: String,
+    // Required even for no-preview preparations. Version 1 has no binding and
+    // must not silently acquire permission to resume under a different query.
+    pub preview_requirement: PreviewRequirement,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repaired_from: Option<RepairSource>,
 }
@@ -69,15 +75,27 @@ impl SavedPreparation {
                 "only an admitted preparation can be saved; a publication outcome is not a resume receipt",
             ));
         }
+        if report.source_rebuild_performed
+            && !matches!(
+                report.preview_requirement,
+                PreviewRequirement::Query {
+                    searchable: true,
+                    ..
+                }
+            )
+        {
+            return Err(invalid("a source rebuild requires a bound useful preview"));
+        }
         let receipt = Self {
             format: FORMAT.to_owned(),
-            schema_version: 1,
+            schema_version: 2,
             store_path_sha256: store_path_sha256(root),
             generation_id: report.generation_id.clone(),
             manifest_sha256: report.manifest_sha256.clone(),
             expected_selection_sha256: report.expected_selection_sha256.clone().ok_or_else(
                 || invalid("a saved preparation requires its original selection guard"),
             )?,
+            preview_requirement: report.preview_requirement.clone(),
             repaired_from: report.repaired_from.clone(),
         };
         receipt.validate()?;
@@ -85,7 +103,7 @@ impl SavedPreparation {
     }
 
     fn validate(&self) -> SearchResult<()> {
-        if self.format != FORMAT || self.schema_version != 1 {
+        if self.format != FORMAT || self.schema_version != 2 {
             return Err(invalid("unsupported preparation receipt format or version"));
         }
         if !is_generation(&self.generation_id)
@@ -101,6 +119,11 @@ impl SavedPreparation {
             && (!is_generation(&origin.generation_id) || !is_hex(&origin.manifest_sha256, 64))
         {
             return Err(invalid("invalid preparation repair origin"));
+        }
+        if let PreviewRequirement::Query { policy_sha256, .. } = &self.preview_requirement
+            && !is_hex(policy_sha256, 64)
+        {
+            return Err(invalid("invalid preparation preview-policy digest"));
         }
         Ok(())
     }
@@ -222,7 +245,7 @@ mod tests {
 
     fn report() -> Report {
         Report {
-            schema_version: 1,
+            schema_version: 2,
             state: RecoveryState::Prepared,
             generation_id: format!("g-{}-{}-{}", "a".repeat(32), "b".repeat(8), "c".repeat(16)),
             manifest_sha256: "d".repeat(64),
@@ -236,6 +259,7 @@ mod tests {
             }),
             expected_selection_sha256: Some("f".repeat(64)),
             sync_error_kind: None,
+            preview_requirement: PreviewRequirement::None {},
             preview: Vec::new(),
         }
     }
@@ -309,7 +333,7 @@ mod tests {
         assert!(decode(valid.as_slice()).is_ok());
         for (field, value) in [
             ("format", serde_json::json!("other")),
-            ("schema_version", serde_json::json!(2)),
+            ("schema_version", serde_json::json!(1)),
             ("generation_id", serde_json::json!("../outside")),
             ("manifest_sha256", serde_json::json!("A".repeat(64))),
             (
@@ -331,7 +355,7 @@ mod tests {
         }
         let mut duplicate = valid.clone();
         duplicate.pop();
-        duplicate.extend_from_slice(b",\"schema_version\":1}");
+        duplicate.extend_from_slice(b",\"schema_version\":2}");
         assert!(decode(duplicate.as_slice()).is_err());
         let mut trailing = valid.clone();
         trailing.extend_from_slice(b" {}");
@@ -348,6 +372,65 @@ mod tests {
             decode(io::repeat(b' ')).is_err(),
             "an unbounded reader must stop at the byte ceiling"
         );
+    }
+
+    #[test]
+    fn version_two_requires_explicit_preview_policy_and_preserves_source_obligation() {
+        let mut facts = report();
+        facts.source_rebuild_performed = true;
+        assert!(SavedPreparation::from_report(Path::new("/fixture"), &facts).is_err());
+        facts.preview_requirement = PreviewRequirement::Query {
+            policy_sha256: "9".repeat(64),
+            searchable: true,
+        };
+        let receipt = SavedPreparation::from_report(Path::new("/fixture"), &facts).unwrap();
+        let value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(value["schema_version"], 2);
+        let decoded = decode(serde_json::to_vec(&value).unwrap().as_slice()).unwrap();
+        assert_eq!(decoded.preview_requirement, facts.preview_requirement);
+        for preview in [
+            serde_json::Value::Null,
+            serde_json::json!({"kind": "query", "policy_sha256": "9".repeat(64)}),
+            serde_json::json!({"kind": "query", "policy_sha256": "bad", "searchable": true}),
+            serde_json::json!({"kind": "none", "searchable": false}),
+        ] {
+            let mut invalid = value.clone();
+            invalid["preview_requirement"] = preview;
+            assert!(decode(serde_json::to_vec(&invalid).unwrap().as_slice()).is_err());
+        }
+        let mut missing = value.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("preview_requirement");
+        assert!(decode(serde_json::to_vec(&missing).unwrap().as_slice()).is_err());
+        missing["schema_version"] = serde_json::json!(1);
+        assert!(decode(serde_json::to_vec(&missing).unwrap().as_slice()).is_err());
+    }
+
+    #[test]
+    fn resumed_bound_preview_requires_query_but_confirmation_only_uses_target() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join("store");
+            fs::create_dir(&root).unwrap();
+            let path = directory.path().join("prepared.json");
+            let mut facts = report();
+            facts.preview_requirement = PreviewRequirement::Query {
+                policy_sha256: "9".repeat(64),
+                searchable: true,
+            };
+            write(&cx, &path, &root, &facts).unwrap();
+            assert!(Options::parse(arguments(&root, &path, "--apply")).is_err());
+            let mut args = arguments(&root, &path, "--apply");
+            args.extend(["--query", "exact original query"].map(OsString::from));
+            let resumed = Options::parse(args).unwrap();
+            assert_eq!(resumed.resume_preview, Some(facts.preview_requirement));
+            let confirmation =
+                Options::parse(arguments(&root, &path, "--confirm-durability")).unwrap();
+            assert_eq!(confirmation.action, RecoveryAction::ConfirmDurability);
+            assert!(confirmation.resume_preview.is_none());
+        });
     }
 
     #[test]

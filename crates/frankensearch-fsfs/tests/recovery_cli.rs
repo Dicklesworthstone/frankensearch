@@ -143,6 +143,11 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
         "recoverystagingsentinel initial document",
     )
     .unwrap();
+    fs::write(
+        source.join("beta.md"),
+        "recoverystagingsentinel excluded document",
+    )
+    .unwrap();
     let mut config = FsfsConfig::default();
     config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
     config.indexing.offline = true;
@@ -169,7 +174,17 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
     prepare
         .arg("--rebuild-source")
         .arg(&source)
-        .args(["--prepare", "--query", "recoverystagingsentinel"])
+        .args([
+            "--prepare",
+            "--query",
+            "recoverystagingsentinel",
+            "--search-mode",
+            "lexical",
+            "--filter",
+            "path:alpha.md",
+            "--ranking-priors",
+            "--no-rerank",
+        ])
         .arg("--save-preparation")
         .arg(&receipt);
     let output = run(&mut prepare, directory.path(), Duration::from_secs(120));
@@ -183,6 +198,17 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
     assert_eq!(prepared["source_rebuild_performed"], true);
     assert_eq!(prepared["selection_write_performed"], false);
     assert_eq!(prepared["preview"][0]["hits"][0]["path"], "alpha.md");
+    assert_eq!(prepared["preview"][0]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(prepared["preview_requirement"]["searchable"], true);
+    let saved = fs::read_to_string(&receipt).unwrap();
+    assert!(!saved.contains("recoverystagingsentinel"));
+    assert!(!saved.contains("path:alpha.md"));
+    let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["schema_version"], 2);
+    assert_eq!(
+        saved["preview_requirement"],
+        prepared["preview_requirement"]
+    );
     assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
     let target = root
         .join("generations")
@@ -190,13 +216,103 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
     let sealed = files(&target);
     fs::rename(&source, directory.path().join("source-unavailable")).unwrap();
 
-    let mut apply = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
-    configure(&mut apply);
-    apply.arg("--resume-file").arg(&receipt).args([
-        "--apply",
+    let store_before = files(&root);
+    let original_policy = [
         "--query",
         "recoverystagingsentinel",
-    ]);
+        "--search-mode",
+        "lexical",
+        "--filter",
+        "path:alpha.md",
+        "--ranking-priors",
+        "--no-rerank",
+    ];
+    // Each new process independently reloads its config and the saved binding.
+    // No changed request may create files, select the candidate, or rescan the
+    // now-unavailable source merely because its target/selection guard matches.
+    for (index, replacement) in [
+        (1, "different query"),
+        (3, "full"),
+        (3, "fast"),
+        (3, "quality"),
+        (5, "path:beta.md"),
+        (6, "--no-ranking-priors"),
+        (7, "--rerank"),
+    ] {
+        let mut policy = original_policy;
+        policy[index] = replacement;
+        let mut changed = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+        configure(&mut changed);
+        changed
+            .arg("--resume-file")
+            .arg(&receipt)
+            .arg("--apply")
+            .args(policy);
+        let output = run(&mut changed, directory.path(), Duration::from_secs(30));
+        assert!(
+            !output.status.success(),
+            "changed preview policy was accepted"
+        );
+        assert_eq!(body(&output)["ok"], false);
+        assert_eq!(files(&root), store_before);
+    }
+    for extra in [vec!["--limit", "9"], vec!["--format", "jsonl"]] {
+        let mut changed = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+        configure(&mut changed);
+        changed
+            .arg("--resume-file")
+            .arg(&receipt)
+            .arg("--apply")
+            .args(original_policy)
+            .args(extra);
+        let output = run(&mut changed, directory.path(), Duration::from_secs(30));
+        assert!(!output.status.success());
+        assert_eq!(files(&root), store_before);
+    }
+    for policy in [
+        Vec::new(),
+        vec![
+            "--query",
+            "recoverystagingsentinel",
+            "--search-mode",
+            "lexical",
+            "--ranking-priors",
+            "--no-rerank",
+        ],
+    ] {
+        let mut changed = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+        configure(&mut changed);
+        changed
+            .arg("--resume-file")
+            .arg(&receipt)
+            .arg("--apply")
+            .args(policy);
+        let output = run(&mut changed, directory.path(), Duration::from_secs(30));
+        assert!(!output.status.success());
+        assert_eq!(files(&root), store_before);
+    }
+    config.search.quality_timeout_ms += 1;
+    fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+    let mut changed = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    configure(&mut changed);
+    changed
+        .arg("--resume-file")
+        .arg(&receipt)
+        .arg("--apply")
+        .args(original_policy);
+    let output = run(&mut changed, directory.path(), Duration::from_secs(30));
+    assert!(!output.status.success());
+    assert_eq!(files(&root), store_before);
+    config.search.quality_timeout_ms -= 1;
+    fs::write(&config_path, config.to_toml().unwrap()).unwrap();
+
+    let mut apply = Command::new(env!("CARGO_BIN_EXE_fsfs-recover"));
+    configure(&mut apply);
+    apply
+        .arg("--resume-file")
+        .arg(&receipt)
+        .arg("--apply")
+        .args(original_policy);
     let output = run(&mut apply, directory.path(), Duration::from_secs(120));
     assert!(
         output.status.success(),
@@ -208,12 +324,24 @@ fn source_rebuild_prepares_then_resumes_in_a_fresh_process_without_rescanning() 
     assert_eq!(restored["generation_id"], prepared["generation_id"]);
     assert_eq!(restored["source_rebuild_performed"], false);
     assert_eq!(restored["preview"][0]["hits"][0]["path"], "alpha.md");
+    assert_eq!(restored["preview"][0]["hits"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        restored["preview_requirement"],
+        prepared["preview_requirement"]
+    );
     assert_eq!(files(&target), sealed);
 
     let mut search = Command::new(env!("CARGO_BIN_EXE_fsfs"));
     search.args(["search", "recoverystagingsentinel"]);
     configure(&mut search);
-    search.args(["--no-daemon", "--format", "json", "--quiet"]);
+    search.args([
+        "--no-daemon",
+        "--format",
+        "json",
+        "--quiet",
+        "--filter",
+        "path:alpha.md",
+    ]);
     let output = run(&mut search, directory.path(), Duration::from_secs(120));
     assert!(
         output.status.success(),

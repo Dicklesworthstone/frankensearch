@@ -54,6 +54,20 @@ impl std::fmt::Debug for PreparedRetainedRecovery {
 }
 
 impl PreparedRetainedRecovery {
+    /// Require a fresh, useful preview before this preparation can be exported
+    /// or selected, including after resuming a source-rebuild receipt.
+    ///
+    /// A persisted caller workflow must carry this requirement separately from
+    /// the selection guard: that guard authenticates neither query policy nor
+    /// a previous process's preview. This only strengthens admission and never
+    /// changes the original selection expectation or the admitted target.
+    #[must_use]
+    pub const fn with_required_searchable_preview(mut self) -> Self {
+        self.require_searchable_preview = true;
+        self.preview_ready = false;
+        self
+    }
+
     /// The exact admitted target, not a newly discovered predecessor.
     #[must_use]
     pub const fn generation(&self) -> &crate::generation_store::PublishedGeneration {
@@ -236,6 +250,63 @@ impl PreparedRetainedRecovery {
 }
 
 impl FsfsRuntime {
+    /// Fingerprint the exact request and resolved policy used by recovery preview.
+    ///
+    /// The digest binds query bytes, filters, limit, output format, requested and
+    /// effective modes, model selections, ranking, deadlines, degradation and
+    /// privacy policy. It performs no model loading or filesystem writes. Model
+    /// identities remain independently checked against the receipted generation;
+    /// this digest is a workflow guard, not a signature or a model attestation.
+    /// Keep the digest in trusted preparation storage and compare it before
+    /// resuming a target. Query text and filters need not be persisted.
+    ///
+    /// # Errors
+    /// Returns invalid query, filter, limit, model selection or search policy.
+    pub fn recovery_query_policy_sha256(&self, query: &str, limit: usize) -> SearchResult<String> {
+        if query.trim().is_empty() || limit == 0 {
+            return Err(retained_recovery_error(
+                "recovery preview requires a nonblank query and a positive limit",
+            ));
+        }
+        SearchFilterExpr::parse(self.cli_input.filter.as_deref().unwrap_or(""))?;
+        let mode = degraded_search_mode(
+            self.config.pressure.degradation_override,
+            self.requested_search_mode(),
+        )?;
+        self.validate_semantic_model_selection(mode)?;
+        let policy = serde_json::json!({
+            "query": query,
+            "limit": limit,
+            "filter": self.cli_input.filter,
+            "format": self.cli_input.format.to_string(),
+            "requested_mode": self.requested_search_mode().label(),
+            "effective_mode": mode.label(),
+            "semantic_loaders_compiled": SEMANTIC_LOADERS_COMPILED,
+            "rerank_compiled": cfg!(feature = "rerank"),
+            "fast_model": self.config.indexing.fast_model,
+            "quality_model": self.config.indexing.quality_model,
+            "quality_disabled": self.quality_disabled_by_policy(),
+            "ranking_priors": self.config.search.ranking_priors,
+            "rrf_k_bits": self.config.search.rrf_k.to_bits(),
+            "quality_weight_bits": self.effective_quality_weight().to_bits(),
+            "quality_timeout_ms": self.config.search.quality_timeout_ms,
+            "rerank": self.reranking_enabled_by_policy(),
+            "rerank_timeout_ms": self.config.search.rerank_timeout_ms,
+            "explain": self.config.search.explain,
+            "degradation_override": self.config.pressure.degradation_override,
+            "quality_circuit_open": self.config.pressure.quality_circuit_open,
+            "pressure_profile": self.config.pressure.profile,
+            "privacy": self.config.privacy,
+        });
+        let bytes = serde_json::to_vec(&policy).map_err(|_| {
+            retained_recovery_error("the recovery query policy could not be encoded")
+        })?;
+        let mut hash = Sha256::new();
+        hash.update(b"fsfs.recovery.query-policy.v1\0");
+        hash.update(bytes);
+        Ok(sha256_digest_hex(hash.finalize()))
+    }
+
     /// Rebuild sources into a sealed inactive generation for explicit preview.
     ///
     /// The source directory and query filters/ranking come from this runtime's
@@ -776,6 +847,78 @@ mod retained_recovery_tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn recovery_query_fingerprint_binds_resolved_policy_without_loading_models() {
+        let mut config = FsfsConfig::default();
+        config.pressure.degradation_override = DegradationOverrideMode::ForceLexicalOnly;
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            filter: Some("path:alpha.md".to_owned()),
+            format: OutputFormat::Json,
+            ..CliInput::default()
+        });
+        let expected = runtime
+            .recovery_query_policy_sha256(REBUILD_QUERY, 10)
+            .unwrap();
+        assert_eq!(expected.len(), 64);
+        assert_eq!(
+            runtime
+                .clone()
+                .recovery_query_policy_sha256(REBUILD_QUERY, 10)
+                .unwrap(),
+            expected
+        );
+        for (query, limit) in [("a different original request", 10), (REBUILD_QUERY, 9)] {
+            assert_ne!(
+                runtime.recovery_query_policy_sha256(query, limit).unwrap(),
+                expected
+            );
+        }
+        for mutate in [
+            (|runtime: &mut FsfsRuntime| runtime.cli_input.filter = None) as fn(&mut FsfsRuntime),
+            |runtime| runtime.cli_input.filter = Some("path:beta.md".to_owned()),
+            |runtime| runtime.cli_input.format = OutputFormat::Jsonl,
+            |runtime| runtime.config.search.ranking_priors = true,
+            |runtime| runtime.config.search.rerank = true,
+            |runtime| runtime.config.search.quality_timeout_ms += 1,
+            |runtime| runtime.config.search.rerank_timeout_ms += 1,
+            |runtime| runtime.config.search.rrf_k += 1.0,
+            |runtime| runtime.config.search.quality_weight = 0.4,
+            |runtime| runtime.config.search.fast_only = true,
+            |runtime| runtime.config.indexing.quality_model.clear(),
+            |runtime| runtime.config.privacy.redact_paths_in_telemetry = false,
+        ] {
+            let mut changed = runtime.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                changed
+                    .recovery_query_policy_sha256(REBUILD_QUERY, 10)
+                    .unwrap(),
+                expected
+            );
+        }
+        let mut changed = runtime.clone();
+        changed.config.indexing.model_dir = "/unavailable/relocated-model-cache".to_owned();
+        assert_eq!(
+            changed
+                .recovery_query_policy_sha256(REBUILD_QUERY, 10)
+                .unwrap(),
+            expected,
+            "cache location is not a query policy; producer admission owns actual identity"
+        );
+        assert!(runtime.recovery_query_policy_sha256(" ", 10).is_err());
+        assert!(
+            runtime
+                .recovery_query_policy_sha256(REBUILD_QUERY, 0)
+                .is_err()
+        );
+        changed.cli_input.filter = Some("unknown:private-filter-canary".to_owned());
+        assert!(
+            changed
+                .recovery_query_policy_sha256(REBUILD_QUERY, 10)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2007,6 +2150,87 @@ mod retained_recovery_tests {
                     .await
                     .is_err()
             );
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn source_rebuild_quality_preview_uses_requested_tier_and_filter() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, source, root) = fixture(directory.path());
+            fs::write(source.join("beta.md"), "sharedtoken excluded beta document").unwrap();
+            runtime.cli_input.quality_only = true;
+            runtime.cli_input.filter = Some("path:alpha.md".to_owned());
+            let mut prepared = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            // Both stored producers were admitted; only the requested quality
+            // producer may supply query vectors for this direct preview.
+            models.fast.zero_signal.store(true, Ordering::Relaxed);
+            let phases = prepared.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            assert_eq!(phases.len(), 1);
+            assert_eq!(phases[0].hits.len(), 1);
+            assert_eq!(phases[0].hits[0].path, "alpha.md");
+            let blend = phases[0].semantic_blend.as_ref().unwrap();
+            assert!(
+                blend
+                    .hits
+                    .iter()
+                    .all(|hit| hit.fast.is_none() && hit.quality.is_some())
+            );
+            assert!(prepared.expected_selection_sha256(&cx).is_ok());
+            assert!(!root.join(COMPLETE_GENERATION_POINTER).exists());
+            models.fast.zero_signal.store(false, Ordering::Relaxed);
+        });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn resumed_source_rebuild_rechecks_useful_semantic_preview_before_publication() {
+        on_runtime(|cx| async move {
+            let models = RecoveryModels::install();
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let old = publish(&runtime, &cx, &root).await;
+            let pointer = fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap();
+            let mut prepared = runtime.prepare_retained_rebuild(&cx, &root).await.unwrap();
+            prepared.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            let guard = prepared.expected_selection_sha256(&cx).unwrap();
+            let target = prepared.generation().clone();
+            let target_bytes = file_bytes(target.path());
+            drop(prepared);
+            fs::rename(source, directory.path().join("source-unavailable")).unwrap();
+
+            let unpreviewed = fresh_runtime(&runtime)
+                .resume_retained_recovery(&cx, &root, target.id(), target.manifest_sha256(), &guard)
+                .await
+                .unwrap()
+                .with_required_searchable_preview();
+            assert!(unpreviewed.expected_selection_sha256(&cx).is_err());
+            assert!(unpreviewed.restore(&cx).is_err());
+
+            let mut resumed = fresh_runtime(&runtime)
+                .resume_retained_recovery(&cx, &root, target.id(), target.manifest_sha256(), &guard)
+                .await
+                .unwrap()
+                .with_required_searchable_preview();
+            models.quality.zero_signal.store(true, Ordering::Relaxed);
+            assert!(resumed.search(&cx, REBUILD_QUERY, 10).await.is_err());
+            assert!(resumed.expected_selection_sha256(&cx).is_err());
+            assert_eq!(
+                fs::read(root.join(COMPLETE_GENERATION_POINTER)).unwrap(),
+                pointer
+            );
+            assert_eq!(file_bytes(target.path()), target_bytes);
+            models.quality.zero_signal.store(false, Ordering::Relaxed);
+            resumed.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+            assert_eq!(resumed.expected_selection_sha256(&cx).unwrap(), guard);
+            let (publication, _) = resumed.restore(&cx).unwrap();
+            assert!(
+                matches!(publication, GenerationPublication::Durable(ref selected) if selected == &target)
+            );
+            assert_eq!(file_bytes(target.path()), target_bytes);
+            assert!(old.path().exists());
         });
     }
 

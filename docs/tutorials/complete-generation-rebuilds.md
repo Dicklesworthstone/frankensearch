@@ -151,6 +151,15 @@ original descriptor under publication ownership, rebuilds independently from
 sources, refuses inherited hardlinked artifacts, and retains the damaged bytes.
 Unsafe selection objects (such as symlinks) and oversized descriptors still fail.
 
+Preview supports the ordinary search filter through `--filter`, explicit
+`--search-mode full|fast|quality|lexical`, and `--rerank` / `--no-rerank` and
+`--ranking-priors` / `--no-ranking-priors` overrides. An explicit search mode
+overrides configured fast-only and degradation selection; omitting it uses the
+resolved configuration. `quality` queries the independently admitted quality
+tier directly. Every stored tier still needs producer admission before any
+restoration, even when the preview requests only one tier. These options require
+`--query`, and filters apply to each returned phase.
+
 Failed indexing, producer admission, cancellation or a failed preview leaves
 the previous generation selected. A successful source-rebuild preview must
 return at least one hit from the sealed candidate before exporting its selection
@@ -171,11 +180,24 @@ ownership, so another indexer can proceed; if it publishes first, applying the
 old preparation fails instead of replacing its work. Existing readers keep
 their pinned generation after a successful publication.
 
-The saved preparation names the sealed snapshot and its original selection
-guard. Resuming does not rescan the source, and source changes after preparation
-do not alter the target. Keep the preparation in trusted storage outside the
-store; it is not a retention pin. The response names the new generation and
-reports `source_rebuild_performed` only for the invocation that rebuilt it.
+The version-2 saved preparation names the sealed snapshot, its original selection
+guard and a digest of the exact preview request and resolved policy. It contains
+no query text, filters or result bodies. Resume must repeat the same query,
+limit, filter, output format, model selections, ranking, deadlines, degradation
+and privacy policy. A changed or omitted query, a wider filter, or changed
+configuration is refused before target admission or mutation. The source-rebuild
+requirement also survives restart: the new process must again return a useful
+result and exercise the required semantic tiers before selecting the candidate.
+Older preparation files without this binding are rejected. A receipt-directed
+preparation that intentionally requested no preview may still resume without
+one, or add a preview; deliberate restoration of an empty generation remains
+supported.
+
+Resuming does not rescan the source, and source changes after preparation do not
+alter the target. Keep the preparation in trusted storage outside the store; it
+is not a signature or retention pin. The response names the new generation and
+reports `source_rebuild_performed` only for the invocation that rebuilt it;
+`preview_requirement` records the independent obligation carried across resume.
 Use the receipt-directed durability confirmation command after an uncertain
 publication rather than rebuilding again. This capability uses the cooperative
 complete-store protocol; it does not execute the core recovery planner's

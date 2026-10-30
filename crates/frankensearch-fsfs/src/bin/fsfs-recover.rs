@@ -20,6 +20,7 @@ use asupersync::Cx;
 use asupersync::runtime::RuntimeBuilder;
 use frankensearch_core::rfc3339::{format_unix_nanos, now_unix_nanos};
 use frankensearch_core::{SearchError, SearchResult};
+use frankensearch_fsfs::config::DegradationOverrideMode;
 use frankensearch_fsfs::generation_store::{
     CompleteGenerationStore, GenerationPublication, PublishedGeneration,
 };
@@ -48,6 +49,12 @@ No directory scan chooses a recovery target. Models are never downloaded.
   --config FILE       Use the normal fsfs configuration loader and model selection
   --query TEXT        Preview a query against the target before any restoration
   --limit N           Preview results per phase (1..=100; default 10)
+  --search-mode MODE  Explicit preview policy: full, fast, quality, or lexical
+  --filter EXPR       Apply the ordinary search filter to every preview phase
+  --rerank|--no-rerank
+                      Override the configured cross-encoder reranking policy
+  --ranking-priors|--no-ranking-priors
+                      Override the configured path/module ranking priors
   --prepare           Admit a target and export a resume guard WITHOUT changing selection
   --apply             Explicitly restore the admitted target; default is read-only inspection
   --rebuild-source DIR Reindex this source into a NEW sealed generation before preview
@@ -87,7 +94,12 @@ Save the prepared receipt to resume without rescanning sources; a competing publ
 --save-preparation requires --prepare or --apply and an existing trusted parent outside STORE.
 It never overwrites a path. Failure prevents selection; an incomplete file may remain.
 The file is flushed before selection; on Unix it is created private (0600) and its parent is synced.
-Saved files contain no query or preview. Supply desired --query/--limit/--config again on resume.
+Saved files contain a query-policy digest, never query/filter text or preview results.
+Resume must supply the same query, limit, filter, output format and resolved search policy.
+Changing model selection, ranking, deadlines, degradation or privacy policy refuses resume.
+A source-rebuild resume repeats its nonempty requested-tier preview before selection.
+--search-mode explicitly overrides configured fast-only/degradation selection; all stored tiers still admit.
+Query policy options require --query. A saved preparation without a preview may add one on resume.
 --resume-file cannot mix with manual target/guard fields or repair options. Store relocation is refused.
 A saved file records PREPARATION, not the final outcome, and is not rewritten after publication.
 After a lost response or uncertain publication, use --resume-file FILE --confirm-durability;
@@ -111,6 +123,24 @@ enum RecoveryTarget {
     Source(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoverySearchMode {
+    Full,
+    Fast,
+    Quality,
+    Lexical,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum PreviewRequirement {
+    None {},
+    Query {
+        policy_sha256: String,
+        searchable: bool,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct Options {
     root: PathBuf,
@@ -118,12 +148,17 @@ struct Options {
     config: Option<PathBuf>,
     query: Option<String>,
     limit: usize,
+    search_mode: Option<RecoverySearchMode>,
+    filter: Option<String>,
+    rerank: Option<bool>,
+    ranking_priors: Option<bool>,
     action: RecoveryAction,
     repair_vectors: bool,
     max_copy_bytes: u64,
     expected_selection_sha256: Option<String>,
     save_preparation: Option<PathBuf>,
     resume_origin: Option<RepairSource>,
+    resume_preview: Option<PreviewRequirement>,
     format: OutputFormat,
 }
 
@@ -150,6 +185,10 @@ impl Options {
         let mut config = None;
         let mut query = None;
         let mut limit = 10;
+        let mut search_mode = None;
+        let mut filter = None;
+        let mut rerank = None;
+        let mut ranking_priors = None;
         let mut action = RecoveryAction::Inspect;
         let mut repair_vectors = false;
         let mut max_copy_bytes = DEFAULT_REPAIR_COPY_BYTES;
@@ -170,6 +209,12 @@ impl Options {
                     | "--config"
                     | "--query"
                     | "--limit"
+                    | "--search-mode"
+                    | "--filter"
+                    | "--rerank"
+                    | "--no-rerank"
+                    | "--ranking-priors"
+                    | "--no-ranking-priors"
                     | "--prepare"
                     | "--apply"
                     | "--expected-selection-sha256"
@@ -204,6 +249,18 @@ impl Options {
                 repair_vectors = true;
                 continue;
             }
+            if matches!(flag.as_str(), "--rerank" | "--no-rerank") {
+                if rerank.replace(flag == "--rerank").is_some() {
+                    return Err(invalid("conflicting reranking flags are not allowed"));
+                }
+                continue;
+            }
+            if matches!(flag.as_str(), "--ranking-priors" | "--no-ranking-priors") {
+                if ranking_priors.replace(flag == "--ranking-priors").is_some() {
+                    return Err(invalid("conflicting ranking-prior flags are not allowed"));
+                }
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| invalid(format!("missing value for {flag}")))?;
@@ -220,6 +277,20 @@ impl Options {
                 "--save-preparation" => save_preparation = Some(PathBuf::from(value)),
                 "--resume-file" => resume_file = Some(PathBuf::from(value)),
                 "--query" => query = Some(text(value)?),
+                "--filter" => filter = Some(text(value)?),
+                "--search-mode" => {
+                    search_mode = Some(match text(value)?.as_str() {
+                        "full" => RecoverySearchMode::Full,
+                        "fast" => RecoverySearchMode::Fast,
+                        "quality" => RecoverySearchMode::Quality,
+                        "lexical" => RecoverySearchMode::Lexical,
+                        _ => {
+                            return Err(invalid(
+                                "--search-mode must be full, fast, quality, or lexical",
+                            ));
+                        }
+                    });
+                }
                 "--max-copy-bytes" => {
                     let value = text(value)?;
                     max_copy_bytes = value
@@ -252,6 +323,7 @@ impl Options {
         }
         let root =
             root.ok_or_else(|| invalid("--index-dir is required; recovery never guesses a store"))?;
+        let mut resume_preview = None;
         let resume_origin = if let Some(path) = resume_file {
             // Reject conflicting authority before reading a file. Its contents
             // can supply a target, never an action, configuration or preview.
@@ -274,6 +346,7 @@ impl Options {
             digest = Some(receipt.manifest_sha256);
             if action == RecoveryAction::Apply {
                 expected_selection_sha256 = Some(receipt.expected_selection_sha256);
+                resume_preview = Some(receipt.preview_requirement);
             }
             // Confirmation uses only this store-bound target, never the old
             // guard or a fresh prepare. It cannot republish an unselected copy.
@@ -307,12 +380,17 @@ impl Options {
             config,
             query,
             limit,
+            search_mode,
+            filter,
+            rerank,
+            ranking_priors,
             action,
             repair_vectors,
             max_copy_bytes,
             expected_selection_sha256,
             save_preparation,
             resume_origin,
+            resume_preview,
             format,
         }
         .validate(seen.contains("--limit"), seen.contains("--max-copy-bytes"))
@@ -352,6 +430,26 @@ impl Options {
         }
         if explicit_limit && self.query.is_none() {
             return Err(invalid("--limit requires --query"));
+        }
+        if self.query.is_none()
+            && (self.search_mode.is_some()
+                || self.filter.is_some()
+                || self.rerank.is_some()
+                || self.ranking_priors.is_some()
+                || matches!(self.resume_preview, Some(PreviewRequirement::Query { .. })))
+        {
+            return Err(invalid(
+                "preview policy and a prepared query binding require --query; repeat the original request when resuming",
+            ));
+        }
+        if self
+            .filter
+            .as_ref()
+            .is_some_and(|filter| filter.trim().is_empty() || filter.len() > MAX_QUERY_BYTES)
+        {
+            return Err(invalid(
+                "preview filter must be nonblank and at most 64 KiB",
+            ));
         }
         if self.repair_vectors
             && !matches!(self.action, RecoveryAction::Prepare | RecoveryAction::Apply)
@@ -449,13 +547,14 @@ struct Report {
     expected_selection_sha256: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sync_error_kind: Option<String>,
+    preview_requirement: PreviewRequirement,
     preview: Vec<SearchPayload>,
 }
 
 impl Report {
     fn inspected(generation: &PublishedGeneration) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: 2,
             state: RecoveryState::Inspected,
             generation_id: generation.id().to_owned(),
             manifest_sha256: generation.manifest_sha256().to_owned(),
@@ -466,6 +565,7 @@ impl Report {
             repaired_from: None,
             expected_selection_sha256: None,
             sync_error_kind: None,
+            preview_requirement: PreviewRequirement::None {},
             preview: Vec::new(),
         }
     }
@@ -618,6 +718,41 @@ fn validate_preview(preview: &[SearchPayload]) -> SearchResult<()> {
     Ok(())
 }
 
+fn preview_requirement(
+    runtime: &FsfsRuntime,
+    options: &Options,
+) -> SearchResult<PreviewRequirement> {
+    let Some(query) = &options.query else {
+        if matches!(
+            options.resume_preview,
+            Some(PreviewRequirement::Query { .. })
+        ) {
+            return Err(invalid(
+                "the saved preparation requires its original query preview",
+            ));
+        }
+        return Ok(PreviewRequirement::None {});
+    };
+    let policy_sha256 = runtime.recovery_query_policy_sha256(query, options.limit)?;
+    let mut searchable = matches!(options.target, RecoveryTarget::Source(_));
+    if let Some(PreviewRequirement::Query {
+        policy_sha256: expected,
+        searchable: required,
+    }) = &options.resume_preview
+    {
+        if &policy_sha256 != expected {
+            return Err(invalid(
+                "the query or resolved preview policy differs from the saved preparation; repeat the original request and configuration",
+            ));
+        }
+        searchable |= *required;
+    }
+    Ok(PreviewRequirement::Query {
+        policy_sha256,
+        searchable,
+    })
+}
+
 async fn execute(
     cx: &Cx,
     runtime: Option<&FsfsRuntime>,
@@ -635,6 +770,9 @@ async fn execute(
         return Ok(report.completed(publication, false));
     }
     let runtime = runtime.ok_or_else(|| invalid("recovery runtime was not initialized"))?;
+    // Refuse policy drift before acquiring the store, loading producers,
+    // copying repair data or creating a source-rebuild candidate.
+    let preview_requirement = preview_requirement(runtime, options)?;
     if matches!(
         options.action,
         RecoveryAction::Prepare | RecoveryAction::Apply
@@ -670,7 +808,17 @@ async fn execute(
                 .prepare_retained_recovery(cx, &options.root, generation, digest)
                 .await?
         };
+        if matches!(
+            preview_requirement,
+            PreviewRequirement::Query {
+                searchable: true,
+                ..
+            }
+        ) {
+            plan = plan.with_required_searchable_preview();
+        }
         let mut report = Report::inspected(plan.generation());
+        report.preview_requirement = preview_requirement;
         report.source_rebuild_performed = matches!(options.target, RecoveryTarget::Source(_));
         report.repaired_from.clone_from(&options.resume_origin);
         if options.repair_vectors {
@@ -708,6 +856,7 @@ async fn execute(
             .open_retained_search_from_receipt(cx, &options.root, generation, digest)
             .await?;
         let mut report = Report::inspected(reader.generation());
+        report.preview_requirement = preview_requirement;
         if let Some(query) = &options.query {
             report.preview = reader.search(cx, query, options.limit).await?;
             validate_preview(&report.preview)?;
@@ -719,7 +868,21 @@ async fn execute(
 fn configured_runtime(options: &Options) -> SearchResult<FsfsRuntime> {
     let home = frankensearch_core::platform_dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let env = current_unicode_environment();
-    let overrides = CliOverrides::default();
+    let overrides = CliOverrides {
+        fast_only: options
+            .search_mode
+            .map(|mode| mode == RecoverySearchMode::Fast),
+        degradation_override: options.search_mode.map(|mode| {
+            if mode == RecoverySearchMode::Lexical {
+                DegradationOverrideMode::ForceLexicalOnly
+            } else {
+                DegradationOverrideMode::ForceFull
+            }
+        }),
+        rerank: options.rerank,
+        ranking_priors: options.ranking_priors,
+        ..CliOverrides::default()
+    };
     let loaded = if let Some(path) = &options.config {
         if !std::fs::metadata(path)?.is_file() {
             return Err(invalid("--config must name a regular configuration file"));
@@ -737,6 +900,10 @@ fn configured_runtime(options: &Options) -> SearchResult<FsfsRuntime> {
     config.indexing.watch_mode = false;
     Ok(FsfsRuntime::new(config).with_cli_input(CliInput {
         command: CliCommand::Doctor,
+        overrides,
+        query: options.query.clone(),
+        filter: options.filter.clone(),
+        quality_only: options.search_mode == Some(RecoverySearchMode::Quality),
         index_dir: Some(options.root.clone()),
         target_path: match &options.target {
             RecoveryTarget::Source(source) => Some(source.clone()),
@@ -825,6 +992,17 @@ fn render(response: &Response, format: OutputFormat) -> SearchResult<Vec<u8>> {
             writeln!(
                 output,
                 "Resume with --apply --expected-selection-sha256 and this target receipt; do not repeat repair."
+            )?;
+        }
+        if let PreviewRequirement::Query {
+            policy_sha256,
+            searchable,
+        } = &report.preview_requirement
+        {
+            writeln!(output, "Preview policy SHA-256: {policy_sha256}")?;
+            writeln!(
+                output,
+                "Fresh useful preview required on resume: {searchable}"
             )?;
         }
         writeln!(
@@ -1035,6 +1213,54 @@ mod tests {
     }
 
     #[test]
+    fn explicit_query_policy_is_typed_bounded_and_requires_a_preview() {
+        for (mode, expected) in [
+            ("full", RecoverySearchMode::Full),
+            ("fast", RecoverySearchMode::Fast),
+            ("quality", RecoverySearchMode::Quality),
+            ("lexical", RecoverySearchMode::Lexical),
+        ] {
+            let mut input = args();
+            input.extend(
+                [
+                    "--query",
+                    "original query",
+                    "--search-mode",
+                    mode,
+                    "--filter",
+                    "path:src/ ext:rs",
+                    "--rerank",
+                    "--ranking-priors",
+                ]
+                .map(OsString::from),
+            );
+            let options = Options::parse(input).unwrap();
+            assert_eq!(options.search_mode, Some(expected));
+            assert_eq!(options.filter.as_deref(), Some("path:src/ ext:rs"));
+            assert_eq!(options.rerank, Some(true));
+            assert_eq!(options.ranking_priors, Some(true));
+        }
+        for suffix in [
+            vec!["--search-mode", "quality"],
+            vec!["--filter", "path:alpha.md"],
+            vec!["--rerank"],
+            vec!["--no-ranking-priors"],
+            vec!["--query", "text", "--search-mode", "unknown"],
+            vec!["--query", "text", "--rerank", "--no-rerank"],
+            vec!["--query", "text", "--ranking-priors", "--no-ranking-priors"],
+            vec!["--query", "text", "--filter", " "],
+        ] {
+            let mut input = args();
+            input.extend(suffix.into_iter().map(OsString::from));
+            assert!(Options::parse(input).is_err());
+        }
+        let mut input = args();
+        input.extend(["--query", "text", "--filter"].map(OsString::from));
+        input.push("x".repeat(MAX_QUERY_BYTES + 1).into());
+        assert!(Options::parse(input).is_err());
+    }
+
+    #[test]
     fn output_buffer_refuses_before_partial_admission() {
         let mut output = BoundedOutput::new(3);
         output.write_all(b"abc").unwrap();
@@ -1193,7 +1419,7 @@ mod tests {
 
     fn report(state: RecoveryState) -> Report {
         Report {
-            schema_version: 1,
+            schema_version: 2,
             state,
             generation_id: "g-test".to_owned(),
             manifest_sha256: "a".repeat(64),
@@ -1213,6 +1439,7 @@ mod tests {
             repaired_from: None,
             expected_selection_sha256: None,
             sync_error_kind: None,
+            preview_requirement: PreviewRequirement::None {},
             preview: Vec::new(),
         }
     }
