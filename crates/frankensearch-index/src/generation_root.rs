@@ -5649,6 +5649,7 @@ pub mod generation_reader {
         health: SnapshotHealthV1,
         selected_predecessor_of: Option<AuthorityRefV1>,
         history_current: Option<Arc<OpenedGenerationSnapshotV1>>,
+        recovery_current_manifest: Option<(AuthorityRefV1, QualifiedGenerationFile)>,
         history_manifests: Vec<QualifiedGenerationFile>,
     }
 
@@ -5703,11 +5704,12 @@ pub mod generation_reader {
 
         /// Current authority against which this predecessor was admitted.
         ///
-        /// `None` identifies an ordinary current-head open. `Some(current)`
-        /// identifies an explicit predecessor selection, admitted while the
-        /// exact [`Self::authority_pair`] still selected `current`. It is a
+        /// `Some(current)` identifies an immediate predecessor selection,
+        /// admitted while the exact [`Self::authority_pair`] selected `current`. It is a
         /// retained rollback target, not proof that its older authority is
         /// current or an authorization to publish after that older authority.
+        /// `None` also applies to older ancestors; use [`Self::selected_history_of`]
+        /// to distinguish every historical selection from a current-head open.
         #[must_use]
         pub const fn selected_predecessor_of(&self) -> Option<AuthorityRefV1> {
             self.selected_predecessor_of
@@ -5723,6 +5725,11 @@ pub mod generation_reader {
             self.history_current
                 .as_ref()
                 .map(|current| current.head().authority)
+                .or_else(|| {
+                    self.recovery_current_manifest
+                        .as_ref()
+                        .map(|(authority, _)| *authority)
+                })
                 .or(self.selected_predecessor_of)
         }
 
@@ -5731,6 +5738,19 @@ pub mod generation_reader {
         #[must_use]
         pub const fn history_current(&self) -> Option<&Arc<OpenedGenerationSnapshotV1>> {
             self.history_current.as_ref()
+        }
+
+        /// Current activation manifest retained by explicit damaged-current recovery.
+        ///
+        /// Its exact authority and predecessor chain authorize the selected
+        /// healthy target, but none of its component images are admitted or
+        /// made searchable. Ordinary historical reads retain a complete
+        /// [`Self::history_current`] instead.
+        #[must_use]
+        pub fn recovery_current_manifest(&self) -> Option<&QualifiedGenerationFile> {
+            self.recovery_current_manifest
+                .as_ref()
+                .map(|(_, manifest)| manifest)
         }
 
         /// Exact intermediate manifest descriptors retained by history admission.
@@ -5742,9 +5762,10 @@ pub mod generation_reader {
 
         /// Total encoded images retained by this snapshot and its history anchor.
         ///
-        /// Includes every intermediate manifest and the complete retained
-        /// current snapshot. Shared component bytes are charged in each admitted
-        /// closure, as they are during opening. Parsed engines and process RSS
+        /// Includes every intermediate manifest and either the complete retained
+        /// current snapshot or the current recovery manifest. Shared component
+        /// bytes are charged in each admitted closure, as they are during opening.
+        /// Parsed engines and process RSS
         /// are outside this count. Arithmetic overflow returns `None`.
         #[must_use]
         pub fn retained_image_bytes(&self) -> Option<u64> {
@@ -5760,7 +5781,9 @@ pub mod generation_reader {
                 })?;
             let current = match &self.history_current {
                 Some(current) => current.retained_image_bytes()?,
-                None => 0,
+                None => self
+                    .recovery_current_manifest()
+                    .map_or(0, |file| file.witness().byte_len()),
             };
             with_history.checked_add(current)
         }
@@ -6078,6 +6101,7 @@ pub mod generation_reader {
             current: AuthorityRefV1,
             current_generation: ArtifactGenerationIdentityV1,
             target: AuthorityRefV1,
+            max_history_hops: Option<u64>,
         },
     }
 
@@ -6097,16 +6121,23 @@ pub mod generation_reader {
         manifest_bytes: u64,
     }
 
+    struct HistoryPathOrigin<'a> {
+        authority: AuthorityRefV1,
+        manifest: &'a ActivationManifest,
+        // A healthy current snapshot is already owned by its caller. Recovery
+        // instead opens and retains this manifest within the supplied budget.
+        retained_image_bytes: u64,
+    }
+
     fn admit_history_path(
         root: &QualifiedGenerationRoot,
-        current: &OpenedGenerationSnapshotV1,
+        current: HistoryPathOrigin<'_>,
         target: AuthorityRefV1,
         resolution: &Resolution,
         max_hops: u64,
         max_owned_image_bytes: u64,
     ) -> GenerationRootResult<Result<HistoryPath, SnapshotRefusalV1>> {
         let Some(distance) = current
-            .head()
             .authority
             .sequence
             .checked_sub(target.sequence)
@@ -6120,8 +6151,8 @@ pub mod generation_reader {
                 limit: max_hops,
             }));
         }
-        let mut parent = current.head().authority;
-        let mut next = current.manifest().predecessor();
+        let mut parent = current.authority;
+        let mut next = current.manifest.predecessor();
         let mut manifests = Vec::new();
         let mut manifest_bytes = 0_u64;
         loop {
@@ -6152,7 +6183,11 @@ pub mod generation_reader {
             }
             if let Err(refusal) = check_image_budget(
                 target.manifest_len,
-                [manifest_bytes, authority.manifest_len],
+                [
+                    current.retained_image_bytes,
+                    manifest_bytes,
+                    authority.manifest_len,
+                ],
                 max_owned_image_bytes,
             ) {
                 return Ok(Err(refusal));
@@ -6423,8 +6458,8 @@ pub mod generation_reader {
         /// intermediate manifests, the target manifest and its components;
         /// it excludes the already retained current snapshot and parsed engine
         /// memory. Callers bounding their total images must account for current
-        /// separately. The existing immediate-predecessor recovery API remains
-        /// the explicit route when current components are damaged.
+        /// separately. Explicit recovery admission can authenticate the same
+        /// manifest ancestry when current components are damaged.
         ///
         /// # Errors
         /// Returns typed stale-head, history-depth, unretained-history, image
@@ -6536,6 +6571,70 @@ pub mod generation_reader {
                     current: expected_current,
                     current_generation: expected_current_generation,
                     target: selected_predecessor,
+                    max_history_hops: None,
+                }),
+            )
+        }
+
+        /// Admit an authenticated healthy ancestor while current components are damaged.
+        ///
+        /// The exact expected current authority and artifact generation are
+        /// authenticated from the physical control pair and current activation
+        /// manifest. Only verified predecessor references can lead to the
+        /// caller-selected target: every intermediate manifest receives exact
+        /// length, digest and consecutive-sequence validation. Neither directory
+        /// inventory nor a caller's old receipt can supply a missing link.
+        /// Current and intermediate component images are never opened. The
+        /// selected target receives complete ordinary component admission.
+        ///
+        /// Both shared-lock resolutions must retain the captured pair and
+        /// control anchors; a changed winner is refused rather than followed.
+        /// Pending publication, an unsafe root, a damaged ancestry manifest or
+        /// a damaged target also refuses recovery. This operation supports only
+        /// the cooperative local profile without an external floor.
+        ///
+        /// The returned target retains the current manifest, every intermediate
+        /// manifest and its own complete closure. It records the authorizing
+        /// current head in [`OpenedGenerationSnapshotV1::selected_history_of`]
+        /// without constructing a searchable current snapshot or fabricating a
+        /// physical slot for an older target. Rollback must publish a higher
+        /// sequence against this retained snapshot's exact authority pair.
+        ///
+        /// `max_history_hops` bounds ancestry traversal before intermediate
+        /// manifests are read. `max_owned_image_bytes` covers all retained
+        /// manifests plus every declared target component, checked before the
+        /// respective object reads. It does not describe parsed engine memory.
+        ///
+        /// # Errors
+        /// Returns typed stale-current, history-depth, unretained-history,
+        /// manifest, closure, image-budget and infrastructure errors.
+        pub fn open_historical_generation_for_recovery_with_budget(
+            &self,
+            root_id: [u8; 16],
+            expected_current: AuthorityRefV1,
+            expected_current_generation: ArtifactGenerationIdentityV1,
+            selected_ancestor: AuthorityRefV1,
+            max_history_hops: u64,
+            max_owned_image_bytes: u64,
+        ) -> GenerationRootResult<SnapshotOpenOutcomeV1> {
+            for authority in [expected_current, selected_ancestor] {
+                if let Err(error) = authority.validate() {
+                    return Ok(SnapshotOpenOutcomeV1::Refused(
+                        SnapshotRefusalV1::Authority(error),
+                    ));
+                }
+            }
+            self.open_selected_generation_snapshot_with_budget(
+                root_id,
+                GenerationRootSecurityProfileV1::CooperativeLocal,
+                None,
+                max_owned_image_bytes,
+                None,
+                Some(PredecessorSelection::Recovery {
+                    current: expected_current,
+                    current_generation: expected_current_generation,
+                    target: selected_ancestor,
+                    max_history_hops: Some(max_history_hops),
                 }),
             )
         }
@@ -6594,7 +6693,11 @@ pub mod generation_reader {
                         }
                         match admit_history_path(
                             self,
-                            current,
+                            HistoryPathOrigin {
+                                authority: current.head().authority,
+                                manifest: current.manifest(),
+                                retained_image_bytes: 0,
+                            },
                             target,
                             &first,
                             max_hops,
@@ -6612,6 +6715,7 @@ pub mod generation_reader {
                         current,
                         current_generation,
                         target,
+                        max_history_hops,
                     }) => {
                         if first.head.authority != current {
                             return Ok(SnapshotOpenOutcomeV1::Refused(
@@ -6676,11 +6780,34 @@ pub mod generation_reader {
                                 ),
                             ));
                         }
-                        match predecessor_slot_from_manifest(current, &manifest, target, &first) {
-                            Ok(slot) => {
-                                (GenerationSnapshotSelectionV1::from_slot(slot), Some(file))
+                        if let Some(max_hops) = max_history_hops {
+                            match admit_history_path(
+                                self,
+                                HistoryPathOrigin {
+                                    authority: current,
+                                    manifest: &manifest,
+                                    retained_image_bytes: current.manifest_len,
+                                },
+                                target,
+                                &first,
+                                max_hops,
+                                max_owned_image_bytes,
+                            )? {
+                                Ok(path) => {
+                                    history_manifests = path.manifests;
+                                    history_manifest_bytes = path.manifest_bytes;
+                                    (path.selected, Some(file))
+                                }
+                                Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
                             }
-                            Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
+                        } else {
+                            match predecessor_slot_from_manifest(current, &manifest, target, &first)
+                            {
+                                Ok(slot) => {
+                                    (GenerationSnapshotSelectionV1::from_slot(slot), Some(file))
+                                }
+                                Err(refusal) => return Ok(SnapshotOpenOutcomeV1::Refused(refusal)),
+                            }
                         }
                     }
                     None => (GenerationSnapshotSelectionV1::from_slot(first.head), None),
@@ -6865,6 +6992,9 @@ pub mod generation_reader {
                             }
                             _ => None,
                         }),
+                        recovery_current_manifest: recovery_manifest_file
+                            .zip(predecessor.map(PredecessorSelection::current_authority))
+                            .map(|(file, current)| (current, file)),
                         history_manifests,
                     },
                 )));
@@ -8316,6 +8446,255 @@ pub mod generation_reader {
                         assert_eq!(fs::read(path.join("LOCK")).unwrap(), lock_before);
                     }
                 }
+            }
+        }
+
+        #[test]
+        fn recovery_history_reopens_ancestors_without_current_or_intermediate_components() {
+            for with_ann in [false, true] {
+                for missing in [false, true] {
+                    let (path, root, current, target) =
+                        historical_root("recovery-history-components", with_ann);
+                    let expected = current.head().authority;
+                    let generation = current.manifest().generation();
+                    let pair = current.authority_pair();
+                    let current_manifest = current.manifest_bytes();
+                    drop(current);
+                    drop(root);
+                    // Every newer component is unavailable. Only the exact
+                    // activation-manifest chain and the selected target survive.
+                    let mut displaced = Vec::new();
+                    for sequence in 2..=4 {
+                        let bytes =
+                            fs::read(path.join(activation_manifest_name_v1(object_id(sequence))))
+                                .unwrap();
+                        let manifest = ActivationManifest::from_canonical_bytes(&bytes).unwrap();
+                        for (role, receipt) in manifest.components().iter() {
+                            let component =
+                                path.join(component_object_name_v1(role, receipt.sha256));
+                            let original = fs::read(&component).unwrap();
+                            let saved =
+                                displace_recovery_fixture_object(&path, &component, missing);
+                            displaced.push((component, saved, original));
+                        }
+                    }
+                    let authority_before = fs::read(path.join("AUTHORITY")).unwrap();
+                    let lock_before = fs::read(path.join("LOCK")).unwrap();
+                    let root = admit(&path);
+                    assert!(matches!(
+                        open(
+                            &root,
+                            GenerationRootSecurityProfileV1::CooperativeLocal,
+                            None
+                        ),
+                        SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(_))
+                    ));
+                    let recovered = opened(
+                        root.open_historical_generation_for_recovery_with_budget(
+                            ROOT_ID,
+                            expected,
+                            generation,
+                            target,
+                            3,
+                            u64::MAX,
+                        )
+                        .expect("fresh recovery through retained manifest ancestry"),
+                    );
+                    assert_eq!(recovered.head().authority, target);
+                    assert_eq!(recovered.head().slot, None);
+                    assert_eq!(recovered.selected_predecessor_of(), None);
+                    assert_eq!(recovered.selected_history_of(), Some(expected));
+                    assert_eq!(recovered.authority_pair(), pair);
+                    assert!(recovered.history_current().is_none());
+                    assert_eq!(recovered.history_manifests().len(), 2);
+                    assert_eq!(
+                        recovered.recovery_current_manifest().unwrap().as_bytes(),
+                        &*current_manifest
+                    );
+                    let required = recovered.manifest().components().iter().fold(
+                        target.manifest_len + expected.manifest_len,
+                        |sum, (_, receipt)| sum + receipt.byte_len,
+                    ) + recovered
+                        .history_manifests()
+                        .iter()
+                        .map(|file| file.witness().byte_len())
+                        .sum::<u64>();
+                    assert_eq!(recovered.retained_image_bytes(), Some(required));
+                    for (role, _) in recovered.manifest().components().iter() {
+                        assert_eq!(
+                            recovered.closure().file(role).unwrap().as_bytes(),
+                            component_bytes(role, 1)
+                        );
+                    }
+                    for (component, saved, original) in displaced {
+                        assert_eq!(fs::read(saved).unwrap(), original);
+                        if missing {
+                            assert!(!component.exists());
+                        } else {
+                            assert_ne!(fs::read(component).unwrap(), original);
+                        }
+                    }
+                    assert_eq!(fs::read(path.join("AUTHORITY")).unwrap(), authority_before);
+                    assert_eq!(fs::read(path.join("LOCK")).unwrap(), lock_before);
+                }
+            }
+        }
+
+        #[test]
+        fn recovery_history_requires_exact_ancestry_and_charges_all_retained_images() {
+            for missing in [false, true] {
+                let (path, root, current, target) =
+                    historical_root("recovery-history-bounds", true);
+                let expected = current.head().authority;
+                let generation = current.manifest().generation();
+                let recovered = opened(
+                    root.open_historical_generation_for_recovery_with_budget(
+                        ROOT_ID,
+                        expected,
+                        generation,
+                        target,
+                        3,
+                        u64::MAX,
+                    )
+                    .unwrap(),
+                );
+                let required = recovered.retained_image_bytes().unwrap();
+                assert!(matches!(
+                    root.open_historical_generation_for_recovery_with_budget(
+                        ROOT_ID, expected, generation, target, 3, required,
+                    )
+                    .unwrap(),
+                    SnapshotOpenOutcomeV1::Opened(_)
+                ));
+                assert_eq!(
+                    refused(
+                        root.open_historical_generation_for_recovery_with_budget(
+                            ROOT_ID,
+                            expected,
+                            generation,
+                            target,
+                            3,
+                            required - 1,
+                        )
+                        .unwrap()
+                    ),
+                    SnapshotRefusalV1::ImageBudget {
+                        required,
+                        limit: required - 1,
+                    }
+                );
+                let mut foreign_target = target;
+                foreign_target.object_id[0] ^= 0xff;
+                for selected in [foreign_target, expected] {
+                    assert_eq!(
+                        refused(
+                            root.open_historical_generation_for_recovery_with_budget(
+                                ROOT_ID,
+                                expected,
+                                generation,
+                                selected,
+                                3,
+                                u64::MAX,
+                            )
+                            .unwrap()
+                        ),
+                        SnapshotRefusalV1::HistoryNotRetained
+                    );
+                }
+                let intermediate = path.join(activation_manifest_name_v1(object_id(3)));
+                let intermediate_len = fs::metadata(&intermediate).unwrap().len();
+                displace_recovery_fixture_object(&path, &intermediate, missing);
+                assert_eq!(
+                    refused(
+                        root.open_historical_generation_for_recovery_with_budget(
+                            ROOT_ID,
+                            expected,
+                            generation,
+                            target,
+                            2,
+                            u64::MAX,
+                        )
+                        .unwrap()
+                    ),
+                    SnapshotRefusalV1::HistoryDepth {
+                        required: 3,
+                        limit: 2,
+                    },
+                    "depth refusal precedes reading damaged ancestry"
+                );
+                let first_manifest_set =
+                    expected.manifest_len + target.manifest_len + intermediate_len;
+                assert_eq!(
+                    refused(
+                        root.open_historical_generation_for_recovery_with_budget(
+                            ROOT_ID,
+                            expected,
+                            generation,
+                            target,
+                            3,
+                            first_manifest_set - 1,
+                        )
+                        .unwrap()
+                    ),
+                    SnapshotRefusalV1::ImageBudget {
+                        required: first_manifest_set,
+                        limit: first_manifest_set - 1,
+                    },
+                    "the current manifest remains charged while ancestry is read"
+                );
+                assert!(matches!(
+                    refused(
+                        root.open_historical_generation_for_recovery_with_budget(
+                            ROOT_ID,
+                            expected,
+                            generation,
+                            target,
+                            3,
+                            u64::MAX,
+                        )
+                        .unwrap()
+                    ),
+                    SnapshotRefusalV1::Closure(_)
+                ));
+                assert!(matches!(
+                    open(
+                        &root,
+                        GenerationRootSecurityProfileV1::CooperativeLocal,
+                        None
+                    ),
+                    SnapshotOpenOutcomeV1::Opened(_)
+                ));
+                assert_eq!(
+                    recovered
+                        .closure()
+                        .file(GenerationComponentRole::Vector)
+                        .unwrap()
+                        .as_bytes(),
+                    component_bytes(GenerationComponentRole::Vector, 1),
+                    "retained recovery owns its admitted images after path replacement"
+                );
+                publish_manifest(
+                    &path,
+                    &publisher(&root),
+                    &manifest_v2(5, Some(expected), true),
+                    current.authority_pair(),
+                    None,
+                );
+                assert_eq!(
+                    refused(
+                        root.open_historical_generation_for_recovery_with_budget(
+                            ROOT_ID,
+                            expected,
+                            generation,
+                            target,
+                            3,
+                            u64::MAX,
+                        )
+                        .unwrap()
+                    ),
+                    SnapshotRefusalV1::ExpectedCurrentChanged,
+                    "a recovery request never rebases onto a new winner"
+                );
             }
         }
 
