@@ -123,6 +123,12 @@ pub use fastembed_embedder::{FastEmbedEmbedder, OnnxEmbedderConfig};
 pub mod model_download;
 
 #[cfg(feature = "download")]
+pub mod proxy;
+
+#[cfg(feature = "download")]
+pub use proxy::ProxySetting;
+
+#[cfg(feature = "download")]
 pub use model_download::{
     DownloadConfig, DownloadProgress, MODEL_ACQUISITION_PROGRESS_SCHEMA_V1,
     MODEL_ACQUISITION_RECEIPT_SCHEMA_V1, MODEL_ACQUISITION_RECOVERY_SCHEMA_V1,

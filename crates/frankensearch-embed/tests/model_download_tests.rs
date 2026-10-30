@@ -53,7 +53,7 @@ fn verified_fixture_manifest() -> ModelManifest {
 fn granted_consent_does_not_download_unqualified_manifests() {
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::SearchError;
-    use frankensearch_embed::{DownloadConfig, ModelDownloader};
+    use frankensearch_embed::{DownloadConfig, ModelDownloader, ProxySetting};
     use std::io::ErrorKind;
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -87,6 +87,7 @@ fn granted_consent_does_not_download_unqualified_manifests() {
         );
         let downloader = ModelDownloader::new(DownloadConfig {
             max_retries: 0,
+            proxy: ProxySetting::Disabled,
             ..DownloadConfig::default()
         });
 

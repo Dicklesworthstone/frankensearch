@@ -30,6 +30,7 @@ use crate::model_manifest::{
     FrozenModelArtifactManifestV1, ModelArtifactFileV1, ModelArtifactRoleV1, ModelFile,
     ModelLifecycle, ModelManifest,
 };
+use crate::proxy::{ProxySetting, proxy_for_url};
 
 static STAGING_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOCAL_COPY_BUFFER_BYTES: usize = 1024 * 1024;
@@ -74,6 +75,10 @@ pub struct DownloadConfig {
     /// verified against the manifest's declared size and SHA-256, so this bound
     /// only guards against an unexpectedly large response.
     pub max_response_bytes: usize,
+    /// How downloads reach the network. Defaults to the conventional proxy
+    /// environment variables (`https_proxy`, `all_proxy`, `no_proxy`, ...); see
+    /// [`ProxySetting`].
+    pub proxy: ProxySetting,
 }
 
 impl Default for DownloadConfig {
@@ -84,6 +89,7 @@ impl Default for DownloadConfig {
             user_agent: format!("frankensearch/{}", env!("CARGO_PKG_VERSION")),
             max_redirects: 5,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::FromEnvironment,
         }
     }
 }
@@ -439,23 +445,29 @@ impl fmt::Display for DownloadProgress {
 /// Downloads model files from `HuggingFace` with verification and progress reporting.
 pub struct ModelDownloader {
     config: DownloadConfig,
-    client: HttpClient,
 }
 
 impl ModelDownloader {
     /// Create a new downloader with the given configuration.
     #[must_use]
-    pub fn new(config: DownloadConfig) -> Self {
+    pub const fn new(config: DownloadConfig) -> Self {
+        Self { config }
+    }
+
+    /// The HTTP client for a request to `url`. The proxy depends on the URL (its scheme
+    /// selects the environment variable and `no_proxy` matches its host), and the client
+    /// fixes its proxy at construction. Building one is cheap: TLS and connections are
+    /// set up per request, and each artifact is one large streamed request.
+    fn http_client_for(&self, url: &str) -> HttpClient {
         let mut client_config = HttpClientConfig::default();
-        client_config.redirect_policy = RedirectPolicy::Limited(config.max_redirects);
-        client_config.user_agent = Some(config.user_agent.clone());
+        client_config.redirect_policy = RedirectPolicy::Limited(self.config.max_redirects);
+        client_config.user_agent = Some(self.config.user_agent.clone());
         // Lift the codec's 16 MiB default body cap; model artifacts routinely
         // exceed it. Streaming-to-disk keeps memory bounded regardless.
-        client_config.max_body_size = Some(config.max_response_bytes);
-        Self {
-            config,
-            client: HttpClient::with_config(client_config),
-        }
+        client_config.max_body_size = Some(self.config.max_response_bytes);
+        client_config.proxy_url =
+            proxy_for_url(&self.config.proxy, url, |name| std::env::var(name).ok());
+        HttpClient::with_config(client_config)
     }
 
     /// Create a downloader with default configuration.
@@ -968,7 +980,7 @@ impl ModelDownloader {
 
         // Stream directly into a temp file to keep memory bounded.
         let mut response = self
-            .client
+            .http_client_for(url)
             .request_streaming(cx, Method::Get, url, Vec::new(), Vec::new())
             .await
             .map_err(|e| client_error_to_search(e, url))?;
@@ -2810,6 +2822,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -2834,6 +2847,80 @@ mod tests {
         assert_eq!(last.bytes_downloaded, expected_size);
         assert_eq!(last.total_bytes, Some(expected_size));
         drop(events);
+    }
+
+    #[test]
+    fn download_config_debug_redacts_proxy_credentials() {
+        let config = DownloadConfig {
+            proxy: ProxySetting::Url("http://user:hunter2@proxy.corp:3128".to_owned()),
+            ..DownloadConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("Url(<redacted>)"), "{rendered}");
+    }
+
+    #[test]
+    fn download_single_file_routes_through_the_configured_proxy() {
+        // A local listener stands in for an HTTP proxy. The target host does not resolve,
+        // so the download can only succeed if the client sends it to the proxy, and an
+        // http:// target must arrive in absolute form.
+        let body = b"proxied model bytes".to_vec();
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: sha256_hex(&body),
+            size: u64::try_from(body.len()).unwrap(),
+            url: None,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let body_for_proxy = body.clone();
+        let proxy = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0_u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).unwrap();
+                assert!(read > 0, "proxy saw EOF before the request headers ended");
+                request.extend_from_slice(&buf[..read]);
+            }
+            let request = String::from_utf8_lossy(&request).into_owned();
+            let response = TestHttpResponse {
+                status: 200,
+                reason: "OK",
+                body: body_for_proxy,
+            };
+            write_http_response(&mut stream, &response).unwrap();
+            let _ = stream.shutdown(Shutdown::Both);
+            request.lines().next().unwrap_or_default().to_owned()
+        });
+
+        let url = "http://model-host.invalid/model.onnx".to_owned();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("model.onnx");
+        let dest_for_task = dest.clone();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Url(format!("http://{proxy_addr}")),
+        });
+
+        run_test_with_cx(|cx| async move {
+            downloader
+                .download_single_file(&cx, &url, &dest_for_task, &file, 0, 1, &|_| {})
+                .await
+                .unwrap();
+        });
+
+        let request_line = proxy.join().unwrap();
+        assert_eq!(
+            request_line,
+            "GET http://model-host.invalid/model.onnx HTTP/1.1"
+        );
+        assert_eq!(std::fs::read(dest).unwrap(), body);
     }
 
     #[test]
@@ -2895,6 +2982,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: manifest_cap_test_bytes(),
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -2951,6 +3039,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -2996,6 +3085,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3037,6 +3127,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3088,6 +3179,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3334,6 +3426,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3365,6 +3458,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
