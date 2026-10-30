@@ -159,7 +159,8 @@ fn source_changed() -> SearchError {
 }
 
 fn is_source_changed(error: &SearchError) -> bool {
-    matches!(error, SearchError::SubsystemError { source, .. } if source.is::<SourceChanged>())
+    matches!(error, SearchError::SubsystemError { source, .. }
+        if source.is::<SourceChanged>() || source.is::<super::IndexSourceChanged>())
 }
 
 fn observation_io(error: std::io::Error) -> SearchError {
@@ -2244,6 +2245,95 @@ mod lifecycle_tests {
             assert!(matches!(error, SearchError::Cancelled { .. }));
             assert_eq!(delivered, 0);
             assert!(!root.exists());
+        });
+    }
+
+    #[test]
+    fn complete_watch_retries_a_source_that_grows_after_worker_admission() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (runtime, source, root) = fixture(directory.path());
+            let runtime = runtime.with_lexical_only_indexing();
+            let mut session = CompleteWatchSession::open(&runtime, &cx, &root).unwrap();
+            controlled_notifications(&mut session);
+            let before = publish_tick(&mut session, &cx).await;
+            let pointer = root.join(COMPLETE_GENERATION_POINTER);
+            let selected = fs::read(&pointer).unwrap();
+            // The proof needs a read, not successful carry-forward of the
+            // unchanged completion receipt that the initial build created.
+            session.runtime.cli_input.full_reindex = true;
+            let pool = runtime.source_preparation_pool.get().unwrap().handle();
+            let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let (started, starts) = std::sync::mpsc::channel();
+            let mut blockers = Vec::new();
+            for _ in 0..pool.current_max_threads() {
+                let gate = Arc::clone(&gate);
+                let started = started.clone();
+                blockers.push(pool.spawn(move || {
+                    started.send(()).unwrap();
+                    let (lock, ready) = &*gate;
+                    let (held, timeout) = ready
+                        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |open| {
+                            !*open
+                        })
+                        .unwrap();
+                    assert!(*held && !timeout.timed_out(), "source capacity released");
+                }));
+                starts.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            let now = Instant::now();
+            lock_changes(&session.changes).unwrap().record(now, true);
+            let mut rebuilding = Box::pin(session.advance(&cx, now + MAX_DEBOUNCE));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            poll_fn(|task| {
+                assert!(rebuilding.as_mut().poll(task).is_pending());
+                if pool.pending_count() > 0 {
+                    Poll::Ready(())
+                } else {
+                    assert!(
+                        Instant::now() < deadline,
+                        "source read reached its worker queue"
+                    );
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+            // Discovery and allocation have completed; the queued reader still
+            // carries the smaller byte bound. No notification is injected.
+            fs::write(
+                source.join("alpha.md"),
+                "sharedtoken alpha document grew with new durable content",
+            )
+            .unwrap();
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            assert!(rebuilding.await.unwrap().is_none());
+            for blocker in blockers {
+                assert!(blocker.wait_timeout(Duration::from_secs(5)));
+            }
+            assert_eq!(fs::read(&pointer).unwrap(), selected);
+            assert_eq!(session.unstable_builds, 1);
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_some());
+            let after = require_durable_publication(
+                session
+                    .advance(&cx, Instant::now() + MAX_DEBOUNCE)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_ne!(before, after);
+            assert!(lock_changes(&session.changes).unwrap().dirty.is_none());
+            let manifests = FsfsRuntime::read_index_manifest(after.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(manifests.len(), 1);
+            assert_eq!(manifests[0].file_key, "alpha.md");
+            assert!(manifests[0].canonical_bytes > 25);
         });
     }
 

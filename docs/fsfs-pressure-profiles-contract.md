@@ -181,11 +181,31 @@ already-running native call actually finishes; shutdown drains those calls.
 These limits bound pool jobs, not internal model threads or all synchronous
 embedding and indexing operations.
 
+Source preparation uses a separate pool shared by runtime clones: `strict`
+permits two concurrent workers, `performance` eight, and `degraded` one. One-shot
+indexing and the complete-generation rebuilds used by watching and recovery send
+source reading, hashing, classification, PDF extraction and canonicalization to
+this pool. Checkpoint, lexical and vector writes stay ordered on the coordinating
+task. A cancelled caller cannot release a running worker's capacity; the pool
+owner drains admitted jobs before shutdown. Cancellation is checked between
+bounded reads and preparation stages; an individual synchronous parser or
+canonicalizer call is not preemptible.
+
+Prepared batches obey both the configured embedding item limit and a 64 MiB
+source-byte bound. An otherwise admitted file larger than that bound runs alone.
+No whole-corpus text staging is performed. A file that grows beyond its discovered
+size fails closed and requires a fresh indexing attempt; its content is never
+silently truncated. The byte budget describes source input, not a hard heap cap
+on parser output. Discovery exclusions and unchanged-file reuse precede worker
+admission. Metadata-only jobs perform only filesystem stat and path preparation,
+with no body open, hashing, decoding or PDF extraction.
+
 The `config.setting.no_effect` warning still covers a `strict` or `degraded`
-profile because its separate indexing concurrency and workload scheduler limits
-are not applied yet; its blocking-worker, quality and background-indexing ceilings
-do apply. Automatic durable background resumption of deferred quality embedding
-remains unimplemented.
+profile because its workload scheduler policy is not applied yet; its model-worker,
+source-worker, quality and background-indexing ceilings do apply. Legacy incremental
+watch/append operations remain serial; the source pool does not make lexical/vector
+publication concurrent. Automatic durable background resumption of deferred quality
+embedding remains unimplemented.
 
 The `performance` profile allows either `fast_only` value. The `strict` and
 `degraded` profiles disable quality: `fast_only=true` is accepted, while a winning

@@ -356,6 +356,12 @@ impl PressureProfile {
         self.contract().max_embed_concurrency
     }
 
+    /// Maximum simultaneously executing source-read/canonicalization workers.
+    #[must_use]
+    pub(crate) const fn indexing_worker_limit(self) -> u8 {
+        self.contract().max_index_concurrency
+    }
+
     #[must_use]
     const fn contract(self) -> PressureProfileContract {
         match self {
@@ -3441,7 +3447,7 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
             reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
             field: "pressure.profile".into(),
             source: ConfigSource::Runtime,
-            message: "this profile limits blocking model workers and disables quality search, but its indexing concurrency and scheduler limits are not applied yet".into(),
+            message: "this profile limits blocking model and source-preparation workers and disables quality search, but its workload scheduler policy is not applied yet".into(),
         });
     }
     if config.tui.theme != TuiTheme::Dark {

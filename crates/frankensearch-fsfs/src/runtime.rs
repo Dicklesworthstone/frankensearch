@@ -2076,12 +2076,146 @@ impl SearchDashboardState {
 struct IndexCandidate {
     file_path: PathBuf,
     file_key: String,
+    /// Discovery's byte bound also limits a later read if the file grows.
+    byte_len: u64,
     modified_ms: u64,
     ingestion_class: IngestionClass,
     /// What discovery saw, if settled before the walk began (see
     /// [`SourceStamp::settled_before`]); `None` where the platform reports no
     /// change time or the file changed too recently to trust its stamp.
     stamp: Option<SourceStamp>,
+}
+
+/// Bound source staging independently of the embedding batch's item count.
+/// An admitted larger file is processed alone; it is never split or truncated.
+const INDEX_SOURCE_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
+fn index_source_batches<'a, 'source: 'a>(
+    mut candidates: &'a [&'source IndexCandidate],
+    max_items: usize,
+) -> impl Iterator<Item = &'a [&'source IndexCandidate]> + 'a {
+    std::iter::from_fn(move || {
+        if candidates.is_empty() {
+            return None;
+        }
+        let mut bytes = 0_u64;
+        let mut count = 0;
+        for candidate in candidates.iter().take(max_items.max(1)) {
+            let source_bytes = if candidate.ingestion_class == IngestionClass::MetadataOnly {
+                0
+            } else {
+                candidate.byte_len
+            };
+            if count > 0 && bytes.saturating_add(source_bytes) > INDEX_SOURCE_BATCH_BYTES {
+                break;
+            }
+            count += 1;
+            bytes = bytes.saturating_add(source_bytes);
+        }
+        let (batch, remaining) = candidates.split_at(count);
+        candidates = remaining;
+        Some(batch)
+    })
+}
+
+#[derive(Debug)]
+struct PreparedIndexSource {
+    content_hash_hex: String,
+    classification: Option<FileClassificationDecision>,
+    /// Absent when PDF extraction or content classification excludes a source.
+    text: Option<(String, String)>,
+}
+
+#[derive(Debug)]
+struct IndexSourceChanged {
+    file_key: String,
+}
+
+impl std::fmt::Display for IndexSourceChanged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "source {} grew after discovery; retry indexing the current source instead of exceeding its admitted byte bound",
+            self.file_key,
+        )
+    }
+}
+
+impl std::error::Error for IndexSourceChanged {}
+
+/// Pure preparation on a bounded worker: no index, checkpoint or manifest writes.
+fn prepare_index_source(cx: &Cx, candidate: &IndexCandidate) -> SearchResult<PreparedIndexSource> {
+    FsfsRuntime::semantic_retry_checkpoint(cx, "index.source_prepare")?;
+    if candidate.ingestion_class == IngestionClass::Skip {
+        return Err(SearchError::InvalidConfig {
+            field: "index.source_prepare".to_owned(),
+            value: candidate.file_key.clone(),
+            reason: "an excluded source cannot be admitted for reading".to_owned(),
+        });
+    }
+    let canonicalizer = DefaultCanonicalizer::default();
+    if candidate.ingestion_class == IngestionClass::MetadataOnly {
+        if !fs::metadata(&candidate.file_path)?.is_file() {
+            return Err(std::io::Error::new(
+                ErrorKind::IsADirectory,
+                "metadata-only source is no longer a regular file",
+            )
+            .into());
+        }
+        return Ok(PreparedIndexSource {
+            content_hash_hex: String::new(),
+            classification: None,
+            text: Some((
+                canonicalizer.canonicalize(&candidate.file_key),
+                String::new(),
+            )),
+        });
+    }
+
+    let mut source =
+        fs::File::open(&candidate.file_path)?.take(candidate.byte_len.saturating_add(1));
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        FsfsRuntime::semantic_retry_checkpoint(cx, "index.source_read")?;
+        let read = match source.read(&mut buffer) {
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > candidate.byte_len {
+            return Err(SearchError::SubsystemError {
+                subsystem: "fsfs.index.source_changed",
+                source: Box::new(IndexSourceChanged {
+                    file_key: candidate.file_key.clone(),
+                }),
+            });
+        }
+    }
+    let content_hash_hex = content_sha256_hex(&bytes);
+    let mut classification = None;
+    let text = if is_pdf_file(&candidate.file_path) {
+        try_extract_pdf_text(&bytes, &candidate.file_path)
+            .map(|text| canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &text))
+    } else {
+        let decision = FileClassificationContractDefinition::default()
+            .classify_bytes(candidate.file_path.to_string_lossy().as_ref(), &bytes);
+        let text = file_classification_allows_index(&decision).then(|| {
+            canonicalizer
+                .canonicalize_pair(&LEXICAL_CANONICALIZER, &String::from_utf8_lossy(&bytes))
+        });
+        classification = Some(decision);
+        text
+    };
+    FsfsRuntime::semantic_retry_checkpoint(cx, "index.source_prepared")?;
+    Ok(PreparedIndexSource {
+        content_hash_hex,
+        classification,
+        text,
+    })
 }
 
 /// Extend the legacy scan's millisecond timestamps with inode, length, ctime
@@ -6463,6 +6597,15 @@ struct RerankStageOutcome {
 /// this owner outside the scheduler so long ONNX calls cannot escape shutdown.
 pub struct SearchBlockingPool(asupersync::runtime::blocking_pool::BlockingPool);
 
+impl std::fmt::Debug for SearchBlockingPool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SearchBlockingPool")
+            .field("max_workers", &self.0.current_max_threads())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for SearchBlockingPool {
     fn default() -> Self {
         Self(asupersync::runtime::blocking_pool::BlockingPool::new(0, 2))
@@ -6528,6 +6671,9 @@ pub struct FsfsRuntime {
     /// One caller-owned capacity shared by daemon requests and runtime clones.
     /// Only the handle lives here: the caller drains the owner after all users.
     search_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
+    /// Source preparation has its own profile capacity, independent of model
+    /// workers. Clones share the owner; cancellation cannot abandon its jobs.
+    source_preparation_pool: Arc<std::sync::OnceLock<SearchBlockingPool>>,
     #[cfg(feature = "rerank")]
     native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
     #[cfg(feature = "embedded-models")]
@@ -6602,6 +6748,7 @@ impl FsfsRuntime {
             )),
             quality_budget_started_at: None,
             search_blocking_pool: None,
+            source_preparation_pool: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "rerank")]
             native_blocking_pool: None,
             #[cfg(feature = "embedded-models")]
@@ -6613,6 +6760,86 @@ impl FsfsRuntime {
             seeded_from_receipt: false,
             discovery_excluded_root: None,
         }
+    }
+
+    /// Prepare only this bounded source batch, preserving discovery order even
+    /// when later files finish first. The worker pool owns executing reads until
+    /// completion after a caller cancellation; queued jobs are cancellable.
+    async fn prepare_index_sources_with<F>(
+        &self,
+        cx: &Cx,
+        control: &mut IndexRunControl,
+        candidates: &[&IndexCandidate],
+        prepare: F,
+    ) -> SearchResult<Vec<SearchResult<PreparedIndexSource>>>
+    where
+        F: Fn(&Cx, &IndexCandidate) -> SearchResult<PreparedIndexSource> + Send + Sync + 'static,
+    {
+        let capacity = usize::from(self.config.pressure.profile.indexing_worker_limit());
+        let pool = self.source_preparation_pool.get_or_init(|| {
+            SearchBlockingPool(asupersync::runtime::blocking_pool::BlockingPool::new(
+                0, capacity,
+            ))
+        });
+        let worker_cx = cx.clone().with_blocking_pool_handle(Some(pool.handle()));
+        let prepare = Arc::new(prepare);
+        let mut prepared = Vec::with_capacity(candidates.len());
+        for window in candidates.chunks(capacity) {
+            control.admit_work(cx, "index.source_batch").await?;
+            let mut work = window
+                .iter()
+                .copied()
+                .cloned()
+                .map(|candidate| {
+                    let cx = cx.clone();
+                    let prepare = Arc::clone(&prepare);
+                    Box::pin(spawn_blocking(move || {
+                        // A pool shutdown/worker-start failure can make the
+                        // dependency dispatch inline. Never read or parse a
+                        // source on the async executor in that fallback.
+                        if Cx::is_active() {
+                            return Err(SearchError::SubsystemError {
+                                subsystem: "fsfs.index.source_worker",
+                                source: "source preparation worker was not dispatched to its blocking pool".into(),
+                            });
+                        }
+                        Self::semantic_retry_checkpoint(&cx, "index.source_prepare")?;
+                        prepare(&cx, &candidate)
+                    }))
+                })
+                .collect::<Vec<_>>();
+            let mut results = std::iter::repeat_with(|| None)
+                .take(work.len())
+                .collect::<Vec<_>>();
+            let batch = with_cancellation(
+                cx,
+                "index.source_prepare",
+                std::future::poll_fn(|task| {
+                    // The free blocking helper chooses the currently installed
+                    // caller pool. Scope the guard to this poll, never an await.
+                    let _current = Cx::set_current(Some(worker_cx.clone()));
+                    for (index, future) in work.iter_mut().enumerate() {
+                        if results[index].is_none()
+                            && let Poll::Ready(result) = future.as_mut().poll(task)
+                        {
+                            results[index] = Some(result);
+                        }
+                    }
+                    if results.iter().all(Option::is_some) {
+                        Poll::Ready(Ok(results
+                            .iter_mut()
+                            .map(|result| result.take().expect("every source worker completed"))
+                            .collect::<Vec<_>>()))
+                    } else {
+                        Poll::Pending
+                    }
+                }),
+            )
+            .await?;
+            prepared.extend(batch);
+            control.checkpoint(cx, "index.sources_prepared", true)?;
+        }
+        Ok(prepared)
     }
 
     /// Enable or disable zero-I/O code-navigation ranking priors (`code_structure_sidecar`
@@ -19467,8 +19694,6 @@ impl FsfsRuntime {
             lexical_index.delete_all(cx).await?;
         }
 
-        let canonicalizer = DefaultCanonicalizer::default();
-        let file_classification_contract = FileClassificationContractDefinition::default();
         let mut manifests = BTreeMap::<String, IndexManifestEntry>::new();
         let mut resume_reuse = BTreeMap::<String, CheckpointReuse>::new();
         let mut validated_content_hashes = HashMap::<String, String>::new();
@@ -19810,7 +20035,7 @@ impl FsfsRuntime {
             discard_undurable_lexical_generation || lexical_plan.publish_pointer.is_some();
 
         // 3. Process in batches
-        for chunk in reading.chunks(batch_size) {
+        for chunk in index_source_batches(&reading, batch_size) {
             control.admit_work(cx, "index.batch").await?;
             if checkpoint_durable_on_disk {
                 checkpoint.artifacts_durable = false;
@@ -19821,8 +20046,12 @@ impl FsfsRuntime {
             }
             let mut chunk_docs = Vec::with_capacity(chunk.len());
 
-            // Read & Canonicalize
-            for candidate in chunk {
+            // Read, hash and canonicalize on bounded source workers. Only this
+            // coordinator updates checkpoint/manifests in discovery order.
+            let prepared = self
+                .prepare_index_sources_with(cx, &mut control, chunk, prepare_index_source)
+                .await?;
+            for (candidate, prepared) in chunk.iter().copied().zip(prepared) {
                 control.checkpoint(cx, "index.file", false)?;
                 let mut reuse = resume_reuse
                     .get(&candidate.file_key)
@@ -19837,16 +20066,9 @@ impl FsfsRuntime {
                     remaining_reused_semantic = remaining_reused_semantic.saturating_sub(1);
                 }
 
-                let (read, _) = read_ingestion_source(
-                    cx,
-                    &candidate.file_path,
-                    candidate.ingestion_class,
-                    None,
-                )
-                .await?;
-                let bytes = match read {
-                    Ok(bytes) => bytes,
-                    Err(error) if is_ignorable_index_walk_error(&error) => {
+                let prepared = match prepared {
+                    Ok(prepared) => prepared,
+                    Err(SearchError::Io(error)) if is_ignorable_index_walk_error(&error) => {
                         if error.kind() == ErrorKind::PermissionDenied {
                             observed_reason_codes
                                 .insert(REASON_DISCOVERY_FILE_PERMISSION_DENIED.to_owned());
@@ -19854,18 +20076,13 @@ impl FsfsRuntime {
                         content_skipped_files = content_skipped_files.saturating_add(1);
                         continue;
                     }
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(error),
                 };
                 control.checkpoint(cx, "index.file_loaded", false)?;
                 // An empty digest explicitly carries no evidence about source
                 // bytes. Metadata-only paths are rebuilt from stat/path input;
                 // they never manufacture a digest of a filename as a body proof.
-                let content_hash_hex = if candidate.ingestion_class == IngestionClass::MetadataOnly
-                {
-                    String::new()
-                } else {
-                    content_sha256_hex(&bytes)
-                };
+                let content_hash_hex = prepared.content_hash_hex;
                 if validated_content_hashes
                     .get(&candidate.file_key)
                     .is_some_and(|validated| validated != &content_hash_hex)
@@ -19873,51 +20090,22 @@ impl FsfsRuntime {
                     reuse = CheckpointReuse::None;
                 }
 
-                // PDF files are binary but contain extractable text.
-                // Try PDF extraction before the generic binary check.
-                let mut classification_metadata = None;
-                let (canonical, lexical_text) =
-                    if candidate.ingestion_class == IngestionClass::MetadataOnly {
-                        (
-                            canonicalizer.canonicalize(&candidate.file_key),
-                            String::new(),
-                        )
-                    } else if is_pdf_file(&candidate.file_path) {
-                        match try_extract_pdf_text(&bytes, &candidate.file_path) {
-                            Some(pdf_text) => {
-                                canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &pdf_text)
-                            }
-                            None => {
-                                record_content_skip(
-                                    &mut checkpoint,
-                                    candidate,
-                                    None,
-                                    &content_hash_hex,
-                                );
-                                content_skipped_files = content_skipped_files.saturating_add(1);
-                                continue;
-                            }
-                        }
-                    } else {
-                        let path_for_contract = candidate.file_path.to_string_lossy();
-                        let classification = file_classification_contract
-                            .classify_bytes(path_for_contract.as_ref(), &bytes);
-                        observed_reason_codes.insert(classification.reason_code.clone());
-                        if !file_classification_allows_index(&classification) {
-                            record_content_skip(
-                                &mut checkpoint,
-                                candidate,
-                                Some(&classification.reason_code),
-                                &content_hash_hex,
-                            );
-                            content_skipped_files = content_skipped_files.saturating_add(1);
-                            continue;
-                        }
-
-                        let raw_text = String::from_utf8_lossy(&bytes);
-                        classification_metadata = Some(classification);
-                        canonicalizer.canonicalize_pair(&LEXICAL_CANONICALIZER, &raw_text)
-                    };
+                let classification_metadata = prepared.classification;
+                if let Some(classification) = classification_metadata.as_ref() {
+                    observed_reason_codes.insert(classification.reason_code.clone());
+                }
+                let Some((canonical, lexical_text)) = prepared.text else {
+                    record_content_skip(
+                        &mut checkpoint,
+                        candidate,
+                        classification_metadata
+                            .as_ref()
+                            .map(|classification| classification.reason_code.as_str()),
+                        &content_hash_hex,
+                    );
+                    content_skipped_files = content_skipped_files.saturating_add(1);
+                    continue;
+                };
 
                 if canonical.trim().is_empty() {
                     observed_reason_codes.insert(REASON_DISCOVERY_FILE_EXCLUDED.to_owned());
@@ -24528,6 +24716,7 @@ impl FsfsRuntime {
             output.push(IndexCandidate {
                 file_path: entry_path.clone(),
                 file_key: normalize_file_key_for_index(&entry_path, target_root),
+                byte_len: metadata.len(),
                 modified_ms,
                 ingestion_class: decision.ingestion_class,
                 stamp,
@@ -35683,6 +35872,444 @@ mod tests {
                 &rebound.reranker_load_gate
             ));
         }
+    }
+
+    #[test]
+    fn source_preparation_profile_capacity_is_shared_across_concurrent_batches() {
+        for (profile, capacity) in [
+            (PressureProfile::Degraded, 1),
+            (PressureProfile::Strict, 2),
+            (PressureProfile::Performance, 8),
+        ] {
+            run_test_with_cx(|cx| async move {
+                let temp = tempfile::tempdir().unwrap();
+                let candidates = (0..capacity)
+                    .map(|index| {
+                        let path = temp.path().join(format!("source-{index}.md"));
+                        fs::write(&path, format!("source preparation document {index}\n")).unwrap();
+                        super::IndexCandidate {
+                            byte_len: fs::metadata(&path).unwrap().len(),
+                            file_key: format!("source-{index}.md"),
+                            file_path: path,
+                            modified_ms: 0,
+                            ingestion_class: IngestionClass::FullSemanticLexical,
+                            stamp: None,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let sources = candidates.iter().collect::<Vec<_>>();
+                let mut config = FsfsConfig::default();
+                config.pressure.profile = profile;
+                // Source capacity must not inherit the smaller model pool.
+                let model_pool = super::SearchBlockingPool::for_profile(PressureProfile::Degraded);
+                let runtime =
+                    FsfsRuntime::new(config.clone()).with_search_blocking_pool(model_pool.handle());
+                let other = runtime.clone();
+                let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+                let started = Arc::new(AtomicUsize::new(0));
+                let caller = thread::current().id();
+                let prepare = {
+                    let gate = Arc::clone(&gate);
+                    let started = Arc::clone(&started);
+                    move |cx: &Cx, candidate: &super::IndexCandidate| {
+                        assert_ne!(thread::current().id(), caller);
+                        started.fetch_add(1, Ordering::SeqCst);
+                        let (lock, ready) = &*gate;
+                        let held = lock.lock().unwrap();
+                        let (held, timeout) = ready
+                            .wait_timeout_while(held, Duration::from_secs(5), |open| !*open)
+                            .unwrap();
+                        assert!(*held && !timeout.timed_out(), "source workers released");
+                        drop(held);
+                        super::prepare_index_source(cx, candidate)
+                    }
+                };
+                let mut first_control = super::IndexRunControl::new(&config).unwrap();
+                let mut second_control = super::IndexRunControl::new(&config).unwrap();
+                let mut first = Box::pin(runtime.prepare_index_sources_with(
+                    &cx,
+                    &mut first_control,
+                    &sources,
+                    prepare.clone(),
+                ));
+                let mut second = Box::pin(other.prepare_index_sources_with(
+                    &cx,
+                    &mut second_control,
+                    &sources,
+                    prepare,
+                ));
+                let deadline = Instant::now() + Duration::from_secs(5);
+                poll_fn(|task| {
+                    assert!(first.as_mut().poll(task).is_pending());
+                    assert!(second.as_mut().poll(task).is_pending());
+                    let pool = runtime.source_preparation_pool.get().unwrap().handle();
+                    assert!(started.load(Ordering::SeqCst) <= capacity);
+                    if pool.busy_threads() == capacity
+                        && pool.pending_count() >= capacity
+                        && started.load(Ordering::SeqCst) == capacity
+                    {
+                        Poll::Ready(())
+                    } else {
+                        assert!(
+                            Instant::now() < deadline,
+                            "both batches reach the shared pool"
+                        );
+                        task.waker().wake_by_ref();
+                        Poll::Pending
+                    }
+                })
+                .await;
+                assert_eq!(started.load(Ordering::SeqCst), capacity);
+                assert!(Arc::ptr_eq(
+                    &runtime.source_preparation_pool,
+                    &other.source_preparation_pool
+                ));
+                *gate.0.lock().unwrap() = true;
+                gate.1.notify_all();
+                for batch in [first.await.unwrap(), second.await.unwrap()] {
+                    for (index, prepared) in batch.into_iter().enumerate() {
+                        let prepared = prepared.unwrap();
+                        assert_eq!(
+                            prepared.content_hash_hex,
+                            super::content_sha256_hex(
+                                &fs::read(&candidates[index].file_path).unwrap(),
+                            )
+                        );
+                        assert!(
+                            prepared
+                                .text
+                                .unwrap()
+                                .1
+                                .contains(&format!("document {index}"))
+                        );
+                    }
+                }
+                assert_eq!(started.load(Ordering::SeqCst), capacity * 2);
+            });
+        }
+    }
+
+    #[test]
+    fn source_preparation_preserves_discovery_order_after_reverse_completion() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let candidates = ["first.md", "second.md"].map(|name| {
+                let path = temp.path().join(name);
+                fs::write(&path, format!("distinct source {name}\n")).unwrap();
+                super::IndexCandidate {
+                    byte_len: fs::metadata(&path).unwrap().len(),
+                    file_key: name.to_owned(),
+                    file_path: path,
+                    modified_ms: 0,
+                    ingestion_class: IngestionClass::FullSemanticLexical,
+                    stamp: None,
+                }
+            });
+            let sources = candidates.iter().collect::<Vec<_>>();
+            let mut config = FsfsConfig::default();
+            config.pressure.profile = PressureProfile::Strict;
+            let runtime = FsfsRuntime::new(config.clone());
+            let mut control = super::IndexRunControl::new(&config).unwrap();
+            let (second_done, first_may_finish) = std::sync::mpsc::channel();
+            let first_may_finish = std::sync::Mutex::new(first_may_finish);
+            let completion = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let completed = Arc::clone(&completion);
+            let prepared = runtime
+                .prepare_index_sources_with(&cx, &mut control, &sources, move |cx, candidate| {
+                    let prepared = super::prepare_index_source(cx, candidate)?;
+                    if candidate.file_key == "first.md" {
+                        first_may_finish
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .unwrap();
+                        completed.lock().unwrap().push(candidate.file_key.clone());
+                    } else {
+                        completed.lock().unwrap().push(candidate.file_key.clone());
+                        second_done.send(()).unwrap();
+                    }
+                    Ok(prepared)
+                })
+                .await
+                .unwrap();
+            assert_eq!(*completion.lock().unwrap(), ["second.md", "first.md"]);
+            for (candidate, prepared) in candidates.iter().zip(prepared) {
+                assert!(
+                    prepared
+                        .unwrap()
+                        .text
+                        .unwrap()
+                        .1
+                        .contains(&candidate.file_key)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn source_preparation_cancellation_retains_running_capacity_and_cancels_queued_reads() {
+        run_test_with_cx(|_cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("source.md");
+            fs::write(&path, "source preparation cancellation\n").unwrap();
+            let candidate = super::IndexCandidate {
+                byte_len: fs::metadata(&path).unwrap().len(),
+                file_path: path,
+                file_key: "source.md".to_owned(),
+                modified_ms: 0,
+                ingestion_class: IngestionClass::FullSemanticLexical,
+                stamp: None,
+            };
+            let sources = [&candidate];
+            let mut config = FsfsConfig::default();
+            config.pressure.profile = PressureProfile::Degraded;
+            let runtime = FsfsRuntime::new(config.clone());
+            let other = runtime.clone();
+            let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+            let started = Arc::new(AtomicBool::new(false));
+            let held_gate = Arc::clone(&gate);
+            let held_started = Arc::clone(&started);
+            let cancelled = Cx::for_testing();
+            let mut first_control = super::IndexRunControl::new(&config).unwrap();
+            let mut first = Box::pin(runtime.prepare_index_sources_with(
+                &cancelled,
+                &mut first_control,
+                &sources,
+                move |cx, candidate| {
+                    held_started.store(true, Ordering::SeqCst);
+                    let (lock, ready) = &*held_gate;
+                    let held = lock.lock().unwrap();
+                    let (held, timeout) = ready
+                        .wait_timeout_while(held, Duration::from_secs(5), |open| !*open)
+                        .unwrap();
+                    assert!(
+                        *held && !timeout.timed_out(),
+                        "running source worker released"
+                    );
+                    drop(held);
+                    super::prepare_index_source(cx, candidate)
+                },
+            ));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            poll_fn(|task| {
+                assert!(first.as_mut().poll(task).is_pending());
+                if started.load(Ordering::SeqCst) {
+                    Poll::Ready(())
+                } else {
+                    assert!(Instant::now() < deadline);
+                    task.waker().wake_by_ref();
+                    Poll::Pending
+                }
+            })
+            .await;
+            cancelled.set_cancel_requested(true);
+            assert!(matches!(first.await, Err(SearchError::Cancelled { .. })));
+            assert_eq!(
+                runtime
+                    .source_preparation_pool
+                    .get()
+                    .unwrap()
+                    .handle()
+                    .busy_threads(),
+                1
+            );
+
+            let queued_cx = Cx::for_testing();
+            let queued_ran = Arc::new(AtomicBool::new(false));
+            let queued_flag = Arc::clone(&queued_ran);
+            let mut queued_control = super::IndexRunControl::new(&config).unwrap();
+            let mut queued = Box::pin(other.prepare_index_sources_with(
+                &queued_cx,
+                &mut queued_control,
+                &sources,
+                move |cx, candidate| {
+                    queued_flag.store(true, Ordering::SeqCst);
+                    super::prepare_index_source(cx, candidate)
+                },
+            ));
+            poll_fn(|task| {
+                assert!(queued.as_mut().poll(task).is_pending());
+                assert_eq!(
+                    other
+                        .source_preparation_pool
+                        .get()
+                        .unwrap()
+                        .handle()
+                        .pending_count(),
+                    1
+                );
+                Poll::Ready(())
+            })
+            .await;
+            queued_cx.set_cancel_requested(true);
+            assert!(matches!(queued.await, Err(SearchError::Cancelled { .. })));
+            assert!(!queued_ran.load(Ordering::SeqCst));
+
+            let fresh = Cx::for_testing();
+            let mut resumed_control = super::IndexRunControl::new(&config).unwrap();
+            let mut resumed = Box::pin(other.prepare_index_sources_with(
+                &fresh,
+                &mut resumed_control,
+                &sources,
+                super::prepare_index_source,
+            ));
+            poll_fn(|task| {
+                assert!(resumed.as_mut().poll(task).is_pending());
+                assert_eq!(
+                    runtime
+                        .source_preparation_pool
+                        .get()
+                        .unwrap()
+                        .handle()
+                        .busy_threads(),
+                    1
+                );
+                Poll::Ready(())
+            })
+            .await;
+            *gate.0.lock().unwrap() = true;
+            gate.1.notify_all();
+            let mut ready = resumed.await.unwrap();
+            assert!(ready.remove(0).unwrap().text.is_some());
+            assert!(
+                !queued_ran.load(Ordering::SeqCst),
+                "cancelled queued work never opened a body"
+            );
+        });
+    }
+
+    #[test]
+    fn source_preparation_bounds_staging_and_refuses_growth_without_reading_metadata_bodies() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("source.md");
+        fs::write(&path, "source grew after discovery\n").unwrap();
+        let mut candidate = super::IndexCandidate {
+            file_path: path,
+            file_key: "source.md".to_owned(),
+            byte_len: 1,
+            modified_ms: 0,
+            ingestion_class: IngestionClass::FullSemanticLexical,
+            stamp: None,
+        };
+        let cx = Cx::for_testing();
+        assert!(matches!(super::prepare_index_source(&cx, &candidate),
+            Err(SearchError::SubsystemError { source, .. }) if source.is::<super::IndexSourceChanged>()));
+        candidate.ingestion_class = IngestionClass::MetadataOnly;
+        candidate.byte_len = 0;
+        let metadata = super::prepare_index_source(&cx, &candidate).unwrap();
+        assert!(metadata.content_hash_hex.is_empty());
+        assert_eq!(metadata.text.unwrap().1, "");
+        candidate.ingestion_class = IngestionClass::Skip;
+        candidate.file_path = temp.path().join("absent-excluded.md");
+        assert!(matches!(super::prepare_index_source(&cx, &candidate),
+            Err(SearchError::InvalidConfig { field, .. }) if field == "index.source_prepare"));
+
+        let mut large = candidate.clone();
+        large.ingestion_class = IngestionClass::LexicalOnly;
+        large.byte_len = super::INDEX_SOURCE_BATCH_BYTES;
+        let mut small = large.clone();
+        small.byte_len = 1;
+        let mut oversized = large.clone();
+        oversized.byte_len += 1;
+        let sources = [&large, &small, &oversized, &small, &small, &small];
+        let batches = super::index_source_batches(&sources, 2).collect::<Vec<_>>();
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
+            [1, 1, 1, 2, 1]
+        );
+        assert!(std::ptr::eq(batches[2][0], &oversized));
+        assert_eq!(
+            batches.iter().map(|batch| batch.len()).sum::<usize>(),
+            sources.len()
+        );
+    }
+
+    #[test]
+    fn source_preparation_parallel_index_preserves_lexical_membership_and_results() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            fs::create_dir_all(source.join(".git")).unwrap();
+            fs::write(
+                source.join("first.md"),
+                "badger indexing recovery recovery\n",
+            )
+            .unwrap();
+            fs::write(
+                source.join("second.md"),
+                "badger ordered source processing\n",
+            )
+            .unwrap();
+            fs::write(source.join("empty.md"), " \n\n").unwrap();
+            fs::write(source.join("binary.md"), b"\0\0\0\0binary payload\0\0").unwrap();
+            fs::write(
+                source.join("server.log"),
+                "private_body_must_not_be_indexed\n",
+            )
+            .unwrap();
+            let mut expected = None;
+            for (profile, root_name) in [
+                (PressureProfile::Degraded, "serial"),
+                (PressureProfile::Performance, "parallel"),
+            ] {
+                let root = temp.path().join(root_name);
+                let mut config = FsfsConfig::default();
+                config.pressure.profile = profile;
+                config.storage.index_dir = root.display().to_string();
+                let runtime = FsfsRuntime::new(config)
+                    .with_lexical_only_indexing()
+                    .with_cli_input(CliInput {
+                        command: CliCommand::Index,
+                        target_path: Some(source.clone()),
+                        index_dir: Some(root.clone()),
+                        ..CliInput::default()
+                    });
+                Box::pin(runtime.run_one_shot_index_scaffold_internal(
+                    &cx,
+                    CliCommand::Index,
+                    |_| Ok(()),
+                    false,
+                    false,
+                ))
+                .await
+                .unwrap();
+                let manifests = FsfsRuntime::read_index_manifest(&root).unwrap().unwrap();
+                let resources = runtime
+                    .prepare_search_execution_resources(
+                        &cx,
+                        super::SearchExecutionMode::LexicalOnly,
+                    )
+                    .await
+                    .unwrap();
+                let lexical = resources.lexical_index.as_ref().unwrap();
+                let mut results = Vec::new();
+                for query in [
+                    "badger",
+                    "recovery",
+                    "server",
+                    "private_body_must_not_be_indexed",
+                ] {
+                    results.push(
+                        lexical
+                            .search_doc_ids(&cx, query, 10)
+                            .unwrap()
+                            .into_iter()
+                            .map(|hit| hit.document_id)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                assert_eq!(results[0].len(), 2);
+                assert_eq!(results[1], ["first.md"]);
+                assert_eq!(results[2], ["server.log"]);
+                assert!(results[3].is_empty());
+                if let Some((expected_manifests, expected_results)) = expected.as_ref() {
+                    assert_eq!(&manifests, expected_manifests);
+                    assert_eq!(&results, expected_results);
+                } else {
+                    expected = Some((manifests, results));
+                }
+            }
+        });
     }
 
     #[cfg(unix)]
@@ -59243,6 +59870,7 @@ mod tests {
         let candidate = super::IndexCandidate {
             file_path: PathBuf::from("/tmp/project/src/main.rs"),
             file_key: "src/main.rs".to_owned(),
+            byte_len: 1_024,
             modified_ms: 42,
             ingestion_class: IngestionClass::FullSemanticLexical,
             stamp: None,

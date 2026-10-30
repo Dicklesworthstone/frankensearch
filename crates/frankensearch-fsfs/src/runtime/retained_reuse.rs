@@ -2028,6 +2028,7 @@ mod generation_tests {
                 let probe = IndexCandidate {
                     file_path: source.join("doc-0.md"),
                     file_key: "doc-0.md".to_owned(),
+                    byte_len: fs::metadata(source.join("doc-0.md")).unwrap().len(),
                     modified_ms: u64::try_from(entry.revision).unwrap(),
                     ingestion_class: IngestionClass::FullSemanticLexical,
                     stamp: None,
@@ -3275,6 +3276,7 @@ mod generation_tests {
             let probe = IndexCandidate {
                 file_path: path.clone(),
                 file_key: key.clone(),
+                byte_len: fs::metadata(&path).unwrap().len(),
                 modified_ms: u64::try_from(entry.revision).unwrap(),
                 ingestion_class: IngestionClass::FullSemanticLexical,
                 stamp: None,
