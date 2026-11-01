@@ -2428,8 +2428,32 @@ mod tests {
             let error = validate_download_config(&config).unwrap_err();
             assert!(matches!(
                 error,
-                SearchError::InvalidConfig { ref field: actual, .. } if actual == field
+                SearchError::InvalidConfig { field: ref actual, .. } if actual == field
             ));
+
+            let destination_root = tempfile::tempdir().unwrap();
+            let destination = destination_root.path().join("must-not-exist");
+            let manifest = ModelManifest::minilm_v2();
+            let mut lifecycle = ModelLifecycle::new(
+                manifest.clone(),
+                DownloadConsent::granted(ConsentSource::Programmatic),
+            );
+            run_test_with_cx(|cx| async move {
+                let downloader = ModelDownloader::new(config);
+                let error = downloader
+                    .download_model(&cx, &manifest, &destination, &mut lifecycle, |_| {})
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field: ref actual, .. } if actual == field
+                ));
+                assert!(!destination.exists());
+                assert!(matches!(
+                    lifecycle.state(),
+                    ModelState::VerificationFailed { .. }
+                ));
+            });
         }
     }
 
