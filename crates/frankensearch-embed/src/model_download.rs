@@ -8,14 +8,16 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{File, OpenOptions, TryLockError};
-use std::future::poll_fn;
+use std::future::{Future, poll_fn};
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use asupersync::bytes::Buf;
+use asupersync::channel::oneshot;
 use asupersync::http::body::{Body, Frame};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -65,6 +67,13 @@ pub struct DownloadConfig {
     pub max_retries: u32,
     /// Base delay for exponential backoff between retries.
     pub retry_base_delay: Duration,
+    /// Maximum wait for each request's connection, proxy handshake and response
+    /// headers, including redirect hops individually. Defaults to 60 seconds.
+    pub request_timeout: Duration,
+    /// Maximum time without receiving nonempty model bytes after the response
+    /// headers. Defaults to 60 seconds. Progressing large downloads have no
+    /// total wall-clock limit; the caller's shorter deadline still applies.
+    pub idle_timeout: Duration,
     /// User-Agent header value.
     pub user_agent: String,
     /// Maximum redirects to follow. Proxy selection and bypass rules are
@@ -89,6 +98,8 @@ impl Default for DownloadConfig {
         Self {
             max_retries: 3,
             retry_base_delay: Duration::from_secs(1),
+            request_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
             user_agent: format!("frankensearch/{}", env!("CARGO_PKG_VERSION")),
             max_redirects: 5,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
@@ -470,6 +481,7 @@ impl ModelDownloader {
         // Lift the codec's 16 MiB default body cap; model artifacts routinely
         // exceed it. Streaming-to-disk keeps memory bounded regardless.
         client_config.max_body_size = Some(self.config.max_response_bytes);
+        client_config.request_timeout = Some(self.config.request_timeout);
         client_config.proxy_url = proxy_from_environment(&self.config.proxy, url);
         HttpClient::with_config(client_config)
     }
@@ -762,6 +774,10 @@ impl ModelDownloader {
         lifecycle: &mut ModelLifecycle,
         on_progress: impl Fn(&DownloadProgress) + Send + Sync,
     ) -> SearchResult<PathBuf> {
+        if let Err(error) = validate_download_config(&self.config) {
+            lifecycle.fail_verification(bounded_download_failure_reason(&error));
+            return Err(error);
+        }
         if let Err(error) = check_acquisition_cancel(cx, "download-start") {
             lifecycle.cancel();
             return Err(error);
@@ -919,15 +935,17 @@ impl ModelDownloader {
         for attempt in 0..=self.config.max_retries {
             check_acquisition_cancel(cx, "download-retry")?;
             if attempt > 0 {
-                let delay = self.config.retry_base_delay * 2_u32.saturating_pow(attempt - 1);
+                let delay = self
+                    .config
+                    .retry_base_delay
+                    .saturating_mul(2_u32.saturating_pow(attempt - 1));
                 warn!(
                     file = %file.name,
                     attempt,
                     delay_ms = delay.as_millis(),
                     "retrying download after failure"
                 );
-                asupersync::time::sleep(cx.now(), delay).await;
-                check_acquisition_cancel(cx, "download-backoff")?;
+                wait_download_retry(cx, url, delay).await?;
             }
 
             match self
@@ -968,6 +986,7 @@ impl ModelDownloader {
         files_total: usize,
         on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
     ) -> SearchResult<()> {
+        validate_download_config(&self.config)?;
         let start = Instant::now();
         check_acquisition_cancel(cx, "download-request")?;
 
@@ -987,13 +1006,16 @@ impl ModelDownloader {
         // selected proxy only. Drop redirect bodies without buffering them.
         let mut request_url = url.to_owned();
         let mut redirects = 0_u32;
-        let mut response = loop {
+        let response = loop {
             check_acquisition_cancel(cx, "download-request")?;
-            let response = self
-                .http_client_for(&request_url)
-                .request_streaming(cx, Method::Get, &request_url, Vec::new(), Vec::new())
-                .await
-                .map_err(|e| client_error_to_search(e, &request_url))?;
+            let response =
+                run_download_request(cx, &request_url, self.config.request_timeout, async {
+                    self.http_client_for(&request_url)
+                        .request_streaming(cx, Method::Get, &request_url, Vec::new(), Vec::new())
+                        .await
+                        .map_err(|e| client_error_to_search(e, &request_url))
+                })
+                .await?;
             check_acquisition_cancel(cx, "download-response")?;
             if !matches!(response.head.status, 301 | 302 | 303 | 307 | 308) {
                 break response;
@@ -1061,69 +1083,50 @@ impl ModelDownloader {
         let mut hasher = Sha256::new();
         let mut bytes_downloaded: u64 = 0;
 
-        while let Some(frame) = poll_fn(|cx| Pin::new(&mut response.body).poll_frame(cx)).await {
-            check_acquisition_cancel(cx, "download-stream")?;
-            let frame = frame.map_err(|e| SearchError::ModelLoadFailed {
-                path: PathBuf::from("<redacted-model-stage>"),
-                source: format!(
-                    "stream read failed via host {} ({})",
-                    diagnostic_source_host(url),
-                    bounded_http_body_error(&e)
-                )
-                .into(),
-            })?;
-            if let Frame::Data(mut chunk) = frame {
-                while chunk.has_remaining() {
-                    check_acquisition_cancel(cx, "download-chunk")?;
-                    let bytes = chunk.chunk();
-                    if bytes.is_empty() {
-                        break;
-                    }
-                    let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-                    let next_size = bytes_downloaded.checked_add(byte_count).ok_or_else(|| {
-                        SearchError::HashMismatch {
-                            path: dest.to_path_buf(),
-                            expected: format!("size={}", file.size),
-                            actual: "size-overflow".to_owned(),
-                        }
-                    })?;
-                    if file.size > 0 && next_size > file.size {
-                        return Err(SearchError::HashMismatch {
-                            path: dest.to_path_buf(),
-                            expected: format!("size={}", file.size),
-                            actual: format!("size-at-least={next_size}"),
-                        });
-                    }
-                    tmp_file.write_all(bytes).map_err(SearchError::from)?;
-                    hasher.update(bytes);
-                    bytes_downloaded = next_size;
-                    chunk.advance(bytes.len());
+        stream_download_body(cx, url, response.body, self.config.idle_timeout, |bytes| {
+            let byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            let next_size = bytes_downloaded.checked_add(byte_count).ok_or_else(|| {
+                SearchError::HashMismatch {
+                    path: dest.to_path_buf(),
+                    expected: format!("size={}", file.size),
+                    actual: "size-overflow".to_owned(),
                 }
-
-                let elapsed = start.elapsed();
-                let speed = if elapsed.as_secs_f64() > 0.0 {
-                    bytes_downloaded as f64 / elapsed.as_secs_f64()
-                } else {
-                    0.0
-                };
-                let eta_seconds = total_bytes.and_then(|total| {
-                    if speed <= f64::EPSILON || bytes_downloaded >= total {
-                        None
-                    } else {
-                        Some((total.saturating_sub(bytes_downloaded)) as f64 / speed)
-                    }
-                });
-                on_progress(&DownloadProgress {
-                    file_name: file.name.clone(),
-                    bytes_downloaded,
-                    total_bytes,
-                    files_completed: file_idx,
-                    files_total,
-                    speed_bytes_per_sec: speed,
-                    eta_seconds,
+            })?;
+            if file.size > 0 && next_size > file.size {
+                return Err(SearchError::HashMismatch {
+                    path: dest.to_path_buf(),
+                    expected: format!("size={}", file.size),
+                    actual: format!("size-at-least={next_size}"),
                 });
             }
-        }
+            tmp_file.write_all(bytes).map_err(SearchError::from)?;
+            hasher.update(bytes);
+            bytes_downloaded = next_size;
+            let elapsed = start.elapsed();
+            let speed = if elapsed.as_secs_f64() > 0.0 {
+                bytes_downloaded as f64 / elapsed.as_secs_f64()
+            } else {
+                0.0
+            };
+            let eta_seconds = total_bytes.and_then(|total| {
+                if speed <= f64::EPSILON || bytes_downloaded >= total {
+                    None
+                } else {
+                    Some((total.saturating_sub(bytes_downloaded)) as f64 / speed)
+                }
+            });
+            on_progress(&DownloadProgress {
+                file_name: file.name.clone(),
+                bytes_downloaded,
+                total_bytes,
+                files_completed: file_idx,
+                files_total,
+                speed_bytes_per_sec: speed,
+                eta_seconds,
+            });
+            Ok(())
+        })
+        .await?;
 
         check_acquisition_cancel(cx, "download-file-sync")?;
         // ubs:ignore — artifact byte counts are public integrity metadata.
@@ -1187,6 +1190,260 @@ impl ModelDownloader {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn validate_download_config(config: &DownloadConfig) -> SearchResult<()> {
+    for (field, value) in [
+        ("download.request_timeout", config.request_timeout),
+        ("download.idle_timeout", config.idle_timeout),
+    ] {
+        if value.is_zero() {
+            return Err(SearchError::InvalidConfig {
+                field: field.to_owned(),
+                value: "0ms".to_owned(),
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+    }
+    if config.max_response_bytes == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "download.max_response_bytes".to_owned(),
+            value: "0".to_owned(),
+            reason: "must be greater than zero".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Bound a pending request independently of socket activity. The transport's
+/// own timeout covers response headers, but its I/O cannot wake for every Cx
+/// cancellation (notably a silent CONNECT or SOCKS handshake).
+async fn run_download_request<T: Send>(
+    cx: &Cx,
+    url: &str,
+    timeout: Duration,
+    work: impl Future<Output = SearchResult<T>> + Send,
+) -> SearchResult<T> {
+    let started = cx.now();
+    let ambient_started = asupersync::time::wall_now();
+    let wall_started = Instant::now();
+    let progress = AtomicU64::new(0);
+    run_download_io_with_elapsed(cx, url, timeout, &progress, work, || {
+        Duration::from_nanos(cx.now().duration_since(started))
+            .max(Duration::from_nanos(
+                asupersync::time::wall_now().duration_since(ambient_started),
+            ))
+            .max(wall_started.elapsed())
+    })
+    .await
+}
+
+/// A backoff belongs to the caller's cancellation/deadline, not another HTTP
+/// attempt. Keeping its timer inside the same guard also unregisters its wake
+/// when the caller abandons the download.
+async fn wait_download_retry(cx: &Cx, url: &str, delay: Duration) -> SearchResult<()> {
+    run_download_request(cx, url, Duration::MAX, async {
+        asupersync::time::sleep(asupersync::time::wall_now(), delay).await;
+        Ok(())
+    })
+    .await
+}
+
+fn check_download_wait_cancel(cx: &Cx) -> SearchResult<()> {
+    check_acquisition_cancel(cx, "download-wait")?;
+    // Sleep also observes the ambient task. A caller may pass a separate Cx;
+    // cancellation of either owner must end the wait without repolling a
+    // timer that completed early because its ambient task was cancelled.
+    if Cx::with_current(Cx::is_cancel_requested).unwrap_or(false) {
+        return Err(SearchError::Cancelled {
+            phase: "download-wait".to_owned(),
+            reason: "model download task cancelled".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// One cancellation registration and timer cover a complete request or body.
+/// Only nonempty body bytes advance `progress`; empty frames and trailers do
+/// not keep a stalled transfer alive. The timer is rearmed only when its old
+/// deadline fires, avoiding timer allocation/registration for every chunk.
+/// `elapsed` uses runtime/wall time in production and controlled time in tests.
+async fn run_download_io_with_elapsed<T: Send>(
+    cx: &Cx,
+    url: &str,
+    timeout: Duration,
+    progress: &AtomicU64,
+    work: impl Future<Output = SearchResult<T>> + Send,
+    elapsed: impl Fn() -> Duration + Send + Sync,
+) -> SearchResult<T> {
+    check_download_wait_cancel(cx)?;
+    let explicit_remaining = cx
+        .budget()
+        .deadline
+        .map(|deadline| Duration::from_nanos(deadline.duration_since(cx.now())));
+    let ambient_remaining = Cx::with_current(|ambient| {
+        ambient
+            .budget()
+            .deadline
+            .map(|deadline| Duration::from_nanos(deadline.duration_since(ambient.now())))
+    })
+    .flatten();
+    let caller_remaining = [explicit_remaining, ambient_remaining]
+        .into_iter()
+        .flatten()
+        .min();
+    let remaining = || {
+        let elapsed = elapsed();
+        let last_progress = Duration::from_nanos(progress.load(Ordering::Relaxed));
+        let idle = timeout.saturating_sub(elapsed.saturating_sub(last_progress));
+        caller_remaining.map_or(idle, |budget| idle.min(budget.saturating_sub(elapsed)))
+    };
+    let timed_out = || client_error_to_search(ClientError::DeadlineExceeded, url);
+    let (sender, mut receiver) = oneshot::channel::<()>();
+    let outcome = {
+        let mut cancelled = std::pin::pin!(receiver.recv(cx));
+        // wall_now follows the ambient driver used by an unbound Sleep. The
+        // explicit Cx can have a different clock; its budget was converted to
+        // a remaining duration above before meeting the two owners' limits.
+        let mut timer = asupersync::time::sleep(asupersync::time::wall_now(), remaining());
+        let mut work = std::pin::pin!(work);
+        poll_fn(|task| {
+            check_download_wait_cancel(cx)?;
+            if cancelled.as_mut().poll(task).is_ready() {
+                return Poll::Ready(Err(SearchError::Cancelled {
+                    phase: "download-wait".to_owned(),
+                    reason: "model download wait cancelled".to_owned(),
+                }));
+            }
+            let left = remaining();
+            if left.is_zero() {
+                return Poll::Ready(Err(timed_out()));
+            }
+            if Pin::new(&mut timer).poll(task).is_ready() {
+                // Actual progress may have extended the inactivity deadline
+                // since the previous registration. A caller deadline never moves.
+                timer.reset_after(asupersync::time::wall_now(), left);
+                if Pin::new(&mut timer).poll(task).is_ready() {
+                    check_download_wait_cancel(cx)?;
+                    return Poll::Ready(Err(timed_out()));
+                }
+            }
+            let outcome = work.as_mut().poll(task);
+            check_download_wait_cancel(cx)?;
+            if matches!(&outcome, Poll::Ready(Err(_))) {
+                return outcome;
+            }
+            if remaining().is_zero() {
+                return Poll::Ready(Err(timed_out()));
+            }
+            outcome
+        })
+        .await
+    };
+    drop(receiver);
+    drop(sender);
+    // Work (and therefore any owned response/socket) is dropped before return.
+    check_download_wait_cancel(cx)?;
+    outcome
+}
+
+const DOWNLOAD_BODY_BYTES_PER_POLL: usize = 64 * 1024;
+const DOWNLOAD_BODY_STEPS_PER_POLL: usize = 32;
+
+async fn stream_download_body<B>(
+    cx: &Cx,
+    url: &str,
+    body: B,
+    idle_timeout: Duration,
+    on_chunk: impl FnMut(&[u8]) -> SearchResult<()> + Send,
+) -> SearchResult<()>
+where
+    B: Body + Unpin + Send,
+    B::Data: Send,
+    B::Error: Send,
+{
+    let started = cx.now();
+    let ambient_started = asupersync::time::wall_now();
+    let wall_started = Instant::now();
+    let elapsed = || {
+        Duration::from_nanos(cx.now().duration_since(started))
+            .max(Duration::from_nanos(
+                asupersync::time::wall_now().duration_since(ambient_started),
+            ))
+            .max(wall_started.elapsed())
+    };
+    let progress = AtomicU64::new(0);
+    let work = copy_download_body(cx, url, body, &progress, &elapsed, on_chunk);
+    run_download_io_with_elapsed(cx, url, idle_timeout, &progress, work, &elapsed).await
+}
+
+/// Bound synchronous copy/hash/callback work per poll so even continuously
+/// ready empty frames or a large fragmented buffer cannot starve cancellation
+/// or the inactivity timer. Unconsumed bytes remain owned across yields.
+async fn copy_download_body<B>(
+    cx: &Cx,
+    url: &str,
+    mut body: B,
+    progress: &AtomicU64,
+    elapsed: &(impl Fn() -> Duration + Send + Sync),
+    mut on_chunk: impl FnMut(&[u8]) -> SearchResult<()> + Send,
+) -> SearchResult<()>
+where
+    B: Body + Unpin + Send,
+    B::Data: Send,
+    B::Error: Send,
+{
+    let mut pending: Option<B::Data> = None;
+    poll_fn(|task| {
+        let mut bytes_left = DOWNLOAD_BODY_BYTES_PER_POLL;
+        for _ in 0..DOWNLOAD_BODY_STEPS_PER_POLL {
+            check_acquisition_cancel(cx, "download-stream")?;
+            if bytes_left == 0 {
+                break;
+            }
+            if let Some(chunk) = pending.as_mut() {
+                if !chunk.has_remaining() {
+                    pending = None;
+                    continue;
+                }
+                let bytes = chunk.chunk();
+                if bytes.is_empty() || bytes.len() > chunk.remaining() {
+                    return Poll::Ready(Err(SearchError::ModelLoadFailed {
+                        path: PathBuf::from("<redacted-model-stage>"),
+                        source: "HTTP body buffer violated its byte contract".into(),
+                    }));
+                }
+                let count = bytes.len().min(bytes_left);
+                on_chunk(&bytes[..count])?;
+                chunk.advance(count);
+                bytes_left -= count;
+                progress.store(
+                    u64::try_from(elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+                continue;
+            }
+            match Pin::new(&mut body).poll_frame(task) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Ready(Some(Ok(Frame::Data(chunk)))) => pending = Some(chunk),
+                Poll::Ready(Some(Ok(Frame::Trailers(_)))) => {}
+                Poll::Ready(Some(Err(_error))) => {
+                    return Poll::Ready(Err(SearchError::ModelLoadFailed {
+                        path: PathBuf::from("<redacted-model-stage>"),
+                        source: format!(
+                            "stream read failed via host {} (http-body-failure)",
+                            diagnostic_source_host(url)
+                        )
+                        .into(),
+                    }));
+                }
+            }
+        }
+        task.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
 
 struct AcquisitionLock {
     _file: File,
@@ -1936,10 +2193,6 @@ fn client_error_to_search(error: ClientError, url: &str) -> SearchError {
     }
 }
 
-fn bounded_http_body_error(_error: &impl std::error::Error) -> &'static str {
-    "http-body-failure"
-}
-
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2145,6 +2398,63 @@ mod tests {
         assert_eq!(config.max_response_bytes, DEFAULT_MAX_MODEL_ARTIFACT_BYTES);
         assert!(config.max_response_bytes > 16 * 1024 * 1024);
         assert!(config.user_agent.starts_with("frankensearch/"));
+    }
+
+    #[test]
+    fn invalid_download_timeouts_fail_before_network_or_staging() {
+        for (field, config) in [
+            (
+                "download.request_timeout",
+                DownloadConfig {
+                    request_timeout: Duration::ZERO,
+                    ..DownloadConfig::default()
+                },
+            ),
+            (
+                "download.idle_timeout",
+                DownloadConfig {
+                    idle_timeout: Duration::ZERO,
+                    ..DownloadConfig::default()
+                },
+            ),
+            (
+                "download.max_response_bytes",
+                DownloadConfig {
+                    max_response_bytes: 0,
+                    ..DownloadConfig::default()
+                },
+            ),
+        ] {
+            let error = validate_download_config(&config).unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { field: ref actual, .. } if actual == field
+            ));
+
+            let destination_root = tempfile::tempdir().unwrap();
+            let destination = destination_root.path().join("must-not-exist");
+            let manifest = ModelManifest::minilm_v2();
+            let mut lifecycle = ModelLifecycle::new(
+                manifest.clone(),
+                DownloadConsent::granted(ConsentSource::Programmatic),
+            );
+            run_test_with_cx(|cx| async move {
+                let downloader = ModelDownloader::new(config);
+                let error = downloader
+                    .download_model(&cx, &manifest, &destination, &mut lifecycle, |_| {})
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { field: ref actual, .. } if actual == field
+                ));
+                assert!(!destination.exists());
+                assert!(matches!(
+                    lifecycle.state(),
+                    ModelState::VerificationFailed { .. }
+                ));
+            });
+        }
     }
 
     #[test]
@@ -2949,6 +3259,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
             proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -3020,6 +3331,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
             proxy: ProxySetting::Url(format!("http://{proxy_addr}")),
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -3553,6 +3865,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: manifest_cap_test_bytes(),
             proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -3610,6 +3923,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
             proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -3656,6 +3970,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
             proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -3698,6 +4013,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
             proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -3750,6 +4066,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
             proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -3997,6 +4314,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
             proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -4029,6 +4347,7 @@ mod tests {
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
             proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
         });
 
         run_test_with_cx(|cx| async move {
@@ -4044,6 +4363,342 @@ mod tests {
                 lifecycle.state(),
                 crate::model_manifest::ModelState::VerificationFailed { .. }
             ));
+        });
+    }
+}
+
+#[cfg(test)]
+mod download_wait_tests {
+    use super::*;
+    use asupersync::test_utils::run_test_with_cx;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Wake, Waker};
+
+    const TEST_URL: &str = "https://model.invalid/model?secret=never-log";
+
+    struct CountWake(AtomicUsize);
+
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct PendingWork(Arc<AtomicBool>);
+
+    impl Future for PendingWork {
+        type Output = SearchResult<()>;
+
+        fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingWork {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn pending_download_wait_cancellation_wakes_and_releases_owned_work() {
+        for cancel in [false, true] {
+            run_test_with_cx(|cx| async move {
+                let dropped = Arc::new(AtomicBool::new(false));
+                let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+                let waker = Waker::from(Arc::clone(&wake));
+                let progress = AtomicU64::new(0);
+                let mut operation = Box::pin(run_download_io_with_elapsed(
+                    &cx,
+                    TEST_URL,
+                    Duration::from_secs(3_600),
+                    &progress,
+                    PendingWork(Arc::clone(&dropped)),
+                    || Duration::ZERO,
+                ));
+                assert!(
+                    operation
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+                assert!(!dropped.load(Ordering::SeqCst));
+                if cancel {
+                    let before = wake.0.load(Ordering::SeqCst);
+                    cx.cancel_with(asupersync::CancelKind::User, Some("stop silent proxy"));
+                    assert!(wake.0.load(Ordering::SeqCst) > before);
+                    assert!(matches!(
+                        operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                        Poll::Ready(Err(SearchError::Cancelled { .. }))
+                    ));
+                    assert!(dropped.load(Ordering::SeqCst));
+                }
+                drop(operation);
+                assert!(dropped.load(Ordering::SeqCst));
+            });
+        }
+    }
+
+    #[test]
+    fn retry_backoff_cancellation_does_not_wait_for_the_delay() {
+        run_test_with_cx(|cx| async move {
+            let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut operation = Box::pin(wait_download_retry(&cx, TEST_URL, Duration::MAX));
+            assert!(
+                operation
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let before = wake.0.load(Ordering::SeqCst);
+            cx.cancel_with(asupersync::CancelKind::User, Some("stop backoff"));
+            assert!(wake.0.load(Ordering::SeqCst) > before);
+            assert!(matches!(
+                operation.as_mut().poll(&mut Context::from_waker(&waker)),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+        });
+    }
+
+    #[test]
+    fn ambient_cancellation_terminates_a_wait_with_a_separate_caller_context() {
+        run_test_with_cx(|cx| async move {
+            let ambient = Cx::for_testing();
+            let _ambient = Cx::set_current(Some(ambient.clone()));
+            let progress = AtomicU64::new(0);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut operation = Box::pin(run_download_io_with_elapsed(
+                &cx,
+                TEST_URL,
+                Duration::from_secs(60),
+                &progress,
+                PendingWork(Arc::clone(&dropped)),
+                || Duration::ZERO,
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            ambient.cancel_with(asupersync::CancelKind::User, Some("cancel ambient owner"));
+            assert!(!cx.is_cancel_requested());
+            // Sleep completes early under ambient cancellation. The guard must
+            // report cancellation immediately and never repoll that completed
+            // timer, even though the explicitly supplied caller is not cancelled.
+            assert!(matches!(
+                operation.as_mut().poll(&mut context),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            assert!(dropped.load(Ordering::SeqCst));
+        });
+    }
+
+    struct QueuedBody {
+        frames: Arc<Mutex<VecDeque<Frame<&'static [u8]>>>>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Body for QueuedBody {
+        type Data = &'static [u8];
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.frames
+                .lock()
+                .unwrap()
+                .pop_front()
+                .map_or(Poll::Pending, |frame| Poll::Ready(Some(Ok(frame))))
+        }
+    }
+
+    impl Drop for QueuedBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn model_body_idle_deadline_extends_only_when_nonempty_bytes_arrive() {
+        run_test_with_cx(|cx| async move {
+            let frames = Arc::new(Mutex::new(VecDeque::new()));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let body = QueuedBody {
+                frames: Arc::clone(&frames),
+                dropped: Arc::clone(&dropped),
+            };
+            let milliseconds = AtomicU64::new(0);
+            let elapsed = || Duration::from_millis(milliseconds.load(Ordering::SeqCst));
+            let progress = AtomicU64::new(0);
+            let copied = Arc::new(Mutex::new(Vec::new()));
+            let copied_for_work = Arc::clone(&copied);
+            let work = copy_download_body(&cx, TEST_URL, body, &progress, &elapsed, move |bytes| {
+                copied_for_work.lock().unwrap().extend_from_slice(bytes);
+                Ok(())
+            });
+            let mut operation = Box::pin(run_download_io_with_elapsed(
+                &cx,
+                TEST_URL,
+                Duration::from_millis(50),
+                &progress,
+                work,
+                &elapsed,
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            milliseconds.store(40, Ordering::SeqCst);
+            frames.lock().unwrap().push_back(Frame::Data(b"a"));
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            milliseconds.store(80, Ordering::SeqCst);
+            frames.lock().unwrap().push_back(Frame::Data(b"b"));
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            // Total time already exceeds the idle budget, yet real progress
+            // keeps the download valid. Empty frames/trailers do not extend it.
+            milliseconds.store(120, Ordering::SeqCst);
+            frames.lock().unwrap().extend([
+                Frame::Data(&b""[..]),
+                Frame::Trailers(asupersync::http::body::HeaderMap::default()),
+            ]);
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            assert_eq!(progress.load(Ordering::SeqCst), 80_000_000);
+            milliseconds.store(130, Ordering::SeqCst);
+            let result = operation.as_mut().poll(&mut context);
+            let Poll::Ready(Err(error)) = result else {
+                panic!("idle deadline did not terminate the transfer");
+            };
+            assert!(error.to_string().contains("request-deadline-exceeded"));
+            assert!(!error.to_string().contains("never-log"));
+            assert_eq!(*copied.lock().unwrap(), b"ab");
+            assert!(dropped.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn ready_empty_frames_yield_and_cannot_keep_a_download_alive() {
+        struct EmptyFrames(Arc<AtomicUsize>);
+        impl Body for EmptyFrames {
+            type Data = &'static [u8];
+            type Error = std::convert::Infallible;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+                let before = self.0.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    before < DOWNLOAD_BODY_STEPS_PER_POLL,
+                    "body failed to yield"
+                );
+                Poll::Ready(Some(Ok(Frame::Data(&[]))))
+            }
+        }
+        run_test_with_cx(|cx| async move {
+            let polls = Arc::new(AtomicUsize::new(0));
+            let milliseconds = AtomicU64::new(0);
+            let elapsed = || Duration::from_millis(milliseconds.load(Ordering::SeqCst));
+            let progress = AtomicU64::new(0);
+            let work = copy_download_body(
+                &cx,
+                TEST_URL,
+                EmptyFrames(Arc::clone(&polls)),
+                &progress,
+                &elapsed,
+                |_| panic!("empty bytes must not count as progress"),
+            );
+            let mut operation = Box::pin(run_download_io_with_elapsed(
+                &cx,
+                TEST_URL,
+                Duration::from_millis(50),
+                &progress,
+                work,
+                &elapsed,
+            ));
+            let wake = Arc::new(CountWake(AtomicUsize::new(0)));
+            let waker = Waker::from(Arc::clone(&wake));
+            let mut context = Context::from_waker(&waker);
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            assert!(
+                wake.0.load(Ordering::SeqCst) > 0,
+                "body must schedule continuation"
+            );
+            let before = polls.load(Ordering::SeqCst);
+            assert!((1..=DOWNLOAD_BODY_STEPS_PER_POLL).contains(&before));
+            milliseconds.store(50, Ordering::SeqCst);
+            assert!(matches!(
+                operation.as_mut().poll(&mut context),
+                Poll::Ready(Err(SearchError::ModelLoadFailed { .. }))
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), before);
+            assert_eq!(progress.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[test]
+    fn model_progress_cannot_extend_the_callers_deadline() {
+        run_test_with_cx(|_| async move {
+            let budget = asupersync::Budget::INFINITE
+                .tightened_by_timeout(asupersync::time::wall_now(), Duration::from_secs(3_600));
+            let cx = Cx::for_testing_with_budget(budget);
+            let elapsed_seconds = AtomicU64::new(0);
+            let progress = AtomicU64::new(0);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut operation = Box::pin(run_download_io_with_elapsed(
+                &cx,
+                TEST_URL,
+                Duration::from_secs(7_200),
+                &progress,
+                PendingWork(Arc::clone(&dropped)),
+                || Duration::from_secs(elapsed_seconds.load(Ordering::SeqCst)),
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            elapsed_seconds.store(1, Ordering::SeqCst);
+            progress.store(1_000_000_000, Ordering::SeqCst);
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            elapsed_seconds.store(3_601, Ordering::SeqCst);
+            progress.store(3_601_000_000_000, Ordering::SeqCst);
+            assert!(matches!(
+                operation.as_mut().poll(&mut context),
+                Poll::Ready(Err(SearchError::ModelLoadFailed { .. }))
+            ));
+            assert!(dropped.load(Ordering::SeqCst));
+        });
+    }
+
+    #[test]
+    fn model_progress_cannot_extend_a_shorter_ambient_deadline() {
+        run_test_with_cx(|cx| async move {
+            let ambient = Cx::for_testing_with_budget(
+                asupersync::Budget::INFINITE
+                    .tightened_by_timeout(asupersync::time::wall_now(), Duration::from_secs(3_600)),
+            );
+            let _ambient = Cx::set_current(Some(ambient));
+            let elapsed_seconds = AtomicU64::new(0);
+            let progress = AtomicU64::new(0);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut operation = Box::pin(run_download_io_with_elapsed(
+                &cx,
+                TEST_URL,
+                Duration::from_secs(7_200),
+                &progress,
+                PendingWork(Arc::clone(&dropped)),
+                || Duration::from_secs(elapsed_seconds.load(Ordering::SeqCst)),
+            ));
+            let mut context = Context::from_waker(Waker::noop());
+            assert!(operation.as_mut().poll(&mut context).is_pending());
+            elapsed_seconds.store(3_601, Ordering::SeqCst);
+            progress.store(3_601_000_000_000, Ordering::SeqCst);
+            assert!(matches!(
+                operation.as_mut().poll(&mut context),
+                Poll::Ready(Err(SearchError::ModelLoadFailed { .. }))
+            ));
+            assert!(dropped.load(Ordering::SeqCst));
+            assert!(!cx.is_cancel_requested());
         });
     }
 }
@@ -4116,21 +4771,37 @@ mod proxy_transport_tests {
     }
 
     fn download_once(url: &str, proxy_url: String, destination: &Path) -> SearchResult<()> {
+        download_configured(
+            url,
+            DownloadConfig {
+                max_retries: 0,
+                proxy: ProxySetting::Url(proxy_url),
+                ..DownloadConfig::default()
+            },
+            destination,
+            |_| {},
+            &|_| {},
+        )
+    }
+
+    fn download_configured(
+        url: &str,
+        config: DownloadConfig,
+        destination: &Path,
+        on_started: impl FnOnce(&Cx),
+        on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
+    ) -> SearchResult<()> {
         let file = ModelFile {
             name: "model.onnx".to_owned(),
             sha256: sha256_hex(MODEL_BYTES),
             size: u64::try_from(MODEL_BYTES.len()).unwrap(),
             url: None,
         };
-        let downloader = ModelDownloader::new(DownloadConfig {
-            max_retries: 0,
-            proxy: ProxySetting::Url(proxy_url),
-            ..DownloadConfig::default()
-        });
+        let downloader = ModelDownloader::new(config);
         let mut result = None;
         let result_slot = &mut result;
-        let on_progress = |_: &DownloadProgress| {};
         run_test_with_cx(|cx| async move {
+            on_started(&cx);
             *result_slot = Some(
                 assert_completes_within(PEER_TIMEOUT, "proxied model download", || {
                     Box::pin(downloader.download_single_file(
@@ -4140,7 +4811,7 @@ mod proxy_transport_tests {
                         &file,
                         0,
                         1,
-                        &on_progress,
+                        on_progress,
                     ))
                 })
                 .await,
@@ -4155,6 +4826,194 @@ mod proxy_transport_tests {
         let mut value = vec![0_u8; usize::from(length[0])];
         stream.read_exact(&mut value).unwrap();
         value
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StallPoint {
+        Connect,
+        SocksGreeting,
+        Headers,
+        Body,
+        DirectBody,
+    }
+
+    fn assert_stalled_download_terminates(point: StallPoint, cancel: bool) {
+        let body_stalls = matches!(point, StallPoint::Body | StallPoint::DirectBody);
+        let (context_sender, context_receiver) = std::sync::mpsc::channel::<Cx>();
+        let (progress_sender, progress_receiver) = std::sync::mpsc::channel::<()>();
+        let (address, peer) = spawn_proxy(move |mut stream| {
+            if point == StallPoint::SocksGreeting {
+                let mut greeting = [0_u8; 2];
+                stream.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting[0], 5);
+                let mut methods = vec![0_u8; usize::from(greeting[1])];
+                stream.read_exact(&mut methods).unwrap();
+            } else {
+                let request = read_request(&mut stream);
+                assert!(request.starts_with(if point == StallPoint::Connect {
+                    "CONNECT model-host.invalid:443 "
+                } else if point == StallPoint::DirectBody {
+                    "GET /model.onnx"
+                } else {
+                    "GET http://model-host.invalid/"
+                }));
+                if body_stalls {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        MODEL_BYTES.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&MODEL_BYTES[..1]).unwrap();
+                    stream.flush().unwrap();
+                    // Ensure acquisition has consumed and staged a byte before
+                    // cancellation. The peer stays open and never releases it.
+                    progress_receiver.recv_timeout(PEER_TIMEOUT).unwrap();
+                }
+            }
+            if cancel {
+                context_receiver
+                    .recv_timeout(PEER_TIMEOUT)
+                    .unwrap()
+                    .cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel stalled transfer"),
+                    );
+            }
+            let mut byte = [0_u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+                other => panic!("download did not release its stalled connection: {other:?}"),
+            }
+        });
+        let (target_scheme, proxy_scheme) = match point {
+            StallPoint::Connect => ("https", "http"),
+            StallPoint::SocksGreeting => ("http", "socks5h"),
+            StallPoint::Headers | StallPoint::Body | StallPoint::DirectBody => ("http", "http"),
+        };
+        let budget = if cancel {
+            PEER_TIMEOUT
+        } else {
+            Duration::from_millis(200)
+        };
+        let config = DownloadConfig {
+            max_retries: 0,
+            request_timeout: if body_stalls {
+                Duration::from_secs(5)
+            } else {
+                budget
+            },
+            idle_timeout: budget,
+            proxy: if point == StallPoint::DirectBody {
+                ProxySetting::Disabled
+            } else {
+                ProxySetting::Url(format!(
+                    "{proxy_scheme}://{PROXY_USERNAME}:{PROXY_PASSWORD}@{address}"
+                ))
+            },
+            ..DownloadConfig::default()
+        };
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination = destination_dir.path().join("model.onnx");
+        let previous = b"previous verified generation";
+        std::fs::write(&destination, previous).unwrap();
+        let url = if point == StallPoint::DirectBody {
+            format!("http://{address}/model.onnx?token=origin-query-canary")
+        } else {
+            format!("{target_scheme}://model-host.invalid/model.onnx?token=origin-query-canary")
+        };
+        let error = download_configured(
+            &url,
+            config,
+            &destination,
+            |cx| context_sender.send(cx.clone()).unwrap(),
+            &|progress| {
+                if progress.bytes_downloaded > 0 {
+                    let _ = progress_sender.send(());
+                }
+            },
+        )
+        .unwrap_err();
+        peer.join().unwrap();
+        if cancel {
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+        } else {
+            assert!(error.to_string().contains("request-deadline-exceeded"));
+        }
+        let rendered = format!("{error}\n{error:?}");
+        assert!(!rendered.contains(PROXY_USERNAME));
+        assert!(!rendered.contains(PROXY_PASSWORD));
+        assert!(!rendered.contains("origin-query-canary"));
+        assert_eq!(std::fs::read(&destination).unwrap(), previous);
+        assert!(!destination.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn stalled_connect_socks_headers_and_body_have_finite_deadlines() {
+        for point in [
+            StallPoint::Connect,
+            StallPoint::SocksGreeting,
+            StallPoint::Headers,
+            StallPoint::Body,
+            StallPoint::DirectBody,
+        ] {
+            assert_stalled_download_terminates(point, false);
+        }
+    }
+
+    #[test]
+    fn cancelled_connect_socks_headers_and_body_close_without_peer_activity() {
+        for point in [
+            StallPoint::Connect,
+            StallPoint::SocksGreeting,
+            StallPoint::Headers,
+            StallPoint::Body,
+            StallPoint::DirectBody,
+        ] {
+            assert_stalled_download_terminates(point, true);
+        }
+    }
+
+    #[test]
+    fn progressing_model_download_outlives_request_and_idle_timeout() {
+        let (address, peer) = spawn_proxy(|mut stream| {
+            read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MODEL_BYTES.len()
+            )
+            .unwrap();
+            for (index, chunk) in MODEL_BYTES.chunks(8).enumerate() {
+                if index > 0 {
+                    thread::sleep(Duration::from_millis(300));
+                }
+                stream.write_all(chunk).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination = destination_dir.path().join("model.onnx");
+        let started = Instant::now();
+        download_configured(
+            "http://model-host.invalid/model.onnx",
+            DownloadConfig {
+                max_retries: 0,
+                request_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_secs(1),
+                proxy: ProxySetting::Url(format!("http://{address}")),
+                ..DownloadConfig::default()
+            },
+            &destination,
+            |_| {},
+            &|_| {},
+        )
+        .unwrap();
+        peer.join().unwrap();
+        assert!(started.elapsed() > Duration::from_secs(1));
+        assert_eq!(std::fs::read(&destination).unwrap(), MODEL_BYTES);
+        assert!(!destination.with_extension("tmp").exists());
     }
 
     fn assert_socks_download(scheme: &str, authenticated: bool) {
