@@ -817,6 +817,16 @@ Library callers can set `DownloadConfig::proxy` or `ApiEmbedderConfig::proxy` to
 Invalid selected proxy URLs fail without falling back to a direct connection.
 Proxy configuration debug output redacts the URL, including credentials.
 
+Model acquisition also bounds stalled network operations. By default,
+`DownloadConfig::request_timeout` allows 60 seconds for connection setup, proxy
+negotiation, and response headers at each redirect hop. Once streaming starts,
+`DownloadConfig::idle_timeout` allows 60 seconds without receiving model bytes.
+Only byte progress resets that inactivity limit, so large downloads can keep
+running while a silent proxy or server fails promptly. Caller cancellation and
+earlier caller deadlines apply during network waits and retry backoff; incomplete
+artifacts are discarded before a retry or error is returned. Library callers can
+adjust both limits for their network.
+
 ## How It Works
 
 Pipeline summary:
