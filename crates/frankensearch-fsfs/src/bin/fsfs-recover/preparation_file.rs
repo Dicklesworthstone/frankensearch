@@ -388,6 +388,21 @@ mod tests {
         assert_eq!(value["schema_version"], 2);
         let decoded = decode(serde_json::to_vec(&value).unwrap().as_slice()).unwrap();
         assert_eq!(decoded.preview_requirement, facts.preview_requirement);
+        assert_eq!(
+            serde_json::from_value::<PreviewRequirement>(serde_json::json!({"kind": "none"}))
+                .unwrap(),
+            PreviewRequirement::None {},
+        );
+        for unexpected in [serde_json::json!(false), serde_json::Value::Null] {
+            // Test the decoder directly: source-rebuild admission must not
+            // mask an unknown-field acceptance by rejecting None later.
+            assert!(
+                serde_json::from_value::<PreviewRequirement>(serde_json::json!({
+                    "kind": "none", "searchable": unexpected,
+                }))
+                .is_err()
+            );
+        }
         for preview in [
             serde_json::Value::Null,
             serde_json::json!({"kind": "query", "policy_sha256": "9".repeat(64)}),

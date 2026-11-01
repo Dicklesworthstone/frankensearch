@@ -2537,6 +2537,7 @@ mod tests {
         "fsfs index <X>",
         "fsfs index",
         "fsfs index --full",
+        "fsfs index --complete-quality --index-dir <X>",
         "fsfs index . --full --index-dir <X>",
         "fsfs watch",
         "fsfs doctor",

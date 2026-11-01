@@ -2175,7 +2175,7 @@ fn prepare_index_source(cx: &Cx, candidate: &IndexCandidate) -> SearchResult<Pre
     let mut source =
         fs::File::open(&candidate.file_path)?.take(candidate.byte_len.saturating_add(1));
     let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
     loop {
         FsfsRuntime::semantic_retry_checkpoint(cx, "index.source_read")?;
         let read = match source.read(&mut buffer) {
@@ -23951,13 +23951,18 @@ impl FsfsRuntime {
             let exclusion = excluded_doc_ids.as_deref().map(|excluded| {
                 ExcludeDocIdsFilter::new(path_filter, excluded.iter().map(String::as_str))
             });
-            let mut hits = index.search_top_k(
-                &query_embedding,
-                budget,
-                exclusion
-                    .as_ref()
-                    .map_or(path_filter, |filter| Some(filter as &dyn SearchFilter)),
-            )?;
+            // Match the fast lane's query classification: a zero-norm query
+            // has no semantic signal and must not assign arbitrary ranks to
+            // every document, including during a recovery preview.
+            let mut hits = index
+                .search_top_k_classified(
+                    &query_embedding,
+                    budget,
+                    exclusion
+                        .as_ref()
+                        .map_or(path_filter, |filter| Some(filter as &dyn SearchFilter)),
+                )?
+                .hits;
             // Independent top-k retrieval admits quality-only documents, but
             // omission from that bounded pool does not prove a fast candidate
             // lacks a quality vector. Score those exact eligible IDs too, with
@@ -23976,11 +23981,15 @@ impl FsfsRuntime {
                     PredicateFilter::new("fsfs.quality.fast_candidates", move |id| {
                         fast_ids.contains(id)
                     });
-                hits.extend(index.search_top_k(
-                    &query_embedding,
-                    missing_limit,
-                    Some(&missing_fast),
-                )?);
+                hits.extend(
+                    index
+                        .search_top_k_classified(
+                            &query_embedding,
+                            missing_limit,
+                            Some(&missing_fast),
+                        )?
+                        .hits,
+                );
                 hits.sort_unstable_by(|left, right| {
                     right
                         .score
@@ -35932,9 +35941,12 @@ mod tests {
                         assert_ne!(thread::current().id(), caller);
                         started.fetch_add(1, Ordering::SeqCst);
                         let (lock, ready) = &*gate;
-                        let held = lock.lock().unwrap();
                         let (held, timeout) = ready
-                            .wait_timeout_while(held, Duration::from_secs(5), |open| !*open)
+                            .wait_timeout_while(
+                                lock.lock().unwrap(),
+                                Duration::from_secs(5),
+                                |open| !*open,
+                            )
                             .unwrap();
                         assert!(*held && !timeout.timed_out(), "source workers released");
                         drop(held);
@@ -36095,9 +36107,10 @@ mod tests {
                 move |cx, candidate| {
                     held_started.store(true, Ordering::SeqCst);
                     let (lock, ready) = &*held_gate;
-                    let held = lock.lock().unwrap();
                     let (held, timeout) = ready
-                        .wait_timeout_while(held, Duration::from_secs(5), |open| !*open)
+                        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |open| {
+                            !*open
+                        })
                         .unwrap();
                     assert!(
                         *held && !timeout.timed_out(),
@@ -36234,7 +36247,7 @@ mod tests {
             batches.iter().map(|batch| batch.len()).collect::<Vec<_>>(),
             [1, 1, 1, 2, 1]
         );
-        assert!(std::ptr::eq(batches[2][0], &oversized));
+        assert!(std::ptr::eq(batches[2][0], std::ptr::from_ref(&oversized)));
         assert_eq!(
             batches.iter().map(|batch| batch.len()).sum::<usize>(),
             sources.len()

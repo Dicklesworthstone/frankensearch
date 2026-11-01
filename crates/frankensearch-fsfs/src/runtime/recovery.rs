@@ -1141,6 +1141,23 @@ mod retained_recovery_tests {
             assert!(plan.expected_selection_sha256(&cx).is_ok());
             for producer in [&models.fast, &models.quality] {
                 producer.zero_signal.store(true, Ordering::Relaxed);
+                // A zero quality query must not manufacture quality votes
+                // while rescoring the otherwise valid fast candidate head.
+                if Arc::ptr_eq(producer, &models.quality) {
+                    let ordinary = plan.reader.search(&cx, REBUILD_QUERY, 10).await.unwrap();
+                    assert_eq!(ordinary.last().unwrap().phase, SearchOutputPhase::Refined);
+                    assert!(
+                        ordinary
+                            .last()
+                            .unwrap()
+                            .semantic_blend
+                            .as_ref()
+                            .unwrap()
+                            .hits
+                            .iter()
+                            .all(|hit| hit.quality.is_none())
+                    );
+                }
                 assert!(plan.search(&cx, REBUILD_QUERY, 10).await.is_err());
                 producer.zero_signal.store(false, Ordering::Relaxed);
                 assert!(plan.expected_selection_sha256(&cx).is_err());
@@ -1216,7 +1233,7 @@ mod retained_recovery_tests {
                     "fast_only" => explicit.config.search.fast_only = true,
                     "embed_deferred" => {
                         explicit.config.pressure.degradation_override =
-                            crate::config::DegradationOverrideMode::ForceEmbedDeferred
+                            crate::config::DegradationOverrideMode::ForceEmbedDeferred;
                     }
                     _ => explicit.config.indexing.quality_model.clear(),
                 }

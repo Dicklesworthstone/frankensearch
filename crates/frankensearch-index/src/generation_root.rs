@@ -5648,7 +5648,7 @@ pub mod generation_reader {
         closure: GenerationClosureV1,
         health: SnapshotHealthV1,
         selected_predecessor_of: Option<AuthorityRefV1>,
-        history_current: Option<Arc<OpenedGenerationSnapshotV1>>,
+        history_current: Option<Arc<Self>>,
         recovery_current_manifest: Option<(AuthorityRefV1, QualifiedGenerationFile)>,
         history_manifests: Vec<QualifiedGenerationFile>,
     }
@@ -5736,7 +5736,7 @@ pub mod generation_reader {
         /// Retained current snapshot anchoring an authenticated history walk.
         /// Immediate-predecessor-only admission does not need a manifest walk.
         #[must_use]
-        pub const fn history_current(&self) -> Option<&Arc<OpenedGenerationSnapshotV1>> {
+        pub const fn history_current(&self) -> Option<&Arc<Self>> {
             self.history_current.as_ref()
         }
 
@@ -6131,7 +6131,7 @@ pub mod generation_reader {
 
     fn admit_history_path(
         root: &QualifiedGenerationRoot,
-        current: HistoryPathOrigin<'_>,
+        current: &HistoryPathOrigin<'_>,
         target: AuthorityRefV1,
         resolution: &Resolution,
         max_hops: u64,
@@ -6693,7 +6693,7 @@ pub mod generation_reader {
                         }
                         match admit_history_path(
                             self,
-                            HistoryPathOrigin {
+                            &HistoryPathOrigin {
                                 authority: current.head().authority,
                                 manifest: current.manifest(),
                                 retained_image_bytes: 0,
@@ -6783,7 +6783,7 @@ pub mod generation_reader {
                         if let Some(max_hops) = max_history_hops {
                             match admit_history_path(
                                 self,
-                                HistoryPathOrigin {
+                                &HistoryPathOrigin {
                                     authority: current,
                                     manifest: &manifest,
                                     retained_image_bytes: current.manifest_len,

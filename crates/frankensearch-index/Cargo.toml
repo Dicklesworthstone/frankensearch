@@ -45,7 +45,7 @@ hnsw_rs_034 = { package = "hnsw_rs", version = "=0.3.4", optional = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
-asupersync = { workspace = true }
+asupersync = { workspace = true, features = ["test-internals"] }
 serde_json = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }

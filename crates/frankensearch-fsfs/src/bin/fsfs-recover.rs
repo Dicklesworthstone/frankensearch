@@ -134,11 +134,38 @@ enum RecoverySearchMode {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum PreviewRequirement {
+    #[serde(deserialize_with = "deserialize_no_preview")]
     None {},
     Query {
         policy_sha256: String,
         searchable: bool,
     },
+}
+
+// The empty struct variant must reject extra fields. Serde's unit-variant
+// visitor ignores them, while its derived empty-struct field enum trips
+// Clippy's empty_enums lint. Keep the same strict wire format explicitly.
+fn deserialize_no_preview<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<(), D::Error> {
+    struct EmptyPreview;
+
+    impl<'input> serde::de::Visitor<'input> for EmptyPreview {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an empty preview requirement")
+        }
+
+        fn visit_map<M: serde::de::MapAccess<'input>>(self, mut fields: M) -> Result<(), M::Error> {
+            if let Some(field) = fields.next_key::<String>()? {
+                return Err(serde::de::Error::unknown_field(&field, &[]));
+            }
+            Ok(())
+        }
+    }
+
+    deserializer.deserialize_map(EmptyPreview)
 }
 
 #[derive(Clone, Debug)]

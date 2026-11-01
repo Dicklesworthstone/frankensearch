@@ -1,5 +1,7 @@
 //! Complete deferred quality work from the exact input retained with a selected
-//! generation. Queue claims and document revisions use the storage queue; the
+//! generation.
+//!
+//! Queue claims and document revisions use the storage queue; the
 //! ordinary complete-generation writer owns the publication boundary.
 //!
 //! A failed or cancelled attempt leaves the selected queue pending. Its private
@@ -275,8 +277,8 @@ pub(super) fn finish_index(
         let retained = match storage.get_document(id)? {
             Some(document) => match source_input(&document)? {
                 Some(source)
-                    if source.revision == entry.revision
-                        && source.source_sha256 == entry.content_hash_hex =>
+                    if (source.revision, source.source_sha256.as_str())
+                        == (entry.revision, entry.content_hash_hex.as_str()) =>
                 {
                     storage.get_document_content(id)?.filter(|text| {
                         text.len() <= MAX_INPUT_BYTES
@@ -652,7 +654,7 @@ impl FsfsRuntime {
         drop(storage);
         let mut sentinel = Self::read_index_sentinel(build.path())?
             .ok_or_else(|| invalid("quality candidate has no completion sentinel"))?;
-        sentinel.command = "complete-quality".to_owned();
+        "complete-quality".clone_into(&mut sentinel.command);
         sentinel.generated_at_ms = pressure_timestamp_ms();
         sentinel
             .reason_codes
@@ -699,6 +701,7 @@ impl FsfsRuntime {
 
 #[cfg(all(test, feature = "semantic-loaders"))]
 mod tests {
+    use std::fmt::Write as _;
     use std::future::Future;
     use std::path::PathBuf;
     use std::process::Command;
@@ -743,7 +746,7 @@ mod tests {
             self.id
         }
 
-        fn model_name(&self) -> &str {
+        fn model_name(&self) -> &'static str {
             "Explicit deferred-quality wiring control"
         }
 
@@ -877,6 +880,10 @@ mod tests {
     fn source_fixture(parent: &Path) -> BTreeMap<String, String> {
         let source = parent.join("source");
         fs::create_dir(&source).unwrap();
+        let mut code = String::new();
+        for number in 0..40 {
+            writeln!(&mut code, "let variable_{number} = {number};").unwrap();
+        }
         let documents = BTreeMap::from([
             (
                 "alpha.md".to_owned(),
@@ -884,12 +891,7 @@ mod tests {
             ),
             (
                 "beta.md".to_owned(),
-                format!(
-                    "sharedtoken retained code sample\n```rust\n{}\n```\nquality tail",
-                    (0..40)
-                        .map(|number| format!("let variable_{number} = {number};\n"))
-                        .collect::<String>()
-                ),
+                format!("sharedtoken retained code sample\n```rust\n{code}\n```\nquality tail"),
             ),
         ]);
         for (id, text) in &documents {
@@ -974,6 +976,27 @@ mod tests {
             );
             let successor_before = files(next.path());
             let mut reader = restarted
+                .open_retained_search(&cx, &directory.path().join("store"))
+                .await
+                .unwrap();
+            let phases = reader
+                .search(
+                    &cx,
+                    "how do sharedtoken documents retain quality input across restarts",
+                    5,
+                )
+                .await
+                .unwrap();
+            // Strict pressure deliberately serves only the fast phase even
+            // after quality completion. A performance reader must still admit
+            // and execute the newly published quality tier.
+            assert_eq!(phases.len(), 1);
+            assert_eq!(phases[0].phase, SearchOutputPhase::Initial);
+            let mut performance_config = restarted.config().clone();
+            performance_config.pressure.profile = crate::config::PressureProfile::Performance;
+            let performance =
+                FsfsRuntime::new(performance_config).with_cli_input(restarted.cli_input.clone());
+            let mut reader = performance
                 .open_retained_search(&cx, &directory.path().join("store"))
                 .await
                 .unwrap();
