@@ -527,6 +527,30 @@ case "\${1:-}" in
     printf 'fsfs $version (frankensearch $version)\n'
     ;;
   download-models)
+    # GH#70: exercise the environment received by the staged executable, not
+    # the installer's own shell. Keep fixture credentials out of its output.
+    if [ -n "\${FSFS_STUB_PROXY_ENV:-}" ]; then
+      for proxy_name in http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; do
+        if [ "\$FSFS_STUB_PROXY_ENV" = unset ]; then
+          if printenv "\$proxy_name" >/dev/null 2>&1; then exit 75; fi
+        else
+          proxy_value=\$(printenv "\$proxy_name") || exit 75
+          if [ "\$FSFS_STUB_PROXY_ENV" = empty ]; then
+            expected_proxy_value=""
+          else
+            case "\$proxy_name" in
+              no_proxy|NO_PROXY) expected_proxy_value=" .internal.example, localhost " ;;
+              all_proxy|ALL_PROXY) expected_proxy_value="socks5h://\$proxy_name:fixture-secret@127.0.0.1:9" ;;
+              *) expected_proxy_value="http://\$proxy_name:fixture-secret@127.0.0.1:9" ;;
+            esac
+          fi
+          [ "\$proxy_value" = "\$expected_proxy_value" ] || exit 75
+        fi
+      done
+    fi
+    if [ -n "\${FSFS_STUB_MODEL_CALLS:-}" ]; then
+      printf '%s %s %s\n' "\$1" "\${2:-}" "\${3:-}" >>"\$FSFS_STUB_MODEL_CALLS"
+    fi
     case "\${2:-}" in
       potion-multilingual-128m|all-minilm-l6-v2) ;;
       *) exit 72 ;;
@@ -704,6 +728,57 @@ check_installer_offline_e2e() {
     echo "[installer][FAIL] regular download failure gate failed status=$status output=${output:-<empty>}"
     FAILURES=$((FAILURES + 1))
   fi
+
+  # GH#70: use the real installer and staged executable to prove it forwards
+  # all proxy spellings unchanged. The local archive keeps this independent
+  # of external DNS, a real proxy, release hosting, and downloaded models.
+  # Rust transport tests separately prove those settings route real requests.
+  local proxy_case proxy_name proxy_value proxy_calls expected_calls actual_calls
+  local -a proxy_env
+  for proxy_case in populated unset empty offline; do
+    proxy_calls="$work/model-calls-$proxy_case.log"
+    proxy_env=(
+      env -u http_proxy -u HTTP_PROXY -u https_proxy -u HTTPS_PROXY
+      -u all_proxy -u ALL_PROXY -u no_proxy -u NO_PROXY
+      NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock"
+      "FSFS_STUB_PROXY_ENV=$proxy_case" "FSFS_STUB_MODEL_CALLS=$proxy_calls"
+    )
+    expected_calls=$'download-models potion-multilingual-128m \ndownload-models potion-multilingual-128m --verify\ndownload-models all-minilm-l6-v2 \ndownload-models all-minilm-l6-v2 --verify'
+    if [[ "$proxy_case" == offline ]]; then
+      proxy_env+=(FSFS_STUB_DOWNLOAD_STATUS=73)
+      expected_calls=$'download-models potion-multilingual-128m --verify\ndownload-models all-minilm-l6-v2 --verify'
+    fi
+    if [[ "$proxy_case" != unset ]]; then
+      for proxy_name in http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY no_proxy NO_PROXY; do
+        if [[ "$proxy_case" == empty ]]; then
+          proxy_value=""
+        else
+          case "$proxy_name" in
+            no_proxy|NO_PROXY) proxy_value=" .internal.example, localhost " ;;
+            all_proxy|ALL_PROXY) proxy_value="socks5h://$proxy_name:fixture-secret@127.0.0.1:9" ;;
+            *) proxy_value="http://$proxy_name:fixture-secret@127.0.0.1:9" ;;
+          esac
+        fi
+        proxy_env+=("$proxy_name=$proxy_value")
+      done
+    fi
+    proxy_env+=("$installer_shell" "$installer" --version v9.9.9
+      --artifact-url "$archive" --checksum "$digest" --dest "$dest")
+    if [[ "$proxy_case" == offline ]]; then proxy_env+=(--offline); fi
+    status=0
+    output=$("${proxy_env[@]}" 2>&1) || status=$?
+    actual_calls=""
+    if [[ -f "$proxy_calls" ]]; then actual_calls=$(cat "$proxy_calls"); fi
+    after_digest=$(installer_file_digest "$dest/fsfs")
+    if [[ "$status" -eq 0 && "$after_digest" == "$staged_digest" \
+      && "$actual_calls" == "$expected_calls" && "$output" != *fixture-secret* ]]; then
+      echo "[installer][OK]   proxy environment=$proxy_case preserves exact child environment and model-command order"
+    else
+      # Avoid including potentially credential-bearing output on failure.
+      echo "[installer][FAIL] proxy environment=$proxy_case failed preservation, command-order, or redaction contract (status=$status)"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
 
   rm -rf "$work"
 }
