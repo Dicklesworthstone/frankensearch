@@ -4506,7 +4506,7 @@ pub mod authority_publisher {
                 ])
                 .env(LOCK_HOLDER_CHILD_ENV, &root_path)
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::inherit())
                 .spawn()
                 .expect("spawn lock-holder child");
             let stdout = child.stdout.take().expect("child stdout");
