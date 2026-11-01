@@ -774,6 +774,10 @@ impl ModelDownloader {
         lifecycle: &mut ModelLifecycle,
         on_progress: impl Fn(&DownloadProgress) + Send + Sync,
     ) -> SearchResult<PathBuf> {
+        if let Err(error) = validate_download_config(&self.config) {
+            lifecycle.fail_verification(bounded_download_failure_reason(&error));
+            return Err(error);
+        }
         if let Err(error) = check_acquisition_cancel(cx, "download-start") {
             lifecycle.cancel();
             return Err(error);
@@ -982,6 +986,7 @@ impl ModelDownloader {
         files_total: usize,
         on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
     ) -> SearchResult<()> {
+        validate_download_config(&self.config)?;
         let start = Instant::now();
         check_acquisition_cancel(cx, "download-request")?;
 
@@ -1185,6 +1190,29 @@ impl ModelDownloader {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn validate_download_config(config: &DownloadConfig) -> SearchResult<()> {
+    for (field, value) in [
+        ("download.request_timeout", config.request_timeout),
+        ("download.idle_timeout", config.idle_timeout),
+    ] {
+        if value.is_zero() {
+            return Err(SearchError::InvalidConfig {
+                field: field.to_owned(),
+                value: "0ms".to_owned(),
+                reason: "must be greater than zero".to_owned(),
+            });
+        }
+    }
+    if config.max_response_bytes == 0 {
+        return Err(SearchError::InvalidConfig {
+            field: "download.max_response_bytes".to_owned(),
+            value: "0".to_owned(),
+            reason: "must be greater than zero".to_owned(),
+        });
+    }
+    Ok(())
+}
 
 /// Bound a pending request independently of socket activity. The transport's
 /// own timeout covers response headers, but its I/O cannot wake for every Cx
@@ -2370,6 +2398,39 @@ mod tests {
         assert_eq!(config.max_response_bytes, DEFAULT_MAX_MODEL_ARTIFACT_BYTES);
         assert!(config.max_response_bytes > 16 * 1024 * 1024);
         assert!(config.user_agent.starts_with("frankensearch/"));
+    }
+
+    #[test]
+    fn invalid_download_timeouts_fail_before_network_or_staging() {
+        for (field, config) in [
+            (
+                "download.request_timeout",
+                DownloadConfig {
+                    request_timeout: Duration::ZERO,
+                    ..DownloadConfig::default()
+                },
+            ),
+            (
+                "download.idle_timeout",
+                DownloadConfig {
+                    idle_timeout: Duration::ZERO,
+                    ..DownloadConfig::default()
+                },
+            ),
+            (
+                "download.max_response_bytes",
+                DownloadConfig {
+                    max_response_bytes: 0,
+                    ..DownloadConfig::default()
+                },
+            ),
+        ] {
+            let error = validate_download_config(&config).unwrap_err();
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { ref field: actual, .. } if actual == field
+            ));
+        }
     }
 
     #[test]
