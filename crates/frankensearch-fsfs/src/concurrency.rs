@@ -496,6 +496,9 @@ const SENTINEL_ACQUIRE_MAX_RETRIES: usize = 2;
 ///
 /// Returns `Ok(LockSentinel)` on success, `Err` if the resource is already
 /// legitimately locked by another process.
+/// An incomplete or invalid sentinel also blocks acquisition: exclusive
+/// creation makes the path visible before its owner finishes writing JSON,
+/// and unreadable ownership never authorizes replacing that owner's claim.
 ///
 /// # Errors
 ///
@@ -550,6 +553,14 @@ pub fn try_acquire_sentinel(
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         // Sentinel was removed between our create_new and read
                         // (another process cleaned it up). Retry creation.
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!(
+                                "Resource '{resource}' has an incomplete or invalid lock sentinel; ownership cannot be verified: {e}"
+                            ),
+                        ));
                     }
                     Err(e) => return Err(e),
                 }
@@ -1614,6 +1625,70 @@ mod tests {
 
         // Cleanup.
         remove_sentinel(&path).expect("cleanup");
+    }
+
+    #[test]
+    fn sentinel_initialization_keeps_ownership_before_json_is_complete() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = LockSentinel::current("resource", "original holder");
+        let json = serde_json::to_vec_pretty(&owner).expect("serialize");
+        for prefix_len in [0, json.len() / 2] {
+            let path = dir.path().join(format!("initializing-{prefix_len}.lock"));
+            let mut writer = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("claim path");
+            writer.write_all(&json[..prefix_len]).expect("write prefix");
+            assert_eq!(
+                read_sentinel(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            let error =
+                try_acquire_sentinel(&path, "resource", "contender", Duration::from_mins(5))
+                    .expect_err("the initializing owner must retain its claim");
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            assert_eq!(
+                std::fs::read(&path).expect("read prefix"),
+                json[..prefix_len]
+            );
+            writer.write_all(&json[prefix_len..]).expect("finish JSON");
+            let loaded = read_sentinel(&path).expect("read complete owner");
+            assert_eq!(loaded.holder, owner.holder);
+            assert_eq!(loaded.pid, owner.pid);
+            assert_eq!(
+                try_acquire_sentinel(&path, "resource", "contender", Duration::from_mins(5))
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn sentinel_invalid_ownership_is_preserved_and_other_io_errors_propagate() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        for (index, bytes) in [b"not JSON".as_slice(), b"{\"holder\":\"\xe2".as_slice()]
+            .into_iter()
+            .enumerate()
+        {
+            let path = dir.path().join(format!("invalid-{index}.lock"));
+            std::fs::write(&path, bytes).expect("write invalid ownership");
+            assert_eq!(
+                read_sentinel(&path).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(
+                try_acquire_sentinel(&path, "resource", "contender", Duration::ZERO)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert_eq!(std::fs::read(path).expect("preserved ownership"), bytes);
+        }
+        let error = try_acquire_sentinel(dir.path(), "resource", "contender", Duration::ZERO)
+            .expect_err("a directory cannot be acquired as a sentinel");
+        assert_ne!(error.kind(), std::io::ErrorKind::WouldBlock);
     }
 
     #[test]

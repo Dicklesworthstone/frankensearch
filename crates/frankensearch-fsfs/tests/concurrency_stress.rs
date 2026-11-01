@@ -550,20 +550,7 @@ fn sentinel_atomic_acquire_has_single_winner_under_race() {
             std::thread::spawn(move || {
                 start.wait();
                 let holder = format!("holder_{i}");
-                let attempt =
-                    try_acquire_sentinel(&path, "racy_resource", &holder, stale_threshold);
-                // Contenders can briefly observe a partially-written sentinel JSON
-                // from the winner. Retry once so the race test validates lock
-                // semantics rather than parser timing.
-                let resolved = match attempt {
-                    Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
-                        std::thread::sleep(Duration::from_millis(1));
-                        try_acquire_sentinel(&path, "racy_resource", &holder, stale_threshold)
-                    }
-                    other => other,
-                };
-
-                resolved
+                try_acquire_sentinel(&path, "racy_resource", &holder, stale_threshold)
                     .map(|sentinel| sentinel.holder)
                     .map_err(|err| err.kind())
             })
@@ -593,7 +580,7 @@ fn sentinel_atomic_acquire_has_single_winner_under_race() {
         errors
             .iter()
             .all(|kind| *kind == std::io::ErrorKind::WouldBlock),
-        "all losing contenders should see WouldBlock"
+        "all losing contenders should see WouldBlock: {errors:?}"
     );
 
     if sentinel_path.exists() {
