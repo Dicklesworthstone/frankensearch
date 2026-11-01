@@ -36310,8 +36310,8 @@ mod tests {
                         lexical
                             .search_doc_ids(&cx, query, 10)
                             .unwrap()
-                            .into_iter()
-                            .map(|hit| hit.document_id)
+                            .iter()
+                            .map(|hit| hit.document_id.clone())
                             .collect::<Vec<_>>(),
                     );
                 }
