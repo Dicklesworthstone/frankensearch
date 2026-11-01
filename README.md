@@ -58,6 +58,8 @@ provisions and verifies the two default search models, Potion and MiniLM,
 requiring roughly 621 MB. Install optional models separately with
 `fsfs download-models MODEL`. Offline installation requires the default pair
 to be cached and verified; it never downloads missing models.
+For networks that require a proxy, export the [proxy settings](#network-proxies)
+before running the installer so its model-provisioning subprocess inherits them.
 
 When upgrading a Linux full installation from 1.9.0 or earlier, use the installer
 above: those executables' `fsfs update` selects the MUSL lite archive and loses
@@ -761,6 +763,59 @@ For full contracts and knobs:
 - `docs/fsfs-packaging-release-install-contract.md#staged-rollout-and-deterministic-fallback-protocol`
 - `docs/fsfs-packaging-release-install-contract.md#upgrade-and-migration-compatibility-verification-strategy`
 - `docs/architecture/`
+
+### Network proxies
+
+Model downloads, installer model provisioning, and hosted embedding APIs share
+the same proxy policy. Export settings before invoking the installer or CLI:
+
+```bash
+# HTTP CONNECT proxy for HTTPS destinations, including Hugging Face.
+export HTTPS_PROXY=http://127.0.0.1:3128
+fsfs download-models potion-multilingual-128m
+
+# Alternatively, use a SOCKS5 proxy for destinations without a scheme-specific proxy.
+export ALL_PROXY=socks5h://127.0.0.1:1080
+```
+
+The first nonempty value in each row wins; surrounding whitespace is ignored:
+
+| Destination | Proxy lookup order |
+|---|---|
+| HTTPS | `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY` |
+| HTTP | `http_proxy`, `all_proxy`, `ALL_PROXY` |
+| Bypass list | `no_proxy`, then `NO_PROXY` |
+
+Uppercase `HTTP_PROXY` is deliberately ignored because CGI can populate it from
+an untrusted HTTP request header (httpoxy). Proxy URLs require a scheme:
+`http://`, `https://`, `socks5://`, or `socks5h://`. Both SOCKS5 spellings resolve
+destination hostnames at the proxy with the current transport. Proxy credentials
+are passed literally: percent-encoded userinfo is not decoded by asupersync.
+
+The bypass list accepts comma-separated hostnames, domain suffixes, IPv4/IPv6
+literals, literal IP CIDR ranges, and `*` for all destinations. Hostnames match
+case-insensitively at a dot boundary, with optional leading or trailing dots;
+`example.com` also matches `api.example.com`, but not `otherexample.com`.
+An optional port restricts an entry to that destination port (for example,
+`localhost:8080` or `[::1]:8080`). CIDR matching uses literal destination IPs
+only; it does not perform DNS lookups. To force direct CLI connections regardless
+of other proxy settings:
+
+```bash
+no_proxy='*' NO_PROXY='*' fsfs download-models potion-multilingual-128m
+```
+
+Model downloads reevaluate proxy selection and bypasses at each redirect, keep
+the configured redirect limit, and reject HTTPS-to-HTTP downgrades. Hosted
+embedding redirects must stay on the same origin to protect request data and
+API credentials. `--offline` continues to forbid downloads regardless of proxy
+settings; installer offline mode only verifies cached models.
+
+Library callers can set `DownloadConfig::proxy` or `ApiEmbedderConfig::proxy` to
+`ProxySetting::FromEnvironment` (default), `Disabled` (always direct), or
+`Url(...)` (explicit proxy, ignoring environment settings and bypass lists).
+Invalid selected proxy URLs fail without falling back to a direct connection.
+Proxy configuration debug output redacts the URL, including credentials.
 
 ## How It Works
 

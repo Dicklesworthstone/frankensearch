@@ -400,6 +400,9 @@ pub use frankensearch_embed::model2vec_embedder::Model2VecEmbedder;
 #[cfg(feature = "fastembed")]
 pub use frankensearch_embed::fastembed_embedder::FastEmbedEmbedder;
 
+#[cfg(any(feature = "download", feature = "api"))]
+pub use frankensearch_embed::ProxySetting;
+
 // ─── Feature-gated lexical re-exports ───────────────────────────────────────
 
 #[cfg(feature = "lexical-tantivy")]

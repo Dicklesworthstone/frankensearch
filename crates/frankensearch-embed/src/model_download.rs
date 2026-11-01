@@ -22,7 +22,9 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use asupersync::Cx;
-use asupersync::http::h1::{ClientError, HttpClient, HttpClientConfig, Method, RedirectPolicy};
+use asupersync::http::h1::{
+    ClientError, HttpClient, HttpClientConfig, Method, ParsedUrl, RedirectPolicy, Scheme,
+};
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::generation::QuantizationFormat;
 
@@ -30,6 +32,7 @@ use crate::model_manifest::{
     FrozenModelArtifactManifestV1, ModelArtifactFileV1, ModelArtifactRoleV1, ModelFile,
     ModelLifecycle, ModelManifest,
 };
+use crate::proxy::{ProxySetting, proxy_from_environment};
 
 static STAGING_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 const LOCAL_COPY_BUFFER_BYTES: usize = 1024 * 1024;
@@ -64,7 +67,8 @@ pub struct DownloadConfig {
     pub retry_base_delay: Duration,
     /// User-Agent header value.
     pub user_agent: String,
-    /// Maximum redirects to follow.
+    /// Maximum redirects to follow. Proxy selection and bypass rules are
+    /// reevaluated for each destination. HTTPS-to-HTTP downgrades are rejected.
     pub max_redirects: u32,
     /// Maximum size, in bytes, of a single downloaded model artifact.
     ///
@@ -74,6 +78,10 @@ pub struct DownloadConfig {
     /// verified against the manifest's declared size and SHA-256, so this bound
     /// only guards against an unexpectedly large response.
     pub max_response_bytes: usize,
+    /// How downloads reach the network. Defaults to the conventional proxy
+    /// environment variables (`https_proxy`, `all_proxy`, `no_proxy`, ...); see
+    /// [`ProxySetting`].
+    pub proxy: ProxySetting,
 }
 
 impl Default for DownloadConfig {
@@ -84,6 +92,7 @@ impl Default for DownloadConfig {
             user_agent: format!("frankensearch/{}", env!("CARGO_PKG_VERSION")),
             max_redirects: 5,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::FromEnvironment,
         }
     }
 }
@@ -439,23 +448,30 @@ impl fmt::Display for DownloadProgress {
 /// Downloads model files from `HuggingFace` with verification and progress reporting.
 pub struct ModelDownloader {
     config: DownloadConfig,
-    client: HttpClient,
 }
 
 impl ModelDownloader {
     /// Create a new downloader with the given configuration.
     #[must_use]
-    pub fn new(config: DownloadConfig) -> Self {
+    pub const fn new(config: DownloadConfig) -> Self {
+        Self { config }
+    }
+
+    /// The HTTP client for a request to `url`. The proxy depends on the URL (its scheme
+    /// selects the environment variable and `no_proxy` matches its host), and the client
+    /// fixes its proxy at construction. Building one is cheap: TLS and connections are
+    /// set up per request, and each artifact is one large streamed request.
+    fn http_client_for(&self, url: &str) -> HttpClient {
         let mut client_config = HttpClientConfig::default();
-        client_config.redirect_policy = RedirectPolicy::Limited(config.max_redirects);
-        client_config.user_agent = Some(config.user_agent.clone());
+        // Follow redirects here rather than inside a fixed-route client: a CDN
+        // or mirror can have a different scheme or `no_proxy` policy.
+        client_config.redirect_policy = RedirectPolicy::None;
+        client_config.user_agent = Some(self.config.user_agent.clone());
         // Lift the codec's 16 MiB default body cap; model artifacts routinely
         // exceed it. Streaming-to-disk keeps memory bounded regardless.
-        client_config.max_body_size = Some(config.max_response_bytes);
-        Self {
-            config,
-            client: HttpClient::with_config(client_config),
-        }
+        client_config.max_body_size = Some(self.config.max_response_bytes);
+        client_config.proxy_url = proxy_from_environment(&self.config.proxy, url);
+        HttpClient::with_config(client_config)
     }
 
     /// Create a downloader with default configuration.
@@ -966,13 +982,45 @@ impl ModelDownloader {
             eta_seconds: None,
         });
 
-        // Stream directly into a temp file to keep memory bounded.
-        let mut response = self
-            .client
-            .request_streaming(cx, Method::Get, url, Vec::new(), Vec::new())
-            .await
-            .map_err(|e| client_error_to_search(e, url))?;
-        check_acquisition_cancel(cx, "download-response")?;
+        // Every hop gets its own route. No cookies or origin credentials are
+        // carried between clients; proxy authentication belongs to the newly
+        // selected proxy only. Drop redirect bodies without buffering them.
+        let mut request_url = url.to_owned();
+        let mut redirects = 0_u32;
+        let mut response = loop {
+            check_acquisition_cancel(cx, "download-request")?;
+            let response = self
+                .http_client_for(&request_url)
+                .request_streaming(cx, Method::Get, &request_url, Vec::new(), Vec::new())
+                .await
+                .map_err(|e| client_error_to_search(e, &request_url))?;
+            check_acquisition_cancel(cx, "download-response")?;
+            if !matches!(response.head.status, 301 | 302 | 303 | 307 | 308) {
+                break response;
+            }
+            let Some((_, location)) = response
+                .head
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("location"))
+            else {
+                break response;
+            };
+            if redirects >= self.config.max_redirects {
+                return Err(client_error_to_search(
+                    ClientError::TooManyRedirects {
+                        count: redirects.saturating_add(1),
+                        max: self.config.max_redirects,
+                    },
+                    &request_url,
+                ));
+            }
+            let next_url = resolve_download_redirect(&request_url, location)
+                .map_err(|e| client_error_to_search(e, &request_url))?;
+            drop(response);
+            request_url = next_url;
+            redirects = redirects.saturating_add(1);
+        };
 
         // Check HTTP status.
         if response.head.status < 200 || response.head.status >= 300 {
@@ -1675,6 +1723,96 @@ fn create_unique_staging_dir(dest_dir: &Path) -> SearchResult<PathBuf> {
         path: PathBuf::from("<redacted-model-cache>"),
         source: "failed to allocate unique staging directory".into(),
     })
+}
+
+/// Resolve an HTTP redirect without carrying an origin's query or credentials
+/// into a different origin. The transport parser validates the resulting
+/// authority; relative references need path/query resolution before parsing.
+fn resolve_download_redirect(current: &str, location: &str) -> Result<String, ClientError> {
+    let invalid = || ClientError::InvalidUrl("invalid model download redirect".to_owned());
+    let current = ParsedUrl::parse(current)?;
+    let location = location.trim();
+    if location
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(invalid());
+    }
+    // Fragments never belong in an HTTP request target.
+    let reference = location.split('#').next().unwrap_or_default();
+    let scheme = match current.scheme {
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+    };
+    let origin = format!("{scheme}://{}", current.authority());
+    let current_path = current.path.split('#').next().unwrap_or("/");
+    let path_only = current_path.split('?').next().unwrap_or("/");
+    let path_only = if path_only.is_empty() { "/" } else { path_only };
+    let next = if reference.starts_with("//") {
+        format!("{scheme}:{reference}")
+    } else if reference
+        .split(['/', '?'])
+        .next()
+        .is_some_and(|first| first.contains(':'))
+    {
+        let (next_scheme, rest) = reference.split_once("://").ok_or_else(invalid)?;
+        if !next_scheme.eq_ignore_ascii_case("http") && !next_scheme.eq_ignore_ascii_case("https") {
+            return Err(invalid());
+        }
+        format!("{}://{rest}", next_scheme.to_ascii_lowercase())
+    } else if reference.is_empty() {
+        format!("{origin}{current_path}")
+    } else if reference.starts_with('?') {
+        format!("{origin}{path_only}{reference}")
+    } else if reference.starts_with('/') {
+        format!("{origin}{reference}")
+    } else {
+        let directory = path_only.rfind('/').map_or("/", |idx| &path_only[..=idx]);
+        format!("{origin}{directory}{reference}")
+    };
+    let next = ParsedUrl::parse(&next)?;
+    if current.scheme == Scheme::Https && next.scheme == Scheme::Http {
+        return Err(ClientError::InvalidUrl(
+            "model download redirect would downgrade HTTPS".to_owned(),
+        ));
+    }
+    let next_scheme = match next.scheme {
+        Scheme::Http => "http",
+        Scheme::Https => "https",
+    };
+    let (path, query) = next
+        .path
+        .split_once('?')
+        .map_or((next.path.as_str(), None), |(path, query)| {
+            (path, Some(query))
+        });
+    // Remove literal dot segments (RFC 3986 section 5.2.4), preserving empty
+    // segments and escaped bytes so signed CDN paths are not rewritten.
+    let trailing_dot = path.ends_with("/.") || path.ends_with("/..");
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "." => {}
+            ".." => {
+                if segments.len() > 1 {
+                    segments.pop();
+                }
+            }
+            other => segments.push(other),
+        }
+    }
+    if trailing_dot {
+        segments.push("");
+    }
+    let mut path = segments.join("/");
+    if !path.starts_with('/') {
+        path.insert(0, '/');
+    }
+    if let Some(query) = query {
+        path.push('?');
+        path.push_str(query);
+    }
+    Ok(format!("{next_scheme}://{}{path}", next.authority()))
 }
 
 fn response_content_length(headers: &[(String, String)]) -> Option<u64> {
@@ -2810,6 +2948,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -2834,6 +2973,524 @@ mod tests {
         assert_eq!(last.bytes_downloaded, expected_size);
         assert_eq!(last.total_bytes, Some(expected_size));
         drop(events);
+    }
+
+    #[test]
+    fn download_config_debug_redacts_proxy_credentials() {
+        let config = DownloadConfig {
+            proxy: ProxySetting::Url("http://user:hunter2@proxy.corp:3128".to_owned()),
+            ..DownloadConfig::default()
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("Url(<redacted>)"), "{rendered}");
+    }
+
+    #[test]
+    fn download_single_file_routes_through_the_configured_proxy() {
+        // A local listener stands in for an HTTP proxy. The target host does not resolve,
+        // so the download can only succeed if the client sends it to the proxy, and an
+        // http:// target must arrive in absolute form.
+        let body = b"proxied model bytes".to_vec();
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: sha256_hex(&body),
+            size: u64::try_from(body.len()).unwrap(),
+            url: None,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let proxy = recording_download_server(
+            listener,
+            vec![format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                std::str::from_utf8(&body).unwrap(),
+            )],
+        );
+
+        let url = "http://model-host.invalid/model.onnx".to_owned();
+        let dest_dir = tempfile::tempdir().unwrap();
+        let dest = dest_dir.path().join("model.onnx");
+        let dest_for_task = dest.clone();
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            retry_base_delay: Duration::from_millis(1),
+            user_agent: "frankensearch-test".to_owned(),
+            max_redirects: 0,
+            max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Url(format!("http://{proxy_addr}")),
+        });
+
+        run_test_with_cx(|cx| async move {
+            downloader
+                .download_single_file(&cx, &url, &dest_for_task, &file, 0, 1, &|_| {})
+                .await
+                .unwrap();
+        });
+
+        let requests = proxy.join().unwrap();
+        assert_eq!(
+            requests[0].lines().next(),
+            Some("GET http://model-host.invalid/model.onnx HTTP/1.1")
+        );
+        assert_eq!(std::fs::read(dest).unwrap(), body);
+    }
+
+    const PROXY_TEST_BODY: &[u8] = b"verified proxy download";
+
+    fn recording_download_server(
+        listener: TcpListener,
+        responses: Vec<String>,
+    ) -> thread::JoinHandle<Vec<String>> {
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let mut requests = Vec::new();
+            for response in responses {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                            assert!(
+                                Instant::now() < deadline,
+                                "download test server saw no request"
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("download test accept failed: {error}"),
+                    }
+                };
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                    assert!(
+                        request.len() <= 64 * 1024,
+                        "request headers exceeded test bound"
+                    );
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        })
+    }
+
+    fn proxy_download_response() -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            PROXY_TEST_BODY.len(),
+            std::str::from_utf8(PROXY_TEST_BODY).unwrap(),
+        )
+    }
+
+    fn run_proxy_download_child(url: &str, disabled: bool, environment: &[(&str, String)]) {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "model_download::tests::download_proxy_environment_child",
+            "--nocapture",
+        ]);
+        for variable in [
+            "http_proxy",
+            "HTTP_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+        ] {
+            command.env_remove(variable);
+        }
+        command
+            .env("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_URL", url)
+            .env(
+                "FRANKENSEARCH_TEST_DOWNLOAD_PROXY_DISABLED",
+                if disabled { "1" } else { "0" },
+            )
+            .env_remove("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_EXPECT_ERROR");
+        for (key, value) in environment {
+            command.env(key, value);
+        }
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut timed_out = false;
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().unwrap();
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !timed_out && output.status.success(),
+            "download child failed (timeout={timed_out}): {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn download_proxy_environment_child() {
+        let Ok(url) = std::env::var("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_URL") else {
+            return;
+        };
+        let disabled = std::env::var("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_DISABLED").unwrap() == "1";
+        let expect_error = std::env::var("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_EXPECT_ERROR")
+            .is_ok_and(|value| value == "1");
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("model.bin");
+        let file = ModelFile {
+            name: "model.bin".to_owned(),
+            sha256: sha256_hex(PROXY_TEST_BODY),
+            size: u64::try_from(PROXY_TEST_BODY.len()).unwrap(),
+            url: None,
+        };
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            proxy: if disabled {
+                ProxySetting::Disabled
+            } else {
+                ProxySetting::FromEnvironment
+            },
+            ..DownloadConfig::default()
+        });
+        run_test_with_cx(|cx| async move {
+            let result = downloader
+                .download_single_file(&cx, &url, &destination, &file, 0, 1, &|_| {})
+                .await;
+            if expect_error {
+                let error = result.expect_err("the configured HTTPS proxy must refuse CONNECT");
+                let rendered = format!("{error:?} {error}");
+                assert!(rendered.contains("proxy-tunnel-http-407"), "{rendered}");
+                for secret in [
+                    "proxy-user-canary",
+                    "proxy-password-canary",
+                    "proxy-reason-canary",
+                ] {
+                    assert!(!rendered.contains(secret), "proxy error exposed {secret}");
+                }
+                assert!(!destination.exists());
+                assert_eq!(
+                    std::fs::read_dir(destination.parent().unwrap())
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            } else {
+                result.unwrap();
+                assert_eq!(std::fs::read(destination).unwrap(), PROXY_TEST_BODY);
+            }
+        });
+    }
+
+    #[test]
+    fn download_proxy_environment_reaches_an_unresolvable_destination() {
+        for variable in ["http_proxy", "all_proxy", "ALL_PROXY"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = recording_download_server(listener, vec![proxy_download_response()]);
+            let mut environment = vec![(variable, format!("http://{address}"))];
+            // Windows cannot store both spellings as distinct variables.
+            if !cfg!(windows) {
+                environment.push(("HTTP_PROXY", "invalid://ignored".to_owned()));
+            }
+            run_proxy_download_child("http://model-host.invalid/model.bin", false, &environment);
+            let requests = server.join().unwrap();
+            assert!(
+                requests[0].starts_with("GET http://model-host.invalid/model.bin HTTP/1.1\r\n")
+            );
+        }
+    }
+
+    #[test]
+    fn download_proxy_https_environment_precedence_reaches_connect_proxy() {
+        // A refusal proves HTTPS routing reached the selected proxy without
+        // weakening certificate validation or needing a resolvable destination.
+        for selected in ["https_proxy", "HTTPS_PROXY", "ALL_PROXY"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let response = b"HTTP/1.1 407 proxy-reason-canary\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+            let server = recording_download_server(listener, vec![response]);
+            let mut environment = vec![
+                (
+                    selected,
+                    format!("http://proxy-user-canary:proxy-password-canary@{address}"),
+                ),
+                (
+                    "FRANKENSEARCH_TEST_DOWNLOAD_PROXY_EXPECT_ERROR",
+                    "1".to_owned(),
+                ),
+            ];
+            if selected != "ALL_PROXY" {
+                environment.push(("ALL_PROXY", "invalid://must-not-be-used".to_owned()));
+            }
+            // Windows cannot hold lower/upper spellings as distinct values.
+            if selected == "https_proxy" && !cfg!(windows) {
+                environment.push(("HTTPS_PROXY", "invalid://must-not-be-used".to_owned()));
+            }
+            run_proxy_download_child("https://model-host.invalid/model.bin", false, &environment);
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].starts_with("CONNECT model-host.invalid:443 HTTP/1.1\r\n"));
+            assert!(requests[0].lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("proxy-authorization")
+                        && value.trim().starts_with("Basic ")
+                })
+            }));
+        }
+    }
+
+    #[test]
+    fn download_proxy_disabled_bypass_and_unset_connect_directly() {
+        for (disabled, environment) in [
+            (
+                true,
+                vec![(
+                    "http_proxy",
+                    "invalid://user:secret@proxy.invalid".to_owned(),
+                )],
+            ),
+            (
+                false,
+                vec![
+                    (
+                        "http_proxy",
+                        "invalid://user:secret@proxy.invalid".to_owned(),
+                    ),
+                    ("no_proxy", "127.0.0.1".to_owned()),
+                ],
+            ),
+            (
+                false,
+                vec![
+                    (
+                        "ALL_PROXY",
+                        "invalid://user:secret@proxy.invalid".to_owned(),
+                    ),
+                    ("NO_PROXY", "*".to_owned()),
+                ],
+            ),
+            (
+                false,
+                vec![(
+                    "HTTP_PROXY",
+                    "invalid://user:secret@proxy.invalid".to_owned(),
+                )],
+            ),
+            (false, vec![]),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = recording_download_server(listener, vec![proxy_download_response()]);
+            run_proxy_download_child(
+                &format!("http://{address}/model.bin"),
+                disabled,
+                &environment,
+            );
+            let requests = server.join().unwrap();
+            assert!(requests[0].starts_with("GET /model.bin HTTP/1.1\r\n"));
+            assert!(
+                !requests[0]
+                    .to_ascii_lowercase()
+                    .contains("proxy-authorization")
+            );
+        }
+    }
+
+    #[test]
+    fn download_proxy_redirects_reselect_routes_in_both_directions() {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let origin_server = recording_download_server(origin, vec![
+            "HTTP/1.1 302 Found\r\nLocation: http://download-cdn.invalid/model.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned(),
+            proxy_download_response(),
+        ]);
+        let proxy_server = recording_download_server(
+            proxy,
+            vec![format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{origin_address}/verified.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )],
+        );
+        run_proxy_download_child(
+            &format!("http://{origin_address}/start?origin-token=private"),
+            false,
+            &[
+                (
+                    "http_proxy",
+                    format!("http://user:password@{proxy_address}"),
+                ),
+                ("no_proxy", "127.0.0.1".to_owned()),
+            ],
+        );
+        let direct_requests = origin_server.join().unwrap();
+        let proxy_requests = proxy_server.join().unwrap();
+        assert!(direct_requests[0].starts_with("GET /start?origin-token=private HTTP/1.1\r\n"));
+        assert!(direct_requests[1].starts_with("GET /verified.bin HTTP/1.1\r\n"));
+        assert!(
+            direct_requests
+                .iter()
+                .all(|request| !request.to_ascii_lowercase().contains("proxy-authorization"))
+        );
+        assert!(
+            proxy_requests[0].starts_with("GET http://download-cdn.invalid/model.bin HTTP/1.1\r\n")
+        );
+        assert!(
+            proxy_requests[0]
+                .to_ascii_lowercase()
+                .contains("proxy-authorization:")
+        );
+        assert!(!proxy_requests[0].contains("origin-token"));
+    }
+
+    #[test]
+    fn download_proxy_malformed_configuration_fails_closed_and_redacts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("model.bin");
+        let downloader = ModelDownloader::new(DownloadConfig {
+            proxy: ProxySetting::Url(
+                "unsupported://secret-user:secret-password@private-proxy.invalid".to_owned(),
+            ),
+            max_retries: 0,
+            ..DownloadConfig::default()
+        });
+        let file = ModelFile {
+            name: "model.bin".to_owned(),
+            sha256: sha256_hex(PROXY_TEST_BODY),
+            size: 23,
+            url: None,
+        };
+        run_test_with_cx(|cx| async move {
+            let error = downloader
+                .download_single_file(
+                    &cx,
+                    &format!("http://{address}/model.bin"),
+                    &destination,
+                    &file,
+                    0,
+                    1,
+                    &|_| {},
+                )
+                .await
+                .unwrap_err();
+            let rendered = format!("{error}\n{error:?}");
+            for secret in ["secret-user", "secret-password", "private-proxy.invalid"] {
+                assert!(!rendered.contains(secret));
+            }
+            assert!(!destination.exists());
+            assert!(!destination.with_extension("tmp").exists());
+        });
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn download_redirect_references_preserve_query_and_path_semantics() {
+        let base = "https://models.example/a/b/model.bin?old=token";
+        for (location, expected) in [
+            ("../weights.bin", "https://models.example/a/weights.bin"),
+            (
+                "?next=https://cdn.invalid/x",
+                "https://models.example/a/b/model.bin?next=https://cdn.invalid/x",
+            ),
+            (
+                "#fragment",
+                "https://models.example/a/b/model.bin?old=token",
+            ),
+            ("//cdn.invalid/model.bin", "https://cdn.invalid/model.bin"),
+            (
+                "HTTPS://cdn.invalid/model.bin#fragment",
+                "https://cdn.invalid/model.bin",
+            ),
+            ("/a//.", "https://models.example/a//"),
+            ("/a///..", "https://models.example/a//"),
+            ("/../../x", "https://models.example/x"),
+            (
+                "/%2e%2e/signed//object?x=1",
+                "https://models.example/%2e%2e/signed//object?x=1",
+            ),
+        ] {
+            assert_eq!(
+                resolve_download_redirect(base, location).unwrap(),
+                expected,
+                "{location}"
+            );
+        }
+        assert_eq!(
+            resolve_download_redirect("https://[::1]:8443/a/model", "../weights").unwrap(),
+            "https://[::1]:8443/weights",
+        );
+        for location in [
+            "http://cdn.invalid/model",
+            "ftp://cdn.invalid/model",
+            "file:///etc/passwd",
+            "https://user:secret@cdn.invalid/x",
+            "https://cdn.invalid:bad/x",
+            "https://cdn.invalid/x\r\nInjected: secret",
+        ] {
+            assert!(resolve_download_redirect(base, location).is_err());
+        }
+    }
+
+    #[test]
+    fn download_redirect_limit_stops_before_publishing_bytes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let redirect = "HTTP/1.1 302 Found\r\nLocation: /loop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned();
+        let server = recording_download_server(listener, vec![redirect.clone(), redirect]);
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_redirects: 1,
+            max_retries: 0,
+            proxy: ProxySetting::Disabled,
+            ..DownloadConfig::default()
+        });
+        let temporary = tempfile::tempdir().unwrap();
+        let destination = temporary.path().join("model.bin");
+        let file = ModelFile {
+            name: "model.bin".to_owned(),
+            sha256: sha256_hex(PROXY_TEST_BODY),
+            size: 23,
+            url: None,
+        };
+        run_test_with_cx(|cx| async move {
+            let error = downloader
+                .download_single_file(
+                    &cx,
+                    &format!("http://{address}/loop"),
+                    &destination,
+                    &file,
+                    0,
+                    1,
+                    &|_| {},
+                )
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("redirect-limit-2-of-1"));
+            assert!(!destination.exists());
+            assert!(!destination.with_extension("tmp").exists());
+        });
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]
@@ -2895,6 +3552,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: manifest_cap_test_bytes(),
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -2951,6 +3609,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -2996,6 +3655,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3037,6 +3697,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3088,6 +3749,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3334,6 +3996,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3365,6 +4028,7 @@ mod tests {
             user_agent: "frankensearch-test".to_owned(),
             max_redirects: 0,
             max_response_bytes: DEFAULT_MAX_MODEL_ARTIFACT_BYTES,
+            proxy: ProxySetting::Disabled,
         });
 
         run_test_with_cx(|cx| async move {
@@ -3381,5 +4045,281 @@ mod tests {
                 crate::model_manifest::ModelState::VerificationFailed { .. }
             ));
         });
+    }
+}
+
+#[cfg(test)]
+mod proxy_transport_tests {
+    use super::*;
+    use asupersync::test_utils::{assert_completes_within, run_test_with_cx};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::thread;
+
+    const PEER_TIMEOUT: Duration = Duration::from_secs(10);
+    const MODEL_BYTES: &[u8] = b"verified model bytes from a loopback proxy";
+    const PROXY_USERNAME: &str = "proxy-canary-user";
+    const PROXY_PASSWORD: &str = "proxy-canary-password";
+    const PROXY_BASIC_AUTH: &str = "Basic cHJveHktY2FuYXJ5LXVzZXI6cHJveHktY2FuYXJ5LXBhc3N3b3Jk";
+
+    /// Every accept/read/write has a bound so a routing regression cannot
+    /// leave a fixture thread waiting forever for a connection or handshake.
+    fn spawn_proxy<T: Send + 'static>(
+        serve: impl FnOnce(TcpStream) -> T + Send + 'static,
+    ) -> (SocketAddr, thread::JoinHandle<T>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let started = Instant::now();
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < PEER_TIMEOUT,
+                            "proxy was never contacted"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("proxy accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(PEER_TIMEOUT)).unwrap();
+            stream.set_write_timeout(Some(PEER_TIMEOUT)).unwrap();
+            serve(stream)
+        });
+        (address, peer)
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "proxy saw EOF before complete request headers");
+            request.extend_from_slice(&buffer[..count]);
+            assert!(
+                request.len() <= 16 * 1024,
+                "unbounded proxy request headers"
+            );
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    fn request_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+        request.lines().find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    fn download_once(url: &str, proxy_url: String, destination: &Path) -> SearchResult<()> {
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: sha256_hex(MODEL_BYTES),
+            size: u64::try_from(MODEL_BYTES.len()).unwrap(),
+            url: None,
+        };
+        let downloader = ModelDownloader::new(DownloadConfig {
+            max_retries: 0,
+            proxy: ProxySetting::Url(proxy_url),
+            ..DownloadConfig::default()
+        });
+        let mut result = None;
+        let result_slot = &mut result;
+        let on_progress = |_: &DownloadProgress| {};
+        run_test_with_cx(|cx| async move {
+            *result_slot = Some(
+                assert_completes_within(PEER_TIMEOUT, "proxied model download", || {
+                    Box::pin(downloader.download_single_file(
+                        &cx,
+                        url,
+                        destination,
+                        &file,
+                        0,
+                        1,
+                        &on_progress,
+                    ))
+                })
+                .await,
+            );
+        });
+        result.unwrap()
+    }
+
+    fn read_socks_string(stream: &mut TcpStream) -> Vec<u8> {
+        let mut length = [0_u8; 1];
+        stream.read_exact(&mut length).unwrap();
+        let mut value = vec![0_u8; usize::from(length[0])];
+        stream.read_exact(&mut value).unwrap();
+        value
+    }
+
+    fn assert_socks_download(scheme: &str, authenticated: bool) {
+        let (address, peer) = spawn_proxy(move |mut stream| {
+            let mut greeting = [0_u8; 2];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting[0], 5);
+            let mut methods = vec![0_u8; usize::from(greeting[1])];
+            stream.read_exact(&mut methods).unwrap();
+            let selected_method = if authenticated { 2 } else { 0 };
+            assert!(methods.contains(&selected_method));
+            stream.write_all(&[5, selected_method]).unwrap();
+
+            if authenticated {
+                let mut auth_version = [0_u8; 1];
+                stream.read_exact(&mut auth_version).unwrap();
+                assert_eq!(auth_version, [1]);
+                assert_eq!(read_socks_string(&mut stream), PROXY_USERNAME.as_bytes());
+                assert_eq!(read_socks_string(&mut stream), PROXY_PASSWORD.as_bytes());
+                stream.write_all(&[1, 0]).unwrap();
+            }
+
+            let mut connect = [0_u8; 4];
+            stream.read_exact(&mut connect).unwrap();
+            assert_eq!(
+                connect,
+                [5, 1, 0, 3],
+                "hostname must be resolved by the proxy"
+            );
+            assert_eq!(read_socks_string(&mut stream), b"model-host.invalid");
+            let mut port = [0_u8; 2];
+            stream.read_exact(&mut port).unwrap();
+            assert_eq!(u16::from_be_bytes(port), 8123);
+            stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+
+            let request = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MODEL_BYTES.len()
+            )
+            .unwrap();
+            stream.write_all(MODEL_BYTES).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+        let credentials = if authenticated {
+            format!("{PROXY_USERNAME}:{PROXY_PASSWORD}@")
+        } else {
+            String::new()
+        };
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination = destination_dir.path().join("model.onnx");
+        let result = download_once(
+            "http://model-host.invalid:8123/model.onnx?revision=frozen",
+            format!("{scheme}://{credentials}{address}"),
+            &destination,
+        );
+        let request = peer.join().unwrap();
+        result.unwrap();
+        assert!(request.starts_with("GET /model.onnx?revision=frozen HTTP/1.1\r\n"));
+        assert_eq!(
+            request_header(&request, "Host"),
+            Some("model-host.invalid:8123")
+        );
+        assert_eq!(request_header(&request, "Proxy-Authorization"), None);
+        assert!(!request.contains(PROXY_USERNAME));
+        assert!(!request.contains(PROXY_PASSWORD));
+        let downloaded = std::fs::read(&destination).unwrap();
+        assert_eq!(downloaded, MODEL_BYTES);
+        assert_eq!(sha256_hex(&downloaded), sha256_hex(MODEL_BYTES));
+        assert!(!destination.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn socks5_and_socks5h_resolve_destination_hostnames_at_the_proxy() {
+        for scheme in ["socks5", "socks5h"] {
+            assert_socks_download(scheme, false);
+        }
+    }
+
+    #[test]
+    fn socks5_authentication_is_not_forwarded_as_origin_headers() {
+        for scheme in ["socks5", "socks5h"] {
+            assert_socks_download(scheme, true);
+        }
+    }
+
+    #[test]
+    fn https_download_connect_authentication_and_refusal_are_redacted() {
+        let (address, peer) = spawn_proxy(|mut stream| {
+            let request = read_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 407 proxy-reason-canary-{PROXY_USERNAME}-{PROXY_PASSWORD}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            request
+        });
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination = destination_dir.path().join("model.onnx");
+        let result = download_once(
+            "https://model-host.invalid/model.onnx?token=origin-query-canary",
+            format!("http://{PROXY_USERNAME}:{PROXY_PASSWORD}@{address}"),
+            &destination,
+        );
+        let request = peer.join().unwrap();
+        assert!(request.starts_with("CONNECT model-host.invalid:443 HTTP/1.1\r\n"));
+        assert_eq!(
+            request_header(&request, "Proxy-Authorization"),
+            Some(PROXY_BASIC_AUTH)
+        );
+        assert!(!request.contains("origin-query-canary"));
+        let error = result.unwrap_err();
+        let rendered = format!("{error}\n{error:?}");
+        assert!(rendered.contains("proxy-tunnel-http-407"), "{rendered}");
+        for secret in [
+            PROXY_USERNAME,
+            PROXY_PASSWORD,
+            PROXY_BASIC_AUTH,
+            "proxy-reason-canary",
+            "origin-query-canary",
+        ] {
+            assert!(!rendered.contains(secret), "{rendered}");
+        }
+        assert!(!destination.exists());
+        assert!(!destination.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn https_proxy_requires_tls_before_sending_proxy_credentials() {
+        let (address, peer) = spawn_proxy(|mut stream| {
+            let mut record_header = [0_u8; 5];
+            stream.read_exact(&mut record_header).unwrap();
+            assert_eq!(record_header[0], 0x16, "expected TLS handshake record");
+            assert_eq!(record_header[1], 0x03, "expected TLS record version");
+            let record_length = u16::from_be_bytes([record_header[3], record_header[4]]);
+            let mut hello = vec![0_u8; usize::from(record_length)];
+            stream.read_exact(&mut hello).unwrap();
+            assert!(
+                !hello
+                    .windows(PROXY_PASSWORD.len())
+                    .any(|w| w == PROXY_PASSWORD.as_bytes())
+            );
+            // A plaintext peer cannot impersonate an HTTPS proxy. This is a
+            // handshake-failure test; it does not install a test trust root.
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+        });
+        let destination_dir = tempfile::tempdir().unwrap();
+        let destination = destination_dir.path().join("model.onnx");
+        let result = download_once(
+            "http://model-host.invalid/model.onnx",
+            format!("https://{PROXY_USERNAME}:{PROXY_PASSWORD}@{address}"),
+            &destination,
+        );
+        peer.join().unwrap();
+        let error = result.unwrap_err();
+        let rendered = format!("{error}\n{error:?}");
+        assert!(rendered.contains("tls-handshake-failure"), "{rendered}");
+        assert!(!rendered.contains(PROXY_PASSWORD), "{rendered}");
+        assert!(!destination.exists());
+        assert!(!destination.with_extension("tmp").exists());
     }
 }

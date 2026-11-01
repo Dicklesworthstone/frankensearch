@@ -32,6 +32,7 @@ use crate::api_provider::{
     remote_ordered_request_sha256,
 };
 use crate::cached_embedder::CachedEmbedder;
+use crate::proxy::{ProxySetting, proxy_from_environment};
 
 const API_OUTPUT_NORMALIZATION_V1: &str = "l2-f32-zero-on-degenerate-v1";
 const API_STORAGE_FORMAT_V1: &str = "in-memory-f32-v1";
@@ -56,6 +57,9 @@ pub struct ApiEmbedderConfig {
     pub request_timeout: Duration,
     /// Maximum response bytes admitted before parsing.
     pub max_response_bytes: usize,
+    /// Outbound proxy policy shared with model downloads. By default, select
+    /// from the conventional proxy environment variables for each request URL.
+    pub proxy: ProxySetting,
 }
 
 impl Default for ApiEmbedderConfig {
@@ -66,6 +70,7 @@ impl Default for ApiEmbedderConfig {
             requests_per_minute: 0,
             request_timeout: DEFAULT_API_REQUEST_TIMEOUT,
             max_response_bytes: DEFAULT_MAX_API_RESPONSE_BYTES,
+            proxy: ProxySetting::FromEnvironment,
         }
     }
 }
@@ -378,13 +383,12 @@ enum ApiAttemptError {
 type ApiAttemptResult<T> = Result<T, ApiAttemptError>;
 
 /// One HTTP exchange owns its connection through the complete bounded body.
-/// HttpClient's streaming deadline ends at the response head, so it cannot
+/// `HttpClient`'s streaming deadline ends at the response head, so it cannot
 /// protect this caller's subsequent body reads. Start after rate admission and
 /// keep one deadline across connect, headers and all chunks; never reset it on
 /// body progress. Decoding/authentication remain in the calling request path.
 async fn request_api_response(
     cx: &Cx,
-    client: &HttpClient,
     provider: &dyn ApiProvider,
     config: &ApiEmbedderConfig,
     url: &str,
@@ -392,7 +396,11 @@ async fn request_api_response(
     body: Vec<u8>,
 ) -> ApiAttemptResult<(u16, Vec<u8>)> {
     let work = async {
-        let response = client
+        // Routing belongs to the actual request URL, including providers whose
+        // request_url differs from endpoint_url. Streaming responses own their
+        // connections instead of returning them to the pool, so constructing
+        // one per attempt does not discard a reusable connection.
+        let response = build_http_client(config, url)
             .request_streaming(cx, Method::Post, url, headers.to_vec(), body)
             .await
             .map_err(|error| {
@@ -650,7 +658,6 @@ impl VerifiedProviderContractV1 {
 /// supplied by the caller does not authenticate the responding service.
 pub struct ApiEmbedder {
     provider: Box<dyn ApiProvider>,
-    client: HttpClient,
     rate_limiter: RateLimiter,
     config: ApiEmbedderConfig,
     identity: EmbeddingIdentityBundleV1,
@@ -712,11 +719,9 @@ impl ApiEmbedder {
         validate_http_config(&config)?;
         let identity = validate_remote_identity(provider.as_ref(), immutable_space_epoch)?;
         let provider_contract = VerifiedProviderContractV1::capture(provider.as_ref())?;
-        let client = build_http_client(&config);
         let rate_limiter = RateLimiter::new(config.requests_per_minute);
         Ok(Self {
             provider,
-            client,
             rate_limiter,
             config,
             identity,
@@ -863,7 +868,6 @@ impl ApiEmbedder {
 
             let (status, response_body) = match request_api_response(
                 cx,
-                &self.client,
                 self.provider.as_ref(),
                 &self.config,
                 &url,
@@ -1018,7 +1022,6 @@ impl ApiEmbedder {
 /// [`ApiEmbedder`].
 pub struct AssumedRemoteApi {
     provider: Box<dyn ApiProvider>,
-    client: HttpClient,
     rate_limiter: RateLimiter,
     config: ApiEmbedderConfig,
     identity: EmbeddingIdentityBundleV1,
@@ -1051,11 +1054,9 @@ impl AssumedRemoteApi {
     ) -> SearchResult<Self> {
         validate_http_config(&config)?;
         let identity = validate_remote_identity(provider.as_ref(), assumed_space_epoch)?;
-        let client = build_http_client(&config);
         let rate_limiter = RateLimiter::new(config.requests_per_minute);
         Ok(Self {
             provider,
-            client,
             rate_limiter,
             config,
             identity,
@@ -1159,7 +1160,6 @@ impl AssumedRemoteApi {
 
             let (status, response_body) = match request_api_response(
                 cx,
-                &self.client,
                 self.provider.as_ref(),
                 &self.config,
                 &url,
@@ -1340,15 +1340,20 @@ fn verify_response_vectors(
     Ok(())
 }
 
-fn build_http_client(config: &ApiEmbedderConfig) -> HttpClient {
+fn build_http_client(config: &ApiEmbedderConfig, url: &str) -> HttpClient {
     let mut client_config = HttpClientConfig::default();
-    client_config.redirect_policy = RedirectPolicy::Limited(5);
+    // Embedding POST bodies contain private input text. Stripping credentials
+    // alone cannot make a cross-origin 307/308 safe: it would still replay the
+    // body to a different service. Same-origin redirects also retain the same
+    // proxy/bypass decision because their scheme, host and port cannot change.
+    client_config.redirect_policy = RedirectPolicy::SameOrigin(5);
     client_config.user_agent = Some(format!(
         "frankensearch/{} (api-embedder)",
         env!("CARGO_PKG_VERSION")
     ));
     client_config.max_body_size = Some(config.max_response_bytes);
     client_config.request_timeout = Some(config.request_timeout);
+    client_config.proxy_url = proxy_from_environment(&config.proxy, url);
     HttpClient::with_config(client_config)
 }
 
@@ -1780,7 +1785,7 @@ mod tests {
         let handle = thread::spawn(move || {
             let mut nonces = Vec::new();
             for attempt in 0..=transient_failures {
-                let (mut stream, _) = listener.accept().unwrap();
+                let mut stream = accept_http_test_connection(&listener);
                 let body = read_http_request_body(&mut stream);
                 let request: TestGatewayRequest = serde_json::from_slice(&body).unwrap();
                 let input_refs: Vec<&str> = request.inputs.iter().map(String::as_str).collect();
@@ -1829,6 +1834,13 @@ mod tests {
     }
 
     fn read_http_request_body(stream: &mut TcpStream) -> Vec<u8> {
+        read_http_request(stream).1
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> (String, Vec<u8>) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let mut request = Vec::new();
         let mut buffer = [0_u8; 4096];
         let header_end = loop {
@@ -1840,7 +1852,7 @@ mod tests {
             }
             assert!(request.len() <= 64 * 1024, "request headers too large");
         };
-        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let headers = String::from_utf8(request[..header_end].to_vec()).unwrap();
         let content_length = headers
             .lines()
             .find_map(|line| {
@@ -1850,12 +1862,46 @@ mod tests {
                     .flatten()
             })
             .unwrap();
+        assert!(content_length <= 1024 * 1024, "request body too large");
         while request.len() - header_end < content_length {
             let read = stream.read(&mut buffer).unwrap();
             assert!(read > 0, "request ended before declared body");
             request.extend_from_slice(&buffer[..read]);
         }
-        request[header_end..header_end + content_length].to_vec()
+        (
+            headers,
+            request[header_end..header_end + content_length].to_vec(),
+        )
+    }
+
+    fn accept_http_test_connection(listener: &TcpListener) -> TcpStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "HTTP test server saw no request");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("HTTP test accept failed: {error}"),
+            }
+        }
+    }
+
+    fn test_http_config(proxy: ProxySetting) -> ApiEmbedderConfig {
+        ApiEmbedderConfig {
+            proxy,
+            max_retries: 0,
+            request_timeout: Duration::from_secs(5),
+            ..ApiEmbedderConfig::default()
+        }
     }
 
     fn write_http_response(stream: &mut TcpStream, status: u16, body: &[u8]) {
@@ -2239,6 +2285,7 @@ mod tests {
                 let config = ApiEmbedderConfig {
                     requests_per_minute: 1,
                     max_retries: 0,
+                    proxy: ProxySetting::Disabled,
                     ..ApiEmbedderConfig::default()
                 };
                 let authenticated = ApiEmbedder::new_verified(
@@ -3281,9 +3328,13 @@ mod tests {
             endpoint,
             dimension: 4,
         });
-        let embedder =
-            ApiEmbedder::with_verified_defaults(provider, Some(frozen_identity), test_attester())
-                .unwrap();
+        let embedder = ApiEmbedder::new_verified(
+            provider,
+            test_http_config(ProxySetting::Disabled),
+            Some(frozen_identity),
+            test_attester(),
+        )
+        .unwrap();
 
         let captured = Arc::new(Mutex::new(None));
         let captured_for_task = Arc::clone(&captured);
@@ -3313,9 +3364,13 @@ mod tests {
             endpoint,
             dimension: 4,
         });
-        let embedder =
-            ApiEmbedder::with_verified_defaults(provider, Some(frozen_identity), test_attester())
-                .unwrap();
+        let embedder = ApiEmbedder::new_verified(
+            provider,
+            test_http_config(ProxySetting::Disabled),
+            Some(frozen_identity),
+            test_attester(),
+        )
+        .unwrap();
 
         let rejected = Arc::new(Mutex::new(false));
         let rejected_for_task = Arc::clone(&rejected);
@@ -3344,6 +3399,7 @@ mod tests {
         let config = ApiEmbedderConfig {
             max_retries: 1,
             retry_base_delay: Duration::from_millis(1),
+            proxy: ProxySetting::Disabled,
             ..ApiEmbedderConfig::default()
         };
         let embedder =
@@ -3361,6 +3417,331 @@ mod tests {
         assert_eq!(vectors, vec![vec![1.0, 0.0, 0.0, 0.0]]);
         assert_eq!(nonces.len(), 2);
         assert_ne!(nonces[0], nonces[1]);
+    }
+
+    fn serve_one_proxy_embedding(
+        listener: TcpListener,
+        verified: bool,
+    ) -> thread::JoinHandle<(String, Vec<u8>)> {
+        thread::spawn(move || {
+            let mut stream = accept_http_test_connection(&listener);
+            let (headers, body) = read_http_request(&mut stream);
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["inputs"], serde_json::json!(["proxy-input-canary"]));
+            let vectors = vec![vec![3.0, 4.0, 0.0, 0.0]];
+            let attestation = verified.then(|| {
+                let challenge: RemoteEmbeddingChallengeV1 =
+                    serde_json::from_value(request["challenge"].clone()).unwrap();
+                let identity = remote_test_identity(4);
+                let mut attestation = RemoteEmbeddingAttestationV1::unsigned(
+                    &challenge,
+                    &identity.identity,
+                    "openai",
+                    "text-embedding-3-small",
+                    TEST_GENERATION,
+                    &vectors,
+                    TEST_KEY_ID,
+                )
+                .unwrap();
+                attestation.sign_hmac_sha256(TEST_ATTESTATION_KEY).unwrap();
+                attestation
+            });
+            let response = serde_json::to_vec(&TestGatewayResponse {
+                vectors,
+                attestation,
+            })
+            .unwrap();
+            write_http_response(&mut stream, 200, &response);
+            (headers, body)
+        })
+    }
+
+    fn assert_api_proxy_round_trip(verified: bool, config: ApiEmbedderConfig, endpoint: String) {
+        run_test_with_cx(|cx| async move {
+            let provider = Box::new(TestGatewayProvider {
+                endpoint,
+                dimension: 4,
+            });
+            let vectors = if verified {
+                ApiEmbedder::new_verified(
+                    provider,
+                    config,
+                    Some(remote_test_identity(4)),
+                    test_attester(),
+                )
+                .unwrap()
+                .embed_batch(&cx, &["proxy-input-canary"])
+                .await
+                .unwrap()
+            } else {
+                AssumedRemoteApi::new(provider, config, Some(remote_test_identity(4)))
+                    .unwrap()
+                    .embed_transient(&cx, "proxy-input-canary")
+                    .await
+                    .unwrap()
+                    .into_vectors()
+            };
+            assert_eq!(vectors.len(), 1);
+            for (actual, expected) in vectors[0].iter().zip([0.6, 0.8, 0.0, 0.0]) {
+                assert!((actual - expected).abs() < 1e-6);
+            }
+        });
+    }
+
+    #[test]
+    fn api_proxy_reaches_unresolvable_provider_in_both_trust_modes() {
+        for verified in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let proxy = serve_one_proxy_embedding(listener, verified);
+            let config =
+                test_http_config(ProxySetting::Url(format!("http://user:secret@{address}")));
+            assert_api_proxy_round_trip(
+                verified,
+                config,
+                "http://embedding-provider.invalid/v1/embeddings".to_owned(),
+            );
+            let (headers, _) = proxy.join().unwrap();
+            assert!(
+                headers.starts_with(
+                    "POST http://embedding-provider.invalid/v1/embeddings HTTP/1.1\r\n"
+                )
+            );
+            assert!(headers.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("proxy-authorization")
+                        && value.trim() == "Basic dXNlcjpzZWNyZXQ="
+                })
+            }));
+        }
+    }
+
+    // A subprocess supplies an isolated environment without unsafe set_var or
+    // races with the test runner. The parent is the real HTTP proxy/origin.
+    #[test]
+    fn api_proxy_environment_child() {
+        let Ok(case) = std::env::var("FRANKENSEARCH_TEST_API_PROXY_CASE") else {
+            return;
+        };
+        let verified = case.starts_with("verified-");
+        let direct = case.ends_with("-direct");
+        let endpoint = std::env::var("FRANKENSEARCH_TEST_API_ENDPOINT").unwrap();
+        assert_api_proxy_round_trip(
+            verified,
+            test_http_config(if direct {
+                ProxySetting::Disabled
+            } else {
+                ProxySetting::FromEnvironment
+            }),
+            endpoint,
+        );
+    }
+
+    #[test]
+    fn api_proxy_environment_routes_and_explicit_disable_overrides() {
+        for verified in [false, true] {
+            for direct in [false, true] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = serve_one_proxy_embedding(listener, verified);
+                let endpoint = if direct {
+                    format!("http://{address}/v1/embeddings")
+                } else {
+                    "http://embedding-provider.invalid/v1/embeddings".to_owned()
+                };
+                let proxy = if direct {
+                    "invalid://must-not-be-used:secret@proxy.invalid".to_owned()
+                } else {
+                    format!("http://{address}")
+                };
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child.args([
+                    "--exact",
+                    "api_embedder::tests::api_proxy_environment_child",
+                    "--nocapture",
+                ]);
+                for variable in [
+                    "http_proxy",
+                    "HTTP_PROXY",
+                    "https_proxy",
+                    "HTTPS_PROXY",
+                    "all_proxy",
+                    "ALL_PROXY",
+                    "no_proxy",
+                    "NO_PROXY",
+                ] {
+                    child.env_remove(variable);
+                }
+                let case = format!(
+                    "{}-{}",
+                    if verified { "verified" } else { "assumed" },
+                    if direct { "direct" } else { "proxy" }
+                );
+                // Windows cannot store both spellings as distinct variables.
+                if !cfg!(windows) {
+                    child.env("HTTP_PROXY", "invalid://must-not-be-used");
+                }
+                let output = child
+                    .env("FRANKENSEARCH_TEST_API_PROXY_CASE", case)
+                    .env("FRANKENSEARCH_TEST_API_ENDPOINT", endpoint)
+                    .env("http_proxy", proxy)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "child failed: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let (headers, _) = server.join().unwrap();
+                let expected = if direct {
+                    "POST /v1/embeddings HTTP/1.1\r\n"
+                } else {
+                    "POST http://embedding-provider.invalid/v1/embeddings HTTP/1.1\r\n"
+                };
+                assert!(headers.starts_with(expected), "{headers}");
+                assert!(!headers.to_ascii_lowercase().contains("proxy-authorization"));
+            }
+        }
+    }
+
+    #[test]
+    fn api_proxy_invalid_configuration_fails_closed_and_redacts_credentials() {
+        let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+        origin.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}/embeddings", origin.local_addr().unwrap());
+        let config = test_http_config(ProxySetting::Url(
+            "invalid://proxy-user:proxy-password@proxy.invalid".to_owned(),
+        ));
+        let rendered = format!("{config:?}");
+        for secret in ["proxy-user", "proxy-password", "proxy.invalid"] {
+            assert!(!rendered.contains(secret));
+        }
+        run_test_with_cx(|cx| async move {
+            let provider = TestGatewayProvider {
+                endpoint,
+                dimension: 4,
+            };
+            let error = request_api_response(
+                &cx,
+                &provider,
+                &config,
+                &provider.endpoint,
+                &provider.request_headers(),
+                b"private-input-canary".to_vec(),
+            )
+            .await
+            .unwrap_err();
+            let rendered = format!("{error:?}");
+            for secret in [
+                "proxy-user",
+                "proxy-password",
+                "proxy.invalid",
+                "private-input-canary",
+            ] {
+                assert!(!rendered.contains(secret));
+            }
+        });
+        assert!(matches!(
+            origin.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn api_cross_origin_redirects_never_forward_private_post_bodies() {
+        for status in [307, 308] {
+            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            destination.set_nonblocking(true).unwrap();
+            let target = format!(
+                "http://{}/must-not-receive-input",
+                destination.local_addr().unwrap()
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/embeddings", listener.local_addr().unwrap());
+            let origin = thread::spawn(move || {
+                let mut stream = accept_http_test_connection(&listener);
+                let request = read_http_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                request
+            });
+            run_test_with_cx(|cx| async move {
+                let provider = TestGatewayProvider {
+                    endpoint,
+                    dimension: 4,
+                };
+                let (response_status, body) = request_api_response(
+                    &cx,
+                    &provider,
+                    &test_http_config(ProxySetting::Disabled),
+                    &provider.endpoint,
+                    &[(
+                        "Authorization".to_owned(),
+                        "Bearer api-key-canary".to_owned(),
+                    )],
+                    b"private-input-canary".to_vec(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response_status, status);
+                assert!(body.is_empty());
+            });
+            let (headers, body) = origin.join().unwrap();
+            assert!(headers.contains("api-key-canary"));
+            assert_eq!(body, b"private-input-canary");
+            assert!(matches!(
+                destination.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
+    }
+
+    #[test]
+    fn api_same_origin_redirect_preserves_post_and_authorization() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/embeddings", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let mut stream = accept_http_test_connection(&listener);
+            let first = read_http_request(&mut stream);
+            stream.write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /canonical\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            drop(stream);
+            let mut stream = accept_http_test_connection(&listener);
+            let second = read_http_request(&mut stream);
+            write_http_response(&mut stream, 200, b"{}");
+            (first, second)
+        });
+        run_test_with_cx(|cx| async move {
+            let provider = TestGatewayProvider {
+                endpoint,
+                dimension: 4,
+            };
+            let (status, body) = request_api_response(
+                &cx,
+                &provider,
+                &test_http_config(ProxySetting::Disabled),
+                &provider.endpoint,
+                &[(
+                    "Authorization".to_owned(),
+                    "Bearer api-key-canary".to_owned(),
+                )],
+                b"private-input-canary".to_vec(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(body, b"{}");
+        });
+        let ((first_headers, first_body), (second_headers, second_body)) = server.join().unwrap();
+        assert!(first_headers.starts_with("POST /embeddings HTTP/1.1\r\n"));
+        assert!(second_headers.starts_with("POST /canonical HTTP/1.1\r\n"));
+        assert!(first_headers.contains("api-key-canary"));
+        assert!(second_headers.contains("api-key-canary"));
+        assert_eq!(first_body, b"private-input-canary");
+        assert_eq!(second_body, first_body);
     }
 
     #[test]
