@@ -3226,7 +3226,7 @@ mod tests {
         for selected in ["https_proxy", "HTTPS_PROXY", "ALL_PROXY"] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let address = listener.local_addr().unwrap();
-            let response = b"HTTP/1.1 407 proxy-reason-canary\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+            let response = "HTTP/1.1 407 proxy-reason-canary\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned();
             let server = recording_download_server(listener, vec![response]);
             let mut environment = vec![
                 (

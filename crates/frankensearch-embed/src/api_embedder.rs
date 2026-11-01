@@ -1552,6 +1552,7 @@ impl Embedder for ApiEmbedder {
 mod tests {
     use super::*;
     use crate::api_provider::{OpenAiProvider, remote_ordered_request_sha256};
+    use asupersync::http::body::HeaderMap;
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
     use serde::Deserialize;
@@ -2115,7 +2116,7 @@ mod tests {
             let delay = Duration::from_nanos(nanos);
             assert_eq!(limiter.acquire_at(start), Some(delay));
             assert_eq!(
-                limiter.acquire_at(start + delay - Duration::from_nanos(1)),
+                limiter.acquire_at(start + delay.saturating_sub(Duration::from_nanos(1))),
                 Some(Duration::from_nanos(1))
             );
             assert!(limiter.acquire_at(start + delay).is_none());
@@ -2476,7 +2477,7 @@ mod tests {
                     "body drained without yielding"
                 );
                 Poll::Ready(Some(Ok(if self.trailers {
-                    Frame::Trailers(Default::default())
+                    Frame::Trailers(HeaderMap::default())
                 } else {
                     Frame::Data(&[])
                 })))
@@ -2563,7 +2564,7 @@ mod tests {
                 frames.push(Ok(Frame::Data(b"\0".as_slice())));
                 frames.push(Ok(Frame::Data("é".as_bytes())));
                 frames.push(Ok(Frame::Data(b"".as_slice())));
-                frames.push(Ok(Frame::Trailers(Default::default())));
+                frames.push(Ok(Frame::Trailers(HeaderMap::default())));
             }
             let body = AttemptBody::new(frames, false);
             let polls = Arc::clone(&body.polls);
@@ -2837,7 +2838,7 @@ mod tests {
                 let body = AttemptBody::new(
                     vec![
                         Ok(Frame::Data("é".as_bytes())),
-                        Ok(Frame::Trailers(Default::default())),
+                        Ok(Frame::Trailers(HeaderMap::default())),
                         Ok(Frame::Data(b"\0x")),
                     ],
                     false,
