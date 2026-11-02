@@ -396,7 +396,8 @@ fn validate_pending_jobs(
         if hash.as_ref() != document.content_hash.as_slice()
             || source.revision != manifests[id].revision
             || checkpoints.get(id).is_none_or(|entry| {
-                source.revision != entry.revision || source.source_sha256 != entry.content_hash_hex
+                (source.revision, source.source_sha256.as_str())
+                    != (entry.revision, entry.content_hash_hex.as_str())
             })
             || source.source_sha256.len() != 64
             || !source

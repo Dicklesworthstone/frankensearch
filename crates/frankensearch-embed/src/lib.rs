@@ -8,6 +8,9 @@
 //! The `EmbedderStack` auto-detection probes for available models and configures
 //! the best fast+quality pair automatically.
 
+// The download-capable lazy loader needs deeper auto-trait analysis.
+#![recursion_limit = "256"]
+
 pub mod auto_detect;
 pub mod batch_coalescer;
 #[cfg(feature = "bundled-default-models")]

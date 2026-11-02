@@ -15068,11 +15068,17 @@ impl FsfsRuntime {
                 manifest.clone(),
                 DownloadConsent::granted(ConsentSource::Interactive),
             );
-            let staged = downloader
-                .download_model(cx, &manifest, &model_root, &mut lifecycle, |progress| {
+            // Keep the consent-only download state out of every indexing future.
+            let staged = Box::pin(downloader.download_model(
+                cx,
+                &manifest,
+                &model_root,
+                &mut lifecycle,
+                |progress| {
                     eprintln!("{progress}");
-                })
-                .await?;
+                },
+            ))
+            .await?;
             manifest.promote_verified_installation(&staged, &destination)?;
             println!("  verified {} -> {}", manifest.id, destination.display());
         }
