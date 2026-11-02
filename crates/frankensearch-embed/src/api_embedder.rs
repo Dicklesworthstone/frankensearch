@@ -382,6 +382,26 @@ enum ApiAttemptError {
 
 type ApiAttemptResult<T> = Result<T, ApiAttemptError>;
 
+fn api_client_error_is_retryable(error: &ClientError) -> bool {
+    match error {
+        ClientError::DnsError(_)
+        | ClientError::ConnectError(_)
+        | ClientError::Io(_)
+        | ClientError::HttpError(_)
+        | ClientError::DeadlineExceeded
+        | ClientError::PoolExhausted { .. } => true,
+        ClientError::ConnectTunnelRefused { status, .. } => {
+            matches!(*status, 408 | 429) || *status >= 500
+        }
+        ClientError::InvalidUrl(_)
+        | ClientError::TlsError(_)
+        | ClientError::TooManyRedirects { .. }
+        | ClientError::InvalidConnectInput(_)
+        | ClientError::ProxyError(_)
+        | ClientError::Cancelled => false,
+    }
+}
+
 /// One HTTP exchange owns its connection through the complete bounded body.
 /// `HttpClient`'s streaming deadline ends at the response head, so it cannot
 /// protect this caller's subsequent body reads. Start after rate admission and
@@ -403,12 +423,13 @@ async fn request_api_response(
         let response = build_http_client(config, url)
             .request_streaming(cx, Method::Post, url, headers.to_vec(), body)
             .await
-            .map_err(|error| {
-                let error = api_client_error_to_search(&error, provider);
-                if matches!(error, SearchError::Cancelled { .. }) {
-                    ApiAttemptError::Terminal(error)
-                } else {
+            .map_err(|client_error| {
+                let retryable = api_client_error_is_retryable(&client_error);
+                let error = api_client_error_to_search(&client_error, provider);
+                if retryable {
                     ApiAttemptError::Retry(error)
+                } else {
+                    ApiAttemptError::Terminal(error)
                 }
             })?;
         let status = response.head.status;
@@ -3743,6 +3764,49 @@ mod tests {
         assert!(second_headers.contains("api-key-canary"));
         assert_eq!(first_body, b"private-input-canary");
         assert_eq!(second_body, first_body);
+    }
+
+    #[test]
+    fn transport_retry_policy_separates_transient_from_terminal_failures() {
+        for error in [
+            ClientError::DnsError(std::io::Error::other("temporary DNS failure")),
+            ClientError::ConnectError(std::io::Error::other("temporary connect failure")),
+            ClientError::Io(std::io::Error::other("temporary I/O failure")),
+            ClientError::DeadlineExceeded,
+            ClientError::PoolExhausted {
+                host: "provider.invalid".to_owned(),
+                port: 443,
+            },
+            ClientError::ConnectTunnelRefused {
+                status: 429,
+                reason: "rate limited".to_owned(),
+            },
+            ClientError::ConnectTunnelRefused {
+                status: 503,
+                reason: "proxy unavailable".to_owned(),
+            },
+        ] {
+            assert!(api_client_error_is_retryable(&error), "{error:?}");
+        }
+
+        for error in [
+            ClientError::InvalidUrl("invalid endpoint".to_owned()),
+            ClientError::TlsError("certificate rejected".to_owned()),
+            ClientError::TooManyRedirects { count: 6, max: 5 },
+            ClientError::InvalidConnectInput("invalid tunnel target".to_owned()),
+            ClientError::ProxyError("SOCKS authentication failed".to_owned()),
+            ClientError::ConnectTunnelRefused {
+                status: 407,
+                reason: "proxy authentication required".to_owned(),
+            },
+            ClientError::ConnectTunnelRefused {
+                status: 403,
+                reason: "proxy policy rejected request".to_owned(),
+            },
+            ClientError::Cancelled,
+        ] {
+            assert!(!api_client_error_is_retryable(&error), "{error:?}");
+        }
     }
 
     #[test]
