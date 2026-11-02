@@ -25,8 +25,8 @@ use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AdmittedEmbedder, FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsIndexPayload, FsfsRuntime,
-    IndexManifestEntry, IndexRunControl, IngestionClass, PendingIndexDocument,
+    AdmittedEmbedder, CheckpointFileEntry, FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsIndexPayload,
+    FsfsRuntime, IndexManifestEntry, IndexRunControl, IngestionClass, PendingIndexDocument,
     REASON_VECTOR_QUALITY_TIER_BUILT, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE,
     SearchExecutionMode, VectorIndex, content_sha256_hex, ingestion_class_label,
     pressure_timestamp_ms, protect_vector_generations, retained_reuse, retained_search_checkpoint,
@@ -348,6 +348,7 @@ fn validate_pending_jobs(
     storage: &Storage,
     key: &str,
     manifests: &BTreeMap<String, IndexManifestEntry>,
+    checkpoints: &BTreeMap<String, CheckpointFileEntry>,
 ) -> SearchResult<()> {
     let expected = manifests
         .iter()
@@ -394,6 +395,9 @@ fn validate_pending_jobs(
         })?;
         if hash.as_ref() != document.content_hash.as_slice()
             || source.revision != manifests[id].revision
+            || checkpoints.get(id).is_none_or(|entry| {
+                source.revision != entry.revision || source.source_sha256 != entry.content_hash_hex
+            })
             || source.source_sha256.len() != 64
             || !source
                 .source_sha256
@@ -487,8 +491,11 @@ impl FsfsRuntime {
                 "selected generation does not have an unbuilt deferred quality tier",
             ));
         }
-        let manifests = Self::read_matching_manifest_generation(predecessor.path())?
-            .ok_or_else(|| invalid("selected membership manifests disagree"))?;
+        let checkpoint = retained_reuse::completed_input_checkpoint(cx, &predecessor)?;
+        let manifests = Self::read_checkpoint_manifest_generation(predecessor.path(), &checkpoint)?
+            .ok_or_else(|| {
+                invalid("selected membership manifests and source checkpoint disagree")
+            })?;
         let mut input = self.cli_input.clone();
         input.index_dir = Some(build.path().to_path_buf());
         input.complete_quality = false;
@@ -519,7 +526,7 @@ impl FsfsRuntime {
             ));
         }
         let key = backlog.queue_key();
-        validate_pending_jobs(&storage, &key, &manifests)?;
+        validate_pending_jobs(&storage, &key, &manifests, &checkpoint.files)?;
         control
             .admit_work(cx, "complete_quality.model_load")
             .await?;
@@ -1214,17 +1221,21 @@ mod tests {
     #[test]
     #[allow(clippy::arc_with_non_send_sync)]
     fn corrupt_job_input_and_source_fences_are_refused_before_inference() {
-        for corruption in ["job_digest", "source_revision", "retained_text", "status"] {
+        for corruption in [
+            "job_digest",
+            "source_revision",
+            "retained_text",
+            "status",
+            "source_digest",
+            "checkpoint_digest",
+            "checkpoint_revision",
+            "missing_checkpoint",
+        ] {
             let storage = Arc::new(Storage::open_in_memory().unwrap());
             let text = "sharedtoken exact quality input";
-            let mut document = DocumentRecord::new(
-                "alpha.md",
-                text,
-                ContentHasher::hash(text),
-                text.chars().count(),
-                7,
-                7,
-            );
+            let hash = ContentHasher::hash(text);
+            let length = text.chars().count();
+            let mut document = DocumentRecord::new("alpha.md", text, hash, length, 7, 7);
             document.metadata = Some(serde_json::json!({
                 SOURCE_METADATA: { "revision": 7, "source_sha256": "ab".repeat(32) },
             }));
@@ -1246,7 +1257,24 @@ mod tests {
                     fast_windows: None,
                 },
             )]);
-            validate_pending_jobs(&storage, "generation-quality", &manifests).unwrap();
+            let mut checkpoints = BTreeMap::from([(
+                "alpha.md".to_owned(),
+                CheckpointFileEntry {
+                    revision: 7,
+                    ingestion_class: ingestion_class_label(IngestionClass::FullSemanticLexical)
+                        .to_owned(),
+                    canonical_bytes: text.len() as u64,
+                    reason_code: "fixture".to_owned(),
+                    lexical_indexed: true,
+                    semantic_indexed: true,
+                    content_hash_hex: "ab".repeat(32),
+                    fast_windows: None,
+                    canonical_lines: None,
+                    stamp: None,
+                },
+            )]);
+            validate_pending_jobs(&storage, "generation-quality", &manifests, &checkpoints)
+                .unwrap();
             match corruption {
                 "job_digest" => {
                     storage
@@ -1258,6 +1286,16 @@ mod tests {
                         .unwrap();
                 }
                 "source_revision" => manifests.get_mut("alpha.md").unwrap().revision = 8,
+                "source_digest" => {
+                    document.metadata.as_mut().unwrap()[SOURCE_METADATA]["source_sha256"] =
+                        serde_json::json!("cd".repeat(32));
+                    storage.upsert_document(&document).unwrap();
+                }
+                "checkpoint_digest" => {
+                    checkpoints.get_mut("alpha.md").unwrap().content_hash_hex = "cd".repeat(32);
+                }
+                "checkpoint_revision" => checkpoints.get_mut("alpha.md").unwrap().revision = 8,
+                "missing_checkpoint" => checkpoints.clear(),
                 "retained_text" => {
                     storage
                         .connection()
@@ -1276,7 +1314,8 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                validate_pending_jobs(&storage, "generation-quality", &manifests).is_err(),
+                validate_pending_jobs(&storage, "generation-quality", &manifests, &checkpoints)
+                    .is_err(),
                 "{corruption}"
             );
         }

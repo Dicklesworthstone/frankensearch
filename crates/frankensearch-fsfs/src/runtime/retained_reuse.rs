@@ -842,6 +842,28 @@ impl CopyStats {
     }
 }
 
+/// Read historical source identities from an admitted generation's sealed receipt.
+/// The caller holds `store.begin()` and obtains this generation through `active`.
+/// This does not authorize indexing reuse: deferred completion independently
+/// checks retained canonical input and its queued producer, without applying
+/// the current executable or pressure configuration to the historical input.
+pub(super) fn completed_input_checkpoint(
+    cx: &Cx,
+    predecessor: &PublishedGeneration,
+) -> SearchResult<IndexingCheckpoint> {
+    let receipt: ReuseReceipt = read_json(cx, &predecessor.path().join(RECEIPT_FILE))?;
+    if receipt.version != RECEIPT_VERSION
+        || receipt.checkpoint.schema_version != INDEXING_CHECKPOINT_SCHEMA_VERSION
+        || !receipt.checkpoint.artifacts_durable
+        || receipt.checkpoint.index_root != predecessor.path().display().to_string()
+    {
+        return Err(reuse_error(
+            "selected generation has no consistent completed source checkpoint",
+        ));
+    }
+    Ok(receipt.checkpoint)
+}
+
 /// Copy a complete admitted predecessor for an explicit mutation, independently
 /// of indexing-reuse evidence. The caller must hold `store.begin()` throughout
 /// this operation and publish only through that build's predecessor check.
