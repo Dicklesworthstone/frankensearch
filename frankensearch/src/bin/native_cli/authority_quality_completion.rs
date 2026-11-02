@@ -1,6 +1,12 @@
 //! Add a complete independent quality tier using one retained fast authority.
 
-use super::*;
+use super::{
+    BlockingPoolHandle, Cx, MAX_RECORD_BYTES, Models, NativeBuildPrecision,
+    NativeGenerationTopology, Options, PublicationIntent, PublicationOptions, QueryMode, Receipt,
+    Result, Write, admit_root, bad, checkpoint, emit_indexed, execution_context,
+    load_authority_models, new_generation, new_path, prepare_publication_with_intent,
+    retained_rebuild_documents, separate_destinations, stage_prepared_and_publish,
+};
 
 pub(super) async fn run(
     cx: &Cx,
@@ -108,6 +114,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Command, NativeBuildRetrieval, is_command};
     use super::*;
 
     fn arguments() -> Vec<String> {
@@ -194,13 +201,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     mod lifecycle {
+        use super::super::super::{
+            CommitRange, DEFAULT_IMAGE_BYTES, Embedder, EmbedderTierTag, HnswParams,
+            IndexableDocument, MAX_INPUT_BYTES, NativeGenerationSnapshot, NativeIndexBuilder,
+            SearchError, create_root, prepare_publication, stage_and_publish,
+        };
         use super::*;
         use frankensearch_core::generation::{
             EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1,
             GenerationComponentRole,
         };
         use frankensearch_core::{ModelCategory, SearchFuture, SearchResult};
+        use std::fs;
         use std::os::unix::fs::DirBuilderExt as _;
+        use std::path::PathBuf;
+        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::time::{SystemTime, UNIX_EPOCH};
 
