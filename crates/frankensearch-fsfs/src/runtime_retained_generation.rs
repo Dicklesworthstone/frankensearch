@@ -2524,14 +2524,13 @@ mod retained_delete_tests {
                 serde_json::from_slice(&fs::read(next.path().join("FSFS-REUSE.json")).unwrap())
                     .unwrap();
             assert_ne!(projected_receipt, previous_receipt);
-            for field in [
-                "version",
-                "session",
-                "executable_sha256",
-                "indexing_contract_sha256",
-                "configuration_sha256",
-            ] {
+            for field in ["version", "session", "configuration_sha256"] {
                 assert!(previous_receipt.get(field).is_some());
+                assert_eq!(projected_receipt.get(field), previous_receipt.get(field));
+            }
+            // A session-local fixture can have no executable proof. Preserve
+            // that absence exactly rather than minting cross-process scope.
+            for field in ["executable_sha256", "indexing_contract_sha256"] {
                 assert_eq!(projected_receipt.get(field), previous_receipt.get(field));
             }
             let previous_checkpoint: IndexingCheckpoint =
