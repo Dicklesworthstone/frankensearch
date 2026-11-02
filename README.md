@@ -432,6 +432,9 @@ or `FRANKENSEARCH_INDEXING_UPGRADE_REUSE=compatible_contract`; disable it with
 still apply, and old receipts without the contract cannot use this path.
 Reuse skips document embedding; model verification and startup health probes
 still run.
+On complete-generation stores, `compact` and `delete` preserve admitted reuse
+evidence for surviving documents without running embedding inference. A later
+index reuses those documents and embeds changed or restored source rows.
 Exact JSON number parsing advances the indexing contract to v2. A v1 completion
 receipt starts cold once, including with this opt-in; later v2-compatible binary
 upgrades can reuse its work. Older query caches and daemons are also invalidated

@@ -157,10 +157,15 @@ intact. A retry recomputes from that queue; it does not resume a partially
 computed unselected candidate. An unknown quality selection or an older build
 without exact retained input still permits ordinary deferred indexing, but
 requires a full source reindex before explicit quality completion. Successors
-created by append, delete, compaction or retained-watch deltas preserve their
-existing behavior and invalidate the inherited backlog's generation scope;
-an ordinary source reindex establishes fresh work, including when a compaction
-did not change document content.
+published by retained CLI compaction and deletion carry exact surviving quality
+jobs into the new generation without source-body reads or inference. Deleting
+the last semantic member clears the remaining debt. Delete-only retained watch
+batches also carry their already-admitted checkpoint and invalidate touched
+skipped-source witnesses. Missing or inconsistent pending work refuses publication
+and preserves the incumbent. Content upserts and appends retain their existing
+admission and refusal rules; when permitted, those successors and other retained
+watch deltas still invalidate the inherited backlog's generation scope. An
+ordinary source reindex establishes fresh work for those paths.
 This provides durable explicit completion, without automatic background execution
 or a claim that a partially built quality tier is complete.
 
