@@ -1176,12 +1176,14 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
+        let checkpoint =
+            retained_batch::retain_unchanged_inputs(cx, &candidate, &predecessor, build.path())?;
         deferred_quality::carry_after_maintenance(
             cx,
             &candidate,
             &predecessor,
             build.path(),
-            || retained_batch::retain_unchanged_inputs(cx, &candidate, &predecessor, build.path()),
+            || Ok(checkpoint),
         )?;
         let publication = build.publish_with_precommit(
             cx,
@@ -1281,12 +1283,14 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
+        let checkpoint =
+            retained_batch::retain_unchanged_inputs(cx, &candidate, &predecessor, build.path())?;
         deferred_quality::carry_after_maintenance(
             cx,
             &candidate,
             &predecessor,
             build.path(),
-            || retained_batch::retain_unchanged_inputs(cx, &candidate, &predecessor, build.path()),
+            || Ok(checkpoint),
         )?;
         let publication = build.publish(cx, |_, path| {
             Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)

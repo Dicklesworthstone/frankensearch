@@ -2779,6 +2779,26 @@ mod generation_tests {
                     panic!("append must publish durably"); // ubs:ignore — cfg(test) assertion.
                 };
                 generation
+            } else if operation == "compact" {
+                runtime.cli_input.command = CliCommand::Compact;
+                let (publication, _) = runtime
+                    .compact_retained_generation(cx, &root)
+                    .await
+                    .unwrap();
+                let Some(GenerationPublication::Durable(generation)) = publication else {
+                    panic!("compaction must publish durably");
+                };
+                generation
+            } else if operation == "delete" {
+                runtime.cli_input.command = CliCommand::Delete;
+                runtime.cli_input.delete_ids = vec!["doc-0.md".to_owned()];
+                let (publication, count) =
+                    runtime.delete_retained_generation(cx, &root).await.unwrap();
+                assert_eq!(count, 1);
+                let Some(GenerationPublication::Durable(generation)) = publication else {
+                    panic!("deletion must publish durably");
+                };
+                generation
             } else {
                 publish(&runtime, cx, &root).await
             };
@@ -2806,7 +2826,14 @@ mod generation_tests {
                     )
                     .unwrap();
                     assert_eq!(index.embedder_revision(), producer.identity.fingerprint());
-                    assert_eq!(index.live_doc_ids().unwrap().len(), 2);
+                    if operation == "delete" {
+                        assert_eq!(
+                            index.live_doc_ids().unwrap(),
+                            std::collections::HashSet::from(["doc-1.md".to_owned()])
+                        );
+                    } else {
+                        assert_eq!(index.live_doc_ids().unwrap().len(), 2);
+                    }
                     for row in 0..index.record_count() {
                         let text =
                             fs::read_to_string(source.join(index.doc_id_at(row).unwrap())).unwrap();
@@ -2817,9 +2844,44 @@ mod generation_tests {
                 }
                 let mut reader = runtime.open_retained_search(cx, &root).await.unwrap();
                 let phases = reader.search(cx, "sharedtoken", 10).await.unwrap();
-                assert_eq!(phases.last().unwrap().hits.len(), 2);
+                assert_eq!(
+                    phases.last().unwrap().hits.len(),
+                    if operation == "delete" { 1 } else { 2 }
+                );
             }
             report
+        }
+
+        #[test]
+        fn completed_two_tier_compaction_preserves_warm_inputs() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                let (_, source, _) = fixture(parent.path(), 2);
+                assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 2, 2);
+                assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 0, 0);
+                assert_index_calls(&run_counted(&cx, parent.path(), "compact").await, 0, 0);
+                assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 0, 0);
+                fs::write(
+                    source.join("doc-0.md"),
+                    "sharedtoken changed after compaction",
+                )
+                .unwrap();
+                assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 1, 1);
+            });
+        }
+
+        #[test]
+        fn completed_two_tier_deletion_preserves_only_surviving_warm_inputs() {
+            run_test_with_cx(|cx| async move {
+                let parent = tempfile::tempdir().unwrap();
+                fixture(parent.path(), 2);
+                assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 2, 2);
+                assert_index_calls(&run_counted(&cx, parent.path(), "delete").await, 0, 0);
+                // Deletion leaves the source intact. Only that removed row
+                // needs inference when a later source index restores it.
+                assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 1, 1);
+                assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 0, 0);
+            });
         }
 
         #[test]
