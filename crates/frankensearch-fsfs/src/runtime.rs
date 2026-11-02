@@ -38317,11 +38317,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn overlong_default_daemon_socket_moves_to_a_short_private_directory() {
-        let temp = tempfile::tempdir().expect("socket dir tempdir");
-        let short_dir = temp.path().join("run");
-        let long_dir = temp.path().join("l".repeat(120));
+        // Routing only measures path bytes; a long process TMPDIR must not
+        // turn this test's explicitly short preferred/fallback paths long.
+        let short_dir = PathBuf::from("/run");
+        let long_dir = short_dir.join("l".repeat(120));
         let name = "fsfs-query-0123456789abcdef-01234567.sock";
-        let fallback = temp.path().join("fallback");
+        let fallback = PathBuf::from("/fallback");
+        assert!(super::ensure_daemon_socket_path_fits(&short_dir.join(name)).is_ok());
+        assert!(super::ensure_daemon_socket_path_fits(&fallback.join(name)).is_ok());
+        assert!(super::ensure_daemon_socket_path_fits(&long_dir.join(name)).is_err());
         assert_eq!(
             super::choose_daemon_socket_path(&short_dir, name, || unreachable!(
                 "no fallback needed"
