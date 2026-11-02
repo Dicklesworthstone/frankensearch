@@ -2518,7 +2518,51 @@ mod retained_delete_tests {
                 sentinel.source_hash_hex,
                 index_source_hash_hex(&manifests.into_values().collect::<Vec<_>>())
             );
-            assert!(!next.path().join("FSFS-REUSE.json").exists());
+            let previous_receipt: serde_json::Value =
+                serde_json::from_slice(&before[Path::new("FSFS-REUSE.json")]).unwrap();
+            let projected_receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(next.path().join("FSFS-REUSE.json")).unwrap())
+                    .unwrap();
+            assert_ne!(projected_receipt, previous_receipt);
+            for field in [
+                "version",
+                "session",
+                "executable_sha256",
+                "indexing_contract_sha256",
+                "configuration_sha256",
+            ] {
+                assert!(previous_receipt.get(field).is_some());
+                assert_eq!(projected_receipt.get(field), previous_receipt.get(field));
+            }
+            let previous_checkpoint: IndexingCheckpoint =
+                serde_json::from_value(previous_receipt["checkpoint"].clone()).unwrap();
+            let projected_checkpoint: IndexingCheckpoint =
+                serde_json::from_value(projected_receipt["checkpoint"].clone()).unwrap();
+            let mut expected_checkpoint = previous_checkpoint.clone();
+            expected_checkpoint
+                .files
+                .retain(|id, _| expected.contains(id));
+            expected_checkpoint.index_root = next.path().display().to_string();
+            expected_checkpoint
+                .source_hash_hex
+                .clone_from(&sentinel.source_hash_hex);
+            expected_checkpoint.discovered_files = sentinel.discovered_files;
+            expected_checkpoint.skipped_files = sentinel.skipped_files;
+            expected_checkpoint.updated_at_ms = sentinel.generated_at_ms;
+            assert_eq!(projected_checkpoint, expected_checkpoint);
+            assert!(
+                FsfsRuntime::read_checkpoint_manifest_generation(next.path(), &previous_checkpoint)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                FsfsRuntime::read_checkpoint_manifest_generation(
+                    next.path(),
+                    &projected_checkpoint
+                )
+                .unwrap()
+                .is_some()
+            );
             assert_eq!(
                 old.search(&cx, "sharedtoken", 10)
                     .await

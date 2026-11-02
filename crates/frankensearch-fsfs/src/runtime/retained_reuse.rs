@@ -2859,7 +2859,13 @@ mod generation_tests {
                 let (_, source, _) = fixture(parent.path(), 2);
                 assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 2, 2);
                 assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 0, 0);
-                assert_index_calls(&run_counted(&cx, parent.path(), "compact").await, 0, 0);
+                let compact = run_counted(&cx, parent.path(), "compact").await;
+                assert_eq!(compact["fast_documents"], 0);
+                assert_eq!(compact["quality_documents"], 0);
+                assert_eq!(compact["fast_probes"], 0);
+                assert_eq!(compact["quality_probes"], 0);
+                assert_eq!(compact["checkpoint_present"], false);
+                assert_eq!(compact["receipt_present"], true);
                 assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 0, 0);
                 fs::write(
                     source.join("doc-0.md"),
@@ -2876,7 +2882,13 @@ mod generation_tests {
                 let parent = tempfile::tempdir().unwrap();
                 fixture(parent.path(), 2);
                 assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 2, 2);
-                assert_index_calls(&run_counted(&cx, parent.path(), "delete").await, 0, 0);
+                let deleted = run_counted(&cx, parent.path(), "delete").await;
+                assert_eq!(deleted["fast_documents"], 0);
+                assert_eq!(deleted["quality_documents"], 0);
+                assert_eq!(deleted["fast_probes"], 0);
+                assert_eq!(deleted["quality_probes"], 0);
+                assert_eq!(deleted["checkpoint_present"], false);
+                assert_eq!(deleted["receipt_present"], true);
                 // Deletion leaves the source intact. Only that removed row
                 // needs inference when a later source index restores it.
                 assert_index_calls(&run_counted(&cx, parent.path(), "index").await, 1, 1);
