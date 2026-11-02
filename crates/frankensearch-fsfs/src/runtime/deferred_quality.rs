@@ -419,12 +419,18 @@ fn validate_pending_jobs(
 /// Carry only unchanged pending inputs through deletion or compaction. The
 /// caller owns an independently copied candidate and the store's build lease.
 /// Never reconstruct missing input from a preview or a mutable source path.
-pub(super) fn carry_after_maintenance(
+/// A mixed batch supplies the checkpoint its ordinary inherited-input path
+/// already admitted, including invalidation of every touched skip witness.
+pub(super) fn carry_after_maintenance<F>(
     cx: &Cx,
     runtime: &FsfsRuntime,
     predecessor: &PublishedGeneration,
     destination: &Path,
-) -> SearchResult<()> {
+    project_inputs: F,
+) -> SearchResult<()>
+where
+    F: FnOnce() -> SearchResult<Option<super::IndexingCheckpoint>>,
+{
     retained_search_checkpoint(cx)?;
     let previous = FsfsRuntime::read_index_sentinel(predecessor.path())?
         .ok_or_else(|| invalid("maintenance predecessor has no completion sentinel"))?;
@@ -465,7 +471,7 @@ pub(super) fn carry_after_maintenance(
         // queue validation; no empty source-reuse receipt need be fabricated.
         retained_reuse::completed_input_checkpoint(cx, predecessor)?
     } else {
-        super::retained_batch::retain_unchanged_inputs(cx, runtime, predecessor, destination)?
+        project_inputs()?
             .ok_or_else(|| invalid("maintenance cannot preserve the deferred source checkpoint"))?
     };
     let old_key = backlog.queue_key();
@@ -1232,8 +1238,173 @@ mod tests {
     }
 
     #[test]
+    fn mixed_delete_keeps_pending_quality_completable_without_sources() {
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            fs::write(directory.path().join("source/skipped.md"), b"\0binary\0").unwrap();
+            let fast = Arc::new(Producer::new("deferred-fast"));
+            let quality = Arc::new(Producer::new("deferred-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let deferred = runtime(directory.path(), true);
+            let root = directory.path().join("store");
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let first_bytes = files(first.path());
+            let first_receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(first.path().join("FSFS-REUSE.json")).unwrap())
+                    .unwrap();
+            assert!(
+                first_receipt["checkpoint"]["content_skipped"]
+                    .get("skipped.md")
+                    .is_some()
+            );
+            fast.inputs.lock().unwrap().clear();
+            let result = deferred
+                .apply_retained_batch(
+                    &cx,
+                    &root,
+                    &first,
+                    &[
+                        super::super::retained_batch::RetainedMutation::Delete {
+                            id: "beta.md".to_owned(),
+                        },
+                        super::super::retained_batch::RetainedMutation::Delete {
+                            id: "skipped.md".to_owned(),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!((result.upserted, result.deleted), (0, 1));
+            let next = durable(result.publication.unwrap());
+            let next_bytes = files(next.path());
+            let next_receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(next.path().join("FSFS-REUSE.json")).unwrap())
+                    .unwrap();
+            assert!(
+                next_receipt["checkpoint"]["content_skipped"]
+                    .get("skipped.md")
+                    .is_none()
+            );
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            let absent = [super::super::retained_batch::RetainedMutation::Delete {
+                id: "absent.md".to_owned(),
+            }];
+            let noop = deferred
+                .apply_retained_batch(&cx, &root, &next, &absent)
+                .await
+                .unwrap();
+            assert!(noop.publication.is_none());
+            assert_eq!((noop.upserted, noop.deleted), (0, 0));
+            assert!(
+                deferred
+                    .apply_retained_batch(&cx, &root, &first, &absent)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(files(next.path()), next_bytes);
+            fs::rename(
+                directory.path().join("source"),
+                directory.path().join("source-gone"),
+            )
+            .unwrap();
+            let completed = runtime(directory.path(), false)
+                .complete_retained_quality(&cx, &root, &next)
+                .await
+                .unwrap();
+            assert_eq!(completed.completed_documents, 1);
+            let completed = durable(completed.publication);
+            assert_eq!(
+                quality.inputs.lock().unwrap().as_slice(),
+                std::slice::from_ref(&expected["alpha.md"])
+            );
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert_eq!(files(first.path()), first_bytes);
+            assert_eq!(files(next.path()), next_bytes);
+            assert_eq!(
+                fs::read(completed.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                next_bytes[Path::new(FSFS_VECTOR_INDEX_FILE)]
+            );
+            assert_eq!(
+                VectorIndex::open_read_only(&completed.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE))
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap(),
+                std::collections::HashSet::from(["alpha.md".to_owned()])
+            );
+        });
+    }
+
+    #[test]
+    fn mixed_delete_of_last_pending_documents_clears_quality_debt() {
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("deferred-fast"));
+            let quality = Arc::new(Producer::new("deferred-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let deferred = runtime(directory.path(), true);
+            let root = directory.path().join("store");
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let before = files(first.path());
+            fast.inputs.lock().unwrap().clear();
+            let operations = ["alpha.md", "beta.md"].map(|id| {
+                super::super::retained_batch::RetainedMutation::Delete { id: id.to_owned() }
+            });
+            let result = deferred
+                .apply_retained_batch(&cx, &root, &first, &operations)
+                .await
+                .unwrap();
+            assert_eq!((result.upserted, result.deleted), (0, 2));
+            let next = durable(result.publication.unwrap());
+            let sentinel = FsfsRuntime::read_index_sentinel(next.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(sentinel.indexed_files, 0);
+            assert!(
+                !sentinel
+                    .reason_codes
+                    .iter()
+                    .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+            );
+            let mut input = deferred.cli_input.clone();
+            input.index_dir = Some(next.path().to_path_buf());
+            let candidate = deferred.clone().with_cli_input(input);
+            let backlog = read_backlog(&open_catalog(&candidate, false).unwrap()).unwrap();
+            assert_eq!(
+                (
+                    backlog.requested_documents,
+                    backlog.queued_documents,
+                    backlog.unavailable_documents
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(backlog.generation_root, next.path().display().to_string());
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            assert_eq!(files(first.path()), before);
+        });
+    }
+
+    #[test]
     fn maintenance_refuses_corrupt_pending_fences_without_changing_selection() {
-        for corruption in ["generation", "source", "status", "source_digest"] {
+        for corruption in [
+            "generation",
+            "source",
+            "status",
+            "source_digest",
+            "projection",
+        ] {
             run(|cx| async move {
                 let directory = tempfile::tempdir().unwrap();
                 source_fixture(directory.path());
@@ -1279,11 +1450,24 @@ mod tests {
                             serde_json::json!("cd".repeat(32));
                         storage.upsert_document(&document).unwrap();
                     }
+                    "projection" => {}
                     _ => unreachable!(),
                 }
                 drop(storage);
                 assert!(
-                    carry_after_maintenance(&cx, &candidate, &first, build.path()).is_err(),
+                    carry_after_maintenance(&cx, &candidate, &first, build.path(), || {
+                        if corruption == "projection" {
+                            Ok(None)
+                        } else {
+                            super::super::retained_batch::retain_unchanged_inputs(
+                                &cx,
+                                &candidate,
+                                &first,
+                                build.path(),
+                            )
+                        }
+                    })
+                    .is_err(),
                     "{corruption}"
                 );
                 assert_eq!(store.active(&cx).unwrap(), Some(first.clone()));

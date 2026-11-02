@@ -917,7 +917,7 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
-        inherited_reuse::retain_inputs(
+        let checkpoint = inherited_reuse::retain_inputs(
             cx,
             self,
             &predecessor,
@@ -925,6 +925,18 @@ impl FsfsRuntime {
             &changed_ids,
             &source_inputs,
         )?;
+        if upserted == 0 {
+            // Keep the ordinary skip-witness invalidation above. Its admitted
+            // checkpoint also fences the carried quality work; do not write a
+            // second, less precise receipt for the same candidate.
+            super::deferred_quality::carry_after_maintenance(
+                cx,
+                &candidate,
+                &predecessor,
+                build.path(),
+                || Ok(checkpoint),
+            )?;
+        }
         for producer in [fast.as_ref(), quality.as_ref()].into_iter().flatten() {
             producer.recheck()?;
         }
