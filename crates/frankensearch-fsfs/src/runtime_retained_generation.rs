@@ -1176,6 +1176,7 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
+        deferred_quality::carry_after_maintenance(cx, &candidate, &predecessor, build.path())?;
         let publication = build.publish_with_precommit(
             cx,
             |_, path| Self::validate_search_generation_at_root(path, candidate_mode),
@@ -1218,7 +1219,8 @@ impl FsfsRuntime {
         input.daemon = false;
         input.daemon_socket = None;
         let candidate = self.clone().with_cli_input(input);
-        retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?;
+        let predecessor =
+            retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?;
         let candidate_lease = crate::lifecycle::PublicationLease::acquire(build.path())?;
         let mut payload = serde_json::Value::Null;
         for (tier, relative) in FSFS_VECTOR_GENERATION_FILES {
@@ -1273,6 +1275,7 @@ impl FsfsRuntime {
         )
         .await?;
         drop(resources);
+        deferred_quality::carry_after_maintenance(cx, &candidate, &predecessor, build.path())?;
         let publication = build.publish(cx, |_, path| {
             Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
         })?;

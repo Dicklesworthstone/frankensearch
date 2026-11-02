@@ -303,9 +303,9 @@ pub(super) fn retain_inputs(
     destination: &Path,
     changed: &HashSet<String>,
     source_inputs: &BTreeMap<String, SourceInput>,
-) -> SearchResult<()> {
+) -> SearchResult<Option<IndexingCheckpoint>> {
     let Some(mut receipt) = read_receipt(cx, predecessor)? else {
-        return Ok(());
+        return Ok(None);
     };
     let manifests = FsfsRuntime::read_matching_manifest_generation(destination)?
         .ok_or_else(|| invalid("candidate reuse requires matching manifests"))?;
@@ -346,7 +346,7 @@ pub(super) fn retain_inputs(
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit())
     }) {
-        return Ok(());
+        return Ok(None);
     }
     receipt.checkpoint.index_root = destination.display().to_string();
     receipt
@@ -364,7 +364,7 @@ pub(super) fn retain_inputs(
         tracing::debug!(
             "ordinary checkpoint admission refused inherited evidence; next indexing starts cold"
         );
-        return Ok(());
+        return Ok(None);
     }
     retained_search_checkpoint(cx)?;
     let mut encoded = BoundedBytes(Vec::new());
@@ -381,7 +381,8 @@ pub(super) fn retain_inputs(
     }
     output.sync_all()?;
     File::open(destination)?.sync_all()?;
-    retained_search_checkpoint(cx)
+    retained_search_checkpoint(cx)?;
+    Ok(Some(receipt.checkpoint))
 }
 
 #[cfg(all(test, unix))]

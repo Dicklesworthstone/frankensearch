@@ -37,6 +37,23 @@ const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_VECTOR_BYTES: usize = 128 * 1024 * 1024;
 
+/// Maintenance may remove members, but cannot mint evidence for a new body.
+pub(super) fn retain_unchanged_inputs(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    predecessor: &PublishedGeneration,
+    destination: &Path,
+) -> SearchResult<Option<super::IndexingCheckpoint>> {
+    inherited_reuse::retain_inputs(
+        cx,
+        runtime,
+        predecessor,
+        destination,
+        &HashSet::new(),
+        &BTreeMap::new(),
+    )
+}
+
 /// One ordered document mutation. The last operation for an ID wins.
 ///
 /// IDs are not read as paths. Every operation is validated, including superseded

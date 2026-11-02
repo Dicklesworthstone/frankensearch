@@ -416,6 +416,92 @@ fn validate_pending_jobs(
     Ok(())
 }
 
+/// Carry only unchanged pending inputs through deletion or compaction. The
+/// caller owns an independently copied candidate and the store's build lease.
+/// Never reconstruct missing input from a preview or a mutable source path.
+pub(super) fn carry_after_maintenance(
+    cx: &Cx,
+    runtime: &FsfsRuntime,
+    predecessor: &PublishedGeneration,
+    destination: &Path,
+) -> SearchResult<()> {
+    retained_search_checkpoint(cx)?;
+    let previous = FsfsRuntime::read_index_sentinel(predecessor.path())?
+        .ok_or_else(|| invalid("maintenance predecessor has no completion sentinel"))?;
+    if !previous
+        .reason_codes
+        .iter()
+        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+        || !runtime.resolve_storage_db_path()?.try_exists()?
+    {
+        return Ok(());
+    }
+    let storage = open_catalog(runtime, false)?;
+    // Older or unregistered deferral can have no resumable work. Preserve that
+    // existing fast-only state rather than inventing a producer or input fence.
+    if storage.get_index_metadata(BACKLOG_NAME)?.is_none() {
+        return Ok(());
+    }
+    let mut backlog = read_backlog(&storage)?;
+    if backlog.generation_root != predecessor.path().display().to_string()
+        || backlog.source_hash != previous.source_hash_hex
+        || backlog.unavailable_documents != 0
+    {
+        return Err(invalid(
+            "maintenance requires a consistent exact deferred backlog; run a full source reindex to establish new work",
+        ));
+    }
+    let manifests = FsfsRuntime::read_matching_manifest_generation(destination)?
+        .ok_or_else(|| invalid("maintenance candidate membership manifests disagree"))?;
+    let requested = manifests
+        .values()
+        .filter(|entry| {
+            entry.ingestion_class == ingestion_class_label(IngestionClass::FullSemanticLexical)
+        })
+        .count();
+    let checkpoint = if requested == 0 {
+        // No remaining semantic member owes inference, including deletion of
+        // the last document. The original checkpoint still fences the empty
+        // queue validation; no empty source-reuse receipt need be fabricated.
+        retained_reuse::completed_input_checkpoint(cx, predecessor)?
+    } else {
+        super::retained_batch::retain_unchanged_inputs(cx, runtime, predecessor, destination)?
+            .ok_or_else(|| invalid("maintenance cannot preserve the deferred source checkpoint"))?
+    };
+    let old_key = backlog.queue_key();
+    validate_pending_jobs(&storage, &old_key, &manifests, &checkpoint.files)?;
+    let mut sentinel = FsfsRuntime::read_index_sentinel(destination)?
+        .ok_or_else(|| invalid("maintenance candidate has no completion sentinel"))?;
+    backlog.generation_root = destination.display().to_string();
+    backlog.source_hash.clone_from(&sentinel.source_hash_hex);
+    backlog.requested_documents = requested;
+    backlog.queued_documents = requested;
+    storage
+        .connection()
+        .execute_with_params_sync(
+            "UPDATE embedding_jobs SET embedder_id = ?1 WHERE embedder_id = ?2;",
+            &[
+                SqliteValue::Text(backlog.queue_key().into()),
+                SqliteValue::Text(old_key.into()),
+            ],
+        )
+        .map_err(storage_error)?;
+    record_backlog(&storage, &backlog, 0)?;
+    if requested == 0 {
+        sentinel
+            .reason_codes
+            .retain(|reason| reason != REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+        runtime.write_index_sentinel(destination, &sentinel)?;
+    }
+    tracing::info!(
+        queued = requested,
+        source_hash = backlog.source_hash,
+        producer = backlog.producer.fingerprint(),
+        "preserved exact deferred quality work across retained maintenance"
+    );
+    retained_search_checkpoint(cx)
+}
+
 impl FsfsRuntime {
     /// Finish the exact quality backlog of an explicitly selected generation.
     ///
@@ -1020,6 +1106,191 @@ mod tests {
             assert!(!phases.last().unwrap().hits.is_empty());
             assert_eq!(files(next.path()), successor_before);
         });
+    }
+
+    #[test]
+    fn maintenance_preserves_pending_quality_without_sources_or_reembedding() {
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("deferred-fast"));
+            let quality = Arc::new(Producer::new("deferred-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let deferred = runtime(directory.path(), true);
+            let root = directory.path().join("store");
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let first_bytes = files(first.path());
+            fast.inputs.lock().unwrap().clear();
+            let (compacted, _) = deferred
+                .compact_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            let compacted = durable(compacted.unwrap());
+            let compacted_bytes = files(compacted.path());
+            let mut deleting = deferred.clone();
+            deleting.cli_input.delete_ids = vec!["beta.md".to_owned()];
+            let (deleted, count) = deleting
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+            let deleted = durable(deleted.unwrap());
+            let deleted_bytes = files(deleted.path());
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            fs::rename(
+                directory.path().join("source"),
+                directory.path().join("source-gone"),
+            )
+            .unwrap();
+            let restarted = runtime(directory.path(), false);
+            let completed = restarted
+                .complete_retained_quality(&cx, &root, &deleted)
+                .await
+                .unwrap();
+            assert_eq!(completed.completed_documents, 1);
+            let completed = durable(completed.publication);
+            assert_eq!(
+                quality.inputs.lock().unwrap().as_slice(),
+                &[expected["alpha.md"].clone()]
+            );
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert_eq!(files(first.path()), first_bytes);
+            assert_eq!(files(compacted.path()), compacted_bytes);
+            assert_eq!(files(deleted.path()), deleted_bytes);
+            assert_eq!(
+                fs::read(completed.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                deleted_bytes[Path::new(FSFS_VECTOR_INDEX_FILE)]
+            );
+            assert_eq!(
+                VectorIndex::open_read_only(&completed.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE))
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap(),
+                std::collections::HashSet::from(["alpha.md".to_owned()])
+            );
+        });
+    }
+
+    #[test]
+    fn deleting_every_deferred_document_retires_owed_quality_without_inference() {
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("deferred-fast"));
+            let quality = Arc::new(Producer::new("deferred-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let mut deferred = runtime(directory.path(), true);
+            let root = directory.path().join("store");
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let before = files(first.path());
+            fast.inputs.lock().unwrap().clear();
+            deferred.cli_input.delete_ids = vec!["alpha.md".to_owned(), "beta.md".to_owned()];
+            let (next, count) = deferred
+                .delete_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+            let next = durable(next.unwrap());
+            let sentinel = FsfsRuntime::read_index_sentinel(next.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(sentinel.indexed_files, 0);
+            assert!(
+                !sentinel
+                    .reason_codes
+                    .iter()
+                    .any(|r| r == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+            );
+            let mut input = deferred.cli_input.clone();
+            input.index_dir = Some(next.path().to_path_buf());
+            let candidate = deferred.clone().with_cli_input(input);
+            let backlog = read_backlog(&open_catalog(&candidate, false).unwrap()).unwrap();
+            assert_eq!(
+                (
+                    backlog.requested_documents,
+                    backlog.queued_documents,
+                    backlog.unavailable_documents
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(backlog.generation_root, next.path().display().to_string());
+            assert!(fast.inputs.lock().unwrap().is_empty());
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            assert_eq!(files(first.path()), before);
+        });
+    }
+
+    #[test]
+    fn maintenance_refuses_corrupt_pending_fences_without_changing_selection() {
+        for corruption in ["generation", "source", "status", "source_digest"] {
+            run(|cx| async move {
+                let directory = tempfile::tempdir().unwrap();
+                source_fixture(directory.path());
+                let fast = Arc::new(Producer::new("deferred-fast"));
+                let quality = Arc::new(Producer::new("deferred-quality"));
+                let _providers = Providers::install(fast, Arc::clone(&quality));
+                let deferred = runtime(directory.path(), true);
+                let root = directory.path().join("store");
+                let first = durable(
+                    deferred
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                );
+                let before = files(first.path());
+                let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                let build = store.begin(&cx).unwrap();
+                let mut input = deferred.cli_input.clone();
+                input.index_dir = Some(build.path().to_path_buf());
+                let candidate = deferred.clone().with_cli_input(input);
+                retained_reuse::copy_selected_generation(&cx, &candidate, &store, build.path())
+                    .unwrap();
+                let storage = open_catalog(&candidate, false).unwrap();
+                let mut backlog = read_backlog(&storage).unwrap();
+                match corruption {
+                    "generation" => {
+                        backlog.generation_root.push_str("-foreign");
+                        record_backlog(&storage, &backlog, 0).unwrap();
+                    }
+                    "source" => {
+                        "0123456789abcdef".clone_into(&mut backlog.source_hash);
+                        record_backlog(&storage, &backlog, 0).unwrap();
+                    }
+                    "status" => {
+                        storage
+                            .connection()
+                            .execute_sync("UPDATE embedding_jobs SET status = 'processing';")
+                            .unwrap();
+                    }
+                    "source_digest" => {
+                        let mut document = storage.get_document("alpha.md").unwrap().unwrap();
+                        document.metadata.as_mut().unwrap()[SOURCE_METADATA]["source_sha256"] =
+                            serde_json::json!("cd".repeat(32));
+                        storage.upsert_document(&document).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                drop(storage);
+                assert!(
+                    carry_after_maintenance(&cx, &candidate, &first, build.path()).is_err(),
+                    "{corruption}"
+                );
+                assert_eq!(store.active(&cx).unwrap(), Some(first.clone()));
+                assert_eq!(files(first.path()), before);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+            });
+        }
     }
 
     #[test]
