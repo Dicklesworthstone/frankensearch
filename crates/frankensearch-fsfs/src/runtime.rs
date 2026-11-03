@@ -2659,7 +2659,7 @@ impl FsfsIndexPayload {
             warnings.push(OutputWarning::new(
                 OutputWarningCode::QUALITY_INDEX_DEFERRED,
                 format!(
-                    "Quality embeddings for {} file(s) were deferred by pressure policy. Clear force_embed_deferred and rerun `fsfs index {}` to build the quality tier.",
+                    "Quality embeddings for {} file(s) were deferred by pressure policy. Clear force_embed_deferred. Complete-generation stores can resume retained inputs with `fsfs index --complete-quality --index-dir STORE`; otherwise rerun `fsfs index {}` from the sources.",
                     self.quality_deferred_files, self.generation.target_root,
                 ),
             ));
@@ -30583,7 +30583,7 @@ fn render_status_table(status: &FsfsStatusPayload, no_color: bool) -> String {
     if status.index.quality_deferred_files > 0 {
         let _ = writeln!(
             out,
-            "  quality deferred: {} file(s); clear force_embed_deferred and run `fsfs index` to build the quality tier",
+            "  quality deferred: {} file(s); clear force_embed_deferred; complete-generation stores can resume retained inputs with `fsfs index --complete-quality --index-dir STORE`; otherwise rebuild with `fsfs index` from the sources",
             status.index.quality_deferred_files,
         );
     }
