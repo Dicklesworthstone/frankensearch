@@ -621,6 +621,18 @@ existing store in a parent directory when run from a project subdirectory.
 Corrupt selections and interrupted first publications produce errors at that
 store instead of redirecting the command to a different legacy index.
 
+Current source builds can finish a pressure-deferred quality tier. Clear forced
+deferral and fast-only policy, enable a pressure profile that permits quality,
+and make the original registered quality model available, then run:
+
+```bash
+fsfs index --complete-quality --index-dir ./search-store
+```
+
+Completion uses the generation's exact retained embedding inputs, even after
+source files are moved, preserves its fast vectors, and publishes a complete
+successor. A generation missing those exact inputs requires a full source reindex.
+
 `append-batch` accepts JSONL objects with string `id` and `text` fields, from
 `--file` or standard input. It inserts or replaces the supplied documents in
 lexical data, every present vector tier, and an existing catalog, then publishes
