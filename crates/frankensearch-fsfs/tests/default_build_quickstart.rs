@@ -4702,6 +4702,334 @@ meta:
         Ok(())
     }
 
+    #[cfg(all(unix, feature = "semantic-loaders"))]
+    #[test]
+    #[ignore = "requires pinned real models; deferred watch completion through the production CLI"]
+    fn deferred_complete_watch_retains_latest_inputs_after_source_loss() -> Result<(), String> {
+        log_binary_profile("real-model-deferred-watch");
+        if std::env::var("FRANKENSEARCH_REQUIRE_SEMANTIC_E2E").as_deref() != Ok("1") {
+            return Err(
+                "set FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 for deferred watch validation".to_owned(),
+            );
+        }
+        let model_root = configured_model_root();
+        verify_pinned_model_cache(&model_root)?;
+        let temp = tempfile::tempdir().expect("deferred watch fixture");
+        let fsfs = IsolatedFsfs::new(temp.path(), model_root);
+        let corpus = temp.path().join("corpus");
+        let index = temp.path().join("index");
+        fs::create_dir(&corpus).unwrap();
+        for id in ["alpha.md", "beta.md"] {
+            fs::write(
+                corpus.join(id),
+                format!("sharedtoken durable transactions galaxies {id} original body"),
+            )
+            .unwrap();
+        }
+        let defer = temp.path().join("defer.toml");
+        fs::write(
+            &defer,
+            "[pressure]\ndegradation_override=\"force_embed_deferred\"\n",
+        )
+        .unwrap();
+        let retained = [
+            ("FSFS_COMPLETE_GENERATIONS", "1"),
+            ("FSFS_GENERATION_RETENTION", "off"),
+        ];
+        let indexed = fsfs.run_with_env(
+            temp.path(),
+            "deferred-watch-seed",
+            [
+                "index",
+                corpus.to_str().unwrap(),
+                "--config",
+                defer.to_str().unwrap(),
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &retained,
+        );
+        let seed = parse_success_envelope("deferred watch seed", &indexed);
+        assert_eq!(seed["data"]["quality_deferred_files"], 2);
+        let stdout = fsfs.log_root.join("deferred-watch.stdout.log");
+        let stderr = fsfs.log_root.join("deferred-watch.stderr.log");
+        let mut watch = WatchChild(
+            fsfs.command(temp.path())
+                .args([
+                    "watch",
+                    corpus.to_str().unwrap(),
+                    "--config",
+                    defer.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--format",
+                    "jsonl",
+                ])
+                .envs(retained)
+                .stdout(File::create(&stdout).unwrap())
+                .stderr(File::create(&stderr).unwrap())
+                .spawn()
+                .expect("spawn deferred watcher"),
+        );
+        wait_for_watch_output(
+            &mut watch,
+            &stdout,
+            "\"generation_complete\":true",
+            1,
+            QUICKSTART_TIMEOUT,
+        );
+        let first = active_generation_root(&index);
+        fs::write(
+            corpus.join("alpha.md"),
+            "sharedtoken durable transactions galaxies alpha latest body",
+        )
+        .unwrap();
+        fs::write(
+            corpus.join("gamma.md"),
+            "sharedtoken durable transactions galaxies gamma latest body",
+        )
+        .unwrap();
+        fs::rename(
+            corpus.join("beta.md"),
+            temp.path().join("beta-preserved.md"),
+        )
+        .unwrap();
+        let started = Instant::now();
+        let selected = loop {
+            let selected = active_generation_root(&index);
+            let manifest: Value = serde_json::from_slice(
+                &fs::read(selected.join("vector/index_manifest.json")).unwrap(),
+            )
+            .unwrap();
+            let ids = manifest
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["file_key"].as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            if selected != first
+                && ids == std::collections::BTreeSet::from(["alpha.md", "gamma.md"])
+            {
+                break selected;
+            }
+            assert!(
+                watch.0.try_wait().unwrap().is_none(),
+                "deferred watcher exited: {}",
+                fs::read_to_string(&stderr).unwrap()
+            );
+            assert!(
+                started.elapsed() < QUICKSTART_TIMEOUT,
+                "deferred watcher did not publish latest membership: {}",
+                fs::read_to_string(&stderr).unwrap()
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(terminate_and_wait(&mut watch, "deferred watcher").success());
+        drop(watch);
+        let sentinel: Value =
+            serde_json::from_slice(&fs::read(selected.join("index_sentinel.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            sentinel["command"], "retained-batch",
+            "bounded deferred edits must use the admitted mixed batch, rather than rebuild the source corpus"
+        );
+        // Do not restart or reindex before completion: either would recapture
+        // source input and hide a delta that failed to preserve its owed work.
+        assert_eq!(active_generation_root(&index), selected);
+        fs::rename(&corpus, temp.path().join("source-moved-intact")).unwrap();
+        let snapshot = |path: &Path| {
+            let mut files = std::collections::BTreeMap::new();
+            let mut directories = vec![path.to_path_buf()];
+            while let Some(directory) = directories.pop() {
+                for entry in fs::read_dir(directory).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_type().unwrap().is_dir() {
+                        directories.push(entry.path());
+                    } else {
+                        files.insert(
+                            entry.path().strip_prefix(path).unwrap().to_path_buf(),
+                            fs::read(entry.path()).unwrap(),
+                        );
+                    }
+                }
+            }
+            files
+        };
+        let before = snapshot(&selected);
+        let selection = fs::read(index.join("FSFS-CURRENT")).unwrap();
+        assert!(!selected.join("vector/quality.fsvi").exists());
+        let foreign = temp.path().join("foreign.toml");
+        fs::write(
+            &foreign,
+            "[indexing]\nquality_model=\"all-MiniLM-L6-v2-native\"\n",
+        )
+        .unwrap();
+        for (label, config, reason) in [
+            (
+                "deferred-watch-still-forced",
+                &defer,
+                "clear quality deferral",
+            ),
+            (
+                "deferred-watch-foreign-producer",
+                &foreign,
+                "producer changed",
+            ),
+        ] {
+            let rejected = fsfs.run_with_env(
+                temp.path(),
+                label,
+                [
+                    "index",
+                    "--complete-quality",
+                    "--config",
+                    config.to_str().unwrap(),
+                    "--index-dir",
+                    index.to_str().unwrap(),
+                    "--format",
+                    "json",
+                ],
+                QUICKSTART_TIMEOUT,
+                &retained,
+            );
+            assert!(!rejected.timed_out);
+            assert_eq!(
+                rejected.status.code(),
+                Some(2),
+                "{}",
+                rejected.combined_output()
+            );
+            let error: Value = serde_json::from_str(&rejected.stdout).unwrap();
+            assert_eq!(error["error"]["field"], "index.complete_quality");
+            assert!(
+                error["error"]["message"].as_str().unwrap().contains(reason),
+                "{error}"
+            );
+            assert_eq!(fs::read(index.join("FSFS-CURRENT")).unwrap(), selection);
+            assert_eq!(snapshot(&selected), before);
+        }
+        let completed = fsfs.run_with_env(
+            temp.path(),
+            "deferred-watch-complete",
+            [
+                "index",
+                "--complete-quality",
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+            QUICKSTART_TIMEOUT,
+            &retained,
+        );
+        let receipt = parse_success_envelope("complete actual watch delta", &completed);
+        assert_eq!(receipt["data"]["completed_documents"], 2);
+        assert_eq!(receipt["data"]["publication"], "durable");
+        assert_eq!(
+            receipt["data"]["vector_generation"]["is_hash_control"],
+            false
+        );
+        assert_eq!(
+            receipt["data"]["quality_generation"]["is_hash_control"],
+            false
+        );
+        let current = active_generation_root(&index);
+        assert_ne!(current, selected);
+        assert_eq!(
+            fs::read(current.join("vector/index.fsvi")).unwrap(),
+            before[Path::new("vector/index.fsvi")]
+        );
+        let searched = fsfs.run(
+            temp.path(),
+            "deferred-watch-refined",
+            [
+                "search",
+                "sharedtoken durable transactions galaxies",
+                "--stream",
+                "--no-daemon",
+                "--index-dir",
+                index.to_str().unwrap(),
+                "--format",
+                "jsonl",
+                "--limit",
+                "10",
+            ],
+            QUICKSTART_TIMEOUT,
+        );
+        assert_finished_successfully("search completed watch delta", &searched);
+        let frames = searched
+            .stdout
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let mut phases =
+            std::collections::BTreeMap::<String, std::collections::BTreeSet<String>>::new();
+        let mut phase = None;
+        for (seq, frame) in frames.iter().enumerate() {
+            assert_eq!(frame["seq"].as_u64(), Some(u64::try_from(seq).unwrap()));
+            assert_eq!(frame["stream_id"], frames[0]["stream_id"]);
+            if frame["event"] == "progress" {
+                phase = match frame["payload"]["stage"].as_str() {
+                    Some("retrieve.fast") => Some("initial"),
+                    Some("retrieve.quality") => Some("refined"),
+                    _ => None,
+                };
+                if let Some(phase) = phase {
+                    assert!(
+                        phases
+                            .insert(phase.to_owned(), std::collections::BTreeSet::new())
+                            .is_none()
+                    );
+                }
+            }
+            if frame["event"] == "result" {
+                let item = &frame["payload"]["item"];
+                let id = item["path"].as_str().unwrap();
+                let expected = match id {
+                    "alpha.md" => "alpha latest body",
+                    "gamma.md" => "gamma latest body",
+                    _ => panic!("unexpected watched membership: {item}"),
+                };
+                assert!(item["semantic_rank"].is_number(), "{item}");
+                assert!(
+                    item["snippet"].as_str().unwrap().contains(expected),
+                    "{item}"
+                );
+                assert!(
+                    phases
+                        .get_mut(phase.unwrap())
+                        .unwrap()
+                        .insert(id.to_owned())
+                );
+            }
+        }
+        assert_eq!(
+            phases.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["initial", "refined"]
+        );
+        for ids in phases.values() {
+            assert_eq!(
+                ids,
+                &std::collections::BTreeSet::from(["alpha.md".to_owned(), "gamma.md".to_owned()])
+            );
+        }
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame["event"] == "terminal")
+                .count(),
+            1
+        );
+        let terminal = frames.last().unwrap();
+        assert_eq!(terminal["event"], "terminal");
+        assert_eq!(terminal["payload"]["status"], "completed");
+        assert_eq!(snapshot(&selected), before);
+        Ok(())
+    }
+
     /// The complete-generation layout's watch, judged by what a user sees:
     /// independent searches succeed while it runs (the legacy layout refuses
     /// them with its map lock), each edit becomes searchable through a

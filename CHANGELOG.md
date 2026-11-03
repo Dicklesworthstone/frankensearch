@@ -37,6 +37,11 @@
 - Stores first indexed from an empty corpus under forced deferral also retain
   the producer choice. Later appends keep exact quality inputs and can complete
   with the original producer, including after empty compaction or source loss.
+- Complete-generation watching under forced quality deferral uses the existing
+  retained mixed-batch writer for supported bounded edits with a registered
+  quality producer. Those edits preserve the latest owed quality inputs instead
+  of returning to the full index builder. Lexical-only indexes, other forced
+  modes and unsupported source changes retain their existing fallback behavior.
 
 ### Unreleased — Quill 0.4.2 producer metadata (#68, 2026-10-28)
 
