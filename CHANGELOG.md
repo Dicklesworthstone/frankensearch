@@ -34,6 +34,9 @@
 - Deleting the last pending document clears its debt while preserving the
   producer choice for later appends. Empty compaction carries that choice;
   new semantic input can still complete with the original quality producer.
+- Stores first indexed from an empty corpus under forced deferral also retain
+  the producer choice. Later appends keep exact quality inputs and can complete
+  with the original producer, including after empty compaction or source loss.
 
 ### Unreleased — Quill 0.4.2 producer metadata (#68, 2026-10-28)
 

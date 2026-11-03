@@ -638,6 +638,8 @@ deferral leaves that work pending until `--complete-quality` succeeds; deleted
 documents are excluded. The original quality producer must still match.
 Deleting the last pending document clears current work. Later appends can still
 queue their inputs for the original quality producer and explicit completion.
+Stores first indexed from an empty corpus under forced deferral preserve that
+producer choice too, so their later appends can complete quality normally.
 
 `append-batch` accepts JSONL objects with string `id` and `text` fields, from
 `--file` or standard input. It inserts or replaces the supplied documents in

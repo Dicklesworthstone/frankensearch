@@ -252,9 +252,12 @@ pub(super) fn finish_index(
     runtime: &FsfsRuntime,
     payload: &FsfsIndexPayload,
 ) -> SearchResult<()> {
-    if !captures_quality(runtime) || payload.quality_deferred_files == 0 {
+    if !captures_quality(runtime) {
         return Ok(());
     }
+    // An initially empty corpus still declares its deferred producer. Without
+    // this zero-count fence, a later append cannot retain completable quality
+    // inputs, even though the selected generation advertises deferral.
     retained_search_checkpoint(cx)?;
     let Some(producer) = declared_producer(runtime)? else {
         return Ok(());
@@ -2096,6 +2099,126 @@ mod tests {
                     .live_doc_ids()
                     .unwrap(),
                     std::collections::HashSet::from(["delta.md".to_owned()])
+                );
+                for (generation, before) in &history {
+                    assert_eq!(files(generation.path()), *before);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn initially_empty_deferred_index_retains_quality_intent_for_cli_append() {
+        for (compact, forced_append) in [(false, false), (false, true), (true, false), (true, true)]
+        {
+            run(|cx| async move {
+                let directory = tempfile::tempdir().unwrap();
+                fs::create_dir(directory.path().join("source")).unwrap();
+                let fast = Arc::new(Producer::new("initial-empty-fast"));
+                let quality = Arc::new(Producer::new("initial-empty-quality"));
+                let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+                let deferred = runtime(directory.path(), true);
+                let cleared = runtime(directory.path(), false);
+                let root = directory.path().join("store");
+                let first = durable(
+                    deferred
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                );
+                let sentinel = FsfsRuntime::read_index_sentinel(first.path())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(sentinel.indexed_files, 0);
+                assert!(!first.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists());
+                let before = files(first.path());
+                let mut history = vec![(first, before)];
+                fs::rename(
+                    directory.path().join("source"),
+                    directory.path().join("source-gone"),
+                )
+                .unwrap();
+                if compact {
+                    let (publication, _) = cleared
+                        .compact_retained_generation(&cx, &root)
+                        .await
+                        .unwrap();
+                    if let Some(publication) = publication {
+                        let next = durable(publication);
+                        let before = files(next.path());
+                        history.push((next, before));
+                    }
+                }
+                fast.inputs.lock().unwrap().clear();
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                let input = directory.path().join("append.jsonl");
+                fs::write(
+                    &input,
+                    serde_json::json!({"id": "gamma.md", "text": "latest initial-empty gamma"})
+                        .to_string(),
+                )
+                .unwrap();
+                let mut caller = runtime(directory.path(), forced_append);
+                caller.cli_input.command = CliCommand::AppendBatch;
+                caller.cli_input.input_file = Some(input);
+                let (publication, count) =
+                    caller.append_retained_generation(&cx, &root).await.unwrap();
+                assert_eq!(count, 1);
+                let appended = durable(publication.unwrap());
+                let sentinel = FsfsRuntime::read_index_sentinel(appended.path())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(sentinel.indexed_files, 1);
+                assert!(
+                    sentinel
+                        .reason_codes
+                        .iter()
+                        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+                );
+                assert!(
+                    !appended
+                        .path()
+                        .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                        .exists()
+                );
+                assert_eq!(fast.inputs.lock().unwrap().len(), 1);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                let fast_before = fs::read(appended.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap();
+                let before = files(appended.path());
+                history.push((appended, before));
+                let selected = &history.last().unwrap().0;
+                let foreign = Arc::new(Producer::new("foreign-initial-empty-quality"));
+                set_test_quality_embedder(Some(foreign.clone()));
+                let error = runtime(directory.path(), false)
+                    .complete_retained_quality(&cx, &root, selected)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == "index.complete_quality"));
+                assert!(foreign.inputs.lock().unwrap().is_empty());
+                set_test_quality_embedder(Some(quality.clone()));
+                let completed = runtime(directory.path(), false)
+                    .complete_retained_quality(&cx, &root, selected)
+                    .await
+                    .unwrap();
+                assert_eq!(completed.completed_documents, 1);
+                let completed = durable(completed.publication);
+                assert_eq!(
+                    fs::read(completed.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                    fast_before
+                );
+                assert_eq!(
+                    quality.inputs.lock().unwrap().as_slice(),
+                    &["latest initial-empty gamma"]
+                );
+                assert_eq!(
+                    VectorIndex::open_read_only(
+                        &completed.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                    )
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap(),
+                    std::collections::HashSet::from(["gamma.md".to_owned()])
                 );
                 for (generation, before) in &history {
                     assert_eq!(files(generation.path()), *before);
