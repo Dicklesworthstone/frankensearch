@@ -1079,6 +1079,7 @@ impl SemanticVoiDecision {
     }
 }
 
+#[derive(Clone)]
 struct SearchExecutionResources {
     index_root: PathBuf,
     generation_fingerprint: String,
@@ -1090,10 +1091,10 @@ struct SearchExecutionResources {
     shadow_observer: Option<frankensearch_core::ShadowLexicalObserver>,
     shadow_pressure_sampler: Option<Arc<ShadowPressureSampler>>,
     /// Fast-tier generation (`vector/index.fsvi`); drives the INITIAL phase.
-    vector_index: Option<VectorIndex>,
+    vector_index: Option<Arc<VectorIndex>>,
     /// Exact persisted source/window correspondence, admitted with the fast
     /// generation and replaced whenever the resources rebind.
-    fast_window_mapping: Option<semantic_windows::FastWindowMapping>,
+    fast_window_mapping: Option<Arc<semantic_windows::FastWindowMapping>>,
     /// Quality-tier generation (`vector/quality.fsvi`) from the same index
     /// run; present only when `fsfs index` built it. Drives the REFINED phase.
     quality_vector_index: Option<Arc<VectorIndex>>,
@@ -1115,7 +1116,167 @@ struct SearchExecutionResources {
 struct AdmittedEmbedder {
     embedder: Arc<dyn Embedder>,
     coalescer: Option<frankensearch_embed::CoalescingEmbedder>,
+    #[cfg(unix)]
+    daemon_service: Option<Arc<DaemonCoalescerService>>,
     identity: frankensearch_core::EmbeddingIdentityBundleV1,
+}
+
+/// The daemon owns dispatch independently of the requests receiving its output.
+/// Native calls still use the daemon's original bounded model pool; this one
+/// service worker only drives the existing asynchronous batch dispatcher.
+#[cfg(unix)]
+struct DaemonCoalescerService {
+    provider: Arc<dyn Embedder>,
+    identity: frankensearch_core::EmbeddingIdentityBundleV1,
+    client: frankensearch_embed::CoalescingEmbedder,
+    _task: asupersync::runtime::blocking_pool::BlockingTaskHandle,
+    _owner: SearchBlockingPool,
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for DaemonCoalescerService {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DaemonCoalescerService")
+            .field("model", &self.provider.id())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(unix)]
+impl DaemonCoalescerService {
+    fn new(cx: &Cx, admitted: &AdmittedEmbedder) -> SearchResult<Self> {
+        let backend =
+            cx.blocking_pool_handle()
+                .ok_or_else(|| SearchError::EmbedderUnavailable {
+                    model: admitted.embedder.id().to_owned(),
+                    reason: "daemon coalescing requires its caller-owned model pool".to_owned(),
+                })?;
+        let (client, mut dispatcher) = frankensearch_embed::CoalescingEmbedder::new(
+            cx,
+            Arc::clone(&admitted.embedder),
+            admitted.identity.clone(),
+            frankensearch_embed::CoalescerConfig {
+                max_batch_size: 32,
+                max_wait_ms: 0,
+                min_batch_size: 1,
+                use_priority_lanes: true,
+            },
+            frankensearch_embed::CoalescerLimits::default(),
+        )?;
+        let owner = SearchBlockingPool(asupersync::runtime::blocking_pool::BlockingPool::new(0, 1));
+        let model = admitted.embedder.id().to_owned();
+        let metrics = Arc::clone(client.metrics());
+        let task = owner.0.spawn(move || {
+            let run = || -> SearchResult<usize> {
+                let scheduler = RuntimeBuilder::current_thread()
+                    .blocking_threads(0, backend.current_max_threads())
+                    .build()
+                    .map_err(|error| SearchError::SubsystemError {
+                        subsystem: "fsfs.daemon.coalescing",
+                        source: Box::new(error),
+                    })?;
+                let service_cx = scheduler
+                    .request_cx_with_budget(asupersync::types::Budget::INFINITE)
+                    .with_blocking_pool_handle(Some(backend));
+                let service = async {
+                    loop {
+                        let before = metrics.total_batches.load(Ordering::Relaxed);
+                        match dispatcher.run(&service_cx).await {
+                            Ok(count) => return Ok(count),
+                            Err(error) => {
+                                // The failed batch already delivered its
+                                // error. Preserve unrelated queued requests,
+                                // but never retry an idle or cancelled service.
+                                if service_cx.is_cancel_requested()
+                                    || metrics.total_batches.load(Ordering::Relaxed) == before
+                                {
+                                    return Err(error);
+                                }
+                                warn!(%model, %error, "daemon embedding batch failed");
+                            }
+                        }
+                    }
+                };
+                let mut service = std::pin::pin!(service);
+                scheduler.block_on(std::future::poll_fn(|task| {
+                    // Ambient and explicit blocking calls share the SAME
+                    // bounded model pool. Scope this guard to one poll.
+                    let _current = Cx::set_current(Some(service_cx.clone()));
+                    service.as_mut().poll(task)
+                }))
+            };
+            if let Err(error) = run() {
+                warn!(%model, %error, "daemon embedding dispatcher stopped");
+            }
+        });
+        Ok(Self {
+            provider: Arc::clone(&admitted.embedder),
+            identity: admitted.identity.clone(),
+            client,
+            _task: task,
+            _owner: owner,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DaemonCoalescerService {
+    fn drop(&mut self) {
+        // Close admission before the owned service pool drains. A disconnected
+        // caller never owns this action, and running model work is not detached.
+        self.client.shutdown();
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct DaemonCoalescerServices {
+    services: asupersync::sync::Mutex<Vec<Arc<DaemonCoalescerService>>>,
+}
+
+#[cfg(unix)]
+impl DaemonCoalescerServices {
+    async fn admit(
+        &self,
+        cx: &Cx,
+        admitted: &AdmittedEmbedder,
+    ) -> SearchResult<Arc<DaemonCoalescerService>> {
+        let mut services =
+            self.services
+                .lock(cx)
+                .await
+                .map_err(|error| SearchError::Cancelled {
+                    phase: "daemon.coalescer_admission".to_owned(),
+                    reason: error.to_string(),
+                })?;
+        let mut retired = Vec::new();
+        let mut index = 0;
+        while index < services.len() {
+            // A timed-out request can leave an owned native call in flight.
+            // Retain its service until the batch releases its input credit.
+            if Arc::strong_count(&services[index]) == 1
+                && services[index].client.usage().outstanding_requests == 0
+            {
+                retired.push(services.swap_remove(index));
+            } else {
+                index += 1;
+            }
+        }
+        let service = if let Some(service) = services.iter().find(|service| {
+            Arc::ptr_eq(&service.provider, &admitted.embedder)
+                && service.identity == admitted.identity
+        }) {
+            Arc::clone(service)
+        } else {
+            let service = Arc::new(DaemonCoalescerService::new(cx, admitted)?);
+            services.push(Arc::clone(&service));
+            service
+        };
+        drop(services);
+        drop(retired);
+        Ok(service)
+    }
 }
 
 impl AdmittedEmbedder {
@@ -1161,8 +1322,27 @@ impl AdmittedEmbedder {
         Ok(Self {
             embedder,
             coalescer,
+            #[cfg(unix)]
+            daemon_service: None,
             identity,
         })
+    }
+
+    #[cfg(unix)]
+    async fn enable_daemon_dispatch(
+        &mut self,
+        cx: &Cx,
+        services: &DaemonCoalescerServices,
+    ) -> SearchResult<()> {
+        if self.daemon_service.is_some() || self.coalescer.is_none() {
+            return Ok(());
+        }
+        self.check_current_identity()?;
+        let service = services.admit(cx, self).await?;
+        self.check_current_identity()?;
+        self.coalescer = Some(service.client.clone());
+        self.daemon_service = Some(service);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -6671,6 +6851,8 @@ pub struct FsfsRuntime {
     /// One caller-owned capacity shared by daemon requests and runtime clones.
     /// Only the handle lives here: the caller drains the owner after all users.
     search_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
+    #[cfg(unix)]
+    daemon_coalescers: Option<Arc<DaemonCoalescerServices>>,
     /// Source preparation has its own profile capacity, independent of model
     /// workers. Clones share the owner; cancellation cannot abandon its jobs.
     source_preparation_pool: Arc<std::sync::OnceLock<SearchBlockingPool>>,
@@ -6748,6 +6930,8 @@ impl FsfsRuntime {
             )),
             quality_budget_started_at: None,
             search_blocking_pool: None,
+            #[cfg(unix)]
+            daemon_coalescers: None,
             source_preparation_pool: Arc::new(std::sync::OnceLock::new()),
             #[cfg(feature = "rerank")]
             native_blocking_pool: None,
@@ -9138,7 +9322,8 @@ impl FsfsRuntime {
             self.clone()
         } else {
             self.clone().with_search_blocking_pool(pool_handle.clone())
-        };
+        }
+        .with_daemon_coalescers();
         let serving_cx = cx.clone().with_blocking_pool_handle(Some(pool_handle));
         let resources = runtime.prepare_search_serve_resources(&serving_cx).await?;
         let ready = Self::search_serve_ready_event(self.cli_input.format.to_string(), &resources);
@@ -9169,11 +9354,9 @@ impl FsfsRuntime {
             "fsfs query daemon listening"
         );
 
-        // Every accepted client runs on its own scoped thread so one stalled
-        // or partial client cannot serialize the rest; search execution
-        // serializes only on the shared resource lock for the compute
-        // duration. The scope joins every client before returning, bounded by
-        // the per-client I/O timeouts.
+        // Each client owns its request and read-only resource snapshot. Shared
+        // admission and cache updates hold short locks; inference and socket
+        // delivery do not. The scope joins every client before returning.
         std::thread::scope(|scope| {
             loop {
                 // Cooperative cancel: this loop holds Cx across a blocking
@@ -9380,23 +9563,16 @@ impl FsfsRuntime {
                     let cx = Cx::current()
                         .expect("asupersync runtime installs a request context")
                         .with_blocking_pool_handle(Some(pool_handle));
-                    let mut guard =
-                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), &cx)
-                            .await
-                            .map_err(|error| SearchError::SubsystemError {
-                                subsystem: "fsfs.search.serve",
-                                source: Box::new(std::io::Error::other(format!(
-                                    "failed to lock shared daemon search state: {error}"
-                                ))),
-                            })?;
-                    let (resources, hot_cache) = &mut *guard;
                     runtime
-                        .execute_search_serve_request(
+                        .execute_shared_search_serve_request_with_sink(
                             &cx,
                             request,
-                            resources,
-                            hot_cache,
-                            hot_cache_enabled,
+                            shared,
+                            SearchServeOptions {
+                                hot_cache_enabled,
+                                persist_explain_session: false,
+                            },
+                            None,
                         )
                         .await
                 });
@@ -9521,12 +9697,6 @@ impl FsfsRuntime {
                             Some("daemon delivery stopped"),
                         );
                     }
-                    let mut guard = asupersync::sync::OwnedMutexGuard::lock(shared, &request_cx)
-                        .await
-                        .map_err(|error| {
-                            Self::search_daemon_error(format!("search state admission: {error}"))
-                        })?;
-                    let (resources, hot_cache) = &mut *guard;
                     let mut total_bytes = 0_usize;
                     let mut publish = |frame: SearchServeFrame| {
                         Self::search_daemon_checkpoint(&request_cx)?;
@@ -9548,11 +9718,10 @@ impl FsfsRuntime {
                         })
                     };
                     runtime
-                        .execute_search_serve_request_with_sink(
+                        .execute_shared_search_serve_request_with_sink(
                             &request_cx,
                             request,
-                            resources,
-                            hot_cache,
+                            shared,
                             SearchServeOptions {
                                 hot_cache_enabled,
                                 persist_explain_session: false,
@@ -9635,6 +9804,127 @@ impl FsfsRuntime {
                 ranking_priors: None,
             })
         }
+    }
+
+    #[cfg(unix)]
+    fn with_daemon_coalescers(mut self) -> Self {
+        self.daemon_coalescers
+            .get_or_insert_with(|| Arc::new(DaemonCoalescerServices::default()));
+        self
+    }
+
+    /// Share immutable readers and admitted model services, not a request's
+    /// mutable execution state. A slow inference must not withhold another
+    /// client's INITIAL phase or own its cancellation context.
+    #[cfg(unix)]
+    async fn execute_shared_search_serve_request_with_sink(
+        &self,
+        cx: &Cx,
+        request: SearchServeRequest,
+        shared: SharedSearchServeState,
+        options: SearchServeOptions,
+        frame_sink: Option<SearchServeFrameSink<'_>>,
+    ) -> SearchResult<SearchServeResponse> {
+        let runtime = self
+            .with_search_serve_request_policy(&request)?
+            .with_daemon_coalescers();
+        let mode = degraded_search_mode(
+            runtime.config.pressure.degradation_override,
+            parse_search_execution_mode(request.mode.as_deref())?,
+        )?;
+        runtime.validate_semantic_model_selection(mode)?;
+        let limit = request.limit.unwrap_or_else(|| {
+            runtime
+                .cli_input
+                .overrides
+                .limit
+                .unwrap_or(runtime.config.search.default_limit)
+        });
+        let key = runtime.search_cache_key(&request.query, limit, mode)?;
+        let (mut resources, mut cache) = {
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), cx)
+                .await
+                .map_err(|error| {
+                    Self::search_daemon_error(format!("search state admission: {error}"))
+                })?;
+            let (resources, cache) = &mut *guard;
+            if runtime
+                .rebind_search_resources_if_generation_changed(cx, mode, resources)
+                .await?
+            {
+                cache.clear();
+            }
+            // Resolve the fast producer once before snapshotting it. Quality
+            // remains lazy so its cold load cannot delay INITIAL delivery.
+            if matches!(
+                mode,
+                SearchExecutionMode::Full | SearchExecutionMode::FastOnly
+            ) && resources.vector_index.is_some()
+            {
+                runtime.maybe_prepare_fast_embedder(cx, resources).await?;
+            }
+            let services = runtime
+                .daemon_coalescers
+                .as_ref()
+                .expect("daemon services installed");
+            for admitted in resources
+                .fast_embedder
+                .iter_mut()
+                .chain(resources.quality_embedder.iter_mut())
+            {
+                admitted.enable_daemon_dispatch(cx, services).await?;
+            }
+            // Clone only this request's cache entry. Other payloads stay in the
+            // bounded shared cache and are neither copied nor held during I/O.
+            let cached = if options.hot_cache_enabled {
+                cache
+                    .get(&key)
+                    .cloned()
+                    .map(|value| HashMap::from([(key.clone(), value)]))
+            } else {
+                None
+            };
+            (resources.clone(), cached.unwrap_or_default())
+        };
+        let response = runtime
+            .execute_search_serve_request_with_sink(
+                cx,
+                request,
+                &mut resources,
+                &mut cache,
+                options,
+                frame_sink,
+            )
+            .await?;
+        Self::search_daemon_checkpoint(cx)?;
+        let mut guard = asupersync::sync::OwnedMutexGuard::lock(shared, cx)
+            .await
+            .map_err(|error| {
+                Self::search_daemon_error(format!("search state completion: {error}"))
+            })?;
+        // An older request cannot overwrite resources or cached results that
+        // another request admitted after a publication or mode transition.
+        if guard.0.generation_fingerprint == resources.generation_fingerprint
+            && guard.0.resource_mode == resources.resource_mode
+        {
+            // Merge successful admission only. A later timeout or narrower
+            // request cannot erase a producer another request already proved.
+            if guard.0.fast_embedder.is_none() && resources.fast_embedder.is_some() {
+                guard.0.fast_embedder = resources.fast_embedder.take();
+                guard.0.fast_embedder_attempted = true;
+            }
+            if guard.0.quality_embedder.is_none() && resources.quality_embedder.is_some() {
+                guard.0.quality_embedder = resources.quality_embedder.take();
+                guard.0.quality_embedder_attempted = true;
+            }
+            if let Some(value) = cache.remove(&key) {
+                if guard.1.len() >= FSFS_DAEMON_MAX_CACHE_ENTRIES {
+                    guard.1.clear();
+                }
+                guard.1.insert(key, value);
+            }
+        }
+        Ok(response)
     }
 
     async fn execute_search_serve_request(
@@ -13206,7 +13496,7 @@ impl FsfsRuntime {
         let vector_index = if matches!(mode, SearchExecutionMode::QualityOnly) {
             resources.quality_vector_index.as_deref()
         } else {
-            resources.vector_index.as_ref()
+            resources.vector_index.as_deref()
         };
         if let Some(index) = vector_index {
             let id = index.embedder_id();
@@ -13706,7 +13996,7 @@ impl FsfsRuntime {
 
         let lexical_doc_count = lexical_stats.map(|stats| stats.live_docs);
         let vector_doc_count = resources.vector_index.as_ref().map(|index| {
-            resources.fast_window_mapping.as_ref().map_or_else(
+            resources.fast_window_mapping.as_deref().map_or_else(
                 || {
                     index
                         .record_count()
@@ -14122,7 +14412,7 @@ impl FsfsRuntime {
                             &query_embedding,
                             semantic_budget,
                             vector_filter,
-                            resources.fast_window_mapping.as_ref(),
+                            resources.fast_window_mapping.as_deref(),
                         );
                         fast_query_embedding = Some(query_embedding);
                         match windowed {
@@ -14341,7 +14631,8 @@ impl FsfsRuntime {
                 .with_quality_deadline(cx, async {
                     if let Some(initialization) = quality_initialization {
                         let resolved = Self::join_search_worker(cx, initialization?).await?;
-                        Self::admit_prepared_quality_embedder(cx, resources, resolved)?;
+                        self.admit_prepared_quality_embedder(cx, resources, resolved)
+                            .await?;
                     }
                     self.quality_candidates(
                         cx,
@@ -14374,7 +14665,7 @@ impl FsfsRuntime {
                     let (blended_candidates, mut blend_hits) = self.blend_semantic_candidates(
                         &fast_candidates,
                         &quality_candidates,
-                        resources.fast_window_mapping.as_ref(),
+                        resources.fast_window_mapping.as_deref(),
                     );
                     let refined_budget = lexical_head_candidates
                         .len()
@@ -23366,8 +23657,8 @@ impl FsfsRuntime {
             lexical_index,
             shadow_observer,
             shadow_pressure_sampler,
-            vector_index,
-            fast_window_mapping,
+            vector_index: vector_index.map(Arc::new),
+            fast_window_mapping: fast_window_mapping.map(Arc::new),
             quality_vector_index: quality_vector_index.map(Arc::new),
             fast_embedder: None,
             quality_embedder: None,
@@ -23553,6 +23844,21 @@ impl FsfsRuntime {
         None
     }
 
+    async fn admit_search_embedder(
+        &self,
+        cx: &Cx,
+        embedder: Arc<dyn Embedder>,
+    ) -> SearchResult<AdmittedEmbedder> {
+        let admitted = AdmittedEmbedder::admit(cx, embedder)?;
+        #[cfg(unix)]
+        if let Some(services) = &self.daemon_coalescers {
+            let mut admitted = admitted;
+            admitted.enable_daemon_dispatch(cx, services).await?;
+            return Ok(admitted);
+        }
+        Ok(admitted)
+    }
+
     async fn maybe_prepare_fast_embedder(
         &self,
         cx: &Cx,
@@ -23612,7 +23918,7 @@ impl FsfsRuntime {
                     dimension = embedder.dimension(),
                     "{message}"
                 );
-                resources.fast_embedder = Some(AdmittedEmbedder::admit(cx, embedder)?);
+                resources.fast_embedder = Some(self.admit_search_embedder(cx, embedder).await?);
                 Ok(())
             }
             Err(error) => {
@@ -24079,7 +24385,7 @@ impl FsfsRuntime {
                 index,
                 query_embedding,
                 discovered,
-                resources.fast_window_mapping.as_ref(),
+                resources.fast_window_mapping.as_deref(),
             )?
             .into_iter()
             .map(|hit| SemanticCandidate::new(hit.doc_id, hit.score)),
@@ -24115,7 +24421,8 @@ impl FsfsRuntime {
             let initialization = self.start_quality_initialization(cx, permit)?;
             Self::join_search_worker(cx, initialization).await?
         };
-        Self::admit_prepared_quality_embedder(cx, resources, resolved)
+        self.admit_prepared_quality_embedder(cx, resources, resolved)
+            .await
     }
 
     fn prefetch_quality_initialization(
@@ -24194,7 +24501,8 @@ impl FsfsRuntime {
         })
     }
 
-    fn admit_prepared_quality_embedder(
+    async fn admit_prepared_quality_embedder(
+        &self,
         cx: &Cx,
         resources: &mut SearchExecutionResources,
         resolved: SearchResult<Option<Arc<dyn Embedder>>>,
@@ -24208,7 +24516,7 @@ impl FsfsRuntime {
                 if let Some(index) = resources.quality_vector_index.as_ref() {
                     Self::admit_quality_generation_for_embedder(index, embedder.as_ref())?;
                 }
-                resources.quality_embedder = Some(AdmittedEmbedder::admit(cx, embedder)?);
+                resources.quality_embedder = Some(self.admit_search_embedder(cx, embedder).await?);
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -33793,7 +34101,7 @@ mod tests {
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
-            vector_index: Some(fast),
+            vector_index: Some(Arc::new(fast)),
             fast_window_mapping: None,
             quality_vector_index: Some(Arc::new(quality)),
             fast_embedder: Some(admitted(BlendQueryEmbedder("blend-fast-2"))),
@@ -34415,7 +34723,7 @@ mod tests {
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(VectorIndex::open_read_only(&path).unwrap()),
+                vector_index: Some(Arc::new(VectorIndex::open_read_only(&path).unwrap())),
                 fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: Some(admitted(BlendQueryEmbedder("blend-fast-2"))),
@@ -35295,7 +35603,10 @@ mod tests {
                 "another query must not duplicate the active initializer"
             );
             let resolved = FsfsRuntime::join_search_worker(&cx, worker).await.unwrap();
-            FsfsRuntime::admit_prepared_quality_embedder(&cx, &mut resources, resolved).unwrap();
+            runtime
+                .admit_prepared_quality_embedder(&cx, &mut resources, resolved)
+                .await
+                .unwrap();
             assert!(Arc::ptr_eq(
                 &resources.quality_embedder.as_ref().unwrap().embedder,
                 &provider
@@ -36418,6 +36729,282 @@ mod tests {
             completed.load(Ordering::SeqCst),
             "shutdown must retain work past the dependency's five-second grace period"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_daemon_queries_share_batches_without_sharing_client_cancellation() {
+        struct HeldNativeBatch {
+            gate: Arc<asupersync::sync::Mutex<()>>,
+            batches: std::sync::Mutex<Vec<Vec<String>>>,
+            singletons: AtomicUsize,
+        }
+        impl Embedder for HeldNativeBatch {
+            fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                self.singletons.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    let _permit =
+                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.gate), cx)
+                            .await
+                            .map_err(|error| SearchError::Cancelled {
+                                phase: "held singleton daemon query".to_owned(),
+                                reason: error.to_string(),
+                            })?;
+                    Ok(vec![1.0, 0.0])
+                })
+            }
+            fn embed_batch_bound<'a>(
+                &'a self,
+                cx: &'a Cx,
+                texts: &'a [&'a str],
+            ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
+                Box::pin(async move {
+                    self.batches
+                        .lock()
+                        .unwrap()
+                        .push(texts.iter().map(|text| (*text).to_owned()).collect());
+                    let _permit =
+                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.gate), cx)
+                            .await
+                            .map_err(|error| SearchError::Cancelled {
+                                phase: "held daemon batch".to_owned(),
+                                reason: error.to_string(),
+                            })?;
+                    Ok(texts
+                        .iter()
+                        .map(|_| frankensearch_core::IdentityBoundEmbedding {
+                            values: vec![1.0, 0.0],
+                            identity: test_identity(self.id(), 2).clone(),
+                        })
+                        .collect())
+                })
+            }
+            fn bound_batch_is_native(&self) -> bool {
+                true
+            }
+            fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+                Ok(test_identity(self.id(), 2))
+            }
+            fn dimension(&self) -> usize {
+                2
+            }
+            fn id(&self) -> &'static str {
+                "blend-quality-2"
+            }
+            fn model_name(&self) -> &'static str {
+                "held native daemon batch"
+            }
+            fn is_semantic(&self) -> bool {
+                true
+            }
+            fn category(&self) -> ModelCategory {
+                ModelCategory::TransformerEmbedder
+            }
+        }
+
+        for client_count in [4, 8] {
+            for (bypass, cancel_dispatching_client) in
+                [(false, false), (false, true), (true, false)]
+            {
+                let temp = tempfile::tempdir().unwrap();
+                let gate = Arc::new(asupersync::sync::Mutex::new(()));
+                let held = futures_lite_block_on(asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&gate),
+                    &Cx::for_request(),
+                ))
+                .unwrap();
+                let producer = Arc::new(HeldNativeBatch {
+                    gate,
+                    batches: std::sync::Mutex::new(Vec::new()),
+                    singletons: AtomicUsize::new(0),
+                });
+                let mut resources = disagreeing_blend_resources(temp.path());
+                let admitted = admitted_shared(&producer);
+                resources.quality_embedder = Some(if bypass {
+                    admitted.without_coalescing()
+                } else {
+                    admitted
+                });
+                let shared = Arc::new(asupersync::sync::Mutex::new((resources, HashMap::new())));
+                let owner = super::SearchBlockingPool::for_profile(PressureProfile::Performance);
+                let runtime = FsfsRuntime::new(FsfsConfig::default())
+                    .with_search_blocking_pool(owner.handle())
+                    .with_daemon_coalescers();
+                let (ready, observed) = std::sync::mpsc::channel();
+                let mut handlers = Vec::new();
+                let mut readers = Vec::new();
+                for index in 0..client_count {
+                    let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let request = serde_json::json!({
+                        "query": format!("recover failed network requests client {index}"),
+                        "quality_timeout_ms": 15_000, "limit": 10, "stream": true,
+                    });
+                    client.write_all(request.to_string().as_bytes()).unwrap();
+                    client.shutdown(std::net::Shutdown::Write).unwrap();
+                    let runtime = runtime.clone();
+                    let state = Arc::clone(&shared);
+                    handlers.push(thread::spawn(move || {
+                        FsfsRuntime::handle_search_serve_socket_client(
+                            runtime,
+                            server,
+                            state,
+                            Arc::new(AtomicBool::new(false)),
+                            true,
+                        );
+                    }));
+                    let ready = ready.clone();
+                    readers.push(thread::spawn(move || {
+                        let mut reader = std::io::BufReader::new(client);
+                        let mut first = String::new();
+                        let mut initial = String::new();
+                        let result = reader
+                            .read_line(&mut first)
+                            .and_then(|_| reader.read_line(&mut initial));
+                        ready.send((index, reader, first, initial, result)).unwrap();
+                    }));
+                }
+                drop(ready);
+                let mut clients = (0..client_count).map(|_| None).collect::<Vec<_>>();
+                let mut initials = Vec::new();
+                let mut read_errors = Vec::new();
+                for (index, reader, first, initial, result) in observed {
+                    if let Err(error) = result {
+                        read_errors.push(error.to_string());
+                    }
+                    clients[index] = Some(reader);
+                    initials.push((first, initial));
+                }
+                for reader in readers {
+                    reader.join().unwrap();
+                }
+                let mut outstanding = 0;
+                let mut cancelled_handler_finished = !cancel_dispatching_client;
+                if read_errors.is_empty() && !bypass {
+                    let coalescer = {
+                        let guard = futures_lite_block_on(asupersync::sync::OwnedMutexGuard::lock(
+                            Arc::clone(&shared),
+                            &Cx::for_request(),
+                        ))
+                        .unwrap();
+                        guard
+                            .0
+                            .quality_embedder
+                            .as_ref()
+                            .unwrap()
+                            .coalescer()
+                            .unwrap()
+                            .clone()
+                    };
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while (coalescer.usage().outstanding_requests != client_count
+                        || producer.batches.lock().unwrap().is_empty())
+                        && Instant::now() < deadline
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    outstanding = coalescer.usage().outstanding_requests;
+                    if cancel_dispatching_client {
+                        let first = producer.batches.lock().unwrap()[0][0].clone();
+                        let index = (0..client_count)
+                            .find(|index| first.ends_with(&index.to_string()))
+                            .unwrap();
+                        drop(clients[index].take());
+                        let deadline = Instant::now() + Duration::from_secs(3);
+                        while !handlers[index].is_finished() && Instant::now() < deadline {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        cancelled_handler_finished = handlers[index].is_finished();
+                    }
+                }
+                // Release on every path before asserting, including the old
+                // serialized implementation's read timeout. No handler is orphaned.
+                drop(held);
+                let mut responses = Vec::new();
+                for mut reader in clients.into_iter().flatten() {
+                    let mut rest = String::new();
+                    let result = reader.read_to_string(&mut rest);
+                    responses.push((rest, result));
+                }
+                for handler in handlers {
+                    handler.join().unwrap();
+                }
+                assert!(
+                    read_errors.is_empty(),
+                    "all INITIAL phases must precede release: {read_errors:?}"
+                );
+                assert_eq!(
+                    outstanding,
+                    if bypass { 0 } else { client_count },
+                    "all coalesced requests reach the same held owner"
+                );
+                assert!(
+                    cancelled_handler_finished,
+                    "a disconnected client must leave independently of the batch owner"
+                );
+                for (first, initial) in initials {
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&first).unwrap()["event"],
+                        "attested"
+                    );
+                    let initial: serde_json::Value = serde_json::from_str(&initial).unwrap();
+                    assert_eq!(initial["event"], "phase");
+                    assert_eq!(initial["payload"]["phase"], "initial");
+                    assert_eq!(initial["payload"]["hits"][0]["path"], "a.rs");
+                }
+                assert_eq!(
+                    responses.len(),
+                    if cancel_dispatching_client {
+                        client_count - 1
+                    } else {
+                        client_count
+                    }
+                );
+                for (rest, result) in responses {
+                    result.unwrap();
+                    let frames = rest
+                        .lines()
+                        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                        .collect::<Vec<_>>();
+                    assert_eq!(frames.len(), 2, "{frames:?}");
+                    assert_eq!(frames[0]["payload"]["phase"], "refined");
+                    assert_eq!(frames[0]["payload"]["hits"][0]["path"], "b.rs");
+                    assert_eq!(frames[1]["event"], "terminal");
+                    assert_eq!(frames[1]["ok"], true);
+                }
+                let batches = producer.batches.lock().unwrap();
+                if bypass {
+                    assert!(batches.is_empty());
+                    assert_eq!(
+                        producer.singletons.load(Ordering::SeqCst),
+                        client_count,
+                        "the planted bypass performs one inference per request"
+                    );
+                } else {
+                    assert!(
+                        batches.len() <= 2,
+                        "socket requests must coalesce: {batches:?}"
+                    );
+                    assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), client_count);
+                    assert_eq!(producer.singletons.load(Ordering::SeqCst), 0);
+                }
+                let guard = futures_lite_block_on(asupersync::sync::OwnedMutexGuard::lock(
+                    Arc::clone(&shared),
+                    &Cx::for_request(),
+                ))
+                .unwrap();
+                assert_eq!(
+                    guard.1.len(),
+                    if cancel_dispatching_client {
+                        client_count - 1
+                    } else {
+                        client_count
+                    }
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -41715,7 +42302,7 @@ mod tests {
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(VectorIndex::open_read_only(&vector_path).unwrap()),
+                vector_index: Some(Arc::new(VectorIndex::open_read_only(&vector_path).unwrap())),
                 fast_window_mapping: None,
                 quality_vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&quality_path).unwrap(),
@@ -48596,12 +49183,12 @@ mod tests {
                     );
                     index
                 };
-            resources.vector_index = Some(write(
+            resources.vector_index = Some(Arc::new(write(
                 "filtered-fast.fsvi",
                 "blend-fast-2",
                 "src/fast.rs",
                 None,
-            ));
+            )));
             resources.quality_vector_index = Some(Arc::new(write(
                 "filtered-quality.fsvi",
                 "blend-quality-2",
@@ -48784,12 +49371,12 @@ mod tests {
                 writer.finish().unwrap();
                 VectorIndex::open_read_only(&path).unwrap()
             };
-            resources.vector_index = Some(write(
+            resources.vector_index = Some(Arc::new(write(
                 "completion-fast.fsvi",
                 "blend-fast-2",
                 [0.9, 0.0],
                 [0.1, 0.0],
-            ));
+            )));
             resources.quality_vector_index = Some(Arc::new(write(
                 "completion-quality.fsvi",
                 "blend-quality-2",
@@ -48899,7 +49486,7 @@ mod tests {
                 writer.finish().unwrap();
                 VectorIndex::open_read_only(&path).unwrap()
             };
-            resources.vector_index = Some(write(
+            resources.vector_index = Some(Arc::new(write(
                 "exclusion-fast.fsvi",
                 "blend-fast-2",
                 &[
@@ -48907,7 +49494,7 @@ mod tests {
                     ("b.rs", [0.9, 0.1]),
                     ("c.rs", [0.0, 1.0]),
                 ],
-            ));
+            )));
             resources.quality_vector_index = Some(Arc::new(write(
                 "exclusion-quality.fsvi",
                 "blend-quality-2",
@@ -49999,8 +50586,9 @@ mod tests {
                 )
                 .expect("write vector fixture");
             writer.finish().expect("seal vector fixture");
-            resources.vector_index =
-                Some(VectorIndex::open(&vector_path).expect("open vector fixture"));
+            resources.vector_index = Some(Arc::new(
+                VectorIndex::open(&vector_path).expect("open vector fixture"),
+            ));
             resources.generation_fingerprint =
                 FsfsRuntime::search_index_fingerprint_at_root(temp.path())
                     .expect("refresh search generation fingerprint");
@@ -51548,9 +52136,9 @@ mod tests {
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(
+                vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open vector index"),
-                ),
+                )),
                 // These fixtures bind one 384-d generation as both tiers: the
                 // quality embedder under test owns its identity, and the
                 // fast double supplies a stable initial-phase vector.
@@ -51689,9 +52277,9 @@ mod tests {
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(
+                vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open vector index"),
-                ),
+                )),
                 // These fixtures bind one 384-d generation as both tiers: the
                 // quality embedder under test owns its identity, and the
                 // fast double supplies a stable initial-phase vector.
@@ -51944,7 +52532,9 @@ mod tests {
                 lexical_index: Some(lexical_index),
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(VectorIndex::open(&vector_path).expect("open vector index")),
+                vector_index: Some(Arc::new(
+                    VectorIndex::open(&vector_path).expect("open vector index"),
+                )),
                 fast_window_mapping: None,
                 quality_vector_index: None,
                 fast_embedder: Some(admitted(CancelledEmbedder)),
@@ -52029,9 +52619,9 @@ mod tests {
                 lexical_index: None,
                 shadow_observer: None,
                 shadow_pressure_sampler: None,
-                vector_index: Some(
+                vector_index: Some(Arc::new(
                     VectorIndex::open_read_only(&vector_path).expect("open vector index"),
-                ),
+                )),
                 // These fixtures bind one 384-d generation as both tiers: the
                 // quality embedder under test owns its identity, and the
                 // fast double supplies a stable initial-phase vector.
@@ -55238,9 +55828,9 @@ mod tests {
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
-            vector_index: Some(
+            vector_index: Some(Arc::new(
                 VectorIndex::open_read_only(&vector_path).expect("open semantic index"),
-            ),
+            )),
             fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: loaded.then(|| admitted(HashEmbedder::default_256())),
@@ -55278,7 +55868,9 @@ mod tests {
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
-            vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
+            vector_index: Some(Arc::new(
+                VectorIndex::open_read_only(&vector_path).expect("open hash index"),
+            )),
             fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: Some(admitted(HashEmbedder::default_256())),
@@ -56159,7 +56751,9 @@ mod tests {
             lexical_index: None,
             shadow_observer: None,
             shadow_pressure_sampler: None,
-            vector_index: Some(VectorIndex::open_read_only(&vector_path).expect("open hash index")),
+            vector_index: Some(Arc::new(
+                VectorIndex::open_read_only(&vector_path).expect("open hash index"),
+            )),
             fast_window_mapping: None,
             quality_vector_index: None,
             fast_embedder: None,
