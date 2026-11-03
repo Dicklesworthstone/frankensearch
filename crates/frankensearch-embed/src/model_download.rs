@@ -468,11 +468,11 @@ impl ModelDownloader {
         Self { config }
     }
 
-    /// The HTTP client for a request to `url`. The proxy depends on the URL (its scheme
+    /// The HTTP configuration for a request to `url`. The proxy depends on the URL (its scheme
     /// selects the environment variable and `no_proxy` matches its host), and the client
     /// fixes its proxy at construction. Building one is cheap: TLS and connections are
     /// set up per request, and each artifact is one large streamed request.
-    fn http_client_for(&self, url: &str) -> SearchResult<HttpClient> {
+    fn http_client_config_for(&self, url: &str) -> SearchResult<HttpClientConfig> {
         let mut client_config = HttpClientConfig::default();
         // Follow redirects here rather than inside a fixed-route client: a CDN
         // or mirror can have a different scheme or `no_proxy` policy.
@@ -483,7 +483,7 @@ impl ModelDownloader {
         client_config.max_body_size = Some(self.config.max_response_bytes);
         client_config.request_timeout = Some(self.config.request_timeout);
         client_config.proxy_url = proxy_from_environment(&self.config.proxy, url)?;
-        Ok(HttpClient::with_config(client_config))
+        Ok(client_config)
     }
 
     /// Create a downloader with default configuration.
@@ -982,7 +982,6 @@ impl ModelDownloader {
     }
 
     /// Download a single file (one attempt).
-    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     async fn download_single_file(
         &self,
         cx: &Cx,
@@ -992,6 +991,35 @@ impl ModelDownloader {
         file_idx: usize,
         files_total: usize,
         on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
+    ) -> SearchResult<()> {
+        self.download_single_file_with_client(
+            cx,
+            url,
+            dest,
+            file,
+            file_idx,
+            files_total,
+            on_progress,
+            &HttpClient::with_config,
+        )
+        .await
+    }
+
+    /// Keep transport construction private so loopback qualification can add
+    /// a test CA while exercising the actual routing, deadlines and file
+    /// verification. Every redirect still resolves its policy before the
+    /// factory receives a configuration.
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
+    async fn download_single_file_with_client(
+        &self,
+        cx: &Cx,
+        url: &str,
+        dest: &Path,
+        file: &ModelFile,
+        file_idx: usize,
+        files_total: usize,
+        on_progress: &(impl Fn(&DownloadProgress) + Send + Sync),
+        make_client: &(impl Fn(HttpClientConfig) -> HttpClient + Sync),
     ) -> SearchResult<()> {
         validate_download_config(&self.config)?;
         let start = Instant::now();
@@ -1017,7 +1045,7 @@ impl ModelDownloader {
             check_acquisition_cancel(cx, "download-request")?;
             let response =
                 run_download_request(cx, &request_url, self.config.request_timeout, async {
-                    self.http_client_for(&request_url)?
+                    make_client(self.http_client_config_for(&request_url)?)
                         .request_streaming(cx, Method::Get, &request_url, Vec::new(), Vec::new())
                         .await
                         .map_err(|e| client_error_to_search(e, &request_url))
@@ -3451,7 +3479,7 @@ mod tests {
         );
     }
 
-    fn run_download_proxy_test_child(command: &mut Command) -> std::process::Output {
+    pub(super) fn run_download_proxy_test_child(command: &mut Command) -> std::process::Output {
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -4850,9 +4878,14 @@ mod download_wait_tests {
 #[cfg(test)]
 mod proxy_transport_tests {
     use super::*;
+    use crate::proxy::tls_test_support::{
+        TlsProxyMode, root_certificate, spawn_redirecting_tls_proxy, spawn_tls_proxy,
+        spawn_tls_proxy_with_wrong_proxy_name,
+    };
     use asupersync::test_utils::{assert_completes_within, run_test_with_cx};
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::process::Command;
     use std::thread;
 
     const PEER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -4964,6 +4997,354 @@ mod proxy_transport_tests {
         result.unwrap()
     }
 
+    fn download_with_test_ca(
+        mode: TlsProxyMode,
+        address: SocketAddr,
+        host: &str,
+        destination: &Path,
+        trust_test_ca: bool,
+    ) -> SearchResult<()> {
+        let target_scheme = if matches!(mode, TlsProxyMode::HttpsForward) {
+            "http"
+        } else {
+            "https"
+        };
+        let proxy_scheme = if matches!(mode, TlsProxyMode::HttpConnect) {
+            "http"
+        } else {
+            "https"
+        };
+        let url = format!("{target_scheme}://{host}/model.onnx?token=origin-query-canary");
+        download_configured_with_test_ca(
+            &url,
+            DownloadConfig {
+                max_retries: 0,
+                request_timeout: PEER_TIMEOUT,
+                idle_timeout: PEER_TIMEOUT,
+                proxy: ProxySetting::Url(format!(
+                    "{proxy_scheme}://{PROXY_USERNAME}:{PROXY_PASSWORD}@{address}"
+                )),
+                ..DownloadConfig::default()
+            },
+            destination,
+            trust_test_ca,
+        )
+    }
+
+    fn download_configured_with_test_ca(
+        url: &str,
+        config: DownloadConfig,
+        destination: &Path,
+        trust_test_ca: bool,
+    ) -> SearchResult<()> {
+        let downloader = ModelDownloader::new(config);
+        let file = ModelFile {
+            name: "model.onnx".to_owned(),
+            sha256: sha256_hex(MODEL_BYTES),
+            size: u64::try_from(MODEL_BYTES.len()).unwrap(),
+            url: None,
+        };
+        let make_client = |mut config: HttpClientConfig| {
+            if trust_test_ca {
+                config.tls_root_certificates.push(root_certificate());
+            }
+            HttpClient::with_config(config)
+        };
+        let mut result = None;
+        let result_slot = &mut result;
+        run_test_with_cx(|cx| async move {
+            *result_slot = Some(
+                assert_completes_within(
+                    PEER_TIMEOUT,
+                    "certificate-verified model download",
+                    || {
+                        Box::pin(downloader.download_single_file_with_client(
+                            &cx,
+                            url,
+                            destination,
+                            &file,
+                            0,
+                            1,
+                            &|_| {},
+                            &make_client,
+                        ))
+                    },
+                )
+                .await,
+            );
+        });
+        result.unwrap()
+    }
+
+    fn run_environment_download(
+        url: &str,
+        expected_error: Option<&str>,
+        environment: &[(&str, String)],
+    ) {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "model_download::proxy_transport_tests::download_transport_environment_child",
+            "--nocapture",
+        ]);
+        for name in [
+            "http_proxy",
+            "HTTP_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+        ] {
+            command.env_remove(name);
+        }
+        command
+            .env("FRANKENSEARCH_TEST_DOWNLOAD_TRANSPORT_URL", url)
+            .env(
+                "FRANKENSEARCH_TEST_DOWNLOAD_TRANSPORT_ERROR",
+                expected_error.unwrap_or_default(),
+            );
+        for (name, value) in environment {
+            command.env(name, value);
+        }
+        let output = super::tests::run_download_proxy_test_child(&mut command);
+        assert!(
+            output.status.success(),
+            "download transport child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn download_transport_environment_child() {
+        let Ok(url) = std::env::var("FRANKENSEARCH_TEST_DOWNLOAD_TRANSPORT_URL") else {
+            return;
+        };
+        let expected_error = std::env::var("FRANKENSEARCH_TEST_DOWNLOAD_TRANSPORT_ERROR").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("model.onnx");
+        let config = DownloadConfig {
+            max_retries: 0,
+            request_timeout: PEER_TIMEOUT,
+            idle_timeout: PEER_TIMEOUT,
+            proxy: ProxySetting::FromEnvironment,
+            ..DownloadConfig::default()
+        };
+        let result = download_configured_with_test_ca(&url, config, &destination, true);
+        if expected_error.is_empty() {
+            result.unwrap();
+            let bytes = std::fs::read(&destination).unwrap();
+            assert_eq!(bytes, MODEL_BYTES);
+            assert_eq!(sha256_hex(&bytes), sha256_hex(MODEL_BYTES));
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        } else {
+            let error = result.expect_err("the configured transport policy must refuse");
+            let rendered = format!("{error:?} {error}");
+            assert!(rendered.contains(&expected_error), "{rendered}");
+            for secret in [
+                PROXY_USERNAME,
+                PROXY_PASSWORD,
+                PROXY_BASIC_AUTH,
+                "first-proxy-user",
+                "first-proxy-password",
+                "origin-query-canary",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+        assert!(!destination.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn http_to_https_redirect_selects_https_proxy_and_verifies_model_bytes() {
+        for mode in [TlsProxyMode::HttpConnect, TlsProxyMode::HttpsConnect] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
+            origin.set_nonblocking(true).unwrap();
+            fallback.set_nonblocking(true).unwrap();
+            let origin_address = origin.local_addr().unwrap();
+            let fallback_url = format!("http://{}", fallback.local_addr().unwrap());
+            let (secure_address, secure_peer) = spawn_tls_proxy(mode, MODEL_BYTES.to_vec());
+            let (initial_address, initial_peer) = spawn_proxy(|mut stream| {
+                let request = read_request(&mut stream);
+                stream.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: https://model-host.invalid/verified.onnx?revision=target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ).unwrap();
+                stream.flush().unwrap();
+                request
+            });
+            let proxy_scheme = if mode == TlsProxyMode::HttpConnect {
+                "http"
+            } else {
+                "https"
+            };
+            run_environment_download(
+                &format!("http://{origin_address}/start?token=origin-query-canary"),
+                None,
+                &[
+                    (
+                        "http_proxy",
+                        format!("http://user:password@{initial_address}"),
+                    ),
+                    (
+                        "https_proxy",
+                        format!(
+                            "{proxy_scheme}://{PROXY_USERNAME}:{PROXY_PASSWORD}@{secure_address}"
+                        ),
+                    ),
+                    ("all_proxy", fallback_url),
+                ],
+            );
+            let initial = initial_peer.join().unwrap();
+            let observed = secure_peer.join().unwrap();
+            assert!(initial.starts_with(&format!(
+                "GET http://{origin_address}/start?token=origin-query-canary HTTP/1.1\r\n"
+            )));
+            assert_eq!(
+                request_header(&initial, "Proxy-Authorization"),
+                Some("Basic dXNlcjpwYXNzd29yZA==")
+            );
+            assert!(!initial.contains(PROXY_BASIC_AUTH));
+            assert!(!observed.tls_rejected);
+            let connect = observed.connect_headers.unwrap();
+            assert!(connect.starts_with("CONNECT model-host.invalid:443 HTTP/1.1\r\n"));
+            assert_eq!(
+                request_header(&connect, "Proxy-Authorization"),
+                Some(PROXY_BASIC_AUTH)
+            );
+            assert!(!connect.contains("origin-query-canary"));
+            let request = observed.request_headers.unwrap();
+            assert!(request.starts_with("GET /verified.onnx?revision=target HTTP/1.1\r\n"));
+            assert_eq!(request_header(&request, "Host"), Some("model-host.invalid"));
+            assert_eq!(request_header(&request, "Proxy-Authorization"), None);
+            assert!(!request.contains("origin-query-canary"));
+            for secret in [
+                PROXY_USERNAME,
+                PROXY_PASSWORD,
+                PROXY_BASIC_AUTH,
+                "dXNlcjpwYXNzd29yZA==",
+            ] {
+                assert!(
+                    !request.contains(secret),
+                    "redirect leaked proxy credentials to origin"
+                );
+            }
+            assert!(observed.request_body.is_empty());
+            assert_eq!(origin.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+            assert_eq!(fallback.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn https_downgrade_redirect_refuses_before_contacting_plaintext_routes() {
+        for mode in [TlsProxyMode::HttpConnect, TlsProxyMode::HttpsConnect] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
+            origin.set_nonblocking(true).unwrap();
+            fallback.set_nonblocking(true).unwrap();
+            let origin_address = origin.local_addr().unwrap();
+            let fallback_url = format!("http://{}", fallback.local_addr().unwrap());
+            let (address, peer) = spawn_redirecting_tls_proxy(
+                mode,
+                format!("http://{origin_address}/model.onnx?token=origin-query-canary"),
+            );
+            let proxy_scheme = if mode == TlsProxyMode::HttpConnect {
+                "http"
+            } else {
+                "https"
+            };
+            run_environment_download(
+                "https://model-host.invalid/model.onnx?token=origin-query-canary",
+                Some("invalid-url"),
+                &[
+                    (
+                        "https_proxy",
+                        format!("{proxy_scheme}://{PROXY_USERNAME}:{PROXY_PASSWORD}@{address}"),
+                    ),
+                    ("http_proxy", fallback_url.clone()),
+                    ("all_proxy", fallback_url),
+                    // If the downgrade were followed, this reachable origin
+                    // would be contacted directly under the selected policy.
+                    ("no_proxy", "127.0.0.1".to_owned()),
+                ],
+            );
+            let observed = peer.join().unwrap();
+            assert!(!observed.tls_rejected);
+            let connect = observed.connect_headers.unwrap();
+            assert_eq!(
+                request_header(&connect, "Proxy-Authorization"),
+                Some(PROXY_BASIC_AUTH)
+            );
+            assert!(!connect.contains("origin-query-canary"));
+            let request = observed.request_headers.unwrap();
+            assert!(request.starts_with("GET /model.onnx?token=origin-query-canary HTTP/1.1\r\n"));
+            assert_eq!(request_header(&request, "Proxy-Authorization"), None);
+            assert!(observed.request_body.is_empty());
+            assert_eq!(origin.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+            assert_eq!(fallback.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        }
+    }
+
+    #[test]
+    fn socks_authentication_refusal_never_uses_direct_or_fallback_routes() {
+        for scheme in ["socks5", "socks5h"] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
+            origin.set_nonblocking(true).unwrap();
+            fallback.set_nonblocking(true).unwrap();
+            let (address, peer) = spawn_proxy(|mut stream| {
+                let mut greeting = [0_u8; 2];
+                stream.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting[0], 5);
+                let mut methods = vec![0_u8; usize::from(greeting[1])];
+                stream.read_exact(&mut methods).unwrap();
+                assert!(methods.contains(&2));
+                stream.write_all(&[5, 2]).unwrap();
+                let mut version = [0_u8; 1];
+                stream.read_exact(&mut version).unwrap();
+                assert_eq!(version, [1]);
+                assert_eq!(read_socks_string(&mut stream), PROXY_USERNAME.as_bytes());
+                assert_eq!(read_socks_string(&mut stream), PROXY_PASSWORD.as_bytes());
+                stream.write_all(&[1, 1]).unwrap();
+                stream.flush().unwrap();
+                // The client must close after auth refusal; no SOCKS CONNECT
+                // or application request may follow the rejected credentials.
+                let mut byte = [0_u8; 1];
+                match stream.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+                    other => {
+                        panic!("download continued after SOCKS authentication refusal: {other:?}")
+                    }
+                }
+            });
+            run_environment_download(
+                &format!(
+                    "http://{}/model.onnx?token=origin-query-canary",
+                    origin.local_addr().unwrap()
+                ),
+                Some("proxy-failure"),
+                &[
+                    (
+                        "http_proxy",
+                        format!("{scheme}://{PROXY_USERNAME}:{PROXY_PASSWORD}@{address}"),
+                    ),
+                    (
+                        "all_proxy",
+                        format!("http://{}", fallback.local_addr().unwrap()),
+                    ),
+                ],
+            );
+            peer.join().unwrap();
+            assert_eq!(origin.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+            assert_eq!(fallback.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        }
+    }
+
     fn read_socks_string(stream: &mut TcpStream) -> Vec<u8> {
         let mut length = [0_u8; 1];
         stream.read_exact(&mut length).unwrap();
@@ -4972,9 +5353,38 @@ mod proxy_transport_tests {
         value
     }
 
+    fn read_tls_client_hello(stream: &mut TcpStream) {
+        let mut header = [0_u8; 5];
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], 0x16, "expected TLS handshake record");
+        assert_eq!(header[1], 0x03, "expected TLS record version");
+        let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        assert!(
+            length > 0 && length <= 16 * 1024,
+            "TLS ClientHello record limit"
+        );
+        let mut hello = vec![0_u8; length];
+        stream.read_exact(&mut hello).unwrap();
+        assert_eq!(hello[0], 1, "expected TLS ClientHello");
+        for secret in [
+            PROXY_USERNAME,
+            PROXY_PASSWORD,
+            PROXY_BASIC_AUTH,
+            "origin-query-canary",
+        ] {
+            assert!(
+                !hello
+                    .windows(secret.len())
+                    .any(|bytes| bytes == secret.as_bytes())
+            );
+        }
+    }
+
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum StallPoint {
         Connect,
+        OriginTls,
+        ProxyTls,
         SocksGreeting,
         Headers,
         Body,
@@ -4992,16 +5402,26 @@ mod proxy_transport_tests {
                 assert_eq!(greeting[0], 5);
                 let mut methods = vec![0_u8; usize::from(greeting[1])];
                 stream.read_exact(&mut methods).unwrap();
+            } else if point == StallPoint::ProxyTls {
+                read_tls_client_hello(&mut stream);
             } else {
                 let request = read_request(&mut stream);
-                assert!(request.starts_with(if point == StallPoint::Connect {
-                    "CONNECT model-host.invalid:443 "
-                } else if point == StallPoint::DirectBody {
-                    "GET /model.onnx"
-                } else {
-                    "GET http://model-host.invalid/"
-                }));
-                if body_stalls {
+                assert!(request.starts_with(
+                    if matches!(point, StallPoint::Connect | StallPoint::OriginTls) {
+                        "CONNECT model-host.invalid:443 "
+                    } else if point == StallPoint::DirectBody {
+                        "GET /model.onnx"
+                    } else {
+                        "GET http://model-host.invalid/"
+                    }
+                ));
+                if point == StallPoint::OriginTls {
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .unwrap();
+                    stream.flush().unwrap();
+                    read_tls_client_hello(&mut stream);
+                } else if body_stalls {
                     write!(
                         stream,
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
@@ -5032,7 +5452,8 @@ mod proxy_transport_tests {
             }
         });
         let (target_scheme, proxy_scheme) = match point {
-            StallPoint::Connect => ("https", "http"),
+            StallPoint::Connect | StallPoint::OriginTls => ("https", "http"),
+            StallPoint::ProxyTls => ("https", "https"),
             StallPoint::SocksGreeting => ("http", "socks5h"),
             StallPoint::Headers | StallPoint::Body | StallPoint::DirectBody => ("http", "http"),
         };
@@ -5115,6 +5536,20 @@ mod proxy_transport_tests {
             StallPoint::Body,
             StallPoint::DirectBody,
         ] {
+            assert_stalled_download_terminates(point, true);
+        }
+    }
+
+    #[test]
+    fn stalled_origin_and_proxy_tls_handshakes_have_finite_deadlines() {
+        for point in [StallPoint::OriginTls, StallPoint::ProxyTls] {
+            assert_stalled_download_terminates(point, false);
+        }
+    }
+
+    #[test]
+    fn cancelled_origin_and_proxy_tls_handshakes_close_without_peer_activity() {
+        for point in [StallPoint::OriginTls, StallPoint::ProxyTls] {
             assert_stalled_download_terminates(point, true);
         }
     }
@@ -5324,5 +5759,154 @@ mod proxy_transport_tests {
         assert!(!rendered.contains(PROXY_PASSWORD), "{rendered}");
         assert!(!destination.exists());
         assert!(!destination.with_extension("tmp").exists());
+    }
+
+    #[test]
+    fn verified_tls_model_transfers_complete_through_connect_and_https_proxies() {
+        for mode in [
+            TlsProxyMode::HttpConnect,
+            TlsProxyMode::HttpsForward,
+            TlsProxyMode::HttpsConnect,
+        ] {
+            let (address, peer) = spawn_tls_proxy(mode, MODEL_BYTES.to_vec());
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("model.onnx");
+            let result =
+                download_with_test_ca(mode, address, "model-host.invalid", &destination, true);
+            let observed = peer.join().unwrap();
+            result.unwrap();
+            assert!(!observed.tls_rejected);
+            assert!(observed.request_body.is_empty());
+            let request = observed.request_headers.unwrap();
+            assert_eq!(request_header(&request, "Host"), Some("model-host.invalid"));
+            if matches!(mode, TlsProxyMode::HttpsForward) {
+                assert!(observed.connect_headers.is_none());
+                assert!(request.starts_with(
+                    "GET http://model-host.invalid/model.onnx?token=origin-query-canary HTTP/1.1\r\n"
+                ));
+                // Forward-proxy authentication belongs on this proxy-facing
+                // request, protected by the verified outer TLS connection.
+                assert_eq!(
+                    request_header(&request, "Proxy-Authorization"),
+                    Some(PROXY_BASIC_AUTH)
+                );
+            } else {
+                let connect = observed.connect_headers.unwrap();
+                assert!(connect.starts_with("CONNECT model-host.invalid:443 HTTP/1.1\r\n"));
+                assert_eq!(
+                    request_header(&connect, "Proxy-Authorization"),
+                    Some(PROXY_BASIC_AUTH)
+                );
+                assert!(!connect.contains("origin-query-canary"));
+                assert!(
+                    request.starts_with("GET /model.onnx?token=origin-query-canary HTTP/1.1\r\n")
+                );
+                assert_eq!(request_header(&request, "Proxy-Authorization"), None);
+                for secret in [PROXY_USERNAME, PROXY_PASSWORD, PROXY_BASIC_AUTH] {
+                    assert!(
+                        !request.contains(secret),
+                        "proxy credentials reached origin"
+                    );
+                }
+            }
+            let bytes = std::fs::read(&destination).unwrap();
+            assert_eq!(bytes, MODEL_BYTES);
+            assert_eq!(sha256_hex(&bytes), sha256_hex(MODEL_BYTES));
+            assert!(!destination.with_extension("tmp").exists());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn model_tls_refuses_untrusted_certificates_and_wrong_origin_names() {
+        for (mode, trust_test_ca, host) in [
+            (TlsProxyMode::HttpConnect, false, "model-host.invalid"),
+            (TlsProxyMode::HttpsForward, false, "model-host.invalid"),
+            (TlsProxyMode::HttpsConnect, false, "model-host.invalid"),
+            (TlsProxyMode::HttpConnect, true, "wrong-host.invalid"),
+            (TlsProxyMode::HttpsConnect, true, "wrong-host.invalid"),
+        ] {
+            let (address, peer) = spawn_tls_proxy(mode, MODEL_BYTES.to_vec());
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("model.onnx");
+            let result = download_with_test_ca(mode, address, host, &destination, trust_test_ca);
+            let observed = peer.join().unwrap();
+            let error = result.expect_err("certificate and hostname validation must remain active");
+            let rendered = format!("{error:?} {error}");
+            assert!(rendered.contains("tls-handshake-failure"), "{rendered}");
+            assert!(observed.tls_rejected);
+            assert!(observed.request_headers.is_none());
+            assert!(observed.request_body.is_empty());
+            if !trust_test_ca && !matches!(mode, TlsProxyMode::HttpConnect) {
+                assert!(
+                    observed.connect_headers.is_none(),
+                    "an untrusted HTTPS proxy must not receive CONNECT credentials"
+                );
+            }
+            for secret in [
+                PROXY_USERNAME,
+                PROXY_PASSWORD,
+                PROXY_BASIC_AUTH,
+                "origin-query-canary",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn model_tls_refuses_trusted_https_proxies_with_the_wrong_hostname() {
+        for mode in [TlsProxyMode::HttpsForward, TlsProxyMode::HttpsConnect] {
+            let (address, peer) = spawn_tls_proxy_with_wrong_proxy_name(mode, MODEL_BYTES.to_vec());
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("model.onnx");
+            let error =
+                download_with_test_ca(mode, address, "model-host.invalid", &destination, true)
+                    .expect_err(
+                        "a trusted issuer must not bypass HTTPS proxy hostname verification",
+                    );
+            let observed = peer.join().unwrap();
+            assert!(observed.tls_rejected);
+            assert!(observed.connect_headers.is_none());
+            assert!(observed.request_headers.is_none());
+            assert!(observed.request_body.is_empty());
+            let rendered = format!("{error:?} {error}");
+            assert!(rendered.contains("tls-handshake-failure"), "{rendered}");
+            for secret in [
+                PROXY_USERNAME,
+                PROXY_PASSWORD,
+                PROXY_BASIC_AUTH,
+                "origin-query-canary",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            assert!(!destination.exists());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn verified_tls_tunnel_does_not_bypass_model_integrity_checks() {
+        let mut corrupted = MODEL_BYTES.to_vec();
+        corrupted[0] ^= 1;
+        let (address, peer) = spawn_tls_proxy(TlsProxyMode::HttpsConnect, corrupted);
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("model.onnx");
+        let result = download_with_test_ca(
+            TlsProxyMode::HttpsConnect,
+            address,
+            "model-host.invalid",
+            &destination,
+            true,
+        );
+        let observed = peer.join().unwrap();
+        assert!(!observed.tls_rejected);
+        assert!(observed.connect_headers.is_some());
+        assert!(observed.request_headers.is_some());
+        assert!(matches!(result, Err(SearchError::HashMismatch { .. })));
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 }

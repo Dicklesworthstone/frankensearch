@@ -321,6 +321,266 @@ fn cidr_matches(host: IpAddr, entry: &str) -> bool {
     }
 }
 
+/// Real loopback TLS peers shared by downloader and API transport tests.
+/// The only additional trust is supplied explicitly by each test's client factory.
+#[cfg(test)]
+pub(crate) mod tls_test_support {
+    use std::net::SocketAddr;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use asupersync::net::TcpListener;
+    use asupersync::test_utils::{assert_completes_within, run_test_with_cx};
+    use asupersync::tls::{Certificate, CertificateChain, PrivateKey, TlsAcceptor};
+
+    // Public, test-only P-256 credentials. The CA and leaf private scalars are
+    // deliberately 1, 2 and 3; these keys provide no production identity.
+    // Certificates are valid from 2020-01-01 through 2100-01-01. Production
+    // clients never trust this CA, and all hostname verification stays enabled.
+    const ROOT_CERT_PEM: &[u8] = br"-----BEGIN CERTIFICATE-----
+MIIBlTCCATygAwIBAgIBATAKBggqhkjOPQQDAjAwMS4wLAYDVQQDDCVGcmFua2Vu
+U2VhcmNoIHByb3h5IHRyYW5zcG9ydCB0ZXN0IENBMCAXDTIwMDEwMTAwMDAwMFoY
+DzIxMDAwMTAxMDAwMDAwWjAwMS4wLAYDVQQDDCVGcmFua2VuU2VhcmNoIHByb3h5
+IHRyYW5zcG9ydCB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEaxfR
+8uEsQkf4vOblY6RA8ncDfYEt6zOg9KE5RdiYwpZP40Li/hp/m47n60p8D54WK84z
+V2sxXs7LtkBoN79R9aNFMEMwEgYDVR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8E
+BAMCAQYwHQYDVR0OBBYEFLRno5mete+mcd4AMvCKnJ5e/aDhMAoGCCqGSM49BAMC
+A0cAMEQCIGau1HkvSta9cbFtXRsy3K4rk09GvkHkJrQBQF2/hVLXAiA3e4+cvA5M
+oZxRF5tNskbv8e410l/n5u6dA9CLKPjP6Q==
+-----END CERTIFICATE-----";
+    const PROXY_CERT_PEM: &[u8] = br"-----BEGIN CERTIFICATE-----
+MIIBuzCCAWGgAwIBAgIBAjAKBggqhkjOPQQDAjAwMS4wLAYDVQQDDCVGcmFua2Vu
+U2VhcmNoIHByb3h5IHRyYW5zcG9ydCB0ZXN0IENBMCAXDTIwMDEwMTAwMDAwMFoY
+DzIxMDAwMTAxMDAwMDAwWjAoMSYwJAYDVQQDDB1GcmFua2VuU2VhcmNoIFBST1hZ
+IHRlc3QgbGVhZjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABHzyexiNA09+ilI4
+AwS1GsPAiWnid/IbNaYLSPxHZpl4B3dVENuO0EApPZrGn3Qw27p9reY86YIpngS3
+nSJ4c9GjcjBwMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQM
+MAoGCCsGAQUFBwMBMBoGA1UdEQQTMBGHBH8AAAGCCWxvY2FsaG9zdDAfBgNVHSME
+GDAWgBS0Z6OZnrXvpnHeADLwipyeXv2g4TAKBggqhkjOPQQDAgNIADBFAiEA3J8b
+G7SqoF0x8X2vz+xhzkFHEsr5i6W0gdvwth0FQMcCIFx4Bg8trHng1lQCij50KOln
+C2RU6SIVa/IU2H1FrhLM
+-----END CERTIFICATE-----";
+    const PROXY_KEY_PEM: &[u8] = br"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAKhRANCAAR88nsYjQNPfopSOAMEtRrDwIlp4nfy
+GzWmC0j8R2aZeAd3VRDbjtBAKT2axp90MNu6fa3mPOmCKZ4Et50ieHPR
+-----END PRIVATE KEY-----";
+    const ORIGIN_CERT_PEM: &[u8] = br"-----BEGIN CERTIFICATE-----
+MIIB3DCCAYOgAwIBAgIBAzAKBggqhkjOPQQDAjAwMS4wLAYDVQQDDCVGcmFua2Vu
+U2VhcmNoIHByb3h5IHRyYW5zcG9ydCB0ZXN0IENBMCAXDTIwMDEwMTAwMDAwMFoY
+DzIxMDAwMTAxMDAwMDAwWjApMScwJQYDVQQDDB5GcmFua2VuU2VhcmNoIE9SSUdJ
+TiB0ZXN0IGxlYWYwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAARey+TRpjMKRMj3
+75UdS/Fl5sa3Ie+tqYX7QWYbxuf9bIc0ZAxJmP9+N0sGzhpkouzYKrA2OE+4PZp5
+sSeifVAyo4GSMIGPMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1Ud
+JQQMMAoGCCsGAQUFBwMBMDkGA1UdEQQyMDCCEm1vZGVsLWhvc3QuaW52YWxpZIIa
+ZW1iZWRkaW5nLXByb3ZpZGVyLmludmFsaWQwHwYDVR0jBBgwFoAUtGejmZ6176Zx
+3gAy8Iqcnl79oOEwCgYIKoZIzj0EAwIDRwAwRAIgVoY8PaFb2SMYCFEbr+3tLzdu
+mSIaEmlvUQqi75kmxVkCIHdOwAioXzuMoGv2VmlqtZ24XWe23Ku2JjljTGoyXgN7
+-----END CERTIFICATE-----";
+    const ORIGIN_KEY_PEM: &[u8] = br"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgAAAAAAAAAAAAAAAA
+AAAAAAAAAAAAAAAAAAAAAAAAAAOhRANCAARey+TRpjMKRMj375UdS/Fl5sa3Ie+t
+qYX7QWYbxuf9bIc0ZAxJmP9+N0sGzhpkouzYKrA2OE+4PZp5sSeifVAy
+-----END PRIVATE KEY-----";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TlsProxyMode {
+        HttpConnect,
+        HttpsForward,
+        HttpsConnect,
+    }
+
+    #[derive(Debug, Default)]
+    pub struct TlsProxyObservation {
+        pub connect_headers: Option<String>,
+        // Origin headers after CONNECT, or proxy-facing absolute-form headers
+        // for HttpsForward. Proxy-Authorization is expected only in the latter.
+        pub request_headers: Option<String>,
+        pub request_body: Vec<u8>,
+        pub tls_rejected: bool,
+    }
+
+    pub fn root_certificate() -> Certificate {
+        Certificate::from_pem(ROOT_CERT_PEM).unwrap().remove(0)
+    }
+
+    fn acceptor(proxy: bool) -> TlsAcceptor {
+        let (certificate, key) = if proxy {
+            (PROXY_CERT_PEM, PROXY_KEY_PEM)
+        } else {
+            (ORIGIN_CERT_PEM, ORIGIN_KEY_PEM)
+        };
+        TlsAcceptor::builder(
+            CertificateChain::from_pem(certificate).unwrap(),
+            PrivateKey::from_pem(key).unwrap(),
+        )
+        .alpn_protocols(vec![b"http/1.1".to_vec()])
+        .handshake_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap()
+    }
+
+    async fn read_headers<IO: AsyncRead + Unpin + Send>(stream: &mut IO) -> String {
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            headers.push(byte[0]);
+            assert!(headers.len() <= 16 * 1024, "TLS peer header limit");
+        }
+        String::from_utf8(headers).unwrap()
+    }
+
+    async fn serve_response<IO: AsyncRead + AsyncWrite + Unpin + Send>(
+        mut stream: IO,
+        response_body: &[u8],
+        redirect: Option<&str>,
+        observation: &mut TlsProxyObservation,
+    ) {
+        let headers = read_headers(&mut stream).await;
+        let length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        assert!(length <= 1024 * 1024, "TLS peer request body limit");
+        let mut body = vec![0_u8; length];
+        stream.read_exact(&mut body).await.unwrap();
+        observation.request_headers = Some(headers);
+        observation.request_body = body;
+        let response_head = redirect.map_or_else(
+            || {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                )
+            },
+            |location| {
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len()
+                )
+            },
+        );
+        stream.write_all(response_head.as_bytes()).await.unwrap();
+        stream.write_all(response_body).await.unwrap();
+        stream.flush().await.unwrap();
+        // The complete declared response is flushed before closing; the client
+        // may already have consumed it and closed its own side.
+        let _ = stream.shutdown().await;
+    }
+
+    async fn serve_connect<IO: AsyncRead + AsyncWrite + Unpin + Send>(
+        mut stream: IO,
+        response_body: &[u8],
+        redirect: Option<&str>,
+        observation: &mut TlsProxyObservation,
+    ) {
+        let headers = read_headers(&mut stream).await;
+        assert!(headers.starts_with("CONNECT "), "{headers}");
+        observation.connect_headers = Some(headers);
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+        match acceptor(false).accept(stream).await {
+            Ok(origin_tls) => {
+                serve_response(origin_tls, response_body, redirect, observation).await;
+            }
+            Err(_) => observation.tls_rejected = true,
+        }
+    }
+
+    pub fn spawn_tls_proxy(
+        mode: TlsProxyMode,
+        response_body: Vec<u8>,
+    ) -> (SocketAddr, JoinHandle<TlsProxyObservation>) {
+        spawn_tls_proxy_with_options(mode, response_body, None, false)
+    }
+
+    pub fn spawn_redirecting_tls_proxy(
+        mode: TlsProxyMode,
+        location: String,
+    ) -> (SocketAddr, JoinHandle<TlsProxyObservation>) {
+        spawn_tls_proxy_with_options(mode, Vec::new(), Some(location), false)
+    }
+
+    pub fn spawn_tls_proxy_with_wrong_proxy_name(
+        mode: TlsProxyMode,
+        response_body: Vec<u8>,
+    ) -> (SocketAddr, JoinHandle<TlsProxyObservation>) {
+        assert_ne!(mode, TlsProxyMode::HttpConnect);
+        // The origin leaf has the same trusted issuer but no localhost/IP SAN.
+        // Serving it on the outer proxy tests hostname verification separately
+        // from the existing untrusted-root failures, without using external DNS.
+        spawn_tls_proxy_with_options(mode, response_body, None, true)
+    }
+
+    fn spawn_tls_proxy_with_options(
+        mode: TlsProxyMode,
+        response_body: Vec<u8>,
+        redirect: Option<String>,
+        wrong_proxy_name: bool,
+    ) -> (SocketAddr, JoinHandle<TlsProxyObservation>) {
+        let (address_sender, address_receiver) = std::sync::mpsc::channel();
+        let peer = thread::spawn(move || {
+            let mut observation = TlsProxyObservation::default();
+            run_test_with_cx(|_cx| async {
+                assert_completes_within(Duration::from_secs(10), "TLS proxy peer", || {
+                    Box::pin(async {
+                        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        address_sender.send(listener.local_addr().unwrap()).unwrap();
+                        let (stream, _) = listener.accept().await.unwrap();
+                        if mode == TlsProxyMode::HttpConnect {
+                            serve_connect(
+                                stream,
+                                &response_body,
+                                redirect.as_deref(),
+                                &mut observation,
+                            )
+                            .await;
+                        } else {
+                            match acceptor(!wrong_proxy_name).accept(stream).await {
+                                Ok(proxy_tls) => {
+                                    if mode == TlsProxyMode::HttpsConnect {
+                                        serve_connect(
+                                            proxy_tls,
+                                            &response_body,
+                                            redirect.as_deref(),
+                                            &mut observation,
+                                        )
+                                        .await;
+                                    } else {
+                                        serve_response(
+                                            proxy_tls,
+                                            &response_body,
+                                            redirect.as_deref(),
+                                            &mut observation,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                Err(_) => observation.tls_rejected = true,
+                            }
+                        }
+                    })
+                })
+                .await;
+            });
+            observation
+        });
+        let address = address_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        (address, peer)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

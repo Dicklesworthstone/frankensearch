@@ -1,5 +1,25 @@
 # Changelog
 
+### Unreleased — Qualify outbound proxy policy (#70, #71; 2026-11-03)
+
+- Model downloads and hosted embedding API requests share the proxy resolver
+  based on [tkfor21's reference contribution](https://github.com/Dicklesworthstone/frankensearch/pull/71).
+  Environment-based selection is the default. HTTP, HTTPS and SOCKS5 proxies
+  are supported; both SOCKS5 URL spellings resolve destination names at the proxy.
+- Lowercase variables take precedence, uppercase `HTTP_PROXY` is ignored,
+  and `NO_PROXY` supports host/domain, port and literal-IP CIDR bypasses.
+  Library callers can explicitly disable proxies or pin a proxy URL. See
+  [Network proxies](README.md#network-proxies) for examples and exact rules.
+- Downloads reevaluate routing at redirects and reject HTTPS downgrades;
+  hosted API redirects stay on the same origin. Proxy authentication and
+  transport failures remain credential-safe. Network waits, body inactivity,
+  caller deadlines and cancellation retain their bounded failure paths.
+- Selected proxy environment values that are not valid Unicode fail closed
+  without retry backoff instead of being treated as unset. An invalid required
+  proxy must not fall through to a lower-priority proxy or a direct connection.
+- These are source changes under qualification. The published `v1.12.3`
+  binaries predate them; this entry does not announce a binary or crate release.
+
 ### Unreleased — Preserve deferred quality inputs through updates (2026-11-03)
 
 - `append-batch` and retained mixed batches preserve the latest exact embedding
