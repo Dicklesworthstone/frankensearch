@@ -11,6 +11,7 @@ use std::fmt;
 use std::net::{IpAddr, Ipv6Addr};
 
 use asupersync::http::h1::{ParsedUrl, Scheme};
+use frankensearch_core::error::{SearchError, SearchResult};
 
 /// How outbound HTTP requests reach the network.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -21,6 +22,8 @@ pub enum ProxySetting {
     /// `http_proxy`, which is lower case only (upper-case `HTTP_PROXY` can be set from a
     /// request header under CGI, the "httpoxy" issue). Hosts matched by `no_proxy`
     /// connect directly. Unset or empty variables mean a direct connection.
+    /// A selected non-Unicode value is an invalid configuration; it never
+    /// authorizes a direct connection or a lower-priority proxy fallback.
     ///
     /// Bypass entries are comma-separated DNS names, IP addresses, IP networks in
     /// CIDR notation, or `*` for every host. DNS matching includes subdomains at
@@ -57,7 +60,10 @@ impl fmt::Debug for ProxySetting {
 
 /// Resolve one request against the process environment with the same httpoxy
 /// protection on every platform, including Windows' case-insensitive lookup.
-pub(crate) fn proxy_from_environment(setting: &ProxySetting, url: &str) -> Option<String> {
+pub(crate) fn proxy_from_environment(
+    setting: &ProxySetting,
+    url: &str,
+) -> SearchResult<Option<String>> {
     proxy_for_url(setting, url, |name| {
         #[cfg(windows)]
         if name == "http_proxy" {
@@ -66,22 +72,36 @@ pub(crate) fn proxy_from_environment(setting: &ProxySetting, url: &str) -> Optio
             // proxy merely because the OS ignores environment-variable case.
             return exact_environment_value(name, std::env::vars_os());
         }
-        std::env::var(name).ok()
+        environment_value(name, std::env::var_os(name))
     })
+}
+
+/// Preserve the distinction between an absent setting and one that cannot be
+/// decoded. Never retain the rejected value in an error: it may contain proxy
+/// credentials. The caller's lazy lookup order decides whether it is relevant.
+fn environment_value(
+    name: &str,
+    value: Option<std::ffi::OsString>,
+) -> SearchResult<Option<String>> {
+    value
+        .map(std::ffi::OsString::into_string)
+        .transpose()
+        .map_err(|_| SearchError::InvalidConfig {
+            field: format!("proxy.{name}"),
+            value: "<non-Unicode>".to_owned(),
+            reason: "proxy environment variables must contain valid Unicode".to_owned(),
+        })
 }
 
 #[cfg(any(windows, test))]
 fn exact_environment_value(
     name: &str,
     variables: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
-) -> Option<String> {
-    variables.into_iter().find_map(|(key, value)| {
-        if key == std::ffi::OsStr::new(name) {
-            value.into_string().ok()
-        } else {
-            None
-        }
-    })
+) -> SearchResult<Option<String>> {
+    let value = variables
+        .into_iter()
+        .find_map(|(key, value)| (key == std::ffi::OsStr::new(name)).then_some(value));
+    environment_value(name, value)
 }
 
 /// The proxy URL to use for a request to `url`, or `None` to connect directly.
@@ -91,48 +111,64 @@ fn exact_environment_value(
 /// redirect destination, because the transport fixes its proxy at construction.
 /// A selected but malformed proxy remains `Some` so the transport rejects it;
 /// configuration errors must never silently select a direct connection.
+/// Errors reading a selected environment value propagate before any transport
+/// is constructed; unselected fallback variables are not read.
 pub(crate) fn proxy_for_url(
     setting: &ProxySetting,
     url: &str,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Option<String> {
+    lookup: impl Fn(&str) -> SearchResult<Option<String>>,
+) -> SearchResult<Option<String>> {
     let proxy = match setting {
-        ProxySetting::Disabled => return None,
+        ProxySetting::Disabled => return Ok(None),
         ProxySetting::Url(proxy) => proxy.clone(),
         ProxySetting::FromEnvironment => {
-            let target = parse_target(url)?;
-            if let Some(no_proxy) = env_value(&lookup, "no_proxy", true) {
+            let Some(target) = parse_target(url) else {
+                return Ok(None);
+            };
+            if let Some(no_proxy) = env_value(&lookup, "no_proxy", true)? {
                 if no_proxy_matches(&target, &no_proxy) {
-                    return None;
+                    return Ok(None);
                 }
             }
             let by_scheme = match target.scheme {
                 Scheme::Https => env_value(&lookup, "https_proxy", true),
                 Scheme::Http => env_value(&lookup, "http_proxy", false),
+            }?;
+            let selected = if by_scheme.is_some() {
+                by_scheme
+            } else {
+                env_value(&lookup, "all_proxy", true)?
             };
-            by_scheme.or_else(|| env_value(&lookup, "all_proxy", true))?
+            let Some(proxy) = selected else {
+                return Ok(None);
+            };
+            proxy
         }
     };
-    Some(normalize_proxy_url(&proxy))
+    Ok(Some(normalize_proxy_url(&proxy)))
 }
 
 /// The trimmed, non-empty value of `name` (lower case), then of its upper-case form.
 fn env_value(
-    lookup: &impl Fn(&str) -> Option<String>,
+    lookup: &impl Fn(&str) -> SearchResult<Option<String>>,
     name: &str,
     allow_upper: bool,
-) -> Option<String> {
+) -> SearchResult<Option<String>> {
     let upper = name.to_ascii_uppercase();
     let names: &[&str] = if allow_upper {
         &[name, &upper]
     } else {
         &[name]
     };
-    names
-        .iter()
-        .filter_map(|candidate| lookup(candidate))
-        .map(|value| value.trim().to_owned())
-        .find(|value| !value.is_empty())
+    for candidate in names {
+        if let Some(value) = lookup(candidate)? {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Ok(Some(value.to_owned()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// curl's `socks5h://` (resolve names at the proxy) is what asupersync's `socks5://`
@@ -288,6 +324,17 @@ fn cidr_matches(host: IpAddr, entry: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Keep the infallible string fixtures concise while exercising the same
+    // fallible resolver used by real environment lookups.
+    fn proxy_for_url(
+        setting: &ProxySetting,
+        url: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Option<String> {
+        super::proxy_for_url(setting, url, |name| Ok(lookup(name)))
+            .expect("infallible environment lookup")
+    }
 
     fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |name| {
@@ -453,18 +500,20 @@ mod tests {
             OsString::from("HTTP_PROXY"),
             OsString::from("http://attacker:8080"),
         )];
-        assert_eq!(exact_environment_value("http_proxy", upper), None);
+        assert_eq!(exact_environment_value("http_proxy", upper).unwrap(), None);
         let mixed = [(
             OsString::from("Http_Proxy"),
             OsString::from("http://attacker:8080"),
         )];
-        assert_eq!(exact_environment_value("http_proxy", mixed), None);
+        assert_eq!(exact_environment_value("http_proxy", mixed).unwrap(), None);
         let lower = [(
             OsString::from("http_proxy"),
             OsString::from("http://configured:3128"),
         )];
         assert_eq!(
-            exact_environment_value("http_proxy", lower).as_deref(),
+            exact_environment_value("http_proxy", lower)
+                .unwrap()
+                .as_deref(),
             Some("http://configured:3128")
         );
     }
@@ -779,6 +828,156 @@ mod tests {
             .as_deref(),
             Some("http://chosen:3128")
         );
+    }
+
+    #[cfg(any(unix, windows))]
+    fn non_unicode_environment_value() -> std::ffi::OsString {
+        const SECRET: &str = "proxy-credential-canary";
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let mut bytes = SECRET.as_bytes().to_vec();
+            bytes.push(0xff);
+            std::ffi::OsString::from_vec(bytes)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+
+            let mut units: Vec<_> = SECRET.encode_utf16().collect();
+            units.push(0xd800);
+            std::ffi::OsString::from_wide(&units)
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_unicode_environment_errors_never_retain_credentials() {
+        for name in ["http_proxy", "HTTPS_PROXY", "ALL_PROXY", "no_proxy"] {
+            let error = environment_value(name, Some(non_unicode_environment_value()))
+                .expect_err("a present non-Unicode value is not an absent setting");
+            match &error {
+                SearchError::InvalidConfig { field, value, .. } => {
+                    assert_eq!(field, &format!("proxy.{name}"));
+                    assert_eq!(value, "<non-Unicode>");
+                }
+                other => panic!("unexpected error: {other:?}"),
+            }
+            let rendered = format!("{error:?} {error}");
+            assert!(!rendered.contains("proxy-credential-canary"));
+        }
+        assert!(environment_value("http_proxy", None).unwrap().is_none());
+        assert_eq!(
+            environment_value("http_proxy", Some(std::ffi::OsString::new()))
+                .unwrap()
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn non_unicode_selected_variables_stop_before_lower_priority_lookups() {
+        for (url, selected) in [
+            ("http://remote.invalid/model", "http_proxy"),
+            ("https://remote.invalid/model", "https_proxy"),
+            ("https://remote.invalid/model", "HTTPS_PROXY"),
+            ("http://remote.invalid/model", "all_proxy"),
+            ("https://remote.invalid/model", "ALL_PROXY"),
+            ("http://remote.invalid/model", "no_proxy"),
+            ("https://remote.invalid/model", "NO_PROXY"),
+        ] {
+            let read = std::cell::RefCell::new(Vec::new());
+            let error = super::proxy_for_url(&ProxySetting::FromEnvironment, url, |name| {
+                read.borrow_mut().push(name.to_owned());
+                if name == selected {
+                    environment_value(name, Some(non_unicode_environment_value()))
+                } else {
+                    Ok(None)
+                }
+            })
+            .expect_err("the selected malformed setting must terminate resolution");
+            assert!(matches!(error, SearchError::InvalidConfig { .. }));
+            assert_eq!(read.borrow().last().map(String::as_str), Some(selected));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn unused_malformed_environment_values_do_not_change_selected_policy() {
+        let url = "https://remote.invalid/model";
+        let bypass = super::proxy_for_url(&ProxySetting::FromEnvironment, url, |name| {
+            if name == "no_proxy" {
+                Ok(Some("remote.invalid".to_owned()))
+            } else {
+                environment_value(name, Some(non_unicode_environment_value()))
+            }
+        })
+        .unwrap();
+        assert!(
+            bypass.is_none(),
+            "an intentional bypass never reads a proxy"
+        );
+
+        let selected =
+            super::proxy_for_url(&ProxySetting::FromEnvironment, url, |name| match name {
+                "no_proxy" | "NO_PROXY" => Ok(None),
+                "https_proxy" => Ok(Some("http://chosen:3128".to_owned())),
+                _ => environment_value(name, Some(non_unicode_environment_value())),
+            })
+            .unwrap();
+        assert_eq!(selected.as_deref(), Some("http://chosen:3128"));
+
+        for setting in [
+            ProxySetting::Disabled,
+            ProxySetting::Url("http://chosen:3128".to_owned()),
+        ] {
+            let route = super::proxy_for_url(&setting, url, |name| {
+                environment_value(name, Some(non_unicode_environment_value()))
+            })
+            .unwrap();
+            match setting {
+                ProxySetting::Disabled => assert!(route.is_none()),
+                ProxySetting::Url(_) => assert_eq!(route.as_deref(), Some("http://chosen:3128")),
+                ProxySetting::FromEnvironment => unreachable!(),
+            }
+        }
+        let ignored_upper_http = super::proxy_for_url(
+            &ProxySetting::FromEnvironment,
+            "http://remote.invalid/model",
+            |name| {
+                if name == "HTTP_PROXY" {
+                    environment_value(name, Some(non_unicode_environment_value()))
+                } else {
+                    Ok(None)
+                }
+            },
+        )
+        .unwrap();
+        assert!(ignored_upper_http.is_none());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn exact_http_proxy_lookup_preserves_invalid_selected_values() {
+        let upper = [(
+            std::ffi::OsString::from("HTTP_PROXY"),
+            non_unicode_environment_value(),
+        )];
+        assert!(
+            exact_environment_value("http_proxy", upper)
+                .unwrap()
+                .is_none()
+        );
+        let lower = [(
+            std::ffi::OsString::from("http_proxy"),
+            non_unicode_environment_value(),
+        )];
+        assert!(matches!(
+            exact_environment_value("http_proxy", lower),
+            Err(SearchError::InvalidConfig { .. })
+        ));
     }
 
     #[test]
