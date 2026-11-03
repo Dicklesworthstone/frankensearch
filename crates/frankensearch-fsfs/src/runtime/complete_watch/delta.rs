@@ -377,10 +377,19 @@ pub(super) async fn prepare(
     hint: Option<&DirtyWindow>,
 ) -> SearchResult<Option<SourceBatch>> {
     retained_search_checkpoint(cx)?;
-    // Forced indexing, explicit degradation and link aliases retain the normal
-    // indexer's admission/policy path. A delta must not bypass those controls.
+    // The retained writer captures exact deferred inputs and refuses a base
+    // that still has a quality tier. Other forced modes, full indexing and
+    // link aliases retain the normal indexer's admission/policy path.
+    let deferred_quality = runtime.config.pressure.degradation_override
+        == DegradationOverrideMode::ForceEmbedDeferred
+        && !runtime.lexical_only_indexing
+        && frankensearch_embed::RegisteredQualityModel::from_name(
+            &runtime.config.indexing.quality_model,
+        )
+        .is_some();
     if runtime.cli_input.full_reindex
-        || runtime.config.pressure.degradation_override != DegradationOverrideMode::Auto
+        || (runtime.config.pressure.degradation_override != DegradationOverrideMode::Auto
+            && !deferred_quality)
         || runtime.config.discovery.follow_symlinks
     {
         return Ok(None);
@@ -581,6 +590,73 @@ mod metadata_tests {
             .unwrap()
             .set_len(MAX_SOURCE_BYTES + 1)
             .unwrap();
+    }
+
+    #[test]
+    fn deferred_quality_prepares_bounded_deltas_without_admitting_other_forced_modes() {
+        run_test_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let (mut runtime, path, _) = fixture(directory.path());
+            runtime.lexical_only_indexing = false;
+            "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
+            let source = SourceRoot::open(path.clone()).unwrap();
+            let before = source.observe(&cx, &runtime.config.discovery).unwrap();
+            fs::write(path.join("alpha.md"), "latest deferred source body").unwrap();
+            let after = source.observe(&cx, &runtime.config.discovery).unwrap();
+            for (mode, supported) in [
+                (DegradationOverrideMode::Auto, true),
+                (DegradationOverrideMode::ForceEmbedDeferred, true),
+                (DegradationOverrideMode::ForceFull, false),
+                (DegradationOverrideMode::ForceLexicalOnly, false),
+                (DegradationOverrideMode::ForceMetadataOnly, false),
+                (DegradationOverrideMode::ForcePaused, false),
+            ] {
+                runtime.config.pressure.degradation_override = mode;
+                assert_eq!(
+                    prepare(&cx, &runtime, &source, &before, &after, None)
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    supported,
+                    "{mode:?}"
+                );
+            }
+            runtime.config.pressure.degradation_override =
+                DegradationOverrideMode::ForceEmbedDeferred;
+            runtime.lexical_only_indexing = true;
+            assert!(
+                prepare(&cx, &runtime, &source, &before, &after, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            runtime.lexical_only_indexing = false;
+            for selection in ["", "unregistered-quality-selection"] {
+                selection.clone_into(&mut runtime.config.indexing.quality_model);
+                assert!(
+                    prepare(&cx, &runtime, &source, &before, &after, None)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
+            runtime.cli_input.full_reindex = true;
+            assert!(
+                prepare(&cx, &runtime, &source, &before, &after, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            runtime.cli_input.full_reindex = false;
+            runtime.config.discovery.follow_symlinks = true;
+            assert!(
+                prepare(&cx, &runtime, &source, &before, &after, None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
     }
 
     #[test]

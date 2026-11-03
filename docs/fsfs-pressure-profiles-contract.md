@@ -162,10 +162,21 @@ jobs into the new generation without source-body reads or inference. Deleting
 the last semantic member clears the remaining debt. Delete-only retained watch
 batches also carry their already-admitted checkpoint and invalidate touched
 skipped-source witnesses. Missing or inconsistent pending work refuses publication
-and preserves the incumbent. Content upserts and appends retain their existing
-admission and refusal rules; when permitted, those successors and other retained
-watch deltas still invalidate the inherited backlog's generation scope. An
-ordinary source reindex establishes fresh work for those paths.
+and preserves the incumbent. Permitted content upserts, `append-batch` and bounded
+retained watch deltas retain their exact canonical embedding inputs and rebind
+the quality queue to the successor's generation and membership. Repeated source
+or document revisions replace the owed input with the latest admitted body;
+deleted documents leave the queue. Completion still requires the original
+quality producer, and does not infer missing input from lexical text or a mutable
+source path. These inputs survive watcher stop/restart and source-tree removal.
+With a registered quality selection, semantic watching under forced deferral
+uses the existing retained mixed-batch writer for supported bounded edits.
+Lexical-only indexes, other forced modes, explicit full reindexing, link
+traversal and unsupported source changes retain the normal builder route.
+Deleting every pending document clears current debt while preserving its producer
+choice for later appends, including stores first indexed empty under deferral.
+Completed-quality and intentionally fast-only generations keep their existing
+topology. The ordinary admission and refusal rules still apply.
 This provides durable explicit completion, without automatic background execution
 or a claim that a partially built quality tier is complete.
 
