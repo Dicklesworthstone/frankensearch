@@ -421,6 +421,7 @@ async fn request_api_response(
         // connections instead of returning them to the pool, so constructing
         // one per attempt does not discard a reusable connection.
         let response = build_http_client(config, url)
+            .map_err(ApiAttemptError::Terminal)?
             .request_streaming(cx, Method::Post, url, headers.to_vec(), body)
             .await
             .map_err(|client_error| {
@@ -1361,7 +1362,7 @@ fn verify_response_vectors(
     Ok(())
 }
 
-fn build_http_client(config: &ApiEmbedderConfig, url: &str) -> HttpClient {
+fn build_http_client(config: &ApiEmbedderConfig, url: &str) -> SearchResult<HttpClient> {
     let mut client_config = HttpClientConfig::default();
     // Embedding POST bodies contain private input text. Stripping credentials
     // alone cannot make a cross-origin 307/308 safe: it would still replay the
@@ -1374,8 +1375,8 @@ fn build_http_client(config: &ApiEmbedderConfig, url: &str) -> HttpClient {
     ));
     client_config.max_body_size = Some(config.max_response_bytes);
     client_config.request_timeout = Some(config.request_timeout);
-    client_config.proxy_url = proxy_from_environment(&config.proxy, url);
-    HttpClient::with_config(client_config)
+    client_config.proxy_url = proxy_from_environment(&config.proxy, url)?;
+    Ok(HttpClient::with_config(client_config))
 }
 
 fn bounded_embedding_failure(provider: &dyn ApiProvider, reason: &str) -> SearchError {
@@ -3559,6 +3560,33 @@ mod tests {
         );
     }
 
+    fn run_api_proxy_test_child(command: &mut std::process::Command) -> std::process::Output {
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let timed_out = loop {
+            if child.try_wait().unwrap().is_some() {
+                break false;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                break true;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            !timed_out,
+            "API proxy child exceeded 10 seconds: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
+
     #[test]
     fn api_proxy_environment_routes_and_explicit_disable_overrides() {
         for verified in [false, true] {
@@ -3603,12 +3631,11 @@ mod tests {
                 if !cfg!(windows) {
                     child.env("HTTP_PROXY", "invalid://must-not-be-used");
                 }
-                let output = child
+                child
                     .env("FRANKENSEARCH_TEST_API_PROXY_CASE", case)
                     .env("FRANKENSEARCH_TEST_API_ENDPOINT", endpoint)
-                    .env("http_proxy", proxy)
-                    .output()
-                    .unwrap();
+                    .env("http_proxy", proxy);
+                let output = run_api_proxy_test_child(&mut child);
                 assert!(
                     output.status.success(),
                     "child failed: {}\n{}",
@@ -3623,6 +3650,129 @@ mod tests {
                 };
                 assert!(headers.starts_with(expected), "{headers}");
                 assert!(!headers.to_ascii_lowercase().contains("proxy-authorization"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_proxy_non_unicode_environment_child() {
+        let Ok(variable) = std::env::var("FRANKENSEARCH_TEST_INVALID_PROXY_VARIABLE") else {
+            return;
+        };
+        let endpoint = std::env::var("FRANKENSEARCH_TEST_API_ENDPOINT").unwrap();
+        let verified = std::env::var("FRANKENSEARCH_TEST_API_TRUST").unwrap() == "verified";
+        run_test_with_cx(|cx| async move {
+            let provider = Box::new(TestGatewayProvider {
+                endpoint,
+                dimension: 4,
+            });
+            let config = ApiEmbedderConfig {
+                max_retries: 1,
+                retry_base_delay: Duration::from_millis(1),
+                request_timeout: Duration::from_millis(200),
+                ..test_http_config(ProxySetting::FromEnvironment)
+            };
+            let error = if verified {
+                ApiEmbedder::new_verified(
+                    provider,
+                    config,
+                    Some(remote_test_identity(4)),
+                    test_attester(),
+                )
+                .unwrap()
+                .embed_batch(&cx, &["private-input-canary"])
+                .await
+                .expect_err("non-Unicode policy must refuse before transport")
+            } else {
+                AssumedRemoteApi::new(provider, config, Some(remote_test_identity(4)))
+                    .unwrap()
+                    .embed_transient(&cx, "private-input-canary")
+                    .await
+                    .expect_err("non-Unicode policy must refuse before transport")
+            };
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::InvalidConfig { field, value, .. }
+                        if field == &format!("proxy.{variable}") && value == "<non-Unicode>"
+                ),
+                "{error:?}"
+            );
+            let rendered = format!("{error}\n{error:?}");
+            for secret in ["proxy-user", "proxy-password", "private-input-canary"] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_proxy_non_unicode_policy_never_connects_directly_or_to_a_fallback() {
+        use std::os::unix::ffi::OsStringExt;
+
+        for variable in ["http_proxy", "all_proxy", "no_proxy"] {
+            for trust in ["verified", "assumed"] {
+                for fallback_enabled in [false, true] {
+                    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
+                    origin.set_nonblocking(true).unwrap();
+                    fallback.set_nonblocking(true).unwrap();
+                    let endpoint = format!("http://{}/embeddings", origin.local_addr().unwrap());
+                    let fallback_url = format!("http://{}", fallback.local_addr().unwrap());
+                    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                    child.args([
+                        "--exact",
+                        "api_embedder::tests::api_proxy_non_unicode_environment_child",
+                        "--nocapture",
+                    ]);
+                    for name in [
+                        "http_proxy",
+                        "HTTP_PROXY",
+                        "https_proxy",
+                        "HTTPS_PROXY",
+                        "all_proxy",
+                        "ALL_PROXY",
+                        "no_proxy",
+                        "NO_PROXY",
+                    ] {
+                        child.env_remove(name);
+                    }
+                    // A reachable lower-priority route must never receive private
+                    // input when the selected setting cannot be decoded.
+                    if fallback_enabled {
+                        child.env("ALL_PROXY", &fallback_url);
+                        if variable == "no_proxy" {
+                            child.env("http_proxy", &fallback_url);
+                        }
+                    }
+                    if variable == "no_proxy" {
+                        child.env("NO_PROXY", "*");
+                    }
+                    let invalid = std::ffi::OsString::from_vec(
+                        b"http://proxy-user:proxy-password@\xff".to_vec(),
+                    );
+                    child
+                        .env("FRANKENSEARCH_TEST_INVALID_PROXY_VARIABLE", variable)
+                        .env("FRANKENSEARCH_TEST_API_ENDPOINT", endpoint)
+                        .env("FRANKENSEARCH_TEST_API_TRUST", trust)
+                        .env(variable, invalid);
+                    let output = run_api_proxy_test_child(&mut child);
+                    for (route, listener) in [("origin", &origin), ("fallback", &fallback)] {
+                        assert!(
+                            matches!(listener.accept(),
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                            ),
+                            "{variable}/{trust}/{fallback_enabled} opened the unauthorized {route}"
+                        );
+                    }
+                    assert!(
+                        output.status.success(),
+                        "{variable}/{trust}/{fallback_enabled}: {}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
             }
         }
     }

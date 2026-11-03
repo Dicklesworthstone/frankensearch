@@ -472,7 +472,7 @@ impl ModelDownloader {
     /// selects the environment variable and `no_proxy` matches its host), and the client
     /// fixes its proxy at construction. Building one is cheap: TLS and connections are
     /// set up per request, and each artifact is one large streamed request.
-    fn http_client_for(&self, url: &str) -> HttpClient {
+    fn http_client_for(&self, url: &str) -> SearchResult<HttpClient> {
         let mut client_config = HttpClientConfig::default();
         // Follow redirects here rather than inside a fixed-route client: a CDN
         // or mirror can have a different scheme or `no_proxy` policy.
@@ -482,8 +482,8 @@ impl ModelDownloader {
         // exceed it. Streaming-to-disk keeps memory bounded regardless.
         client_config.max_body_size = Some(self.config.max_response_bytes);
         client_config.request_timeout = Some(self.config.request_timeout);
-        client_config.proxy_url = proxy_from_environment(&self.config.proxy, url);
-        HttpClient::with_config(client_config)
+        client_config.proxy_url = proxy_from_environment(&self.config.proxy, url)?;
+        Ok(HttpClient::with_config(client_config))
     }
 
     /// Create a downloader with default configuration.
@@ -954,7 +954,14 @@ impl ModelDownloader {
             {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    if matches!(e, SearchError::Cancelled { .. }) {
+                    // A rejected proxy policy is terminal. Retrying must not
+                    // reinterpret it through a later environment lookup.
+                    if matches!(&e, SearchError::Cancelled { .. })
+                        || matches!(
+                            &e,
+                            SearchError::InvalidConfig { field, .. } if field.starts_with("proxy.")
+                        )
+                    {
                         return Err(e);
                     }
                     warn!(
@@ -1010,7 +1017,7 @@ impl ModelDownloader {
             check_acquisition_cancel(cx, "download-request")?;
             let response =
                 run_download_request(cx, &request_url, self.config.request_timeout, async {
-                    self.http_client_for(&request_url)
+                    self.http_client_for(&request_url)?
                         .request_streaming(cx, Method::Get, &request_url, Vec::new(), Vec::new())
                         .await
                         .map_err(|e| client_error_to_search(e, &request_url))
@@ -3430,10 +3437,21 @@ mod tests {
                 "FRANKENSEARCH_TEST_DOWNLOAD_PROXY_DISABLED",
                 if disabled { "1" } else { "0" },
             )
-            .env_remove("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_EXPECT_ERROR");
+            .env_remove("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_EXPECT_ERROR")
+            .env_remove("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_INVALID_VARIABLE");
         for (key, value) in environment {
             command.env(key, value);
         }
+        let output = run_download_proxy_test_child(&mut command);
+        assert!(
+            output.status.success(),
+            "download child failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    fn run_download_proxy_test_child(command: &mut Command) -> std::process::Output {
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3451,11 +3469,12 @@ mod tests {
         }
         let output = child.wait_with_output().unwrap();
         assert!(
-            !timed_out && output.status.success(),
+            !timed_out,
             "download child failed (timeout={timed_out}): {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
+        output
     }
 
     #[test]
@@ -3466,6 +3485,8 @@ mod tests {
         let disabled = std::env::var("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_DISABLED").unwrap() == "1";
         let expect_error = std::env::var("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_EXPECT_ERROR")
             .is_ok_and(|value| value == "1");
+        let invalid_variable =
+            std::env::var("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_INVALID_VARIABLE").ok();
         let temp = tempfile::tempdir().unwrap();
         let destination = temp.path().join("model.bin");
         let file = ModelFile {
@@ -3475,7 +3496,19 @@ mod tests {
             url: None,
         };
         let downloader = ModelDownloader::new(DownloadConfig {
-            max_retries: 0,
+            max_retries: if invalid_variable.is_some() { 2 } else { 0 },
+            // Any retry outlives the unchanged subprocess bound, so malformed
+            // proxy configuration must return before entering backoff.
+            retry_base_delay: if invalid_variable.is_some() {
+                Duration::from_secs(60)
+            } else {
+                DownloadConfig::default().retry_base_delay
+            },
+            request_timeout: if invalid_variable.is_some() {
+                Duration::from_millis(250)
+            } else {
+                DownloadConfig::default().request_timeout
+            },
             proxy: if disabled {
                 ProxySetting::Disabled
             } else {
@@ -3485,9 +3518,25 @@ mod tests {
         });
         run_test_with_cx(|cx| async move {
             let result = downloader
-                .download_single_file(&cx, &url, &destination, &file, 0, 1, &|_| {})
+                .download_file_with_retry(&cx, &url, &destination, &file, 0, 1, &|_| {})
                 .await;
-            if expect_error {
+            if let Some(variable) = invalid_variable {
+                let error = result.expect_err("a malformed policy must refuse before transport");
+                assert!(
+                    matches!(
+                        &error,
+                        SearchError::InvalidConfig { field, value, .. }
+                            if field == &format!("proxy.{variable}") && value == "<non-Unicode>"
+                    ),
+                    "{error:?}"
+                );
+                let rendered = format!("{error:?} {error}");
+                for secret in ["proxy-user-canary", "proxy-password-canary"] {
+                    assert!(!rendered.contains(secret), "{rendered}");
+                }
+                assert!(!destination.exists());
+                assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            } else if expect_error {
                 let error = result.expect_err("the configured HTTPS proxy must refuse CONNECT");
                 let rendered = format!("{error:?} {error}");
                 assert!(rendered.contains("proxy-tunnel-http-407"), "{rendered}");
@@ -3510,6 +3559,101 @@ mod tests {
                 assert_eq!(std::fs::read(destination).unwrap(), PROXY_TEST_BODY);
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_non_unicode_proxy_policy_never_connects_directly_or_to_a_fallback() {
+        use std::os::unix::ffi::OsStringExt;
+
+        for (scheme, variable) in [
+            ("http", "http_proxy"),
+            ("https", "https_proxy"),
+            ("https", "HTTPS_PROXY"),
+            ("http", "all_proxy"),
+            ("https", "ALL_PROXY"),
+            ("http", "no_proxy"),
+            ("https", "NO_PROXY"),
+        ] {
+            for fallback_enabled in [false, true] {
+                let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+                let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
+                origin.set_nonblocking(true).unwrap();
+                fallback.set_nonblocking(true).unwrap();
+                let url = format!("{scheme}://{}/model.bin", origin.local_addr().unwrap());
+                let fallback_url = format!("http://{}", fallback.local_addr().unwrap());
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                command.args([
+                    "--exact",
+                    "model_download::tests::download_proxy_environment_child",
+                    "--nocapture",
+                ]);
+                for name in [
+                    "http_proxy",
+                    "HTTP_PROXY",
+                    "https_proxy",
+                    "HTTPS_PROXY",
+                    "all_proxy",
+                    "ALL_PROXY",
+                    "no_proxy",
+                    "NO_PROXY",
+                ] {
+                    command.env_remove(name);
+                }
+                if fallback_enabled {
+                    match variable {
+                        "http_proxy" | "HTTPS_PROXY" => {
+                            command.env("all_proxy", &fallback_url);
+                        }
+                        "https_proxy" => {
+                            command.env("HTTPS_PROXY", &fallback_url);
+                        }
+                        "all_proxy" => {
+                            command.env("ALL_PROXY", &fallback_url);
+                        }
+                        "no_proxy" | "NO_PROXY" => {
+                            command.env("all_proxy", &fallback_url);
+                        }
+                        // ALL_PROXY has no lower-priority proxy to consult.
+                        "ALL_PROXY" => {}
+                        _ => unreachable!(),
+                    }
+                }
+                if variable == "no_proxy" {
+                    command.env("NO_PROXY", "*");
+                }
+                command
+                    .env("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_URL", url)
+                    .env("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_DISABLED", "0")
+                    .env_remove("FRANKENSEARCH_TEST_DOWNLOAD_PROXY_EXPECT_ERROR")
+                    .env(
+                        "FRANKENSEARCH_TEST_DOWNLOAD_PROXY_INVALID_VARIABLE",
+                        variable,
+                    )
+                    .env(
+                        variable,
+                        std::ffi::OsString::from_vec(
+                            b"http://proxy-user-canary:proxy-password-canary@\xff".to_vec(),
+                        ),
+                    );
+                let output = run_download_proxy_test_child(&mut command);
+                for listener in [&origin, &fallback] {
+                    assert!(
+                        matches!(
+                            listener.accept(),
+                            Err(error) if error.kind() == ErrorKind::WouldBlock
+                        ),
+                        "{variable} opened an unauthorized route"
+                    );
+                }
+                assert!(
+                    output.status.success(),
+                    "{variable}/{fallback_enabled}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+            }
+        }
     }
 
     #[test]
