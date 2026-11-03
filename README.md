@@ -632,6 +632,10 @@ fsfs index --complete-quality --index-dir ./search-store
 Completion uses the generation's exact retained embedding inputs, even after
 source files are moved, preserves its fast vectors, and publishes a complete
 successor. A generation missing those exact inputs requires a full source reindex.
+For a generation retaining all pending quality inputs, `append-batch` also keeps
+the latest replacement and added bodies for this completion. Clearing forced
+deferral leaves that work pending until `--complete-quality` succeeds; deleted
+documents are excluded. The original quality producer must still match.
 
 `append-batch` accepts JSONL objects with string `id` and `text` fields, from
 `--file` or standard input. It inserts or replaces the supplied documents in

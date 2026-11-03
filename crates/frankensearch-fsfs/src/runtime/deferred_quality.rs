@@ -60,6 +60,8 @@ pub struct DeferredQualityCompletion {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Backlog {
+    // 1 binds original source checkpoints; 2 binds retained embedding text.
+    // A version-2 fence never grants filesystem discovery or reuse authority.
     schema_version: u16,
     generation_root: String,
     source_hash: String,
@@ -84,6 +86,7 @@ impl Backlog {
 #[serde(deny_unknown_fields)]
 struct SourceInput {
     revision: i64,
+    // Source bytes for backlog v1; canonical embedding bytes for backlog v2.
     source_sha256: String,
 }
 
@@ -230,7 +233,7 @@ fn record_backlog(storage: &Storage, backlog: &Backlog, completed: usize) -> Sea
         file_path: Some(FSFS_VECTOR_QUALITY_INDEX_FILE.to_owned()),
         file_size_bytes: None,
         file_hash: Some(backlog.source_hash.clone()),
-        schema_version: Some(1),
+        schema_version: Some(i64::from(backlog.schema_version)),
         config_json: Some(serde_json::to_string(backlog).map_err(storage_error)?),
         fec_path: None,
         fec_size_bytes: None,
@@ -323,7 +326,7 @@ fn read_backlog(storage: &Storage) -> SearchResult<Backlog> {
         })?)
         .map_err(storage_error)?;
     backlog.producer.validate()?;
-    if backlog.schema_version != 1
+    if !matches!(backlog.schema_version, 1 | 2)
         || backlog
             .queued_documents
             .checked_add(backlog.unavailable_documents)
@@ -332,7 +335,7 @@ fn read_backlog(storage: &Storage) -> SearchResult<Backlog> {
         || metadata.embedder_revision.as_deref() != Some(backlog.producer.fingerprint().as_str())
         || metadata.file_hash.as_deref() != Some(backlog.source_hash.as_str())
         || metadata.index_type != "deferred_quality"
-        || metadata.schema_version != Some(1)
+        || metadata.schema_version != Some(i64::from(backlog.schema_version))
         || metadata.dimension != i64::from(backlog.producer.space.dimension)
         || usize::try_from(metadata.source_doc_count).ok() != Some(backlog.requested_documents)
         || metadata.record_count != 0
@@ -348,7 +351,7 @@ fn validate_pending_jobs(
     storage: &Storage,
     key: &str,
     manifests: &BTreeMap<String, IndexManifestEntry>,
-    checkpoints: &BTreeMap<String, CheckpointFileEntry>,
+    checkpoints: Option<&BTreeMap<String, CheckpointFileEntry>>,
 ) -> SearchResult<()> {
     let expected = manifests
         .iter()
@@ -394,11 +397,17 @@ fn validate_pending_jobs(
             invalid("exact deferred input is absent; a preview cannot replace it")
         })?;
         if hash.as_ref() != document.content_hash.as_slice()
+            || document.content_hash != ContentHasher::hash(&text)
             || source.revision != manifests[id].revision
-            || checkpoints.get(id).is_none_or(|entry| {
-                (source.revision, source.source_sha256.as_str())
-                    != (entry.revision, entry.content_hash_hex.as_str())
-            })
+            || checkpoints.map_or_else(
+                || source.source_sha256 != content_sha256_hex(text.as_bytes()),
+                |checkpoints| {
+                    checkpoints.get(id).is_none_or(|entry| {
+                        (source.revision, source.source_sha256.as_str())
+                            != (entry.revision, entry.content_hash_hex.as_str())
+                    })
+                },
+            )
             || source.source_sha256.len() != 64
             || !source
                 .source_sha256
@@ -414,6 +423,156 @@ fn validate_pending_jobs(
         }
     }
     Ok(())
+}
+
+/// Move an admitted source backlog to an owned-text fence in the independently
+/// copied candidate. Version 2 certifies embedding input, never filesystem bytes
+/// or upgrade reuse. Validate every old job before replacing its source fence.
+pub(super) fn begin_content_upserts(
+    cx: &Cx,
+    candidate: &FsfsRuntime,
+    predecessor: &PublishedGeneration,
+) -> SearchResult<bool> {
+    retained_search_checkpoint(cx)?;
+    let previous = FsfsRuntime::read_index_sentinel(predecessor.path())?
+        .ok_or_else(|| invalid("batch predecessor has no completion sentinel"))?;
+    if !previous
+        .reason_codes
+        .iter()
+        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+        || !candidate.resolve_storage_db_path()?.try_exists()?
+    {
+        return Ok(false);
+    }
+    let storage = open_catalog(candidate, false)?;
+    if storage.get_index_metadata(BACKLOG_NAME)?.is_none() {
+        return Ok(false);
+    }
+    let mut backlog = read_backlog(&storage)?;
+    if backlog.generation_root != predecessor.path().display().to_string()
+        || backlog.source_hash != previous.source_hash_hex
+        || backlog.unavailable_documents != 0
+    {
+        return Err(invalid(
+            "content upserts require exact deferred inputs; run `fsfs index --complete-quality` or rebuild from sources first",
+        ));
+    }
+    let manifests = FsfsRuntime::read_matching_manifest_generation(predecessor.path())?
+        .ok_or_else(|| invalid("batch predecessor membership manifests disagree"))?;
+    let checkpoint = if backlog.schema_version == 1 {
+        Some(retained_reuse::completed_input_checkpoint(cx, predecessor)?)
+    } else {
+        None
+    };
+    validate_pending_jobs(
+        &storage,
+        &backlog.queue_key(),
+        &manifests,
+        checkpoint.as_ref().map(|checkpoint| &checkpoint.files),
+    )?;
+    for (id, entry) in &manifests {
+        retained_search_checkpoint(cx)?;
+        if entry.ingestion_class != ingestion_class_label(IngestionClass::FullSemanticLexical) {
+            continue;
+        }
+        let text = storage
+            .get_document_content(id)?
+            .ok_or_else(|| invalid("admitted deferred input disappeared"))?;
+        capture_content_upsert(&storage, id, &text, entry.revision)?;
+    }
+    backlog.schema_version = 2;
+    record_backlog(&storage, &backlog, 0)?;
+    retained_search_checkpoint(cx)?;
+    Ok(true)
+}
+
+/// The caller supplies its exact canonical embedding input, not a lexical
+/// preview or an inferred source path. Only an unpublished candidate is opened.
+pub(super) fn capture_content_upsert(
+    storage: &Storage,
+    id: &str,
+    text: &str,
+    revision: i64,
+) -> SearchResult<()> {
+    if text.trim().is_empty() || text.len() > MAX_INPUT_BYTES {
+        return Err(invalid(
+            "retained quality input exceeds its canonical text bound",
+        ));
+    }
+    let mut document = storage
+        .get_document(id)?
+        .ok_or_else(|| invalid("retained quality document is absent"))?;
+    let metadata = document
+        .metadata
+        .get_or_insert_with(|| serde_json::json!({}));
+    metadata[SOURCE_METADATA] = serde_json::to_value(SourceInput {
+        revision,
+        source_sha256: content_sha256_hex(text.as_bytes()),
+    })
+    .map_err(storage_error)?;
+    storage.upsert_document(&document)?;
+    storage.set_document_content(id, text)?;
+    Ok(())
+}
+
+/// Reconcile the new selected membership and revisions under a fresh queue key.
+/// Old work is retired only in the candidate, never in the selected generation.
+#[allow(clippy::arc_with_non_send_sync)]
+pub(super) fn finish_content_upserts(
+    cx: &Cx,
+    candidate: &FsfsRuntime,
+    destination: &Path,
+) -> SearchResult<()> {
+    retained_search_checkpoint(cx)?;
+    let storage = Arc::new(open_catalog(candidate, false)?);
+    let mut backlog = read_backlog(&storage)?;
+    if backlog.schema_version != 2 {
+        return Err(invalid(
+            "content mutation has no admitted owned-input backlog",
+        ));
+    }
+    let old_key = backlog.queue_key();
+    let manifests = FsfsRuntime::read_matching_manifest_generation(destination)?
+        .ok_or_else(|| invalid("batch candidate membership manifests disagree"))?;
+    let mut sentinel = FsfsRuntime::read_index_sentinel(destination)?
+        .ok_or_else(|| invalid("batch candidate has no completion sentinel"))?;
+    backlog.generation_root = destination.display().to_string();
+    backlog.source_hash.clone_from(&sentinel.source_hash_hex);
+    backlog.requested_documents = manifests
+        .values()
+        .filter(|entry| {
+            entry.ingestion_class == ingestion_class_label(IngestionClass::FullSemanticLexical)
+        })
+        .count();
+    backlog.queued_documents = backlog.requested_documents;
+    storage
+        .connection()
+        .execute_with_params_sync(
+            "DELETE FROM embedding_jobs WHERE embedder_id = ?1;",
+            &[SqliteValue::Text(old_key.into())],
+        )
+        .map_err(storage_error)?;
+    let key = backlog.queue_key();
+    let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
+    for (id, entry) in &manifests {
+        retained_search_checkpoint(cx)?;
+        if entry.ingestion_class != ingestion_class_label(IngestionClass::FullSemanticLexical) {
+            continue;
+        }
+        let text = storage
+            .get_document_content(id)?
+            .ok_or_else(|| invalid("batch candidate lost its exact deferred input"))?;
+        queue.enqueue(id, &key, &ContentHasher::hash(&text), 0)?;
+    }
+    validate_pending_jobs(&storage, &key, &manifests, None)?;
+    record_backlog(&storage, &backlog, 0)?;
+    if backlog.requested_documents == 0 {
+        sentinel
+            .reason_codes
+            .retain(|reason| reason != REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+        candidate.write_index_sentinel(destination, &sentinel)?;
+    }
+    retained_search_checkpoint(cx)
 }
 
 /// Carry only unchanged pending inputs through deletion or compaction. The
@@ -465,17 +624,26 @@ where
             entry.ingestion_class == ingestion_class_label(IngestionClass::FullSemanticLexical)
         })
         .count();
-    let checkpoint = if requested == 0 {
-        // No remaining semantic member owes inference, including deletion of
-        // the last document. The original checkpoint still fences the empty
-        // queue validation; no empty source-reuse receipt need be fabricated.
-        retained_reuse::completed_input_checkpoint(cx, predecessor)?
-    } else {
-        project_inputs()?
-            .ok_or_else(|| invalid("maintenance cannot preserve the deferred source checkpoint"))?
-    };
+    let checkpoint =
+        if backlog.schema_version == 2 {
+            None
+        } else if requested == 0 {
+            // No remaining semantic member owes inference, including deletion of
+            // the last document. The original checkpoint still fences the empty
+            // queue validation; no empty source-reuse receipt need be fabricated.
+            Some(retained_reuse::completed_input_checkpoint(cx, predecessor)?)
+        } else {
+            Some(project_inputs()?.ok_or_else(|| {
+                invalid("maintenance cannot preserve the deferred source checkpoint")
+            })?)
+        };
     let old_key = backlog.queue_key();
-    validate_pending_jobs(&storage, &old_key, &manifests, &checkpoint.files)?;
+    validate_pending_jobs(
+        &storage,
+        &old_key,
+        &manifests,
+        checkpoint.as_ref().map(|checkpoint| &checkpoint.files),
+    )?;
     let mut sentinel = FsfsRuntime::read_index_sentinel(destination)?
         .ok_or_else(|| invalid("maintenance candidate has no completion sentinel"))?;
     backlog.generation_root = destination.display().to_string();
@@ -584,11 +752,6 @@ impl FsfsRuntime {
                 "selected generation does not have an unbuilt deferred quality tier",
             ));
         }
-        let checkpoint = retained_reuse::completed_input_checkpoint(cx, &predecessor)?;
-        let manifests = Self::read_checkpoint_manifest_generation(predecessor.path(), &checkpoint)?
-            .ok_or_else(|| {
-                invalid("selected membership manifests and source checkpoint disagree")
-            })?;
         let mut input = self.cli_input.clone();
         input.index_dir = Some(build.path().to_path_buf());
         input.complete_quality = false;
@@ -618,8 +781,27 @@ impl FsfsRuntime {
                 "some deferred documents lack exact retained input; run a full source reindex before completing quality",
             ));
         }
+        let checkpoint = if backlog.schema_version == 1 {
+            Some(retained_reuse::completed_input_checkpoint(
+                cx,
+                &predecessor,
+            )?)
+        } else {
+            None
+        };
+        let manifests = if let Some(checkpoint) = &checkpoint {
+            Self::read_checkpoint_manifest_generation(predecessor.path(), checkpoint)?
+        } else {
+            Self::read_matching_manifest_generation(predecessor.path())?
+        }
+        .ok_or_else(|| invalid("selected membership manifests and input fence disagree"))?;
         let key = backlog.queue_key();
-        validate_pending_jobs(&storage, &key, &manifests, &checkpoint.files)?;
+        validate_pending_jobs(
+            &storage,
+            &key,
+            &manifests,
+            checkpoint.as_ref().map(|checkpoint| &checkpoint.files),
+        )?;
         control
             .admit_work(cx, "complete_quality.model_load")
             .await?;
@@ -1112,6 +1294,307 @@ mod tests {
             assert!(!phases.last().unwrap().hits.is_empty());
             assert_eq!(files(next.path()), successor_before);
         });
+    }
+
+    #[test]
+    fn deferred_upserts_retain_latest_inputs_and_resume_after_source_loss() {
+        use super::super::retained_batch::RetainedMutation;
+
+        run(|cx| async move {
+            let directory = tempfile::tempdir().unwrap();
+            let expected = source_fixture(directory.path());
+            let fast = Arc::new(Producer::new("deferred-fast"));
+            let quality = Arc::new(Producer::new("deferred-quality"));
+            let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+            let deferred = runtime(directory.path(), true);
+            let root = directory.path().join("store");
+            let first = durable(
+                deferred
+                    .rebuild_retained_generation(&cx, &root)
+                    .await
+                    .unwrap(),
+            );
+            let before = files(first.path());
+            fast.inputs.lock().unwrap().clear();
+            fs::rename(
+                directory.path().join("source"),
+                directory.path().join("source-gone"),
+            )
+            .unwrap();
+            let updated = deferred
+                .apply_retained_batch(
+                    &cx,
+                    &root,
+                    &first,
+                    &[
+                        RetainedMutation::Upsert {
+                            id: "alpha.md".to_owned(),
+                            text: "replacement retained alpha".to_owned(),
+                        },
+                        RetainedMutation::Upsert {
+                            id: "gamma.md".to_owned(),
+                            text: "superseded retained gamma".to_owned(),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!((updated.upserted, updated.deleted), (2, 0));
+            let updated = durable(updated.publication.unwrap());
+            let updated_bytes = files(updated.path());
+            assert!(!updated.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists());
+            assert_eq!(files(first.path()), before);
+            assert!(quality.inputs.lock().unwrap().is_empty());
+
+            let restarted = runtime(directory.path(), false);
+            let latest = restarted
+                .apply_retained_batch(
+                    &cx,
+                    &root,
+                    &updated,
+                    &[
+                        RetainedMutation::Upsert {
+                            id: "gamma.md".to_owned(),
+                            text: "latest retained gamma".to_owned(),
+                        },
+                        RetainedMutation::Delete {
+                            id: "alpha.md".to_owned(),
+                        },
+                    ],
+                )
+                .await
+                .unwrap();
+            assert_eq!((latest.upserted, latest.deleted), (1, 1));
+            let latest = durable(latest.publication.unwrap());
+            let latest_bytes = files(latest.path());
+            assert_eq!(files(updated.path()), updated_bytes);
+            assert_eq!(fast.inputs.lock().unwrap().len(), 3);
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            fast.inputs.lock().unwrap().clear();
+            let (compacted, _) = restarted
+                .compact_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            let compacted = durable(compacted.unwrap());
+            let compacted_bytes = files(compacted.path());
+            assert!(fast.inputs.lock().unwrap().is_empty());
+
+            // The CLI has its own retained append kernel. Exercise it, rather
+            // than assuming the public mixed-batch path also wires that route.
+            let forced_file = directory.path().join("forced-cli.jsonl");
+            fs::write(
+                &forced_file,
+                serde_json::json!({"id": "gamma.md", "text": "intermediate CLI gamma"}).to_string(),
+            )
+            .unwrap();
+            let mut forced_cli = runtime(directory.path(), true);
+            forced_cli.cli_input.command = CliCommand::AppendBatch;
+            forced_cli.cli_input.input_file = Some(forced_file);
+            let (publication, count) = forced_cli
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 1);
+            let cli_first = durable(publication.unwrap());
+            let cli_first_bytes = files(cli_first.path());
+            assert_eq!(files(compacted.path()), compacted_bytes);
+
+            let cleared_file = directory.path().join("cleared-cli.jsonl");
+            fs::write(
+                &cleared_file,
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"id": "gamma.md", "text": "final CLI gamma"}),
+                    serde_json::json!({"id": "delta.md", "text": "new CLI delta"}),
+                ),
+            )
+            .unwrap();
+            let mut cleared_cli = runtime(directory.path(), false);
+            cleared_cli.cli_input.command = CliCommand::AppendBatch;
+            cleared_cli.cli_input.input_file = Some(cleared_file);
+            let (publication, count) = cleared_cli
+                .append_retained_generation(&cx, &root)
+                .await
+                .unwrap();
+            assert_eq!(count, 2);
+            let cli_latest = durable(publication.unwrap());
+            let cli_latest_bytes = files(cli_latest.path());
+            assert_eq!(files(cli_first.path()), cli_first_bytes);
+            assert_eq!(fast.inputs.lock().unwrap().len(), 3);
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            fast.inputs.lock().unwrap().clear();
+
+            // A new caller must still admit the original queued producer.
+            set_test_quality_embedder(Some(Arc::new(Producer::new("foreign-quality"))));
+            let error = runtime(directory.path(), false)
+                .complete_retained_quality(&cx, &root, &cli_latest)
+                .await
+                .unwrap_err();
+            assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                if field == "index.complete_quality"));
+            assert_eq!(files(cli_latest.path()), cli_latest_bytes);
+            assert!(quality.inputs.lock().unwrap().is_empty());
+            set_test_quality_embedder(Some(quality.clone()));
+
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                restarted
+                    .complete_retained_quality(&cx, &root, &cli_latest)
+                    .await,
+                Err(SearchError::Cancelled { .. })
+            ));
+            cx.set_cancel_requested(false);
+            assert_eq!(files(cli_latest.path()), cli_latest_bytes);
+            let completed = restarted
+                .complete_retained_quality(&cx, &root, &cli_latest)
+                .await
+                .unwrap();
+            assert_eq!(completed.completed_documents, 3);
+            let completed = durable(completed.publication);
+            assert_eq!(files(first.path()), before);
+            assert_eq!(files(updated.path()), updated_bytes);
+            assert_eq!(files(latest.path()), latest_bytes);
+            assert_eq!(files(compacted.path()), compacted_bytes);
+            assert_eq!(files(cli_first.path()), cli_first_bytes);
+            assert_eq!(files(cli_latest.path()), cli_latest_bytes);
+            assert_eq!(
+                fs::read(completed.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                cli_latest_bytes[Path::new(FSFS_VECTOR_INDEX_FILE)]
+            );
+            assert_eq!(
+                quality
+                    .inputs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    expected["beta.md"].clone(),
+                    "final CLI gamma".to_owned(),
+                    "new CLI delta".to_owned(),
+                ])
+            );
+            assert_eq!(
+                VectorIndex::open_read_only(&completed.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE))
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap(),
+                std::collections::HashSet::from([
+                    "beta.md".to_owned(),
+                    "gamma.md".to_owned(),
+                    "delta.md".to_owned(),
+                ])
+            );
+            assert!(fast.inputs.lock().unwrap().is_empty());
+
+            fast.inputs.lock().unwrap().clear();
+            quality.inputs.lock().unwrap().clear();
+            let completed_bytes = files(completed.path());
+            let updated = restarted
+                .apply_retained_batch(
+                    &cx,
+                    &root,
+                    &completed,
+                    &[RetainedMutation::Upsert {
+                        id: "new.md".to_owned(),
+                        text: "new retained content".to_owned(),
+                    }],
+                )
+                .await
+                .unwrap();
+            assert_eq!((updated.upserted, updated.deleted), (1, 0));
+            let updated = durable(updated.publication.unwrap());
+            assert!(
+                updated
+                    .path()
+                    .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                    .is_file()
+            );
+            assert_eq!(
+                fast.inputs.lock().unwrap().as_slice(),
+                &["new retained content"]
+            );
+            assert_eq!(
+                quality.inputs.lock().unwrap().as_slice(),
+                &["new retained content"]
+            );
+            assert_eq!(files(completed.path()), completed_bytes);
+        });
+    }
+
+    #[test]
+    fn owned_quality_fence_rejects_same_length_text_and_digest_substitution() {
+        for replace_queue_digest in [false, true] {
+            let storage = Arc::new(Storage::open_in_memory().unwrap());
+            let original = "safe retained body";
+            let corrupt = "evil retained body";
+            assert_eq!(original.len(), corrupt.len());
+            let mut document = DocumentRecord::new(
+                "owned.md",
+                original,
+                ContentHasher::hash(original),
+                original.chars().count(),
+                7,
+                7,
+            );
+            document.metadata = Some(serde_json::json!({
+                SOURCE_METADATA: {
+                    "revision": 7,
+                    "source_sha256": content_sha256_hex(original.as_bytes()),
+                },
+            }));
+            storage.upsert_document(&document).unwrap();
+            storage.set_document_content("owned.md", original).unwrap();
+            let queue = PersistentJobQueue::new(Arc::clone(&storage), JobQueueConfig::default());
+            queue
+                .enqueue("owned.md", "owned-quality", &document.content_hash, 0)
+                .unwrap();
+            let manifests = BTreeMap::from([(
+                "owned.md".to_owned(),
+                IndexManifestEntry {
+                    file_key: "owned.md".to_owned(),
+                    revision: 7,
+                    ingestion_class: ingestion_class_label(IngestionClass::FullSemanticLexical)
+                        .to_owned(),
+                    canonical_bytes: original.len() as u64,
+                    reason_code: "retained_batch".to_owned(),
+                    fast_windows: None,
+                },
+            )]);
+            validate_pending_jobs(&storage, "owned-quality", &manifests, None).unwrap();
+            // The public setter refuses this corruption. Inject damaged
+            // stored bytes directly, as a corrupt catalog would present them.
+            storage
+                .connection()
+                .execute_with_params_sync(
+                    "UPDATE document_contents SET canonical_text = ?1;",
+                    &[SqliteValue::Text(corrupt.to_owned().into())],
+                )
+                .unwrap();
+            if replace_queue_digest {
+                document.content_hash = ContentHasher::hash(corrupt);
+                storage.upsert_document(&document).unwrap();
+                storage.set_document_content("owned.md", corrupt).unwrap();
+                queue
+                    .enqueue("owned.md", "owned-quality", &document.content_hash, 0)
+                    .unwrap();
+            }
+            let error =
+                validate_pending_jobs(&storage, "owned-quality", &manifests, None).unwrap_err();
+            if replace_queue_digest {
+                assert!(matches!(error, SearchError::InvalidConfig { reason, .. }
+                    if reason.contains("input differs")));
+            } else {
+                assert!(matches!(
+                    error,
+                    SearchError::SubsystemError {
+                        subsystem: "storage",
+                        ..
+                    }
+                ));
+            }
+        }
     }
 
     #[test]
@@ -1729,8 +2212,13 @@ mod tests {
                     stamp: None,
                 },
             )]);
-            validate_pending_jobs(&storage, "generation-quality", &manifests, &checkpoints)
-                .unwrap();
+            validate_pending_jobs(
+                &storage,
+                "generation-quality",
+                &manifests,
+                Some(&checkpoints),
+            )
+            .unwrap();
             match corruption {
                 "job_digest" => {
                     storage
@@ -1770,8 +2258,13 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                validate_pending_jobs(&storage, "generation-quality", &manifests, &checkpoints)
-                    .is_err(),
+                validate_pending_jobs(
+                    &storage,
+                    "generation-quality",
+                    &manifests,
+                    Some(&checkpoints)
+                )
+                .is_err(),
                 "{corruption}"
             );
         }

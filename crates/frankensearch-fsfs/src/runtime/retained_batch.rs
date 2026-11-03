@@ -608,6 +608,22 @@ impl FsfsRuntime {
                 "source policy requires vectors absent from the selected generation",
             ));
         }
+        let mut input = self.cli_input.clone();
+        input.index_dir = Some(build.path().to_path_buf());
+        input.daemon = false;
+        input.daemon_socket = None;
+        let candidate = self.clone().with_cli_input(input);
+        if retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?
+            != predecessor
+        {
+            return Err(invalid(
+                "selected predecessor changed while copying the batch base",
+            ));
+        }
+        let lease = PublicationLease::acquire(build.path())?;
+        lease.fence("retained batch deferred-input admission")?;
+        let deferred_upserts = upserted > 0
+            && super::deferred_quality::begin_content_upserts(cx, &candidate, &predecessor)?;
         let semantic_upserts = documents.values().flatten().any(Body::semantic);
         let window_maximum = if lexical_only {
             1
@@ -709,19 +725,6 @@ impl FsfsRuntime {
             None => Vec::new(),
         };
         retained_search_checkpoint(cx)?;
-        let mut input = self.cli_input.clone();
-        input.index_dir = Some(build.path().to_path_buf());
-        input.daemon = false;
-        input.daemon_socket = None;
-        let candidate = self.clone().with_cli_input(input);
-        if retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?
-            != predecessor
-        {
-            return Err(invalid(
-                "selected predecessor changed while copying the batch base",
-            ));
-        }
-        let lease = PublicationLease::acquire(build.path())?;
         let timestamp = pressure_timestamp_ms();
         let revision = manifests
             .values()
@@ -843,6 +846,14 @@ impl FsfsRuntime {
                         created,
                         revision.max(created),
                     ))?;
+                    if deferred_upserts && body.semantic() {
+                        super::deferred_quality::capture_content_upsert(
+                            &storage,
+                            id,
+                            &body.embedding,
+                            revision,
+                        )?;
+                    }
                     if body.semantic() {
                         for producer in [fast.as_ref(), quality.as_ref()].into_iter().flatten() {
                             storage.mark_embedded(id, producer.embedder.id())?;
@@ -925,7 +936,9 @@ impl FsfsRuntime {
             &changed_ids,
             &source_inputs,
         )?;
-        if upserted == 0 {
+        if deferred_upserts {
+            super::deferred_quality::finish_content_upserts(cx, &candidate, build.path())?;
+        } else if upserted == 0 {
             // Keep the ordinary skip-witness invalidation above. Its admitted
             // checkpoint also fences the carried quality work; do not write a
             // second, less precise receipt for the same candidate.

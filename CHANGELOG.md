@@ -1,5 +1,17 @@
 # Changelog
 
+### Unreleased — Preserve deferred quality inputs through updates (2026-11-03)
+
+- `append-batch` and retained mixed batches preserve the latest exact embedding
+  inputs when a generation already has pending quality work. Replacements,
+  additions, deletion and compaction keep that work recoverable after source
+  files move. Explicit `index --complete-quality` builds the surviving quality
+  tier while preserving fast vectors and existing reader generations.
+- Pending updates bind their retained canonical text and revisions separately
+  from filesystem source checkpoints. Completion still requires the original
+  quality producer and rejects damaged or missing inputs. Clearing forced
+  deferral leaves pending work for explicit completion.
+
 ### Unreleased — Quill 0.4.2 producer metadata (#68, 2026-10-28)
 
 - Quill derives its durable producer version from Cargo's package metadata

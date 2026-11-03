@@ -674,6 +674,24 @@ impl FsfsRuntime {
             }
         }
 
+        let mut input = self.cli_input.clone();
+        input.index_dir = Some(build.path().to_path_buf());
+        input.daemon = false;
+        input.daemon_socket = None;
+        let candidate = self.clone().with_cli_input(input);
+        if retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?
+            != predecessor
+        {
+            return Err(complete_cli::complete_cli_error(
+                "append_selection",
+                "selected predecessor changed while preparing the batch",
+            ));
+        }
+        let candidate_lease = crate::lifecycle::PublicationLease::acquire(build.path())?;
+        candidate_lease.fence("complete-generation append deferred-input admission")?;
+        let deferred_upserts =
+            deferred_quality::begin_content_upserts(cx, &candidate, &predecessor)?;
+
         // Use the same producer-resolution and admission checks as the ordinary
         // appender. Do not borrow a different tier's identity or manufacture
         // vectors from copied producer labels. No mutable mapping spans inference.
@@ -775,20 +793,6 @@ impl FsfsRuntime {
             }
         }
         retained_search_checkpoint(cx)?;
-        let mut input = self.cli_input.clone();
-        input.index_dir = Some(build.path().to_path_buf());
-        input.daemon = false;
-        input.daemon_socket = None;
-        let candidate = self.clone().with_cli_input(input);
-        if retained_reuse::copy_selected_generation(cx, &candidate, &store, build.path())?
-            != predecessor
-        {
-            return Err(complete_cli::complete_cli_error(
-                "append_selection",
-                "selected predecessor changed while preparing the batch",
-            ));
-        }
-        let candidate_lease = crate::lifecycle::PublicationLease::acquire(build.path())?;
         let timestamp = pressure_timestamp_ms();
         let ingestion_class = if lexical_only {
             IngestionClass::LexicalOnly
@@ -880,6 +884,9 @@ impl FsfsRuntime {
                     created_at,
                     revision.max(created_at),
                 ))?;
+                if deferred_upserts {
+                    deferred_quality::capture_content_upsert(&storage, id, text, revision)?;
+                }
                 if let Some((embedder, _)) = fast.as_ref() {
                     storage.mark_embedded(id, embedder.id())?;
                 }
@@ -934,6 +941,9 @@ impl FsfsRuntime {
             }
         }
         candidate.write_index_sentinel(build.path(), &sentinel)?;
+        if deferred_upserts {
+            deferred_quality::finish_content_upserts(cx, &candidate, build.path())?;
+        }
         candidate_lease.fence("complete-generation append candidate complete")?;
         drop(candidate_lease);
         if !lexical_reclaimed {
