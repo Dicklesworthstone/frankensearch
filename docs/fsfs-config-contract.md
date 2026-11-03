@@ -55,6 +55,20 @@ Path expansion rule:
 - `max_file_size_mb: int` (`1..1024`)
 - `follow_symlinks: bool`
 
+Discovery skips hidden entries and applies the same ignore files as ripgrep:
+`.ignore` files, plus `.gitignore`, `.git/info/exclude` and the global Git
+excludes file inside a Git repository. Git rules are scoped the way Git scopes
+them. A directory that contains a `.git` directory, a `.git` file (a linked
+worktree or submodule) or a `.jj` directory starts a nested repository. Below
+it, only that repository's own `.gitignore` and `info/exclude` apply; the
+enclosing repository's rules do not, just as `git status` in the outer
+repository never looks inside it. `.ignore` files apply across repository
+boundaries. To keep paths inside nested repositories out of an index, put the
+rule in a `.ignore` file at the indexed root, in the nested repository's own
+ignore files, or in `exclude_patterns`. `git check-ignore --no-index` matches
+patterns without regard to repository boundaries, so it can report such paths
+as ignored even though Git itself does not apply the outer rules to them.
+
 ## `[indexing]`
 
 - `fast_model: string`
