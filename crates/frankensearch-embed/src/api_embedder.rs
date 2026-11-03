@@ -415,13 +415,37 @@ async fn request_api_response(
     headers: &[(String, String)],
     body: Vec<u8>,
 ) -> ApiAttemptResult<(u16, Vec<u8>)> {
+    request_api_response_with_client(
+        cx,
+        provider,
+        config,
+        url,
+        headers,
+        body,
+        HttpClient::with_config,
+    )
+    .await
+}
+
+// The production path and TLS qualification use the same route, timeout and
+// response handling. Only a test-created client adds the fixture's local CA.
+async fn request_api_response_with_client(
+    cx: &Cx,
+    provider: &dyn ApiProvider,
+    config: &ApiEmbedderConfig,
+    url: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+    make_client: impl FnOnce(HttpClientConfig) -> HttpClient + Send,
+) -> ApiAttemptResult<(u16, Vec<u8>)> {
     let work = async {
         // Routing belongs to the actual request URL, including providers whose
         // request_url differs from endpoint_url. Streaming responses own their
         // connections instead of returning them to the pool, so constructing
         // one per attempt does not discard a reusable connection.
-        let response = build_http_client(config, url)
-            .map_err(ApiAttemptError::Terminal)?
+        let client_config =
+            build_http_client_config(config, url).map_err(ApiAttemptError::Terminal)?;
+        let response = make_client(client_config)
             .request_streaming(cx, Method::Post, url, headers.to_vec(), body)
             .await
             .map_err(|client_error| {
@@ -1362,7 +1386,10 @@ fn verify_response_vectors(
     Ok(())
 }
 
-fn build_http_client(config: &ApiEmbedderConfig, url: &str) -> SearchResult<HttpClient> {
+fn build_http_client_config(
+    config: &ApiEmbedderConfig,
+    url: &str,
+) -> SearchResult<HttpClientConfig> {
     let mut client_config = HttpClientConfig::default();
     // Embedding POST bodies contain private input text. Stripping credentials
     // alone cannot make a cross-origin 307/308 safe: it would still replay the
@@ -1376,7 +1403,7 @@ fn build_http_client(config: &ApiEmbedderConfig, url: &str) -> SearchResult<Http
     client_config.max_body_size = Some(config.max_response_bytes);
     client_config.request_timeout = Some(config.request_timeout);
     client_config.proxy_url = proxy_from_environment(&config.proxy, url)?;
-    Ok(HttpClient::with_config(client_config))
+    Ok(client_config)
 }
 
 fn bounded_embedding_failure(provider: &dyn ApiProvider, reason: &str) -> SearchError {
@@ -1574,6 +1601,10 @@ impl Embedder for ApiEmbedder {
 mod tests {
     use super::*;
     use crate::api_provider::{OpenAiProvider, remote_ordered_request_sha256};
+    use crate::proxy::tls_test_support::{
+        TlsProxyMode, TlsProxyObservation, root_certificate, spawn_tls_proxy,
+        spawn_tls_proxy_with_wrong_proxy_name,
+    };
     use asupersync::http::body::HeaderMap;
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::generation::{EmbeddingArtifactIdentityV1, EmbeddingSpaceKindV1};
@@ -1895,6 +1926,13 @@ mod tests {
             headers,
             request[header_end..header_end + content_length].to_vec(),
         )
+    }
+
+    fn api_request_header<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+        headers.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
     }
 
     fn accept_http_test_connection(listener: &TcpListener) -> TcpStream {
@@ -3539,6 +3577,676 @@ mod tests {
         }
     }
 
+    fn read_api_socks_string(stream: &mut TcpStream) -> Vec<u8> {
+        let mut length = [0_u8; 1];
+        stream.read_exact(&mut length).unwrap();
+        let mut bytes = vec![0_u8; usize::from(length[0])];
+        stream.read_exact(&mut bytes).unwrap();
+        bytes
+    }
+
+    fn accept_api_socks_tunnel(stream: &mut TcpStream, authenticated: bool) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut greeting = [0_u8; 2];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting[0], 5);
+        let mut methods = vec![0_u8; usize::from(greeting[1])];
+        stream.read_exact(&mut methods).unwrap();
+        let method = if authenticated { 2 } else { 0 };
+        assert!(methods.contains(&method));
+        stream.write_all(&[5, method]).unwrap();
+        if authenticated {
+            let mut version = [0_u8; 1];
+            stream.read_exact(&mut version).unwrap();
+            assert_eq!(version, [1]);
+            assert_eq!(read_api_socks_string(stream), b"api-proxy-user");
+            assert_eq!(read_api_socks_string(stream), b"api-proxy-password");
+            stream.write_all(&[1, 0]).unwrap();
+        }
+        let mut connect = [0_u8; 4];
+        stream.read_exact(&mut connect).unwrap();
+        assert_eq!(
+            connect,
+            [5, 1, 0, 3],
+            "SOCKS proxy must resolve destination DNS"
+        );
+        assert_eq!(read_api_socks_string(stream), b"embedding-provider.invalid");
+        let mut port = [0_u8; 2];
+        stream.read_exact(&mut port).unwrap();
+        assert_eq!(u16::from_be_bytes(port), 8123);
+        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+    }
+
+    #[test]
+    fn api_socks5_and_socks5h_preserve_remote_dns_auth_and_embedding_results() {
+        for scheme in ["socks5", "socks5h"] {
+            for authenticated in [false, true] {
+                for verified in [false, true] {
+                    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let origin_address = origin.local_addr().unwrap();
+                    let gateway = serve_one_proxy_embedding(origin, verified);
+                    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                    let proxy_address = listener.local_addr().unwrap();
+                    let proxy = thread::spawn(move || {
+                        let mut stream = accept_http_test_connection(&listener);
+                        accept_api_socks_tunnel(&mut stream, authenticated);
+                        let (headers, body) = read_http_request(&mut stream);
+                        let mut upstream = TcpStream::connect(origin_address).unwrap();
+                        upstream
+                            .set_read_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        upstream
+                            .set_write_timeout(Some(Duration::from_secs(5)))
+                            .unwrap();
+                        upstream.write_all(headers.as_bytes()).unwrap();
+                        upstream.write_all(&body).unwrap();
+                        upstream.flush().unwrap();
+                        std::io::copy(&mut upstream, &mut stream).unwrap();
+                    });
+                    let credentials = if authenticated {
+                        "api-proxy-user:api-proxy-password@"
+                    } else {
+                        ""
+                    };
+                    assert_api_proxy_round_trip(
+                        verified,
+                        test_http_config(ProxySetting::Url(format!(
+                            "{scheme}://{credentials}{proxy_address}"
+                        ))),
+                        "http://embedding-provider.invalid:8123/v1/embeddings".to_owned(),
+                    );
+                    proxy.join().unwrap();
+                    let (headers, _) = gateway.join().unwrap();
+                    assert!(headers.starts_with("POST /v1/embeddings HTTP/1.1\r\n"));
+                    assert!(headers.lines().any(|line| {
+                        line.split_once(':').is_some_and(|(name, value)| {
+                            name.eq_ignore_ascii_case("host")
+                                && value.trim() == "embedding-provider.invalid:8123"
+                        })
+                    }));
+                    for secret in [
+                        "proxy-authorization",
+                        "api-proxy-user",
+                        "api-proxy-password",
+                    ] {
+                        assert!(!headers.to_ascii_lowercase().contains(secret));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn api_socks_authentication_refusal_never_contacts_origin_or_fallback() {
+        for scheme in ["socks5", "socks5h"] {
+            for verified in [false, true] {
+                let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+                let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
+                origin.set_nonblocking(true).unwrap();
+                fallback.set_nonblocking(true).unwrap();
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let proxy_address = listener.local_addr().unwrap();
+                let proxy_probe = listener.try_clone().unwrap();
+                proxy_probe.set_nonblocking(true).unwrap();
+                let peer = thread::spawn(move || {
+                    let mut stream = accept_http_test_connection(&listener);
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut greeting = [0_u8; 2];
+                    stream.read_exact(&mut greeting).unwrap();
+                    assert_eq!(greeting[0], 5);
+                    let mut methods = vec![0_u8; usize::from(greeting[1])];
+                    stream.read_exact(&mut methods).unwrap();
+                    assert!(methods.contains(&2));
+                    stream.write_all(&[5, 2]).unwrap();
+                    let mut version = [0_u8; 1];
+                    stream.read_exact(&mut version).unwrap();
+                    assert_eq!(version, [1]);
+                    assert_eq!(read_api_socks_string(&mut stream), b"api-proxy-user");
+                    assert_eq!(read_api_socks_string(&mut stream), b"api-proxy-password");
+                    stream.write_all(&[1, 1]).unwrap();
+                    stream.flush().unwrap();
+                    // Authentication was denied. No CONNECT destination or
+                    // private application bytes may follow the refusal.
+                    let mut byte = [0_u8; 1];
+                    match stream.read(&mut byte) {
+                        Ok(0) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                        other => {
+                            panic!("SOCKS auth refusal retained or reused its socket: {other:?}")
+                        }
+                    }
+                });
+                let endpoint = format!(
+                    "http://{}/v1/embeddings?key=query-canary",
+                    origin.local_addr().unwrap()
+                );
+                let mut child = api_proxy_environment_command(
+                    verified,
+                    &endpoint,
+                    Some("remote proxy failure"),
+                );
+                child
+                    .env(
+                        "http_proxy",
+                        format!("{scheme}://api-proxy-user:api-proxy-password@{proxy_address}"),
+                    )
+                    .env(
+                        "all_proxy",
+                        format!("http://{}", fallback.local_addr().unwrap()),
+                    );
+                let output = run_api_proxy_test_child(&mut child);
+                for (route, listener) in [
+                    ("origin", &origin),
+                    ("fallback", &fallback),
+                    ("another proxy connection", &proxy_probe),
+                ] {
+                    assert!(
+                        matches!(listener.accept(),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                        ),
+                        "{scheme}/{verified} contacted {route} after SOCKS authentication failed"
+                    );
+                }
+                assert!(
+                    output.status.success(),
+                    "{scheme}/{verified}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                peer.join().unwrap();
+            }
+        }
+    }
+
+    fn read_api_proxy_headers(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = stream.read(&mut buffer).unwrap();
+            assert!(count > 0, "proxy saw EOF before request headers");
+            bytes.extend_from_slice(&buffer[..count]);
+            assert!(
+                bytes.len() <= 16 * 1024,
+                "proxy headers exceeded test bound"
+            );
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn api_connect_refusal_authenticates_only_the_proxy_and_redacts_its_reason() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let proxy = thread::spawn(move || {
+            let mut stream = accept_http_test_connection(&listener);
+            let headers = read_api_proxy_headers(&mut stream);
+            stream.write_all(b"HTTP/1.1 407 api-proxy-password reflected-reason-canary\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            stream.flush().unwrap();
+            headers
+        });
+        run_test_with_cx(|cx| async move {
+            let provider = TestGatewayProvider {
+                endpoint: "https://embedding-provider.invalid:8443/embeddings?key=query-canary"
+                    .to_owned(),
+                dimension: 4,
+            };
+            let config = test_http_config(ProxySetting::Url(format!(
+                "http://api-proxy-user:api-proxy-password@{address}"
+            )));
+            let error = request_api_response(
+                &cx,
+                &provider,
+                &config,
+                &provider.endpoint,
+                &[(
+                    "Authorization".to_owned(),
+                    "Bearer api-key-canary".to_owned(),
+                )],
+                b"private-input-canary".to_vec(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(&error, ApiAttemptError::Terminal(_)), "{error:?}");
+            let rendered = format!("{error:?}");
+            assert!(rendered.contains("remote proxy tunnel refused"));
+            for secret in [
+                "api-proxy-user",
+                "api-proxy-password",
+                "reflected-reason-canary",
+                "api-key-canary",
+                "query-canary",
+                "private-input-canary",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        });
+        let headers = proxy.join().unwrap();
+        assert!(headers.starts_with("CONNECT embedding-provider.invalid:8443 HTTP/1.1\r\n"));
+        assert!(headers.lines().any(|line| {
+            line.split_once(':').is_some_and(|(name, value)| {
+                name.eq_ignore_ascii_case("proxy-authorization")
+                    && value.trim() == "Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk"
+            })
+        }));
+        for private in ["api-key-canary", "query-canary", "private-input-canary"] {
+            assert!(!headers.contains(private), "CONNECT exposed origin input");
+        }
+    }
+
+    const API_TLS_RESPONSE: &[u8] = br#"{"vectors":[[3.0,4.0,0.0,0.0]],"attestation":null}"#;
+
+    fn exchange_through_tls_proxy(
+        mode: TlsProxyMode,
+        trust_test_ca: bool,
+        hostname: &str,
+        wrong_proxy_name: bool,
+    ) -> (ApiAttemptResult<(u16, Vec<u8>)>, TlsProxyObservation) {
+        let (address, peer) = if wrong_proxy_name {
+            spawn_tls_proxy_with_wrong_proxy_name(mode, API_TLS_RESPONSE.to_vec())
+        } else {
+            spawn_tls_proxy(mode, API_TLS_RESPONSE.to_vec())
+        };
+        let scheme = if mode == TlsProxyMode::HttpsForward {
+            "http"
+        } else {
+            "https"
+        };
+        let proxy_scheme = if mode == TlsProxyMode::HttpConnect {
+            "http"
+        } else {
+            "https"
+        };
+        let mut result = None;
+        let result_slot = &mut result;
+        run_test_with_cx(|cx| async move {
+            let provider = TestGatewayProvider {
+                endpoint: format!("{scheme}://{hostname}:8443/embeddings?key=query-canary"),
+                dimension: 4,
+            };
+            let config = test_http_config(ProxySetting::Url(format!(
+                "{proxy_scheme}://api-proxy-user:api-proxy-password@{address}"
+            )));
+            let headers = [(
+                "Authorization".to_owned(),
+                "Bearer api-key-canary".to_owned(),
+            )];
+            *result_slot = Some(
+                asupersync::test_utils::assert_completes_within(
+                    Duration::from_secs(8),
+                    "verified TLS API exchange",
+                    || {
+                        Box::pin(request_api_response_with_client(
+                            &cx,
+                            &provider,
+                            &config,
+                            &provider.endpoint,
+                            &headers,
+                            b"private-input-canary".to_vec(),
+                            move |mut client_config: HttpClientConfig| {
+                                assert!(client_config.tls_root_certificates.is_empty());
+                                if trust_test_ca {
+                                    client_config.tls_root_certificates.push(root_certificate());
+                                }
+                                HttpClient::with_config(client_config)
+                            },
+                        ))
+                    },
+                )
+                .await,
+            );
+        });
+        (result.unwrap(), peer.join().unwrap())
+    }
+
+    #[test]
+    fn api_verified_tls_connect_and_https_proxies_return_complete_responses() {
+        for mode in [
+            TlsProxyMode::HttpConnect,
+            TlsProxyMode::HttpsForward,
+            TlsProxyMode::HttpsConnect,
+        ] {
+            let (result, observation) =
+                exchange_through_tls_proxy(mode, true, "embedding-provider.invalid", false);
+            let (status, response) = result.unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(response, API_TLS_RESPONSE);
+            let decoded: TestGatewayResponse = serde_json::from_slice(&response).unwrap();
+            assert_eq!(decoded.vectors, vec![vec![3.0, 4.0, 0.0, 0.0]]);
+            assert!(!observation.tls_rejected, "{mode:?}: {observation:?}");
+            assert_eq!(observation.request_body, b"private-input-canary");
+            let headers = observation.request_headers.as_ref().unwrap();
+            assert_eq!(
+                api_request_header(headers, "Authorization"),
+                Some("Bearer api-key-canary")
+            );
+            let proxy_auth = "Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk";
+            if mode == TlsProxyMode::HttpsForward {
+                assert!(observation.connect_headers.is_none());
+                assert!(headers.starts_with(
+                    "POST http://embedding-provider.invalid:8443/embeddings?key=query-canary HTTP/1.1\r\n"
+                ));
+                assert_eq!(
+                    api_request_header(headers, "Proxy-Authorization"),
+                    Some(proxy_auth)
+                );
+            } else {
+                assert!(headers.starts_with("POST /embeddings?key=query-canary HTTP/1.1\r\n"));
+                assert!(!headers.to_ascii_lowercase().contains("proxy-authorization"));
+                assert!(!headers.contains(proxy_auth));
+                for secret in ["api-proxy-user", "api-proxy-password"] {
+                    assert!(!headers.contains(secret));
+                }
+                let connect = observation.connect_headers.as_ref().unwrap();
+                assert!(
+                    connect.starts_with("CONNECT embedding-provider.invalid:8443 HTTP/1.1\r\n")
+                );
+                assert_eq!(
+                    api_request_header(connect, "Proxy-Authorization"),
+                    Some(proxy_auth)
+                );
+                assert_eq!(api_request_header(connect, "Authorization"), None);
+                for secret in ["api-key-canary", "query-canary", "private-input-canary"] {
+                    assert!(!connect.contains(secret));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn api_tls_proxies_reject_untrusted_certificates_and_wrong_origin_names() {
+        for mode in [
+            TlsProxyMode::HttpConnect,
+            TlsProxyMode::HttpsForward,
+            TlsProxyMode::HttpsConnect,
+        ] {
+            for trust_test_ca in [false, true] {
+                if trust_test_ca && mode == TlsProxyMode::HttpsForward {
+                    continue;
+                }
+                let hostname = if trust_test_ca {
+                    "wrong-host.invalid"
+                } else {
+                    "embedding-provider.invalid"
+                };
+                let (result, observation) =
+                    exchange_through_tls_proxy(mode, trust_test_ca, hostname, false);
+                let error = result.unwrap_err();
+                assert!(matches!(&error, ApiAttemptError::Terminal(_)), "{error:?}");
+                let rendered = format!("{error:?}");
+                assert!(
+                    rendered.contains("remote transport TLS failure"),
+                    "{rendered}"
+                );
+                for secret in [
+                    "api-proxy-user",
+                    "api-proxy-password",
+                    "api-key-canary",
+                    "query-canary",
+                    "private-input-canary",
+                ] {
+                    assert!(!rendered.contains(secret), "{rendered}");
+                }
+                assert!(observation.tls_rejected, "{mode:?}: {observation:?}");
+                assert!(observation.request_headers.is_none(), "{observation:?}");
+                assert!(observation.request_body.is_empty(), "{observation:?}");
+                if !trust_test_ca && mode != TlsProxyMode::HttpConnect {
+                    assert!(
+                        observation.connect_headers.is_none(),
+                        "an untrusted HTTPS proxy must not receive CONNECT credentials"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn api_https_proxies_reject_trusted_certificates_for_the_wrong_proxy_name() {
+        for mode in [TlsProxyMode::HttpsForward, TlsProxyMode::HttpsConnect] {
+            let (result, observation) =
+                exchange_through_tls_proxy(mode, true, "embedding-provider.invalid", true);
+            let error =
+                result.expect_err("a trusted issuer must not disable proxy hostname checks");
+            assert!(matches!(&error, ApiAttemptError::Terminal(_)), "{error:?}");
+            let rendered = format!("{error:?}");
+            assert!(
+                rendered.contains("remote transport TLS failure"),
+                "{rendered}"
+            );
+            for secret in [
+                "api-proxy-user",
+                "api-proxy-password",
+                "Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk",
+                "api-key-canary",
+                "query-canary",
+                "private-input-canary",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+            assert!(observation.tls_rejected, "{mode:?}: {observation:?}");
+            assert!(
+                observation.connect_headers.is_none(),
+                "a proxy with the wrong TLS identity must not receive CONNECT credentials"
+            );
+            assert!(observation.request_headers.is_none(), "{observation:?}");
+            assert!(observation.request_body.is_empty(), "{observation:?}");
+        }
+    }
+
+    fn read_api_tls_client_hello(stream: &mut TcpStream) {
+        let mut header = [0_u8; 5];
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(header[0], 0x16, "expected TLS handshake record");
+        assert_eq!(header[1], 0x03, "expected TLS record version");
+        let length = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        assert!(
+            length > 0 && length <= 16 * 1024,
+            "TLS ClientHello record limit"
+        );
+        let mut hello = vec![0_u8; length];
+        stream.read_exact(&mut hello).unwrap();
+        assert_eq!(hello[0], 1, "expected TLS ClientHello");
+        for secret in [
+            "api-proxy-user",
+            "api-proxy-password",
+            "Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk",
+            "api-key-canary",
+            "private-input-canary",
+        ] {
+            assert!(
+                !hello
+                    .windows(secret.len())
+                    .any(|bytes| bytes == secret.as_bytes()),
+                "TLS handshake exposed application or proxy credentials"
+            );
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ApiProxyStall {
+        Connect,
+        OriginTls,
+        ProxyTls,
+        SocksGreeting,
+        ResponseHeaders,
+        ResponseBody,
+    }
+
+    fn assert_api_stalled_proxy_terminates(point: ApiProxyStall, cancel: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (context_sender, context_receiver) = std::sync::mpsc::channel::<Cx>();
+        let proxy = thread::spawn(move || {
+            let mut stream = accept_http_test_connection(&listener);
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            if point == ApiProxyStall::SocksGreeting {
+                let mut greeting = [0_u8; 2];
+                stream.read_exact(&mut greeting).unwrap();
+                assert_eq!(greeting[0], 5);
+                let mut methods = vec![0_u8; usize::from(greeting[1])];
+                stream.read_exact(&mut methods).unwrap();
+            } else if point == ApiProxyStall::ProxyTls {
+                read_api_tls_client_hello(&mut stream);
+            } else if matches!(point, ApiProxyStall::Connect | ApiProxyStall::OriginTls) {
+                let headers = read_api_proxy_headers(&mut stream);
+                assert!(headers.starts_with("CONNECT embedding-provider.invalid:443 HTTP/1.1\r\n"));
+                assert!(!headers.contains("private-input-canary"));
+                assert!(!headers.contains("api-key-canary"));
+                if point == ApiProxyStall::OriginTls {
+                    stream
+                        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                        .unwrap();
+                    stream.flush().unwrap();
+                    read_api_tls_client_hello(&mut stream);
+                }
+            } else {
+                let (headers, body) = read_http_request(&mut stream);
+                assert!(
+                    headers.starts_with(
+                        "POST http://embedding-provider.invalid/embeddings HTTP/1.1\r\n"
+                    )
+                );
+                assert_eq!(body, b"private-input-canary");
+                if point == ApiProxyStall::ResponseBody {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                        )
+                        .unwrap();
+                    stream.flush().unwrap();
+                }
+            }
+            if cancel {
+                context_receiver
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .cancel_with(
+                        asupersync::CancelKind::User,
+                        Some("cancel silent API proxy"),
+                    );
+            }
+            // The peer never supplies the missing reply/bytes or closes first.
+            // Observe client-owned connection release before the fixture exits.
+            let mut byte = [0_u8; 1];
+            match stream.read(&mut byte) {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("API request retained its stalled socket: {other:?}"),
+            }
+        });
+        let (scheme, proxy_scheme) = match point {
+            ApiProxyStall::Connect | ApiProxyStall::OriginTls => ("https", "http"),
+            ApiProxyStall::ProxyTls => ("https", "https"),
+            ApiProxyStall::SocksGreeting => ("http", "socks5h"),
+            ApiProxyStall::ResponseHeaders | ApiProxyStall::ResponseBody => ("http", "http"),
+        };
+        run_test_with_cx(|cx| async move {
+            context_sender.send(cx.clone()).unwrap();
+            let provider = TestGatewayProvider {
+                endpoint: format!("{scheme}://embedding-provider.invalid/embeddings"),
+                dimension: 4,
+            };
+            let config = ApiEmbedderConfig {
+                request_timeout: if cancel {
+                    Duration::from_secs(3)
+                } else {
+                    Duration::from_millis(250)
+                },
+                ..test_http_config(ProxySetting::Url(format!(
+                    "{proxy_scheme}://api-proxy-user:api-proxy-password@{address}"
+                )))
+            };
+            let headers = [(
+                "Authorization".to_owned(),
+                "Bearer api-key-canary".to_owned(),
+            )];
+            let error = asupersync::test_utils::assert_completes_within(
+                Duration::from_secs(4),
+                "API stalled proxy must release its request",
+                || {
+                    Box::pin(request_api_response(
+                        &cx,
+                        &provider,
+                        &config,
+                        &provider.endpoint,
+                        &headers,
+                        b"private-input-canary".to_vec(),
+                    ))
+                },
+            )
+            .await
+            .unwrap_err();
+            if cancel {
+                assert!(
+                    matches!(
+                        &error,
+                        ApiAttemptError::Terminal(SearchError::Cancelled { .. })
+                    ),
+                    "{error:?}"
+                );
+            } else {
+                assert!(matches!(&error, ApiAttemptError::Retry(_)), "{error:?}");
+                assert!(format!("{error:?}").contains("remote request deadline exceeded"));
+            }
+            let rendered = format!("{error:?}");
+            for secret in [
+                "api-proxy-user",
+                "api-proxy-password",
+                "api-key-canary",
+                "private-input-canary",
+            ] {
+                assert!(!rendered.contains(secret), "{rendered}");
+            }
+        });
+        proxy.join().unwrap();
+    }
+
+    #[test]
+    fn api_stalled_connect_socks_headers_and_body_have_finite_deadlines() {
+        for point in [
+            ApiProxyStall::Connect,
+            ApiProxyStall::SocksGreeting,
+            ApiProxyStall::ResponseHeaders,
+            ApiProxyStall::ResponseBody,
+        ] {
+            assert_api_stalled_proxy_terminates(point, false);
+        }
+    }
+
+    #[test]
+    fn api_cancelled_connect_socks_headers_and_body_release_the_socket() {
+        for point in [
+            ApiProxyStall::Connect,
+            ApiProxyStall::SocksGreeting,
+            ApiProxyStall::ResponseHeaders,
+            ApiProxyStall::ResponseBody,
+        ] {
+            assert_api_stalled_proxy_terminates(point, true);
+        }
+    }
+
+    #[test]
+    fn api_stalled_origin_and_proxy_tls_handshakes_have_finite_deadlines() {
+        for point in [ApiProxyStall::OriginTls, ApiProxyStall::ProxyTls] {
+            assert_api_stalled_proxy_terminates(point, false);
+        }
+    }
+
+    #[test]
+    fn api_cancelled_origin_and_proxy_tls_handshakes_release_the_socket() {
+        for point in [ApiProxyStall::OriginTls, ApiProxyStall::ProxyTls] {
+            assert_api_stalled_proxy_terminates(point, true);
+        }
+    }
+
     // A subprocess supplies an isolated environment without unsafe set_var or
     // races with the test runner. The parent is the real HTTP proxy/origin.
     #[test]
@@ -3549,15 +4257,91 @@ mod tests {
         let verified = case.starts_with("verified-");
         let direct = case.ends_with("-direct");
         let endpoint = std::env::var("FRANKENSEARCH_TEST_API_ENDPOINT").unwrap();
-        assert_api_proxy_round_trip(
-            verified,
-            test_http_config(if direct {
-                ProxySetting::Disabled
-            } else {
-                ProxySetting::FromEnvironment
-            }),
-            endpoint,
-        );
+        let config = test_http_config(if direct {
+            ProxySetting::Disabled
+        } else {
+            ProxySetting::FromEnvironment
+        });
+        if let Ok(expected) = std::env::var("FRANKENSEARCH_TEST_API_PROXY_EXPECT_ERROR") {
+            run_test_with_cx(|cx| async move {
+                let provider = Box::new(TestGatewayProvider {
+                    endpoint,
+                    dimension: 4,
+                });
+                let error = if verified {
+                    ApiEmbedder::new_verified(
+                        provider,
+                        config,
+                        Some(remote_test_identity(4)),
+                        test_attester(),
+                    )
+                    .unwrap()
+                    .embed_batch(&cx, &["private-input-canary"])
+                    .await
+                    .expect_err("proxy refusal must reach the verified public entry point")
+                } else {
+                    AssumedRemoteApi::new(provider, config, Some(remote_test_identity(4)))
+                        .unwrap()
+                        .embed_transient(&cx, "private-input-canary")
+                        .await
+                        .expect_err("proxy refusal must reach the assumed public entry point")
+                };
+                assert!(matches!(&error, SearchError::EmbeddingFailed { .. }));
+                let rendered = format!("{error}\n{error:?}");
+                assert!(rendered.contains(&expected), "{rendered}");
+                for secret in [
+                    "api-proxy-user",
+                    "api-proxy-password",
+                    "private-input-canary",
+                    "query-canary",
+                    "proxy-reason-canary",
+                ] {
+                    assert!(!rendered.contains(secret), "{rendered}");
+                }
+            });
+        } else {
+            assert_api_proxy_round_trip(verified, config, endpoint);
+        }
+    }
+
+    fn api_proxy_environment_command(
+        verified: bool,
+        endpoint: &str,
+        expected_error: Option<&str>,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "api_embedder::tests::api_proxy_environment_child",
+            "--nocapture",
+        ]);
+        for variable in [
+            "http_proxy",
+            "HTTP_PROXY",
+            "https_proxy",
+            "HTTPS_PROXY",
+            "all_proxy",
+            "ALL_PROXY",
+            "no_proxy",
+            "NO_PROXY",
+            "FRANKENSEARCH_TEST_API_PROXY_EXPECT_ERROR",
+        ] {
+            command.env_remove(variable);
+        }
+        command
+            .env(
+                "FRANKENSEARCH_TEST_API_PROXY_CASE",
+                if verified {
+                    "verified-environment"
+                } else {
+                    "assumed-environment"
+                },
+            )
+            .env("FRANKENSEARCH_TEST_API_ENDPOINT", endpoint);
+        if let Some(expected_error) = expected_error {
+            command.env("FRANKENSEARCH_TEST_API_PROXY_EXPECT_ERROR", expected_error);
+        }
+        command
     }
 
     fn run_api_proxy_test_child(command: &mut std::process::Command) -> std::process::Output {
@@ -3654,6 +4438,209 @@ mod tests {
         }
     }
 
+    #[test]
+    fn api_valid_environment_precedence_selects_only_the_required_proxy() {
+        for (scheme, selected) in [
+            ("http", "http_proxy"),
+            ("http", "all_proxy"),
+            ("http", "ALL_PROXY"),
+            ("https", "https_proxy"),
+            ("https", "HTTPS_PROXY"),
+            ("https", "all_proxy"),
+            ("https", "ALL_PROXY"),
+        ] {
+            for verified in [false, true] {
+                let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+                let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
+                origin.set_nonblocking(true).unwrap();
+                fallback.set_nonblocking(true).unwrap();
+                let origin_address = origin.local_addr().unwrap();
+                let fallback_url = format!("http://{}", fallback.local_addr().unwrap());
+                let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+                let proxy_url = format!(
+                    "http://api-proxy-user:api-proxy-password@{}",
+                    proxy.local_addr().unwrap()
+                );
+                let server = if scheme == "https" {
+                    // An exact CONNECT refusal proves HTTPS environment routing;
+                    // successful certificate-verified transfers are separate tests.
+                    thread::spawn(move || {
+                        let mut stream = accept_http_test_connection(&proxy);
+                        let headers = read_api_proxy_headers(&mut stream);
+                        stream.write_all(b"HTTP/1.1 407 proxy-reason-canary\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        (headers, Vec::new())
+                    })
+                } else {
+                    serve_one_proxy_embedding(proxy, verified)
+                };
+                let endpoint =
+                    format!("{scheme}://{origin_address}/v1/embeddings?key=query-canary");
+                let mut child = api_proxy_environment_command(
+                    verified,
+                    &endpoint,
+                    (scheme == "https").then_some("remote proxy tunnel refused"),
+                );
+                match selected {
+                    "http_proxy" | "https_proxy" | "HTTPS_PROXY" => {
+                        child.env("all_proxy", &fallback_url);
+                        if !cfg!(windows) {
+                            child.env("ALL_PROXY", &fallback_url);
+                            if selected == "https_proxy" {
+                                child.env("HTTPS_PROXY", &fallback_url);
+                            }
+                        }
+                    }
+                    "all_proxy" | "ALL_PROXY" => {
+                        child.env(
+                            if scheme == "http" {
+                                "http_proxy"
+                            } else {
+                                "https_proxy"
+                            },
+                            " \t ",
+                        );
+                        if !cfg!(windows) {
+                            if selected == "all_proxy" {
+                                child.env("ALL_PROXY", &fallback_url);
+                            } else {
+                                child.env("all_proxy", " \t ");
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                // A proxy for the other scheme must not override this choice.
+                child.env(
+                    if scheme == "http" {
+                        "https_proxy"
+                    } else {
+                        "http_proxy"
+                    },
+                    &fallback_url,
+                );
+                if scheme == "http" && !cfg!(windows) {
+                    child.env("HTTP_PROXY", &fallback_url);
+                }
+                child.env(selected, proxy_url);
+                let output = run_api_proxy_test_child(&mut child);
+                for (route, listener) in [("origin", &origin), ("fallback", &fallback)] {
+                    assert!(
+                        matches!(listener.accept(),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                        ),
+                        "{scheme}/{selected}/{verified} contacted the unauthorized {route}"
+                    );
+                }
+                assert!(
+                    output.status.success(),
+                    "{scheme}/{selected}/{verified}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let (headers, body) = server.join().unwrap();
+                assert_eq!(
+                    api_request_header(&headers, "Proxy-Authorization"),
+                    Some("Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk")
+                );
+                if scheme == "https" {
+                    assert!(headers.starts_with(&format!("CONNECT {origin_address} HTTP/1.1\r\n")));
+                    assert_eq!(api_request_header(&headers, "Authorization"), None);
+                    assert!(!headers.contains("query-canary"));
+                    assert!(!headers.contains("private-input-canary"));
+                    assert!(body.is_empty());
+                } else {
+                    assert!(headers.starts_with(&format!("POST {endpoint} HTTP/1.1\r\n")));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn api_no_proxy_rules_bypass_only_matching_destinations_in_both_trust_modes() {
+        for rule in [
+            "host",
+            "port",
+            "cidr",
+            "wildcard",
+            "wrong-port",
+            "lower-precedence",
+        ] {
+            if rule == "lower-precedence" && cfg!(windows) {
+                continue;
+            }
+            for verified in [false, true] {
+                let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+                let origin_address = origin.local_addr().unwrap();
+                let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+                let proxy_address = proxy.local_addr().unwrap();
+                let direct = !matches!(rule, "wrong-port" | "lower-precedence");
+                let (server, unused) = if direct {
+                    (serve_one_proxy_embedding(origin, verified), proxy)
+                } else {
+                    (serve_one_proxy_embedding(proxy, verified), origin)
+                };
+                unused.set_nonblocking(true).unwrap();
+                let endpoint = format!("http://{origin_address}/v1/embeddings");
+                let mut child = api_proxy_environment_command(verified, &endpoint, None);
+                child.env(
+                    "http_proxy",
+                    format!("http://api-proxy-user:api-proxy-password@{proxy_address}"),
+                );
+                match rule {
+                    "host" => {
+                        child.env("no_proxy", "127.0.0.1");
+                    }
+                    "port" => {
+                        child.env("no_proxy", origin_address.to_string());
+                    }
+                    "cidr" => {
+                        child.env("no_proxy", "127.0.0.0/8");
+                    }
+                    "wildcard" => {
+                        child.env("NO_PROXY", "*");
+                    }
+                    "wrong-port" => {
+                        child.env(
+                            "no_proxy",
+                            format!("127.0.0.1:{}", origin_address.port().wrapping_add(1)),
+                        );
+                    }
+                    "lower-precedence" => {
+                        child
+                            .env("no_proxy", "not-this-origin.invalid")
+                            .env("NO_PROXY", "*");
+                    }
+                    _ => unreachable!(),
+                }
+                let output = run_api_proxy_test_child(&mut child);
+                assert!(
+                    matches!(unused.accept(),
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                    ),
+                    "{rule}/{verified} contacted the route excluded by NO_PROXY policy"
+                );
+                assert!(
+                    output.status.success(),
+                    "{rule}/{verified}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let (headers, _) = server.join().unwrap();
+                let target = if direct { "/v1/embeddings" } else { &endpoint };
+                assert!(headers.starts_with(&format!("POST {target} HTTP/1.1\r\n")));
+                assert_eq!(
+                    api_request_header(&headers, "Proxy-Authorization"),
+                    (!direct).then_some("Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk")
+                );
+                if direct {
+                    for secret in ["api-proxy-user", "api-proxy-password"] {
+                        assert!(!headers.contains(secret));
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn api_proxy_non_unicode_environment_child() {
@@ -3711,14 +4698,32 @@ mod tests {
     fn api_proxy_non_unicode_policy_never_connects_directly_or_to_a_fallback() {
         use std::os::unix::ffi::OsStringExt;
 
-        for variable in ["http_proxy", "all_proxy", "no_proxy"] {
+        for (scheme, variable, fallback_variable) in [
+            ("http", "http_proxy", Some("all_proxy")),
+            ("http", "all_proxy", Some("ALL_PROXY")),
+            ("http", "ALL_PROXY", None),
+            ("http", "no_proxy", Some("http_proxy")),
+            ("http", "NO_PROXY", Some("http_proxy")),
+            ("https", "https_proxy", Some("HTTPS_PROXY")),
+            ("https", "HTTPS_PROXY", Some("all_proxy")),
+            ("https", "all_proxy", Some("ALL_PROXY")),
+            ("https", "ALL_PROXY", None),
+            ("https", "no_proxy", Some("https_proxy")),
+            ("https", "NO_PROXY", Some("https_proxy")),
+        ] {
             for trust in ["verified", "assumed"] {
                 for fallback_enabled in [false, true] {
+                    // ALL_PROXY is the last candidate, so there is no lower-priority
+                    // proxy to configure without shadowing the malformed value.
+                    if fallback_enabled && fallback_variable.is_none() {
+                        continue;
+                    }
                     let origin = TcpListener::bind("127.0.0.1:0").unwrap();
                     let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
                     origin.set_nonblocking(true).unwrap();
                     fallback.set_nonblocking(true).unwrap();
-                    let endpoint = format!("http://{}/embeddings", origin.local_addr().unwrap());
+                    let endpoint =
+                        format!("{scheme}://{}/embeddings", origin.local_addr().unwrap());
                     let fallback_url = format!("http://{}", fallback.local_addr().unwrap());
                     let mut child = std::process::Command::new(std::env::current_exe().unwrap());
                     child.args([
@@ -3741,10 +4746,7 @@ mod tests {
                     // A reachable lower-priority route must never receive private
                     // input when the selected setting cannot be decoded.
                     if fallback_enabled {
-                        child.env("ALL_PROXY", &fallback_url);
-                        if variable == "no_proxy" {
-                            child.env("http_proxy", &fallback_url);
-                        }
+                        child.env(fallback_variable.unwrap(), &fallback_url);
                     }
                     if variable == "no_proxy" {
                         child.env("NO_PROXY", "*");
@@ -3763,12 +4765,12 @@ mod tests {
                             matches!(listener.accept(),
                                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
                             ),
-                            "{variable}/{trust}/{fallback_enabled} opened the unauthorized {route}"
+                            "{scheme}/{variable}/{trust}/{fallback_enabled} opened the unauthorized {route}"
                         );
                     }
                     assert!(
                         output.status.success(),
-                        "{variable}/{trust}/{fallback_enabled}: {}\n{}",
+                        "{scheme}/{variable}/{trust}/{fallback_enabled}: {}\n{}",
                         String::from_utf8_lossy(&output.stdout),
                         String::from_utf8_lossy(&output.stderr)
                     );
@@ -3914,6 +4916,157 @@ mod tests {
         assert!(second_headers.contains("api-key-canary"));
         assert_eq!(first_body, b"private-input-canary");
         assert_eq!(second_body, first_body);
+    }
+
+    #[test]
+    fn api_same_origin_redirects_keep_post_credentials_and_selected_proxy() {
+        for redirect_status in [307, 308] {
+            let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+            origin.set_nonblocking(true).unwrap();
+            let origin_address = origin.local_addr().unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let proxy_address = listener.local_addr().unwrap();
+            let endpoint = format!("http://{origin_address}/embeddings?key=query-canary");
+            let server = thread::spawn(move || {
+                let mut stream = accept_http_test_connection(&listener);
+                let first = read_http_request(&mut stream);
+                write!(stream, "HTTP/1.1 {redirect_status} Redirect\r\nLocation: /canonical\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                drop(stream);
+                let mut stream = accept_http_test_connection(&listener);
+                let second = read_http_request(&mut stream);
+                write_http_response(&mut stream, 200, API_TLS_RESPONSE);
+                (first, second)
+            });
+            run_test_with_cx(|cx| async move {
+                let provider = TestGatewayProvider {
+                    endpoint,
+                    dimension: 4,
+                };
+                let (status, body) = request_api_response(
+                    &cx,
+                    &provider,
+                    &test_http_config(ProxySetting::Url(format!(
+                        "http://api-proxy-user:api-proxy-password@{proxy_address}"
+                    ))),
+                    &provider.endpoint,
+                    &[(
+                        "Authorization".to_owned(),
+                        "Bearer api-key-canary".to_owned(),
+                    )],
+                    b"private-input-canary".to_vec(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(status, 200);
+                assert_eq!(body, API_TLS_RESPONSE);
+            });
+            let ((first_headers, first_body), (second_headers, second_body)) =
+                server.join().unwrap();
+            assert!(first_headers.starts_with(&format!(
+                "POST http://{origin_address}/embeddings?key=query-canary HTTP/1.1\r\n"
+            )));
+            assert!(second_headers.starts_with(&format!(
+                "POST http://{origin_address}/canonical HTTP/1.1\r\n"
+            )));
+            for headers in [&first_headers, &second_headers] {
+                assert_eq!(
+                    api_request_header(headers, "Authorization"),
+                    Some("Bearer api-key-canary")
+                );
+                assert_eq!(
+                    api_request_header(headers, "Proxy-Authorization"),
+                    Some("Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk")
+                );
+            }
+            assert_eq!(first_body, b"private-input-canary");
+            assert_eq!(second_body, first_body);
+            assert!(
+                matches!(origin.accept(),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ),
+                "a same-origin redirect bypassed the required proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn api_cross_origin_redirects_through_a_proxy_never_replay_or_bypass() {
+        for redirect_status in [307, 308] {
+            for changes_scheme in [false, true] {
+                let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+                let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+                origin.set_nonblocking(true).unwrap();
+                destination.set_nonblocking(true).unwrap();
+                let origin_address = origin.local_addr().unwrap();
+                let endpoint = format!("http://{origin_address}/embeddings?key=query-canary");
+                let target = if changes_scheme {
+                    format!("https://{origin_address}/must-not-receive-input")
+                } else {
+                    format!(
+                        "http://{}/must-not-receive-input",
+                        destination.local_addr().unwrap()
+                    )
+                };
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let proxy_address = listener.local_addr().unwrap();
+                let proxy_probe = listener.try_clone().unwrap();
+                proxy_probe.set_nonblocking(true).unwrap();
+                let server = thread::spawn(move || {
+                    let mut stream = accept_http_test_connection(&listener);
+                    let request = read_http_request(&mut stream);
+                    write!(stream, "HTTP/1.1 {redirect_status} Redirect\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                    request
+                });
+                run_test_with_cx(|cx| async move {
+                    let provider = TestGatewayProvider {
+                        endpoint,
+                        dimension: 4,
+                    };
+                    let (status, body) = request_api_response(
+                        &cx,
+                        &provider,
+                        &test_http_config(ProxySetting::Url(format!(
+                            "http://api-proxy-user:api-proxy-password@{proxy_address}"
+                        ))),
+                        &provider.endpoint,
+                        &[(
+                            "Authorization".to_owned(),
+                            "Bearer api-key-canary".to_owned(),
+                        )],
+                        b"private-input-canary".to_vec(),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(status, redirect_status);
+                    assert!(body.is_empty());
+                });
+                let (headers, body) = server.join().unwrap();
+                assert!(headers.starts_with(&format!(
+                    "POST http://{origin_address}/embeddings?key=query-canary HTTP/1.1\r\n"
+                )));
+                assert_eq!(
+                    api_request_header(&headers, "Authorization"),
+                    Some("Bearer api-key-canary")
+                );
+                assert_eq!(
+                    api_request_header(&headers, "Proxy-Authorization"),
+                    Some("Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk")
+                );
+                assert_eq!(body, b"private-input-canary");
+                for (route, listener) in [
+                    ("origin", &origin),
+                    ("redirect destination", &destination),
+                    ("another proxy connection", &proxy_probe),
+                ] {
+                    assert!(
+                        matches!(listener.accept(),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                        ),
+                        "{redirect_status}/{changes_scheme} followed a cross-origin redirect via {route}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
