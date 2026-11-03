@@ -11,6 +11,9 @@
   from filesystem source checkpoints. Completion still requires the original
   quality producer and rejects damaged or missing inputs. Clearing forced
   deferral leaves pending work for explicit completion.
+- Deleting the last pending document clears its debt while preserving the
+  producer choice for later appends. Empty compaction carries that choice;
+  new semantic input can still complete with the original quality producer.
 
 ### Unreleased — Quill 0.4.2 producer metadata (#68, 2026-10-28)
 

@@ -26,11 +26,11 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     AdmittedEmbedder, CheckpointFileEntry, FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsIndexPayload,
-    FsfsRuntime, IndexManifestEntry, IndexRunControl, IngestionClass, PendingIndexDocument,
-    REASON_VECTOR_QUALITY_TIER_BUILT, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE,
-    SearchExecutionMode, VectorIndex, content_sha256_hex, ingestion_class_label,
-    pressure_timestamp_ms, protect_vector_generations, retained_reuse, retained_search_checkpoint,
-    validate_retained_catalog_path,
+    FsfsRuntime, IndexManifestEntry, IndexRunControl, IndexSentinel, IngestionClass,
+    PendingIndexDocument, REASON_VECTOR_QUALITY_TIER_BUILT,
+    REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE, SearchExecutionMode, VectorIndex,
+    content_sha256_hex, ingestion_class_label, pressure_timestamp_ms, protect_vector_generations,
+    retained_reuse, retained_search_checkpoint, validate_retained_catalog_path,
 };
 use crate::generation_store::{
     CompleteGenerationStore, GenerationPublication, PublishedGeneration,
@@ -425,6 +425,50 @@ fn validate_pending_jobs(
     Ok(())
 }
 
+/// An empty queue owes no inference, but its exact generation-bound descriptor
+/// still records the requested producer. Carry that intent without inventing
+/// inputs or filesystem reuse authority. Completed and intentional fast-only
+/// generations must not acquire a quality tier from stale catalog metadata.
+fn open_carried_backlog(
+    runtime: &FsfsRuntime,
+    predecessor: &PublishedGeneration,
+    previous: &IndexSentinel,
+) -> SearchResult<Option<(Storage, Backlog)>> {
+    let deferred = previous
+        .reason_codes
+        .iter()
+        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
+    if (!deferred
+        && predecessor
+            .path()
+            .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+            .try_exists()?)
+        || !runtime.resolve_storage_db_path()?.try_exists()?
+    {
+        return Ok(None);
+    }
+    let storage = open_catalog(runtime, false)?;
+    let Some(metadata) = storage.get_index_metadata(BACKLOG_NAME)? else {
+        return Ok(None);
+    };
+    if !deferred
+        && (metadata.record_count != 0
+            || metadata.source_doc_count != 0
+            || metadata.file_hash.as_deref() != Some(previous.source_hash_hex.as_str()))
+    {
+        return Ok(None);
+    }
+    let backlog = read_backlog(&storage)?;
+    if !deferred
+        && (backlog.requested_documents != 0
+            || backlog.generation_root != predecessor.path().display().to_string()
+            || backlog.source_hash != previous.source_hash_hex)
+    {
+        return Ok(None);
+    }
+    Ok(Some((storage, backlog)))
+}
+
 /// Move an admitted source backlog to an owned-text fence in the independently
 /// copied candidate. Version 2 certifies embedding input, never filesystem bytes
 /// or upgrade reuse. Validate every old job before replacing its source fence.
@@ -436,19 +480,10 @@ pub(super) fn begin_content_upserts(
     retained_search_checkpoint(cx)?;
     let previous = FsfsRuntime::read_index_sentinel(predecessor.path())?
         .ok_or_else(|| invalid("batch predecessor has no completion sentinel"))?;
-    if !previous
-        .reason_codes
-        .iter()
-        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
-        || !candidate.resolve_storage_db_path()?.try_exists()?
-    {
+    let Some((storage, mut backlog)) = open_carried_backlog(candidate, predecessor, &previous)?
+    else {
         return Ok(false);
-    }
-    let storage = open_catalog(candidate, false)?;
-    if storage.get_index_metadata(BACKLOG_NAME)?.is_none() {
-        return Ok(false);
-    }
-    let mut backlog = read_backlog(&storage)?;
+    };
     if backlog.generation_root != predecessor.path().display().to_string()
         || backlog.source_hash != previous.source_hash_hex
         || backlog.unavailable_documents != 0
@@ -459,7 +494,19 @@ pub(super) fn begin_content_upserts(
     }
     let manifests = FsfsRuntime::read_matching_manifest_generation(predecessor.path())?
         .ok_or_else(|| invalid("batch predecessor membership manifests disagree"))?;
-    let checkpoint = if backlog.schema_version == 1 {
+    if manifests
+        .values()
+        .filter(|entry| {
+            entry.ingestion_class == ingestion_class_label(IngestionClass::FullSemanticLexical)
+        })
+        .count()
+        != backlog.requested_documents
+    {
+        return Err(invalid(
+            "deferred quality coverage disagrees with selected membership",
+        ));
+    }
+    let checkpoint = if backlog.schema_version == 1 && backlog.requested_documents != 0 {
         Some(retained_reuse::completed_input_checkpoint(cx, predecessor)?)
     } else {
         None
@@ -571,6 +618,15 @@ pub(super) fn finish_content_upserts(
             .reason_codes
             .retain(|reason| reason != REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE);
         candidate.write_index_sentinel(destination, &sentinel)?;
+    } else if !sentinel
+        .reason_codes
+        .iter()
+        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+    {
+        sentinel
+            .reason_codes
+            .push(REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE.to_owned());
+        candidate.write_index_sentinel(destination, &sentinel)?;
     }
     retained_search_checkpoint(cx)
 }
@@ -593,21 +649,10 @@ where
     retained_search_checkpoint(cx)?;
     let previous = FsfsRuntime::read_index_sentinel(predecessor.path())?
         .ok_or_else(|| invalid("maintenance predecessor has no completion sentinel"))?;
-    if !previous
-        .reason_codes
-        .iter()
-        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
-        || !runtime.resolve_storage_db_path()?.try_exists()?
-    {
+    let Some((storage, mut backlog)) = open_carried_backlog(runtime, predecessor, &previous)?
+    else {
         return Ok(());
-    }
-    let storage = open_catalog(runtime, false)?;
-    // Older or unregistered deferral can have no resumable work. Preserve that
-    // existing fast-only state rather than inventing a producer or input fence.
-    if storage.get_index_metadata(BACKLOG_NAME)?.is_none() {
-        return Ok(());
-    }
-    let mut backlog = read_backlog(&storage)?;
+    };
     if backlog.generation_root != predecessor.path().display().to_string()
         || backlog.source_hash != previous.source_hash_hex
         || backlog.unavailable_documents != 0
@@ -624,8 +669,13 @@ where
             entry.ingestion_class == ingestion_class_label(IngestionClass::FullSemanticLexical)
         })
         .count();
+    if requested > backlog.requested_documents {
+        return Err(invalid(
+            "maintenance cannot grow the declared deferred membership",
+        ));
+    }
     let checkpoint =
-        if backlog.schema_version == 2 {
+        if backlog.schema_version == 2 || backlog.requested_documents == 0 {
             None
         } else if requested == 0 {
             // No remaining semantic member owes inference, including deletion of
@@ -1877,6 +1927,181 @@ mod tests {
             assert!(quality.inputs.lock().unwrap().is_empty());
             assert_eq!(files(first.path()), before);
         });
+    }
+
+    #[test]
+    fn empty_backlog_preserves_producer_intent_through_compaction_and_cli_upserts() {
+        use super::super::retained_batch::RetainedMutation;
+
+        for owned_inputs in [false, true] {
+            run(|cx| async move {
+                let directory = tempfile::tempdir().unwrap();
+                source_fixture(directory.path());
+                let fast = Arc::new(Producer::new("deferred-fast"));
+                let quality = Arc::new(Producer::new("deferred-quality"));
+                let _providers = Providers::install(Arc::clone(&fast), Arc::clone(&quality));
+                let deferred = runtime(directory.path(), true);
+                let cleared = runtime(directory.path(), false);
+                let root = directory.path().join("store");
+                let first = durable(
+                    deferred
+                        .rebuild_retained_generation(&cx, &root)
+                        .await
+                        .unwrap(),
+                );
+                let before = files(first.path());
+                let mut history = vec![(first, before)];
+                if owned_inputs {
+                    let result = deferred
+                        .apply_retained_batch(
+                            &cx,
+                            &root,
+                            &history.last().unwrap().0,
+                            &[RetainedMutation::Upsert {
+                                id: "alpha.md".to_owned(),
+                                text: "replacement initial alpha".to_owned(),
+                            }],
+                        )
+                        .await
+                        .unwrap();
+                    let next = durable(result.publication.unwrap());
+                    let before = files(next.path());
+                    history.push((next, before));
+                }
+                fs::rename(
+                    directory.path().join("source"),
+                    directory.path().join("source-gone"),
+                )
+                .unwrap();
+                fast.inputs.lock().unwrap().clear();
+                let operations = ["alpha.md", "beta.md"]
+                    .map(|id| RetainedMutation::Delete { id: id.to_owned() });
+                let result = deferred
+                    .apply_retained_batch(&cx, &root, &history.last().unwrap().0, &operations)
+                    .await
+                    .unwrap();
+                let empty = durable(result.publication.unwrap());
+                let before = files(empty.path());
+                history.push((empty, before));
+                let (compacted, _) = cleared
+                    .compact_retained_generation(&cx, &root)
+                    .await
+                    .unwrap();
+                if let Some(publication) = compacted {
+                    let empty = durable(publication);
+                    let before = files(empty.path());
+                    history.push((empty, before));
+                }
+                let sentinel = FsfsRuntime::read_index_sentinel(history.last().unwrap().0.path())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(sentinel.indexed_files, 0);
+                assert!(
+                    !sentinel
+                        .reason_codes
+                        .iter()
+                        .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+                );
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                assert!(quality.inputs.lock().unwrap().is_empty());
+
+                // Empty membership must retain the original producer rather
+                // than borrowing the caller's newly available model identity.
+                let foreign = Arc::new(Producer::new("foreign-empty-quality"));
+                set_test_quality_embedder(Some(foreign.clone()));
+                for (forced, id, text) in [
+                    (true, "gamma.md", "intermediate owned gamma"),
+                    (false, "delta.md", "latest owned delta"),
+                ] {
+                    let input = directory.path().join(format!("{id}.jsonl"));
+                    fs::write(
+                        &input,
+                        serde_json::json!({"id": id, "text": text}).to_string(),
+                    )
+                    .unwrap();
+                    let mut caller = runtime(directory.path(), forced);
+                    caller.cli_input.command = CliCommand::AppendBatch;
+                    caller.cli_input.input_file = Some(input);
+                    let (publication, count) =
+                        caller.append_retained_generation(&cx, &root).await.unwrap();
+                    assert_eq!(count, 1);
+                    let next = durable(publication.unwrap());
+                    let sentinel = FsfsRuntime::read_index_sentinel(next.path())
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        sentinel
+                            .reason_codes
+                            .iter()
+                            .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+                    );
+                    assert!(!next.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists());
+                    let before = files(next.path());
+                    history.push((next, before));
+                    if forced {
+                        let result = cleared
+                            .apply_retained_batch(
+                                &cx,
+                                &root,
+                                &history.last().unwrap().0,
+                                &[RetainedMutation::Delete { id: id.to_owned() }],
+                            )
+                            .await
+                            .unwrap();
+                        let empty = durable(result.publication.unwrap());
+                        let before = files(empty.path());
+                        history.push((empty, before));
+                        let (compacted, _) = cleared
+                            .compact_retained_generation(&cx, &root)
+                            .await
+                            .unwrap();
+                        if let Some(publication) = compacted {
+                            let empty = durable(publication);
+                            let before = files(empty.path());
+                            history.push((empty, before));
+                        }
+                    }
+                }
+                assert_eq!(fast.inputs.lock().unwrap().len(), 2);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                let selected = &history.last().unwrap().0;
+                let error = runtime(directory.path(), false)
+                    .complete_retained_quality(&cx, &root, selected)
+                    .await
+                    .unwrap_err();
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == "index.complete_quality"));
+                assert!(foreign.inputs.lock().unwrap().is_empty());
+                set_test_quality_embedder(Some(quality.clone()));
+                let fast_before = fs::read(selected.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap();
+                let completed = runtime(directory.path(), false)
+                    .complete_retained_quality(&cx, &root, selected)
+                    .await
+                    .unwrap();
+                assert_eq!(completed.completed_documents, 1);
+                let completed = durable(completed.publication);
+                assert_eq!(
+                    fs::read(completed.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                    fast_before
+                );
+                assert_eq!(
+                    quality.inputs.lock().unwrap().as_slice(),
+                    &["latest owned delta"]
+                );
+                assert_eq!(
+                    VectorIndex::open_read_only(
+                        &completed.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                    )
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap(),
+                    std::collections::HashSet::from(["delta.md".to_owned()])
+                );
+                for (generation, before) in &history {
+                    assert_eq!(files(generation.path()), *before);
+                }
+            });
+        }
     }
 
     #[test]
