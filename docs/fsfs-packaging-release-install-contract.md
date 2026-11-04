@@ -642,8 +642,9 @@ stages. Clippy also checks the optional HTTP features. The installer checker
 requires Python `jsonschema`; its verifier fixtures establish orchestration,
 while release signatures must additionally pass the real Minisign verifier.
 The installer stage also runs `--mode dsr-tests` for the staged-artifact
-validator's positive and negative fixtures; those synthetic cases do not
-constitute a signed release or a native execution result.
+validator and `--mode proxy-binary-tests` for the executable proxy runner.
+These fixture regressions do not constitute a signed release, successful model
+provisioning by `fsfs`, or a native execution result for a release candidate.
 Its `examples` and `perf` stages are opt-in.
 The cross-target check establishes compilation, not Windows runtime support.
 
@@ -846,6 +847,59 @@ succeeded. Those receipts, the full current-source quality gate and explicit
 publication approval remain separate requirements. This path preserves the
 historical schema cases and does not close the outstanding full Windows or
 full Linux ARM delivery obligations.
+
+### Execute the staged binary through proxies
+
+The packaging checker also accepts an explicit executable whose SHA-256 must
+match the binary digest in the authenticated staged metadata:
+
+```bash
+scripts/check_fsfs_packaging_release_install_contract.sh \
+  --mode proxy-binary --binary /absolute/path/to/candidate/fsfs \
+  --expected-sha256 EXPECTED_BINARY_SHA256 --expected-version 1.13.0 \
+  --work-dir /absolute/path/to/new-retained-proxy-evidence --provision
+```
+
+This mode uses the supplied executable without building or retrieving a
+replacement. It checks its identity and digest before and after execution,
+records the reported version, and creates private empty model/configuration
+directories for each acquisition. Credentials are random test canaries; child
+output containing them fails the check and is redacted in retained logs.
+Existing evidence directories are refused rather than overwritten.
+
+The local wire checks require authenticated HTTP CONNECT and SOCKS5/`socks5h`
+exchanges to the registered model's HTTPS authority. They cover lowercase
+precedence, `HTTPS_PROXY` versus `ALL_PROXY`, nonmatching and wrong-port
+`NO_PROXY` entries, SOCKS domain-name forwarding, authentication refusal and
+untrusted-origin TLS rejection. An untrusted HTTPS proxy must be rejected before
+CONNECT or proxy credentials are sent. Every retry must use the expected protocol;
+timeouts and signals cannot count as application refusals. Refused downloads
+must leave no model bytes or installed model. The default process deadline is
+20 seconds; `--deadline-seconds` can adjust it without changing success criteria.
+
+With `--provision`, the same executable additionally downloads the registered
+`potion-base-8m` bundle through authenticated forwarding proxies. This requires
+working external HTTPS access and transfers about 31 MB per protocol. The
+proxy forwards encrypted bytes without substituting certificates or changing
+the client's trust store. Pinned file sizes and SHA-256 values, the CLI's
+verification result, and a warm offline replay with no new proxy contacts are
+required. `--provision-deadline-seconds` bounds each live acquisition (180
+seconds by default). A fourth cold acquisition uses matching `NO_PROXY` and
+requires the complete verified bundle without contacting the configured proxy.
+The retained `receipt.json` distinguishes these live results from the local
+wire/security checks; the four acquisitions total about 124 MB.
+
+The runner does not observe all host egress. Successful proxy exchanges or a
+matching transfer byte count do not prove that no direct connection occurred;
+use an external egress observer or enforced proxy-only network for that claim.
+The untrusted-chain case also does not independently establish trusted-chain
+hostname validation. Native platform execution, default installer model-pair
+provisioning, hosted embedding API execution and exact build provenance remain
+separate requirements. Record the execution host and corroborate the binary
+architecture, including whether translation was active on macOS. Run the
+checks on the extracted candidate and again on the installed binary, retaining
+the matching digest and the existing installer signature/self-test evidence.
+Neither this runner nor its fixture tests create a release or publish files.
 
 ### Crates.io publish lane policy (required when enabled)
 
