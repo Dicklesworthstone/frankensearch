@@ -19,7 +19,8 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
 use super::{
-    FsfsRuntime, STORE_OVERLAP_REASON, SourceStamp, canonical_store_root, index_discovery_walker,
+    FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsRuntime, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE,
+    STORE_OVERLAP_REASON, SourceStamp, canonical_store_root, index_discovery_walker,
     retained_search_checkpoint, store_overlaps_source, validate_retained_catalog_path,
 };
 use crate::OutputFormat;
@@ -701,13 +702,66 @@ impl CompleteWatchSession {
         Ok(())
     }
 
+    /// Resume only a selected backlog from this watched source. A startup
+    /// completion does not establish a source baseline: retained text can
+    /// predate edits made while the watcher was stopped.
+    fn startup_quality_generation(&self, cx: &Cx) -> SearchResult<Option<PublishedGeneration>> {
+        if self.baseline.is_some()
+            || self.runtime.cli_input.full_reindex
+            || self.runtime.quality_disabled_by_policy()
+            || self.runtime.lexical_only_indexing
+            || self.runtime.config.pressure.quality_circuit_open
+            || frankensearch_embed::RegisteredQualityModel::from_name(
+                &self.runtime.config.indexing.quality_model,
+            )
+            .is_none()
+            || !self.store_root.try_exists()?
+        {
+            return Ok(None);
+        }
+        let store = CompleteGenerationStore::open(cx, &self.store_root)?;
+        let Some(generation) = store.active(cx)? else {
+            return Ok(None);
+        };
+        let Some(sentinel) = FsfsRuntime::read_index_sentinel(generation.path())? else {
+            return Ok(None);
+        };
+        if Path::new(&sentinel.target_root) != self.source.path.as_path()
+            || !sentinel
+                .reason_codes
+                .iter()
+                .any(|reason| reason == REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE)
+            || generation
+                .path()
+                .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                .try_exists()?
+        {
+            return Ok(None);
+        }
+        // Old deferred generations may predate retained quality inputs. Keep
+        // their ordinary source-rebuild route without opening a sealed catalog
+        // for writing merely to inspect its availability.
+        let mut input = self.runtime.cli_input.clone();
+        input.index_dir = Some(generation.path().to_path_buf());
+        if !self
+            .runtime
+            .clone()
+            .with_cli_input(input)
+            .resolve_storage_db_path()?
+            .try_exists()?
+        {
+            return Ok(None);
+        }
+        Ok(Some(generation))
+    }
+
     #[allow(clippy::future_not_send)]
     async fn attempt(
         &self,
         cx: &Cx,
         force_rebuild: bool,
         pending: Option<&DirtyWindow>,
-    ) -> SearchResult<Option<(SourceObservation, GenerationPublication)>> {
+    ) -> SearchResult<Option<(Option<SourceObservation>, GenerationPublication)>> {
         let observed = self.source.observe(cx, &self.runtime.config.discovery)?;
         let touched = pending
             .is_some_and(|hint| touches_observed_files(hint, &observed, self.baseline.as_ref()));
@@ -744,6 +798,20 @@ impl CompleteWatchSession {
             drop(changes);
             Ok(())
         };
+        if let Some(generation) = self.startup_quality_generation(cx)? {
+            let completed = self
+                .runtime
+                .complete_retained_quality_with_precommit(cx, store_root, &generation, |cx| {
+                    precommit(cx)?;
+                    check_watch_publication(cx, store_root, Some(&generation))
+                })
+                .await?;
+            if let Some(completed) = completed {
+                // The next tick still owes initial source reconciliation. Do not
+                // attach the observed current tree to older retained source text.
+                return Ok(Some((None, completed.publication)));
+            }
+        }
         if !force_rebuild
             && !self.runtime.cli_input.full_reindex
             && let (Some(baseline), Some(selected)) = (self.baseline.as_ref(), selected)
@@ -761,7 +829,7 @@ impl CompleteWatchSession {
                 )
                 .await?;
             if let Some(publication) = outcome.publication {
-                return Ok(Some((observed, publication)));
+                return Ok(Some((Some(observed), publication)));
             }
             // Only absent deletions can reach this no-op outcome. Reconcile
             // through the ordinary builder before advancing source authority.
@@ -783,7 +851,7 @@ impl CompleteWatchSession {
             .rebuild_retained_generation_with_precommit(cx, &self.store_root, precommit)
             .await?
             .0;
-        Ok(Some((observed, publication)))
+        Ok(Some((Some(observed), publication)))
     }
 
     #[allow(clippy::future_not_send)]
@@ -822,7 +890,7 @@ impl CompleteWatchSession {
         let force_rebuild = initial || pending.as_ref().is_some_and(|window| window.force_rebuild);
         match self.attempt(cx, force_rebuild, pending.as_ref()).await {
             Ok(Some((observation, publication))) => {
-                self.baseline = Some(observation);
+                self.baseline = observation;
                 self.publication = Some(match &publication {
                     GenerationPublication::Durable(generation)
                     | GenerationPublication::VisibleButDurabilityUncertain { generation, .. } => {
@@ -854,6 +922,12 @@ impl FsfsRuntime {
     /// with unchanged coarse timestamps. Every build reuses full-search admission and
     /// validates source membership/metadata before selection. Source and store
     /// must be disjoint; an incomplete scan is never an authoritative deletion.
+    ///
+    /// On restart, an eligible selected quality backlog is completed from its
+    /// retained inputs before rebuilding sources, once pressure permits work.
+    /// Explicit quality deferral, fast-only policy and `--full-reindex` retain
+    /// their normal behavior. Completion leaves the initial source reconciliation
+    /// owed; it never claims that older retained text represents the current tree.
     ///
     /// Existing retained readers remain usable throughout this future. Bounded
     /// UTF-8 text changes use an atomic mixed batch; unchanged documents are not
@@ -2390,5 +2464,486 @@ mod lifecycle_tests {
             assert!(output.is_empty());
             assert!(!root.exists());
         });
+    }
+
+    #[cfg(feature = "semantic-loaders")]
+    mod quality_resume {
+        use std::future::Future;
+
+        use asupersync::runtime::RuntimeBuilder;
+        use frankensearch_core::{
+            Canonicalizer, DefaultCanonicalizer, Embedder, EmbeddingIdentityBundleV1,
+            IdentityBoundEmbedding, ModelCategory, SearchFuture,
+        };
+        use frankensearch_storage::{Storage, StorageConfig};
+
+        use super::*;
+        use crate::config::DegradationOverrideMode;
+        use crate::pressure_sensing::PressureSample;
+        use crate::runtime::{
+            FSFS_VECTOR_INDEX_FILE, SearchExecutionMode, retained_reuse, set_test_fast_embedder,
+            set_test_quality_embedder, test_fast_embedder_override, test_quality_embedder_override,
+        };
+
+        type DuringEmbedding = Box<dyn FnOnce(&Cx) -> SearchResult<()> + Send>;
+
+        // Identity-bound controls count real pipeline inputs; they make no
+        // model-quality claim and never substitute a worker/publication path.
+        struct Producer {
+            identity: EmbeddingIdentityBundleV1,
+            inputs: Mutex<Vec<String>>,
+            during_embedding: Mutex<Option<DuringEmbedding>>,
+        }
+
+        impl Producer {
+            fn new(id: &str) -> Self {
+                Self {
+                    identity: EmbeddingIdentityBundleV1::explicit_test_model(id, 3),
+                    inputs: Mutex::new(Vec::new()),
+                    during_embedding: Mutex::new(None),
+                }
+            }
+        }
+
+        impl Embedder for Producer {
+            fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+                Ok(&self.identity)
+            }
+
+            fn embed<'a>(&'a self, _: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+                Box::pin(async move {
+                    if text == "probe" {
+                        Ok(vec![1.0, 0.0, 0.0])
+                    } else {
+                        Err(complete_cli_error(
+                            "test_producer",
+                            "bound inference required",
+                        ))
+                    }
+                })
+            }
+
+            fn embed_bound<'a>(
+                &'a self,
+                cx: &'a Cx,
+                text: &'a str,
+            ) -> SearchFuture<'a, IdentityBoundEmbedding> {
+                Box::pin(async move {
+                    self.inputs.lock().unwrap().push(text.to_owned());
+                    let action = self.during_embedding.lock().unwrap().take();
+                    if let Some(action) = action {
+                        action(cx)?;
+                    }
+                    Ok(IdentityBoundEmbedding {
+                        values: vec![1.0, 0.0, 0.0],
+                        identity: self.identity.clone(),
+                    })
+                })
+            }
+
+            fn embed_batch_bound<'a>(
+                &'a self,
+                cx: &'a Cx,
+                texts: &'a [&'a str],
+            ) -> SearchFuture<'a, Vec<IdentityBoundEmbedding>> {
+                Box::pin(async move {
+                    let mut values = Vec::with_capacity(texts.len());
+                    for text in texts {
+                        values.push(self.embed_bound(cx, text).await?);
+                    }
+                    Ok(values)
+                })
+            }
+
+            fn dimension(&self) -> usize {
+                3
+            }
+
+            fn id(&self) -> &str {
+                &self.identity.space.logical_model_id
+            }
+
+            fn model_name(&self) -> &str {
+                self.id()
+            }
+
+            fn is_semantic(&self) -> bool {
+                true
+            }
+
+            fn category(&self) -> ModelCategory {
+                ModelCategory::TransformerEmbedder
+            }
+        }
+
+        struct RestoreProviders {
+            fast: Option<Arc<dyn Embedder>>,
+            quality: Option<Arc<dyn Embedder>>,
+        }
+
+        impl Drop for RestoreProviders {
+            fn drop(&mut self) {
+                set_test_fast_embedder(self.fast.take());
+                set_test_quality_embedder(self.quality.take());
+            }
+        }
+
+        fn run<F: Future<Output = ()>>(test: impl FnOnce(Cx, Arc<Producer>, Arc<Producer>) -> F) {
+            let scheduler = RuntimeBuilder::current_thread()
+                .blocking_threads(0, 2)
+                .build()
+                .unwrap();
+            scheduler.block_on(async move {
+                let _restore = RestoreProviders {
+                    fast: test_fast_embedder_override(),
+                    quality: test_quality_embedder_override(),
+                };
+                let fast = Arc::new(Producer::new("watch-resume-fast"));
+                let quality = Arc::new(Producer::new("watch-resume-quality"));
+                set_test_fast_embedder(Some(fast.clone()));
+                set_test_quality_embedder(Some(quality.clone()));
+                test(Cx::current().unwrap(), fast, quality).await;
+            });
+        }
+
+        async fn pending_generation(
+            cx: &Cx,
+            parent: &Path,
+        ) -> (FsfsRuntime, PathBuf, PathBuf, PublishedGeneration) {
+            let (mut runtime, source, root) = fixture(parent);
+            "all-minilm-l6-v2".clone_into(&mut runtime.config.indexing.quality_model);
+            runtime.config.search.fast_only = false;
+            runtime.config.pressure.degradation_override =
+                DegradationOverrideMode::ForceEmbedDeferred;
+            runtime.config.pressure.ewma_alpha_per_mille = 1_000;
+            runtime.config.pressure.anti_flap_readings = 1;
+            runtime.config.pressure.sample_interval_ms = 60_000;
+            let generation = require_durable_publication(
+                runtime
+                    .rebuild_retained_generation(cx, &root)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let mut config = runtime.config.clone();
+            config.pressure.degradation_override = DegradationOverrideMode::Auto;
+            // A fresh runtime has no producer or source-preparation cache from
+            // the earlier deferred indexing process.
+            let restarted = FsfsRuntime::new(config).with_cli_input(runtime.cli_input.clone());
+            (restarted, source, root, generation)
+        }
+
+        fn pressure(session: &mut CompleteWatchSession, cpu_pct: f64) {
+            session.pressure.observe(
+                &PressureSample {
+                    cpu_pct,
+                    rss_bytes: 0,
+                    io_read_bytes: 0,
+                    io_write_bytes: 0,
+                    io_counters_available: true,
+                    load_avg_1m: Some(0.0),
+                },
+                Instant::now(),
+            );
+        }
+
+        fn session(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> CompleteWatchSession {
+            let mut session = CompleteWatchSession::open(runtime, cx, root).unwrap();
+            controlled_notifications(&mut session);
+            pressure(&mut session, 0.0);
+            session
+        }
+
+        #[test]
+        fn watch_restart_resumes_quality_after_pressure_without_an_event_then_reconciles_sources() {
+            run(|cx, fast, quality| async move {
+                let directory = tempfile::tempdir().unwrap();
+                let (runtime, source, root, before) =
+                    pending_generation(&cx, directory.path()).await;
+                let input = DefaultCanonicalizer::default()
+                    .canonicalize(&fs::read_to_string(source.join("alpha.md")).unwrap());
+                let fast_bytes = fs::read(before.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap();
+                let catalog_bytes = fs::read(before.path().join("catalog.sqlite")).unwrap();
+                fast.inputs.lock().unwrap().clear();
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                // A valid retained backlog is older than the source tree. Its
+                // completion must not acknowledge this downtime edit as indexed.
+                fs::write(source.join("alpha.md"), "afterrestarttoken updated source").unwrap();
+                let mut watching = session(&runtime, &cx, &root);
+                pressure(&mut watching, 200.0);
+                let allocated = candidate_count(&root);
+                assert!(
+                    watching
+                        .advance(&cx, Instant::now())
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(candidate_count(&root), allocated);
+                assert!(quality.inputs.lock().unwrap().is_empty());
+                assert!(lock_changes(&watching.changes).unwrap().dirty.is_none());
+
+                pressure(&mut watching, 0.0);
+                let completed = require_durable_publication(
+                    watching
+                        .advance(&cx, Instant::now())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_ne!(before, completed);
+                assert!(watching.baseline.is_none());
+                assert!(fast.inputs.lock().unwrap().is_empty());
+                assert_eq!(*quality.inputs.lock().unwrap(), vec![input]);
+                assert_eq!(
+                    fs::read(completed.path().join(FSFS_VECTOR_INDEX_FILE)).unwrap(),
+                    fast_bytes
+                );
+                assert_eq!(
+                    fs::read(before.path().join("catalog.sqlite")).unwrap(),
+                    catalog_bytes
+                );
+                assert_eq!(
+                    FsfsRuntime::read_index_sentinel(completed.path())
+                        .unwrap()
+                        .unwrap()
+                        .command,
+                    "complete-quality"
+                );
+                assert_eq!(
+                    frankensearch_index::VectorIndex::open_read_only(
+                        &completed.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE),
+                    )
+                    .unwrap()
+                    .live_doc_ids()
+                    .unwrap()
+                    .len(),
+                    1
+                );
+
+                // Still no notification: initial reconciliation remains owed.
+                let current = require_durable_publication(
+                    watching
+                        .advance(&cx, Instant::now())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_ne!(current, completed);
+                assert!(watching.baseline.is_some());
+                let mut reader = runtime.open_retained_search(&cx, &root).await.unwrap();
+                let result = reader.search(&cx, "afterrestarttoken", 5).await.unwrap();
+                assert_eq!(result.last().unwrap().hits.len(), 1);
+                assert_eq!(watching.publication.as_ref(), Some(&current));
+            });
+        }
+
+        #[test]
+        fn watch_restart_keeps_explicit_deferral_and_full_reindex_policy() {
+            for defer in [true, false] {
+                run(|cx, fast, quality| async move {
+                    let directory = tempfile::tempdir().unwrap();
+                    let (mut runtime, _, root, before) =
+                        pending_generation(&cx, directory.path()).await;
+                    fast.inputs.lock().unwrap().clear();
+                    if defer {
+                        runtime.config.pressure.degradation_override =
+                            DegradationOverrideMode::ForceEmbedDeferred;
+                    } else {
+                        runtime.cli_input.full_reindex = true;
+                    }
+                    let mut watching = session(&runtime, &cx, &root);
+                    let next = require_durable_publication(
+                        watching
+                            .advance(&cx, Instant::now())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert_ne!(before, next);
+                    assert!(watching.baseline.is_some());
+                    assert_ne!(
+                        FsfsRuntime::read_index_sentinel(next.path())
+                            .unwrap()
+                            .unwrap()
+                            .command,
+                        "complete-quality"
+                    );
+                    assert_eq!(quality.inputs.lock().unwrap().is_empty(), defer);
+                    assert_eq!(
+                        next.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists(),
+                        !defer
+                    );
+                });
+            }
+        }
+
+        #[test]
+        fn watch_quality_cancel_source_race_and_selection_race_preserve_owed_work() {
+            for failure in ["cancel", "source", "selection"] {
+                run(|cx, fast, quality| async move {
+                    let directory = tempfile::tempdir().unwrap();
+                    let (runtime, source, root, before) =
+                        pending_generation(&cx, directory.path()).await;
+                    let pointer = root.join(COMPLETE_GENERATION_POINTER);
+                    let selected = fs::read(&pointer).unwrap();
+                    let catalog = fs::read(before.path().join("catalog.sqlite")).unwrap();
+                    let mut expected = before.clone();
+                    let replacement = if failure == "selection" {
+                        let mut other = runtime.clone();
+                        other.config.pressure.degradation_override =
+                            DegradationOverrideMode::ForceEmbedDeferred;
+                        expected = require_durable_publication(
+                            other.rebuild_retained_generation(&cx, &root).await.unwrap(),
+                        )
+                        .unwrap();
+                        let bytes = fs::read(&pointer).unwrap();
+                        fs::write(&pointer, &selected).unwrap();
+                        Some(bytes)
+                    } else {
+                        None
+                    };
+                    fast.inputs.lock().unwrap().clear();
+                    let change_pointer = pointer.clone();
+                    *quality.during_embedding.lock().unwrap() = Some(Box::new(move |cx| {
+                        match failure {
+                            "cancel" => cx.set_cancel_requested(true),
+                            "source" => fs::write(
+                                source.join("alpha.md"),
+                                "changed during quality inference",
+                            )?,
+                            "selection" => {
+                                fs::write(change_pointer, replacement.as_ref().unwrap())?
+                            }
+                            _ => unreachable!(),
+                        }
+                        Ok(())
+                    }));
+                    let mut watching = session(&runtime, &cx, &root);
+                    let outcome = watching.advance(&cx, Instant::now()).await;
+                    cx.set_cancel_requested(false);
+                    match failure {
+                        "cancel" => assert!(matches!(outcome, Err(SearchError::Cancelled { .. }))),
+                        "source" => {
+                            assert!(outcome.unwrap().is_none());
+                            assert!(lock_changes(&watching.changes).unwrap().dirty.is_some());
+                        }
+                        "selection" => assert!(
+                            matches!(outcome, Err(SearchError::InvalidConfig { field, .. })
+                            if field == "complete_generation.watch_selection_changed")
+                        ),
+                        _ => unreachable!(),
+                    }
+                    assert!(watching.publication.is_none());
+                    assert!(watching.baseline.is_none());
+                    assert_eq!(
+                        CompleteGenerationStore::open(&cx, &root)
+                            .unwrap()
+                            .active(&cx)
+                            .unwrap(),
+                        Some(expected)
+                    );
+                    assert_eq!(
+                        fs::read(before.path().join("catalog.sqlite")).unwrap(),
+                        catalog
+                    );
+                    assert!(fast.inputs.lock().unwrap().is_empty());
+                    // The immutable queue is still pending and the failed
+                    // attempt released the store lease; a new watch can retry.
+                    let mut retry = session(&runtime, &cx, &root);
+                    let completed = require_durable_publication(
+                        retry.advance(&cx, Instant::now()).await.unwrap().unwrap(),
+                    )
+                    .unwrap();
+                    assert!(
+                        completed
+                            .path()
+                            .join(FSFS_VECTOR_QUALITY_INDEX_FILE)
+                            .exists()
+                    );
+                    assert!(fast.inputs.lock().unwrap().is_empty());
+                });
+            }
+        }
+
+        #[test]
+        fn watch_rebuilds_old_catalogs_without_backlogs_and_changed_quality_producers() {
+            for absent_backlog in [true, false] {
+                run(|cx, fast, quality| async move {
+                    let directory = tempfile::tempdir().unwrap();
+                    let (runtime, _, root, before) =
+                        pending_generation(&cx, directory.path()).await;
+                    let selected = if absent_backlog {
+                        let store = CompleteGenerationStore::open(&cx, &root).unwrap();
+                        let build = store.begin(&cx).unwrap();
+                        retained_reuse::copy_selected_generation(
+                            &cx,
+                            &runtime,
+                            &store,
+                            build.path(),
+                        )
+                        .unwrap();
+                        let storage = Storage::open(StorageConfig {
+                            db_path: build.path().join("catalog.sqlite"),
+                            ..StorageConfig::default()
+                        })
+                        .unwrap();
+                        assert!(
+                            storage
+                                .delete_index_metadata("fsfs.deferred_quality.v1")
+                                .unwrap()
+                        );
+                        drop(storage);
+                        require_durable_publication(
+                            build
+                                .publish(&cx, |_, path| {
+                                    FsfsRuntime::validate_search_generation_at_root(
+                                        path,
+                                        SearchExecutionMode::Full,
+                                    )
+                                })
+                                .unwrap(),
+                        )
+                        .unwrap()
+                    } else {
+                        set_test_quality_embedder(Some(Arc::new(Producer::new(
+                            "watch-new-quality",
+                        ))));
+                        before
+                    };
+                    fast.inputs.lock().unwrap().clear();
+                    assert!(
+                        runtime
+                            .complete_retained_quality(&cx, &root, &selected)
+                            .await
+                            .is_err()
+                    );
+                    assert!(fast.inputs.lock().unwrap().is_empty());
+                    assert!(quality.inputs.lock().unwrap().is_empty());
+                    let mut watching = session(&runtime, &cx, &root);
+                    let next = require_durable_publication(
+                        watching
+                            .advance(&cx, Instant::now())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    assert!(watching.baseline.is_some());
+                    assert_ne!(next, selected);
+                    assert_ne!(
+                        FsfsRuntime::read_index_sentinel(next.path())
+                            .unwrap()
+                            .unwrap()
+                            .command,
+                        "complete-quality"
+                    );
+                    assert!(next.path().join(FSFS_VECTOR_QUALITY_INDEX_FILE).exists());
+                });
+            }
+        }
     }
 }
