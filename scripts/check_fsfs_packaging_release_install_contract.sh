@@ -11,6 +11,11 @@ DSR_VERSION=""
 DSR_SOURCE_REVISION=""
 DSR_MINISIGN="minisign"
 DSR_OPTIONS_SET=0
+PROXY_BINARY=""
+PROXY_BINARY_SHA256=""
+PROXY_WORK_DIR=""
+PROXY_OPTIONS_SET=0
+PROXY_EXTRA_ARGS=()
 
 case "$INSTALLER_EXPECTED_PROFILE" in
   semantic-loaders|explicit-lite) ;;
@@ -22,7 +27,7 @@ esac
 
 usage() {
   cat <<USAGE
-Usage: scripts/check_fsfs_packaging_release_install_contract.sh [--mode unit|integration|e2e|installer-behavior|installer|model-features|all|dsr-tests|dsr-release]
+Usage: scripts/check_fsfs_packaging_release_install_contract.sh [--mode unit|integration|e2e|installer-behavior|installer|model-features|all|dsr-tests|dsr-release|proxy-binary-tests|proxy-binary]
 
 Validates fsfs packaging/release/install fixtures and model-feature boundaries.
 
@@ -31,14 +36,46 @@ dsr-release requires --artifact-dir DIR --version VERSION --source-revision FULL
 and accepts --minisign PATH (default: minisign). It verifies the existing signed
 50-file DSR inventory without executing binaries, changing the old schema's
 platform obligations, or publishing anything.
+
+proxy-binary requires --binary PATH --expected-sha256 DIGEST --work-dir NEW_DIR.
+It executes that exact fsfs binary against real loopback proxy peers.
+Optional --expected-version VERSION and --deadline-seconds N constrain the run.
+--provision additionally downloads and verifies the pinned 31 MB Potion 8M model
+through live forwarding proxies; it requires working external HTTPS access.
+--provision-deadline-seconds N bounds each live acquisition (default: 180).
+Wire checks alone do not prove complete provisioning or direct-egress isolation.
+proxy-binary-tests exercises the protocol peer and runner's fixture regressions.
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "ERROR: --mode requires a value" >&2
+        exit 2
+      fi
       MODE="${2:-}"
       shift 2
+      ;;
+    --binary|--expected-sha256|--work-dir|--expected-version|--deadline-seconds|--provision-deadline-seconds)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "ERROR: $1 requires a value" >&2
+        exit 2
+      fi
+      case "$1" in
+        --binary) PROXY_BINARY="$2" ;;
+        --expected-sha256) PROXY_BINARY_SHA256="$2" ;;
+        --work-dir) PROXY_WORK_DIR="$2" ;;
+        --expected-version|--deadline-seconds|--provision-deadline-seconds) PROXY_EXTRA_ARGS+=("$1" "$2") ;;
+      esac
+      PROXY_OPTIONS_SET=1
+      shift 2
+      ;;
+    --provision)
+      PROXY_EXTRA_ARGS+=("--provision")
+      PROXY_OPTIONS_SET=1
+      shift
       ;;
     --artifact-dir|--version|--source-revision|--minisign)
       if [[ $# -lt 2 || -z "$2" ]]; then
@@ -67,12 +104,30 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODE" in
-  unit|integration|e2e|installer-behavior|installer|model-features|all|dsr-tests|dsr-release) ;;
+  unit|integration|e2e|installer-behavior|installer|model-features|all|dsr-tests|dsr-release|proxy-binary-tests|proxy-binary) ;;
   *)
     echo "ERROR: invalid mode '$MODE' (see --help)" >&2
     exit 2
     ;;
 esac
+
+if [[ "$PROXY_OPTIONS_SET" -ne 0 && "$MODE" != "proxy-binary" ]]; then
+  echo "ERROR: binary/hash/work-dir/provision options require --mode proxy-binary" >&2
+  exit 2
+fi
+if [[ "$MODE" == "proxy-binary" ]]; then
+  if [[ "$DSR_OPTIONS_SET" -ne 0 ]]; then
+    echo "ERROR: staged DSR artifact options cannot be used with --mode proxy-binary" >&2
+    exit 2
+  fi
+  if [[ -z "$PROXY_BINARY" || -z "$PROXY_BINARY_SHA256" || -z "$PROXY_WORK_DIR" ]]; then
+    echo "ERROR: proxy-binary requires --binary, --expected-sha256, and --work-dir" >&2
+    exit 2
+  fi
+  exec python3 -B "$ROOT_DIR/scripts/check_fsfs_proxy_binary.py" \
+    --binary "$PROXY_BINARY" --expected-sha256 "$PROXY_BINARY_SHA256" \
+    --work-dir "$PROXY_WORK_DIR" "${PROXY_EXTRA_ARGS[@]}"
+fi
 
 if [[ "$MODE" == "dsr-release" ]]; then
   if [[ -z "$DSR_ARTIFACT_DIR" || -z "$DSR_VERSION" || -z "$DSR_SOURCE_REVISION" ]]; then
@@ -89,6 +144,9 @@ if [[ "$DSR_OPTIONS_SET" -ne 0 ]]; then
 fi
 if [[ "$MODE" == "dsr-tests" ]]; then
   exec python3 -B "$ROOT_DIR/scripts/test_fsfs_dsr_release.py"
+fi
+if [[ "$MODE" == "proxy-binary-tests" ]]; then
+  exec python3 -B "$ROOT_DIR/scripts/test_fsfs_proxy_binary.py"
 fi
 
 if [[ "$MODE" != "model-features" ]]; then
@@ -1985,6 +2043,9 @@ if [[ "$MODE" == "model-features" || "$MODE" == "all" ]]; then
 fi
 if [[ "$MODE" == "all" ]]; then
   if ! python3 -B "$ROOT_DIR/scripts/test_fsfs_dsr_release.py"; then
+    FAILURES=$((FAILURES + 1))
+  fi
+  if ! python3 -B "$ROOT_DIR/scripts/test_fsfs_proxy_binary.py"; then
     FAILURES=$((FAILURES + 1))
   fi
 fi

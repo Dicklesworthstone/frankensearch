@@ -16,6 +16,14 @@
   upload inventory, hashes, signatures, source and capability metadata, aliases
   and archive contents. Historical fixtures remain separate, and neither path
   substitutes for executable platform qualification.
+- The same checker now accepts an explicit SHA-256-pinned `fsfs` executable for
+  real CONNECT/SOCKS5 wire, environment precedence, nonmatching `NO_PROXY`,
+  authentication-refusal and untrusted-origin/proxy TLS checks. An explicit live
+  provisioning mode forwards end-to-end HTTPS, checks the complete pinned
+  Potion 8M bundle, checks matching `NO_PROXY` bypass and verifies warm offline
+  replay. It retains bounded,
+  credential-redacted evidence; its fixture tests are not candidate-binary
+  qualification or proof of direct-egress isolation.
 - The existing quality gate now includes downloader and hosted-API proxy tests
   together, optional-feature Clippy checks, and installer contract regressions.
   Added real-socket TLS cases assert authenticated SOCKS5/`socks5h` hostname

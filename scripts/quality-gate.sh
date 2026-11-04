@@ -20,7 +20,8 @@
 #              that no stage ran went red unnoticed (the bd-ctzo activation census)
 #   proxy      downloader and hosted-API regressions with both optional HTTP features;
 #              includes real CONNECT/SOCKS/TLS, bypass, redirect and credential checks
-#   installer  installer contract, proxy-environment propagation and signed-archive policy
+#   installer  installer contract, proxy-environment propagation and signed-archive policy;
+#              staged DSR artifact and executable-proxy runner fixtures (no candidate execution)
 #   quill      native Quill + pinned Tantivy witness, validator negatives and typed replay;
 #              complete all-feature Cargo inventory, 90s execution budget after compilation
 #   quill-full default + all-feature gauntlet binaries, unchanged nonignored workloads;
@@ -145,6 +146,7 @@ want tests     && run_stage tests  cargo test --locked --workspace --tests --exc
 want proxy     && run_stage proxy cargo test --locked -p frankensearch-embed --features download,api
 want installer && run_stage installer bash scripts/check_fsfs_packaging_release_install_contract.sh --mode installer
 want installer && run_stage installer-dsr bash scripts/check_fsfs_packaging_release_install_contract.sh --mode dsr-tests
+want installer && run_stage installer-proxy bash scripts/check_fsfs_packaging_release_install_contract.sh --mode proxy-binary-tests
 want quill     && run_stage quill python3 scripts/check_quill_correctness.py
 want quill-full && run_stage quill-full python3 scripts/check_quill_correctness.py --full
 want quill-probes && run_stage quill-probes python3 scripts/check_quill_correctness.py --probes
