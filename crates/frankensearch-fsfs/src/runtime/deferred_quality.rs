@@ -57,6 +57,15 @@ pub struct DeferredQualityCompletion {
     pub producer_fingerprint: String,
 }
 
+/// A watch restart can rebuild unavailable work; explicit completion must
+/// retain the specific reason that prevented resuming the selected backlog.
+#[derive(Debug)]
+pub(super) enum DeferredQualityAttempt {
+    Completed(DeferredQualityCompletion),
+    MissingBacklog,
+    ProducerChanged,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Backlog {
@@ -754,17 +763,25 @@ impl FsfsRuntime {
         store_root: &Path,
         expected: &PublishedGeneration,
     ) -> SearchResult<DeferredQualityCompletion> {
-        self.complete_retained_quality_with_precommit(cx, store_root, expected, |_| Ok(()))
+        match self
+            .complete_retained_quality_with_precommit(cx, store_root, expected, |_| Ok(()))
             .await?
-            .ok_or_else(|| {
-                invalid("selected generation has no retained quality backlog for the configured producer; run a full source reindex")
-            })
+        {
+            DeferredQualityAttempt::Completed(completed) => Ok(completed),
+            DeferredQualityAttempt::MissingBacklog => Err(invalid(
+                "selected generation has no retained quality backlog; run a full source reindex",
+            )),
+            DeferredQualityAttempt::ProducerChanged => Err(invalid(
+                "deferred quality producer changed; run a full source reindex to establish new work",
+            )),
+        }
     }
 
     /// The watch owner rechecks its source and notification authority after
     /// sealing, at the same publication boundary as ordinary source updates.
-    /// Missing backlog metadata or a newly selected producer returns `None`
-    /// before inference, so watch startup can use its ordinary source rebuild.
+    /// Missing backlog metadata and a newly selected producer have distinct
+    /// outcomes before inference, so watch can use its ordinary source rebuild
+    /// while explicit completion preserves its refusal diagnostic.
     #[allow(
         clippy::future_not_send,
         clippy::too_many_lines,
@@ -776,7 +793,7 @@ impl FsfsRuntime {
         store_root: &Path,
         expected: &PublishedGeneration,
         precommit: F,
-    ) -> SearchResult<Option<DeferredQualityCompletion>>
+    ) -> SearchResult<DeferredQualityAttempt>
     where
         F: FnOnce(&Cx) -> SearchResult<()>,
     {
@@ -849,7 +866,7 @@ impl FsfsRuntime {
         let lease = PublicationLease::acquire(build.path())?;
         let storage = Arc::new(open_catalog(&candidate, false)?);
         let Some(backlog) = read_optional_backlog(&storage)? else {
-            return Ok(None);
+            return Ok(DeferredQualityAttempt::MissingBacklog);
         };
         if backlog.generation_root != predecessor.path().display().to_string()
             || backlog.source_hash != sentinel.source_hash_hex
@@ -887,7 +904,7 @@ impl FsfsRuntime {
         if backlog.producer != producer {
             // A configuration change may request a source rebuild, but cannot
             // conceal damaged source fences or queued input in its predecessor.
-            return Ok(None);
+            return Ok(DeferredQualityAttempt::ProducerChanged);
         }
         control
             .admit_work(cx, "complete_quality.model_load")
@@ -1061,12 +1078,14 @@ impl FsfsRuntime {
             |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
             precommit,
         )?;
-        Ok(Some(DeferredQualityCompletion {
-            publication,
-            completed_documents: completed,
-            source_hash: backlog.source_hash,
-            producer_fingerprint: backlog.producer.fingerprint(),
-        }))
+        Ok(DeferredQualityAttempt::Completed(
+            DeferredQualityCompletion {
+                publication,
+                completed_documents: completed,
+                source_hash: backlog.source_hash,
+                producer_fingerprint: backlog.producer.fingerprint(),
+            },
+        ))
     }
 }
 
@@ -2404,12 +2423,11 @@ mod tests {
             );
             let foreign = Arc::new(Producer::new("foreign-producer"));
             set_test_quality_embedder(Some(foreign.clone()));
-            assert!(
-                runtime(directory.path(), false)
-                    .complete_retained_quality(&cx, &root, &first)
-                    .await
-                    .is_err()
-            );
+            let error = runtime(directory.path(), false)
+                .complete_retained_quality(&cx, &root, &first)
+                .await
+                .expect_err("foreign producer cannot complete the selected backlog");
+            assert!(error.to_string().contains("producer changed"), "{error}");
             assert!(foreign.inputs.lock().unwrap().is_empty());
             set_test_quality_embedder(Some(quality.clone()));
             fs::write(

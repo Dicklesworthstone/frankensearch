@@ -18,6 +18,7 @@ use frankensearch_core::{SearchError, SearchResult};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use super::complete_cli::{complete_cli_error, require_durable_publication};
+use super::deferred_quality::DeferredQualityAttempt;
 use super::{
     FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsRuntime, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE,
     STORE_OVERLAP_REASON, SourceStamp, canonical_store_root, index_discovery_walker,
@@ -806,7 +807,7 @@ impl CompleteWatchSession {
                     check_watch_publication(cx, store_root, Some(&generation))
                 })
                 .await?;
-            if let Some(completed) = completed {
+            if let DeferredQualityAttempt::Completed(completed) = completed {
                 // The next tick still owes initial source reconciliation. Do not
                 // attach the observed current tree to older retained source text.
                 return Ok(Some((None, completed.publication)));
