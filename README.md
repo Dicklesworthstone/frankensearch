@@ -1326,6 +1326,7 @@ Use this as a pragmatic hardening pass before rollout:
    - `cargo check --workspace --all-targets`
    - `cargo clippy --workspace --all-targets -- -D warnings`
    - `cargo test --workspace --lib --exclude frankensearch-quill-gauntlet` plus the fsfs test binaries
+   - downloader/hosted-API proxy tests and Clippy with `--features download,api`, plus installer contract checks
    - the Quill native witness against real Quill and pinned Tantivy, plus its oracle-validator negatives
    - the real-model quick-start lane and the executable quick-start gate against the built binary
 6. Run benchmark and quality harnesses on representative corpora before release.
@@ -1376,10 +1377,11 @@ before any release lives in the repository and runs on a real host:
 ```bash
 export FSFS_UPGRADE_REUSE_PREVIOUS_BINARY=/absolute/path/to/previous/fsfs
 scripts/quality-gate.sh                     # fmt, check, clippy -D warnings, lib tests,
+                                            # downloader/API proxies, installer contracts,
                                             # Quill/Tantivy witness, fsfs tests, real-model e2e,
                                             # executable quick-start gate
-dsr quality --tool frankensearch            # the same gate plus the packaging/installer
-                                            # contract checks, driven by dsr
+dsr quality --tool frankensearch            # the same gate plus configured packaging
+                                            # checks, driven by dsr
 ```
 
 The full `e2e` stage runs the two-executable upgrade-reuse regression. Supply a
@@ -1396,6 +1398,20 @@ models and does not use that skip. Releases use `dsr` or the documented real-hos
 build and publication commands with the same gates;
 `docs/fsfs-packaging-release-install-contract.md` and
 `docs/crates-publishing-contract.md` are the authoritative recipes.
+
+The default `proxy` stage explicitly enables both `download` and `api`, because
+workspace defaults and the facade's `hybrid` profile do not enable hosted APIs.
+It runs the embed crate's unit, integration and doctests, including real
+CONNECT/SOCKS/TLS transport and credential-isolation regressions. The `installer`
+stage runs the existing installer contract checker (requires Python `jsonschema`),
+including proxy-environment propagation, fail-closed Minisign verification and
+regressions for the staged DSR artifact validator. Before publication, run that
+checker's `--mode dsr-release` against the actual artifact directory with the
+proposed version, exact source revision and real Minisign verifier; the packaging
+contract below documents its arguments. Historical release-schema fixtures alone
+do not validate the staged files.
+These source checks do not replace tests of the exact packaged binaries on their
+declared platforms or native Apple Silicon qualification.
 
 The default `quill` stage runs the existing native engine witness and all tests
 beside its independent oracle, plus the typed-query seed and replay regressions.

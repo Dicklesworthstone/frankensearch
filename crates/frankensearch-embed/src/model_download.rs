@@ -5009,11 +5009,7 @@ mod proxy_transport_tests {
         } else {
             "https"
         };
-        let proxy_scheme = if matches!(mode, TlsProxyMode::HttpConnect) {
-            "http"
-        } else {
-            "https"
-        };
+        let proxy_scheme = mode.proxy_scheme();
         let url = format!("{target_scheme}://{host}/model.onnx?token=origin-query-canary");
         download_configured_with_test_ca(
             &url,
@@ -5818,13 +5814,52 @@ mod proxy_transport_tests {
     }
 
     #[test]
+    fn verified_tls_socks_downloads_preserve_remote_dns_auth_and_model_bytes() {
+        for mode in [TlsProxyMode::Socks5, TlsProxyMode::Socks5h] {
+            let (address, peer) = spawn_tls_proxy(mode, MODEL_BYTES.to_vec());
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("model.onnx");
+            let result =
+                download_with_test_ca(mode, address, "model-host.invalid", &destination, true);
+            let observed = peer.join().unwrap();
+            result.unwrap();
+            assert!(!observed.tls_rejected);
+            assert!(observed.connect_headers.is_none());
+            let handshake = observed.socks_handshake.unwrap();
+            assert_eq!(handshake.host, "model-host.invalid");
+            assert_eq!(handshake.port, 443);
+            assert_eq!(handshake.username, PROXY_USERNAME);
+            assert_eq!(handshake.password, PROXY_PASSWORD);
+            let request = observed.request_headers.unwrap();
+            assert!(request.starts_with("GET /model.onnx?token=origin-query-canary HTTP/1.1\r\n"));
+            assert_eq!(request_header(&request, "Host"), Some("model-host.invalid"));
+            assert_eq!(request_header(&request, "Proxy-Authorization"), None);
+            for secret in [PROXY_USERNAME, PROXY_PASSWORD, PROXY_BASIC_AUTH] {
+                assert!(
+                    !request.contains(secret),
+                    "SOCKS credentials reached origin"
+                );
+            }
+            assert!(observed.request_body.is_empty());
+            let bytes = std::fs::read(&destination).unwrap();
+            assert_eq!(bytes, MODEL_BYTES);
+            assert_eq!(sha256_hex(&bytes), sha256_hex(MODEL_BYTES));
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
     fn model_tls_refuses_untrusted_certificates_and_wrong_origin_names() {
         for (mode, trust_test_ca, host) in [
             (TlsProxyMode::HttpConnect, false, "model-host.invalid"),
             (TlsProxyMode::HttpsForward, false, "model-host.invalid"),
             (TlsProxyMode::HttpsConnect, false, "model-host.invalid"),
+            (TlsProxyMode::Socks5, false, "model-host.invalid"),
+            (TlsProxyMode::Socks5h, false, "model-host.invalid"),
             (TlsProxyMode::HttpConnect, true, "wrong-host.invalid"),
             (TlsProxyMode::HttpsConnect, true, "wrong-host.invalid"),
+            (TlsProxyMode::Socks5, true, "wrong-host.invalid"),
+            (TlsProxyMode::Socks5h, true, "wrong-host.invalid"),
         ] {
             let (address, peer) = spawn_tls_proxy(mode, MODEL_BYTES.to_vec());
             let directory = tempfile::tempdir().unwrap();
@@ -5837,11 +5872,24 @@ mod proxy_transport_tests {
             assert!(observed.tls_rejected);
             assert!(observed.request_headers.is_none());
             assert!(observed.request_body.is_empty());
-            if !trust_test_ca && !matches!(mode, TlsProxyMode::HttpConnect) {
+            if !trust_test_ca
+                && matches!(
+                    mode,
+                    TlsProxyMode::HttpsForward | TlsProxyMode::HttpsConnect
+                )
+            {
                 assert!(
                     observed.connect_headers.is_none(),
                     "an untrusted HTTPS proxy must not receive CONNECT credentials"
                 );
+            }
+            if matches!(mode, TlsProxyMode::Socks5 | TlsProxyMode::Socks5h) {
+                let handshake = observed.socks_handshake.unwrap();
+                assert_eq!(handshake.host, host);
+                assert_eq!(handshake.port, 443);
+                assert_eq!(handshake.username, PROXY_USERNAME);
+                assert_eq!(handshake.password, PROXY_PASSWORD);
+                assert!(observed.connect_headers.is_none());
             }
             for secret in [
                 PROXY_USERNAME,

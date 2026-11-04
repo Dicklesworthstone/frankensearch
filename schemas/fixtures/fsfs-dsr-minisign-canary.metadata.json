@@ -1,0 +1,17 @@
+{
+  "tag": "v1.12.3",
+  "target": "aarch64-apple-darwin",
+  "binary": "fsfs",
+  "profile": "default",
+  "source_revision": "cc528269c66ce89f640b860aff80992cc2333704",
+  "build_host": "Mac-mini-max",
+  "build_timestamp_utc": "2026-10-05T19:16:39.915350+00:00",
+  "rustc": "rustc 1.100.0-nightly (908501772 2026-08-30)",
+  "features": "default",
+  "semantic_loaders": true,
+  "embedded_models": false,
+  "binary_sha256": "sha256:0038da43d54f35fd74d840125814f781c7fc238723810c156be69b966208bde2",
+  "execution_validation": "version checked natively on Darwin/arm64",
+  "version_output": "fsfs 1.12.3 (frankensearch 1.12.3)",
+  "file_description": "/Users/jemanuel/release-work/fsfs-1.12.3/fsfs-aarch64-apple-darwin: Mach-O 64-bit executable arm64"
+}

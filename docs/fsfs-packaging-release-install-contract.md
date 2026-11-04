@@ -193,8 +193,9 @@ Every lite target MUST instead publish:
 - checksum: `fsfs-lite-<version>-<target>.tar.xz.sha256`
 - metadata: `fsfs-lite-<version>-<target>.metadata.json`
 
-Optional signing files append `.sig` and `.pem` to the archive name. Lite and
-full names MUST remain distinct even when both profiles exist for one target.
+Release signatures append `.minisig` to the archive and metadata names; the
+release checksum manifest is signed as `SHA256SUMS.minisig`. Lite and full
+names MUST remain distinct even when both profiles exist for one target.
 
 Metadata MUST include:
 
@@ -222,8 +223,18 @@ are requirements, not claims that every v1.8.0 asset satisfies them.
 - A missing checksum manifest entry or sidecar, a malformed digest, an absent
   `sha256sum`/`shasum` implementation, or a checksum mismatch MUST fail closed.
   No skip token, warning-only bypass, or unverified replacement is permitted.
-- Signature verification SHOULD be supported through `--verify` mode and Sigstore/Cosign blob signatures.
-- Missing signatures in optional-signing mode MUST emit a deterministic warning reason code, not silent success.
+- `--verify` MUST authenticate the archive's `.minisig` with Minisign and the
+  repository's pinned `minisign.pub` trust key before extraction or execution.
+  The installer embeds that public key so a streamed installer does not fetch
+  a replacement key alongside the untrusted artifact.
+- An explicitly requested signature check MUST fail closed on a missing or
+  empty signature, missing Minisign verifier, or signature mismatch. It MUST
+  preserve the incumbent installation and MUST NOT fall back to a source build
+  that cannot satisfy the release signature requirement. `--from-source` and
+  `--verify` are therefore mutually exclusive.
+- Installs without `--verify` retain mandatory checksum verification; a checksum
+  alone does not authenticate the release signer. `--verify` also retains the
+  post-install self-test and rollback behavior.
 
 ## Install UX Expectations
 
@@ -624,8 +635,16 @@ scripts/quality-gate.sh
 ```
 
 The default script runs formatting, workspace check/clippy, the non-Unix index
-compile guard, library tests, fsfs tests, facade integration, real-model E2E,
-the bounded Quill/Tantivy native witness, and executable quick-start stages.
+compile guard, library tests, downloader/hosted-API proxy tests with both HTTP
+features enabled, installer contract checks, fsfs tests, facade integration,
+real-model E2E, the bounded Quill/Tantivy native witness, and executable quick-start
+stages. Clippy also checks the optional HTTP features. The installer checker
+requires Python `jsonschema`; its verifier fixtures establish orchestration,
+while release signatures must additionally pass the real Minisign verifier.
+The installer stage also runs `--mode dsr-tests` for the staged-artifact
+validator and `--mode proxy-binary-tests` for the executable proxy runner.
+These fixture regressions do not constitute a signed release, successful model
+provisioning by `fsfs`, or a native execution result for a release candidate.
 Its `examples` and `perf` stages are opt-in.
 The cross-target check establishes compilation, not Windows runtime support.
 
@@ -798,6 +817,90 @@ matrix. Reconciling the validator's old exact-six matrix with the actual DSR
 matrix belongs to the existing delivery task and must preserve positive
 capability probes and checksum/platform negative cases.
 
+The historical `unit` and `integration` schema fixtures describe the old
+embedded/Windows/Cosign envelope. Passing those fixtures does not inspect any
+staged DSR file. Use the existing checker's explicit artifact mode for the
+currently delivered default/lite matrix and Minisign format:
+
+```bash
+scripts/check_fsfs_packaging_release_install_contract.sh \
+  --mode dsr-release --artifact-dir /absolute/path/to/staged-release \
+  --version 1.13.0 --source-revision FULL_SOURCE_COMMIT_SHA \
+  --minisign /absolute/path/to/minisign
+```
+
+The version above is an example, not an announced release. This path requires
+the six declared versioned variants, the two full installer aliases and their
+sidecars: exactly 50 files. `SHA256SUMS` covers the 16 archive/metadata payloads;
+their individual checksum sidecars must agree. The 16 payload signatures and
+the checksum-manifest signature must verify with the pinned repository key.
+Metadata must agree with the requested tag, source revision, target, profile,
+capabilities and archived binary digest. Alias archive/metadata bytes must
+match the corresponding versioned payloads. The checker inspects archives
+without executing their binaries.
+
+Run `--mode dsr-tests` to exercise the validator's synthetic positive/negative
+regressions. Artifact mode requires an actual Minisign verifier; fixture
+orchestration is not signature proof. Even authenticated metadata cannot prove
+that a binary was executed natively or that proxy-only model acquisition
+succeeded. Those receipts, the full current-source quality gate and explicit
+publication approval remain separate requirements. This path preserves the
+historical schema cases and does not close the outstanding full Windows or
+full Linux ARM delivery obligations.
+
+### Execute the staged binary through proxies
+
+The packaging checker also accepts an explicit executable whose SHA-256 must
+match the binary digest in the authenticated staged metadata:
+
+```bash
+scripts/check_fsfs_packaging_release_install_contract.sh \
+  --mode proxy-binary --binary /absolute/path/to/candidate/fsfs \
+  --expected-sha256 EXPECTED_BINARY_SHA256 --expected-version 1.13.0 \
+  --work-dir /absolute/path/to/new-retained-proxy-evidence --provision
+```
+
+This mode uses the supplied executable without building or retrieving a
+replacement. It checks its identity and digest before and after execution,
+records the reported version, and creates private empty model/configuration
+directories for each acquisition. Credentials are random test canaries; child
+output containing them fails the check and is redacted in retained logs.
+Existing evidence directories are refused rather than overwritten.
+
+The local wire checks require authenticated HTTP CONNECT and SOCKS5/`socks5h`
+exchanges to the registered model's HTTPS authority. They cover lowercase
+precedence, `HTTPS_PROXY` versus `ALL_PROXY`, nonmatching and wrong-port
+`NO_PROXY` entries, SOCKS domain-name forwarding, authentication refusal and
+untrusted-origin TLS rejection. An untrusted HTTPS proxy must be rejected before
+CONNECT or proxy credentials are sent. Every retry must use the expected protocol;
+timeouts and signals cannot count as application refusals. Refused downloads
+must leave no model bytes or installed model. The default process deadline is
+20 seconds; `--deadline-seconds` can adjust it without changing success criteria.
+
+With `--provision`, the same executable additionally downloads the registered
+`potion-base-8m` bundle through authenticated forwarding proxies. This requires
+working external HTTPS access and transfers about 31 MB per protocol. The
+proxy forwards encrypted bytes without substituting certificates or changing
+the client's trust store. Pinned file sizes and SHA-256 values, the CLI's
+verification result, and a warm offline replay with no new proxy contacts are
+required. `--provision-deadline-seconds` bounds each live acquisition (180
+seconds by default). A fourth cold acquisition uses matching `NO_PROXY` and
+requires the complete verified bundle without contacting the configured proxy.
+The retained `receipt.json` distinguishes these live results from the local
+wire/security checks; the four acquisitions total about 124 MB.
+
+The runner does not observe all host egress. Successful proxy exchanges or a
+matching transfer byte count do not prove that no direct connection occurred;
+use an external egress observer or enforced proxy-only network for that claim.
+The untrusted-chain case also does not independently establish trusted-chain
+hostname validation. Native platform execution, default installer model-pair
+provisioning, hosted embedding API execution and exact build provenance remain
+separate requirements. Record the execution host and corroborate the binary
+architecture, including whether translation was active on macOS. Run the
+checks on the extracted candidate and again on the installed binary, retaining
+the matching digest and the existing installer signature/self-test evidence.
+Neither this runner nor its fixture tests create a release or publish files.
+
 ### Crates.io publish lane policy (required when enabled)
 
 Publication is a separately authorized, credentialed action following
@@ -823,6 +926,8 @@ Publication is a separately authorized, credentialed action following
 - `release.publish.asset_upload_failed`
 - `install.preflight.disk_space_low`
 - `install.verify.signature_missing`
+- `install.verify.signature_unverifiable`
+- `install.verify.signature_invalid`
 - `upgrade.apply.unsupported_path`
 - `upgrade.apply.rollback_triggered`
 - `upgrade.migration.matrix_failed`
