@@ -1193,7 +1193,7 @@ impl DaemonCoalescerService {
                                 {
                                     return Err(error);
                                 }
-                                warn!(%model, %error, "daemon embedding batch failed");
+                                warn!(%model, failure = ?classify_search_error(&error), "daemon embedding batch failed");
                             }
                         }
                     }
@@ -1207,7 +1207,7 @@ impl DaemonCoalescerService {
                 }))
             };
             if let Err(error) = run() {
-                warn!(%model, %error, "daemon embedding dispatcher stopped");
+                warn!(%model, failure = ?classify_search_error(&error), "daemon embedding dispatcher stopped");
             }
         });
         Ok(Self {
@@ -9867,11 +9867,7 @@ impl FsfsRuntime {
                 .daemon_coalescers
                 .as_ref()
                 .expect("daemon services installed");
-            for admitted in resources
-                .fast_embedder
-                .iter_mut()
-                .chain(resources.quality_embedder.iter_mut())
-            {
+            if let Some(admitted) = &mut resources.fast_embedder {
                 admitted.enable_daemon_dispatch(cx, services).await?;
             }
             // Clone only this request's cache entry. Other payloads stay in the
@@ -24401,6 +24397,15 @@ impl FsfsRuntime {
         if self.quality_work_deferred() || self.config.indexing.quality_model.trim().is_empty() {
             return Ok(());
         }
+        #[cfg(unix)]
+        if let (Some(admitted), Some(services)) = (
+            resources.quality_embedder.as_mut(),
+            self.daemon_coalescers.as_ref(),
+        ) {
+            // Warm quality admission belongs to the refinement budget too.
+            // Its failure must not withhold the already valid Initial phase.
+            admitted.enable_daemon_dispatch(cx, services).await?;
+        }
         if resources.quality_embedder.is_some() || resources.quality_embedder_attempted {
             return Ok(());
         }
@@ -33262,7 +33267,9 @@ mod tests {
     }
 
     /// Admit a shared test embedder while the test keeps its handle.
-    fn admitted_shared<E: Embedder + 'static>(embedder: &Arc<E>) -> super::AdmittedEmbedder {
+    pub(super) fn admitted_shared<E: Embedder + 'static>(
+        embedder: &Arc<E>,
+    ) -> super::AdmittedEmbedder {
         super::AdmittedEmbedder::admit(
             &Cx::for_request(),
             Arc::clone(embedder) as Arc<dyn Embedder>,
@@ -34057,7 +34064,7 @@ mod tests {
         });
     }
 
-    fn disagreeing_blend_resources(root: &Path) -> SearchExecutionResources {
+    pub(super) fn disagreeing_blend_resources(root: &Path) -> SearchExecutionResources {
         let write = |name: &str, id: &str, rows: &[(&str, [f32; 2])]| {
             let path = root.join(name);
             let mut writer = VectorIndex::create_with_revision(
@@ -36732,76 +36739,76 @@ mod tests {
     }
 
     #[cfg(unix)]
+    pub(super) struct HeldNativeBatch {
+        pub(super) gate: Arc<asupersync::sync::Mutex<()>>,
+        pub(super) batches: std::sync::Mutex<Vec<Vec<String>>>,
+        pub(super) singletons: AtomicUsize,
+    }
+    #[cfg(unix)]
+    impl Embedder for HeldNativeBatch {
+        fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.singletons.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let _permit = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.gate), cx)
+                    .await
+                    .map_err(|error| SearchError::Cancelled {
+                        phase: "held singleton daemon query".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                Ok(vec![1.0, 0.0])
+            })
+        }
+        fn embed_batch_bound<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
+            Box::pin(async move {
+                self.batches
+                    .lock()
+                    .unwrap()
+                    .push(texts.iter().map(|text| (*text).to_owned()).collect());
+                let _permit = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.gate), cx)
+                    .await
+                    .map_err(|error| SearchError::Cancelled {
+                        phase: "held daemon batch".to_owned(),
+                        reason: error.to_string(),
+                    })?;
+                Ok(texts
+                    .iter()
+                    .map(|_| frankensearch_core::IdentityBoundEmbedding {
+                        values: vec![1.0, 0.0],
+                        identity: test_identity(self.id(), 2).clone(),
+                    })
+                    .collect())
+            })
+        }
+        fn bound_batch_is_native(&self) -> bool {
+            true
+        }
+        fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
+            Ok(test_identity(self.id(), 2))
+        }
+        fn dimension(&self) -> usize {
+            2
+        }
+        fn id(&self) -> &'static str {
+            "blend-quality-2"
+        }
+        fn model_name(&self) -> &'static str {
+            "held native daemon batch"
+        }
+        fn is_semantic(&self) -> bool {
+            true
+        }
+        fn category(&self) -> ModelCategory {
+            ModelCategory::TransformerEmbedder
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn concurrent_daemon_queries_share_batches_without_sharing_client_cancellation() {
-        struct HeldNativeBatch {
-            gate: Arc<asupersync::sync::Mutex<()>>,
-            batches: std::sync::Mutex<Vec<Vec<String>>>,
-            singletons: AtomicUsize,
-        }
-        impl Embedder for HeldNativeBatch {
-            fn embed<'a>(&'a self, cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
-                self.singletons.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async move {
-                    let _permit =
-                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.gate), cx)
-                            .await
-                            .map_err(|error| SearchError::Cancelled {
-                                phase: "held singleton daemon query".to_owned(),
-                                reason: error.to_string(),
-                            })?;
-                    Ok(vec![1.0, 0.0])
-                })
-            }
-            fn embed_batch_bound<'a>(
-                &'a self,
-                cx: &'a Cx,
-                texts: &'a [&'a str],
-            ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
-                Box::pin(async move {
-                    self.batches
-                        .lock()
-                        .unwrap()
-                        .push(texts.iter().map(|text| (*text).to_owned()).collect());
-                    let _permit =
-                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&self.gate), cx)
-                            .await
-                            .map_err(|error| SearchError::Cancelled {
-                                phase: "held daemon batch".to_owned(),
-                                reason: error.to_string(),
-                            })?;
-                    Ok(texts
-                        .iter()
-                        .map(|_| frankensearch_core::IdentityBoundEmbedding {
-                            values: vec![1.0, 0.0],
-                            identity: test_identity(self.id(), 2).clone(),
-                        })
-                        .collect())
-                })
-            }
-            fn bound_batch_is_native(&self) -> bool {
-                true
-            }
-            fn identity(&self) -> SearchResult<&frankensearch_core::EmbeddingIdentityBundleV1> {
-                Ok(test_identity(self.id(), 2))
-            }
-            fn dimension(&self) -> usize {
-                2
-            }
-            fn id(&self) -> &'static str {
-                "blend-quality-2"
-            }
-            fn model_name(&self) -> &'static str {
-                "held native daemon batch"
-            }
-            fn is_semantic(&self) -> bool {
-                true
-            }
-            fn category(&self) -> ModelCategory {
-                ModelCategory::TransformerEmbedder
-            }
-        }
-
         for client_count in [4, 8] {
             for (bypass, cancel_dispatching_client) in
                 [(false, false), (false, true), (true, false)]
@@ -36883,30 +36890,40 @@ mod tests {
                 let mut outstanding = 0;
                 let mut cancelled_handler_finished = !cancel_dispatching_client;
                 if read_errors.is_empty() && !bypass {
-                    let coalescer = {
-                        let guard = futures_lite_block_on(asupersync::sync::OwnedMutexGuard::lock(
-                            Arc::clone(&shared),
-                            &Cx::for_request(),
-                        ))
-                        .unwrap();
-                        guard
-                            .0
-                            .quality_embedder
-                            .as_ref()
-                            .unwrap()
-                            .coalescer()
-                            .unwrap()
-                            .clone()
-                    };
                     let deadline = Instant::now() + Duration::from_secs(3);
-                    while (coalescer.usage().outstanding_requests != client_count
-                        || producer.batches.lock().unwrap().is_empty())
-                        && Instant::now() < deadline
-                    {
+                    // Quality becomes daemon-owned only after Initial, inside
+                    // each request's refinement budget. Observe that actual
+                    // shared dispatcher, not the untouched admission snapshot.
+                    let coalescer = loop {
+                        let services = futures_lite_block_on(
+                            runtime
+                                .daemon_coalescers
+                                .as_ref()
+                                .unwrap()
+                                .services
+                                .lock(&Cx::for_request()),
+                        )
+                        .unwrap();
+                        let coalescer = services
+                            .iter()
+                            .find(|service| service.provider.id() == "blend-quality-2")
+                            .map(|service| service.client.clone());
+                        drop(services);
+                        if coalescer.as_ref().is_some_and(|client| {
+                            client.usage().outstanding_requests == client_count
+                        }) && !producer.batches.lock().unwrap().is_empty()
+                        {
+                            break coalescer;
+                        }
+                        if Instant::now() >= deadline {
+                            break None;
+                        }
                         thread::sleep(Duration::from_millis(1));
-                    }
-                    outstanding = coalescer.usage().outstanding_requests;
-                    if cancel_dispatching_client {
+                    };
+                    outstanding = coalescer
+                        .as_ref()
+                        .map_or(0, |client| client.usage().outstanding_requests);
+                    if cancel_dispatching_client && coalescer.is_some() {
                         let first = producer.batches.lock().unwrap()[0][0].clone();
                         let index = (0..client_count)
                             .find(|index| first.ends_with(&index.to_string()))

@@ -79,6 +79,17 @@ struct SearchRequest {
 }
 
 impl SearchRequest {
+    fn admission_policy(&self) -> (Duration, SearchExecutionMode) {
+        let mode = if self.quality_only {
+            SearchExecutionMode::QualityOnly
+        } else if self.policy.fast_only {
+            SearchExecutionMode::FastOnly
+        } else {
+            SearchExecutionMode::Full
+        };
+        (self.policy.delivery_budget(), mode)
+    }
+
     /// The policy is already installed on the per-request runtime. Omitted
     /// serve overrides preserve that exact policy in the common executor.
     fn as_serve_request(&self, mode: SearchExecutionMode) -> SearchServeRequest {
@@ -587,6 +598,30 @@ pub(super) async fn serve(
         Box::pin(execute(cx, runtime, session, &request, cache)).await
     })
     .await
+}
+
+/// Preserve the request's existing end-to-end budget while the daemon admits
+/// its shared reader snapshot. The actual server still validates the bytes.
+pub(super) fn admission_policy(bytes: &[u8]) -> SearchResult<(Duration, SearchExecutionMode)> {
+    if progressive::is_streamed(bytes) {
+        progressive::admission_policy(bytes)
+    } else {
+        Ok(decode_request(bytes)?.search.admission_policy())
+    }
+}
+
+pub(super) async fn refuse_admission(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    bytes: &[u8],
+    timeout: Duration,
+    error: SearchError,
+) -> SearchResult<PeerOutcome> {
+    if progressive::is_streamed(bytes) {
+        progressive::refuse_admission(cx, peer, bytes, timeout, error).await
+    } else {
+        serve_buffered(cx, peer, bytes, timeout, |_| async { Err(error) }).await
+    }
 }
 
 /// The ordinary buffered transport, with one caller-owned execution future.

@@ -11,6 +11,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::pin::pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Poll;
 use std::time::{Duration, Instant};
@@ -22,9 +23,9 @@ use serde::Serialize;
 use super::super::{
     FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS, FSFS_DAEMON_CONNECT_MAX_ATTEMPTS,
     FSFS_DAEMON_CONNECT_RETRY_DELAY_MS, FSFS_DAEMON_IDLE_TIMEOUT_MS, FSFS_DAEMON_REQUEST_MAX_BYTES,
-    SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
-    SearchStreamResources, daemon_socket_path_capacity, degraded_search_mode,
-    parse_search_execution_mode,
+    LiveRetainedSearchReader, RetainedSearchReader, SearchExecutionFlags, SearchExecutionMode,
+    SearchExecutionResources, SearchServeRequest, SearchStreamResources,
+    daemon_socket_path_capacity, degraded_search_mode, parse_search_execution_mode,
 };
 use super::{
     FsfsRuntime, complete_cli_error, emit_complete_serve_line, pressure_timestamp_ms,
@@ -49,6 +50,12 @@ mod forwarding;
 mod admission;
 
 static STREAM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+type SessionState = (
+    LiveRetainedSearchReader,
+    HashMap<super::super::SearchCacheKey, Vec<crate::output_schema::SearchPayload>>,
+);
+type SharedSession = Arc<asupersync::sync::Mutex<SessionState>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerOutcome {
@@ -380,8 +387,8 @@ impl FsfsRuntime {
         }))
     }
 
-    /// Frame up to eight waiting connections while one search owns the retained
-    /// resources. Incomplete senders do not block other clients, and an exactly
+    /// Drive up to eight owned queries against admitted reader snapshots.
+    /// Incomplete senders do not block other clients, and an exactly
     /// decoded shutdown can interrupt pending execution before acknowledgment.
     /// Intake/queue time is bounded separately from each search's delivery
     /// budget. No detached worker owns a reader, socket, or request after return.
@@ -400,126 +407,295 @@ impl FsfsRuntime {
         }
         // Admit before opening the transport: no listening socket claims a
         // ready service while its generation or semantic producer is invalid.
-        let mut session = self.open_live_retained_search(cx, root).await?;
-        retained_search_checkpoint(cx)?;
+        let (_pool, handle) = self.search_blocking_capacity();
+        let runtime = if self.search_blocking_pool.is_some() {
+            self.clone()
+        } else {
+            self.clone().with_search_blocking_pool(handle.clone())
+        }
+        .with_daemon_coalescers();
+        let cx = cx.clone().with_blocking_pool_handle(Some(handle));
+        let session = runtime.open_live_retained_search(&cx, root).await?;
+        retained_search_checkpoint(&cx)?;
         let bound = BoundCompleteSocket::bind(socket_path)?;
-        let mut cache = HashMap::new();
+        let shared = Arc::new(asupersync::sync::Mutex::new((session, HashMap::new())));
         let cache_enabled = std::env::var_os("FSFS_DISABLE_QUERY_CACHE").is_none();
         let idle_timeout = control::idle_timeout(self.cli_input.daemon_idle_timeout_ms);
         let peer_timeout = Duration::from_millis(FSFS_DAEMON_CLIENT_IO_TIMEOUT_MS);
         let mut intake = admission::Intake::new(peer_timeout);
+        let mut active = Vec::new();
         loop {
-            retained_search_checkpoint(cx)?;
-            let Some(request) = intake.next(cx, &bound.listener, idle_timeout).await? else {
-                return Ok(());
+            retained_search_checkpoint(&cx)?;
+            let request = match intake
+                .next_concurrent(&cx, &bound.listener, idle_timeout, &mut active)
+                .await?
+            {
+                admission::Event::Idle => return Ok(()),
+                admission::Event::Finished(result) => {
+                    if stop_after_peer(&cx, result)? {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                admission::Event::Peer(request) => request,
             };
-            let shutdown = request.is_shutdown();
-            let (mut peer, bytes) = request.into_parts();
-            if shutdown {
+            if request.is_shutdown() {
+                // Drop every request's readers and writer clones before the
+                // acknowledgment. Native dispatch has its own draining owner.
+                active.clear();
+                let (mut peer, _) = request.into_parts();
                 // An acknowledged stop must not subsequently be relabelled by
                 // a driver checkpoint. Only the strict decoder mints this flag.
                 let result =
-                    write_response(cx, &mut peer, control::SHUTDOWN_RESPONSE, peer_timeout)
+                    write_response(&cx, &mut peer, control::SHUTDOWN_RESPONSE, peer_timeout)
                         .await
                         .map(|()| PeerOutcome::Shutdown);
-                if stop_after_peer(cx, result)? {
+                if stop_after_peer(&cx, result)? {
                     return Ok(());
                 }
                 intake.completed();
                 continue;
             }
-            let execution = async {
-                let session = &mut session;
-                let cache = &mut cache;
+            active.push(Box::pin(runtime.execute_complete_daemon_peer(
+                &cx,
+                Arc::clone(&shared),
+                request,
+                peer_timeout,
+                cache_enabled,
+            )));
+        }
+    }
+
+    async fn execute_complete_daemon_peer(
+        &self,
+        cx: &Cx,
+        shared: SharedSession,
+        request: admission::ReadyPeer,
+        peer_timeout: Duration,
+        cache_enabled: bool,
+    ) -> SearchResult<PeerOutcome> {
+        let (mut peer, bytes) = request.into_parts();
+        let (budget, mode) = if forwarding::is_forwarded(&bytes) {
+            forwarding::admission_policy(&bytes)
+                .unwrap_or((peer_timeout, SearchExecutionMode::LexicalOnly))
+        } else {
+            parse_request(&bytes)
+                .and_then(|(request, _)| {
+                    Ok((
+                        self.complete_request_delivery_budget(&request),
+                        parse_search_execution_mode(request.mode.as_deref())?,
+                    ))
+                })
+                .unwrap_or((peer_timeout, SearchExecutionMode::LexicalOnly))
+        };
+        let prepare_fast = matches!(
+            degraded_search_mode(self.config.pressure.degradation_override, mode),
+            Ok(SearchExecutionMode::Full | SearchExecutionMode::FastOnly)
+        );
+        let connection = streaming::PhaseWriter::new(&peer)?;
+        Box::pin(run_request(
+            cx,
+            budget,
+            streaming::drive(cx, &connection, async {
                 if is_ready_probe(&bytes) {
                     // Inspect the admitted resources only while owning them;
                     // a readiness probe never races an in-flight refresh.
-                    let ready = encode_response(&Self::search_serve_ready_event(
-                        session.reader.runtime.cli_input.format.to_string(),
-                        &session.reader.resources,
-                    ))?;
+                    let ready = {
+                        let state =
+                            asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), cx)
+                                .await
+                                .map_err(|error| {
+                                    complete_cli_error("daemon_admission", &error.to_string())
+                                })?;
+                        encode_response(&Self::search_serve_ready_event(
+                            state.0.reader.runtime.cli_input.format.to_string(),
+                            &state.0.reader.resources,
+                        ))?
+                    };
                     write_response(cx, &mut peer, &ready, peer_timeout).await?;
                     return Ok(PeerOutcome::Search);
                 }
-                if forwarding::is_forwarded(&bytes) {
+                let (mut session, mut cache) = match self
+                    .snapshot_complete_daemon(cx, &shared, prepare_fast)
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) if forwarding::is_forwarded(&bytes) => {
+                        return forwarding::refuse_admission(
+                            cx,
+                            &mut peer,
+                            &bytes,
+                            peer_timeout,
+                            error,
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        // Keep the original typed refusal and stream boundary:
+                        // shared admission failure never authorizes stale retrieval.
+                        return serve_peer_bytes(
+                            cx,
+                            &mut peer,
+                            peer_timeout,
+                            &bytes,
+                            |request| self.complete_request_delivery_budget(request),
+                            |_, _| async {
+                                Err::<Option<super::super::SearchServeResponse>, _>(error)
+                            },
+                        )
+                        .await;
+                    }
+                };
+                let original_keys = cache
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>();
+                let result = if forwarding::is_forwarded(&bytes) {
                     // Forwarded and raw requests retain the same generation,
                     // cache, configuration admission and no-replay contracts.
-                    return Box::pin(forwarding::serve(
+                    Box::pin(forwarding::serve(
                         cx,
                         self,
-                        session,
+                        &mut session,
                         &mut peer,
                         &bytes,
                         peer_timeout,
-                        cache_enabled.then_some(cache),
+                        cache_enabled.then_some(&mut cache),
                     ))
-                    .await;
-                }
-                Box::pin(serve_peer_bytes(
-                    cx,
-                    &mut peer,
-                    peer_timeout,
-                    &bytes,
-                    |request| self.complete_request_delivery_budget(request),
-                    |request, output| async move {
-                        // A cached request must pass selection admission too.
-                        // Refresh never swaps on failure and we never consult
-                        // old cache/resources after a failed refresh.
-                        if session.refresh(cx).await? {
-                            cache.clear();
-                        }
-                        if let Some(mut output) = output {
+                    .await
+                } else {
+                    let session = &mut session;
+                    let cache = &mut cache;
+                    Box::pin(serve_peer_bytes(
+                        cx,
+                        &mut peer,
+                        peer_timeout,
+                        &bytes,
+                        |request| self.complete_request_delivery_budget(request),
+                        |request, output| async move {
+                            // A cached request must pass selection admission too.
+                            // Refresh never swaps on failure and we never consult
+                            // old cache/resources after a failed refresh.
+                            if session.refresh(cx).await? {
+                                cache.clear();
+                            }
+                            if let Some(mut output) = output {
+                                session
+                                    .reader
+                                    .runtime
+                                    .stream_complete_search_request(
+                                        cx,
+                                        request,
+                                        &mut session.reader.resources,
+                                        &mut output,
+                                    )
+                                    .await?;
+                                return Ok(None);
+                            }
                             session
                                 .reader
                                 .runtime
-                                .stream_complete_search_request(
+                                .execute_search_serve_request(
                                     cx,
                                     request,
                                     &mut session.reader.resources,
-                                    &mut output,
+                                    cache,
+                                    cache_enabled,
                                 )
-                                .await?;
-                            return Ok(None);
-                        }
-                        session
-                            .reader
-                            .runtime
-                            .execute_search_serve_request(
-                                cx,
-                                request,
-                                &mut session.reader.resources,
-                                cache,
-                                cache_enabled,
-                            )
-                            .await
-                            .map(Some)
-                    },
-                ))
-                .await
-            };
-            let result = match intake.drive(cx, &bound.listener, execution).await? {
-                admission::DriveOutcome::Finished(result) => result,
-                admission::DriveOutcome::Shutdown(request) => {
-                    // The owned search future (and any phase-writer clones) is
-                    // already dropped. Close its peer before acknowledging stop;
-                    // partial output stays a failed search, never fake success.
-                    drop(peer);
-                    let (mut control_peer, _) = request.into_parts();
-                    write_response(
-                        cx,
-                        &mut control_peer,
-                        control::SHUTDOWN_RESPONSE,
-                        peer_timeout,
-                    )
+                                .await
+                                .map(Some)
+                        },
+                    ))
                     .await
-                    .map(|()| PeerOutcome::Shutdown)
+                };
+                retained_search_checkpoint(cx)?;
+                if result.is_ok() {
+                    let mut state =
+                        asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&shared), cx)
+                            .await
+                            .map_err(|error| {
+                                complete_cli_error("daemon_completion", &error.to_string())
+                            })?;
+                    if state.0.generation() == session.generation() {
+                        let current = &mut state.0.reader.resources;
+                        let completed = &mut session.reader.resources;
+                        if current.resource_mode == completed.resource_mode {
+                            if current.fast_embedder.is_none() && completed.fast_embedder.is_some()
+                            {
+                                current.fast_embedder = completed.fast_embedder.take();
+                                current.fast_embedder_attempted = true;
+                            }
+                            if current.quality_embedder.is_none()
+                                && completed.quality_embedder.is_some()
+                            {
+                                current.quality_embedder = completed.quality_embedder.take();
+                                current.quality_embedder_attempted = true;
+                            }
+                        }
+                        if cache_enabled {
+                            for (key, value) in cache {
+                                if !original_keys.contains(&key) {
+                                    if state.1.len() >= super::super::FSFS_DAEMON_MAX_CACHE_ENTRIES
+                                    {
+                                        state.1.clear();
+                                    }
+                                    state.1.insert(key, value);
+                                }
+                            }
+                        }
+                    }
                 }
-            };
-            if stop_after_peer(cx, result)? {
-                return Ok(());
-            }
-            intake.completed();
+                result
+            }),
+        ))
+        .await
+    }
+
+    async fn snapshot_complete_daemon(
+        &self,
+        cx: &Cx,
+        shared: &SharedSession,
+        prepare_fast: bool,
+    ) -> SearchResult<SessionState> {
+        let mut state = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(shared), cx)
+            .await
+            .map_err(|error| complete_cli_error("daemon_admission", &error.to_string()))?;
+        if state.0.refresh(cx).await? {
+            state.1.clear();
         }
+        let runtime = state.0.reader.runtime.clone();
+        let resources = &mut state.0.reader.resources;
+        if prepare_fast
+            && matches!(
+                resources.resource_mode,
+                SearchExecutionMode::Full | SearchExecutionMode::FastOnly
+            )
+            && resources.vector_index.is_some()
+        {
+            runtime.maybe_prepare_fast_embedder(cx, resources).await?;
+        }
+        let services = self
+            .daemon_coalescers
+            .as_ref()
+            .expect("daemon services installed");
+        if prepare_fast {
+            if let Some(admitted) = &mut resources.fast_embedder {
+                admitted.enable_daemon_dispatch(cx, services).await?;
+            }
+        }
+        // The existing cache has at most eight entries. Each request owns its
+        // working set; only newly completed keys are merged after generation fencing.
+        Ok((
+            LiveRetainedSearchReader {
+                store: state.0.store.clone(),
+                reader: RetainedSearchReader {
+                    runtime,
+                    generation: state.0.reader.generation.clone(),
+                    resources: state.0.reader.resources.clone(),
+                },
+            },
+            state.1.clone(),
+        ))
     }
 
     /// Raw streams use the same typed request mode as buffered searches. Admit
@@ -2225,6 +2401,143 @@ mod generation_tests {
             );
             cx.set_cancel_requested(false);
         });
+    }
+
+    #[cfg(feature = "semantic-support")]
+    #[test]
+    fn complete_daemon_batches_owned_queries_and_isolates_disconnected_clients() {
+        use crate::runtime::tests::{
+            HeldNativeBatch, admitted_shared, disagreeing_blend_resources,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        for count in [4, 8] {
+            for disconnect in [false, true] {
+                let scheduler = asupersync::runtime::RuntimeBuilder::current_thread()
+                    .blocking_threads(0, 2)
+                    .build()
+                    .unwrap();
+                let owner = crate::runtime::SearchBlockingPool::default();
+                scheduler.block_on(async {
+                    let cx = owner.context(Cx::current().unwrap());
+                    let directory = tempfile::tempdir().unwrap();
+                    let (base, root) = published_daemon_fixture(&cx, directory.path()).await;
+                    let mut session = base.open_live_retained_search(&cx, &root).await.unwrap();
+                    let vectors = directory.path().join("unit-vectors");
+                    fs::create_dir(&vectors).unwrap();
+                    // Inject explicitly identified two-dimensional UNIT vectors;
+                    // ordinary real-model acceptance covers sealed artifact admission.
+                    let mut resources = disagreeing_blend_resources(&vectors);
+                    let gate = Arc::new(asupersync::sync::Mutex::new(()));
+                    let held = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&gate), &cx)
+                        .await.unwrap();
+                    let producer = Arc::new(HeldNativeBatch {
+                        gate, batches: std::sync::Mutex::new(Vec::new()),
+                        singletons: AtomicUsize::new(0),
+                    });
+                    let runtime = FsfsRuntime::new(FsfsConfig::default())
+                        .with_search_blocking_pool(owner.handle())
+                        .with_daemon_coalescers()
+                        .with_cli_input(CliInput { index_dir: Some(vectors), ..CliInput::default() });
+                    let mut admitted = admitted_shared(&producer);
+                    admitted.enable_daemon_dispatch(&cx, runtime.daemon_coalescers.as_ref().unwrap())
+                        .await.unwrap();
+                    let coalescer = admitted.coalescer().unwrap().clone();
+                    resources.quality_embedder = Some(admitted);
+                    session.reader.runtime = runtime.clone();
+                    session.reader.resources = resources;
+                    let shared = Arc::new(asupersync::sync::Mutex::new((session, HashMap::new())));
+                    let bound = BoundCompleteSocket::bind(root.join("concurrent.sock")).unwrap();
+                    let address = bound.listener.local_addr().unwrap();
+                    let mut clients = Vec::new();
+                    for index in 0..count {
+                        let mut client = UnixStream::connect(address.as_pathname().unwrap()).unwrap();
+                        writeln!(client, "{}", serde_json::json!({
+                            "query": format!("recover failed network requests client {index}"),
+                            "quality_timeout_ms": 15_000, "limit": 10, "stream": true,
+                        })).unwrap();
+                        client.shutdown(std::net::Shutdown::Write).unwrap();
+                        client.set_nonblocking(true).unwrap();
+                        clients.push(Some(client));
+                    }
+                    let timeout = Duration::from_secs(15);
+                    let mut intake = admission::Intake::new(timeout);
+                    let mut active: Vec<admission::Request<'_, SearchResult<PeerOutcome>>> = Vec::new();
+                    for _ in 0..count {
+                        let peer = intake.next(&cx, &bound.listener, None).await.unwrap().unwrap();
+                        active.push(Box::pin(runtime.execute_complete_daemon_peer(
+                            &cx, Arc::clone(&shared), peer, timeout, true,
+                        )));
+                    }
+                    let mut received = vec![Vec::new(); count];
+                    let mut read_available = |clients: &mut Vec<Option<UnixStream>>| {
+                        for (index, client) in clients.iter_mut().enumerate() {
+                            let Some(client) = client else { continue };
+                            let mut bytes = [0; 8192];
+                            loop {
+                                match client.read(&mut bytes) {
+                                    Ok(0) => break,
+                                    Ok(len) => received[index].extend_from_slice(&bytes[..len]),
+                                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                                    Err(error) => panic!("unit socket read: {error}"),
+                                }
+                            }
+                        }
+                        received.iter().all(|bytes| String::from_utf8_lossy(bytes)
+                            .contains("query.stream.initial_ready"))
+                    };
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut driving = Box::pin(intake.next_concurrent(&cx, &bound.listener, None, &mut active));
+                    let all_waiting = poll_fn(|task| {
+                        if driving.as_mut().poll(task).is_ready() { return Poll::Ready(false) }
+                        if read_available(&mut clients) && coalescer.usage().outstanding_requests == count
+                            && !producer.batches.lock().unwrap().is_empty()
+                        { return Poll::Ready(true) }
+                        if Instant::now() >= deadline { return Poll::Ready(false) }
+                        task.waker().wake_by_ref();
+                        Poll::Pending
+                    }).await;
+                    // Release the native owner on every failure path before panic.
+                    if !all_waiting { drop(held); panic!("all default daemon clients must reach held quality after Initial") }
+                    drop(driving);
+                    if disconnect {
+                        let first = producer.batches.lock().unwrap()[0][0].clone();
+                        let index = (0..count).find(|index| first.ends_with(&index.to_string())).unwrap();
+                        drop(clients[index].take());
+                        let result = run_request(&cx, Duration::from_secs(3), async {
+                            intake.next_concurrent(&cx, &bound.listener, None, &mut active).await
+                        }).await;
+                        let independently_finished = matches!(result, Ok(admission::Event::Finished(Err(_))));
+                        if !independently_finished { drop(held); panic!("disconnected default client must finish while native batch remains held") }
+                        assert_eq!(coalescer.usage().outstanding_requests, count);
+                    }
+                    drop(held);
+                    while !active.is_empty() {
+                        let admission::Event::Finished(result) = intake
+                            .next_concurrent(&cx, &bound.listener, None, &mut active).await.unwrap()
+                        else { panic!("no additional peer was sent") };
+                        result.unwrap();
+                    }
+                    read_available(&mut clients);
+                    drop(read_available);
+                    for (client, bytes) in clients.iter().zip(&received) {
+                        if client.is_none() { continue }
+                        let frames = bytes.split(|byte| *byte == b'\n').filter(|line| !line.is_empty())
+                            .map(|line| serde_json::from_slice::<serde_json::Value>(line).unwrap())
+                            .collect::<Vec<_>>();
+                        assert_completed_stream(&frames);
+                        let hits = frames.iter().filter(|frame| frame["event"] == "result")
+                            .map(|frame| frame["payload"]["item"]["path"].as_str().unwrap()).collect::<Vec<_>>();
+                        assert_eq!(hits.first(), Some(&"a.rs"));
+                        assert_eq!(hits[hits.len() / 2], "b.rs");
+                    }
+                    let batches = producer.batches.lock().unwrap();
+                    assert!(batches.len() <= 2, "{batches:?}");
+                    assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), count);
+                    assert_eq!(producer.singletons.load(Ordering::SeqCst), 0);
+                });
+            }
+        }
     }
 
     /// Execute the production raw stream path over a real Unix socket. Retained

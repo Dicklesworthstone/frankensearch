@@ -729,6 +729,10 @@ impl BatchCoalescer {
         debug!(
             target: "frankensearch.coalescer",
             batch_size = requests.len(),
+            coalesced_batch_size = requests.len(),
+            // Oldest input's actual queue residence, excluding model inference.
+            wait_micros = requests.iter().map(|request| request.submitted_at).min()
+                .map_or(0, |submitted| submitted.elapsed().as_micros()),
             remaining = state.pending.len(),
             ?reason,
             "batch formed"

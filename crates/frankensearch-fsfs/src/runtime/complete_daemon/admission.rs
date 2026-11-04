@@ -1,8 +1,8 @@
-//! Bounded multi-peer framing around the daemon's single search owner.
+//! Bounded multi-peer framing and concurrently owned request execution.
 //!
 //! A peer that has not finished its request cannot monopolize the listener.
-//! Framing futures are polled here, never spawned. Search/model/cache access
-//! remains serialized by the parent; only transport intake runs alongside it.
+//! Futures are polled here, never spawned. The parent admits immutable reader
+//! snapshots before inference; slow peers cannot retain the shared state lock.
 
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
@@ -19,8 +19,16 @@ use super::{IO_POLL_INTERVAL, control, read_request, retained_search_checkpoint}
 
 // At most eight framed/framing peers in addition to the executing request.
 // The existing 1 MiB request limit therefore also bounds queued payloads.
-const MAX_PEERS: usize = 8;
+pub(super) const MAX_PEERS: usize = 8;
 const ACCEPTS_PER_TURN: usize = 4;
+
+pub(super) type Request<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+pub(super) enum Event<T> {
+    Peer(ReadyPeer),
+    Finished(T),
+    Idle,
+}
 
 pub(super) struct ReadyPeer {
     peer: UnixStream,
@@ -44,6 +52,7 @@ struct ReadingPeer {
     future: Pin<Box<dyn Future<Output = SearchResult<ReadyPeer>> + Send>>,
 }
 
+#[cfg(test)]
 pub(super) enum DriveOutcome<T> {
     Finished(T),
     // Only the existing strict control decoder can mint this disposition.
@@ -104,6 +113,7 @@ impl Intake {
         listener: &UnixListener,
         task: &mut Context<'_>,
         now: Instant,
+        capacity: usize,
     ) -> SearchResult<bool> {
         retained_search_checkpoint(cx)?;
         let before = self.len();
@@ -122,7 +132,7 @@ impl Intake {
         self.discard_disconnected(now);
         let mut accepted = 0;
         for _ in 0..ACCEPTS_PER_TURN {
-            if self.len() == MAX_PEERS {
+            if self.len() >= capacity {
                 break;
             }
             retained_search_checkpoint(cx)?;
@@ -179,7 +189,7 @@ impl Intake {
         self.discard_disconnected(now);
         // Drain a still-readable accept backlog on another scheduler turn,
         // not recursively here. A full queue waits for capacity/the I/O tick.
-        Ok(accepted == ACCEPTS_PER_TURN && self.len() < MAX_PEERS)
+        Ok(accepted == ACCEPTS_PER_TURN && self.len() < capacity)
     }
 
     fn take_shutdown(&mut self) -> Option<ReadyPeer> {
@@ -187,10 +197,71 @@ impl Intake {
         self.ready.remove(position)
     }
 
+    /// Drive at most eight searches, retaining the original nine-peer total
+    /// (one executing plus eight waiting). A strict shutdown wins before any
+    /// new search poll; the parent drops every owned request before replying.
+    #[allow(clippy::future_not_send)] // All request futures stay on this owner.
+    pub(super) async fn next_concurrent<T: Send>(
+        &mut self,
+        cx: &Cx,
+        listener: &UnixListener,
+        idle_timeout: Option<Duration>,
+        work: &mut Vec<Request<'_, T>>,
+    ) -> SearchResult<Event<T>> {
+        loop {
+            let mut tick = pin!(asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL));
+            let event = poll_fn(|task| {
+                let now = Instant::now();
+                let again = match self.pump(cx, listener, task, now, MAX_PEERS + 1 - work.len()) {
+                    Ok(again) => again,
+                    Err(error) => return Poll::Ready(Err(error)),
+                };
+                if let Some(peer) = self.take_shutdown() {
+                    return Poll::Ready(Ok(Some(Event::Peer(peer))));
+                }
+                for index in 0..work.len() {
+                    if let Poll::Ready(result) = work[index].as_mut().poll(task) {
+                        drop(work.remove(index));
+                        self.completed();
+                        return Poll::Ready(Ok(Some(Event::Finished(result))));
+                    }
+                    if let Err(error) = retained_search_checkpoint(cx) {
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                if work.len() < MAX_PEERS
+                    && let Some(peer) = self.ready.pop_front()
+                {
+                    return Poll::Ready(Ok(Some(Event::Peer(peer))));
+                }
+                if work.is_empty()
+                    && self.len() == 0
+                    && idle_timeout
+                        .is_some_and(|limit| now.duration_since(self.last_activity) >= limit)
+                {
+                    return Poll::Ready(Ok(Some(Event::Idle)));
+                }
+                if again {
+                    task.waker().wake_by_ref();
+                }
+                if tick.as_mut().poll(task).is_ready() {
+                    Poll::Ready(Ok(None))
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await?;
+            if let Some(event) = event {
+                return Ok(event);
+            }
+        }
+    }
+
     /// Wait for a complete request, never for a particular incomplete sender.
     /// Valid shutdown controls take priority; all other ready peers retain
     /// completion order. Admission saturation leaves the kernel backlog alone.
     #[allow(clippy::future_not_send)] // Framing futures stay on this owning task.
+    #[cfg(test)]
     pub(super) async fn next(
         &mut self,
         cx: &Cx,
@@ -201,7 +272,7 @@ impl Intake {
             let mut tick = pin!(asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL));
             let result = poll_fn(|task| {
                 let now = Instant::now();
-                let again = match self.pump(cx, listener, task, now) {
+                let again = match self.pump(cx, listener, task, now, MAX_PEERS) {
                     Ok(again) => again,
                     Err(error) => return Poll::Ready(Err(error)),
                 };
@@ -237,6 +308,7 @@ impl Intake {
     /// generation mutation occurs here. Acknowledgment remains the parent's job.
     /// Synchronous work already running inside poll cannot be preempted.
     #[allow(clippy::future_not_send)] // Never spawn or require Send from the search owner.
+    #[cfg(test)]
     pub(super) async fn drive<T>(
         &mut self,
         cx: &Cx,
@@ -247,7 +319,7 @@ impl Intake {
         loop {
             let mut tick = pin!(asupersync::time::sleep(cx.now(), IO_POLL_INTERVAL));
             let result = poll_fn(|task| {
-                let again = match self.pump(cx, listener, task, Instant::now()) {
+                let again = match self.pump(cx, listener, task, Instant::now(), MAX_PEERS) {
                     Ok(again) => again,
                     Err(error) => return Poll::Ready(Err(error)),
                 };
@@ -316,8 +388,8 @@ mod tests {
     }
 
     fn connect(listener: &UnixListener, bytes: &[u8]) -> UnixStream {
-        let mut client = UnixStream::connect(listener.local_addr().unwrap().as_pathname().unwrap())
-            .unwrap();
+        let mut client =
+            UnixStream::connect(listener.local_addr().unwrap().as_pathname().unwrap()).unwrap();
         client.write_all(bytes).unwrap();
         client.set_nonblocking(true).unwrap();
         client
@@ -325,8 +397,74 @@ mod tests {
 
     fn pump(intake: &mut Intake, cx: &Cx, listener: &UnixListener, now: Instant) {
         intake
-            .pump(cx, listener, &mut Context::from_waker(Waker::noop()), now)
+            .pump(
+                cx,
+                listener,
+                &mut Context::from_waker(Waker::noop()),
+                now,
+                MAX_PEERS,
+            )
             .unwrap();
+    }
+
+    #[test]
+    fn concurrent_driver_bounds_intake_and_prioritizes_shutdown_over_all_owners() {
+        run_test_with_cx(|cx| async move {
+            let (_directory, listener) = listener();
+            let mut intake = Intake::new(Duration::from_secs(60));
+            let polls = std::sync::atomic::AtomicUsize::new(0);
+            let released = Arc::new(AtomicBool::new(false));
+            let mut work: Vec<Request<'_, ()>> = (0..MAX_PEERS)
+                .map(|_| {
+                    let owned = Released(Arc::clone(&released));
+                    let polls = &polls;
+                    Box::pin(async move {
+                        let _owned = owned;
+                        poll_fn(|_| {
+                            polls.fetch_add(1, Ordering::SeqCst);
+                            Poll::<()>::Pending
+                        })
+                        .await;
+                    }) as Request<'_, ()>
+                })
+                .collect();
+            let queued = (0..MAX_PEERS)
+                .map(|_| connect(&listener, b"queued\n"))
+                .collect::<Vec<_>>();
+            let mut driving = Box::pin(intake.next_concurrent(&cx, &listener, None, &mut work));
+            let mut task = Context::from_waker(Waker::noop());
+            assert!(driving.as_mut().poll(&mut task).is_pending());
+            assert_eq!(
+                polls.load(Ordering::SeqCst),
+                MAX_PEERS,
+                "every admitted owner is driven"
+            );
+            drop(driving);
+            assert_eq!(
+                intake.len(),
+                1,
+                "eight executing plus one queued, not sixteen"
+            );
+            assert_eq!(work.len(), MAX_PEERS);
+            drop(queued);
+            // The first turn prunes disconnected peers still in the backlog.
+            let mut shutdown = connect(&listener, control::SHUTDOWN_REQUEST);
+            let event = intake
+                .next_concurrent(&cx, &listener, None, &mut work)
+                .await
+                .unwrap();
+            let Event::Peer(peer) = event else {
+                panic!("strict shutdown must preempt all owners")
+            };
+            assert!(peer.is_shutdown());
+            work.clear();
+            assert!(released.load(Ordering::SeqCst));
+            assert_eq!(
+                shutdown.read(&mut [0; 1]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "the driver grants no acknowledgment itself"
+            );
+        });
     }
 
     #[test]
@@ -410,7 +548,12 @@ mod tests {
             let mut received = Vec::new();
             for _ in 0..2 {
                 received.push(
-                    intake.next(&cx, &listener, None).await.unwrap().unwrap().bytes,
+                    intake
+                        .next(&cx, &listener, None)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .bytes,
                 );
             }
             received.sort();
@@ -445,7 +588,8 @@ mod tests {
             assert!(driving.as_mut().poll(&mut task).is_pending());
             assert_eq!(polls.get(), 1);
             let mut client = connect(&listener, control::SHUTDOWN_REQUEST);
-            let Poll::Ready(Ok(DriveOutcome::Shutdown(shutdown))) = driving.as_mut().poll(&mut task)
+            let Poll::Ready(Ok(DriveOutcome::Shutdown(shutdown))) =
+                driving.as_mut().poll(&mut task)
             else {
                 panic!("an exact shutdown must preempt pending work"); // ubs:ignore — cfg(test) assertion.
             };
@@ -538,7 +682,11 @@ mod tests {
             let (_directory, listener) = listener();
             let mut intake = Intake::new(Duration::from_secs(60));
             assert!(
-                intake.next(&cx, &listener, Some(Duration::ZERO)).await.unwrap().is_none()
+                intake
+                    .next(&cx, &listener, Some(Duration::ZERO))
+                    .await
+                    .unwrap()
+                    .is_none()
             );
             let _client = connect(&listener, b"ready\n");
             let polled = Cell::new(false);
@@ -603,7 +751,10 @@ mod tests {
             cx.set_cancel_requested(true);
             let result = reading.as_mut().poll(&mut task);
             cx.set_cancel_requested(false);
-            assert!(matches!(result, Poll::Ready(Err(SearchError::Cancelled { .. }))));
+            assert!(matches!(
+                result,
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
             assert_eq!(calls.get(), 32);
         });
     }

@@ -68,6 +68,43 @@ fn parse_request(bytes: &[u8]) -> SearchResult<StreamRequest> {
     Ok(request)
 }
 
+pub(super) fn admission_policy(
+    bytes: &[u8],
+) -> SearchResult<(Duration, super::SearchExecutionMode)> {
+    Ok(parse_request(bytes)?.request.search.admission_policy())
+}
+
+pub(super) async fn refuse_admission(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    bytes: &[u8],
+    timeout: Duration,
+    error: SearchError,
+) -> SearchResult<PeerOutcome> {
+    write_refusal(cx, peer, parse_request(bytes)?, timeout, error).await
+}
+
+async fn write_refusal(
+    cx: &Cx,
+    peer: &mut UnixStream,
+    request: StreamRequest,
+    timeout: Duration,
+    error: SearchError,
+) -> SearchResult<PeerOutcome> {
+    if matches!(error, SearchError::Cancelled { .. }) {
+        return Err(error);
+    }
+    let reply = Reply {
+        fsfs_complete_cli: VERSION,
+        request_id: request.request.request_id,
+        query: request.request.search.query,
+        result: error_envelope(&error),
+    };
+    let bytes = encode_response(&reply)?;
+    write_response(cx, peer, &bytes, timeout).await?;
+    Ok(PeerOutcome::Search)
+}
+
 pub(super) async fn serve(
     cx: &Cx,
     runtime: &FsfsRuntime,
@@ -130,15 +167,7 @@ pub(super) async fn serve(
         Err(error) => {
             // Before any canonical frame was exposed, use the same correlated
             // refusal as buffered forwarding. Never switch protocols mid-stream.
-            let reply = Reply {
-                fsfs_complete_cli: VERSION,
-                request_id: request.request.request_id,
-                query: request.request.search.query,
-                result: error_envelope(&error),
-            };
-            let bytes = encode_response(&reply)?;
-            write_response(cx, peer, &bytes, timeout).await?;
-            Ok(PeerOutcome::Search)
+            write_refusal(cx, peer, request, timeout, error).await
         }
     }
 }
