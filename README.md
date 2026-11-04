@@ -325,19 +325,20 @@ process within seconds, and retention keeps the active generation and one
 predecessor, which share their unchanged keyword segments (a 19,480-file
 store held 186 MB after 8 watched edits, about one fresh build). On that tree a
 one-line edit is published in about 1.8–2.0 s (median per round, lite release
-build), against about 0.7 s for the legacy watcher to commit it. On Linux, running
-`fsfs index`, `fsfs watch`, or `fsfs index --watch` against a completed legacy
+build), against about 0.7 s for the legacy watcher to commit it. On Linux and
+macOS, running `fsfs index`, `fsfs watch`, or `fsfs index --watch` against a completed legacy
 index (`index_sentinel.json` with `generation_complete = true`) automatically
 promotes it into a complete-generation store while searches keep serving from
 the legacy predecessor until `FSFS-CURRENT` publishes the first generation. An
 index that remains on the legacy layout (an incomplete/interrupted legacy root,
-a non-Linux platform without `FSFS_COMPLETE_GENERATIONS=1`, a store inside a
-non-hidden directory of the indexed tree, or `FSFS_COMPLETE_GENERATIONS=0`) has
+an unsupported platform, a store inside a non-hidden directory of the indexed
+tree, or `FSFS_COMPLETE_GENERATIONS=0`) has
 a known limit (bd-z2nfa): its watcher holds the vector files' exclusive writer
 lock for its whole life, so `fsfs search` from another process (and the query
 daemon) is refused with "another fsfs process is writing this index's vector
-files" until the watcher stops. Build it once with `FSFS_COMPLETE_GENERATIONS=1`
-to force conversion.
+files" until the watcher stops. On Linux and macOS,
+`FSFS_COMPLETE_GENERATIONS=1` forces conversion when the source and store
+satisfy the complete-generation path rules below.
 
 Example output:
 
@@ -594,25 +595,29 @@ each word scored for a hit, run `fsfs explain <rank>` after the search.
 
 The complete-generation store publishes lexical data, vector tiers, and the
 catalog as one retained bundle, so readers in other processes, including a
-search while `fsfs watch` runs, always see one whole generation. On Linux a
-build into a directory with no index creates this store, and later commands
-recognize it automatically; on macOS, where the store is not yet qualified on
-release hosts, a build creates it only with `FSFS_COMPLETE_GENERATIONS=1`. The
-store may sit inside the tree it indexes only beneath a hidden directory, like
-the default in-project `.frankensearch` that `fsfs index .` uses; a build into
+search while `fsfs watch` runs, always see one whole generation. On Linux and
+macOS a build into a directory with no index creates this store, and later
+commands recognize it automatically. Native macOS watch and daemon tests
+exercise this default; cross-platform binary release qualification remains a
+separate gate. The store may sit inside the tree it indexes only beneath a
+hidden directory, like the default in-project `.frankensearch` that `fsfs index .`
+uses; a build into
 any other directory inside the indexed tree keeps building a legacy index, and
-the store may never contain that tree. On Linux, a directory that already holds a
-completed legacy index (`index_sentinel.json` with `generation_complete = true`)
+the store may never contain that tree. On either supported platform, a directory
+that already holds a completed legacy index (`index_sentinel.json` with
+`generation_complete = true`)
 is automatically migrated into this store on its next `fsfs index`, `fsfs watch`,
 or `fsfs index --watch` while readers keep using the legacy predecessor until
 `FSFS-CURRENT` publishes the first generation; an incomplete/interrupted legacy
 root stays on the legacy recovery path unless `FSFS_COMPLETE_GENERATIONS=1`
 forces conversion, and `FSFS_COMPLETE_GENERATIONS=0` keeps building legacy
-indexes. When the legacy index's completion evidence comes from the same fsfs
-build and configuration, the conversion copies its keyword segments (shared by
-hard link) and vector files into the first generation and carries every
+indexes. When Linux can authenticate the legacy index's completion evidence
+from the same fsfs build and configuration, conversion copies its keyword
+segments (shared by hard link) and vector files into the first generation and carries every
 unchanged file instead of recomputing it; otherwise, as on the first build after
-an upgrade, it rebuilds. Once `FSFS-CURRENT` is published, the old `vector/`,
+an upgrade, it rebuilds. macOS rebuilds during conversion because retained
+executable proofs are Linux-only. Once `FSFS-CURRENT` is published, the old
+`vector/`,
 `lexical/` and `index_sentinel.json` stay behind, unread:
 
 ```bash

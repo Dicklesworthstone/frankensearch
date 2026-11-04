@@ -253,12 +253,14 @@ fn watch_binary_enforces_background_policy_before_creating_an_index() {
 
 #[test]
 fn later_no_watch_override_keeps_index_binary_one_shot() {
-    for complete in ["0", "1"] {
+    for complete in [None, Some("0"), Some("1")] {
         let fixture = Fixture::new(None);
+        let mut invocation = fixture.command("index", "json");
+        if let Some(complete) = complete {
+            invocation.env("FSFS_COMPLETE_GENERATIONS", complete);
+        }
         let output = Process::start(
-            fixture
-                .command("index", "json")
-                .env("FSFS_COMPLETE_GENERATIONS", complete)
+            invocation
                 .env(
                     "FRANKENSEARCH_PRESSURE_DEGRADATION_OVERRIDE",
                     "force_lexical_only",
@@ -268,13 +270,21 @@ fn later_no_watch_override_keeps_index_binary_one_shot() {
         .finish(Duration::from_secs(30));
         assert!(
             output.status.success(),
-            "complete={complete}: {}\n{}",
+            "complete={complete:?}: {}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let result: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["ok"], true);
         assert!(fixture.store.exists());
+        assert_eq!(
+            fixture.store.join("FSFS-CURRENT").is_file(),
+            complete.map_or(
+                cfg!(any(target_os = "linux", target_os = "macos")),
+                |value| value == "1"
+            ),
+            "default selection and explicit opt-out must select the intended layout: {complete:?}"
+        );
     }
 }
 
@@ -362,12 +372,36 @@ fn complete_watch_binary_keeps_search_available() {
             .expect("provide a verified semantic model-cache root"),
     )
     .unwrap();
-    let fixture = Fixture::new(Some(&models));
-    let mut watch = Process::start(
-        fixture
-            .command("watch", "jsonl")
-            .env("FSFS_COMPLETE_GENERATIONS", "1"),
-    );
+    for legacy_seed in [false, true] {
+        assert_default_complete_watch_lifecycle(&models, legacy_seed);
+    }
+}
+
+#[cfg(feature = "semantic-support")]
+fn assert_default_complete_watch_lifecycle(models: &Path, legacy_seed: bool) {
+    eprintln!("default complete-watch lifecycle: legacy_seed={legacy_seed}");
+    let fixture = Fixture::new(Some(models));
+    // A completed legacy root must promote on ordinary watch startup, without
+    // an opt-in flag. Keep the explicit opt-out's legacy behavior observable.
+    if legacy_seed {
+        let legacy = Process::start(
+            fixture
+                .command("index", "json")
+                .env("FSFS_COMPLETE_GENERATIONS", "0"),
+        )
+        .finish(Duration::from_secs(180));
+        assert!(
+            legacy.status.success(),
+            "{}",
+            String::from_utf8_lossy(&legacy.stderr)
+        );
+        assert!(!fixture.store.join("FSFS-CURRENT").exists());
+        let sentinel: Value =
+            serde_json::from_slice(&fs::read(fixture.store.join("index_sentinel.json")).unwrap())
+                .unwrap();
+        assert_eq!(sentinel["generation_complete"], true);
+    }
+    let mut watch = Process::start(&mut fixture.command("watch", "jsonl"));
     let first = wait_for_visible_paths(&fixture, &mut watch, &["alpha.md"]);
     let original_manifest = fs::read(first.path().join("FSFS-BUNDLE.json")).unwrap();
     fs::write(fixture.source.join("beta.md"), "sharedtoken beta document").unwrap();
@@ -473,12 +507,8 @@ fn complete_daemon_binary_serves_and_stops_with_corrupt_selection() {
     )
     .unwrap();
     let fixture = Fixture::new(Some(&models));
-    let indexed = Process::start(
-        fixture
-            .command("index", "json")
-            .env("FSFS_COMPLETE_GENERATIONS", "1"),
-    )
-    .finish(Duration::from_secs(180));
+    let indexed =
+        Process::start(&mut fixture.command("index", "json")).finish(Duration::from_secs(180));
     assert!(
         indexed.status.success(),
         "{}",

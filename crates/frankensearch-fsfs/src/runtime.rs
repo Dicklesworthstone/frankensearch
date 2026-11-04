@@ -7189,8 +7189,9 @@ impl FsfsRuntime {
 
     /// Start every new index root as a complete-generation store, so a
     /// watched index serves searches from other processes. A root that
-    /// already holds a legacy index keeps its layout until a build opts it in
-    /// explicitly. The CLI enables this on Linux unless
+    /// holds a completed legacy index stages a complete successor; interrupted
+    /// legacy builds keep their recovery path unless explicitly opted in.
+    /// The CLI enables this on Linux and macOS unless
     /// `FSFS_COMPLETE_GENERATIONS` is false.
     #[must_use]
     pub const fn with_complete_generations_for_new_roots(mut self, enabled: bool) -> Self {

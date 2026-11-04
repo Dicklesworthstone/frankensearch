@@ -181,6 +181,8 @@ mod loader_only {
                 .env_remove("FSFS_RANKING_PRIORS")
                 .env_remove("FRANKENSEARCH_INDEXING_UPGRADE_REUSE")
                 .env_remove("FSFS_INDEXING_UPGRADE_REUSE")
+                .env_remove("FRANKENSEARCH_COMPLETE_GENERATIONS")
+                .env_remove("FSFS_COMPLETE_GENERATIONS")
                 .env_remove("FSFS_DISABLE_QUERY_CACHE")
                 .env_remove("FRANKENSEARCH_API_PROVIDER")
                 .env_remove("FRANKENSEARCH_API_MODEL")
@@ -5061,7 +5063,7 @@ meta:
         .unwrap();
         let corpus_arg = corpus.to_str().unwrap();
         let index_arg = index.to_str().unwrap();
-        let initial = fsfs.run_with_env(
+        let initial = fsfs.run(
             temp.path(),
             "complete-watch-initial-index",
             [
@@ -5073,7 +5075,6 @@ meta:
                 "json",
             ],
             QUICKSTART_TIMEOUT,
-            &[("FSFS_COMPLETE_GENERATIONS", "1")],
         );
         let envelope = parse_success_envelope("complete watch initial index", &initial);
         assert_eq!(envelope["data"]["indexed_files"], 2);
@@ -5095,7 +5096,6 @@ meta:
                     "--format",
                     "jsonl",
                 ])
-                .env("FSFS_COMPLETE_GENERATIONS", "1")
                 .env("RUST_LOG", "info")
                 .stdout(File::create(&stdout_path).unwrap())
                 .stderr(File::create(&stderr_path).unwrap())
@@ -5411,7 +5411,6 @@ meta:
                     "--format",
                     "jsonl",
                 ])
-                .env("FSFS_COMPLETE_GENERATIONS", "1")
                 .env("RUST_LOG", "info")
                 .stdout(File::create(&stdout_path).unwrap())
                 .stderr(File::create(&stderr_path).unwrap())

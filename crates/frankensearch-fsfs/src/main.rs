@@ -265,10 +265,10 @@ fn run(args: Vec<String>) -> SearchResult<()> {
         );
     }
 
-    // The layout of a build. Unset, Linux starts new roots as complete
+    // The layout of a build. Unset, Linux and macOS start new roots as complete
     // stores and converts completed legacy roots before either a one-shot
     // rebuild or watch startup; unfinished legacy builds keep their recovery
-    // path. True also opts in on macOS and forces conversion; false keeps
+    // path. True forces conversion; false keeps
     // building legacy indexes. Existing selections are always recognized.
     let complete_generations = parse_env_bool(
         &env_map,
@@ -277,7 +277,7 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     )?;
     let initialize_complete_store = complete_generations.unwrap_or(false);
     let complete_generations_for_new_roots =
-        complete_generations.unwrap_or(cfg!(target_os = "linux"));
+        complete_generations.unwrap_or(cfg!(any(target_os = "linux", target_os = "macos")));
     // What a complete-store publication does with superseded generations:
     // collect (default), report (dry run), or off.
     let generation_retention = parse_generation_retention(&env_map)?;
