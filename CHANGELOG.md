@@ -1,5 +1,25 @@
 # Changelog
 
+### Unreleased — Signed installer and proxy qualification (2026-11-04)
+
+- Installer `--verify` authenticates the established `.minisig` release
+  signature with the repository's pinned public key. It now requires Minisign
+  and a valid signature before extracting or executing the candidate; missing
+  signatures or verifier tools fail closed. Explicit and automatic source
+  builds cannot bypass a requested release signature check. Ordinary installs
+  retain mandatory SHA-256 checks, and verified installs retain rollback.
+- Archive extraction keeps the installing user's ownership instead of restoring
+  release-builder IDs, allowing authentic release archives to install in root
+  user namespaces without privileged ownership changes.
+- The existing quality gate now includes downloader and hosted-API proxy tests
+  together, optional-feature Clippy checks, and installer contract regressions.
+  Added real-socket TLS cases assert authenticated SOCKS5/`socks5h` hostname
+  forwarding, successful HTTPS transfers and rejected origin certificates.
+  Their execution remains unqualified: both the stock compiler and a scoped
+  diagnostic compiler attempt stopped in `asupersync` before tests ran.
+- These are source changes under qualification. No new release, artifact
+  signature or native Apple Silicon qualification is announced by this entry.
+
 ### Unreleased — Share native batches across daemon clients (2026-11-04)
 
 - Warm queries execute against owned reader snapshots rather than holding the

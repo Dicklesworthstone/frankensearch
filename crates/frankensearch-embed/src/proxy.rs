@@ -389,12 +389,34 @@ qYX7QWYbxuf9bIc0ZAxJmP9+N0sGzhpkouzYKrA2OE+4PZp5sSeifVAy
         HttpConnect,
         HttpsForward,
         HttpsConnect,
+        Socks5,
+        Socks5h,
+    }
+
+    impl TlsProxyMode {
+        pub const fn proxy_scheme(self) -> &'static str {
+            match self {
+                Self::HttpConnect => "http",
+                Self::HttpsForward | Self::HttpsConnect => "https",
+                Self::Socks5 => "socks5",
+                Self::Socks5h => "socks5h",
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    pub struct Socks5Handshake {
+        pub username: String,
+        pub password: String,
+        pub host: String,
+        pub port: u16,
     }
 
     #[derive(Debug, Default)]
     pub struct TlsProxyObservation {
         pub connect_headers: Option<String>,
-        // Origin headers after CONNECT, or proxy-facing absolute-form headers
+        pub socks_handshake: Option<Socks5Handshake>,
+        // Origin headers after CONNECT/SOCKS, or proxy-facing absolute-form headers
         // for HttpsForward. Proxy-Authorization is expected only in the latter.
         pub request_headers: Option<String>,
         pub request_body: Vec<u8>,
@@ -496,6 +518,69 @@ qYX7QWYbxuf9bIc0ZAxJmP9+N0sGzhpkouzYKrA2OE+4PZp5sSeifVAy
         }
     }
 
+    async fn read_socks_string<IO: AsyncRead + Unpin + Send>(stream: &mut IO) -> String {
+        let mut length = [0_u8; 1];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut bytes = vec![0_u8; usize::from(length[0])];
+        stream.read_exact(&mut bytes).await.unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    async fn serve_socks<IO: AsyncRead + AsyncWrite + Unpin + Send>(
+        mut stream: IO,
+        response_body: &[u8],
+        redirect: Option<&str>,
+        observation: &mut TlsProxyObservation,
+    ) {
+        let mut greeting = [0_u8; 2];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting[0], 5);
+        let mut methods = vec![0_u8; usize::from(greeting[1])];
+        stream.read_exact(&mut methods).await.unwrap();
+        assert!(methods.contains(&2), "SOCKS peer requires authentication");
+        stream.write_all(&[5, 2]).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut auth_version = [0_u8; 1];
+        stream.read_exact(&mut auth_version).await.unwrap();
+        assert_eq!(auth_version, [1]);
+        let username = read_socks_string(&mut stream).await;
+        let password = read_socks_string(&mut stream).await;
+        stream.write_all(&[1, 0]).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let mut connect = [0_u8; 4];
+        stream.read_exact(&mut connect).await.unwrap();
+        assert_eq!(
+            connect,
+            [5, 1, 0, 3],
+            "SOCKS peer must receive the hostname"
+        );
+        let host = read_socks_string(&mut stream).await;
+        let mut port = [0_u8; 2];
+        stream.read_exact(&mut port).await.unwrap();
+        observation.socks_handshake = Some(Socks5Handshake {
+            username,
+            password,
+            host,
+            port: u16::from_be_bytes(port),
+        });
+        stream
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+            .await
+            .unwrap();
+        stream.flush().await.unwrap();
+
+        // TLS starts only after the authenticated SOCKS tunnel is established.
+        // Reuse the origin certificate and its normal hostname verification.
+        match acceptor(false).accept(stream).await {
+            Ok(origin_tls) => {
+                serve_response(origin_tls, response_body, redirect, observation).await;
+            }
+            Err(_) => observation.tls_rejected = true,
+        }
+    }
+
     pub fn spawn_tls_proxy(
         mode: TlsProxyMode,
         response_body: Vec<u8>,
@@ -514,7 +599,10 @@ qYX7QWYbxuf9bIc0ZAxJmP9+N0sGzhpkouzYKrA2OE+4PZp5sSeifVAy
         mode: TlsProxyMode,
         response_body: Vec<u8>,
     ) -> (SocketAddr, JoinHandle<TlsProxyObservation>) {
-        assert_ne!(mode, TlsProxyMode::HttpConnect);
+        assert!(matches!(
+            mode,
+            TlsProxyMode::HttpsForward | TlsProxyMode::HttpsConnect
+        ));
         // The origin leaf has the same trusted issuer but no localhost/IP SAN.
         // Serving it on the outer proxy tests hostname verification separately
         // from the existing untrusted-root failures, without using external DNS.
@@ -538,6 +626,14 @@ qYX7QWYbxuf9bIc0ZAxJmP9+N0sGzhpkouzYKrA2OE+4PZp5sSeifVAy
                         let (stream, _) = listener.accept().await.unwrap();
                         if mode == TlsProxyMode::HttpConnect {
                             serve_connect(
+                                stream,
+                                &response_body,
+                                redirect.as_deref(),
+                                &mut observation,
+                            )
+                            .await;
+                        } else if matches!(mode, TlsProxyMode::Socks5 | TlsProxyMode::Socks5h) {
+                            serve_socks(
                                 stream,
                                 &response_body,
                                 redirect.as_deref(),

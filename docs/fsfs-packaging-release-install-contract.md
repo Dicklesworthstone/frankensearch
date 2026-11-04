@@ -635,8 +635,12 @@ scripts/quality-gate.sh
 ```
 
 The default script runs formatting, workspace check/clippy, the non-Unix index
-compile guard, library tests, fsfs tests, facade integration, real-model E2E,
-the bounded Quill/Tantivy native witness, and executable quick-start stages.
+compile guard, library tests, downloader/hosted-API proxy tests with both HTTP
+features enabled, installer contract checks, fsfs tests, facade integration,
+real-model E2E, the bounded Quill/Tantivy native witness, and executable quick-start
+stages. Clippy also checks the optional HTTP features. The installer checker
+requires Python `jsonschema`; its verifier fixtures establish orchestration,
+while release signatures must additionally pass the real Minisign verifier.
 Its `examples` and `perf` stages are opt-in.
 The cross-target check establishes compilation, not Windows runtime support.
 

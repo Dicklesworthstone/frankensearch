@@ -3858,11 +3858,7 @@ mod tests {
         } else {
             "https"
         };
-        let proxy_scheme = if mode == TlsProxyMode::HttpConnect {
-            "http"
-        } else {
-            "https"
-        };
+        let proxy_scheme = mode.proxy_scheme();
         let mut result = None;
         let result_slot = &mut result;
         run_test_with_cx(|cx| async move {
@@ -3960,11 +3956,55 @@ mod tests {
     }
 
     #[test]
+    fn api_verified_tls_socks_preserves_remote_dns_auth_and_private_request() {
+        for mode in [TlsProxyMode::Socks5, TlsProxyMode::Socks5h] {
+            let (result, observation) =
+                exchange_through_tls_proxy(mode, true, "embedding-provider.invalid", false);
+            let (status, response) = result.unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(response, API_TLS_RESPONSE);
+            let decoded: TestGatewayResponse = serde_json::from_slice(&response).unwrap();
+            assert_eq!(decoded.vectors, vec![vec![3.0, 4.0, 0.0, 0.0]]);
+            assert!(!observation.tls_rejected);
+            assert!(observation.connect_headers.is_none());
+            let handshake = observation.socks_handshake.unwrap();
+            assert_eq!(handshake.host, "embedding-provider.invalid");
+            assert_eq!(handshake.port, 8443);
+            assert_eq!(handshake.username, "api-proxy-user");
+            assert_eq!(handshake.password, "api-proxy-password");
+            let headers = observation.request_headers.unwrap();
+            assert!(headers.starts_with("POST /embeddings?key=query-canary HTTP/1.1\r\n"));
+            assert_eq!(
+                api_request_header(&headers, "Host"),
+                Some("embedding-provider.invalid:8443")
+            );
+            assert_eq!(
+                api_request_header(&headers, "Authorization"),
+                Some("Bearer api-key-canary")
+            );
+            assert_eq!(api_request_header(&headers, "Proxy-Authorization"), None);
+            for secret in [
+                "api-proxy-user",
+                "api-proxy-password",
+                "Basic YXBpLXByb3h5LXVzZXI6YXBpLXByb3h5LXBhc3N3b3Jk",
+            ] {
+                assert!(
+                    !headers.contains(secret),
+                    "SOCKS credentials reached origin"
+                );
+            }
+            assert_eq!(observation.request_body, b"private-input-canary");
+        }
+    }
+
+    #[test]
     fn api_tls_proxies_reject_untrusted_certificates_and_wrong_origin_names() {
         for mode in [
             TlsProxyMode::HttpConnect,
             TlsProxyMode::HttpsForward,
             TlsProxyMode::HttpsConnect,
+            TlsProxyMode::Socks5,
+            TlsProxyMode::Socks5h,
         ] {
             for trust_test_ca in [false, true] {
                 if trust_test_ca && mode == TlsProxyMode::HttpsForward {
@@ -3996,11 +4036,24 @@ mod tests {
                 assert!(observation.tls_rejected, "{mode:?}: {observation:?}");
                 assert!(observation.request_headers.is_none(), "{observation:?}");
                 assert!(observation.request_body.is_empty(), "{observation:?}");
-                if !trust_test_ca && mode != TlsProxyMode::HttpConnect {
+                if !trust_test_ca
+                    && matches!(
+                        mode,
+                        TlsProxyMode::HttpsForward | TlsProxyMode::HttpsConnect
+                    )
+                {
                     assert!(
                         observation.connect_headers.is_none(),
                         "an untrusted HTTPS proxy must not receive CONNECT credentials"
                     );
+                }
+                if matches!(mode, TlsProxyMode::Socks5 | TlsProxyMode::Socks5h) {
+                    let handshake = observation.socks_handshake.unwrap();
+                    assert_eq!(handshake.host, hostname);
+                    assert_eq!(handshake.port, 8443);
+                    assert_eq!(handshake.username, "api-proxy-user");
+                    assert_eq!(handshake.password, "api-proxy-password");
+                    assert!(observation.connect_headers.is_none());
                 }
             }
         }
