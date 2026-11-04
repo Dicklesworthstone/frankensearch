@@ -320,9 +320,15 @@ pub(super) fn finish_index(
 }
 
 fn read_backlog(storage: &Storage) -> SearchResult<Backlog> {
-    let metadata = storage.get_index_metadata(BACKLOG_NAME)?.ok_or_else(|| {
+    read_optional_backlog(storage)?.ok_or_else(|| {
         invalid("this generation has no producer-bound quality backlog; select a registered quality producer and run a full source reindex")
-    })?;
+    })
+}
+
+fn read_optional_backlog(storage: &Storage) -> SearchResult<Option<Backlog>> {
+    let Some(metadata) = storage.get_index_metadata(BACKLOG_NAME)? else {
+        return Ok(None);
+    };
     let backlog: Backlog =
         serde_json::from_str(metadata.config_json.as_deref().ok_or_else(|| {
             invalid("the deferred quality catalog has no source and producer descriptor")
@@ -347,7 +353,7 @@ fn read_backlog(storage: &Storage) -> SearchResult<Backlog> {
             "deferred quality catalog descriptor is inconsistent",
         ));
     }
-    Ok(backlog)
+    Ok(Some(backlog))
 }
 
 fn validate_pending_jobs(
@@ -741,17 +747,39 @@ impl FsfsRuntime {
     /// # Errors
     /// Rejects active deferral, missing exact input, a changed generation or
     /// producer, corrupt queues, unavailable models, and publication failures.
-    #[allow(
-        clippy::future_not_send,
-        clippy::too_many_lines,
-        clippy::arc_with_non_send_sync
-    )]
+    #[allow(clippy::future_not_send)]
     pub async fn complete_retained_quality(
         &self,
         cx: &Cx,
         store_root: &Path,
         expected: &PublishedGeneration,
     ) -> SearchResult<DeferredQualityCompletion> {
+        self.complete_retained_quality_with_precommit(cx, store_root, expected, |_| Ok(()))
+            .await?
+            .ok_or_else(|| {
+                invalid("selected generation has no retained quality backlog for the configured producer; run a full source reindex")
+            })
+    }
+
+    /// The watch owner rechecks its source and notification authority after
+    /// sealing, at the same publication boundary as ordinary source updates.
+    /// Missing backlog metadata or a newly selected producer returns `None`
+    /// before inference, so watch startup can use its ordinary source rebuild.
+    #[allow(
+        clippy::future_not_send,
+        clippy::too_many_lines,
+        clippy::arc_with_non_send_sync
+    )]
+    pub(super) async fn complete_retained_quality_with_precommit<F>(
+        &self,
+        cx: &Cx,
+        store_root: &Path,
+        expected: &PublishedGeneration,
+        precommit: F,
+    ) -> SearchResult<Option<DeferredQualityCompletion>>
+    where
+        F: FnOnce(&Cx) -> SearchResult<()>,
+    {
         let request = self.search_blocking_pool.as_ref().map_or_else(
             || cx.clone(),
             |pool| cx.clone().with_blocking_pool_handle(Some(pool.clone())),
@@ -820,10 +848,11 @@ impl FsfsRuntime {
         }
         let lease = PublicationLease::acquire(build.path())?;
         let storage = Arc::new(open_catalog(&candidate, false)?);
-        let backlog = read_backlog(&storage)?;
+        let Some(backlog) = read_optional_backlog(&storage)? else {
+            return Ok(None);
+        };
         if backlog.generation_root != predecessor.path().display().to_string()
             || backlog.source_hash != sentinel.source_hash_hex
-            || backlog.producer != producer
         {
             return Err(invalid(
                 "deferred quality source generation or producer changed; run a full source reindex to establish new work",
@@ -855,6 +884,11 @@ impl FsfsRuntime {
             &manifests,
             checkpoint.as_ref().map(|checkpoint| &checkpoint.files),
         )?;
+        if backlog.producer != producer {
+            // A configuration change may request a source rebuild, but cannot
+            // conceal damaged source fences or queued input in its predecessor.
+            return Ok(None);
+        }
         control
             .admit_work(cx, "complete_quality.model_load")
             .await?;
@@ -1022,15 +1056,17 @@ impl FsfsRuntime {
         drop(resources);
         control.admit_work(cx, "complete_quality.publish").await?;
         admitted.check_current_identity()?;
-        let publication = build.publish(cx, |_, path| {
-            Self::validate_search_generation_at_root(path, SearchExecutionMode::Full)
-        })?;
-        Ok(DeferredQualityCompletion {
+        let publication = build.publish_with_precommit(
+            cx,
+            |_, path| Self::validate_search_generation_at_root(path, SearchExecutionMode::Full),
+            precommit,
+        )?;
+        Ok(Some(DeferredQualityCompletion {
             publication,
             completed_documents: completed,
             source_hash: backlog.source_hash,
             producer_fingerprint: backlog.producer.fingerprint(),
-        })
+        }))
     }
 }
 

@@ -823,7 +823,7 @@ impl SyncTwoTierSearcher {
             Err(error) => {
                 let latency = phase2_started.elapsed();
                 metrics.phase2_total_ms = ms(latency);
-                metrics.skip_reason = Some(error.to_string());
+                metrics.skip_reason = Some(error.diagnostic_code().to_owned());
                 if want_phases {
                     phases.push(SearchPhase::RefinementFailed {
                         initial_results: initial_results.clone(),

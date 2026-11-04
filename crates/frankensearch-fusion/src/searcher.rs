@@ -571,7 +571,7 @@ impl TwoTierSearcher {
     ) -> Self {
         if let Err(e) = config.validate() {
             tracing::warn!(
-                error = %e,
+                error_code = e.diagnostic_code(),
                 "Invalid TwoTierConfig supplied; search behavior may be degenerate"
             );
         }
@@ -1012,7 +1012,7 @@ impl TwoTierSearcher {
             Ok(classified) => classified.zero_signal,
             Err(error) => {
                 tracing::debug!(
-                    error = %error,
+                    error_code = error.diagnostic_code(),
                     "fast-tier zero-signal classification failed; lane left unclassified"
                 );
                 None
@@ -1326,19 +1326,17 @@ impl TwoTierSearcher {
                 if let Some(root_request_id) = telemetry_root_request_id.as_deref() {
                     // A cancelled Initial stops like every later cancellation
                     // boundary, as a typed warning rather than a failure.
-                    let (severity, reason) = match &err {
-                        SearchError::Cancelled { phase, reason } => (
-                            LifecycleSeverity::Warn,
-                            format!("cancelled:{phase}:{reason}"),
-                        ),
-                        error => (LifecycleSeverity::Error, error.to_string()),
+                    let severity = if matches!(&err, SearchError::Cancelled { .. }) {
+                        LifecycleSeverity::Warn
+                    } else {
+                        LifecycleSeverity::Error
                     };
                     self.emit_session_stop_telemetry(
                         root_request_id,
                         telemetry_last_event_id.clone(),
                         LifecycleState::Degraded,
                         severity,
-                        Some(reason),
+                        Some(err.diagnostic_code().to_owned()),
                         search_started_at.elapsed(),
                     );
                 }
@@ -1406,7 +1404,7 @@ impl TwoTierSearcher {
                     telemetry_last_event_id.clone(),
                     LifecycleState::Degraded,
                     LifecycleSeverity::Warn,
-                    Some(format!("cancelled:{phase}:{reason}")),
+                    Some("cancelled".to_owned()),
                     search_started_at.elapsed(),
                 );
             }
@@ -1478,7 +1476,7 @@ impl TwoTierSearcher {
                         elapsed_ms: phase2_latency_ms,
                         budget_ms: self.config.quality_timeout_ms,
                     };
-                    metrics.skip_reason = Some(timeout_error.to_string());
+                    metrics.skip_reason = Some(timeout_error.diagnostic_code().to_owned());
                     self.export_error(&timeout_error);
                     if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
                         let outcome = QualityOutcome::Slow {
@@ -1528,7 +1526,7 @@ impl TwoTierSearcher {
                                     telemetry_last_event_id.clone(),
                                     LifecycleState::Degraded,
                                     LifecycleSeverity::Warn,
-                                    Some(format!("cancelled:{phase}:{reason}")),
+                                    Some("cancelled".to_owned()),
                                     search_started_at.elapsed(),
                                 );
                             }
@@ -1604,7 +1602,7 @@ impl TwoTierSearcher {
                                     telemetry_last_event_id.clone(),
                                     LifecycleState::Degraded,
                                     LifecycleSeverity::Warn,
-                                    Some(format!("cancelled:{phase}:{reason}")),
+                                    Some("cancelled".to_owned()),
                                     search_started_at.elapsed(),
                                 );
                             }
@@ -1677,7 +1675,7 @@ impl TwoTierSearcher {
                                             telemetry_last_event_id.clone(),
                                             LifecycleState::Degraded,
                                             LifecycleSeverity::Warn,
-                                            Some(format!("cancelled:{phase}:{reason}")),
+                                            Some("cancelled".to_owned()),
                                             search_started_at.elapsed(),
                                         );
                                     }
@@ -1685,7 +1683,10 @@ impl TwoTierSearcher {
                                 }
                                 Err(err) => {
                                     self.export_error(&err);
-                                    tracing::warn!(error = %err, "reranking phase failed");
+                                    tracing::warn!(
+                                        error_code = err.diagnostic_code(),
+                                        "reranking phase failed"
+                                    );
                                     // Don't emit RefinementFailed here because Refined already succeeded.
                                 }
                             }
@@ -1701,7 +1702,7 @@ impl TwoTierSearcher {
                                 telemetry_last_event_id.clone(),
                                 LifecycleState::Degraded,
                                 LifecycleSeverity::Warn,
-                                Some(format!("cancelled:{phase}:{reason}")),
+                                Some("cancelled".to_owned()),
                                 search_started_at.elapsed(),
                             );
                         }
@@ -1710,7 +1711,7 @@ impl TwoTierSearcher {
                     Err(err) => {
                         let phase2_latency = phase2_start.elapsed();
                         metrics.phase2_total_ms = phase2_latency.as_secs_f64() * 1000.0;
-                        metrics.skip_reason = Some(format!("{err}"));
+                        metrics.skip_reason = Some(err.diagnostic_code().to_owned());
                         self.export_error(&err);
                         if let Some(circuit_breaker) = self.circuit_breaker.as_ref() {
                             let _ = circuit_breaker.record_outcome(&QualityOutcome::Error);
@@ -1780,7 +1781,7 @@ impl TwoTierSearcher {
                     telemetry_last_event_id.clone(),
                     LifecycleState::Degraded,
                     LifecycleSeverity::Warn,
-                    Some(format!("cancelled:{phase}:{reason}")),
+                    Some("cancelled".to_owned()),
                     search_started_at.elapsed(),
                 );
             }
@@ -1937,7 +1938,7 @@ impl TwoTierSearcher {
                     }
                     self.export_error(&e);
                     tracing::warn!(
-                        error = %e,
+                        error_code = e.diagnostic_code(),
                         "lexical short-circuit failed, falling back to vector path"
                     );
                 }
@@ -2060,7 +2061,10 @@ impl TwoTierSearcher {
                     return Err(e);
                 }
                 self.export_error(&e);
-                tracing::warn!(error = %e, "lexical search failed, continuing without lexical");
+                tracing::warn!(
+                    error_code = e.diagnostic_code(),
+                    "lexical search failed, continuing without lexical"
+                );
                 None
             }
             (None, _) => None,
@@ -2420,7 +2424,7 @@ impl TwoTierSearcher {
                 if let Some(ref lexical) = lexical_results {
                     self.export_error(&embed_err);
                     tracing::warn!(
-                        error = %embed_err,
+                        error_code = embed_err.diagnostic_code(),
                         "fast embedding failed, falling back to lexical-only results"
                     );
                     let lexical = self
@@ -2579,8 +2583,7 @@ impl TwoTierSearcher {
                     Err(err) => {
                         self.export_error(&err);
                         tracing::warn!(
-                            error = %err,
-                            doc_id = %result.doc_id,
+                            error_code = err.diagnostic_code(),
                             "prf feedback vector lookup failed; continuing with remaining candidates"
                         );
                     }
@@ -3460,7 +3463,7 @@ impl TwoTierSearcher {
         if let Err(error) = state.update(observed_error_rate, calibration) {
             self.export_error(&error);
             tracing::warn!(
-                error = %error,
+                error_code = error.diagnostic_code(),
                 observed_error_rate,
                 "adaptive conformal update failed"
             );
@@ -3513,12 +3516,18 @@ impl TwoTierSearcher {
             .publish_search(envelope.clone())
         {
             self.export_error(&err);
-            tracing::warn!(error = %err, "live search stream publish failed");
+            tracing::warn!(
+                error_code = err.diagnostic_code(),
+                "live search stream publish failed"
+            );
         }
 
         if let Err(err) = host_adapter.emit_telemetry(&envelope) {
             self.export_error(&err);
-            tracing::warn!(error = %err, "host adapter telemetry emission failed");
+            tracing::warn!(
+                error_code = err.diagnostic_code(),
+                "host adapter telemetry emission failed"
+            );
         }
 
         Some(event_id)
@@ -3563,7 +3572,10 @@ impl TwoTierSearcher {
 
         if let Err(err) = host_adapter.emit_telemetry(&envelope) {
             self.export_error(&err);
-            tracing::warn!(error = %err, "host adapter telemetry emission failed");
+            tracing::warn!(
+                error_code = err.diagnostic_code(),
+                "host adapter telemetry emission failed"
+            );
         }
 
         Some(event_id)
@@ -3575,7 +3587,10 @@ impl TwoTierSearcher {
         };
         if let Err(err) = host_adapter.on_lifecycle_event(event) {
             self.export_error(&err);
-            tracing::warn!(error = %err, "host adapter lifecycle hook failed");
+            tracing::warn!(
+                error_code = err.diagnostic_code(),
+                "host adapter lifecycle hook failed"
+            );
         }
     }
 
@@ -3612,7 +3627,10 @@ impl TwoTierSearcher {
 
         if let Err(err) = host_adapter.emit_telemetry(&envelope) {
             self.export_error(&err);
-            tracing::warn!(error = %err, "host adapter telemetry emission failed");
+            tracing::warn!(
+                error_code = err.diagnostic_code(),
+                "host adapter telemetry emission failed"
+            );
         }
 
         Some(event_id)
@@ -3642,7 +3660,10 @@ impl TwoTierSearcher {
 
         if let Err(err) = host_adapter.emit_telemetry(&envelope) {
             self.export_error(&err);
-            tracing::warn!(error = %err, "host adapter telemetry emission failed");
+            tracing::warn!(
+                error_code = err.diagnostic_code(),
+                "host adapter telemetry emission failed"
+            );
         }
 
         Some(event_id)
@@ -4196,15 +4217,10 @@ fn should_exclude_document(
     let Some(text) = text_fn(doc_id) else {
         return false;
     };
-    let Some(matched_clause) = find_negative_match(&text, exclusions) else {
+    if find_negative_match(&text, exclusions).is_none() {
         return false;
-    };
-    tracing::debug!(
-        %doc_id,
-        matched_exclusion_term = %matched_clause,
-        source,
-        "doc_excluded"
-    );
+    }
+    tracing::debug!(source, "doc_excluded");
     true
 }
 
@@ -4481,6 +4497,51 @@ mod tests {
 
         fn category(&self) -> ModelCategory {
             ModelCategory::HashEmbedder
+        }
+    }
+
+    const PRIVATE_PROVIDER_ERROR: &str =
+        "private-provider-query https://user:secret@provider/private/path\nforged-log-line";
+
+    struct UntrustedErrorEmbedder {
+        cancel: bool,
+    }
+
+    impl Embedder for UntrustedErrorEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            Box::pin(async move {
+                if self.cancel {
+                    Err(SearchError::Cancelled {
+                        phase: PRIVATE_PROVIDER_ERROR.to_owned(),
+                        reason: PRIVATE_PROVIDER_ERROR.to_owned(),
+                    })
+                } else {
+                    Err(SearchError::EmbeddingFailed {
+                        model: PRIVATE_PROVIDER_ERROR.to_owned(),
+                        source: Box::new(std::io::Error::other(PRIVATE_PROVIDER_ERROR)),
+                    })
+                }
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            4
+        }
+
+        fn id(&self) -> &str {
+            "untrusted-error-embedder"
+        }
+
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
         }
     }
 
@@ -5045,12 +5106,12 @@ mod tests {
                             severity: LifecycleSeverity::Warn,
                             reason: Some(reason),
                             ..
-                        } if reason.starts_with(&format!("cancelled:{phase}:"))
+                        } if reason == "cancelled"
                     )
                 })
                 .count(),
             1,
-            "cancellation must emit one typed terminal lifecycle event"
+            "cancellation during {phase} must emit one typed terminal lifecycle event"
         );
     }
 
@@ -8243,7 +8304,7 @@ mod tests {
                             severity: LifecycleSeverity::Warn,
                             reason: Some(reason),
                             ..
-                        } if reason.starts_with("cancelled:initial_to_quality:")
+                        } if reason == "cancelled"
                     )
                 })
                 .count();
@@ -8326,7 +8387,7 @@ mod tests {
                             severity: LifecycleSeverity::Warn,
                             reason: Some(reason),
                             ..
-                        } if reason.starts_with("cancelled:quality_embed_to_prf:")
+                        } if reason == "cancelled"
                     )
                 })
                 .count();
@@ -9543,13 +9604,7 @@ mod tests {
                 saw_timeout,
                 "phase 2 timeout should degrade to RefinementFailed with SearchTimeout"
             );
-            assert!(
-                metrics
-                    .skip_reason
-                    .as_ref()
-                    .is_some_and(|reason| reason.contains("Search timed out")),
-                "timeout should be recorded in skip reason"
-            );
+            assert_eq!(metrics.skip_reason.as_deref(), Some("search_timeout"));
         });
     }
 
@@ -10347,6 +10402,133 @@ mod tests {
             semantic.metadata.is_none(),
             "semantic-only fused result should not synthesize metadata"
         );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn exclusion_logs_omit_query_clauses_and_document_ids() {
+        let exclusions = NormalizedExclusions {
+            terms: vec!["private-exclusion".to_owned()],
+            phrases: Vec::new(),
+        };
+        assert!(should_exclude_document(
+            "private-document-id",
+            &exclusions,
+            &|_| Some("contains private-exclusion text".to_owned()),
+            "lexical",
+        ));
+        assert!(logs_contain("doc_excluded"));
+        assert!(!logs_contain("private-exclusion"));
+        assert!(!logs_contain("private-document-id"));
+    }
+
+    #[test]
+    fn provider_failures_remain_private_in_metrics_and_lifecycle_telemetry() {
+        for quality_failure in [false, true] {
+            for cancel in [false, true] {
+                asupersync::test_utils::run_test_with_cx(|cx| async move {
+                    let (_index_dir, index) = build_test_index_with_quality(4);
+                    let failing: Arc<dyn Embedder> = Arc::new(UntrustedErrorEmbedder { cancel });
+                    let fast: Arc<dyn Embedder> = if quality_failure {
+                        Arc::new(StubEmbedder::new("fast", 4))
+                    } else {
+                        Arc::clone(&failing)
+                    };
+                    let adapter = Arc::new(RecordingHostAdapter::new("private_failures"));
+                    let mut searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                        .with_host_adapter(adapter.clone());
+                    if quality_failure {
+                        searcher = searcher.with_quality_embedder(failing);
+                    }
+
+                    let mut refinement_error = None;
+                    let mut phases = Vec::new();
+                    let result = searcher
+                        .search(
+                            &cx,
+                            "test query",
+                            5,
+                            |_| None,
+                            |phase| match phase {
+                                SearchPhase::Initial { .. } => phases.push("initial"),
+                                SearchPhase::Refined { .. } => phases.push("refined"),
+                                SearchPhase::Reranked { .. } => phases.push("reranked"),
+                                SearchPhase::RefinementFailed { error, .. } => {
+                                    phases.push("refinement_failed");
+                                    refinement_error = Some(error);
+                                }
+                            },
+                        )
+                        .await;
+                    let expected_phases: &[&str] = match (quality_failure, cancel) {
+                        (true, false) => &["initial", "refinement_failed"],
+                        (true, true) => &["initial"],
+                        (false, _) => &[],
+                    };
+                    assert_eq!(phases.as_slice(), expected_phases);
+                    let expected_code = if cancel {
+                        "cancelled"
+                    } else {
+                        "embedding_failed"
+                    };
+                    let original_error = if quality_failure && !cancel {
+                        let metrics = result.expect("quality failure retains the Initial results");
+                        assert_eq!(metrics.skip_reason.as_deref(), Some(expected_code));
+                        refinement_error.expect("the callback receives the original failure")
+                    } else {
+                        assert!(refinement_error.is_none());
+                        result.expect_err("Initial failure or cancellation must propagate")
+                    };
+                    assert_eq!(original_error.diagnostic_code(), expected_code);
+                    assert!(original_error.to_string().contains(PRIVATE_PROVIDER_ERROR));
+
+                    let events = adapter.telemetry_events();
+                    let encoded = serde_json::to_string(&events).expect("serialize telemetry");
+                    for private in ["private-provider-query", "secret", "forged-log-line"] {
+                        assert!(!encoded.contains(private), "telemetry leaked {private}");
+                    }
+                    assert_eq!(
+                        events
+                            .iter()
+                            .filter(|envelope| matches!(
+                                &envelope.event,
+                                TelemetryEvent::Lifecycle { reason: Some(reason), .. }
+                                    if reason == expected_code
+                            ))
+                            .count(),
+                        1,
+                    );
+                    if cancel {
+                        assert_single_cancelled_session_stop(&adapter, "provider cancellation");
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn lexical_fallback_logs_only_the_provider_failure_code() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (_index_dir, index) = build_test_index(4);
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::new(UntrustedErrorEmbedder { cancel: false }),
+                TwoTierConfig::default(),
+            )
+            .with_lexical(Arc::new(StubLexical));
+            let (results, metrics) = searcher
+                .search_collect(&cx, "natural language retrieval request", 5)
+                .await
+                .expect("lexical fallback");
+            assert!(!results.is_empty());
+            assert_eq!(metrics.skip_reason.as_deref(), Some("fast_embed_failed"));
+        });
+        assert!(logs_contain("fast embedding failed"));
+        assert!(logs_contain("embedding_failed"));
+        assert!(!logs_contain("private-provider-query"));
+        assert!(!logs_contain("secret"));
+        assert!(!logs_contain("forged-log-line"));
     }
 
     #[test]

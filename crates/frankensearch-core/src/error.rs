@@ -247,6 +247,43 @@ pub enum SearchError {
     DurabilityDisabled,
 }
 
+impl SearchError {
+    /// A stable, bounded diagnostic code for logs, metrics, and public telemetry.
+    ///
+    /// Error fields and source chains can contain queries, document content,
+    /// filesystem paths, provider credentials, or arbitrary control characters.
+    /// This projection inspects only the variant and never formats those values.
+    /// Keep the original error for callers that need its structured details;
+    /// use this code when publishing a diagnostic outside that call boundary.
+    #[must_use]
+    pub const fn diagnostic_code(&self) -> &'static str {
+        match self {
+            Self::EmbedderUnavailable { .. } => "embedder_unavailable",
+            Self::EmbeddingFailed { .. } => "embedding_failed",
+            Self::ModelNotFound { .. } => "model_not_found",
+            Self::ModelLoadFailed { .. } => "model_load_failed",
+            Self::IndexCorrupted { .. } => "index_corrupted",
+            Self::IndexVersionMismatch { .. } => "index_version_mismatch",
+            Self::DimensionMismatch { .. } => "dimension_mismatch",
+            Self::IndexNotFound { .. } => "index_not_found",
+            Self::IndexCandidatesNotFound { .. } => "index_candidates_not_found",
+            Self::QueryParseError { .. } => "query_parse_error",
+            Self::SearchTimeout { .. } => "search_timeout",
+            Self::FederatedInsufficientResponses { .. } => "federated_insufficient_responses",
+            Self::RerankerUnavailable { .. } => "reranker_unavailable",
+            Self::RerankFailed { .. } => "rerank_failed",
+            Self::Io(_) => "io_error",
+            Self::InvalidConfig { .. } => "invalid_config",
+            Self::HashMismatch { .. } => "hash_mismatch",
+            Self::UnverifiableRemoteSpace { .. } => "unverifiable_remote_space",
+            Self::Cancelled { .. } => "cancelled",
+            Self::QueueFull { .. } => "queue_full",
+            Self::SubsystemError { .. } => "subsystem_error",
+            Self::DurabilityDisabled => "durability_disabled",
+        }
+    }
+}
+
 /// Convenience alias used throughout the frankensearch crate hierarchy.
 pub type SearchResult<T> = Result<T, SearchError>;
 
@@ -259,6 +296,116 @@ mod tests {
     fn error_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<SearchError>();
+    }
+
+    #[test]
+    fn diagnostics_never_format_untrusted_fields_or_sources() {
+        #[derive(Debug)]
+        struct UntrustedSource;
+
+        impl std::fmt::Display for UntrustedSource {
+            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                panic!("public diagnostics must not format a provider error");
+            }
+        }
+
+        impl std::error::Error for UntrustedSource {}
+
+        const PRIVATE: &str = "private query\nhttps://user:secret@provider/private/path\x1b[31m";
+        let errors = [
+            SearchError::EmbedderUnavailable {
+                model: PRIVATE.into(),
+                reason: PRIVATE.into(),
+            },
+            SearchError::EmbeddingFailed {
+                model: PRIVATE.into(),
+                source: Box::new(UntrustedSource),
+            },
+            SearchError::ModelNotFound {
+                name: PRIVATE.into(),
+            },
+            SearchError::ModelLoadFailed {
+                path: PRIVATE.into(),
+                source: Box::new(UntrustedSource),
+            },
+            SearchError::IndexCorrupted {
+                path: PRIVATE.into(),
+                detail: PRIVATE.into(),
+            },
+            SearchError::IndexVersionMismatch {
+                expected: u16::MAX,
+                found: u16::MAX,
+            },
+            SearchError::DimensionMismatch {
+                expected: usize::MAX,
+                found: usize::MAX,
+            },
+            SearchError::IndexNotFound {
+                path: PRIVATE.into(),
+            },
+            SearchError::IndexCandidatesNotFound {
+                paths: vec![PRIVATE.into()],
+            },
+            SearchError::QueryParseError {
+                query: PRIVATE.into(),
+                detail: PRIVATE.into(),
+            },
+            SearchError::SearchTimeout {
+                elapsed_ms: u64::MAX,
+                budget_ms: u64::MAX,
+            },
+            SearchError::FederatedInsufficientResponses {
+                required: usize::MAX,
+                received: usize::MAX,
+            },
+            SearchError::RerankerUnavailable {
+                model: PRIVATE.into(),
+            },
+            SearchError::RerankFailed {
+                model: PRIVATE.into(),
+                source: Box::new(UntrustedSource),
+            },
+            SearchError::Io(std::io::Error::other(UntrustedSource)),
+            SearchError::InvalidConfig {
+                field: PRIVATE.into(),
+                value: PRIVATE.into(),
+                reason: PRIVATE.into(),
+            },
+            SearchError::HashMismatch {
+                path: PRIVATE.into(),
+                expected: PRIVATE.into(),
+                actual: PRIVATE.into(),
+            },
+            SearchError::UnverifiableRemoteSpace {
+                producer: PRIVATE.into(),
+                reason: PRIVATE.into(),
+            },
+            SearchError::Cancelled {
+                phase: PRIVATE.into(),
+                reason: PRIVATE.into(),
+            },
+            SearchError::QueueFull {
+                pending: usize::MAX,
+                capacity: usize::MAX,
+            },
+            SearchError::SubsystemError {
+                subsystem: PRIVATE,
+                source: Box::new(UntrustedSource),
+            },
+            SearchError::DurabilityDisabled,
+        ];
+        let mut codes = std::collections::BTreeSet::new();
+        for error in &errors {
+            let code = error.diagnostic_code();
+            assert!(!code.is_empty() && code.len() <= 40);
+            assert!(
+                code.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            );
+            assert!(codes.insert(code), "distinct errors need distinct codes");
+            assert!(!code.contains("private"));
+            assert!(!code.contains("secret"));
+        }
     }
 
     #[test]
