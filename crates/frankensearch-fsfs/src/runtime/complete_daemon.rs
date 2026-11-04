@@ -407,14 +407,11 @@ impl FsfsRuntime {
         }
         // Admit before opening the transport: no listening socket claims a
         // ready service while its generation or semantic producer is invalid.
-        let (_pool, handle) = self.search_blocking_capacity();
-        let runtime = if self.search_blocking_pool.is_some() {
-            self.clone()
-        } else {
-            self.clone().with_search_blocking_pool(handle.clone())
-        }
-        .with_daemon_coalescers();
-        let cx = cx.clone().with_blocking_pool_handle(Some(handle));
+        // Preserve the caller's capabilities. A pool handle alone cannot
+        // manufacture the live spawn context needed by asynchronous workers.
+        // The CLI installs and owns its model capacity before entering here.
+        let runtime = self.clone().with_daemon_coalescers();
+        let cx = cx.clone();
         let session = runtime.open_live_retained_search(&cx, root).await?;
         retained_search_checkpoint(&cx)?;
         let bound = BoundCompleteSocket::bind(socket_path)?;

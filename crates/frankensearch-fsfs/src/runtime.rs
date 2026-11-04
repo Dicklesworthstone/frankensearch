@@ -1146,12 +1146,10 @@ impl std::fmt::Debug for DaemonCoalescerService {
 #[cfg(unix)]
 impl DaemonCoalescerService {
     fn new(cx: &Cx, admitted: &AdmittedEmbedder) -> SearchResult<Self> {
-        let backend =
-            cx.blocking_pool_handle()
-                .ok_or_else(|| SearchError::EmbedderUnavailable {
-                    model: admitted.embedder.id().to_owned(),
-                    reason: "daemon coalescing requires its caller-owned model pool".to_owned(),
-                })?;
+        // Synchronous providers also support native batches and need no model
+        // workers. Preserve absent capacity instead of rejecting those callers
+        // or manufacturing a spawn capability on their request contexts.
+        let backend = cx.blocking_pool_handle();
         let (client, mut dispatcher) = frankensearch_embed::CoalescingEmbedder::new(
             cx,
             Arc::clone(&admitted.embedder),
@@ -1170,7 +1168,10 @@ impl DaemonCoalescerService {
         let task = owner.0.spawn(move || {
             let run = || -> SearchResult<usize> {
                 let scheduler = RuntimeBuilder::current_thread()
-                    .blocking_threads(0, backend.current_max_threads())
+                    .blocking_threads(
+                        0,
+                        backend.as_ref().map_or(0, |pool| pool.current_max_threads()),
+                    )
                     .build()
                     .map_err(|error| SearchError::SubsystemError {
                         subsystem: "fsfs.daemon.coalescing",
@@ -1178,7 +1179,7 @@ impl DaemonCoalescerService {
                     })?;
                 let service_cx = scheduler
                     .request_cx_with_budget(asupersync::types::Budget::INFINITE)
-                    .with_blocking_pool_handle(Some(backend));
+                    .with_blocking_pool_handle(backend);
                 let service = async {
                     loop {
                         let before = metrics.total_batches.load(Ordering::Relaxed);
@@ -1673,6 +1674,34 @@ struct SearchCacheKey {
     /// be served to a request that finds a different one, or none.
     #[serde(default)]
     rerank_model: Option<String>,
+}
+
+/// Check the response consumer without reading request bytes or writing a
+/// probe. A client may close its request half and still receive the answer.
+#[cfg(unix)]
+pub(super) fn check_search_daemon_peer(peer: &UnixStream) -> std::io::Result<()> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+
+    let mut descriptors = [PollFd::new(peer, PollFlags::OUT)];
+    let timeout = Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match poll(&mut descriptors, Some(&timeout)) {
+        Ok(_) => {}
+        Err(rustix::io::Errno::INTR) => return Ok(()),
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    if descriptors[0]
+        .revents()
+        .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "complete-generation response peer disconnected",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -9735,6 +9764,10 @@ impl FsfsRuntime {
             });
             let mut transport = Ok(());
             loop {
+                if let Err(error) = check_search_daemon_peer(&stream) {
+                    transport = Err(SearchError::Io(error));
+                    break;
+                }
                 if started.elapsed() >= budget {
                     transport = Err(Self::search_daemon_error(
                         "daemon request delivery deadline exceeded",

@@ -13,7 +13,6 @@ use std::task::Poll;
 
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
 
 use super::super::super::{FSFS_DAEMON_RESPONSE_MAX_BYTES, parse_search_execution_mode};
 use super::{IO_POLL_INTERVAL, complete_cli_error, retained_search_checkpoint};
@@ -28,30 +27,7 @@ use drain::{DrainState, drain_pending};
 /// Request only write readiness, since BSD poll maps a read-side EOF to HUP.
 /// Ignore OUT itself; this zero-time probe never waits or schedules a wake on
 /// a normally writable socket. The owning driver's existing tick sets cadence.
-pub(super) fn check_peer(peer: &UnixStream) -> io::Result<()> {
-    let mut descriptors = [PollFd::new(peer, PollFlags::OUT)];
-    let timeout = Timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    match poll(&mut descriptors, Some(&timeout)) {
-        Ok(_) => {}
-        // A signal is not evidence of disconnection. The next owning poll
-        // repeats the check; do not spin or abort healthy work on EINTR.
-        Err(rustix::io::Errno::INTR) => return Ok(()),
-        Err(error) => return Err(io::Error::from(error)),
-    }
-    if descriptors[0]
-        .revents()
-        .intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
-    {
-        return Err(io::Error::new(
-            ErrorKind::BrokenPipe,
-            "complete-generation response peer disconnected",
-        ));
-    }
-    Ok(())
-}
+pub(super) use super::super::super::check_search_daemon_peer as check_peer;
 
 struct Output {
     peer: UnixStream,
