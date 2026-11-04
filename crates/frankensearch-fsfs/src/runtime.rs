@@ -25000,6 +25000,19 @@ impl FsfsRuntime {
                 }
             };
 
+            if let Some(error) = entry.error() {
+                // A successful directory entry can still carry an invalid
+                // ignore pattern. Publishing with only the surviving rules
+                // would admit sources the caller intended to exclude.
+                return Err(SearchError::InvalidConfig {
+                    field: "discovery.ignore_rules".to_owned(),
+                    value: entry.path().display().to_string(),
+                    reason: format!(
+                        "cannot index with incomplete ignore rules; correct the ignore file and retry: {error}"
+                    ),
+                });
+            }
+
             let path_is_symlink = entry.path_is_symlink();
             let Some(file_type) = entry.file_type() else {
                 if path_is_symlink && !self.config.discovery.follow_symlinks {
@@ -47314,6 +47327,136 @@ mod tests {
                             .index
                             .quality_deferred_files,
                         0
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn reindex_rejects_invalid_ignore_rules_without_changing_published_sources() {
+        run_on_runtime_task(|cx| async move {
+            for ignore_name in [".gitignore", ".ignore"] {
+                for complete in [false, true] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let project = temp.path().join("project");
+                    let root = temp.path().join("index");
+                    fs::create_dir_all(project.join(".git")).unwrap();
+                    fs::write(project.join("public.md"), "publicguide original body").unwrap();
+                    fs::write(project.join("private5.md"), "privatewitness original body").unwrap();
+                    fs::write(project.join(ignore_name), "").unwrap();
+
+                    let mut config = FsfsConfig::default();
+                    config.storage.db_path = "{index_dir}/catalog.sqlite".to_owned();
+                    config.indexing.offline = true;
+                    config.pressure.degradation_override =
+                        DegradationOverrideMode::ForceLexicalOnly;
+                    config.search.rerank = false;
+                    let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+                        command: CliCommand::Index,
+                        target_path: Some(project.clone()),
+                        index_dir: Some(root.clone()),
+                        format: OutputFormat::Json,
+                        quiet: true,
+                        ..CliInput::default()
+                    });
+                    let selected_root = || {
+                        if complete {
+                            crate::generation_store::CompleteGenerationStore::open(&cx, &root)
+                                .unwrap()
+                                .active(&cx)
+                                .unwrap()
+                                .unwrap()
+                                .path()
+                                .to_path_buf()
+                        } else {
+                            root.clone()
+                        }
+                    };
+                    let indexed_files = |path: &Path| {
+                        let mut files = snapshot_directory(path);
+                        // Acquiring the mutable writer lease refreshes its
+                        // owner record even when discovery subsequently fails.
+                        files.remove(Path::new(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME));
+                        files
+                    };
+
+                    runtime
+                        .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, complete)
+                        .await
+                        .expect("initial generation");
+                    let selected = selected_root();
+                    let before = indexed_files(&selected);
+                    let manifests = FsfsRuntime::read_index_manifest(&selected)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(manifests.len(), 2);
+                    assert!(
+                        manifests
+                            .iter()
+                            .any(|entry| entry.file_key == "private5.md")
+                    );
+
+                    fs::write(project.join("public.md"), "publicguide replacement body").unwrap();
+                    fs::write(project.join("private6.md"), "privatewitness new body").unwrap();
+                    // A descending range is a parser error even though the
+                    // walker yields an Ok directory entry. Without checking
+                    // entry.error(), this rule is dropped and both private
+                    // documents are silently admitted by the rebuild.
+                    fs::write(project.join(ignore_name), "private[9-0].md\n").unwrap();
+                    let error = runtime
+                        .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, complete)
+                        .await
+                        .expect_err("invalid ignore policy must refuse publication");
+                    let SearchError::InvalidConfig { field, reason, .. } = error else {
+                        panic!("expected discovery refusal, got {error:?}");
+                    };
+                    assert_eq!(field, "discovery.ignore_rules");
+                    assert!(reason.contains(ignore_name), "{reason}");
+                    assert!(reason.contains("private[9-0].md"), "{reason}");
+                    assert_eq!(
+                        selected_root(),
+                        selected,
+                        "the selected generation is unchanged"
+                    );
+                    assert_eq!(
+                        indexed_files(&selected),
+                        before,
+                        "failed discovery must preserve the checkpoint and every published artifact"
+                    );
+
+                    fs::write(project.join(ignore_name), "private[0-9].md\n").unwrap();
+                    runtime
+                        .run_mode_with_complete_generations(&cx, InterfaceMode::Cli, None, complete)
+                        .await
+                        .expect("corrected ignore rules permit a retry");
+                    let selected = selected_root();
+                    let manifests = FsfsRuntime::read_index_manifest(&selected)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(manifests.len(), 1);
+                    assert_eq!(manifests[0].file_key, "public.md");
+
+                    let mut search = runtime.clone();
+                    search.cli_input.index_dir = Some(selected);
+                    let resources = search
+                        .prepare_search_execution_resources(&cx, SearchExecutionMode::LexicalOnly)
+                        .await
+                        .unwrap();
+                    let lexical = resources.lexical_index.as_ref().unwrap();
+                    assert!(
+                        lexical
+                            .search_doc_ids(&cx, "privatewitness", 10)
+                            .unwrap()
+                            .is_empty(),
+                        "retry must remove old private content from searchable membership"
+                    );
+                    assert_eq!(
+                        lexical
+                            .search_doc_ids(&cx, "publicguide", 10)
+                            .unwrap()
+                            .len(),
+                        1
                     );
                 }
             }
