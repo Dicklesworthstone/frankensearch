@@ -193,8 +193,9 @@ Every lite target MUST instead publish:
 - checksum: `fsfs-lite-<version>-<target>.tar.xz.sha256`
 - metadata: `fsfs-lite-<version>-<target>.metadata.json`
 
-Optional signing files append `.sig` and `.pem` to the archive name. Lite and
-full names MUST remain distinct even when both profiles exist for one target.
+Release signatures append `.minisig` to the archive and metadata names; the
+release checksum manifest is signed as `SHA256SUMS.minisig`. Lite and full
+names MUST remain distinct even when both profiles exist for one target.
 
 Metadata MUST include:
 
@@ -222,8 +223,18 @@ are requirements, not claims that every v1.8.0 asset satisfies them.
 - A missing checksum manifest entry or sidecar, a malformed digest, an absent
   `sha256sum`/`shasum` implementation, or a checksum mismatch MUST fail closed.
   No skip token, warning-only bypass, or unverified replacement is permitted.
-- Signature verification SHOULD be supported through `--verify` mode and Sigstore/Cosign blob signatures.
-- Missing signatures in optional-signing mode MUST emit a deterministic warning reason code, not silent success.
+- `--verify` MUST authenticate the archive's `.minisig` with Minisign and the
+  repository's pinned `minisign.pub` trust key before extraction or execution.
+  The installer embeds that public key so a streamed installer does not fetch
+  a replacement key alongside the untrusted artifact.
+- An explicitly requested signature check MUST fail closed on a missing or
+  empty signature, missing Minisign verifier, or signature mismatch. It MUST
+  preserve the incumbent installation and MUST NOT fall back to a source build
+  that cannot satisfy the release signature requirement. `--from-source` and
+  `--verify` are therefore mutually exclusive.
+- Installs without `--verify` retain mandatory checksum verification; a checksum
+  alone does not authenticate the release signer. `--verify` also retains the
+  post-install self-test and rollback behavior.
 
 ## Install UX Expectations
 
@@ -823,6 +834,8 @@ Publication is a separately authorized, credentialed action following
 - `release.publish.asset_upload_failed`
 - `install.preflight.disk_space_low`
 - `install.verify.signature_missing`
+- `install.verify.signature_unverifiable`
+- `install.verify.signature_invalid`
 - `upgrade.apply.unsupported_path`
 - `upgrade.apply.rollback_triggered`
 - `upgrade.migration.matrix_failed`

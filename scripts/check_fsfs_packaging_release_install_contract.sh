@@ -511,10 +511,37 @@ installer_file_digest() {
   fi
 }
 
+# Instrument the external verifier boundary without a release private key.
+# This fixture validates argv, the pinned key and sidecar identity; it is not
+# cryptographic evidence. Release qualification must also use real Minisign.
+installer_write_verifier_stub() {
+  local path="$1" public_key
+  public_key=$(sed -n '2p' "$ROOT_DIR/minisign.pub")
+  cat >"$path" <<STUB
+#!/bin/sh
+[ "\$#" -eq 7 ] || exit 90
+[ "\$1" = -V ] && [ "\$2" = -m ] && [ "\$4" = -x ] && [ "\$6" = -P ] || exit 91
+[ -s "\$3" ] && [ "\$5" = "\$3.minisig" ] || exit 92
+[ "\$7" = "$public_key" ] || exit 93
+[ "\$(cat "\$5")" = fixture-signature ] || exit 94
+if [ -n "\${FSFS_TEST_MINISIGN_LOG:-}" ]; then
+  printf '%s\n' verifier-called >>"\$FSFS_TEST_MINISIGN_LOG"
+fi
+exit "\${FSFS_TEST_MINISIGN_STATUS:-0}"
+STUB
+  chmod 0755 "$path"
+}
+
 installer_write_stub() {
   local path="$1" version="$2"
   cat >"$path" <<STUB
 #!/bin/sh
+if [ -n "\${FSFS_STUB_EXECUTIONS:-}" ]; then
+  printf '%s\n' "\$0" >>"\$FSFS_STUB_EXECUTIONS"
+fi
+if [ "\${FSFS_STUB_REQUIRE_OWNER:-0}" = 1 ] && [ ! -O "\$0" ]; then
+  exit 76
+fi
 case "\${1:-}" in
   version|--version)
     # Lets a case fail post-install validation only: the staged copy still
@@ -582,14 +609,28 @@ check_installer_offline_e2e() {
 
   installer_write_stub "$work/stage/fsfs" "9.9.9"
   archive="$work/fsfs-9.9.9-local.tar.gz"
-  tar -czf "$archive" -C "$work/stage" fsfs
+  # Real release archives retain the builder's uid/gid. Those may be unmapped
+  # for container root; the staged binary must belong to the installing user.
+  python3 - "$work/stage/fsfs" "$archive" <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[2], "w:gz") as archive:
+    info = archive.gettarinfo(sys.argv[1], arcname="fsfs")
+    info.uid = 1000
+    info.gid = 1000
+    info.uname = ""
+    info.gname = ""
+    with open(sys.argv[1], "rb") as binary:
+        archive.addfile(info, binary)
+PY
 
   digest=$(installer_file_digest "$archive")
   local staged_digest
   staged_digest=$(installer_file_digest "$work/stage/fsfs")
 
   local -a base_cmd=(
-    env NO_COLOR=1 FSFS_STUB_DOWNLOAD_STATUS=73 "FSFS_INSTALL_LOCK_FILE=$work/install.lock"
+    env NO_COLOR=1 FSFS_STUB_DOWNLOAD_STATUS=73 FSFS_STUB_REQUIRE_OWNER=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock"
     "$installer_shell" "$installer"
     --offline --version v9.9.9 --artifact-url "$archive" --checksum "$digest" --dest "$dest"
   )
@@ -599,7 +640,7 @@ check_installer_offline_e2e() {
   status=0
   output=$("${base_cmd[@]}" 2>&1) || status=$?
   if [[ "$status" -eq 0 && -x "$dest/fsfs" ]] && "$dest/fsfs" version | grep -q '9\.9\.9'; then
-    echo "[installer][OK]   offline artifact install completes without network access"
+    echo "[installer][OK]   offline artifact install ignores builder ownership and completes without network access"
   else
     echo "[installer][FAIL] offline install status=$status output=${output:-<empty>}"
     FAILURES=$((FAILURES + 1))
@@ -854,8 +895,8 @@ check_installer_release_policy() {
   status=0
   output=$(FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
     signature "$archive" 2>&1) || status=$?
-  if [[ "$status" -eq 0 && "$output" == *"install.verify.signature_missing"* ]]; then
-    echo "[installer][OK]   an unsigned archive warns install.verify.signature_missing, not silent success"
+  if [[ "$status" -ne 0 && "$output" == *"install.verify.signature_missing"* ]]; then
+    echo "[installer][OK]   an explicitly requested signature check rejects an unsigned archive"
   else
     echo "[installer][FAIL] missing signature not reported status=$status output=${output:-<empty>}"
     FAILURES=$((FAILURES + 1))
@@ -864,12 +905,35 @@ check_installer_release_policy() {
   printf 'signature\n' >"$archive.sig"
   printf 'certificate\n' >"$archive.pem"
 
-  # A signed archive with no verifier present must say so rather than claim success.
+  # Unshipped Cosign sidecars cannot substitute for the established trust root.
   status=0
-  output=$(env FSFS_INSTALL_COSIGN=fsfs-verifier-that-does-not-exist NO_COLOR=1 \
+  output=$(env NO_COLOR=1 \
     FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" signature "$archive" 2>&1) || status=$?
-  if [[ "$status" -eq 0 && "$output" == *"install.verify.signature_unverifiable"* ]]; then
-    echo "[installer][OK]   a signed archive without cosign reports that it went unverified"
+  if [[ "$status" -ne 0 && "$output" == *"install.verify.signature_missing"* ]]; then
+    echo "[installer][OK]   Cosign sidecars cannot bypass the Minisign requirement"
+  else
+    echo "[installer][FAIL] untrusted signature fallback status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  : >"$archive.minisig"
+  status=0
+  output=$(env NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 \
+    "$installer_shell" "$installer" signature "$archive" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"install.verify.signature_missing"* ]]; then
+    echo "[installer][OK]   an empty signature fails closed"
+  else
+    echo "[installer][FAIL] empty signature status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+  printf 'fixture-signature\n' >"$archive.minisig"
+
+  # A signature with no verifier cannot satisfy an explicit --verify request.
+  status=0
+  output=$(env FSFS_INSTALL_MINISIGN=fsfs-verifier-that-does-not-exist NO_COLOR=1 \
+    FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" signature "$archive" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"install.verify.signature_unverifiable"* ]]; then
+    echo "[installer][OK]   a missing Minisign verifier fails closed"
   else
     echo "[installer][FAIL] absent verifier not reported status=$status output=${output:-<empty>}"
     FAILURES=$((FAILURES + 1))
@@ -878,10 +942,10 @@ check_installer_release_policy() {
   # --- signature verification failure MUST abort -----------------------------
   local fake_bin="$work/fakebin"
   mkdir -p "$fake_bin"
-  printf '#!/bin/sh\nexit 1\n' >"$fake_bin/cosign"
-  chmod 0755 "$fake_bin/cosign"
+  installer_write_verifier_stub "$fake_bin/minisign"
   status=0
-  output=$(env "FSFS_INSTALL_COSIGN=$fake_bin/cosign" NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 \
+  output=$(env "FSFS_INSTALL_MINISIGN=$fake_bin/minisign" FSFS_TEST_MINISIGN_STATUS=1 \
+    NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 \
     "$installer_shell" "$installer" signature "$archive" 2>&1) || status=$?
   if [[ "$status" -ne 0 && "$output" == *"install.verify.signature_invalid"* ]]; then
     echo "[installer][OK]   a failing signature aborts before the destination is replaced"
@@ -890,14 +954,15 @@ check_installer_release_policy() {
     FAILURES=$((FAILURES + 1))
   fi
 
-  printf '#!/bin/sh\nexit 0\n' >"$fake_bin/cosign"
   status=0
-  output=$(env "FSFS_INSTALL_COSIGN=$fake_bin/cosign" NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 \
+  output=$(env "FSFS_INSTALL_MINISIGN=$fake_bin/minisign" FSFS_RELEASE_MINISIGN_PUBKEY=untrusted-environment-key \
+    "FSFS_TEST_MINISIGN_LOG=$work/verifier.log" NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 \
     "$installer_shell" "$installer" signature "$archive" 2>&1) || status=$?
-  if [[ "$status" -eq 0 && "$output" == *"Signature verified"* ]]; then
-    echo "[installer][OK]   a valid signature is admitted"
+  if [[ "$status" -eq 0 && "$output" == *"Signature verified"* \
+    && "$(cat "$work/verifier.log")" == verifier-called ]]; then
+    echo "[installer][OK]   verifier wiring uses the repository key and exact archive/sidecar arguments"
   else
-    echo "[installer][FAIL] valid signature rejected status=$status output=${output:-<empty>}"
+    echo "[installer][FAIL] pinned-key verifier wiring failed status=$status output=${output:-<empty>}"
     FAILURES=$((FAILURES + 1))
   fi
 
@@ -973,6 +1038,71 @@ check_installer_rollback_e2e() {
   # An incumbent that works, reporting an older version.
   installer_write_stub "$dest/fsfs" "1.0.0"
   incumbent_digest=$(installer_file_digest "$dest/fsfs")
+
+  # Exercise the production staging path. Rejections must precede candidate
+  # execution, and a verified fixture must still reach the install/self-test.
+  # The verifier fixture proves orchestration, not cryptographic validity.
+  local verifier="$work/minisign" signature_case signature_archive signature_verifier
+  local signature_status expected_reason executions verifier_calls
+  installer_write_verifier_stub "$verifier"
+  for signature_case in missing empty invalid no-verifier; do
+    signature_archive="$work/fsfs-9.9.9-$signature_case.tar.gz"
+    cp "$archive" "$signature_archive"
+    signature_verifier="$verifier"
+    signature_status=0
+    case "$signature_case" in
+      missing) expected_reason=signature_missing ;;
+      empty) : >"$signature_archive.minisig"; expected_reason=signature_missing ;;
+      invalid)
+        printf 'fixture-signature\n' >"$signature_archive.minisig"
+        signature_status=1
+        expected_reason=signature_invalid
+        ;;
+      no-verifier)
+        printf 'fixture-signature\n' >"$signature_archive.minisig"
+        signature_verifier=fsfs-verifier-that-does-not-exist
+        expected_reason=signature_unverifiable
+        ;;
+    esac
+    executions="$work/executions-$signature_case.log"
+    verifier_calls="$work/verifier-$signature_case.log"
+    status=0
+    output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+      "FSFS_INSTALL_MINISIGN=$signature_verifier" "FSFS_TEST_MINISIGN_STATUS=$signature_status" \
+      "FSFS_TEST_MINISIGN_LOG=$verifier_calls" "FSFS_STUB_EXECUTIONS=$executions" \
+      "$installer_shell" "$installer" --offline --lite --version v9.9.9 \
+      --artifact-url "file://$signature_archive" --checksum "$digest" --dest "$dest" --verify --quiet 2>&1) || status=$?
+    if [[ "$status" -ne 0 && "$output" == *"install.verify.$expected_reason"* ]] \
+      && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]] \
+      && [[ -f "$executions" ]] \
+      && awk -v incumbent="$dest/fsfs" '$0 != incumbent { exit 1 }' "$executions"; then
+      echo "[installer][OK]   --verify $signature_case preserves incumbent before candidate execution"
+    else
+      echo "[installer][FAIL] --verify $signature_case status=$status output=${output:-<empty>}"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
+
+  # An explicit source build or unavailable archive must not silently evade
+  # --verify by compiling an unauthenticated candidate instead.
+  local -a unsigned_route
+  for signature_case in explicit-source missing-archive; do
+    unsigned_route=(--from-source)
+    if [[ "$signature_case" == missing-archive ]]; then
+      unsigned_route=(--artifact-url "$work/unavailable.tar.gz" --checksum "$digest")
+    fi
+    status=0
+    output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+      "$installer_shell" "$installer" --version v9.9.9 --dest "$dest" \
+      --verify --quiet "${unsigned_route[@]}" 2>&1) || status=$?
+    if [[ "$status" -ne 0 && "$output" == *"install.verify.signature_unverifiable"* ]] \
+      && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]]; then
+      echo "[installer][OK]   --verify rejects $signature_case without source-build fallback"
+    else
+      echo "[installer][FAIL] --verify $signature_case status=$status output=${output:-<empty>}"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
 
   # Candidate identity is mandatory, including without --verify. A valid
   # archive checksum does not prove that it contains the requested version.
@@ -1085,9 +1215,10 @@ INSTALL_FAULT
 
   # 1. Post-install validation fails only once the binary runs from the
   #    destination; the incumbent must come back.
+  printf 'fixture-signature\n' >"$archive.minisig"
   status=0
   output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
-    "FSFS_STUB_FAIL_FROM_DEST=$dest" \
+    "FSFS_STUB_FAIL_FROM_DEST=$dest" "FSFS_INSTALL_MINISIGN=$verifier" \
     "$installer_shell" "$installer" --offline --version v9.9.9 \
     --artifact-url "$archive" --checksum "$digest" --dest "$dest" --verify 2>&1) || status=$?
   if [[ "$status" -ne 0 && "$output" == *"upgrade.apply.rollback_triggered"* ]] \

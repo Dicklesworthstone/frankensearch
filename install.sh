@@ -13,7 +13,8 @@
 #   --dest DIR         Install to DIR (default: ~/.local/bin)
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
-#   --verify           Run self-test after install
+#   --verify           Require the release's Minisign signature and run self-test
+#                      (requires minisign; prebuilt archives only)
 #   --force            Reinstall even when the resolved version is already present
 #   --offline          Never touch the network; requires --version and a local
 #                      --artifact-url plus --checksum
@@ -39,6 +40,9 @@ shopt -s lastpipe 2>/dev/null || true
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-frankensearch}"
 BINARY_NAME="fsfs"
+# Pinned release trust root from minisign.pub. Keep the key in the installer so
+# curl|bash never fetches an unauthenticated replacement next to the archive.
+readonly FSFS_RELEASE_MINISIGN_PUBKEY="RWTQGPeLsnm9G7VFdFWkkcRi3wJK/PqsYxWC+oLNN74W9IjBxRU1Xu70"
 VERSION="${VERSION:-}"
 DEST_DEFAULT="$HOME/.local/bin"
 DEST="${DEST:-$DEST_DEFAULT}"
@@ -194,29 +198,28 @@ verify_archive_checksum() {
 }
 
 # --- Signature policy --------------------------------------------------------
-# Signing is optional, so an absent sidecar is a deterministic warning rather
-# than a hard failure. A signature that is present and does not verify is a
-# verification failure and MUST abort before the destination is replaced.
+# --verify explicitly requests release authentication in addition to the
+# mandatory checksum. Missing signatures or tools must fail before extraction,
+# candidate execution, or replacement, just like an invalid signature.
 verify_archive_signature() {
   local archive="$1"
-  local signature="${archive}.sig"
-  local certificate="${archive}.pem"
-  local cosign_bin="${FSFS_INSTALL_COSIGN:-cosign}"
+  local signature="${archive}.minisig"
+  local minisign_bin="${FSFS_INSTALL_MINISIGN:-minisign}"
 
-  if [ ! -f "$signature" ] || [ ! -f "$certificate" ]; then
-    warn "install.verify.signature_missing: no .sig/.pem sidecar accompanies $(basename "$archive"); the archive is checksum-verified but unsigned"
-    return 0
+  if [ ! -s "$signature" ]; then
+    err "install.verify.signature_missing: --verify requires a nonempty .minisig sidecar for $(basename "$archive")"
+    err "The existing fsfs installation was not replaced."
+    return 1
   fi
 
-  if ! command -v "$cosign_bin" >/dev/null 2>&1; then
-    warn "install.verify.signature_unverifiable: $(basename "$archive") is signed but ${cosign_bin} is not installed; the signature was not checked"
-    return 0
+  if ! command -v "$minisign_bin" >/dev/null 2>&1; then
+    err "install.verify.signature_unverifiable: --verify requires minisign; install it before retrying"
+    err "The existing fsfs installation was not replaced."
+    return 1
   fi
 
-  if "$cosign_bin" verify-blob \
-    --signature "$signature" \
-    --certificate "$certificate" \
-    "$archive" >/dev/null 2>&1; then
+  if "$minisign_bin" -V -m "$archive" -x "$signature" \
+    -P "$FSFS_RELEASE_MINISIGN_PUBKEY" >/dev/null 2>&1; then
     ok "Signature verified for $(basename "$archive")"
     return 0
   fi
@@ -606,7 +609,8 @@ Options:
   --dest DIR         Install to DIR (default: ~/.local/bin)
   --system           Install to /usr/local/bin (requires sudo)
   --easy-mode        Auto-update PATH in shell rc files
-  --verify           Run self-test after install
+  --verify           Require the release's Minisign signature and run self-test
+                     (requires minisign; prebuilt archives only)
   --artifact-url URL Install from an explicit archive URL or local path
   --checksum HEX     Expected SHA-256 of the archive (64 hex characters)
   --checksum-url URL Fetch the expected SHA-256 from URL instead of the release
@@ -926,6 +930,14 @@ if [ "$LITE" -eq 0 ] && [ "$TARGET" = "x86_64-apple-darwin" ]; then
   exit $?
 fi
 
+if [ "$VERIFY" -eq 1 ]; then
+  if [ "$FROM_SOURCE" -eq 1 ] || { [ -z "$TARGET" ] && [ -z "$ARTIFACT_URL" ]; }; then
+    err "install.verify.signature_unverifiable: --verify requires a signed prebuilt release archive; source builds cannot satisfy release signature verification"
+    err "The existing fsfs installation was not replaced."
+    exit 1
+  fi
+fi
+
 # Offline inputs are validated before anything reaches for the network.
 check_offline_preconditions "$OFFLINE" "$VERSION" "$FROM_SOURCE" "$ARTIFACT_URL" "$CHECKSUM" || exit 1
 
@@ -1120,6 +1132,11 @@ download_with_progress() {
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   if ! download_with_progress "$URL" "$TMP/$TAR" "Downloading ${BINARY_NAME} ${VERSION}"; then
+    if [ "$VERIFY" -eq 1 ]; then
+      err "install.verify.signature_unverifiable: --verify requires a signed release archive; source-build fallback is disabled"
+      err "The existing fsfs installation was not replaced."
+      exit 1
+    fi
     if [ "$OFFLINE" -eq 1 ]; then
       err "The offline artifact could not be staged and --offline forbids the source-build fallback."
       err "The existing fsfs installation was not replaced."
@@ -1269,27 +1286,27 @@ fi
 verify_archive_checksum "$TMP/$TAR" "$CHECKSUM" || exit 1
 ok "Checksum verified"
 
-# Signing is optional, so the sidecars are staged best-effort next to the
-# archive; verify_archive_signature decides what their absence means.
+# Stage the established release signature only when requested. The verifier
+# rejects a missing, empty, or invalid sidecar before any archive is executed.
 if [ "$VERIFY" -eq 1 ]; then
-  for SIGNATURE_EXT in sig pem; do
-    case "$URL" in
-      file://*) cp -- "${URL#file://}.${SIGNATURE_EXT}" "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true ;;
-      *://*)
-        curl -fsSL --connect-timeout 15 --max-time 60 "${URL}.${SIGNATURE_EXT}" \
-          -o "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true
-        ;;
-      *) cp -- "${URL}.${SIGNATURE_EXT}" "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true ;;
-    esac
-  done
+  case "$URL" in
+    file://*) cp -- "${URL#file://}.minisig" "$TMP/$TAR.minisig" 2>/dev/null || true ;;
+    *://*)
+      curl -fsSL --connect-timeout 15 --max-time 60 "${URL}.minisig" \
+        -o "$TMP/$TAR.minisig" 2>/dev/null || true
+      ;;
+    *) cp -- "${URL}.minisig" "$TMP/$TAR.minisig" 2>/dev/null || true ;;
+  esac
   verify_archive_signature "$TMP/$TAR" || exit 1
 fi
 
 # Extract
 info "Extracting"
+# Release-builder uid/gid values are not portable, especially inside a root
+# user namespace. Extract as the installing user instead of restoring them.
 case "$TAR" in
-  *.tar.xz)  tar -xJf "$TMP/$TAR" -C "$TMP" ;;
-  *.tar.gz)  tar -xzf "$TMP/$TAR" -C "$TMP" ;;
+  *.tar.xz)  tar --no-same-owner -xJf "$TMP/$TAR" -C "$TMP" ;;
+  *.tar.gz)  tar --no-same-owner -xzf "$TMP/$TAR" -C "$TMP" ;;
   *.zip)     unzip -qo "$TMP/$TAR" -d "$TMP" ;;
   *)         err "Unknown archive format: $TAR"; exit 1 ;;
 esac
