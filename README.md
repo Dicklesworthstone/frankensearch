@@ -383,15 +383,25 @@ Use `--no-daemon` for direct execution. A daemon policy or producer mismatch is
 an error requiring a daemon restart or explicit direct execution; a request
 that has delivered Initial is never silently retried.
 
-The Unix socket transport admits at most 16 clients, bounds each phase frame
-to 4 MiB and each response to 8 MiB plus 64 KiB, and reports capacity failures
-explicitly. Slow readers do not hold the shared search state while socket
-writes drain. Queued and currently written response bytes are bounded by
-16 × (8 MiB + 64 KiB); the shared query cache retains at most eight entries
-of at most 4 MiB of encoded phases each. Search admission to the shared index
-is serialized. Model/index memory and the active query's candidate set depend
-on the corpus and requested limit; these transport budgets are not a process
-memory cap.
+Warm daemon requests share immutable reader allocations and admitted model
+services. Generation and producer admission are serialized briefly; retrieval
+and socket delivery proceed concurrently. Bursts can share native embedding
+batches. A disconnected request stops its own delivery while an executing
+native batch retains its bounded worker capacity until completion.
+
+The complete-generation daemon drives at most eight searches within a total
+of nine admitted connections, including queued and partially framed requests.
+Each response is bounded to 4 MiB. The legacy flat-index socket transport admits
+at most 16 clients, bounds each phase frame to 4 MiB and each response to
+8 MiB plus 64 KiB, and reports capacity failures explicitly. Slow readers do
+not hold shared search state while writes drain. Its queued and currently
+written response bytes are bounded by 16 × (8 MiB + 64 KiB).
+
+The shared query cache retains at most eight entries of at most 4 MiB of
+encoded phases each; concurrent requests also retain their own working
+payloads. Model/index memory and active query candidate sets depend on the
+corpus, requested limits and concurrency. These transport budgets are not a
+process memory cap.
 
 ## What It Does
 

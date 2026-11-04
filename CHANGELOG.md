@@ -1,5 +1,22 @@
 # Changelog
 
+### Unreleased — Share native batches across daemon clients (2026-11-04)
+
+- Warm queries execute against owned reader snapshots rather than holding the
+  shared search-state lock throughout inference. Both the legacy socket path
+  and the default complete-generation daemon can submit concurrent queries
+  to the existing native embedding coalescer.
+- Daemon-owned dispatch keeps one client's disconnect or deadline from owning
+  sibling inference. Actual model work retains the existing bounded worker
+  pool. Successful model/cache updates are fenced by the admitted generation;
+  failed admission retains typed protocol refusals.
+- The complete-generation daemon drives up to eight searches while retaining
+  the existing nine-connection total bound, strict shutdown decoding, request
+  budgets and pinned generation readers. Batch debug events expose actual
+  `coalesced_batch_size` and oldest-input `wait_micros`.
+- These source changes are under qualification. This entry makes no binary
+  release, throughput improvement or latency guarantee.
+
 ### Unreleased — Qualify outbound proxy policy (#70, #71; 2026-11-03)
 
 - Model downloads and hosted embedding API requests share the proxy resolver
