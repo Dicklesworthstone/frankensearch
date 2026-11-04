@@ -1864,6 +1864,10 @@ pub trait MetricsExporter: fmt::Debug + Send + Sync {
     fn on_index_updated(&self, metrics: &IndexMetrics);
 
     /// Called when a search pipeline error is observed.
+    ///
+    /// The original error may contain private queries, paths, or provider
+    /// credentials. Publish [`SearchError::diagnostic_code`] for telemetry;
+    /// formatting the error or its source chain can expose those details.
     fn on_error(&self, error: &SearchError);
 }
 
