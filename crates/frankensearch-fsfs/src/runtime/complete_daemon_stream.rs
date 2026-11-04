@@ -515,6 +515,10 @@ mod tests {
             let output = PhaseWriter::new(&server).unwrap();
             let calls = AtomicUsize::new(0);
             client.shutdown(Shutdown::Both).unwrap();
+            // Darwin still accepts writes after a peer's SHUT_RDWR while its
+            // descriptor remains open. Closing the last handle abandons the
+            // response on every supported Unix kernel.
+            drop(client);
             let result = drive(&cx, &output, async {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
@@ -525,6 +529,26 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 0);
             assert!(!output.emitted());
             retained_search_checkpoint(&cx).unwrap();
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shut_down_peer_refuses_before_polling_admission_or_inference() {
+        run_test_with_cx(|cx| async move {
+            let (client, server) = UnixStream::pair().unwrap();
+            let output = PhaseWriter::new(&server).unwrap();
+            let calls = AtomicUsize::new(0);
+            client.shutdown(Shutdown::Both).unwrap();
+            let result = drive(&cx, &output, async {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await;
+            assert!(matches!(result, Err(SearchError::Io(error))
+                if error.kind() == ErrorKind::BrokenPipe));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert!(!output.emitted());
         });
     }
 

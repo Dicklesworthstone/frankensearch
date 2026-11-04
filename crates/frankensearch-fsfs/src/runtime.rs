@@ -10325,47 +10325,70 @@ impl FsfsRuntime {
         stream: &mut UnixStream,
         budget: Duration,
     ) -> SearchResult<Option<String>> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        use rustix::fs::{OFlags, fcntl_getfl};
+
+        let was_nonblocking = fcntl_getfl(&*stream)
+            .map_err(std::io::Error::from)?
+            .contains(OFlags::NONBLOCK);
+        // Darwin rejects SO_RCVTIMEO once the peer closes, including when a
+        // complete request is still buffered. Read those bytes before EOF;
+        // nonblocking readiness retains the same absolute request deadline.
+        stream.set_nonblocking(true)?;
         let started = Instant::now();
-        let mut bytes = Vec::new();
-        let mut chunk = [0_u8; 8192];
-        loop {
-            let remaining = budget.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(Self::search_daemon_error(
-                    "daemon request read deadline exceeded",
-                ));
-            }
-            stream
-                .set_read_timeout(Some(remaining))
-                .map_err(SearchError::Io)?;
-            let count = match stream.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(count) => count,
-                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(error)
-                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-                {
+        let result = (|| {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 8192];
+            loop {
+                let remaining = budget.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
                     return Err(Self::search_daemon_error(
                         "daemon request read deadline exceeded",
                     ));
                 }
-                Err(error) => return Err(SearchError::Io(error)),
-            };
-            if bytes.len().saturating_add(count) > FSFS_DAEMON_REQUEST_MAX_BYTES {
-                return Err(SearchError::InvalidConfig {
-                    field: "cli.serve.request".to_owned(),
-                    value: "<payload>".to_owned(),
-                    reason: format!("request exceeds {FSFS_DAEMON_REQUEST_MAX_BYTES} bytes limit"),
-                });
+                let count = match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                    {
+                        let timeout = Timespec::try_from(remaining)
+                            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
+                        let mut descriptors = [PollFd::new(&*stream, PollFlags::IN)];
+                        match poll(&mut descriptors, Some(&timeout)) {
+                            Ok(_) | Err(rustix::io::Errno::INTR) => continue,
+                            Err(error) => return Err(std::io::Error::from(error).into()),
+                        }
+                    }
+                    Err(error) => return Err(SearchError::Io(error)),
+                };
+                if bytes.len().saturating_add(count) > FSFS_DAEMON_REQUEST_MAX_BYTES {
+                    return Err(SearchError::InvalidConfig {
+                        field: "cli.serve.request".to_owned(),
+                        value: "<payload>".to_owned(),
+                        reason: format!(
+                            "request exceeds {FSFS_DAEMON_REQUEST_MAX_BYTES} bytes limit"
+                        ),
+                    });
+                }
+                bytes.extend_from_slice(&chunk[..count]);
             }
-            bytes.extend_from_slice(&chunk[..count]);
+            let raw_request = String::from_utf8(bytes).map_err(|error| {
+                SearchError::Io(std::io::Error::new(ErrorKind::InvalidData, error))
+            })?;
+            if raw_request.trim().is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(raw_request))
+        })();
+        let restore = stream
+            .set_nonblocking(was_nonblocking)
+            .map_err(SearchError::Io);
+        match result {
+            Ok(request) => restore.map(|()| request),
+            Err(error) => Err(error),
         }
-        let raw_request = String::from_utf8(bytes)
-            .map_err(|error| SearchError::Io(std::io::Error::new(ErrorKind::InvalidData, error)))?;
-        if raw_request.trim().is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(raw_request))
     }
 
     #[cfg(unix)]
@@ -10632,12 +10655,18 @@ impl FsfsRuntime {
                         // A daemon that cannot admit the index exits after binding
                         // its socket, so the client saw "Connection reset by peer".
                         // Nothing was delivered yet: report it as unavailable, and
-                        // in-process retrieval names the real cause. A clean close
-                        // stays a protocol failure (missing terminal).
+                        // in-process retrieval names the real cause. Darwin can
+                        // report the same unread-request close as a clean EOF.
                         Err(SearchError::Io(error)) if frames == 0 && daemon_hangup(&error) => {
                             return Err(Self::search_daemon_hung_up(
                                 &socket_path,
                                 &error.to_string(),
+                            ));
+                        }
+                        Ok(None) if frames == 0 => {
+                            return Err(Self::search_daemon_hung_up(
+                                &socket_path,
+                                "daemon closed before sending any response bytes",
                             ));
                         }
                         Ok(None) => break,
@@ -10737,6 +10766,11 @@ impl FsfsRuntime {
                     asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
                 }
                 Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) if !bytes.is_empty() && daemon_hangup(&error) => {
+                    return Err(Self::search_daemon_error(format!(
+                        "truncated daemon frame before disconnect: {error}"
+                    )));
+                }
                 Err(error) => return Err(SearchError::Io(error)),
             }
         }
@@ -37729,7 +37763,9 @@ mod tests {
         for (number, (wire, reason, delivered)) in [
             ("{invalid}\n".to_owned(), "invalid daemon frame", 0),
             (format!("{initial}\n"), "before attestation", 0),
-            (String::new(), "missing terminal", 0),
+            (String::new(), "before sending any response bytes", 0),
+            ("{".to_owned(), "truncated daemon frame", 0),
+            (format!("{header}\n"), "missing terminal", 0),
             (valid_prefix.clone(), "missing terminal", 1),
             (format!("{valid_prefix}{initial}\n"), "out-of-order", 1),
             (
@@ -37817,10 +37853,17 @@ mod tests {
         // unread, which resets the connection. The second one reads it and
         // sends a frame first, after which a hang-up is a real failure.
         let server = thread::spawn(move || {
-            for frames in [0_usize, 1] {
+            for frames in [0_usize, 1, 2] {
                 let (mut stream, _) = listener.accept().unwrap();
                 if frames == 0 {
                     stream.read_exact(&mut [0_u8; 1]).unwrap();
+                    continue;
+                }
+                if frames == 2 {
+                    // Leave request bytes unread so Linux resets while Darwin
+                    // may cleanly close. Neither may replay a partial response.
+                    stream.read_exact(&mut [0_u8; 1]).unwrap();
+                    stream.write_all(b"{").unwrap();
                     continue;
                 }
                 let mut request = Vec::new();
@@ -37847,6 +37890,12 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(!unavailable(&answered), "{answered:?}");
+            let partial = client
+                .search_payloads_via_daemon(&cx, "hangup query", 10)
+                .await
+                .unwrap_err();
+            assert!(!unavailable(&partial), "{partial:?}");
+            assert!(partial.to_string().contains("truncated daemon frame"));
         });
         server.join().unwrap();
     }
@@ -38151,7 +38200,13 @@ mod tests {
             assert!(initial.contains("\"phase\":\"initial\""));
             let mut remaining = String::new();
             if disconnect {
-                reader.get_ref().shutdown(std::net::Shutdown::Both).unwrap();
+                match reader.get_ref().shutdown(std::net::Shutdown::Both) {
+                    Ok(()) => {}
+                    // Darwin reports that the server already closed its end.
+                    // Dropping our last handle below still completes disconnect.
+                    Err(error) if error.kind() == ErrorKind::NotConnected => {}
+                    Err(error) => panic!("disconnect search client: {error}"),
+                }
             } else {
                 reader.read_to_string(&mut remaining).unwrap();
                 assert_eq!(
@@ -39929,7 +39984,7 @@ mod tests {
     }
 
     /// Writes an executable shell script and returns its still-open write
-    /// handle. While that handle lives, `execve` of the script fails with
+    /// handle. On Linux, while that handle lives, `execve` fails with
     /// `ETXTBSY` (`ErrorKind::ExecutableFileBusy`): the kernel refuses to
     /// execute an image that is open for writing anywhere in the process,
     /// which is exactly what a sibling thread's forked-but-not-yet-exec'd
@@ -39951,7 +40006,7 @@ mod tests {
         (dir, binary, writer)
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn spawn_verifying_executable_retries_until_the_image_is_closed_for_writing() {
         let (_fixture_dir, binary, writer) = write_busy_executable("etxtbsy_retry");
@@ -39976,7 +40031,7 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "busy-ok");
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn spawn_verifying_executable_reports_a_writer_that_never_closes() {
         let (_fixture_dir, binary, writer) = write_busy_executable("etxtbsy_exhausted");
@@ -39997,6 +40052,19 @@ mod tests {
             elapsed < std::time::Duration::from_secs(10),
             "the retry budget must stay bounded, took {elapsed:?}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn spawn_verifying_executable_accepts_a_writable_darwin_script() {
+        // Darwin executes a script with an open writer. It must remain a
+        // success; manufacturing ETXTBSY would test a different kernel.
+        let (_fixture_dir, binary, writer) = write_busy_executable("darwin_writable");
+        let output = super::spawn_verifying_executable(&binary, &[])
+            .expect("Darwin permits executing a writable script");
+        assert!(output.status.success(), "status: {:?}", output.status);
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "busy-ok");
+        drop(writer);
     }
 
     fn with_test_backup_dir<F, T>(label: &str, f: F) -> T
@@ -42885,6 +42953,39 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn read_search_serve_socket_request_keeps_buffered_bytes_after_peer_close() {
+        use rustix::fs::{OFlags, fcntl_getfl};
+        use std::os::unix::net::UnixStream;
+
+        for nonblocking in [false, true] {
+            let (mut writer, mut reader) = UnixStream::pair().unwrap();
+            reader.set_nonblocking(nonblocking).unwrap();
+            writer.write_all(b":shutdown\n").unwrap();
+            drop(writer);
+            assert_eq!(
+                FsfsRuntime::read_search_serve_socket_request(&mut reader, Duration::from_secs(1))
+                    .unwrap()
+                    .as_deref(),
+                Some(":shutdown\n")
+            );
+            assert_eq!(
+                fcntl_getfl(&reader).unwrap().contains(OFlags::NONBLOCK),
+                nonblocking,
+                "the reader must restore its caller's socket mode"
+            );
+        }
+        let (_writer, mut reader) = UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let error =
+            FsfsRuntime::read_search_serve_socket_request(&mut reader, Duration::from_millis(50))
+                .unwrap_err();
+        assert!(error.to_string().contains("request read deadline exceeded"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!fcntl_getfl(&reader).unwrap().contains(OFlags::NONBLOCK));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn read_search_serve_socket_request_rejects_oversized_payload() {
         use std::io::Write as _;
         use std::net::Shutdown;
@@ -42924,10 +43025,20 @@ mod tests {
             .default_daemon_socket_path()
             .expect("daemon socket path");
         let rendered = path.to_string_lossy();
+        let preferred = FsfsRuntime::default_daemon_socket_dir();
         assert!(
-            rendered.contains("frankensearch/daemon"),
-            "socket path should be namespaced under a per-user runtime/cache directory: {rendered}"
+            preferred.ends_with("frankensearch/daemon"),
+            "preferred directory should be namespaced: {}",
+            preferred.display()
         );
+        if path.parent() != Some(preferred.as_path()) {
+            assert_eq!(
+                path.parent(),
+                super::existing_private_socket_dir_in(&std::env::temp_dir()).as_deref(),
+                "an oversized preferred path must use the checked private per-user directory"
+            );
+        }
+        super::ensure_daemon_socket_path_fits(&path).expect("bindable default socket path");
         assert!(
             rendered.ends_with(".sock"),
             "daemon socket path should end with .sock: {rendered}"
@@ -43005,13 +43116,18 @@ mod tests {
                 .expect("nonblocking listener");
             std::thread::spawn(move || {
                 while Instant::now() < deadline {
-                    if let Ok((stream, _)) = listener.accept() {
+                    if let Ok((mut stream, _)) = listener.accept() {
                         stream.set_nonblocking(false).expect("blocking stream");
-                        stream
-                            .set_read_timeout(Some(Duration::from_millis(200)))
-                            .expect("read timeout");
-                        let mut line = String::new();
-                        let _ = std::io::BufReader::new(stream).read_line(&mut line);
+                        // Quiesce also connects and immediately closes to test
+                        // liveness. Darwin can reject timeout setup on that
+                        // already disconnected socket; the real bounded request
+                        // reader treats it as a failed request, not a task panic.
+                        let Ok(Some(line)) = FsfsRuntime::read_search_serve_socket_request(
+                            &mut stream,
+                            Duration::from_millis(200),
+                        ) else {
+                            continue;
+                        };
                         if line.trim() == ":shutdown" {
                             let _ = fs::remove_file(&path);
                             return true;
@@ -43036,7 +43152,8 @@ mod tests {
         let runtime = runtime_for(&temp.path().join("index"));
         let current = runtime.default_daemon_socket_path().unwrap();
         let legacy = runtime.legacy_daemon_socket_path().unwrap();
-        let (socket_dir, stem) = runtime.default_daemon_socket_stem().unwrap();
+        let (_, stem) = runtime.default_daemon_socket_stem().unwrap();
+        let socket_dir = current.parent().unwrap();
         let older_protocol = socket_dir.join(format!("{stem}-00000000.sock"));
         let other_index = runtime_for(&temp.path().join("other"))
             .default_daemon_socket_path()
@@ -43050,14 +43167,24 @@ mod tests {
         assert_ne!(current, older_protocol);
         assert!(!other_index.to_str().unwrap().contains(&stem));
 
-        fs::create_dir_all(&socket_dir).expect("daemon dir");
+        fs::create_dir_all(socket_dir).expect("daemon dir");
         let deadline = Instant::now() + Duration::from_secs(3);
-        let asked =
-            [&current, &legacy, &older_protocol].map(|path| fake_daemon(path.clone(), deadline));
+        let mut paths = vec![&current, &older_protocol];
+        if super::ensure_daemon_socket_path_fits(&legacy).is_ok() {
+            paths.push(&legacy);
+        } else {
+            // A legacy daemon could never have bound this oversized path.
+            // Keep the real current/older-protocol fallback sockets live.
+            assert!(UnixListener::bind(&legacy).is_err());
+        }
+        let asked = paths
+            .iter()
+            .map(|path| fake_daemon((*path).clone(), deadline))
+            .collect::<Vec<_>>();
         let unrelated = fake_daemon(other_index.clone(), deadline);
 
         runtime.quiesce_query_daemon("test").expect("quiesce");
-        for (handle, path) in asked.into_iter().zip([&current, &legacy, &older_protocol]) {
+        for (handle, path) in asked.into_iter().zip(paths) {
             assert!(handle.join().unwrap(), "{} was not stopped", path.display());
             assert!(UnixStream::connect(path).is_err(), "{}", path.display());
         }

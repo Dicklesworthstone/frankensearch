@@ -199,11 +199,13 @@ Ordinary indexing reads `cpu_ceiling_pct`, `io_ceiling_bytes_per_sec` and
 `load_ceiling_per_mille` at cooperative admission boundaries. The existing
 pressure controller applies the configured profile thresholds, EWMA and
 consecutive-reading hysteresis to each signal relative to its ceiling. CPU is
-host utilization; load is the one-minute host load per available CPU. Linux
-process disk-I/O rates use independent read/write counter deltas divided by
-actual elapsed time. Other platforms currently have no disk-I/O counter in this
-sampler; CPU and load admission still apply. Shadow-oracle sampling remains
-separate.
+host utilization; load is the one-minute host load per available CPU. Process
+disk-I/O rates use independent cumulative read/write counter deltas divided by
+actual elapsed time: `/proc/self/io` on Linux and the already refreshed
+`sysinfo` process totals on macOS. The latter API retains its last counters if
+an OS refresh fails, so a transient stale sample cannot be distinguished from
+zero activity. Other platforms currently have no disk-I/O counter in this
+sampler; CPU and load admission still apply. Shadow-oracle sampling remains separate.
 
 Unavailable process I/O counters emit `pressure.sensor.io_unavailable` at normal
 verbosity, including on unsupported platforms. A recovered counter establishes

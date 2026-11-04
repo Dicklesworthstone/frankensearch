@@ -1849,8 +1849,13 @@ impl FsWatcher {
                 } => {
                     stop.request();
                     let result = finish_watcher_tasks(cx, Some(producer), Some(ingest_task)).await;
+                    // An aborted ingest task cannot drain the producer's final
+                    // flush. Both owners are now joined, so retain every late
+                    // observation as reconciliation debt before publishing Stop.
+                    let reconciled =
+                        fold_queue_into_reconciliation(&self.ready_batches, &self.reconciliation);
                     lock_or_recover(&self.control).complete_generation(generation);
-                    return result;
+                    return result.and(reconciled);
                 }
             }
         }
@@ -9102,6 +9107,11 @@ mod tests {
                 ingest_task.abort();
                 drop(control);
             }
+            // Model a producer flush racing with the cancelled consumer. The
+            // stop owner must retain it even when ingest can no longer poll.
+            let late_path = temp.path().join("late.rs");
+            lock_or_recover(&watcher.ready_batches)
+                .push_back(vec![WatchEvent::deleted(late_path.clone(), 401)]);
             let _stop_error = watcher
                 .stop_checked(&cx)
                 .await
@@ -9125,6 +9135,11 @@ mod tests {
             assert_eq!(pipeline.attempts.load(Ordering::Acquire), 1);
             assert!(lock_or_recover(&watcher.ready_batches).is_empty());
             assert!(lock_or_recover(&watcher.reconciliation).required);
+            assert!(
+                lock_or_recover(&watcher.reconciliation)
+                    .affected_paths
+                    .contains(&late_path)
+            );
             assert!(matches!(
                 &lock_or_recover(&watcher.control).lifecycle,
                 WatcherLifecycle::Stopped

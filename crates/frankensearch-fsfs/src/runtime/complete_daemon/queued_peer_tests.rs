@@ -30,8 +30,7 @@ fn abandoned_full_queue_admits_shutdown_without_waiting_for_the_search() {
         assert_eq!(polls.get(), 1);
         drop(clients);
         let mut control_client = connect(&listener, control::SHUTDOWN_REQUEST);
-        let Poll::Ready(Ok(DriveOutcome::Shutdown(shutdown))) =
-            driving.as_mut().poll(&mut task)
+        let Poll::Ready(Ok(DriveOutcome::Shutdown(shutdown))) = driving.as_mut().poll(&mut task)
         else {
             panic!("abandoned queue slots must not hide a waiting shutdown"); // ubs:ignore — cfg(test) assertion.
         };
@@ -65,6 +64,8 @@ fn queue_pruning_preserves_live_order_and_write_half_closed_responses() {
         first.shutdown(Shutdown::Write).unwrap();
         drop(gone);
         closed.shutdown(Shutdown::Both).unwrap();
+        // SHUT_RDWR alone does not abandon the descriptor on Darwin.
+        drop(closed);
         // The same instant rules out expiry as the source of freed slots.
         pump(&mut intake, &cx, &listener, now);
         let frames = intake

@@ -239,8 +239,20 @@ fn controlled_session(runtime: &FsfsRuntime, cx: &Cx, root: &Path) -> CompleteWa
 }
 
 async fn initial(session: &mut CompleteWatchSession, cx: &Cx) -> PublishedGeneration {
-    require_durable_publication(session.advance(cx, Instant::now()).await.unwrap().unwrap())
-        .unwrap()
+    // A live native backend can report fixture creation during the first
+    // build. Pending is a normal retry, not a publication: drive the same
+    // bounded consumer loop without weakening any durable-generation check.
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(publication) = session.advance(cx, Instant::now()).await.unwrap() {
+            return require_durable_publication(publication).unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial source did not settle into a durable publication"
+        );
+        asupersync::time::sleep(cx.now(), std::time::Duration::from_millis(10)).await;
+    }
 }
 
 async fn change(session: &mut CompleteWatchSession, cx: &Cx, path: &Path) -> PublishedGeneration {
@@ -938,14 +950,20 @@ fn a_hidden_store_inside_the_source_does_not_wake_its_own_watcher() {
         };
         let quiet_until = Instant::now() + std::time::Duration::from_millis(1_500);
         while Instant::now() < quiet_until {
-            assert!(!dirty(&session), "the store's own writes marked the source dirty");
+            assert!(
+                !dirty(&session),
+                "the store's own writes marked the source dirty"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         // The backend is live: a source write still registers.
         fs::write(source.join("alpha.md"), "replacementword new body").unwrap();
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
         while !dirty(&session) {
-            assert!(Instant::now() < deadline, "the source write was not observed");
+            assert!(
+                Instant::now() < deadline,
+                "the source write was not observed"
+            );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let second = require_durable_publication(

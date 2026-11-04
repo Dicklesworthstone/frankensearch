@@ -415,7 +415,8 @@ impl PressureSensor {
 
 /// OS signal collector backed by the `sysinfo` crate.
 ///
-/// On Linux, also reads `/proc/self/io` for cumulative I/O counters.
+/// Reads cumulative process I/O counters from `/proc/self/io` on Linux and
+/// the existing `sysinfo` process refresh on macOS.
 pub struct HostSampler {
     system: System,
     io_available: Option<bool>,
@@ -456,17 +457,23 @@ impl HostSampler {
 
         let cpu_pct = f64::from(self.system.global_cpu_usage());
 
-        // RSS: sysinfo gives us per-process info via Pid lookup.
+        // This refresh already collects memory and disk usage for our process.
         let pid = sysinfo::get_current_pid().ok();
-        let rss_bytes = pid
-            .and_then(|p| {
-                self.system
-                    .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
-                self.system.process(p).map(sysinfo::Process::memory)
-            })
-            .unwrap_or(0);
+        let process = pid.and_then(|p| {
+            self.system
+                .refresh_processes(sysinfo::ProcessesToUpdate::Some(&[p]), true);
+            self.system.process(p)
+        });
+        let rss_bytes = process.map_or(0, sysinfo::Process::memory);
 
-        // I/O counters from /proc/self/io on Linux.
+        // Use cumulative totals, not sysinfo's per-refresh deltas: the pressure
+        // monitor owns elapsed-time measurement and resets its own baseline.
+        #[cfg(target_os = "macos")]
+        let io = process.map(|process| {
+            let usage = process.disk_usage();
+            (usage.total_read_bytes, usage.total_written_bytes)
+        });
+        #[cfg(not(target_os = "macos"))]
         let io = read_proc_self_io();
         let io_available = io.is_some();
         if !io_available && self.io_available != Some(false) {
@@ -508,6 +515,7 @@ impl HostSampler {
 /// Read `/proc/self/io` for cumulative read/write byte counters.
 ///
 /// Returns `None` on non-Linux or when the file is unreadable.
+#[cfg(not(target_os = "macos"))]
 fn read_proc_self_io() -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
@@ -1090,10 +1098,48 @@ mod tests {
         let sample = sampler.sample();
         // CPU should be non-negative (may be 0 on first call).
         assert!(sample.cpu_pct >= 0.0);
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(sample.io_counters_available, read_proc_self_io().is_some());
         // RSS should be > 0 for our running process.
         // Note: on some CI environments sysinfo may not find our process.
         // We just verify it doesn't panic.
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn host_sampler_observes_cumulative_synced_writes() {
+        use std::io::Write;
+
+        let mut sampler = HostSampler::new();
+        let mut before = sampler.sample();
+        assert!(before.io_counters_available, "self process I/O is required");
+        let mut file = tempfile::NamedTempFile::new().expect("private I/O fixture");
+        let block = vec![0x5a; 1024 * 1024];
+        // A smaller second write distinguishes cumulative totals from the
+        // per-refresh deltas that must never enter the rate calculator.
+        for blocks in [8_u64, 1] {
+            for _ in 0..blocks {
+                file.write_all(&block).expect("write real fixture bytes");
+            }
+            file.as_file().sync_all().expect("sync real fixture bytes");
+            let expected = before.io_write_bytes + blocks * block.len() as u64;
+            let mut after = sampler.sample();
+            for _ in 0..20 {
+                if after.io_write_bytes >= expected {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                after = sampler.sample();
+            }
+            assert!(after.io_counters_available);
+            assert!(after.io_read_bytes >= before.io_read_bytes);
+            assert!(
+                after.io_write_bytes >= expected,
+                "synced writes must advance cumulative counters: {before:?} -> {after:?}"
+            );
+            eprintln!("observed synced process I/O: {before:?} -> {after:?}");
+            before = after;
+        }
     }
 
     #[test]

@@ -1038,7 +1038,7 @@ pub struct PressureConfig {
     pub sample_interval_ms: u64,
     pub ewma_alpha_per_mille: u16,
     pub anti_flap_readings: u8,
-    /// Process disk I/O bytes per second; OS counters are available on Linux.
+    /// Process disk I/O bytes per second; OS counters are available on Linux and macOS.
     pub io_ceiling_bytes_per_sec: u64,
     /// One-minute host load per available CPU, in thousandths.
     pub load_ceiling_per_mille: u16,
