@@ -11,6 +11,11 @@
 - Archive extraction keeps the installing user's ownership instead of restoring
   release-builder IDs, allowing authentic release archives to install in root
   user namespaces without privileged ownership changes.
+- The existing packaging checker gains an explicit staged DSR release mode for
+  the delivered default/lite matrix and Minisign format. It checks the exact
+  upload inventory, hashes, signatures, source and capability metadata, aliases
+  and archive contents. Historical fixtures remain separate, and neither path
+  substitutes for executable platform qualification.
 - The existing quality gate now includes downloader and hosted-API proxy tests
   together, optional-feature Clippy checks, and installer contract regressions.
   Added real-socket TLS cases assert authenticated SOCKS5/`socks5h` hostname

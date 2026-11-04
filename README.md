@@ -1399,7 +1399,12 @@ workspace defaults and the facade's `hybrid` profile do not enable hosted APIs.
 It runs the embed crate's unit, integration and doctests, including real
 CONNECT/SOCKS/TLS transport and credential-isolation regressions. The `installer`
 stage runs the existing installer contract checker (requires Python `jsonschema`),
-including proxy-environment propagation and fail-closed Minisign verification.
+including proxy-environment propagation, fail-closed Minisign verification and
+regressions for the staged DSR artifact validator. Before publication, run that
+checker's `--mode dsr-release` against the actual artifact directory with the
+proposed version, exact source revision and real Minisign verifier; the packaging
+contract below documents its arguments. Historical release-schema fixtures alone
+do not validate the staged files.
 These source checks do not replace tests of the exact packaged binaries on their
 declared platforms or native Apple Silicon qualification.
 

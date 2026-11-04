@@ -641,6 +641,9 @@ real-model E2E, the bounded Quill/Tantivy native witness, and executable quick-s
 stages. Clippy also checks the optional HTTP features. The installer checker
 requires Python `jsonschema`; its verifier fixtures establish orchestration,
 while release signatures must additionally pass the real Minisign verifier.
+The installer stage also runs `--mode dsr-tests` for the staged-artifact
+validator's positive and negative fixtures; those synthetic cases do not
+constitute a signed release or a native execution result.
 Its `examples` and `perf` stages are opt-in.
 The cross-target check establishes compilation, not Windows runtime support.
 
@@ -812,6 +815,37 @@ Linux asset does not erase the unresolved Windows obligation from the original
 matrix. Reconciling the validator's old exact-six matrix with the actual DSR
 matrix belongs to the existing delivery task and must preserve positive
 capability probes and checksum/platform negative cases.
+
+The historical `unit` and `integration` schema fixtures describe the old
+embedded/Windows/Cosign envelope. Passing those fixtures does not inspect any
+staged DSR file. Use the existing checker's explicit artifact mode for the
+currently delivered default/lite matrix and Minisign format:
+
+```bash
+scripts/check_fsfs_packaging_release_install_contract.sh \
+  --mode dsr-release --artifact-dir /absolute/path/to/staged-release \
+  --version 1.13.0 --source-revision FULL_SOURCE_COMMIT_SHA \
+  --minisign /absolute/path/to/minisign
+```
+
+The version above is an example, not an announced release. This path requires
+the six declared versioned variants, the two full installer aliases and their
+sidecars: exactly 50 files. `SHA256SUMS` covers the 16 archive/metadata payloads;
+their individual checksum sidecars must agree. The 16 payload signatures and
+the checksum-manifest signature must verify with the pinned repository key.
+Metadata must agree with the requested tag, source revision, target, profile,
+capabilities and archived binary digest. Alias archive/metadata bytes must
+match the corresponding versioned payloads. The checker inspects archives
+without executing their binaries.
+
+Run `--mode dsr-tests` to exercise the validator's synthetic positive/negative
+regressions. Artifact mode requires an actual Minisign verifier; fixture
+orchestration is not signature proof. Even authenticated metadata cannot prove
+that a binary was executed natively or that proxy-only model acquisition
+succeeded. Those receipts, the full current-source quality gate and explicit
+publication approval remain separate requirements. This path preserves the
+historical schema cases and does not close the outstanding full Windows or
+full Linux ARM delivery obligations.
 
 ### Crates.io publish lane policy (required when enabled)
 

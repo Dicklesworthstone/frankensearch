@@ -6,6 +6,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCHEMA="$ROOT_DIR/schemas/fsfs-packaging-release-install-v1.schema.json"
 FAILURES=0
 INSTALLER_EXPECTED_PROFILE="${FSFS_INSTALL_EXPECTED_PROFILE:-semantic-loaders}"
+DSR_ARTIFACT_DIR=""
+DSR_VERSION=""
+DSR_SOURCE_REVISION=""
+DSR_MINISIGN="minisign"
+DSR_OPTIONS_SET=0
 
 case "$INSTALLER_EXPECTED_PROFILE" in
   semantic-loaders|explicit-lite) ;;
@@ -17,9 +22,15 @@ esac
 
 usage() {
   cat <<USAGE
-Usage: scripts/check_fsfs_packaging_release_install_contract.sh [--mode unit|integration|e2e|installer-behavior|installer|model-features|all]
+Usage: scripts/check_fsfs_packaging_release_install_contract.sh [--mode unit|integration|e2e|installer-behavior|installer|model-features|all|dsr-tests|dsr-release]
 
 Validates fsfs packaging/release/install fixtures and model-feature boundaries.
+
+dsr-tests runs fixture orchestration regressions, not release qualification.
+dsr-release requires --artifact-dir DIR --version VERSION --source-revision FULL_SHA
+and accepts --minisign PATH (default: minisign). It verifies the existing signed
+50-file DSR inventory without executing binaries, changing the old schema's
+platform obligations, or publishing anything.
 USAGE
 }
 
@@ -27,6 +38,20 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode)
       MODE="${2:-}"
+      shift 2
+      ;;
+    --artifact-dir|--version|--source-revision|--minisign)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "ERROR: $1 requires a value" >&2
+        exit 2
+      fi
+      case "$1" in
+        --artifact-dir) DSR_ARTIFACT_DIR="$2" ;;
+        --version) DSR_VERSION="$2" ;;
+        --source-revision) DSR_SOURCE_REVISION="$2" ;;
+        --minisign) DSR_MINISIGN="$2" ;;
+      esac
+      DSR_OPTIONS_SET=1
       shift 2
       ;;
     -h|--help)
@@ -42,12 +67,29 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODE" in
-  unit|integration|e2e|installer-behavior|installer|model-features|all) ;;
+  unit|integration|e2e|installer-behavior|installer|model-features|all|dsr-tests|dsr-release) ;;
   *)
-    echo "ERROR: invalid mode '$MODE' (expected unit|integration|e2e|installer-behavior|installer|model-features|all)" >&2
+    echo "ERROR: invalid mode '$MODE' (see --help)" >&2
     exit 2
     ;;
 esac
+
+if [[ "$MODE" == "dsr-release" ]]; then
+  if [[ -z "$DSR_ARTIFACT_DIR" || -z "$DSR_VERSION" || -z "$DSR_SOURCE_REVISION" ]]; then
+    echo "ERROR: dsr-release requires --artifact-dir, --version, and --source-revision" >&2
+    exit 2
+  fi
+  exec python3 -B "$ROOT_DIR/scripts/check_fsfs_dsr_release.py" \
+    --artifact-dir "$DSR_ARTIFACT_DIR" --version "$DSR_VERSION" \
+    --source-revision "$DSR_SOURCE_REVISION" --minisign "$DSR_MINISIGN"
+fi
+if [[ "$DSR_OPTIONS_SET" -ne 0 ]]; then
+  echo "ERROR: artifact/version/source/verifier options require --mode dsr-release" >&2
+  exit 2
+fi
+if [[ "$MODE" == "dsr-tests" ]]; then
+  exec python3 -B "$ROOT_DIR/scripts/test_fsfs_dsr_release.py"
+fi
 
 if [[ "$MODE" != "model-features" ]]; then
   if [[ ! -f "$SCHEMA" ]]; then
@@ -1940,6 +1982,11 @@ if [[ "$MODE" == "installer" || "$MODE" == "all" ]]; then
 fi
 if [[ "$MODE" == "model-features" || "$MODE" == "all" ]]; then
   check_model_features
+fi
+if [[ "$MODE" == "all" ]]; then
+  if ! python3 -B "$ROOT_DIR/scripts/test_fsfs_dsr_release.py"; then
+    FAILURES=$((FAILURES + 1))
+  fi
 fi
 
 if ((FAILURES > 0)); then

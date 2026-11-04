@@ -144,6 +144,7 @@ fi
 want tests     && run_stage tests  cargo test --locked --workspace --tests --exclude frankensearch-quill-gauntlet --exclude frankensearch-fsfs
 want proxy     && run_stage proxy cargo test --locked -p frankensearch-embed --features download,api
 want installer && run_stage installer bash scripts/check_fsfs_packaging_release_install_contract.sh --mode installer
+want installer && run_stage installer-dsr bash scripts/check_fsfs_packaging_release_install_contract.sh --mode dsr-tests
 want quill     && run_stage quill python3 scripts/check_quill_correctness.py
 want quill-full && run_stage quill-full python3 scripts/check_quill_correctness.py --full
 want quill-probes && run_stage quill-probes python3 scripts/check_quill_correctness.py --probes
