@@ -1145,7 +1145,11 @@ impl std::fmt::Debug for DaemonCoalescerService {
 
 #[cfg(unix)]
 impl DaemonCoalescerService {
-    fn new(cx: &Cx, admitted: &AdmittedEmbedder) -> SearchResult<Self> {
+    fn new(
+        cx: &Cx,
+        admitted: &AdmittedEmbedder,
+        active_requests: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> SearchResult<Self> {
         // Synchronous providers also support native batches and need no model
         // workers. Preserve absent capacity instead of rejecting those callers
         // or manufacturing a spawn capability on their request contexts.
@@ -1183,7 +1187,16 @@ impl DaemonCoalescerService {
                 let service = async {
                     loop {
                         let before = metrics.total_batches.load(Ordering::Relaxed);
-                        match dispatcher.run(&service_cx).await {
+                        match dispatcher
+                            .run_with_window(&service_cx, || {
+                                if active_requests.load(Ordering::Acquire) > 1 {
+                                    Duration::from_millis(2)
+                                } else {
+                                    Duration::ZERO
+                                }
+                            })
+                            .await
+                        {
                             Ok(count) => return Ok(count),
                             Err(error) => {
                                 // The failed batch already delivered its
@@ -1234,10 +1247,26 @@ impl Drop for DaemonCoalescerService {
 #[derive(Debug, Default)]
 struct DaemonCoalescerServices {
     services: asupersync::sync::Mutex<Vec<Arc<DaemonCoalescerService>>>,
+    active_requests: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(unix)]
+struct DaemonQueryGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(unix)]
+impl Drop for DaemonQueryGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(unix)]
 impl DaemonCoalescerServices {
+    fn enter(&self) -> DaemonQueryGuard {
+        self.active_requests.fetch_add(1, Ordering::AcqRel);
+        DaemonQueryGuard(Arc::clone(&self.active_requests))
+    }
+
     async fn admit(
         &self,
         cx: &Cx,
@@ -1270,7 +1299,11 @@ impl DaemonCoalescerServices {
         }) {
             Arc::clone(service)
         } else {
-            let service = Arc::new(DaemonCoalescerService::new(cx, admitted)?);
+            let service = Arc::new(DaemonCoalescerService::new(
+                cx,
+                admitted,
+                Arc::clone(&self.active_requests),
+            )?);
             services.push(Arc::clone(&service));
             service
         };
@@ -9861,6 +9894,10 @@ impl FsfsRuntime {
         let runtime = self
             .with_search_serve_request_policy(&request)?
             .with_daemon_coalescers();
+        let _query = runtime
+            .daemon_coalescers
+            .as_ref()
+            .map(|services| services.enter());
         let mode = degraded_search_mode(
             runtime.config.pressure.degradation_override,
             parse_search_execution_mode(request.mode.as_deref())?,
@@ -33700,6 +33737,7 @@ mod tests {
             identity: frankensearch_core::EmbeddingIdentityBundleV1,
             singleton_calls: AtomicUsize,
             batch_calls: AtomicUsize,
+            gate: Option<Arc<asupersync::sync::Mutex<()>>>,
         }
 
         impl Embedder for NativeBatchProbe {
@@ -33728,7 +33766,7 @@ mod tests {
 
             fn embed_batch_bound<'a>(
                 &'a self,
-                _cx: &'a Cx,
+                cx: &'a Cx,
                 texts: &'a [&'a str],
             ) -> SearchFuture<'a, Vec<frankensearch_core::IdentityBoundEmbedding>> {
                 self.batch_calls.fetch_add(1, Ordering::SeqCst);
@@ -33744,7 +33782,22 @@ mod tests {
                         }
                     })
                     .collect();
-                Box::pin(async move { Ok(outputs) })
+                let gate = self.gate.as_ref().map(Arc::clone);
+                Box::pin(async move {
+                    let _permit = if let Some(gate) = gate {
+                        Some(
+                            asupersync::sync::OwnedMutexGuard::lock(gate, cx)
+                                .await
+                                .map_err(|error| SearchError::Cancelled {
+                                    phase: "native batch probe".to_owned(),
+                                    reason: error.to_string(),
+                                })?,
+                        )
+                    } else {
+                        None
+                    };
+                    Ok(outputs)
+                })
             }
 
             fn bound_batch_is_native(&self) -> bool {
@@ -33787,6 +33840,7 @@ mod tests {
                 identity: test_identity("native-batch-probe", 2).clone(),
                 singleton_calls: AtomicUsize::new(0),
                 batch_calls: AtomicUsize::new(0),
+                gate: None,
             });
             let admitted = admitted_shared(&probe);
             assert!(admitted.coalescer().is_some());
@@ -33838,6 +33892,7 @@ mod tests {
                 identity: test_identity("native-batch-probe", 2).clone(),
                 singleton_calls: AtomicUsize::new(0),
                 batch_calls: AtomicUsize::new(0),
+                gate: None,
             });
             let uncoalesced = admitted_shared(&uncoalesced_probe).without_coalescing();
             assert!(uncoalesced.coalescer().is_none());
@@ -33873,6 +33928,78 @@ mod tests {
             }
             assert_eq!(uncoalesced_probe.singleton_calls.load(Ordering::SeqCst), 6);
             assert_eq!(uncoalesced_probe.batch_calls.load(Ordering::SeqCst), 0);
+
+            #[cfg(unix)]
+            {
+                // Exercise the daemon's actual service factory, not only the
+                // automatic adapter above. Distinct vectors expose reply mixups.
+                let services = super::DaemonCoalescerServices::default();
+                let gate = Arc::new(asupersync::sync::Mutex::new(()));
+                let probe = Arc::new(NativeBatchProbe {
+                    identity: test_identity("native-batch-probe", 2).clone(),
+                    singleton_calls: AtomicUsize::new(0),
+                    batch_calls: AtomicUsize::new(0),
+                    gate: Some(Arc::clone(&gate)),
+                });
+                let mut admitted = admitted_shared(&probe);
+                admitted
+                    .enable_daemon_dispatch(&cx, &services)
+                    .await
+                    .unwrap();
+                assert!(
+                    admitted.daemon_service.is_some(),
+                    "the daemon-owned dispatcher must be installed"
+                );
+                let client = admitted.coalescer().unwrap().clone();
+                let held = asupersync::sync::OwnedMutexGuard::lock(gate, &cx)
+                    .await
+                    .unwrap();
+                let mut futures = queries
+                    .iter()
+                    .map(|query| Box::pin(admitted.embed_admitted(&cx, query)))
+                    .collect::<Vec<_>>();
+                let mut results: Vec<Option<super::SearchResult<Vec<f32>>>> =
+                    (0..queries.len()).map(|_| None).collect();
+                std::future::poll_fn(|task_cx| {
+                    for (index, future) in futures.iter_mut().enumerate() {
+                        if let Poll::Ready(result) = future.as_mut().poll(task_cx) {
+                            results[index] = Some(result);
+                        }
+                    }
+                    Poll::Ready(())
+                })
+                .await;
+                let all_pending = results.iter().all(Option::is_none);
+                let outstanding = client.usage().outstanding_requests;
+                // Release before any assertion or joining the owned service.
+                drop(held);
+                std::future::poll_fn(|task_cx| {
+                    for (index, future) in futures.iter_mut().enumerate() {
+                        if results[index].is_none()
+                            && let Poll::Ready(result) = future.as_mut().poll(task_cx)
+                        {
+                            results[index] = Some(result);
+                        }
+                    }
+                    if results.iter().all(Option::is_some) {
+                        Poll::Ready(())
+                    } else {
+                        Poll::Pending
+                    }
+                })
+                .await;
+                assert!(all_pending, "native inference was held for every request");
+                assert_eq!(outstanding, queries.len());
+                for (result, expected) in results.into_iter().zip(1_u8..=6) {
+                    assert_eq!(result.unwrap().unwrap(), vec![f32::from(expected), 1.0]);
+                }
+                assert!((1..=2).contains(&probe.batch_calls.load(Ordering::SeqCst)));
+                assert_eq!(probe.singleton_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    client.metrics().total_texts_batched.load(Ordering::Relaxed),
+                    6
+                );
+            }
         });
     }
 

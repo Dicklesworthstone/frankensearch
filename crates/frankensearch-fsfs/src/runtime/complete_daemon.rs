@@ -471,6 +471,10 @@ impl FsfsRuntime {
         peer_timeout: Duration,
         cache_enabled: bool,
     ) -> SearchResult<PeerOutcome> {
+        let _query = self
+            .daemon_coalescers
+            .as_ref()
+            .map(|services| services.enter());
         let (mut peer, bytes) = request.into_parts();
         let (budget, mode) = if forwarding::is_forwarded(&bytes) {
             forwarding::admission_policy(&bytes)

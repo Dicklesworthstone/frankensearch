@@ -667,9 +667,36 @@ impl CoalescingDispatcher {
     /// and undispatched requests remain queued for the owner's next decision.
     /// Synchronous provider code and independent provider work are not preempted.
     pub async fn run(&mut self, cx: &Cx) -> SearchResult<usize> {
+        self.run_with_window(cx, || std::time::Duration::ZERO).await
+    }
+
+    /// Drive the service with an owner-selected window before each batch.
+    ///
+    /// The callback runs only after work arrives, following the cooperative
+    /// yield. Returning zero preserves [`Self::run`]'s work-conserving path;
+    /// a bounded nonzero window can collect submissions from concurrent
+    /// execution lanes. The owner supplies its concurrency policy, rather than
+    /// delaying every solo request. Waiting remains cancellation-aware and
+    /// consumes no model worker. Shutdown and delivery retain `run`'s contract.
+    ///
+    /// # Errors
+    /// Returns the same dispatch, identity and cancellation errors as `run`.
+    pub async fn run_with_window(
+        &mut self,
+        cx: &Cx,
+        mut window: impl FnMut() -> std::time::Duration + Send,
+    ) -> SearchResult<usize> {
         let mut discharged = 0_usize;
         while self.wait_for_work(cx).await? {
             YieldOnce(false).await;
+            let delay = window();
+            if !delay.is_zero() {
+                frankensearch_core::with_cancellation(cx, "coalesced_batch_window", async {
+                    asupersync::time::sleep(cx.now(), delay).await;
+                    Ok(())
+                })
+                .await?;
+            }
             let count = self.dispatch_available(cx).await?;
             if count == 0 {
                 return Err(invalid(
@@ -1293,6 +1320,39 @@ mod service_tests {
                 Err(SearchError::Cancelled { .. })
             ));
             assert!(!cx.is_cancel_requested());
+
+            let (provider, client, mut dispatcher) = fixture(&cx);
+            let owner = Cx::for_testing();
+            let mut request = client.embed_bound(&cx, "9");
+            pending(request.as_mut(), Waker::noop());
+            let mut waiting =
+                Box::pin(dispatcher.run_with_window(&owner, || std::time::Duration::from_secs(60)));
+            pending(waiting.as_mut(), Waker::noop()); // Cooperative yield.
+            pending(waiting.as_mut(), Waker::noop()); // Window, no inference.
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+            owner.cancel_with(asupersync::CancelKind::User, Some("window cancelled"));
+            assert!(matches!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop())),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            drop(waiting);
+            // Cancelling the pre-dispatch window must retain the queued input.
+            assert_eq!(client.usage().outstanding_requests, 1);
+            client.shutdown();
+            assert_eq!(
+                dispatcher
+                    .run_with_window(&cx, || std::time::Duration::ZERO)
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                request.await.unwrap().values[0].to_bits(),
+                9.0_f32.to_bits()
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         });
     }
 

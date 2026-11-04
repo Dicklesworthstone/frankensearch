@@ -219,6 +219,14 @@ impl Intake {
                 if let Some(peer) = self.take_shutdown() {
                     return Poll::Ready(Ok(Some(Event::Peer(peer))));
                 }
+                // Admit the framed burst before polling its owners. Otherwise
+                // a ready first query can repeatedly reach inference while
+                // its already-framed peers still wait outside the work set.
+                if work.len() < MAX_PEERS
+                    && let Some(peer) = self.ready.pop_front()
+                {
+                    return Poll::Ready(Ok(Some(Event::Peer(peer))));
+                }
                 for index in 0..work.len() {
                     if let Poll::Ready(result) = work[index].as_mut().poll(task) {
                         drop(work.remove(index));
@@ -228,11 +236,6 @@ impl Intake {
                     if let Err(error) = retained_search_checkpoint(cx) {
                         return Poll::Ready(Err(error));
                     }
-                }
-                if work.len() < MAX_PEERS
-                    && let Some(peer) = self.ready.pop_front()
-                {
-                    return Poll::Ready(Ok(Some(Event::Peer(peer))));
                 }
                 if work.is_empty()
                     && self.len() == 0
@@ -464,6 +467,43 @@ mod tests {
                 std::io::ErrorKind::WouldBlock,
                 "the driver grants no acknowledgment itself"
             );
+
+            // Ready owners must not run ahead of a burst already framed by
+            // intake. In particular, fast real inference need not remain
+            // pending long enough for a serialized admission order to work.
+            let (_burst_directory, burst_listener) = self::listener();
+            let mut intake = Intake::new(Duration::from_secs(60));
+            let burst = (0..4)
+                .map(|_| connect(&burst_listener, b"burst\n"))
+                .collect::<Vec<_>>();
+            let polls = std::sync::atomic::AtomicUsize::new(0);
+            let mut work: Vec<Request<'_, ()>> = Vec::new();
+            for _ in &burst {
+                let event = intake
+                    .next_concurrent(&cx, &burst_listener, None, &mut work)
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(event, Event::Peer(_)),
+                    "admit the entire ready burst"
+                );
+                assert_eq!(
+                    polls.load(Ordering::SeqCst),
+                    0,
+                    "no owner runs ahead of its framed peers"
+                );
+                work.push(Box::pin(async {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                }));
+            }
+            assert!(matches!(
+                intake
+                    .next_concurrent(&cx, &burst_listener, None, &mut work)
+                    .await
+                    .unwrap(),
+                Event::Finished(())
+            ));
+            assert_eq!(polls.load(Ordering::SeqCst), 1);
         });
     }
 
