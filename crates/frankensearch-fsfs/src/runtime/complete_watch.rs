@@ -2816,7 +2816,7 @@ mod lifecycle_tests {
                                 "changed during quality inference",
                             )?,
                             "selection" => {
-                                fs::write(change_pointer, replacement.as_ref().unwrap())?
+                                fs::write(change_pointer, replacement.as_ref().unwrap())?;
                             }
                             _ => unreachable!(),
                         }
