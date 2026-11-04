@@ -81,6 +81,9 @@ fn schema_for_fixture(name: &str) -> &'static str {
     if name.starts_with("fsfs-determinism-") {
         return "fsfs-determinism-v1.schema.json";
     }
+    if name.starts_with("fsfs-dsr-") {
+        return "fsfs-dsr-release-metadata-v1.schema.json";
+    }
     if name.starts_with("fsfs-expected-loss-") {
         return "fsfs-expected-loss-v1.schema.json";
     }
@@ -284,6 +287,63 @@ fn test_schema_fixtures_validate_against_jsonschema() {
         }
         assert_schema_validation(&mut cache, &schemas, &path, false);
     }
+}
+
+#[test]
+fn test_dsr_release_metadata_rejects_invalid_bindings_and_profile_flags() {
+    let name = "fsfs-dsr-minisign-canary.metadata.json";
+    let fixture: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture_dir().join(name)).unwrap()).unwrap();
+    let mut cache = BTreeMap::new();
+    let validator = load_schema(&mut cache, &schema_dir(), schema_for_fixture(name));
+    assert!(validator.is_valid(&fixture), "authentic signed metadata");
+
+    let mut lite = fixture.clone();
+    lite["profile"] = serde_json::json!("lite");
+    lite["semantic_loaders"] = serde_json::json!(false);
+    lite["features"] = serde_json::json!("");
+    assert!(
+        validator.is_valid(&lite),
+        "the established lite metadata shape"
+    );
+    lite["semantic_loaders"] = serde_json::json!(true);
+    assert!(
+        !validator.is_valid(&lite),
+        "lite must not claim semantic loaders"
+    );
+
+    for (field, invalid) in [
+        ("binary", serde_json::json!("sh")),
+        ("profile", serde_json::json!("embedded")),
+        (
+            "source_revision",
+            serde_json::json!("not-a-source-revision"),
+        ),
+        ("binary_sha256", serde_json::json!("sha256:not-a-digest")),
+        ("semantic_loaders", serde_json::json!(false)),
+        ("semantic_loaders", serde_json::json!(0)),
+        ("embedded_models", serde_json::json!(true)),
+        ("embedded_models", serde_json::json!(0)),
+        ("target", serde_json::json!("")),
+        ("rustc", serde_json::json!("gcc 13")),
+        (
+            "build_timestamp_utc",
+            serde_json::json!("2026-10-05T19:16:39+01:00"),
+        ),
+    ] {
+        let mut invalid_fixture = fixture.clone();
+        invalid_fixture[field] = invalid;
+        assert!(!validator.is_valid(&invalid_fixture), "invalid {field}");
+    }
+    let mut missing_digest = fixture;
+    missing_digest
+        .as_object_mut()
+        .unwrap()
+        .remove("binary_sha256");
+    assert!(
+        !validator.is_valid(&missing_digest),
+        "missing binary binding"
+    );
 }
 
 #[test]
