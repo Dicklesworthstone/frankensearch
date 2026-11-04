@@ -385,8 +385,10 @@ that has delivered Initial is never silently retried.
 
 Warm daemon requests share immutable reader allocations and admitted model
 services. Generation and producer admission are serialized briefly; retrieval
-and socket delivery proceed concurrently. Bursts can share native embedding
-batches. A disconnected request stops its own delivery while an executing
+and socket delivery proceed concurrently. When multiple requests are active,
+the daemon uses a 2 ms collection window for each native embedding batch.
+Solo daemon queries and one-shot searches have no batching timer delay.
+A disconnected request stops its own delivery while an executing
 native batch retains its bounded worker capacity until completion.
 
 The complete-generation daemon drives at most eight searches within a total

@@ -10,6 +10,8 @@
   sibling inference. Actual model work retains the existing bounded worker
   pool. Successful model/cache updates are fenced by the admitted generation;
   failed admission retains typed protocol refusals.
+- Concurrent daemon requests use a cancellation-aware 2 ms collection window;
+  solo daemon queries and one-shot searches keep zero batching timer delay.
 - The complete-generation daemon drives up to eight searches while retaining
   the existing nine-connection total bound, strict shutdown decoding, request
   budgets and pinned generation readers. Batch debug events expose actual
