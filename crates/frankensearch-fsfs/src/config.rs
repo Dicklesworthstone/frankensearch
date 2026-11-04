@@ -348,6 +348,12 @@ impl PressureProfileContract {
 }
 
 impl PressureProfile {
+    /// Scheduling discipline consumed by the shared runtime admission gate.
+    #[must_use]
+    pub(crate) const fn scheduler_mode(self) -> ProfileSchedulerMode {
+        self.contract().scheduler_mode
+    }
+
     /// Maximum simultaneously executing model workers for this profile.
     ///
     /// This is a cooperative blocking-pool limit, not an OS thread or CPU cap.
@@ -3439,17 +3445,6 @@ fn no_effect_setting_warnings(config: &FsfsConfig, warnings: &mut Vec<ConfigWarn
             message: "fsfs stores no summaries to expire, so this changes nothing".into(),
         });
     }
-    // The product's caller-owned model worker pool and quality ceiling apply.
-    // Indexing concurrency and scheduler policy still have no reader.
-    if config.pressure.profile != PressureProfile::Performance {
-        warnings.push(ConfigWarning {
-            severity: ConfigDiagnosticSeverity::Warn,
-            reason_code: CONFIG_NO_EFFECT_WARNING_CODE.into(),
-            field: "pressure.profile".into(),
-            source: ConfigSource::Runtime,
-            message: "this profile limits blocking model and source-preparation workers and disables quality search, but its workload scheduler policy is not applied yet".into(),
-        });
-    }
     if config.tui.theme != TuiTheme::Dark {
         warnings.push(ConfigWarning {
             severity: ConfigDiagnosticSeverity::Warn,
@@ -4666,12 +4661,15 @@ mod tests {
             fields,
             [
                 "indexing.reindex_on_change",
-                "pressure.profile",
                 "privacy.redact_file_contents_in_logs",
                 "privacy.redact_paths_in_telemetry",
                 "storage.summary_retention_days",
                 "tui.theme",
             ]
+        );
+        assert_eq!(
+            turned_off.config.pressure.profile.scheduler_mode(),
+            super::ProfileSchedulerMode::FairShare
         );
     }
 

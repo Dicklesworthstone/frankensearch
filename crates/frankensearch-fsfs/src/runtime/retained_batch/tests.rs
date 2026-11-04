@@ -228,6 +228,7 @@ fn producer(reply: Reply) -> (Producer, Arc<TestProducer>) {
             identity: embedder.identity.clone(),
             embedder: embedder.clone(),
             role: "test.batch",
+            workload: FsfsRuntime::new(crate::FsfsConfig::default()).workload_scheduler,
         },
         embedder,
     )

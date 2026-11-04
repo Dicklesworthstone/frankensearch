@@ -336,6 +336,7 @@ struct Producer {
     embedder: Arc<dyn Embedder>,
     identity: EmbeddingIdentityBundleV1,
     role: &'static str,
+    workload: Arc<crate::concurrency::RuntimeWorkloadScheduler>,
 }
 
 impl Producer {
@@ -374,6 +375,7 @@ impl Producer {
             embedder,
             identity,
             role,
+            workload: Arc::clone(&runtime.workload_scheduler),
         })
     }
 

@@ -109,6 +109,11 @@ impl<'a> InferenceBatch<'a> {
             .and_then(|bytes| vector_bytes.checked_add(bytes))
             .filter(|bytes| *bytes <= MAX_VECTOR_BYTES)
             .ok_or_else(|| invalid("retained batch vector payload exceeds 128 MiB"))?;
+        let _workload = self
+            .producer
+            .workload
+            .acquire(cx, crate::concurrency::WorkloadClass::Embed)
+            .await?;
         let values = with_cancellation(cx, "fsfs.retained_batch.inference", async {
             let values = if self.native {
                 let inference = self.producer.embedder.embed_batch_bound(cx, &self.texts);

@@ -204,6 +204,8 @@ fn producer(backend: &Arc<Backend>) -> Producer {
         embedder: backend.clone(),
         identity: backend.identity.clone(),
         role: "test.group",
+        workload: crate::runtime::FsfsRuntime::new(crate::config::FsfsConfig::default())
+            .workload_scheduler,
     }
 }
 

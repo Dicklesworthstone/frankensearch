@@ -909,6 +909,21 @@ impl WorkloadBudgetScheduler {
         demand: WorkloadDemand,
         mode: BudgetSchedulerMode,
     ) -> WorkloadAllocation {
+        let available = self
+            .policy
+            .total_slots
+            .saturating_sub(self.total_inflight_reserved());
+        if available == 0 {
+            return WorkloadAllocation {
+                ingest: 0,
+                embed: 0,
+                query: 0,
+                mode,
+                admission_capped: false,
+                starvation_guard_applied: false,
+                reason_code: "scheduler.plan.capacity_exhausted",
+            };
+        }
         let mut capped = false;
         let mut demand = demand;
         if demand.total() > self.policy.admission_limit {
@@ -918,10 +933,10 @@ impl WorkloadBudgetScheduler {
 
         let mut allocation = match mode {
             BudgetSchedulerMode::FairShare => {
-                fair_share_allocate(demand, self.policy.total_slots, self.rr_cursor)
+                fair_share_allocate(demand, available, self.rr_cursor)
             }
             BudgetSchedulerMode::LatencySensitive => {
-                latency_sensitive_allocate(demand, self.policy.total_slots, self.policy)
+                latency_sensitive_allocate(demand, available, self.policy)
             }
         };
         self.bump_cursor();
@@ -1083,6 +1098,198 @@ impl WorkloadBudgetScheduler {
                 self.starvation_counters[idx] = 0;
             }
         }
+    }
+}
+
+/// Shared admission for source work, background embedding and foreground queries.
+///
+/// This schedules logical operations, not OS threads. Existing blocking pools
+/// still retain running native calls after a caller times out. Source workers
+/// move their admission guard into the closure, so cancellation cannot release
+/// their slot before the actual read/canonicalization finishes.
+#[derive(Debug)]
+pub(crate) struct RuntimeWorkloadScheduler {
+    state: asupersync::sync::Mutex<RuntimeWorkloadState>,
+    changed: asupersync::sync::Notify,
+    epoch: AtomicU64,
+    mode: BudgetSchedulerMode,
+}
+
+#[derive(Debug)]
+struct RuntimeWorkloadState {
+    scheduler: WorkloadBudgetScheduler,
+    requests: Vec<RuntimeWorkloadRequest>,
+}
+
+#[derive(Debug)]
+struct RuntimeWorkloadRequest {
+    class: WorkloadClass,
+    ticket: std::sync::Arc<RuntimeWorkloadTicket>,
+    permit: Option<WorkloadPermit>,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeWorkloadTicket {
+    granted: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+}
+
+/// Dropping a queued or admitted operation always returns its capacity.
+#[derive(Debug)]
+#[must_use = "retain the guard until the admitted work finishes"]
+pub(crate) struct RuntimeWorkloadGuard {
+    owner: std::sync::Arc<RuntimeWorkloadScheduler>,
+    ticket: std::sync::Arc<RuntimeWorkloadTicket>,
+}
+
+impl Drop for RuntimeWorkloadGuard {
+    fn drop(&mut self) {
+        self.ticket.released.store(true, Ordering::Release);
+        self.owner.notify();
+    }
+}
+
+impl RuntimeWorkloadState {
+    fn dispatch(&mut self, mode: BudgetSchedulerMode) -> bool {
+        self.requests.retain(|request| {
+            if !request.ticket.released.load(Ordering::Acquire) {
+                return true;
+            }
+            if let Some(permit) = request.permit {
+                self.scheduler
+                    .complete(permit.class(), permit.slots())
+                    .expect("each admitted operation returns exactly its own slot");
+            }
+            false
+        });
+        let mut demand = WorkloadDemand::default();
+        for request in &self.requests {
+            if request.permit.is_none() {
+                demand.set(request.class, demand.get(request.class) + 1);
+            }
+        }
+        if demand.total() == 0 {
+            return false;
+        }
+        let allocation = self.scheduler.plan_cycle(demand, mode);
+        let mut granted = false;
+        for class in WorkloadClass::all() {
+            for request in self
+                .requests
+                .iter_mut()
+                .filter(|request| request.class == class && request.permit.is_none())
+                .take(allocation.get(class))
+            {
+                let mut permit = self
+                    .scheduler
+                    .reserve(class, 1)
+                    .expect("the allocation fits the remaining capacity");
+                self.scheduler
+                    .commit_permit(&mut permit)
+                    .expect("a new reservation has not been consumed");
+                request.permit = Some(permit);
+                request.ticket.granted.store(true, Ordering::Release);
+                granted = true;
+            }
+        }
+        granted
+    }
+}
+
+impl RuntimeWorkloadScheduler {
+    pub(crate) fn new(total_slots: usize, mode: BudgetSchedulerMode) -> Self {
+        Self {
+            state: asupersync::sync::Mutex::new(RuntimeWorkloadState {
+                scheduler: WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+                    total_slots,
+                    // Waiting futures remain caller-owned. Bound admitted
+                    // operations by total_slots without dropping a demand
+                    // class before the planner's starvation guard sees it.
+                    admission_limit: usize::MAX,
+                    ..BudgetSchedulerPolicy::default()
+                }),
+                requests: Vec::new(),
+            }),
+            changed: asupersync::sync::Notify::new(),
+            epoch: AtomicU64::new(0),
+            mode,
+        }
+    }
+
+    fn notify(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_waiters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_for(&self, class: WorkloadClass) -> usize {
+        self.state
+            .try_lock()
+            .expect("admission state is not held across work")
+            .requests
+            .iter()
+            .filter(|request| {
+                request.class == class
+                    && request.permit.is_none()
+                    && !request.ticket.released.load(Ordering::Acquire)
+            })
+            .count()
+    }
+
+    pub(crate) async fn acquire(
+        self: &std::sync::Arc<Self>,
+        cx: &asupersync::Cx,
+        class: WorkloadClass,
+    ) -> frankensearch_core::SearchResult<RuntimeWorkloadGuard> {
+        let guard = RuntimeWorkloadGuard {
+            owner: std::sync::Arc::clone(self),
+            ticket: std::sync::Arc::new(RuntimeWorkloadTicket::default()),
+        };
+        frankensearch_core::with_cancellation(cx, "workload.admission", async {
+            let mut queued = false;
+            loop {
+                let epoch = self.epoch.load(Ordering::Acquire);
+                let (dispatched, granted, inflight) = {
+                    let mut state = self.state.lock(cx).await.map_err(|error| {
+                        frankensearch_core::SearchError::Cancelled {
+                            phase: "workload.admission".to_owned(),
+                            reason: error.to_string(),
+                        }
+                    })?;
+                    if !queued {
+                        state.requests.push(RuntimeWorkloadRequest {
+                            class,
+                            ticket: std::sync::Arc::clone(&guard.ticket),
+                            permit: None,
+                        });
+                        queued = true;
+                    }
+                    let dispatched = state.dispatch(self.mode);
+                    (
+                        dispatched,
+                        guard.ticket.granted.load(Ordering::Acquire),
+                        state.scheduler.total_inflight_reserved(),
+                    )
+                };
+                // Notify only outside the state lock: wake callbacks can poll
+                // another admission immediately on a different worker.
+                if dispatched {
+                    self.notify();
+                }
+                if granted {
+                    debug!(event = "fsfs.workload.admitted", ?class, mode = ?self.mode,
+                        inflight, "fsfs workload admitted");
+                    return Ok(());
+                }
+                // wait_until arms before checking the epoch, avoiding a lost
+                // release between this state check and notification polling.
+                self.changed
+                    .wait_until(|| self.epoch.load(Ordering::Acquire) != epoch)
+                    .await;
+            }
+        })
+        .await?;
+        Ok(guard)
     }
 }
 
@@ -1762,6 +1969,116 @@ mod tests {
     }
 
     // ── Workload Budget Scheduler ──
+
+    #[test]
+    fn scheduler_plans_only_unreserved_capacity() {
+        let mut scheduler = WorkloadBudgetScheduler::new(BudgetSchedulerPolicy {
+            total_slots: 2,
+            ..BudgetSchedulerPolicy::default()
+        });
+        let mut first = scheduler.reserve(WorkloadClass::Embed, 1).unwrap();
+        scheduler.commit_permit(&mut first).unwrap();
+        let second = scheduler.reserve(WorkloadClass::Ingest, 1).unwrap();
+        let demand = WorkloadDemand {
+            query: 10,
+            ..WorkloadDemand::default()
+        };
+        assert_eq!(
+            scheduler
+                .plan_cycle(demand, BudgetSchedulerMode::LatencySensitive)
+                .total(),
+            0
+        );
+        scheduler.complete(WorkloadClass::Embed, 1).unwrap();
+        let allocation = scheduler.plan_cycle(demand, BudgetSchedulerMode::LatencySensitive);
+        assert_eq!(
+            allocation.query, 1,
+            "the reserved source slot remains owned"
+        );
+        assert_eq!(allocation.total(), 1);
+        let mut second = second;
+        scheduler.cancel_permit(&mut second).unwrap();
+        assert_eq!(
+            scheduler
+                .plan_cycle(demand, BudgetSchedulerMode::FairShare)
+                .total(),
+            2
+        );
+    }
+
+    #[test]
+    fn runtime_scheduler_dispatches_profile_order_and_releases_cancelled_waiters() {
+        use std::future::{Future, poll_fn};
+        use std::sync::Arc;
+        use std::task::Poll;
+
+        for mode in [
+            BudgetSchedulerMode::FairShare,
+            BudgetSchedulerMode::LatencySensitive,
+        ] {
+            asupersync::test_utils::run_test_with_cx(|cx| async move {
+                let scheduler = Arc::new(RuntimeWorkloadScheduler::new(6, mode));
+                let mut held = Vec::new();
+                for _ in 0..6 {
+                    held.push(scheduler.acquire(&cx, WorkloadClass::Embed).await.unwrap());
+                }
+                let classes = WorkloadClass::all()
+                    .into_iter()
+                    .flat_map(|class| std::iter::repeat_n(class, 6))
+                    .collect::<Vec<_>>();
+                let mut pending = classes
+                    .iter()
+                    .map(|class| Box::pin(scheduler.acquire(&cx, *class)))
+                    .collect::<Vec<_>>();
+                poll_fn(|task| {
+                    for work in &mut pending {
+                        assert!(work.as_mut().poll(task).is_pending());
+                    }
+                    Poll::Ready(())
+                })
+                .await;
+                drop(held);
+                let mut grants = Vec::new();
+                let mut allocated = [0; 3];
+                poll_fn(|task| {
+                    for (index, work) in pending.iter_mut().enumerate() {
+                        if let Poll::Ready(result) = work.as_mut().poll(task) {
+                            allocated[classes[index].index()] += 1;
+                            grants.push(result.unwrap());
+                        }
+                    }
+                    Poll::Ready(())
+                })
+                .await;
+                assert_eq!(allocated.iter().sum::<usize>(), 6);
+                match mode {
+                    BudgetSchedulerMode::FairShare => assert_eq!(allocated, [2, 2, 2]),
+                    BudgetSchedulerMode::LatencySensitive => assert_eq!(allocated, [2, 1, 3]),
+                }
+                // Pending futures own their queue entries. Dropping every
+                // waiter while the six grants remain cannot free those grants.
+                drop(pending);
+                let mut blocked = Box::pin(scheduler.acquire(&cx, WorkloadClass::Query));
+                poll_fn(|task| {
+                    assert!(blocked.as_mut().poll(task).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                cx.set_cancel_requested(true);
+                assert!(matches!(
+                    blocked.await,
+                    Err(frankensearch_core::SearchError::Cancelled { .. })
+                ));
+                cx.set_cancel_requested(false);
+                drop(grants);
+                let mut recovered = Vec::new();
+                for _ in 0..6 {
+                    recovered.push(scheduler.acquire(&cx, WorkloadClass::Query).await.unwrap());
+                }
+                assert_eq!(recovered.len(), 6, "no cancelled waiter retains capacity");
+            });
+        }
+    }
 
     #[test]
     fn fair_share_scheduler_balances_active_classes() {

@@ -250,12 +250,30 @@ on parser output. Discovery exclusions and unchanged-file reuse precede worker
 admission. Metadata-only jobs perform only filesystem stat and path preparation,
 with no body open, hashing, decoding or PDF extraction.
 
-The `config.setting.no_effect` warning still covers a `strict` or `degraded`
-profile because its workload scheduler policy is not applied yet; its model-worker,
-source-worker, quality and background-indexing ceilings do apply. Legacy incremental
-watch/append operations remain serial; the source pool does not make lexical/vector
-publication concurrent. Automatic durable background resumption of deferred quality
-embedding remains unimplemented.
+Runtime clones also share workload admission. `strict` and `degraded` use fair
+sharing; `performance` reserves half the available slots for pending fast queries,
+with a starvation guard for source work and background embedding. Idle slots remain
+available to any class. The total logical capacity is the larger of the source and
+model worker ceilings: two, eight and one respectively. The planner subtracts
+already reserved and running operations before allocating another cycle.
+
+Source preparation enters the ingest class. Fast query inference enters the query
+class; quality refinement, indexing, append, retained-mutation and deferred-quality
+inference, and reranking enter the embedding class. Admission precedes execution,
+and a cancelled queued caller returns its place. A source worker retains its slot
+until its closure finishes even when its caller cancels. An already running native
+call can outlive its logical query admission, while its blocking-pool owner still
+retains the physical worker capacity until completion.
+
+Scheduling is cooperative within one runtime and its clones. Separate fsfs
+processes have separate budgets. It does not preempt synchronous calls, cap OS CPU
+or memory use, change producer admission, or make lexical/vector publication
+concurrent. Legacy incremental watch and append publication remain serial.
+
+Complete-generation watching can complete compatible durable deferred-quality work
+on restart, then reconcile current sources without waiting for another source event.
+The selected generation and retained inputs remain authoritative through completion;
+partial or incompatible work never becomes a semantic-complete generation.
 
 The `performance` profile allows either `fast_only` value. The `strict` and
 `degraded` profiles disable quality: `fast_only=true` is accepted, while a winning

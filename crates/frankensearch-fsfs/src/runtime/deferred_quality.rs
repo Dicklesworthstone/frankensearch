@@ -25,12 +25,12 @@ use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AdmittedEmbedder, CheckpointFileEntry, FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsIndexPayload,
-    FsfsRuntime, IndexManifestEntry, IndexRunControl, IndexSentinel, IngestionClass,
-    PendingIndexDocument, REASON_VECTOR_QUALITY_TIER_BUILT,
-    REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE, SearchExecutionMode, VectorIndex,
-    content_sha256_hex, ingestion_class_label, pressure_timestamp_ms, protect_vector_generations,
-    retained_reuse, retained_search_checkpoint, validate_retained_catalog_path,
+    CheckpointFileEntry, FSFS_VECTOR_QUALITY_INDEX_FILE, FsfsIndexPayload, FsfsRuntime,
+    IndexManifestEntry, IndexRunControl, IndexSentinel, IngestionClass, PendingIndexDocument,
+    REASON_VECTOR_QUALITY_TIER_BUILT, REASON_VECTOR_QUALITY_TIER_DEFERRED_PRESSURE,
+    SearchExecutionMode, VectorIndex, content_sha256_hex, ingestion_class_label,
+    pressure_timestamp_ms, protect_vector_generations, retained_reuse, retained_search_checkpoint,
+    validate_retained_catalog_path,
 };
 use crate::generation_store::{
     CompleteGenerationStore, GenerationPublication, PublishedGeneration,
@@ -925,7 +925,8 @@ impl FsfsRuntime {
         }
         .ok_or_else(|| invalid("the deferred quality producer is unavailable"))?;
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), false)?;
-        let admitted = AdmittedEmbedder::admit(cx, embedder)?;
+        let admitted =
+            candidate.admit_workload_embedder(cx, embedder, super::WorkloadClass::Embed)?;
         if admitted.identity != backlog.producer {
             return Err(invalid(
                 "loaded quality producer differs from the queued producer identity",

@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::concurrency::{BudgetSchedulerMode, RuntimeWorkloadScheduler, WorkloadClass};
 use asupersync::Cx;
 use asupersync::fs::read as async_file_read;
 #[cfg(unix)]
@@ -1119,6 +1120,7 @@ struct AdmittedEmbedder {
     #[cfg(unix)]
     daemon_service: Option<Arc<DaemonCoalescerService>>,
     identity: frankensearch_core::EmbeddingIdentityBundleV1,
+    workload: Option<(Arc<RuntimeWorkloadScheduler>, WorkloadClass)>,
 }
 
 /// The daemon owns dispatch independently of the requests receiving its output.
@@ -1359,6 +1361,7 @@ impl AdmittedEmbedder {
             #[cfg(unix)]
             daemon_service: None,
             identity,
+            workload: None,
         })
     }
 
@@ -1414,6 +1417,10 @@ impl AdmittedEmbedder {
     /// error.
     async fn embed_admitted(&self, cx: &Cx, text: &str) -> SearchResult<Vec<f32>> {
         FsfsRuntime::semantic_retry_checkpoint(cx, "admitted_embedding")?;
+        let _workload = match &self.workload {
+            Some((scheduler, class)) => Some(scheduler.acquire(cx, *class).await?),
+            None => None,
+        };
         self.check_current_identity()?;
         let inference = self.coalescer.as_ref().map_or_else(
             || self.embedder.embed_bound(cx, text),
@@ -1439,6 +1446,10 @@ impl AdmittedEmbedder {
     /// The indexing retry loop checks the response count after inference.
     async fn embed_batch_admitted(&self, cx: &Cx, texts: &[&str]) -> SearchResult<Vec<Vec<f32>>> {
         FsfsRuntime::semantic_retry_checkpoint(cx, "admitted_batch_embedding")?;
+        let _workload = match &self.workload {
+            Some((scheduler, _)) => Some(scheduler.acquire(cx, WorkloadClass::Embed).await?),
+            None => None,
+        };
         self.check_current_identity()?;
         let responses = with_cancellation(
             cx,
@@ -6918,6 +6929,9 @@ pub struct FsfsRuntime {
     /// Source preparation has its own profile capacity, independent of model
     /// workers. Clones share the owner; cancellation cannot abandon its jobs.
     source_preparation_pool: Arc<std::sync::OnceLock<SearchBlockingPool>>,
+    /// Shared logical admission across source work, fast queries and quality
+    /// refinement. Blocking owners retain their separate physical ceilings.
+    workload_scheduler: Arc<RuntimeWorkloadScheduler>,
     #[cfg(feature = "rerank")]
     native_blocking_pool: Option<asupersync::runtime::blocking_pool::BlockingPoolHandle>,
     #[cfg(feature = "embedded-models")]
@@ -6981,6 +6995,21 @@ impl FsfsRuntime {
                 DegradationOverrideMode::ForceLexicalOnly
                     | DegradationOverrideMode::ForceMetadataOnly
             );
+        let profile = config.pressure.profile;
+        let mode = match profile.scheduler_mode() {
+            crate::config::ProfileSchedulerMode::LatencySensitive => {
+                BudgetSchedulerMode::LatencySensitive
+            }
+            crate::config::ProfileSchedulerMode::FairShare => BudgetSchedulerMode::FairShare,
+        };
+        let workload_scheduler = Arc::new(RuntimeWorkloadScheduler::new(
+            usize::from(
+                profile
+                    .indexing_worker_limit()
+                    .max(profile.embedding_worker_limit()),
+            ),
+            mode,
+        ));
         Self {
             config,
             cli_input: CliInput::default(),
@@ -6995,6 +7024,7 @@ impl FsfsRuntime {
             #[cfg(unix)]
             daemon_coalescers: None,
             source_preparation_pool: Arc::new(std::sync::OnceLock::new()),
+            workload_scheduler,
             #[cfg(feature = "rerank")]
             native_blocking_pool: None,
             #[cfg(feature = "embedded-models")]
@@ -7039,19 +7069,24 @@ impl FsfsRuntime {
                 .map(|candidate| {
                     let cx = cx.clone();
                     let prepare = Arc::clone(&prepare);
-                    Box::pin(spawn_blocking(move || {
-                        // A pool shutdown/worker-start failure can make the
-                        // dependency dispatch inline. Never read or parse a
-                        // source on the async executor in that fallback.
-                        if Cx::is_active() {
-                            return Err(SearchError::SubsystemError {
-                                subsystem: "fsfs.index.source_worker",
-                                source: "source preparation worker was not dispatched to its blocking pool".into(),
-                            });
-                        }
-                        Self::semantic_retry_checkpoint(&cx, "index.source_prepare")?;
-                        prepare(&cx, &candidate)
-                    }))
+                    let scheduler = Arc::clone(&self.workload_scheduler);
+                    Box::pin(async move {
+                        let workload = scheduler.acquire(&cx, WorkloadClass::Ingest).await?;
+                        spawn_blocking(move || {
+                            let _workload = workload;
+                            // A pool shutdown/worker-start failure can make the
+                            // dependency dispatch inline. Never read or parse a
+                            // source on the async executor in that fallback.
+                            if Cx::is_active() {
+                                return Err(SearchError::SubsystemError {
+                                    subsystem: "fsfs.index.source_worker",
+                                    source: "source preparation worker was not dispatched to its blocking pool".into(),
+                                });
+                            }
+                            Self::semantic_retry_checkpoint(&cx, "index.source_prepare")?;
+                            prepare(&cx, &candidate)
+                        }).await
+                    })
                 })
                 .collect::<Vec<_>>();
             let mut results = std::iter::repeat_with(|| None)
@@ -15839,9 +15874,14 @@ impl FsfsRuntime {
             };
             for (ordinal, text) in texts.into_iter().enumerate() {
                 control.admit_work(cx, "append.fast_embedding").await?;
+                let workload = self
+                    .workload_scheduler
+                    .acquire(cx, WorkloadClass::Embed)
+                    .await?;
                 let response =
                     with_cancellation(cx, "fsfs.append_batch.fast", embedder.embed_bound(cx, text))
                         .await;
+                drop(workload);
                 retained_search_checkpoint(cx)?;
                 let embedding = response?;
                 embedding.validate()?;
@@ -15857,12 +15897,17 @@ impl FsfsRuntime {
             }
             if let Some((quality_embedder, identity)) = quality.as_ref() {
                 control.admit_work(cx, "append.quality_embedding").await?;
+                let workload = self
+                    .workload_scheduler
+                    .acquire(cx, WorkloadClass::Embed)
+                    .await?;
                 let response = with_cancellation(
                     cx,
                     "fsfs.append_batch.quality",
                     quality_embedder.embed_bound(cx, &document.embedding_text),
                 )
                 .await;
+                drop(workload);
                 retained_search_checkpoint(cx)?;
                 let embedding = response?;
                 embedding.validate()?;
@@ -19748,11 +19793,15 @@ impl FsfsRuntime {
         // identity, so capture it once and hold each batch to it.
         let fast_admission = embedder
             .as_ref()
-            .map(|embedder| AdmittedEmbedder::admit(cx, Arc::clone(embedder)))
+            .map(|embedder| {
+                self.admit_workload_embedder(cx, Arc::clone(embedder), WorkloadClass::Embed)
+            })
             .transpose()?;
         let quality_admission = quality_embedder
             .as_ref()
-            .map(|embedder| AdmittedEmbedder::admit(cx, Arc::clone(embedder)))
+            .map(|embedder| {
+                self.admit_workload_embedder(cx, Arc::clone(embedder), WorkloadClass::Embed)
+            })
             .transpose()?;
         let quality_vector_path = index_root.join(FSFS_VECTOR_QUALITY_INDEX_FILE);
 
@@ -22762,6 +22811,10 @@ impl FsfsRuntime {
                 if documents.is_empty() {
                     return Ok(None);
                 }
+                let _workload = self
+                    .workload_scheduler
+                    .acquire(cx, WorkloadClass::Embed)
+                    .await?;
                 reranker.rerank(cx, query, &documents).await.map(Some)
             };
             let mut timed = std::pin::pin!(asupersync::time::timeout_at(deadline, work));
@@ -23910,12 +23963,24 @@ impl FsfsRuntime {
         None
     }
 
+    fn admit_workload_embedder(
+        &self,
+        cx: &Cx,
+        embedder: Arc<dyn Embedder>,
+        class: WorkloadClass,
+    ) -> SearchResult<AdmittedEmbedder> {
+        let mut admitted = AdmittedEmbedder::admit(cx, embedder)?;
+        admitted.workload = Some((Arc::clone(&self.workload_scheduler), class));
+        Ok(admitted)
+    }
+
     async fn admit_search_embedder(
         &self,
         cx: &Cx,
         embedder: Arc<dyn Embedder>,
+        class: WorkloadClass,
     ) -> SearchResult<AdmittedEmbedder> {
-        let admitted = AdmittedEmbedder::admit(cx, embedder)?;
+        let admitted = self.admit_workload_embedder(cx, embedder, class)?;
         #[cfg(unix)]
         if let Some(services) = &self.daemon_coalescers {
             let mut admitted = admitted;
@@ -23984,7 +24049,10 @@ impl FsfsRuntime {
                     dimension = embedder.dimension(),
                     "{message}"
                 );
-                resources.fast_embedder = Some(self.admit_search_embedder(cx, embedder).await?);
+                resources.fast_embedder = Some(
+                    self.admit_search_embedder(cx, embedder, WorkloadClass::Query)
+                        .await?,
+                );
                 Ok(())
             }
             Err(error) => {
@@ -24591,7 +24659,10 @@ impl FsfsRuntime {
                 if let Some(index) = resources.quality_vector_index.as_ref() {
                     Self::admit_quality_generation_for_embedder(index, embedder.as_ref())?;
                 }
-                resources.quality_embedder = Some(self.admit_search_embedder(cx, embedder).await?);
+                resources.quality_embedder = Some(
+                    self.admit_search_embedder(cx, embedder, WorkloadClass::Embed)
+                        .await?,
+                );
                 Ok(())
             }
             Ok(None) => Ok(()),
@@ -24717,7 +24788,7 @@ impl FsfsRuntime {
             Self::admit_quality_generation_for_embedder(&quality_index, quality_embedder.as_ref())?;
             Some((
                 quality_index,
-                AdmittedEmbedder::admit(cx, quality_embedder)?,
+                self.admit_workload_embedder(cx, quality_embedder, WorkloadClass::Embed)?,
             ))
         } else {
             None
@@ -24736,7 +24807,7 @@ impl FsfsRuntime {
             target_root,
             lexical_index,
             vector_index,
-            AdmittedEmbedder::admit(cx, embedder)?,
+            self.admit_workload_embedder(cx, embedder, WorkloadClass::Embed)?,
         )
         .with_storage_db_path(storage_db_path);
         if let Some((quality_index, quality_embedder)) = quality_tier {
@@ -33360,6 +33431,71 @@ mod tests {
         .expect("test embedder has an identity")
     }
 
+    #[test]
+    fn workload_admission_prioritizes_fast_queries_before_queued_quality_inference() {
+        run_test_with_cx(|cx| async move {
+            let runtime = FsfsRuntime::new(FsfsConfig::default());
+            let other = runtime.clone();
+            assert!(Arc::ptr_eq(
+                &runtime.workload_scheduler,
+                &other.workload_scheduler
+            ));
+            let mut held = Vec::new();
+            for _ in 0..8 {
+                held.push(
+                    runtime
+                        .workload_scheduler
+                        .acquire(&cx, super::WorkloadClass::Ingest)
+                        .await
+                        .unwrap(),
+                );
+            }
+            let fast = Arc::new(ScriptedBoundEmbedder::new(BoundScript::Values(vec![
+                1.0, 0.0,
+            ])));
+            let quality = Arc::new(ScriptedBoundEmbedder::new(BoundScript::Values(vec![
+                0.0, 1.0,
+            ])));
+            let fast_admitted = runtime
+                .admit_search_embedder(&cx, fast.clone(), super::WorkloadClass::Query)
+                .await
+                .unwrap();
+            let quality_admitted = other
+                .admit_search_embedder(&cx, quality.clone(), super::WorkloadClass::Embed)
+                .await
+                .unwrap();
+            let mut refinement = Box::pin(quality_admitted.embed_admitted(&cx, "quality query"));
+            let mut initial = Box::pin(fast_admitted.embed_admitted(&cx, "fast query"));
+            std::future::poll_fn(|task| {
+                assert!(refinement.as_mut().poll(task).is_pending());
+                assert!(initial.as_mut().poll(task).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(fast.calls.load(Ordering::Acquire), 0);
+            assert_eq!(quality.calls.load(Ordering::Acquire), 0);
+            drop(held.pop());
+            std::future::poll_fn(|task| {
+                assert!(
+                    refinement.as_mut().poll(task).is_pending(),
+                    "quality cannot take the foreground query slot"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(initial.await.unwrap(), [1.0, 0.0]);
+            assert_eq!(fast.calls.load(Ordering::Acquire), 1);
+            assert_eq!(quality.calls.load(Ordering::Acquire), 0);
+            assert_eq!(refinement.await.unwrap(), [0.0, 1.0]);
+            assert_eq!(quality.calls.load(Ordering::Acquire), 1);
+            assert_eq!(
+                held.len(),
+                7,
+                "both inferences reused the single returned slot"
+            );
+        });
+    }
+
     /// Query vectors are explicit basis vectors; this is a ranking fixture,
     /// not evidence of semantic quality. Retrieval uses actual FSVI files.
     struct BlendQueryEmbedder(&'static str);
@@ -36471,14 +36607,18 @@ mod tests {
                     let pool = runtime.source_preparation_pool.get().unwrap().handle();
                     assert!(started.load(Ordering::SeqCst) <= capacity);
                     if pool.busy_threads() == capacity
-                        && pool.pending_count() >= capacity
+                        && pool.pending_count() == 0
+                        && runtime
+                            .workload_scheduler
+                            .pending_for(super::WorkloadClass::Ingest)
+                            == capacity
                         && started.load(Ordering::SeqCst) == capacity
                     {
                         Poll::Ready(())
                     } else {
                         assert!(
                             Instant::now() < deadline,
-                            "both batches reach the shared pool"
+                            "one batch runs while the other waits at shared workload admission"
                         );
                         task.waker().wake_by_ref();
                         Poll::Pending
@@ -36641,6 +36781,22 @@ mod tests {
                 1
             );
 
+            let query_cx = Cx::for_testing();
+            let mut query = Box::pin(
+                other
+                    .workload_scheduler
+                    .acquire(&query_cx, super::WorkloadClass::Query),
+            );
+            poll_fn(|task| {
+                assert!(
+                    query.as_mut().poll(task).is_pending(),
+                    "a cancelled source caller cannot release the running source's scheduler slot"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            drop(query);
+
             let queued_cx = Cx::for_testing();
             let queued_ran = Arc::new(AtomicBool::new(false));
             let queued_flag = Arc::clone(&queued_ran);
@@ -36663,7 +36819,8 @@ mod tests {
                         .unwrap()
                         .handle()
                         .pending_count(),
-                    1
+                    0,
+                    "the source waits at workload admission before entering the worker queue"
                 );
                 Poll::Ready(())
             })
