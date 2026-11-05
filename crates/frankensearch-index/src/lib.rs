@@ -1005,6 +1005,7 @@ pub struct ValidatedFsviBytes {
     bytes: Arc<[u8]>,
     index: VectorIndex,
     witness: FsviV2Witness,
+    identity_binding: FsviV2IdentityBinding,
     publication_state: FsviPublicationState,
 }
 
@@ -1569,6 +1570,15 @@ impl ValidatedFsviBytes {
             .expect("ValidatedFsviBytes construction requires FSVI v2 identity metadata")
     }
 
+    /// Complete caller-owned binding checked against this immutable image.
+    ///
+    /// Retaining the admitted binding preserves producer and input contracts
+    /// for consumers that materialize these vectors in another representation.
+    #[must_use]
+    pub const fn identity_binding(&self) -> &FsviV2IdentityBinding {
+        &self.identity_binding
+    }
+
     /// Persisted vector dimension.
     #[must_use]
     pub const fn dimension(&self) -> usize {
@@ -1782,6 +1792,7 @@ impl ValidatedFsviBytes {
             bytes,
             index,
             witness,
+            identity_binding: expected.clone(),
             publication_state,
         })
     }

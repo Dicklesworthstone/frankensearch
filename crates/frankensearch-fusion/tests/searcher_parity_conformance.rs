@@ -154,7 +154,7 @@ fn sync_index(with_quality: bool) -> Arc<InMemoryTwoTierIndex> {
         )
         .expect("quality in-memory index")
     });
-    Arc::new(InMemoryTwoTierIndex::new(fast, quality))
+    Arc::new(InMemoryTwoTierIndex::new(fast, quality).expect("sync parity fixture"))
 }
 
 fn lexical_hits() -> Vec<ScoredResult> {
@@ -340,7 +340,7 @@ fn seeded_sync_search(
     )
     .expect("seeded quality index");
     SyncTwoTierSearcher::new(
-        Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality))),
+        Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).expect("seeded sync fixture")),
         config.clone(),
     )
     .search_collect(&tiered_query(query), k)

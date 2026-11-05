@@ -48,7 +48,7 @@ use sha2::{Digest, Sha256};
 
 use crate::search::{ClassifiedHits, PARALLEL_CHUNK_SIZE, SearchParams};
 use crate::simd::{dot_4bit_prepared, dot_i8_i8, dot_product_f16_f32, prepare_4bit_query};
-use crate::{FsviV2Witness, ValidatedFsviBytes, VectorIndex};
+use crate::{FsviV2IdentityBinding, FsviV2Witness, ValidatedFsviBytes, VectorIndex};
 
 #[cfg(any(test, target_os = "linux"))]
 const EXACT_RESIDUAL_SIDECAR_MAGIC: [u8; 8] = *b"FSRSIDX1";
@@ -1575,19 +1575,12 @@ pub struct InMemoryVectorIndex {
     /// header's empty revision is preserved as `Some("")`, distinct from the
     /// `None` of a source with no header at all.
     embedder_revision: Option<String>,
-    /// Whether [`Self::space_fingerprint_hex`] was derived from a validated
-    /// FSVI v2 identity HEADER — i.e. read out of the artifact's own bytes
-    /// through exact admission — rather than declared by a caller
-    /// (bd-9xuj T2-C4-write, admission guards 2+8).
-    ///
-    /// `true` only on the [`Self::from_admitted_v2`] load path (the sole way
-    /// a v2 header reaches this type: [`VectorIndex::open`] is strictly v1).
-    /// A caller-supplied space on [`Self::from_vectors_with_identity`] is a
-    /// DECLARED identity: retained for joins and diagnostics, but it is a
-    /// claim by the constructing process, not an attestation persisted in an
-    /// artifact header, so it stays `false`. Attested-only seams (the refresh
-    /// identity-bound merge) admit against attested identity exclusively.
-    space_identity_attested: bool,
+    /// Complete binding of the exactly admitted source image, present only
+    /// after [`Self::from_admitted_v2`]. This is source provenance: an F32
+    /// artifact is converted into the resident F16 slab, so its storage
+    /// contract does not describe the current heap representation.
+    /// Caller-declared spaces and legacy vectors never manufacture this proof.
+    admitted_source_binding: Option<FsviV2IdentityBinding>,
     /// Vector dimensionality.
     dimension: usize,
     /// Present only for an index loaded from an exactly admitted FSVI v2 image.
@@ -1732,7 +1725,7 @@ impl InMemoryVectorIndex {
             space_fingerprint_hex: None,
             embedder_id: None,
             embedder_revision: None,
-            space_identity_attested: false,
+            admitted_source_binding: None,
             dimension,
             residual_source_binding: None,
             exact_residual_sidecar: OnceLock::new(),
@@ -1781,9 +1774,7 @@ impl InMemoryVectorIndex {
         index.embedder_id = Some(space.logical_model_id.clone());
         index.embedder_revision = Some(space.immutable_revision.clone());
         // A caller-supplied space is a DECLARED identity, not one attested by
-        // an artifact header (bd-9xuj T2-C4-write): the discriminator stays
-        // false, and attested-only seams must not admit against it.
-        index.space_identity_attested = false;
+        // an artifact header. The complete admitted source binding stays absent.
         Ok(index)
     }
 
@@ -1815,6 +1806,7 @@ impl InMemoryVectorIndex {
     /// Returns vector decoding failures from the admitted artifact.
     pub fn from_admitted_v2(source: &ValidatedFsviBytes) -> SearchResult<Self> {
         let mut index = Self::from_open_index(&source.index)?;
+        index.admitted_source_binding = Some(source.identity_binding().clone());
         index.residual_source_binding = Some(ResidualSourceBinding::from_witness(source.witness()));
         Ok(index)
     }
@@ -2172,12 +2164,6 @@ impl InMemoryVectorIndex {
         let space_fingerprint_hex = index
             .identity_v2()
             .map(|identity| crate::fingerprint_hex(&identity.space_fingerprint));
-        // The attested bit derives from WHERE the identity came from
-        // (bd-9xuj T2-C4-write): `identity_v2()` is populated exclusively by
-        // the v2 header parse inside exact admission (`VectorIndex::open` is
-        // strictly v1), so its presence here means the fingerprint above was
-        // read out of the artifact's own validated header bytes.
-        let space_identity_attested = index.identity_v2().is_some();
         // Every FSVI header (v1 and v2) carries the embedder id/revision
         // strings; retain them verbatim instead of discarding them at load
         // (bd-9xuj T2-C2). A v1 header's empty revision stays `Some("")` —
@@ -2196,7 +2182,7 @@ impl InMemoryVectorIndex {
             space_fingerprint_hex,
             embedder_id,
             embedder_revision,
-            space_identity_attested,
+            admitted_source_binding: None,
             dimension,
             residual_source_binding: None,
             exact_residual_sidecar: OnceLock::new(),
@@ -2244,7 +2230,17 @@ impl InMemoryVectorIndex {
     /// seam such as the refresh identity-bound merge.
     #[must_use]
     pub const fn space_identity_is_attested(&self) -> bool {
-        self.space_identity_attested
+        self.admitted_source_binding.is_some()
+    }
+
+    /// Complete binding of the immutable FSVI v2 source, when exactly admitted.
+    ///
+    /// This preserves the source generation, producer, and input contract
+    /// across materialization and cloning. The source storage identity is
+    /// provenance, not a claim about this index's resident F16 representation.
+    #[must_use]
+    pub const fn admitted_source_binding(&self) -> Option<&FsviV2IdentityBinding> {
+        self.admitted_source_binding.as_ref()
     }
 
     /// Whether this index currently has a source-derived exact-residual
@@ -3693,17 +3689,80 @@ pub struct InMemoryTwoTierIndex {
     quality_index: Option<InMemoryVectorIndex>,
 }
 
+fn validate_tier_source_bindings(
+    fast: Option<&FsviV2IdentityBinding>,
+    quality: Option<&FsviV2IdentityBinding>,
+) -> SearchResult<()> {
+    let (fast, quality) = match (fast, quality) {
+        (Some(fast), Some(quality)) => (fast, quality),
+        (None, None) => return Ok(()),
+        _ => {
+            return Err(SearchError::InvalidConfig {
+                field: "in_memory.tiers.source_identity".to_owned(),
+                value: "mixed admitted and unadmitted tiers".to_owned(),
+                reason: "both tiers must carry complete admitted source bindings or both must remain legacy/caller-declared".to_owned(),
+            });
+        }
+    };
+    if fast.generation() != quality.generation() {
+        return Err(SearchError::InvalidConfig {
+            field: "in_memory.tiers.generation".to_owned(),
+            value: format!(
+                "fast={:?}, quality={:?}",
+                fast.generation(),
+                quality.generation()
+            ),
+            reason: "admitted tiers must share the complete generation, including its incarnation"
+                .to_owned(),
+        });
+    }
+    let fast_identity = &fast.frozen_identity().identity;
+    let quality_identity = &quality.frozen_identity().identity;
+    if fast_identity.space.kind != quality_identity.space.kind {
+        return Err(SearchError::InvalidConfig {
+            field: "in_memory.tiers.kind".to_owned(),
+            value: format!(
+                "fast={:?}, quality={:?}",
+                fast_identity.space.kind, quality_identity.space.kind
+            ),
+            reason: "admitted tiers must share the same semantic kind".to_owned(),
+        });
+    }
+    if fast_identity.input.doc_id_semantics != quality_identity.input.doc_id_semantics {
+        return Err(SearchError::InvalidConfig {
+            field: "in_memory.tiers.doc_id_semantics".to_owned(),
+            value: "different document-ID contracts".to_owned(),
+            reason: "admitted tiers must interpret document IDs identically".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 impl InMemoryTwoTierIndex {
     /// Create from two pre-built in-memory indices.
-    #[must_use]
-    pub const fn new(
+    ///
+    /// Admitted tiers must share a complete generation, semantic kind, and
+    /// document-ID contract. Models, dimensions, and coverage may differ.
+    /// A pair of legacy or caller-declared tiers retains its weaker contract;
+    /// mixing either with an admitted tier is rejected.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] for incompatible source bindings.
+    pub fn new(
         fast_index: InMemoryVectorIndex,
         quality_index: Option<InMemoryVectorIndex>,
-    ) -> Self {
-        Self {
+    ) -> SearchResult<Self> {
+        if let Some(quality) = &quality_index {
+            validate_tier_source_bindings(
+                fast_index.admitted_source_binding(),
+                quality.admitted_source_binding(),
+            )?;
+        }
+        Ok(Self {
             fast_index,
             quality_index,
-        }
+        })
     }
 
     /// Construct the shipping in-memory two-tier product from admitted v2
@@ -3714,13 +3773,20 @@ impl InMemoryTwoTierIndex {
     ///
     /// # Errors
     ///
-    /// Returns errors while loading the admitted source vectors. Optional
+    /// Returns errors for incompatible source bindings before loading vectors
+    /// or accessing caches, or errors while loading admitted vectors. Optional
     /// sidecar cache I/O is deliberately contained as per-tier flat fallback.
     pub fn from_admitted_v2_with_residual_sidecar_cache(
         fast_source: &ValidatedFsviBytes,
         fast_cache_dir: &Path,
         quality_source: Option<(&ValidatedFsviBytes, &Path)>,
     ) -> SearchResult<Self> {
+        if let Some((quality, _)) = quality_source {
+            validate_tier_source_bindings(
+                Some(fast_source.identity_binding()),
+                Some(quality.identity_binding()),
+            )?;
+        }
         let fast_index = InMemoryVectorIndex::from_admitted_v2_with_residual_sidecar_cache(
             fast_source,
             fast_cache_dir,
@@ -3730,7 +3796,7 @@ impl InMemoryTwoTierIndex {
                 InMemoryVectorIndex::from_admitted_v2_with_residual_sidecar_cache(source, cache_dir)
             })
             .transpose()?;
-        Ok(Self::new(fast_index, quality_index))
+        Self::new(fast_index, quality_index)
     }
 
     /// Load from an existing two-tier index directory, reading all data into memory.
@@ -3761,10 +3827,7 @@ impl InMemoryTwoTierIndex {
             None
         };
 
-        Ok(Self {
-            fast_index,
-            quality_index,
-        })
+        Self::new(fast_index, quality_index)
     }
 
     /// Search the fast tier.
@@ -4082,7 +4145,8 @@ mod tests {
     use crate::{FsviV2IdentityBinding, Quantization};
     use frankensearch_core::BoundQueryEmbedding;
     use frankensearch_core::generation::{
-        ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+        ArtifactGenerationIdentityV1, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
+        EmbeddingSpaceKindV1, QuantizationFormat,
     };
     use proptest::prelude::*;
     use std::path::Path;
@@ -4440,6 +4504,7 @@ mod tests {
             !index.space_identity_is_attested(),
             "a caller-declared space is DECLARED, never header-attested (C4-write guards 2+8)"
         );
+        assert_eq!(index.admitted_source_binding(), None);
 
         // The identity-less constructor stays typed-absent: no fabrication.
         let (doc_ids, vectors) = identity_rows(dim, 3);
@@ -4450,6 +4515,7 @@ mod tests {
             "an identity-less build must never fabricate a space fingerprint"
         );
         assert!(!legacy.space_identity_is_attested());
+        assert_eq!(legacy.admitted_source_binding(), None);
     }
 
     #[test]
@@ -4507,7 +4573,10 @@ mod tests {
             "an identity read out of a validated v2 header through exact admission is ATTESTED \
              (C4-write guards 2+8)"
         );
-        let two_tier = InMemoryTwoTierIndex::new(index, None);
+        assert_eq!(admitted.identity_binding(), &binding);
+        assert_eq!(index.admitted_source_binding(), Some(&binding));
+        assert_eq!(index.clone().admitted_source_binding(), Some(&binding));
+        let two_tier = InMemoryTwoTierIndex::new(index, None).expect("admitted fast-only index");
         assert!(two_tier.fast_identity_is_attested());
         assert!(
             !two_tier.quality_identity_is_attested(),
@@ -4519,6 +4588,218 @@ mod tests {
         let error = InMemoryVectorIndex::from_fsvi(&path)
             .expect_err("VectorIndex::open must reject v2 bytes");
         assert!(matches!(error, SearchError::IndexVersionMismatch { .. }));
+    }
+
+    fn semantic_tier_identity(model: &str, dimension: u32) -> EmbeddingIdentityBundleV1 {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model, dimension);
+        identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+        identity.space.hash_control = None;
+        identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+        identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+            role: "weights".to_owned(),
+            sha256: "b".repeat(64),
+            size: 1,
+        }];
+        identity.producer.space_fingerprint = identity.space.fingerprint();
+        identity
+    }
+
+    fn admitted_tier_source(
+        path: &Path,
+        mut identity: EmbeddingIdentityBundleV1,
+        generation: ArtifactGenerationIdentityV1,
+        rows: &[(&str, &[f32])],
+    ) -> ValidatedFsviBytes {
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.endianness = "little-endian".to_owned();
+        let binding = FsviV2IdentityBinding::new(
+            generation,
+            identity
+                .freeze()
+                .expect("valid independent fixture identity"),
+        )
+        .expect("valid independent fixture binding");
+        let mut writer = crate::VectorIndex::create_v2(path, binding.clone()).expect("create tier");
+        for (doc_id, vector) in rows {
+            writer.write_record(doc_id, vector).expect("write tier row");
+        }
+        writer.finish().expect("finish tier");
+        ValidatedFsviBytes::from_arc(
+            std::fs::read(path).expect("read tier bytes").into(),
+            &binding,
+        )
+        .expect("exactly admit immutable tier bytes")
+    }
+
+    #[test]
+    fn admitted_tier_pair_preserves_provenance_and_allows_independent_coverage() {
+        let owned = owned_temp_dir("admitted_pair");
+        let generation = ArtifactGenerationIdentityV1::new(41, [0x6a; 16]).unwrap();
+        let fast_source = admitted_tier_source(
+            &owned.path().join("fast.fsvi"),
+            semantic_tier_identity("pair-fast", 2),
+            generation,
+            &[("fast-only", &[1.0, 0.0])],
+        );
+        let mut quality_identity = semantic_tier_identity("pair-quality", 3);
+        quality_identity.input.document_instruction =
+            "quality-specific document instruction".into();
+        quality_identity.space.input_contract_fingerprint = quality_identity.input.fingerprint();
+        quality_identity.producer.space_fingerprint = quality_identity.space.fingerprint();
+        let quality_source = admitted_tier_source(
+            &owned.path().join("quality.fsvi"),
+            quality_identity,
+            generation,
+            &[
+                ("quality-only", &[0.0, 1.0, 0.0]),
+                ("another-quality-only", &[0.0, 0.0, 1.0]),
+            ],
+        );
+        // A missing cache is an optional optimization failure, not permission
+        // to lose the original producer/generation proof. The F32 source
+        // binding remains source provenance even after F16 materialization.
+        let pair = InMemoryTwoTierIndex::from_admitted_v2_with_residual_sidecar_cache(
+            &fast_source,
+            &owned.path().join("missing-fast-cache"),
+            Some((&quality_source, &owned.path().join("missing-quality-cache"))),
+        )
+        .expect("different models, inputs, dimensions, counts, and disjoint coverage are legal");
+        let cloned = pair.clone();
+        for pair in [&pair, &cloned] {
+            assert_eq!(pair.fast_index.dimension(), 2);
+            assert_eq!(pair.fast_index.record_count(), 1);
+            assert_eq!(
+                pair.fast_index.admitted_source_binding(),
+                Some(fast_source.identity_binding())
+            );
+            assert_eq!(
+                fast_source.identity_binding().quantization(),
+                Quantization::F32
+            );
+            let quality = pair.quality_index.as_ref().expect("quality tier");
+            assert_eq!(quality.dimension(), 3);
+            assert_eq!(quality.record_count(), 2);
+            assert_eq!(
+                quality.admitted_source_binding(),
+                Some(quality_source.identity_binding())
+            );
+            assert_eq!(
+                pair.search_fast(&[1.0, 0.0], 1).unwrap()[0].doc_id,
+                "fast-only"
+            );
+            assert_eq!(
+                quality.search_top_k(&[0.0, 1.0, 0.0], 1, None).unwrap()[0].doc_id,
+                "quality-only"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_tier_pair_rejects_incoherent_sources_before_cache_work() {
+        let owned = owned_temp_dir("incoherent_pair");
+        let generation = ArtifactGenerationIdentityV1::new(42, [0x6a; 16]).unwrap();
+        let fast_source = admitted_tier_source(
+            &owned.path().join("fast.fsvi"),
+            semantic_tier_identity("pair-fast", 2),
+            generation,
+            &[("fast", &[1.0, 0.0])],
+        );
+        for (case, expected_field) in [
+            ("sequence", "in_memory.tiers.generation"),
+            ("incarnation", "in_memory.tiers.generation"),
+            ("kind", "in_memory.tiers.kind"),
+            ("document_ids", "in_memory.tiers.doc_id_semantics"),
+        ] {
+            let mut quality_identity = semantic_tier_identity("pair-quality", 2);
+            let quality_generation = match case {
+                "sequence" => ArtifactGenerationIdentityV1::new(43, [0x6a; 16]).unwrap(),
+                "incarnation" => ArtifactGenerationIdentityV1::new(42, [0x6b; 16]).unwrap(),
+                "kind" => {
+                    quality_identity =
+                        EmbeddingIdentityBundleV1::explicit_test_model("pair-quality", 2);
+                    generation
+                }
+                "document_ids" => {
+                    quality_identity.input.doc_id_semantics =
+                        "different-document-id-namespace".into();
+                    quality_identity.space.input_contract_fingerprint =
+                        quality_identity.input.fingerprint();
+                    quality_identity.producer.space_fingerprint =
+                        quality_identity.space.fingerprint();
+                    generation
+                }
+                _ => unreachable!(),
+            };
+            let quality_source = admitted_tier_source(
+                &owned.path().join(format!("{case}.fsvi")),
+                quality_identity,
+                quality_generation,
+                &[("quality", &[0.0, 1.0])],
+            );
+            let fast = InMemoryVectorIndex::from_admitted_v2(&fast_source).unwrap();
+            let quality = InMemoryVectorIndex::from_admitted_v2(&quality_source).unwrap();
+            let error = InMemoryTwoTierIndex::new(fast, Some(quality)).expect_err(case);
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == expected_field)
+            );
+
+            let fast_cache = owned.path().join(format!("{case}-fast-cache"));
+            let quality_cache = owned.path().join(format!("{case}-quality-cache"));
+            std::fs::create_dir(&fast_cache).unwrap();
+            std::fs::create_dir(&quality_cache).unwrap();
+            let error = InMemoryTwoTierIndex::from_admitted_v2_with_residual_sidecar_cache(
+                &fast_source,
+                &fast_cache,
+                Some((&quality_source, &quality_cache)),
+            )
+            .expect_err("reject before materializing or caching either tier");
+            assert!(
+                matches!(error, SearchError::InvalidConfig { field, .. } if field == expected_field)
+            );
+            assert_eq!(std::fs::read_dir(&fast_cache).unwrap().count(), 0, "{case}");
+            assert_eq!(
+                std::fs::read_dir(&quality_cache).unwrap().count(),
+                0,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_tier_pair_rejects_even_empty_unadmitted_partners() {
+        let owned = owned_temp_dir("mixed_admission_pair");
+        let generation = ArtifactGenerationIdentityV1::new(44, [0x6a; 16]).unwrap();
+        let identity = semantic_tier_identity("mixed-fast", 2);
+        let source = admitted_tier_source(
+            &owned.path().join("fast.fsvi"),
+            identity.clone(),
+            generation,
+            &[("fast", &[1.0, 0.0])],
+        );
+        let admitted = InMemoryVectorIndex::from_admitted_v2(&source).unwrap();
+        let legacy = InMemoryVectorIndex::from_vectors(Vec::new(), Vec::new(), 2).unwrap();
+        let declared = InMemoryVectorIndex::from_vectors_with_identity(
+            Vec::new(),
+            Vec::new(),
+            2,
+            &identity.space,
+        )
+        .unwrap();
+        let weak_pair = InMemoryTwoTierIndex::new(declared.clone(), Some(legacy.clone()))
+            .expect("legacy and declared tiers retain their explicit weaker contract");
+        assert!(!weak_pair.fast_identity_is_attested());
+        assert!(!weak_pair.quality_identity_is_attested());
+        for unadmitted in [legacy, declared] {
+            for (fast, quality) in [
+                (admitted.clone(), unadmitted.clone()),
+                (unadmitted, admitted.clone()),
+            ] {
+                let error = InMemoryTwoTierIndex::new(fast, Some(quality))
+                    .expect_err("an empty tier cannot bypass the binding-pair contract");
+                assert!(matches!(error, SearchError::InvalidConfig { field, .. }
+                    if field == "in_memory.tiers.source_identity"));
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5130,7 +5411,8 @@ mod tests {
 
         // Identified fast + identity-less quality: each tier reports its own
         // state; the identified tier never bleeds into the absent one.
-        let two_tier = InMemoryTwoTierIndex::new(fast, Some(quality));
+        let two_tier =
+            InMemoryTwoTierIndex::new(fast, Some(quality)).expect("caller-declared tier pair");
         assert_eq!(two_tier.fast_embedder_id(), Some("tier-fast-model"));
         assert_eq!(
             two_tier.fast_embedder_revision(),
@@ -5142,7 +5424,7 @@ mod tests {
         // No quality tier at all: same typed absence.
         let (doc_ids, vectors) = identity_rows(dim, 2);
         let fast_only = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).expect("build");
-        let composed = InMemoryTwoTierIndex::new(fast_only, None);
+        let composed = InMemoryTwoTierIndex::new(fast_only, None).expect("legacy fast-only index");
         assert_eq!(composed.fast_embedder_id(), None);
         assert_eq!(composed.quality_embedder_id(), None);
         assert_eq!(composed.quality_embedder_revision(), None);
@@ -5240,7 +5522,8 @@ mod tests {
             &quality_bundle.space,
         )
         .expect("build quality tier");
-        let two_tier = InMemoryTwoTierIndex::new(fast, Some(quality));
+        let two_tier =
+            InMemoryTwoTierIndex::new(fast, Some(quality)).expect("caller-declared tier pair");
         assert_eq!(
             two_tier.fast_space_fingerprint_hex(),
             Some(fast_bundle.space.fingerprint().as_str())
@@ -5273,7 +5556,7 @@ mod tests {
         // quality-tier space to verify against — typed absence again.
         let (doc_ids, vectors) = identity_rows(dim, 2);
         let fast_only = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).expect("build");
-        let composed = InMemoryTwoTierIndex::new(fast_only, None);
+        let composed = InMemoryTwoTierIndex::new(fast_only, None).expect("legacy fast-only index");
         assert_eq!(composed.fast_space_fingerprint_hex(), None);
         assert_eq!(composed.quality_space_fingerprint_hex(), None);
     }
@@ -5611,7 +5894,7 @@ mod tests {
         let query = make_normalized_vec(dim, 5.0);
 
         let fast = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).unwrap();
-        let two_tier = InMemoryTwoTierIndex::new(fast, None);
+        let two_tier = InMemoryTwoTierIndex::new(fast, None).expect("legacy fast-only index");
 
         assert!(!two_tier.has_quality_index());
         assert_eq!(two_tier.doc_count(), 20);
@@ -5639,7 +5922,7 @@ mod tests {
         let quality =
             InMemoryVectorIndex::from_vectors(doc_ids, quality_vecs, dim_quality).unwrap();
 
-        let two_tier = InMemoryTwoTierIndex::new(fast, Some(quality));
+        let two_tier = InMemoryTwoTierIndex::new(fast, Some(quality)).expect("legacy tier pair");
         assert!(two_tier.has_quality_index());
 
         let fast_query = make_normalized_vec(dim_fast, 3.0);
@@ -5668,7 +5951,7 @@ mod tests {
             dim,
         )
         .unwrap();
-        let two_tier = InMemoryTwoTierIndex::new(fast, None);
+        let two_tier = InMemoryTwoTierIndex::new(fast, None).expect("legacy fast-only index");
 
         let hits = two_tier
             .search_fast(&make_normalized_vec(dim, 1.0), 1)

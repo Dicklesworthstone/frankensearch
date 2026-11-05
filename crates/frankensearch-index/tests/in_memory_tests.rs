@@ -263,7 +263,8 @@ fn in_memory_two_tier_supports_quality_and_no_quality_modes() {
     )
     .expect("quality index");
 
-    let with_quality = InMemoryTwoTierIndex::new(fast.clone(), Some(quality));
+    let with_quality =
+        InMemoryTwoTierIndex::new(fast.clone(), Some(quality)).expect("two-tier fixture");
     let hits = with_quality
         .search_fast(&normalize(vec![1.0, 0.0]), 3)
         .expect("fast search");
@@ -277,7 +278,7 @@ fn in_memory_two_tier_supports_quality_and_no_quality_modes() {
             .all(|score| score.is_some_and(|s| s.is_finite()))
     );
 
-    let without_quality = InMemoryTwoTierIndex::new(fast, None);
+    let without_quality = InMemoryTwoTierIndex::new(fast, None).expect("fast-only fixture");
     let none_scores = without_quality
         .quality_scores_for_hits(&normalize(vec![1.0, 0.0]), &hits)
         .expect("quality fallback scores");

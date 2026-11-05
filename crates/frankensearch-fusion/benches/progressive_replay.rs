@@ -129,7 +129,7 @@ fn bench_progressive_replay(c: &mut Criterion) {
         .collect();
     let fast = InMemoryVectorIndex::from_vectors(ids.clone(), fast_vecs, DIM).expect("fast");
     let quality = InMemoryVectorIndex::from_vectors(ids, quality_vecs, DIM).expect("quality");
-    let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)));
+    let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).expect("benchmark tiers"));
     let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
 
     // Bound ONCE, outside every timed region: binding a query to its identity

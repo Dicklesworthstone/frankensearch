@@ -87,7 +87,7 @@ fn bench_sync_int8_fetch(c: &mut Criterion) {
         .collect();
     let fast = InMemoryVectorIndex::from_vectors(ids.clone(), fast_vecs, DIM).expect("fast");
     let quality = InMemoryVectorIndex::from_vectors(ids, quality_vecs, DIM).expect("quality");
-    let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)));
+    let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).expect("benchmark tiers"));
 
     // The approximate arm is an explicit control. Product defaults stay exact.
     let int8 = SyncTwoTierSearcher::new(index.clone(), TwoTierConfig::default())

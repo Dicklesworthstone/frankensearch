@@ -60,7 +60,7 @@ fn rank_flip_index() -> Arc<InMemoryTwoTierIndex> {
         2,
     )
     .expect("quality index");
-    Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)))
+    Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).expect("rank-flip fixture"))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -127,7 +127,7 @@ fn clustered_sync_index(
         InMemoryVectorIndex::from_vectors(ids.clone(), fast_vectors, dim).expect("fast index");
     let quality =
         InMemoryVectorIndex::from_vectors(ids, quality_vectors, dim).expect("quality index");
-    Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)))
+    Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)).expect("clustered fixture"))
 }
 
 #[test]
@@ -306,7 +306,8 @@ fn candidate_multiplier_changes_refinement_recall() {
 #[test]
 fn empty_index_is_graceful() {
     let empty_fast = InMemoryVectorIndex::from_vectors(Vec::new(), Vec::new(), 2).expect("empty");
-    let empty_two_tier = Arc::new(InMemoryTwoTierIndex::new(empty_fast, None));
+    let empty_two_tier =
+        Arc::new(InMemoryTwoTierIndex::new(empty_fast, None).expect("empty fast-only fixture"));
     let searcher = SyncTwoTierSearcher::new(empty_two_tier, TwoTierConfig::default());
 
     let (results, metrics) = searcher
