@@ -7,7 +7,9 @@ use std::task::Poll;
 use asupersync::runtime::blocking_pool::BlockingPoolHandle;
 
 use frankensearch_core::generation::EmbeddingSpaceKindV1;
-use frankensearch_core::{BoundQueryEmbedding, FusedHit, LexicalCandidateBatch, LexicalRead};
+use frankensearch_core::{
+    BoundQueryEmbedding, FusedHit, LexicalCandidateBatch, LexicalRead, with_cancellation,
+};
 use frankensearch_fusion::{RrfConfig, candidate_count, rrf_fuse_for_vector_lane};
 
 use super::{NativeAnnIndex, checkpoint, invalid};
@@ -126,7 +128,10 @@ impl NativeAnnIndex {
         if self.live_count() == 0 {
             // The admitted owner proves there is no vector work. This is not
             // a provider-failure fallback and still requires lexical success.
-            let batch = lexical.search_candidates(cx, &lexical_text, budget).await?;
+            let batch = with_cancellation(cx, "native_ann.hybrid_sources", async {
+                lexical.search_candidates(cx, &lexical_text, budget).await
+            })
+            .await?;
             validate_lexical(cx, &batch)?;
             let hits =
                 rrf_fuse_for_vector_lane(batch.results(), &[], k, 0, &RrfConfig::default(), false);
@@ -169,7 +174,10 @@ impl NativeAnnIndex {
         let budget = candidate_count(k, 0, 3);
         let lexical_text = lexical.query_text(text);
         if self.live_count() == 0 {
-            let batch = lexical.search_candidates(cx, &lexical_text, budget).await?;
+            let batch = with_cancellation(cx, "native_ann.hybrid_sources", async {
+                lexical.search_candidates(cx, &lexical_text, budget).await
+            })
+            .await?;
             validate_lexical(cx, &batch)?;
             let hits =
                 rrf_fuse_for_vector_lane(batch.results(), &[], k, 0, &RrfConfig::default(), false);
@@ -298,9 +306,12 @@ async fn hydrate_results(
     }
     // Do not even expose vector-only winners to the lexical backend. Its pin
     // authenticates the lexical scoring batch, not arbitrary vector documents.
-    let response = lexical
-        .hydrate_candidates(cx, batch.context(), &mut staged)
-        .await;
+    let response = with_cancellation(cx, "native_ann.hybrid_after_hydration", async {
+        lexical
+            .hydrate_candidates(cx, batch.context(), &mut staged)
+            .await
+    })
+    .await;
     checkpoint(cx, "native_ann.hybrid_after_hydration")?;
     response?;
     for (expected, actual) in results
@@ -429,43 +440,47 @@ fn validate_lexical(cx: &Cx, batch: &LexicalCandidateBatch) -> SearchResult<()> 
 
 /// Poll both caller-owned sources without spawning or requiring ready futures.
 /// On any error the still-owned sibling is dropped by this function's return.
+/// Cancellation has its own wake registration even when neither source wakes.
 async fn join_sources<A, B>(
     cx: &Cx,
     first: impl Future<Output = SearchResult<A>>,
     second: impl Future<Output = SearchResult<B>>,
 ) -> SearchResult<(A, B)> {
-    let mut first = std::pin::pin!(first);
-    let mut second = std::pin::pin!(second);
-    let mut first_value = None;
-    let mut second_value = None;
-    poll_fn(|task| {
-        if let Err(error) = checkpoint(cx, "native_ann.hybrid_sources") {
-            return Poll::Ready(Err(error));
-        }
-        if first_value.is_none() {
-            match first.as_mut().poll(task) {
-                Poll::Ready(Ok(value)) => first_value = Some(value),
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => {}
+    with_cancellation(cx, "native_ann.hybrid_sources", async move {
+        let mut first = std::pin::pin!(first);
+        let mut second = std::pin::pin!(second);
+        let mut first_value = None;
+        let mut second_value = None;
+        poll_fn(|task| {
+            if let Err(error) = checkpoint(cx, "native_ann.hybrid_sources") {
+                return Poll::Ready(Err(error));
             }
-        }
-        if let Err(error) = checkpoint(cx, "native_ann.hybrid_between_sources") {
-            return Poll::Ready(Err(error));
-        }
-        if second_value.is_none() {
-            match second.as_mut().poll(task) {
-                Poll::Ready(Ok(value)) => second_value = Some(value),
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => {}
+            if first_value.is_none() {
+                match first.as_mut().poll(task) {
+                    Poll::Ready(Ok(value)) => first_value = Some(value),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {}
+                }
             }
-        }
-        if let Some(first) = first_value.take() {
-            if let Some(second) = second_value.take() {
-                return Poll::Ready(Ok((first, second)));
+            if let Err(error) = checkpoint(cx, "native_ann.hybrid_between_sources") {
+                return Poll::Ready(Err(error));
             }
-            first_value = Some(first);
-        }
-        Poll::Pending
+            if second_value.is_none() {
+                match second.as_mut().poll(task) {
+                    Poll::Ready(Ok(value)) => second_value = Some(value),
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => {}
+                }
+            }
+            if let Some(first) = first_value.take() {
+                if let Some(second) = second_value.take() {
+                    return Poll::Ready(Ok((first, second)));
+                }
+                first_value = Some(first);
+            }
+            Poll::Pending
+        })
+        .await
     })
     .await
 }
@@ -475,13 +490,15 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::task::{Context, Waker};
+    use std::task::{Context, Wake, Waker};
 
     use frankensearch_core::LexicalHydrationContext;
     use frankensearch_core::generation::{
         ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
     };
-    use frankensearch_core::traits::{IdentityBoundEmbedding, ModelCategory, SearchFuture};
+    use frankensearch_core::traits::{
+        IdentityBoundEmbedding, ModelCategory, RerankDocument, RerankScore, Reranker, SearchFuture,
+    };
     use frankensearch_index::native_hnsw::HnswParams;
     use frankensearch_index::{FsviV2IdentityBinding, ValidatedFsviBytes, VectorIndex};
 
@@ -511,6 +528,31 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[derive(Default)]
+    struct CancellationWake(AtomicUsize);
+
+    impl Wake for CancellationWake {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn cancel_without_provider_wake(cx: &Cx, wakes: &CancellationWake) {
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| cx.cancel_fast(asupersync::CancelKind::User))
+                .join()
+                .expect("cancel pending native work");
+        });
+        // A manual repoll alone would hide the missing wake registration.
+        assert!(wakes.0.load(Ordering::SeqCst) > 0);
     }
 
     impl Embedder for Provider {
@@ -579,6 +621,7 @@ mod tests {
 
     struct Lexical {
         calls: AtomicUsize,
+        search_drops: AtomicUsize,
         cancelled: bool,
         pending: bool,
         snapshot: Arc<usize>,
@@ -594,6 +637,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
+                search_drops: AtomicUsize::new(0),
                 cancelled: false,
                 pending: false,
                 snapshot: Arc::new(1),
@@ -631,6 +675,7 @@ mod tests {
         ) -> SearchFuture<'a, Vec<ScoredResult>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
+                let _guard = DropCount(&self.search_drops);
                 if self.cancelled {
                     return Err(SearchError::Cancelled {
                         phase: "test.lexical".to_owned(),
@@ -800,6 +845,195 @@ mod tests {
             assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
             assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
             assert_eq!(index.live_count(), 3);
+        });
+    }
+
+    #[test]
+    fn pending_native_embedding_wakes_on_cancel_without_waiting_for_its_provider() {
+        let cx = Cx::for_testing();
+        let index = index(&cx, false);
+        let provider = Provider::new(true);
+        let wakes = Arc::new(CancellationWake::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let baseline = Arc::strong_count(&wakes);
+        let mut task = Context::from_waker(&waker);
+        let mut operation = Box::pin(index.embed_query(&cx, &provider, "query"));
+        assert!(operation.as_mut().poll(&mut task).is_pending());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        cancel_without_provider_wake(&cx, &wakes);
+        assert!(matches!(
+            operation.as_mut().poll(&mut task),
+            Poll::Ready(Err(SearchError::Cancelled { phase, .. }))
+                if phase == "native_ann.after_embedding"
+        ));
+        // Keep the completed outer future alive: cancellation must already
+        // have released the provider and its registration, without another poll.
+        assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&wakes), baseline);
+        assert_eq!(index.live_count(), 3);
+    }
+
+    #[test]
+    fn pending_hybrid_sources_wake_on_cancel_and_release_completed_sibling_pins() {
+        for (embedding_pending, lexical_pending) in [(true, true), (true, false), (false, true)] {
+            let cx = Cx::for_testing();
+            let index = index(&cx, false);
+            let provider = Provider::new(embedding_pending);
+            let mut lexical = Lexical::new();
+            lexical.pending = lexical_pending;
+            let wakes = Arc::new(CancellationWake::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let baseline = Arc::strong_count(&wakes);
+            let mut task = Context::from_waker(&waker);
+            let mut operation =
+                Box::pin(index.search_hybrid_candidates(&cx, &provider, &lexical, "query", 2));
+            assert!(operation.as_mut().poll(&mut task).is_pending());
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                Arc::strong_count(&lexical.snapshot),
+                if lexical_pending { 1 } else { 2 }
+            );
+
+            cancel_without_provider_wake(&cx, &wakes);
+            assert!(matches!(
+                operation.as_mut().poll(&mut task),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            assert_eq!(provider.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.search_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+            assert_eq!(Arc::strong_count(&wakes), baseline);
+            assert_eq!(index.live_count(), 3);
+        }
+    }
+
+    #[test]
+    fn empty_native_owner_still_cancels_a_nonwaking_lexical_provider() {
+        let cx = Cx::for_testing();
+        let index = index(&cx, true);
+        let provider = Provider::new(true);
+        let mut lexical = Lexical::new();
+        lexical.pending = true;
+        let wakes = Arc::new(CancellationWake::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let baseline = Arc::strong_count(&wakes);
+        let mut task = Context::from_waker(&waker);
+        let mut operation =
+            Box::pin(index.search_hybrid_candidates(&cx, &provider, &lexical, "query", 2));
+        assert!(operation.as_mut().poll(&mut task).is_pending());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lexical.calls.load(Ordering::SeqCst), 1);
+
+        cancel_without_provider_wake(&cx, &wakes);
+        assert!(matches!(
+            operation.as_mut().poll(&mut task),
+            Poll::Ready(Err(SearchError::Cancelled { phase, .. }))
+                if phase == "native_ann.hybrid_sources"
+        ));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(lexical.search_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&wakes), baseline);
+    }
+
+    #[test]
+    fn pending_hybrid_hydration_cancels_without_a_partial_page_or_retained_pin() {
+        let cx = Cx::for_testing();
+        let index = index(&cx, false);
+        let provider = Provider::new(false);
+        let mut lexical = Lexical::new();
+        lexical.hydration_reply = HydrationReply::Pending;
+        let wakes = Arc::new(CancellationWake::default());
+        let waker = Waker::from(Arc::clone(&wakes));
+        let baseline = Arc::strong_count(&wakes);
+        let mut task = Context::from_waker(&waker);
+        let mut operation =
+            Box::pin(index.search_hybrid_text(&cx, &provider, &lexical, "query", 2));
+        assert!(operation.as_mut().poll(&mut task).is_pending());
+        assert_eq!(lexical.hydrations.load(Ordering::SeqCst), 1);
+        assert!(lexical.hydrated_docs.load(Ordering::SeqCst) > 0);
+        assert_eq!(Arc::strong_count(&lexical.snapshot), 2);
+
+        cancel_without_provider_wake(&cx, &wakes);
+        assert!(matches!(
+            operation.as_mut().poll(&mut task),
+            Poll::Ready(Err(SearchError::Cancelled { phase, .. }))
+                if phase == "native_ann.hybrid_after_hydration"
+        ));
+        assert_eq!(lexical.hydration_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
+        assert_eq!(Arc::strong_count(&wakes), baseline);
+    }
+
+    struct PendingReranker {
+        calls: AtomicUsize,
+        drops: AtomicUsize,
+    }
+
+    impl Reranker for PendingReranker {
+        fn rerank<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            _documents: &'a [RerankDocument],
+        ) -> SearchFuture<'a, Vec<RerankScore>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let _guard = DropCount(&self.drops);
+                std::future::pending().await
+            })
+        }
+
+        fn id(&self) -> &str {
+            "pending-native-reranker"
+        }
+
+        fn model_name(&self) -> &str {
+            self.id()
+        }
+    }
+
+    #[test]
+    fn pending_native_rerank_wakes_on_cancel_and_emits_no_late_phase() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = index(&cx, false);
+            let provider = Provider::new(false);
+            let lexical = Lexical::new();
+            let reranker = PendingReranker {
+                calls: AtomicUsize::new(0),
+                drops: AtomicUsize::new(0),
+            };
+            let text = |_: &str| Some("retained document text".to_owned());
+            let mut stream = index
+                .search_hybrid_progressive(&cx, &provider, None, &lexical, "query", 2)
+                .unwrap()
+                .with_reranker(&reranker, &text, 2)
+                .unwrap();
+            let initial = stream.next_phase().await.unwrap().unwrap();
+            assert!(matches!(initial, NativeSearchPhase::Initial { .. }));
+            let wakes = Arc::new(CancellationWake::default());
+            let waker = Waker::from(Arc::clone(&wakes));
+            let baseline = Arc::strong_count(&wakes);
+            let mut task = Context::from_waker(&waker);
+            let mut operation = Box::pin(stream.next_phase());
+            assert!(operation.as_mut().poll(&mut task).is_pending());
+            assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);
+
+            cancel_without_provider_wake(&cx, &wakes);
+            assert!(matches!(
+                operation.as_mut().poll(&mut task),
+                Poll::Ready(Err(SearchError::Cancelled { .. }))
+            ));
+            assert_eq!(reranker.drops.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&wakes), baseline);
+            drop(operation);
+            assert!(stream.is_finished());
+            assert!(stream.next_phase().await.unwrap().is_none());
+            assert_eq!(reranker.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(Arc::strong_count(&lexical.snapshot), 1);
         });
     }
 

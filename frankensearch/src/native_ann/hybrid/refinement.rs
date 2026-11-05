@@ -259,7 +259,10 @@ pub(super) async fn checked_lexical(
     budget: usize,
 ) -> SearchResult<LexicalCandidateBatch> {
     let text = lexical.query_text(text);
-    let response = lexical.search_candidates(cx, &text, budget).await;
+    let response = frankensearch_core::with_cancellation(cx, "native_ann.tiered_lexical", async {
+        lexical.search_candidates(cx, &text, budget).await
+    })
+    .await;
     checkpoint(cx, "native_ann.tiered_lexical")?;
     let batch = response?;
     validate_lexical(cx, &batch)?;

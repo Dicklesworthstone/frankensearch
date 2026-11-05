@@ -7,6 +7,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 
 use frankensearch_core::traits::{RerankDocument, Reranker};
+use frankensearch_core::with_cancellation;
 
 use super::{checkpoint, invalid};
 use crate::{Cx, ScoreSource, ScoredResult, SearchError, SearchResult};
@@ -71,7 +72,10 @@ impl RerankRequest<'_> {
         if documents.is_empty() {
             return Ok(None);
         }
-        let response = self.reranker.rerank(cx, query, &documents).await;
+        let response = with_cancellation(cx, "native_ann.rerank_response", async {
+            self.reranker.rerank(cx, query, &documents).await
+        })
+        .await;
         checkpoint(cx, "native_ann.rerank_response")?;
         let response = response?;
         if response.len() != documents.len() {
