@@ -5272,6 +5272,10 @@ impl fmt::Debug for QualifiedGenerationDirectory {
 /// Publication, reconciliation, and deletion are out of scope (see
 /// `authority_publisher`).
 pub mod generation_reader {
+    mod source_recovery;
+
+    pub use source_recovery::{OpenedGenerationSourceV1, SourceOpenOutcomeV1};
+
     use std::fmt;
     use std::path::Path;
     use std::sync::Arc;
@@ -7311,6 +7315,278 @@ pub mod generation_reader {
                 ),
                 "a sufficient budget reaches the deliberately missing components"
             );
+        }
+
+        fn source_recovery_fixture(
+            label: &str,
+            with_ann: bool,
+            write_source: bool,
+            corrupt_source: Option<GenerationComponentRole>,
+        ) -> (
+            PathBuf,
+            QualifiedGenerationRoot,
+            AuthorityRefV1,
+            ActivationManifest,
+        ) {
+            let path = fixture_root(label);
+            let root = admit(&path);
+            let manifest = manifest_v2(1, None, with_ann);
+            if write_source {
+                for role in [
+                    GenerationComponentRole::Lexical,
+                    GenerationComponentRole::Metadata,
+                ] {
+                    let receipt = component_receipt(role, 1);
+                    let mut bytes = component_bytes(role, 1);
+                    if corrupt_source == Some(role) {
+                        bytes[0] ^= 0x80;
+                    }
+                    write_sealed_object(
+                        &path,
+                        &component_object_name_v1(role, receipt.sha256),
+                        &bytes,
+                    );
+                }
+            }
+            write_manifest_object(&path, object_id(1), &manifest.canonical_bytes());
+            let (len, digest) = manifest.object_receipt();
+            let authority =
+                AuthorityRefV1::new(1, object_id(1), len, digest, None).expect("source authority");
+            assert!(matches!(
+                publisher(&root)
+                    .publish(
+                        authority,
+                        ExpectedAuthorityPairV1::default(),
+                        None,
+                        [0x69; 16]
+                    )
+                    .expect("source fixture publication"),
+                PublicationOutcomeV1::Committed { .. }
+            ));
+            (path, root, authority, manifest)
+        }
+
+        #[test]
+        fn source_recovery_admits_first_generation_without_derived_objects() {
+            for with_ann in [false, true] {
+                let (path, root, authority, manifest) =
+                    source_recovery_fixture("source-missing-derived", with_ann, true, None);
+                let source_bytes = authority.manifest_len
+                    + manifest.components().lexical.byte_len
+                    + manifest.components().metadata.byte_len;
+                let SourceOpenOutcomeV1::Opened(source) = root
+                    .open_expected_generation_source_for_recovery_with_budget(
+                        ROOT_ID,
+                        authority,
+                        manifest.generation(),
+                        source_bytes,
+                    )
+                    .expect("source admission")
+                else {
+                    panic!("intact source must not require a derived index or an ancestor");
+                };
+                assert_eq!(source.head().authority, authority);
+                assert_eq!(source.root_id(), ROOT_ID);
+                assert_eq!(
+                    source.profile(),
+                    GenerationRootSecurityProfileV1::CooperativeLocal
+                );
+                assert_eq!(source.manifest_bytes().as_ref(), manifest.canonical_bytes());
+                assert_eq!(
+                    source.lexical_bytes().as_ref(),
+                    component_bytes(GenerationComponentRole::Lexical, 1)
+                );
+                assert_eq!(
+                    source.metadata_bytes().as_ref(),
+                    component_bytes(GenerationComponentRole::Metadata, 1)
+                );
+                assert_eq!(source.retained_image_bytes(), source_bytes);
+                assert!(
+                    matches!(
+                        root.open_generation_snapshot(
+                            ROOT_ID,
+                            GenerationRootSecurityProfileV1::CooperativeLocal,
+                            None,
+                        )
+                        .expect("ordinary admission"),
+                        SnapshotOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(_)),
+                    ),
+                    "source admission must not weaken complete search admission"
+                );
+
+                let next = manifest_v2(2, Some(authority), with_ann);
+                publish_manifest(
+                    &path,
+                    &publisher(&root),
+                    &next,
+                    source.authority_pair(),
+                    None,
+                );
+                assert_eq!(source.head().authority, authority);
+                assert_eq!(
+                    source.lexical_bytes().as_ref(),
+                    component_bytes(GenerationComponentRole::Lexical, 1)
+                );
+                assert!(
+                    matches!(
+                        root.open_expected_generation_source_for_recovery_with_budget(
+                            ROOT_ID,
+                            authority,
+                            manifest.generation(),
+                            0,
+                        )
+                        .expect("stale source selection"),
+                        SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ExpectedCurrentChanged),
+                    ),
+                    "an explicit repair must refuse a winner before even checking its image budget"
+                );
+            }
+        }
+
+        #[test]
+        fn source_recovery_ignores_corrupt_derived_bytes_without_overwriting_them() {
+            let (path, root, authority, manifest) =
+                source_recovery_fixture("source-corrupt-derived", true, true, None);
+            for role in [
+                GenerationComponentRole::Vector,
+                GenerationComponentRole::Ann,
+            ] {
+                let receipt = component_receipt(role, 1);
+                write_sealed_object(
+                    &path,
+                    &component_object_name_v1(role, receipt.sha256),
+                    b"damaged derived evidence",
+                );
+            }
+            let before =
+                fs::read(path.join(GENERATION_ROOT_AUTHORITY_FILE_NAME)).expect("authority before");
+            assert!(matches!(
+                root.open_expected_generation_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    authority,
+                    manifest.generation(),
+                    u64::MAX,
+                )
+                .expect("source recovery"),
+                SourceOpenOutcomeV1::Opened(_),
+            ));
+            for role in [
+                GenerationComponentRole::Vector,
+                GenerationComponentRole::Ann,
+            ] {
+                assert_eq!(
+                    fs::read(path.join(component_object_name_v1(
+                        role,
+                        component_receipt(role, 1).sha256
+                    )))
+                    .expect("damaged evidence retained"),
+                    b"damaged derived evidence",
+                );
+            }
+            assert_eq!(
+                fs::read(path.join(GENERATION_ROOT_AUTHORITY_FILE_NAME)).expect("authority after"),
+                before
+            );
+        }
+
+        #[test]
+        fn source_recovery_refuses_corrupt_source_and_wrong_artifact_generation() {
+            for role in [
+                GenerationComponentRole::Lexical,
+                GenerationComponentRole::Metadata,
+            ] {
+                let (_, root, authority, manifest) =
+                    source_recovery_fixture("source-corrupt-input", false, true, Some(role));
+                assert!(matches!(
+                    root.open_expected_generation_source_for_recovery_with_budget(
+                        ROOT_ID,
+                        authority,
+                        manifest.generation(),
+                        u64::MAX,
+                    )
+                    .expect("corrupt source admission"),
+                    SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(_)),
+                ));
+            }
+            let (_, root, authority, _) =
+                source_recovery_fixture("source-wrong-generation", false, true, None);
+            assert!(matches!(
+                root.open_expected_generation_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    authority,
+                    ArtifactGenerationIdentityV1::new(2, [0x21; 16]).expect("different generation"),
+                    u64::MAX,
+                )
+                .expect("generation refusal"),
+                SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Manifest(
+                    GenerationAuthorityErrorV1::InvalidField {
+                        field: "generation_reader.source_recovery.generation",
+                    },
+                )),
+            ));
+        }
+
+        #[test]
+        fn source_recovery_budget_precedes_source_component_reads() {
+            let (_, root, authority, manifest) =
+                source_recovery_fixture("source-budget-before-io", true, false, None);
+            let required = authority.manifest_len
+                + manifest.components().lexical.byte_len
+                + manifest.components().metadata.byte_len;
+            for (limit, expected_required) in [
+                (authority.manifest_len - 1, authority.manifest_len),
+                (required - 1, required),
+            ] {
+                assert!(matches!(
+                    root.open_expected_generation_source_for_recovery_with_budget(
+                        ROOT_ID, authority, manifest.generation(), limit,
+                    ).expect("bounded source admission"),
+                    SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ImageBudget {
+                        required: actual_required, limit: actual_limit,
+                    }) if actual_required == expected_required && actual_limit == limit,
+                ));
+            }
+            assert!(
+                matches!(
+                    root.open_expected_generation_source_for_recovery_with_budget(
+                        ROOT_ID,
+                        authority,
+                        manifest.generation(),
+                        required,
+                    )
+                    .expect("sufficient source budget"),
+                    SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::Closure(_)),
+                ),
+                "a sufficient budget must reach the absent source component"
+            );
+        }
+
+        #[test]
+        fn source_recovery_does_not_exempt_unopened_derived_names_from_inventory() {
+            let (path, root, authority, manifest) =
+                source_recovery_fixture("source-unread-symlink", true, true, None);
+            let vector_name = component_object_name_v1(
+                GenerationComponentRole::Vector,
+                manifest.components().vector.sha256,
+            );
+            let metadata_name = component_object_name_v1(
+                GenerationComponentRole::Metadata,
+                manifest.components().metadata.sha256,
+            );
+            std::os::unix::fs::symlink(&metadata_name, path.join(vector_name))
+                .expect("unread derived symlink fixture");
+            assert!(matches!(
+                root.open_expected_generation_source_for_recovery_with_budget(
+                    ROOT_ID,
+                    authority,
+                    manifest.generation(),
+                    u64::MAX,
+                )
+                .expect("inventory refusal"),
+                SourceOpenOutcomeV1::Refused(SnapshotRefusalV1::ClosureViolation(
+                    ClosureViolationV1::UndeclaredEntry { .. },
+                )),
+            ));
         }
 
         // Same discipline as the publisher fixtures: a privately owned
