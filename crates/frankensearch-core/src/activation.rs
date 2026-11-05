@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 
 use crate::generation::{
-    ActivationInvariant, EmbedderRevision, GenerationManifest, InvariantKind, ValidationResult,
-    validate_manifest,
+    ActivationInvariant, EmbedderRevision, EmbedderTierTag, GenerationManifest, InvariantKind,
+    ValidationResult, validate_manifest,
 };
 use crate::{SearchError, SearchResult};
 
@@ -83,7 +83,9 @@ pub trait ArtifactVerifier: Send + Sync {
     /// Return runtime embedder revision for a tier key (e.g. `"fast"`, `"quality"`).
     ///
     /// Implementations that cannot provide runtime embedder identity should
-    /// return `None`. In that case, `EmbedderRevisionMatch` invariants fail.
+    /// return `None`. Activation requires an exact, valid identity for every
+    /// declared tier, even when the manifest omits `EmbedderRevisionMatch` or
+    /// contains only empty index images.
     fn runtime_embedder(&self, _tier: &str) -> Option<EmbedderRevision> {
         None
     }
@@ -117,19 +119,57 @@ pub struct InvariantCheck {
     pub reason: String,
 }
 
-/// Evaluate all activation invariants for a manifest.
+/// Evaluate mandatory admission and every additional manifest invariant.
 ///
-/// Returns a list of check results. All must pass for activation to proceed.
+/// Artifact verification and exact runtime embedder identity are always
+/// required. Declared vector tiers must also exist in the embedder map and use
+/// that identity's dimension. A manifest can add checks, never omit this baseline.
+///
+/// Configured checks retain their order and identifiers. Missing mandatory
+/// checks are appended with `required_all_artifacts_verified` and
+/// `required_embedder_revision_match` identifiers. Repeated artifact or embedder
+/// checks reuse one evaluation, so listing a built-in cannot double verification
+/// work. Every returned check must pass before activation proceeds.
 pub fn check_invariants(
     manifest: &GenerationManifest,
     verifier: &dyn ArtifactVerifier,
     previous_generation: Option<&ActiveGeneration>,
 ) -> Vec<InvariantCheck> {
-    manifest
-        .activation_invariants
-        .iter()
-        .map(|inv| evaluate_invariant(inv, manifest, verifier, previous_generation))
-        .collect()
+    let mut checks = Vec::new();
+    let mut artifacts = None;
+    let mut embedders = None;
+    for invariant in &manifest.activation_invariants {
+        let mut check = match &invariant.kind {
+            InvariantKind::AllArtifactsVerified => artifacts
+                .get_or_insert_with(|| {
+                    evaluate_all_artifacts_verified(&invariant.id, manifest, verifier)
+                })
+                .clone(),
+            InvariantKind::EmbedderRevisionMatch => embedders
+                .get_or_insert_with(|| {
+                    evaluate_embedder_revision_match(&invariant.id, manifest, verifier)
+                })
+                .clone(),
+            _ => evaluate_invariant(invariant, manifest, verifier, previous_generation),
+        };
+        check.invariant_id.clone_from(&invariant.id);
+        checks.push(check);
+    }
+    if artifacts.is_none() {
+        checks.push(evaluate_all_artifacts_verified(
+            "required_all_artifacts_verified",
+            manifest,
+            verifier,
+        ));
+    }
+    if embedders.is_none() {
+        checks.push(evaluate_embedder_revision_match(
+            "required_embedder_revision_match",
+            manifest,
+            verifier,
+        ));
+    }
+    checks
 }
 
 fn evaluate_invariant(
@@ -140,10 +180,10 @@ fn evaluate_invariant(
 ) -> InvariantCheck {
     match &inv.kind {
         InvariantKind::AllArtifactsVerified => {
-            evaluate_all_artifacts_verified(inv, manifest, verifier)
+            evaluate_all_artifacts_verified(&inv.id, manifest, verifier)
         }
         InvariantKind::EmbedderRevisionMatch => {
-            evaluate_embedder_revision_match(inv, manifest, verifier)
+            evaluate_embedder_revision_match(&inv.id, manifest, verifier)
         }
         InvariantKind::VectorCountConsistency { expected_total } => {
             evaluate_vector_count_consistency(inv, manifest, *expected_total)
@@ -158,33 +198,43 @@ fn evaluate_invariant(
 }
 
 fn evaluate_all_artifacts_verified(
-    inv: &ActivationInvariant,
+    invariant_id: &str,
     manifest: &GenerationManifest,
     verifier: &dyn ArtifactVerifier,
 ) -> InvariantCheck {
     let mut failures = Vec::new();
     for art in &manifest.vector_artifacts {
         let v = verifier.verify(&art.path, &art.checksum, art.size_bytes);
-        if !v.passed {
+        if v.path != art.path {
+            failures.push(format!(
+                "{}: verifier returned a different artifact path",
+                art.path
+            ));
+        } else if !v.passed {
             failures.push(format!("{}: {}", art.path, v.detail));
         }
     }
     for art in &manifest.lexical_artifacts {
         let v = verifier.verify(&art.path, &art.checksum, art.size_bytes);
-        if !v.passed {
+        if v.path != art.path {
+            failures.push(format!(
+                "{}: verifier returned a different artifact path",
+                art.path
+            ));
+        } else if !v.passed {
             failures.push(format!("{}: {}", art.path, v.detail));
         }
     }
 
     if failures.is_empty() {
         InvariantCheck {
-            invariant_id: inv.id.clone(),
+            invariant_id: invariant_id.to_owned(),
             passed: true,
             reason: "all artifacts verified".into(),
         }
     } else {
         InvariantCheck {
-            invariant_id: inv.id.clone(),
+            invariant_id: invariant_id.to_owned(),
             passed: false,
             reason: format!(
                 "{} artifact(s) failed: {}",
@@ -196,11 +246,29 @@ fn evaluate_all_artifacts_verified(
 }
 
 fn evaluate_embedder_revision_match(
-    inv: &ActivationInvariant,
+    invariant_id: &str,
     manifest: &GenerationManifest,
     verifier: &dyn ArtifactVerifier,
 ) -> InvariantCheck {
     let mut failures = Vec::new();
+    for (index, artifact) in manifest.vector_artifacts.iter().enumerate() {
+        let tier = match artifact.embedder_tier {
+            EmbedderTierTag::Fast => "fast",
+            EmbedderTierTag::Quality => "quality",
+        };
+        let Some(expected) = manifest.embedders.get(tier) else {
+            failures.push(format!(
+                "vector_artifacts[{index}] has no declared identity for tier '{tier}'"
+            ));
+            continue;
+        };
+        if artifact.dimension != expected.identity.space.dimension {
+            failures.push(format!(
+                "vector_artifacts[{index}] dimension {} differs from tier '{tier}' identity dimension {}",
+                artifact.dimension, expected.identity.space.dimension,
+            ));
+        }
+    }
     for (tier, expected) in &manifest.embedders {
         let safe_tier = if tier.len() <= 128 && !tier.chars().any(char::is_control) {
             tier.as_str()
@@ -230,7 +298,7 @@ fn evaluate_embedder_revision_match(
 
     let passed = failures.is_empty();
     InvariantCheck {
-        invariant_id: inv.id.clone(),
+        invariant_id: invariant_id.to_owned(),
         passed,
         reason: if passed {
             "runtime embedder revisions match manifest".into()
@@ -388,7 +456,7 @@ impl GenerationController {
     /// Performs in order:
     /// 1. Validate the manifest structurally.
     /// 2. Verify all artifacts via the provided verifier.
-    /// 3. Check all activation invariants.
+    /// 3. Check exact runtime producer identity and all additional invariants.
     /// 4. Atomically swap the generation pointer.
     ///
     /// On failure at any step, the previous generation remains active.
@@ -414,7 +482,8 @@ impl GenerationController {
             return Err(activation_error(&validation));
         }
 
-        // Step 2 & 3: Check invariants (which includes artifact verification).
+        // Step 2 & 3: Mandatory artifact/producer admission cannot be disabled
+        // by omitting an invariant. Manifest predicates add restrictions only.
         let previous = self
             .active
             .read()
@@ -540,7 +609,11 @@ mod tests {
     use crate::generation::*;
 
     fn sample_embedder() -> EmbedderRevision {
-        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("potion-128M", 256);
+        sample_embedder_for("potion-128M", 256)
+    }
+
+    fn sample_embedder_for(model: &str, dimension: u32) -> EmbedderRevision {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model, dimension);
         identity.storage.format = "fsvi-v2".to_owned();
         identity.storage.quantization = QuantizationFormat::F16;
         identity.storage.endianness = "little-endian".to_owned();
@@ -584,6 +657,65 @@ mod tests {
 
         fn runtime_embedder(&self, tier: &str) -> Option<EmbedderRevision> {
             self.runtime_embedders.get(tier).cloned()
+        }
+    }
+
+    /// Records admission hook calls and can refuse one required boundary.
+    struct ObservedVerifier {
+        base: AlwaysPassVerifier,
+        fail_path: Option<String>,
+        substitute_path: bool,
+        custom_pass: bool,
+        verified: Mutex<Vec<String>>,
+        resolved: Mutex<Vec<String>>,
+        producers: Mutex<Vec<String>>,
+    }
+
+    impl ObservedVerifier {
+        fn new() -> Self {
+            Self {
+                base: AlwaysPassVerifier::new("/data"),
+                fail_path: None,
+                substitute_path: false,
+                custom_pass: true,
+                verified: Mutex::new(Vec::new()),
+                resolved: Mutex::new(Vec::new()),
+                producers: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ArtifactVerifier for ObservedVerifier {
+        fn verify(&self, path: &str, checksum: &str, expected_size: u64) -> ArtifactVerification {
+            self.verified.lock().unwrap().push(path.to_owned());
+            let mut verification = self.base.verify(path, checksum, expected_size);
+            if self.fail_path.as_deref() == Some(path) {
+                verification.passed = false;
+                verification.detail = "fixture artifact failed verification".to_owned();
+            }
+            if self.substitute_path {
+                verification.path = "another-artifact".to_owned();
+            }
+            verification
+        }
+
+        fn resolve_path(&self, path: &str) -> String {
+            self.resolved.lock().unwrap().push(path.to_owned());
+            self.base.resolve_path(path)
+        }
+
+        fn runtime_embedder(&self, tier: &str) -> Option<EmbedderRevision> {
+            self.producers.lock().unwrap().push(tier.to_owned());
+            self.base.runtime_embedder(tier)
+        }
+
+        fn check_custom_invariant(
+            &self,
+            _check_name: &str,
+            _manifest: &GenerationManifest,
+            _previous: Option<&ActiveGeneration>,
+        ) -> Option<(bool, String)> {
+            Some((self.custom_pass, "fixture deployment predicate".to_owned()))
         }
     }
 
@@ -1089,7 +1221,7 @@ mod tests {
             EmbedderRevision::explicit_test_model("different-model", 256),
         );
         let checks = check_invariants(&manifest, &verifier, None);
-        assert_eq!(checks.len(), 1);
+        assert_eq!(checks.len(), 2);
         assert!(!checks[0].passed);
         assert!(checks[0].reason.contains("mismatch"));
     }
@@ -1104,7 +1236,7 @@ mod tests {
         }];
         let verifier = AlwaysPassVerifier::new("/data");
         let checks = check_invariants(&manifest, &verifier, None);
-        assert_eq!(checks.len(), 1);
+        assert_eq!(checks.len(), 2);
         assert!(checks[0].passed);
         assert!(checks[0].reason.contains("match manifest"));
     }
@@ -1123,7 +1255,7 @@ mod tests {
         verifier.runtime_embedders.insert("fast".into(), tampered);
 
         let checks = check_invariants(&manifest, &verifier, None);
-        assert_eq!(checks.len(), 1);
+        assert_eq!(checks.len(), 2);
         assert!(!checks[0].passed);
         assert!(checks[0].reason.contains("mismatch"));
     }
@@ -1148,7 +1280,7 @@ mod tests {
             .insert("fast\nforged-log-line".to_owned(), malformed);
 
         let checks = check_invariants(&manifest, &verifier, None);
-        assert_eq!(checks.len(), 1);
+        assert_eq!(checks.len(), 2);
         assert!(!checks[0].passed);
         assert!(checks[0].reason.contains("<redacted-tier>"));
         assert!(checks[0].reason.contains("failed canonical validation"));
@@ -1258,12 +1390,22 @@ mod tests {
     }
 
     #[test]
-    fn empty_invariants_returns_empty_checks() {
+    fn empty_invariants_still_returns_mandatory_admission_checks() {
         let mut manifest = sample_manifest();
         manifest.activation_invariants.clear();
         let verifier = AlwaysPassVerifier::new("/data");
         let checks = check_invariants(&manifest, &verifier, None);
-        assert!(checks.is_empty());
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| check.invariant_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "required_all_artifacts_verified",
+                "required_embedder_revision_match"
+            ]
+        );
+        assert!(checks.iter().all(|check| check.passed));
     }
 
     #[test]
@@ -1420,6 +1562,278 @@ mod tests {
         let result = ctrl.activate(manifest, &verifier, 100).unwrap();
         assert_eq!(result.activation_seq, 1);
         assert!(!ctrl.is_degraded());
+    }
+
+    #[test]
+    fn empty_or_custom_only_invariants_cannot_bypass_required_admission() {
+        for custom_only in [false, true] {
+            for fault in [
+                "vector",
+                "lexical",
+                "returned_path",
+                "missing_runtime",
+                "foreign_producer",
+                "noncanonical_runtime",
+                "undeclared_tier",
+                "dimension",
+            ] {
+                let ctrl = GenerationController::new();
+                let good = AlwaysPassVerifier::new("/data");
+                let first = ctrl.activate(sample_manifest(), &good, 100).unwrap();
+                let mut second = sample_manifest();
+                second.generation_id = "gen-002".to_owned();
+                second.manifest_hash = compute_manifest_hash(&second).unwrap();
+                let current = ctrl.activate(second, &good, 200).unwrap();
+                let mut candidate = sample_manifest();
+                candidate.generation_id = "gen-003".to_owned();
+                candidate.activation_invariants.clear();
+                if custom_only {
+                    candidate.activation_invariants.push(ActivationInvariant {
+                        id: "deployment".to_owned(),
+                        description: "A passing deployment predicate cannot waive admission"
+                            .to_owned(),
+                        kind: InvariantKind::Custom {
+                            check_name: "deployment".to_owned(),
+                        },
+                    });
+                }
+                let mut verifier = ObservedVerifier::new();
+                let expected_reason = match fault {
+                    "vector" => {
+                        verifier.fail_path = Some(candidate.vector_artifacts[0].path.clone());
+                        "fixture artifact failed verification"
+                    }
+                    "lexical" => {
+                        verifier.fail_path = Some(candidate.lexical_artifacts[0].path.clone());
+                        "fixture artifact failed verification"
+                    }
+                    "returned_path" => {
+                        verifier.substitute_path = true;
+                        "verifier returned a different artifact path"
+                    }
+                    "missing_runtime" => {
+                        verifier.base.runtime_embedders.clear();
+                        "runtime embedder missing"
+                    }
+                    "foreign_producer" => {
+                        let mut identity = sample_embedder().identity;
+                        identity
+                            .producer
+                            .implementation_revision
+                            .push_str("-another-producer");
+                        verifier
+                            .base
+                            .runtime_embedders
+                            .insert("fast".to_owned(), identity.freeze().unwrap());
+                        "mismatch"
+                    }
+                    "noncanonical_runtime" => {
+                        verifier
+                            .base
+                            .runtime_embedders
+                            .get_mut("fast")
+                            .unwrap()
+                            .canonical_bytes
+                            .push(0);
+                        "failed canonical validation"
+                    }
+                    "undeclared_tier" => {
+                        candidate.vector_artifacts[0].embedder_tier = EmbedderTierTag::Quality;
+                        "no declared identity for tier 'quality'"
+                    }
+                    "dimension" => {
+                        candidate.vector_artifacts[0].dimension += 1;
+                        "differs from tier 'fast' identity dimension"
+                    }
+                    _ => unreachable!("fixture fault"), // ubs:ignore — cfg(test) fixture assertion.
+                };
+                candidate.manifest_hash = compute_manifest_hash(&candidate).unwrap();
+                assert!(validate_manifest(&candidate).is_valid(), "{fault}");
+                let error = ctrl.activate(candidate, &verifier, 300).unwrap_err();
+                assert!(matches!(
+                    &error,
+                    SearchError::SubsystemError {
+                        subsystem: "generation_activation",
+                        ..
+                    }
+                ));
+                assert!(
+                    error.to_string().contains(expected_reason),
+                    "{fault}: {error}"
+                );
+                assert!(verifier.resolved.lock().unwrap().is_empty(), "{fault}");
+                assert_eq!(ctrl.activation_seq(), 2, "{fault}");
+                assert!(Arc::ptr_eq(&ctrl.active().unwrap(), &current), "{fault}");
+                // Refusal preserves the rollback slot as well as the active Arc.
+                assert!(ctrl.rollback(), "{fault}");
+                assert!(Arc::ptr_eq(&ctrl.active().unwrap(), &first), "{fault}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_mandatory_predicates_reuse_one_artifact_and_producer_evaluation() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = [
+            ("artifacts-a", InvariantKind::AllArtifactsVerified),
+            ("producer-a", InvariantKind::EmbedderRevisionMatch),
+            ("artifacts-b", InvariantKind::AllArtifactsVerified),
+            ("producer-b", InvariantKind::EmbedderRevisionMatch),
+        ]
+        .into_iter()
+        .map(|(id, kind)| ActivationInvariant {
+            id: id.to_owned(),
+            description: String::new(),
+            kind,
+        })
+        .collect();
+        let verifier = ObservedVerifier::new();
+        let checks = check_invariants(&manifest, &verifier, None);
+        assert!(checks.iter().all(|check| check.passed));
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| check.invariant_id.as_str())
+                .collect::<Vec<_>>(),
+            ["artifacts-a", "producer-a", "artifacts-b", "producer-b"]
+        );
+        assert_eq!(
+            *verifier.verified.lock().unwrap(),
+            ["vectors/shard_0.fsvi", "lexical/segment_0"]
+        );
+        assert_eq!(*verifier.producers.lock().unwrap(), ["fast"]);
+    }
+
+    #[test]
+    fn mandatory_admission_preserves_tier_shapes_physical_rows_and_cumulative_ranges() {
+        for shape in ["fast", "quality", "progressive", "shards", "empty"] {
+            let mut manifest = sample_manifest();
+            manifest.activation_invariants.clear();
+            // Physical rows can include tombstones. They need not equal the
+            // live document count, nor the sum across two independently stored tiers.
+            manifest.vector_artifacts[0].vector_count = 120;
+            match shape {
+                "quality" => {
+                    manifest.embedders = BTreeMap::from([(
+                        "quality".to_owned(),
+                        sample_embedder_for("quality-model", 384),
+                    )]);
+                    manifest.vector_artifacts[0].embedder_tier = EmbedderTierTag::Quality;
+                    manifest.vector_artifacts[0].dimension = 384;
+                }
+                "progressive" => {
+                    manifest.embedders.insert(
+                        "quality".to_owned(),
+                        sample_embedder_for("quality-model", 384),
+                    );
+                    let mut quality = manifest.vector_artifacts[0].clone();
+                    quality.path = "vectors/quality.fsvi".to_owned();
+                    quality.embedder_tier = EmbedderTierTag::Quality;
+                    quality.dimension = 384;
+                    manifest.vector_artifacts.push(quality);
+                }
+                "shards" => {
+                    manifest.vector_artifacts[0].vector_count = 70;
+                    let mut shard = manifest.vector_artifacts[0].clone();
+                    shard.path = "vectors/shard_1.fsvi".to_owned();
+                    shard.vector_count = 50;
+                    manifest.vector_artifacts.push(shard);
+                }
+                "empty" => {
+                    manifest.total_documents = 0;
+                    manifest.vector_artifacts[0].vector_count = 0;
+                    manifest.lexical_artifacts[0].document_count = 0;
+                }
+                "fast" => {}
+                _ => unreachable!("fixture topology"), // ubs:ignore — cfg(test) fixture assertion.
+            }
+            manifest.manifest_hash = compute_manifest_hash(&manifest).unwrap();
+            assert!(validate_manifest(&manifest).is_valid(), "{shape}");
+            let mut verifier = ObservedVerifier::new();
+            verifier.base.runtime_embedders = manifest.embedders.clone();
+            let ctrl = GenerationController::new();
+            let retained = ctrl.activate(manifest.clone(), &verifier, 100).unwrap();
+            assert_eq!(
+                verifier.verified.lock().unwrap().len(),
+                manifest.vector_artifacts.len() + manifest.lexical_artifacts.len()
+            );
+            assert_eq!(
+                *verifier.producers.lock().unwrap(),
+                manifest.embedders.keys().cloned().collect::<Vec<_>>()
+            );
+
+            manifest.generation_id = "gen-002".to_owned();
+            manifest.commit_range.high = 200;
+            manifest.manifest_hash = compute_manifest_hash(&manifest).unwrap();
+            let next = ctrl.activate(manifest, &verifier, 200).unwrap();
+            assert_eq!(
+                next.manifest.commit_range,
+                CommitRange { low: 1, high: 200 }
+            );
+            assert_eq!(
+                retained.manifest.commit_range,
+                CommitRange { low: 1, high: 100 }
+            );
+        }
+    }
+
+    #[test]
+    fn empty_generation_still_requires_the_default_verifier_to_declare_runtime_identity() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants.clear();
+        manifest.total_documents = 0;
+        manifest.vector_artifacts[0].vector_count = 0;
+        manifest.lexical_artifacts[0].document_count = 0;
+        manifest.manifest_hash = compute_manifest_hash(&manifest).unwrap();
+        let ctrl = GenerationController::new();
+        let error = ctrl.activate(manifest, &MinimalVerifier, 100).unwrap_err();
+        assert!(error.to_string().contains("runtime embedder missing"));
+        assert!(ctrl.is_degraded());
+        assert_eq!(ctrl.activation_seq(), 0);
+    }
+
+    #[test]
+    fn an_unused_declared_tier_still_requires_its_exact_runtime_identity() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants.clear();
+        manifest.embedders.insert(
+            "quality".to_owned(),
+            sample_embedder_for("quality-model", 384),
+        );
+        manifest.manifest_hash = compute_manifest_hash(&manifest).unwrap();
+        let mut verifier = ObservedVerifier::new();
+        let ctrl = GenerationController::new();
+        let error = ctrl.activate(manifest.clone(), &verifier, 100).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("runtime embedder missing for tier 'quality'")
+        );
+        assert!(ctrl.is_degraded());
+        verifier.base.runtime_embedders = manifest.embedders.clone();
+        assert!(ctrl.activate(manifest, &verifier, 200).is_ok());
+    }
+
+    #[test]
+    fn custom_predicates_still_add_restrictions_after_mandatory_checks_pass() {
+        let mut manifest = sample_manifest();
+        manifest.activation_invariants = vec![ActivationInvariant {
+            id: "deployment".to_owned(),
+            description: "Additional deployment restriction".to_owned(),
+            kind: InvariantKind::Custom {
+                check_name: "deployment".to_owned(),
+            },
+        }];
+        manifest.manifest_hash = compute_manifest_hash(&manifest).unwrap();
+        let mut verifier = ObservedVerifier::new();
+        verifier.custom_pass = false;
+        let ctrl = GenerationController::new();
+        let error = ctrl.activate(manifest, &verifier, 100).unwrap_err();
+        assert!(error.to_string().contains("deployment"));
+        assert_eq!(verifier.verified.lock().unwrap().len(), 2);
+        assert_eq!(*verifier.producers.lock().unwrap(), ["fast"]);
+        assert!(verifier.resolved.lock().unwrap().is_empty());
+        assert!(ctrl.is_degraded());
     }
 
     #[test]
