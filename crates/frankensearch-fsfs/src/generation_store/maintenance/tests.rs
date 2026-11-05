@@ -103,6 +103,129 @@ fn prepared_first_build_keeps_an_empty_store_unselected_until_restore() {
         let target = plan.target().clone();
         assert_eq!(durable(plan.restore(&cx, |_, _| Ok(())).unwrap()), target);
         assert_eq!(store.active(&cx).unwrap(), Some(target));
+        assert!(store.plan_retention(&cx, 1).unwrap().retained.is_empty());
+        assert!(store.collect_retained(&cx, 0).unwrap().removed.is_empty());
+    });
+}
+
+#[test]
+fn restoring_after_missing_or_malformed_selection_preserves_unknown_history() {
+    run_test_with_cx(|cx| async move {
+        for absent in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let target = published(&store, &cx, b"trusted recovery target");
+            let previous = published(&store, &cx, b"previously selected");
+            let selection = root.path().join(COMPLETE_GENERATION_POINTER);
+            if absent {
+                fs::rename(&selection, root.path().join("saved-selection")).unwrap();
+            } else {
+                fs::write(&selection, b"damaged selection evidence").unwrap();
+            }
+            let restore = store.prepare_restore(&cx, &target).unwrap();
+            assert_eq!(
+                durable(restore.restore(&cx, |_, _| Ok(())).unwrap()),
+                target
+            );
+            let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
+            assert_eq!(reopened.active(&cx).unwrap(), Some(target.clone()));
+            for keep in [0, 1, 2] {
+                assert!(reopened.plan_retention(&cx, keep).is_err());
+                assert!(reopened.collect_retained(&cx, keep).is_err());
+            }
+            assert_eq!(
+                fs::read(previous.path().join("content.txt")).unwrap(),
+                b"previously selected"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_resume_receipt_cannot_upgrade_a_candidate_to_a_proven_first_activation() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let build = store.begin(&cx).unwrap();
+        fs::write(build.path().join("content.txt"), b"prepared first build").unwrap();
+        let plan = build.prepare(&cx, |_, _| Ok(())).unwrap();
+        let id = plan.target().id().to_owned();
+        let manifest = plan.target().manifest_sha256().to_owned();
+        let receipt = plan.expected_selection_sha256();
+        drop(plan);
+        let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
+        let resumed = reopened
+            .resume_restore(&cx, &id, &manifest, &receipt)
+            .unwrap();
+        drop(resumed.restore(&cx, |_, _| Ok(())).unwrap());
+        assert_eq!(reopened.active(&cx).unwrap().unwrap().id(), id);
+        assert!(reopened.plan_retention(&cx, 0).is_err());
+    });
+}
+
+#[test]
+fn a_first_publication_cannot_claim_an_empty_origin_over_another_sealed_candidate() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let build = store.begin(&cx).unwrap();
+        fs::write(
+            build.path().join("content.txt"),
+            b"unselected recovery candidate",
+        )
+        .unwrap();
+        let preview = build.prepare(&cx, |_, _| Ok(())).unwrap();
+        let preserved = preview.target().path().to_path_buf();
+        drop(preview);
+        let current = published(&store, &cx, b"first selection with unknown prior history");
+        assert_eq!(store.active(&cx).unwrap(), Some(current));
+        assert!(store.collect_retained(&cx, 0).is_err());
+        assert_eq!(
+            fs::read(preserved.join("content.txt")).unwrap(),
+            b"unselected recovery candidate"
+        );
+    });
+}
+
+#[test]
+fn a_prepared_restore_rejects_an_aba_selection_even_when_the_same_bundle_returns() {
+    run_test_with_cx(|cx| async move {
+        let root = tempfile::tempdir().unwrap();
+        let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+        let first = published(&store, &cx, b"first");
+        let second = published(&store, &cx, b"second");
+        drop(
+            store
+                .prepare_restore(&cx, &first)
+                .unwrap()
+                .restore(&cx, |_, _| Ok(()))
+                .unwrap(),
+        );
+        let original = pointer(&store);
+        let stale = store.prepare_restore(&cx, &second).unwrap();
+        drop(
+            store
+                .prepare_restore(&cx, &second)
+                .unwrap()
+                .restore(&cx, |_, _| Ok(()))
+                .unwrap(),
+        );
+        drop(
+            store
+                .prepare_restore(&cx, &first)
+                .unwrap()
+                .restore(&cx, |_, _| Ok(()))
+                .unwrap(),
+        );
+        let returned = pointer(&store);
+        assert_ne!(
+            returned, original,
+            "each activation has its own history identity"
+        );
+        assert_eq!(store.active(&cx).unwrap(), Some(first.clone()));
+        assert!(stale.restore(&cx, |_, _| Ok(())).is_err());
+        assert_eq!(pointer(&store), returned);
+        assert_eq!(store.active(&cx).unwrap(), Some(first));
     });
 }
 

@@ -21,7 +21,8 @@ use super::{
     CompleteGenerationStore, GENERATIONS, GenerationBuild, GenerationPublication,
     MAX_MANIFEST_BYTES, MAX_POINTER_BYTES, NEXT_GENERATION, POINTER_MAGIC, PublicationLease,
     PublishedGeneration, checkpoint, decode_pointer, digest, hex, invalid, inventory, open_regular,
-    pin_generation, read_bounded_regular, require_directory, sync_tree, write_new_synced,
+    pin_generation, read_bounded_regular, require_directory, stage_activation_pointer,
+    sync_selected_activation, sync_tree, write_new_synced,
 };
 
 #[cfg(unix)]
@@ -38,6 +39,9 @@ pub struct PreparedGenerationRestore {
     store: CompleteGenerationStore,
     target: PublishedGeneration,
     expected_selection: Option<Vec<u8>>,
+    // Only a newly allocated ordinary build can prove its own first activation.
+    // A trusted restore/resume receipt does not prove an empty prior history.
+    allow_genesis: bool,
 }
 
 impl GenerationBuild {
@@ -69,6 +73,7 @@ impl GenerationBuild {
             store: self.store,
             target,
             expected_selection: self.predecessor,
+            allow_genesis: self.allow_inherited_files,
         };
         drop(self.lease);
         Ok(plan)
@@ -291,6 +296,7 @@ impl CompleteGenerationStore {
             store: self.clone(),
             target,
             expected_selection,
+            allow_genesis: false,
         })
     }
 
@@ -372,6 +378,9 @@ impl CompleteGenerationStore {
         }
         sync_tree(cx, generation.path(), 0)?;
         sync_directory(&self.root.join(GENERATIONS))?;
+        if let Some(pointer) = expected.as_deref() {
+            sync_selected_activation(&self.root, pointer)?;
+        }
         open_regular(&self.root.join(COMPLETE_GENERATION_POINTER))?.sync_all()?;
         // Refuse detected mutation during sync; a checksum is not permission
         // to accept new bytes as the same generation.
@@ -414,6 +423,10 @@ impl PreparedGenerationRestore {
     ///
     /// `validate` must perform the consumer's read-only engine completeness and
     /// producer-identity checks, just like [`super::GenerationBuild::publish`].
+    /// A fresh immutable activation record preserves the exact selection this
+    /// restore replaces, even when the target's bundle was created much earlier.
+    /// Missing/malformed incumbent evidence remains an unresolved history origin
+    /// for retention; restoring cannot manufacture an empty store history.
     /// A failure or cancellation before rename preserves the incumbent. The old
     /// and target directories, including corrupt data, are never deleted.
     ///
@@ -452,12 +465,15 @@ impl PreparedGenerationRestore {
         sync_directory(&self.store.root.join(GENERATIONS))?;
         self.store
             .open_retained(cx, target.id(), target.manifest_sha256())?;
-        let pointer = format!(
-            "{POINTER_MAGIC}\n{}\n{}\n",
+        let pointer = stage_activation_pointer(
+            cx,
+            &self.store.root,
             target.id(),
-            target.manifest_sha256()
-        );
-        let temporary = stage_restore_pointer(cx, &self.store.root, pointer.as_bytes())?;
+            target.manifest_sha256(),
+            self.expected_selection.as_deref(),
+            self.allow_genesis,
+        )?;
+        let temporary = stage_restore_pointer(cx, &self.store.root, &pointer)?;
         checkpoint(cx)?;
         lease.fence("complete-generation restore publication")?;
         ensure_selection(&self.store.root, self.expected_selection.as_deref())?;

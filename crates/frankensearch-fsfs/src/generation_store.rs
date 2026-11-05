@@ -7,8 +7,9 @@
 //! hashed again (see `digest_memo`). Publication, cancellation and
 //! Drop never delete data: predecessors and abandoned builds stay until an
 //! explicit retention pass ([`CompleteGenerationStore::collect_retained`])
-//! removes those older than the newest kept predecessors, skipping any
-//! generation a live reader in any process pins.
+//! protects the actual activation predecessors and skips any generation a live
+//! reader in any process pins. Immutable activation records bind each selection
+//! to the exact selection it replaced; a sealed preview is not a predecessor.
 //!
 //! This is a cooperative, trusted-directory protocol, not protection against a
 //! hostile process replacing directory ancestors or mutating files outside the
@@ -46,12 +47,45 @@ const GENERATIONS: &str = "generations";
 /// Per-generation reader pin files; never part of a sealed bundle.
 const READER_PINS: &str = "readers";
 const POINTER_MAGIC: &str = "FSFS-COMPLETE-GENERATION-v1";
+const HISTORY_POINTER_MAGIC: &str = "FSFS-COMPLETE-GENERATION-v2";
+const ACTIVATION_HISTORY: &str = "activation-history";
 const MAX_POINTER_BYTES: u64 = 256;
+const MAX_ACTIVATION_RECORD_BYTES: u64 = 2048;
+const MAX_RETENTION_HISTORY_HOPS: usize = 4096;
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ARTIFACTS: usize = 100_000;
 const MAX_TREE_DEPTH: usize = 64;
 const MAX_ACTIVE_OPEN_ATTEMPTS: usize = 4;
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// A v1 selection can still be searched, but supplies no activation ancestry.
+/// A v2 selection authenticates one immutable record independently of the bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GenerationSelection {
+    id: String,
+    manifest_sha256: String,
+    activation_sha256: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivationRecord {
+    schema_version: u16,
+    generation: String,
+    manifest_sha256: String,
+    predecessor: ActivationPredecessor,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ActivationPredecessor {
+    /// Only a new build in a store without earlier sealed bundles or records.
+    Genesis,
+    /// The exact, structurally valid descriptor replaced by this activation.
+    Selected { pointer: String },
+    /// Recovery cannot manufacture ancestry from missing or malformed evidence.
+    Unresolved { selection_sha256: Option<String> },
+}
 
 /// A canonical, stable root containing immutable generations and one pointer.
 #[derive(Debug, Clone)]
@@ -339,8 +373,8 @@ impl CompleteGenerationStore {
         };
         for _ in 0..MAX_ACTIVE_OPEN_ATTEMPTS {
             checkpoint(cx)?;
-            let (id, manifest_sha256) = decode_pointer(&pointer, &self.root)?;
-            let error = match open(self, cx, &id, &manifest_sha256) {
+            let selection = decode_pointer(&pointer, &self.root)?;
+            let error = match open(self, cx, &selection.id, &selection.manifest_sha256) {
                 Ok(generation) => return Ok(Some(generation)),
                 Err(error) => error,
             };
@@ -385,10 +419,10 @@ impl CompleteGenerationStore {
         let Some(pointer) = read_pointer(&self.root)? else {
             return Ok(false);
         };
-        let (id, manifest_sha256) = decode_pointer(&pointer, &self.root)?;
-        Ok(generation.id == id
-            && generation.manifest_sha256 == manifest_sha256
-            && generation.path == self.root.join(GENERATIONS).join(id))
+        let selection = decode_pointer(&pointer, &self.root)?;
+        Ok(generation.id == selection.id
+            && generation.manifest_sha256 == selection.manifest_sha256
+            && generation.path == self.root.join(GENERATIONS).join(selection.id))
     }
 
     /// Reserve a fresh directory while excluding every other cooperating writer.
@@ -495,7 +529,14 @@ impl GenerationBuild {
         G: FnOnce(&Cx) -> SearchResult<()>,
     {
         let manifest_sha256 = self.seal(cx, validate)?;
-        let pointer = format!("{POINTER_MAGIC}\n{}\n{manifest_sha256}\n", self.id).into_bytes();
+        let pointer = stage_activation_pointer(
+            cx,
+            &self.store.root,
+            &self.id,
+            &manifest_sha256,
+            self.predecessor.as_deref(),
+            self.allow_inherited_files,
+        )?;
         let temporary = self.store.root.join(format!(".FSFS-CURRENT-{}", self.id));
         write_new_synced(&temporary, &pointer)?;
         precommit(cx)?;
@@ -594,8 +635,8 @@ impl GenerationBuild {
         let Some(pointer) = self.predecessor.as_deref() else {
             return Ok(());
         };
-        let (id, manifest_sha256) = decode_pointer(pointer, &self.store.root)?;
-        let predecessor = self.store.root.join(GENERATIONS).join(id);
+        let selection = decode_pointer(pointer, &self.store.root)?;
+        let predecessor = self.store.root.join(GENERATIONS).join(selection.id);
         let mut sealed = None;
         for artifact in files {
             checkpoint(cx)?;
@@ -616,7 +657,10 @@ impl GenerationBuild {
             }
             let sealed = match &mut sealed {
                 Some(sealed) => sealed,
-                None => sealed.insert(sealed_artifacts_at(&predecessor, &manifest_sha256)?),
+                None => sealed.insert(sealed_artifacts_at(
+                    &predecessor,
+                    &selection.manifest_sha256,
+                )?),
             };
             if sealed.get(&artifact.path) != Some(&(artifact.bytes, artifact.sha256.clone())) {
                 return Err(invalid(
@@ -663,17 +707,17 @@ pub(crate) fn reject_published_write(root: &Path) -> SearchResult<()> {
 
 /// Predecessors a complete-generation command keeps after it publishes.
 ///
-/// A generation copies its predecessor except for the keyword segments the
-/// two share, so one keeps a settled store under twice a fresh build while
-/// leaving the previous generation available to restore.
+/// Count actual, distinct activation predecessors, not directory creation dates
+/// or sealed previews. Re-selecting an old bundle still creates a new activation.
 pub const RETAINED_PREDECESSORS: usize = 1;
 
 /// What a complete-generation command does with superseded generations after
 /// a durable publication (`FSFS_GENERATION_RETENTION`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GenerationRetention {
-    /// Remove generations older than the [`RETAINED_PREDECESSORS`] newest
-    /// predecessors, and abandoned builds, unless a live reader pins them.
+    /// Keep the [`RETAINED_PREDECESSORS`] actual activation predecessors and
+    /// remove other generations and abandoned builds unless a live reader pins
+    /// them. Unavailable activation history refuses collection.
     #[default]
     Collect,
     /// Report what `Collect` would remove; remove nothing.
@@ -710,9 +754,9 @@ impl GenerationRetention {
 pub struct RetentionPlan {
     /// The selected generation, which retention never removes.
     pub active: Option<String>,
-    /// Sealed unselected generations kept as the newest predecessors.
+    /// Distinct actual predecessors, most recently selected first.
     pub retained: Vec<String>,
-    /// Generations a collection would remove, oldest first.
+    /// Generations a collection would remove, ordered by identifier.
     pub reclaimable: Vec<ReclaimableGeneration>,
 }
 
@@ -723,7 +767,7 @@ pub struct ReclaimableGeneration {
     pub id: String,
     /// Bytes removing it frees: a file it shares with a kept generation is not
     /// counted, and one several reclaimable generations share counts once,
-    /// for the oldest.
+    /// for the first in identifier order.
     pub bytes: u64,
     /// False for an abandoned build that never sealed an inventory.
     pub sealed: bool,
@@ -732,7 +776,7 @@ pub struct ReclaimableGeneration {
 /// What one collection removed and what live readers kept.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RetentionReport {
-    /// Removed generation identifiers, oldest first.
+    /// Removed generation identifiers in deterministic identifier order.
     pub removed: Vec<String>,
     /// Bytes the removed generations held (see [`ReclaimableGeneration::bytes`]).
     pub reclaimed_bytes: u64,
@@ -742,36 +786,62 @@ pub struct RetentionReport {
 
 impl CompleteGenerationStore {
     /// Plan retention without changing anything: keep the selection and the
-    /// `keep_predecessors` newest other sealed generations; everything else
-    /// under `generations/` (older sealed generations and abandoned unsealed
-    /// builds) is reclaimable. Only directories named like generations count.
+    /// `keep_predecessors` distinct bundles actually selected before it. The
+    /// immutable activation chain supplies that order; sealed previews cannot
+    /// displace a predecessor. Restores of the active or an already counted
+    /// bundle do not consume another predecessor allowance.
+    ///
+    /// Only exact authenticated links are followed, up to a bounded number of
+    /// hops. The walk stops once enough distinct predecessors are protected, or
+    /// a proven initial activation is reached. An older link beyond that policy
+    /// boundary is not required. No activation record is ever collected.
     ///
     /// # Errors
-    /// Returns cancellation, malformed-selection, or filesystem errors. A
-    /// malformed selection is never guessed around: nothing is reclaimable
-    /// until it is repaired.
+    /// Returns cancellation, changed/malformed selection, unavailable or corrupt
+    /// required history, missing/corrupt retained bundles, or filesystem errors.
+    /// Legacy selections and unresolved recovery origins cannot establish a
+    /// predecessor chain; collection must wait for sufficient known ancestry.
     pub fn plan_retention(&self, cx: &Cx, keep_predecessors: usize) -> SearchResult<RetentionPlan> {
         checkpoint(cx)?;
         self.require_profile_admissible()?;
-        let active = match read_pointer(&self.root)? {
-            Some(pointer) => Some(decode_pointer(&pointer, &self.root)?.0),
-            None => None,
+        let expected_selection = read_pointer(&self.root)?;
+        let selection = expected_selection
+            .as_deref()
+            .map(|pointer| decode_pointer(pointer, &self.root))
+            .transpose()?;
+        let active = selection.as_ref().map(|selection| selection.id.clone());
+        let retained = match selection {
+            Some(selection) => self.retention_predecessors(cx, selection, keep_predecessors)?,
+            None if history_has_objects(&self.root)? => {
+                return Err(retention_history_error(
+                    &self.root,
+                    "activation records remain without a selection",
+                ));
+            }
+            None => Vec::new(),
         };
         let parent = self.root.join(GENERATIONS);
-        let entries = match fs::read_dir(&parent) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
+        match fs::symlink_metadata(&parent) {
+            Ok(_) => require_directory(&parent)?,
+            Err(error) if error.kind() == ErrorKind::NotFound && active.is_none() => {
                 return Ok(RetentionPlan {
                     active,
                     ..RetentionPlan::default()
                 });
             }
             Err(error) => return Err(error.into()),
-        };
-        let mut sealed = Vec::new();
-        let mut abandoned = Vec::new();
-        for entry in entries {
+        }
+        let entries = fs::read_dir(&parent)?;
+        let retained_ids = retained.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut candidates = Vec::new();
+        for (ordinal, entry) in entries.enumerate() {
             checkpoint(cx)?;
+            if ordinal >= MAX_ARTIFACTS {
+                return Err(retention_history_error(
+                    &self.root,
+                    "generation inventory exceeds its entry bound",
+                ));
+            }
             let entry = entry?;
             let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -779,33 +849,23 @@ impl CompleteGenerationStore {
             if !is_generation_id(&id) || active.as_deref() == Some(id.as_str()) {
                 continue;
             }
-            if !fs::symlink_metadata(entry.path())?.is_dir() {
-                continue;
+            require_directory(&entry.path())?;
+            let sealed = is_sealed(&entry.path())?;
+            if active.is_none() && sealed {
+                return Err(retention_history_error(
+                    &self.root,
+                    "sealed generations remain without a selection",
+                ));
             }
-            if is_sealed(&entry.path())? {
-                sealed.push(id);
-            } else {
-                abandoned.push(id);
+            if !retained_ids.contains(id.as_str()) {
+                candidates.push((id, sealed));
             }
         }
-        // Identifiers start with a fixed-width creation timestamp, and builds
-        // are serialized by the publication lease, so this is publication order.
-        sealed.sort_unstable_by(|left, right| right.cmp(left));
-        let older = sealed.split_off(keep_predecessors.min(sealed.len()));
-        let mut candidates = older
-            .into_iter()
-            .map(|id| (id, true))
-            .chain(abandoned.into_iter().map(|id| (id, false)))
-            .collect::<Vec<_>>();
         candidates.sort_unstable();
         // Shared segments the kept generations link are freed by no removal.
         let mut counted = HashSet::new();
-        for id in active.iter().chain(&sealed) {
-            match tree_bytes(cx, &parent.join(id), 0, &mut counted) {
-                Ok(_) => {}
-                Err(SearchError::Io(error)) if error.kind() == ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
-            }
+        for id in active.iter().chain(&retained) {
+            tree_bytes(cx, &parent.join(id), 0, &mut counted)?;
         }
         let mut reclaimable = Vec::with_capacity(candidates.len());
         for (id, is_sealed) in candidates {
@@ -816,11 +876,107 @@ impl CompleteGenerationStore {
                 sealed: is_sealed,
             });
         }
+        if read_pointer(&self.root)? != expected_selection {
+            return Err(retention_history_error(
+                &self.root,
+                "selection changed during retention planning; retry against the new head",
+            ));
+        }
         Ok(RetentionPlan {
             active,
-            retained: sealed,
+            retained,
             reclaimable,
         })
+    }
+
+    fn retention_predecessors(
+        &self,
+        cx: &Cx,
+        mut selection: GenerationSelection,
+        keep: usize,
+    ) -> SearchResult<Vec<String>> {
+        let mut retained = Vec::new();
+        let mut generations =
+            BTreeMap::from([(selection.id.clone(), selection.manifest_sha256.clone())]);
+        let mut activations = HashSet::new();
+        for _ in 0..MAX_RETENTION_HISTORY_HOPS {
+            checkpoint(cx)?;
+            if let Some(sha256) = &selection.activation_sha256
+                && !activations.insert(sha256.clone())
+            {
+                return Err(retention_history_error(
+                    &self.root,
+                    "activation history contains a cycle",
+                ));
+            }
+            let record = read_activation_record(&self.root, &selection)?;
+            let pointer = match record.predecessor {
+                ActivationPredecessor::Genesis => return Ok(retained),
+                ActivationPredecessor::Unresolved { .. } => {
+                    return Err(retention_history_error(
+                        &self.root,
+                        "recovery began without a valid prior selection; required ancestry is unknown",
+                    ));
+                }
+                ActivationPredecessor::Selected { pointer } => pointer,
+            };
+            let predecessor = decode_pointer(pointer.as_bytes(), &self.root)?;
+            if let Some(known) = generations.get(&predecessor.id) {
+                if *known != predecessor.manifest_sha256 {
+                    return Err(retention_history_error(
+                        &self.root,
+                        "one generation has conflicting manifest identities in activation history",
+                    ));
+                }
+            } else if keep > 0 {
+                self.verify_retention_target(cx, &predecessor)?;
+                generations.insert(predecessor.id.clone(), predecessor.manifest_sha256.clone());
+                retained.push(predecessor.id.clone());
+            }
+            if retained.len() == keep {
+                return Ok(retained);
+            }
+            selection = predecessor;
+        }
+        Err(retention_history_error(
+            &self.root,
+            "activation history exceeds its traversal bound before enough distinct predecessors are protected",
+        ))
+    }
+
+    /// Validate a protected root without opening/creating a reader pin. Planning
+    /// is read-only; collection separately owns the publication lease throughout.
+    fn verify_retention_target(
+        &self,
+        cx: &Cx,
+        selection: &GenerationSelection,
+    ) -> SearchResult<()> {
+        let parent = self.root.join(GENERATIONS);
+        require_directory(&parent)?;
+        let path = parent.join(&selection.id);
+        require_directory(&path)?;
+        let bytes =
+            read_bounded_regular(&path.join(COMPLETE_GENERATION_MANIFEST), MAX_MANIFEST_BYTES)?;
+        if digest(&bytes) != selection.manifest_sha256 {
+            return Err(retention_history_error(
+                &self.root,
+                "a retained predecessor's inventory digest changed",
+            ));
+        }
+        let manifest: BundleManifest = serde_json::from_slice(&bytes).map_err(|_| {
+            retention_history_error(&self.root, "a retained predecessor's inventory is invalid")
+        })?;
+        if manifest.schema_version != 1
+            || manifest.generation != selection.id
+            || manifest.files.is_empty()
+            || inventory(cx, &path, true)? != manifest.files
+        {
+            return Err(retention_history_error(
+                &self.root,
+                "a retained predecessor no longer matches its admitted bundle",
+            ));
+        }
+        Ok(())
     }
 
     /// Remove what [`Self::plan_retention`] finds reclaimable, under the
@@ -1360,27 +1516,227 @@ fn read_pointer(root: &Path) -> SearchResult<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
-fn decode_pointer(bytes: &[u8], root: &Path) -> SearchResult<(String, String)> {
+fn decode_pointer(bytes: &[u8], root: &Path) -> SearchResult<GenerationSelection> {
+    if bytes.len() as u64 > MAX_POINTER_BYTES {
+        return Err(invalid(
+            root,
+            "complete-generation pointer exceeds its size bound",
+        ));
+    }
     let text = std::str::from_utf8(bytes).map_err(|_| invalid(root, "selection is not UTF-8"))?;
     let fields = text.split('\n').collect::<Vec<_>>();
-    if fields.len() != 4 || fields[0] != POINTER_MAGIC || !fields[3].is_empty() {
-        return Err(invalid(root, "invalid complete-generation pointer framing"));
-    }
+    let activation_sha256 = match fields.as_slice() {
+        [POINTER_MAGIC, _, _, ""] => None,
+        [HISTORY_POINTER_MAGIC, _, _, activation, ""] if hex(activation, 64) => {
+            Some((*activation).to_owned())
+        }
+        _ => return Err(invalid(root, "invalid complete-generation pointer framing")),
+    };
     let id = fields[1];
-    let parts = id.split('-').collect::<Vec<_>>();
-    if parts.len() != 4
-        || parts[0] != "g"
-        || !hex(parts[1], 32)
-        || !hex(parts[2], 8)
-        || !hex(parts[3], 16)
-        || !hex(fields[2], 64)
-    {
+    if !is_generation_id(id) || !hex(fields[2], 64) {
         return Err(invalid(
             root,
             "invalid complete-generation identity or digest",
         ));
     }
-    Ok((id.to_owned(), fields[2].to_owned()))
+    Ok(GenerationSelection {
+        id: id.to_owned(),
+        manifest_sha256: fields[2].to_owned(),
+        activation_sha256,
+    })
+}
+
+fn retention_history_error(root: &Path, reason: &str) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "generation_retention_history".to_owned(),
+        value: root.display().to_string(),
+        reason: format!(
+            "{reason}; retain the store and recover the required activation history before collection, or use retention=off"
+        ),
+    }
+}
+
+fn activation_path(root: &Path, sha256: &str) -> PathBuf {
+    root.join(ACTIVATION_HISTORY).join(format!("{sha256}.json"))
+}
+
+fn history_has_objects(root: &Path) -> SearchResult<bool> {
+    let directory = root.join(ACTIVATION_HISTORY);
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+        Ok(_) => require_directory(&directory)?,
+    }
+    Ok(fs::read_dir(directory)?.next().transpose()?.is_some())
+}
+
+/// Absence of CURRENT alone cannot prove an empty history. Only a new build may
+/// exclude its own fresh directory, never an already retained restore target.
+fn first_build_origin(cx: &Cx, root: &Path, candidate: &str) -> SearchResult<bool> {
+    if history_has_objects(root)? {
+        return Ok(false);
+    }
+    let parent = root.join(GENERATIONS);
+    require_directory(&parent)?;
+    for (ordinal, entry) in fs::read_dir(&parent)?.enumerate() {
+        checkpoint(cx)?;
+        if ordinal >= MAX_ARTIFACTS {
+            return Err(retention_history_error(
+                root,
+                "initial generation inventory exceeds its entry bound",
+            ));
+        }
+        let entry = entry?;
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if is_generation_id(&id)
+            && id != candidate
+            && (!fs::symlink_metadata(entry.path())?.is_dir() || is_sealed(&entry.path())?)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Stage a create-new immutable record and sync its directory before the caller
+/// can publish the v2 pointer. A failed/cancelled publication leaves only inert
+/// history objects; directory inventory never adopts one as an active record.
+fn stage_activation_pointer(
+    cx: &Cx,
+    root: &Path,
+    id: &str,
+    manifest_sha256: &str,
+    predecessor: Option<&[u8]>,
+    allow_genesis: bool,
+) -> SearchResult<Vec<u8>> {
+    checkpoint(cx)?;
+    let target = format!("{POINTER_MAGIC}\n{id}\n{manifest_sha256}\n");
+    decode_pointer(target.as_bytes(), root)?;
+    let predecessor = match predecessor {
+        Some(bytes) if decode_pointer(bytes, root).is_ok() => ActivationPredecessor::Selected {
+            pointer: std::str::from_utf8(bytes)
+                .map_err(|_| invalid(root, "selection is not UTF-8"))?
+                .to_owned(),
+        },
+        Some(bytes) => ActivationPredecessor::Unresolved {
+            selection_sha256: Some(digest(bytes)),
+        },
+        None if allow_genesis && first_build_origin(cx, root, id)? => {
+            ActivationPredecessor::Genesis
+        }
+        None => ActivationPredecessor::Unresolved {
+            selection_sha256: None,
+        },
+    };
+    let record = ActivationRecord {
+        schema_version: 1,
+        generation: id.to_owned(),
+        manifest_sha256: manifest_sha256.to_owned(),
+        predecessor,
+    };
+    let bytes = serde_json::to_vec(&record)
+        .map_err(|_| invalid(root, "cannot encode complete-generation activation record"))?;
+    if bytes.len() as u64 > MAX_ACTIVATION_RECORD_BYTES {
+        return Err(invalid(root, "activation record exceeds its size bound"));
+    }
+    let directory = root.join(ACTIVATION_HISTORY);
+    match fs::create_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    require_directory(&directory)?;
+    let sha256 = digest(&bytes);
+    let path = activation_path(root, &sha256);
+    match write_new_synced(&path, &bytes) {
+        Ok(()) => {}
+        Err(SearchError::Io(error)) if error.kind() == ErrorKind::AlreadyExists => {
+            // An exact retry may find its own already-staged record. Compare
+            // every bounded byte; never overwrite or trust a filename alone.
+            if read_bounded_regular(&path, MAX_ACTIVATION_RECORD_BYTES)? != bytes {
+                return Err(invalid(
+                    &path,
+                    "existing activation record differs from the exact attempt",
+                ));
+            }
+            open_regular(&path)?.sync_all()?;
+        }
+        Err(error) => return Err(error),
+    }
+    File::open(&directory)?.sync_all()?;
+    // The directory itself may have been created by this first activation.
+    File::open(root)?.sync_all()?;
+    checkpoint(cx)?;
+    Ok(format!("{HISTORY_POINTER_MAGIC}\n{id}\n{manifest_sha256}\n{sha256}\n").into_bytes())
+}
+
+fn read_activation_record(
+    root: &Path,
+    selection: &GenerationSelection,
+) -> SearchResult<ActivationRecord> {
+    let sha256 = selection.activation_sha256.as_deref().ok_or_else(|| {
+        retention_history_error(
+            root,
+            "legacy selection has no authenticated activation ancestry",
+        )
+    })?;
+    require_directory(&root.join(ACTIVATION_HISTORY)).map_err(|_| {
+        retention_history_error(root, "activation history directory is missing or unsafe")
+    })?;
+    let bytes = read_bounded_regular(&activation_path(root, sha256), MAX_ACTIVATION_RECORD_BYTES)
+        .map_err(|_| {
+        retention_history_error(
+            root,
+            "a required activation record is missing, unreadable, unsafe or oversized",
+        )
+    })?;
+    if digest(&bytes) != sha256 {
+        return Err(retention_history_error(
+            root,
+            "a required activation record does not match its authenticated digest",
+        ));
+    }
+    let record: ActivationRecord = serde_json::from_slice(&bytes).map_err(|_| {
+        retention_history_error(root, "a required activation record has invalid framing")
+    })?;
+    if record.schema_version != 1
+        || record.generation != selection.id
+        || record.manifest_sha256 != selection.manifest_sha256
+    {
+        return Err(retention_history_error(
+            root,
+            "activation schema or target differs from the selected bundle",
+        ));
+    }
+    match &record.predecessor {
+        ActivationPredecessor::Selected { pointer } => {
+            decode_pointer(pointer.as_bytes(), root).map_err(|_| {
+                retention_history_error(root, "activation predecessor descriptor is invalid")
+            })?;
+        }
+        ActivationPredecessor::Unresolved {
+            selection_sha256: Some(sha256),
+        } if !hex(sha256, 64) => {
+            return Err(retention_history_error(
+                root,
+                "unresolved activation evidence has an invalid digest",
+            ));
+        }
+        ActivationPredecessor::Genesis | ActivationPredecessor::Unresolved { .. } => {}
+    }
+    Ok(record)
+}
+
+fn sync_selected_activation(root: &Path, pointer: &[u8]) -> SearchResult<()> {
+    let selection = decode_pointer(pointer, root)?;
+    if let Some(sha256) = &selection.activation_sha256 {
+        read_activation_record(root, &selection)?;
+        open_regular(&activation_path(root, sha256))?.sync_all()?;
+        File::open(root.join(ACTIVATION_HISTORY))?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn hex(value: &str, length: usize) -> bool {
@@ -2088,7 +2444,7 @@ mod tests {
         names
     }
 
-    /// bd-2op1d: retention keeps the selection and the newest predecessors,
+    /// bd-2op1d: retention keeps the selection and the actual predecessors,
     /// reclaims older sealed generations and abandoned builds, and leaves
     /// anything not named like a generation alone. Planning changes nothing.
     #[test]
@@ -2159,6 +2515,355 @@ mod tests {
             assert_eq!(generation_names(root.path()), kept);
             assert_eq!(store.active(&cx).unwrap().unwrap().id(), ids[4]);
             assert!(store.plan_retention(&cx, 2).unwrap().reclaimable.is_empty());
+        });
+    }
+
+    #[test]
+    fn retention_keeps_the_actual_predecessor_instead_of_a_rejected_sealed_preview() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let first = publish(&store, &cx, "first").id().to_owned();
+            let previous = publish(&store, &cx, "previous");
+            let previous_id = previous.id().to_owned();
+            let previous_digest = previous.manifest_sha256().to_owned();
+            drop(previous);
+            let build = store.begin(&cx).unwrap();
+            write_bundle(build.path(), "rejected preview");
+            let preview = build.prepare(&cx, |_, _| Ok(())).unwrap();
+            let preview_id = preview.target().id().to_owned();
+            drop(preview);
+            let current = publish(&store, &cx, "current").id().to_owned();
+
+            // Reopening cannot depend on process-local publication order.
+            let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
+            let plan = reopened.plan_retention(&cx, 1).unwrap();
+            assert_eq!(plan.active.as_deref(), Some(current.as_str()));
+            assert_eq!(plan.retained, [previous_id.clone()]);
+            let mut expected_removed = vec![first, preview_id];
+            expected_removed.sort_unstable();
+            assert_eq!(
+                plan.reclaimable
+                    .iter()
+                    .map(|entry| entry.id.clone())
+                    .collect::<Vec<_>>(),
+                expected_removed
+            );
+            let history_before = fs::read_dir(root.path().join(ACTIVATION_HISTORY))
+                .unwrap()
+                .count();
+            assert_eq!(
+                reopened.collect_retained(&cx, 1).unwrap().removed,
+                expected_removed
+            );
+            let rollback = reopened
+                .open_retained(&cx, &previous_id, &previous_digest)
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(rollback.path().join("content.txt")).unwrap(),
+                "previous"
+            );
+            assert_eq!(
+                fs::read_dir(root.path().join(ACTIVATION_HISTORY))
+                    .unwrap()
+                    .count(),
+                history_before
+            );
+        });
+    }
+
+    #[test]
+    fn retention_follows_restore_order_and_counts_each_bundle_once() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let oldest = publish(&store, &cx, "oldest");
+            let middle = publish(&store, &cx, "middle").id().to_owned();
+            let latest = publish(&store, &cx, "latest").id().to_owned();
+            drop(
+                store
+                    .prepare_restore(&cx, &oldest)
+                    .unwrap()
+                    .restore(&cx, |_, _| Ok(()))
+                    .unwrap(),
+            );
+            let first_restore = read_pointer(root.path()).unwrap().unwrap();
+            // Re-selecting the active bundle advances history too. Neither this
+            // duplicate nor the later duplicate may consume a retention slot.
+            drop(
+                store
+                    .prepare_restore(&cx, &oldest)
+                    .unwrap()
+                    .restore(&cx, |_, _| Ok(()))
+                    .unwrap(),
+            );
+            assert_ne!(read_pointer(root.path()).unwrap().unwrap(), first_restore);
+            let oldest_id = oldest.id().to_owned();
+            drop(oldest);
+            drop(publish(&store, &cx, "successor"));
+
+            let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
+            assert_eq!(
+                reopened.plan_retention(&cx, 1).unwrap().retained,
+                [oldest_id.clone()]
+            );
+            assert_eq!(
+                reopened.plan_retention(&cx, 2).unwrap().retained,
+                [oldest_id, latest]
+            );
+            assert_eq!(reopened.collect_retained(&cx, 2).unwrap().removed, [middle]);
+            // A future pass need not traverse the already collected, older
+            // generation or reinterpret a missing old bundle as a new ancestor.
+            assert!(
+                reopened
+                    .plan_retention(&cx, 2)
+                    .unwrap()
+                    .reclaimable
+                    .is_empty()
+            );
+        });
+    }
+
+    #[test]
+    fn legacy_selection_remains_readable_but_cannot_invent_required_history() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "first"));
+            let current = publish(&store, &cx, "legacy selected");
+            fs::write(
+                root.path().join(COMPLETE_GENERATION_POINTER),
+                format!(
+                    "{POINTER_MAGIC}\n{}\n{}\n",
+                    current.id(),
+                    current.manifest_sha256()
+                ),
+            )
+            .unwrap();
+            assert_eq!(store.active(&cx).unwrap(), Some(current.clone()));
+            let before = generation_names(root.path());
+            for keep in [0, 1, 2] {
+                assert!(matches!(
+                    store.plan_retention(&cx, keep),
+                    Err(SearchError::InvalidConfig { field, .. }) if field == "generation_retention_history"
+                ));
+                assert!(store.collect_retained(&cx, keep).is_err());
+                assert_eq!(generation_names(root.path()), before);
+            }
+            // A new activation can prove this one exact predecessor, without
+            // pretending to reconstruct anything before the legacy selection.
+            drop(publish(&store, &cx, "known successor"));
+            assert_eq!(
+                store.plan_retention(&cx, 1).unwrap().retained,
+                [current.id().to_owned()]
+            );
+            assert!(store.plan_retention(&cx, 2).is_err());
+        });
+    }
+
+    #[test]
+    fn missing_or_corrupt_activation_history_blocks_collection_but_not_current_reads() {
+        run_test_with_cx(|cx| async move {
+            for fault in [
+                "missing",
+                "digest",
+                "oversized",
+                "record_symlink",
+                "directory_symlink",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+                drop(publish(&store, &cx, "old"));
+                let current = publish(&store, &cx, "current");
+                let selection =
+                    decode_pointer(&read_pointer(root.path()).unwrap().unwrap(), root.path())
+                        .unwrap();
+                let record_path =
+                    activation_path(root.path(), selection.activation_sha256.as_deref().unwrap());
+                match fault {
+                    "missing" => {
+                        fs::rename(&record_path, root.path().join("saved-record")).unwrap()
+                    }
+                    "digest" => fs::write(&record_path, b"damaged activation record").unwrap(),
+                    "oversized" => fs::write(
+                        &record_path,
+                        vec![b'x'; usize::try_from(MAX_ACTIVATION_RECORD_BYTES).unwrap() + 1],
+                    )
+                    .unwrap(),
+                    "record_symlink" => {
+                        let saved = root.path().join("saved-record");
+                        fs::rename(&record_path, &saved).unwrap();
+                        std::os::unix::fs::symlink(saved, &record_path).unwrap();
+                    }
+                    "directory_symlink" => {
+                        let saved = root.path().join("saved-history");
+                        fs::rename(root.path().join(ACTIVATION_HISTORY), &saved).unwrap();
+                        std::os::unix::fs::symlink(saved, root.path().join(ACTIVATION_HISTORY))
+                            .unwrap();
+                    }
+                    _ => unreachable!("fixture fault"), // ubs:ignore — cfg(test) fixture assertion.
+                }
+                let before = generation_names(root.path());
+                for keep in [0, 1] {
+                    assert!(store.plan_retention(&cx, keep).is_err(), "{fault}");
+                    assert!(store.collect_retained(&cx, keep).is_err(), "{fault}");
+                    assert_eq!(generation_names(root.path()), before, "{fault}");
+                }
+                assert_eq!(store.active(&cx).unwrap(), Some(current), "{fault}");
+            }
+        });
+    }
+
+    #[test]
+    fn activation_schema_target_and_predecessor_are_authenticated_before_collection() {
+        run_test_with_cx(|cx| async move {
+            for fault in ["schema", "target", "predecessor"] {
+                let root = tempfile::tempdir().unwrap();
+                let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+                let old_id = publish(&store, &cx, "old").id().to_owned();
+                let current = publish(&store, &cx, "current");
+                let selection =
+                    decode_pointer(&read_pointer(root.path()).unwrap().unwrap(), root.path())
+                        .unwrap();
+                let mut record = read_activation_record(root.path(), &selection).unwrap();
+                match fault {
+                    "schema" => record.schema_version = 2,
+                    "target" => record.generation = old_id,
+                    "predecessor" => {
+                        record.predecessor = ActivationPredecessor::Selected {
+                            pointer: "invalid predecessor".to_owned(),
+                        }
+                    }
+                    _ => unreachable!("fixture fault"), // ubs:ignore — cfg(test) fixture assertion.
+                }
+                let bytes = serde_json::to_vec(&record).unwrap();
+                let sha256 = digest(&bytes);
+                // Authenticate the malformed record's bytes so each check
+                // exercises its semantic refusal, not just a digest mismatch.
+                write_new_synced(&activation_path(root.path(), &sha256), &bytes).unwrap();
+                fs::write(
+                    root.path().join(COMPLETE_GENERATION_POINTER),
+                    format!(
+                        "{HISTORY_POINTER_MAGIC}\n{}\n{}\n{sha256}\n",
+                        current.id(),
+                        current.manifest_sha256()
+                    ),
+                )
+                .unwrap();
+                let before = generation_names(root.path());
+                assert!(store.collect_retained(&cx, 0).is_err(), "{fault}");
+                assert_eq!(generation_names(root.path()), before, "{fault}");
+                assert_eq!(store.active(&cx).unwrap(), Some(current), "{fault}");
+            }
+        });
+    }
+
+    #[test]
+    fn retention_needs_only_the_history_prefix_that_protects_its_distinct_predecessors() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            drop(publish(&store, &cx, "first"));
+            let previous = publish(&store, &cx, "previous").id().to_owned();
+            let selection =
+                decode_pointer(&read_pointer(root.path()).unwrap().unwrap(), root.path()).unwrap();
+            let record =
+                activation_path(root.path(), selection.activation_sha256.as_deref().unwrap());
+            drop(publish(&store, &cx, "current"));
+            fs::rename(record, root.path().join("saved-older-history")).unwrap();
+            let reopened = CompleteGenerationStore::open(&cx, root.path()).unwrap();
+            assert_eq!(
+                reopened.plan_retention(&cx, 1).unwrap().retained,
+                [previous]
+            );
+            // The current record still proves its predecessor exactly; asking
+            // for another predecessor requires the missing older link.
+            assert!(reopened.plan_retention(&cx, 2).is_err());
+            let before = generation_names(root.path());
+            assert!(reopened.collect_retained(&cx, 2).is_err());
+            assert_eq!(generation_names(root.path()), before);
+        });
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_required_predecessor_freezes_collection_before_any_removal() {
+        run_test_with_cx(|cx| async move {
+            for missing in [true, false] {
+                let root = tempfile::tempdir().unwrap();
+                let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+                drop(publish(&store, &cx, "older recovery source"));
+                let previous = publish(&store, &cx, "required predecessor");
+                let previous_path = previous.path().to_path_buf();
+                drop(previous);
+                let current = publish(&store, &cx, "current");
+                let build = store.begin(&cx).unwrap();
+                write_bundle(build.path(), "unselected preview");
+                drop(build.prepare(&cx, |_, _| Ok(())).unwrap());
+                if missing {
+                    fs::rename(&previous_path, root.path().join("saved-predecessor")).unwrap();
+                } else {
+                    fs::write(previous_path.join("vector.idx"), b"corrupt predecessor").unwrap();
+                }
+                let before = generation_names(root.path());
+                assert_eq!(store.active(&cx).unwrap(), Some(current));
+                assert!(store.plan_retention(&cx, 1).is_err());
+                assert!(store.collect_retained(&cx, 1).is_err());
+                assert_eq!(generation_names(root.path()), before);
+                assert!(store.plan_retention(&cx, 0).is_ok());
+            }
+        });
+    }
+
+    #[test]
+    fn a_symlinked_history_directory_refuses_publication_before_switching_selection() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let current = publish(&store, &cx, "current");
+            let pointer = read_pointer(root.path()).unwrap();
+            let saved = root.path().join("saved-history");
+            fs::rename(root.path().join(ACTIVATION_HISTORY), &saved).unwrap();
+            std::os::unix::fs::symlink(saved, root.path().join(ACTIVATION_HISTORY)).unwrap();
+            let build = store.begin(&cx).unwrap();
+            write_bundle(build.path(), "candidate");
+            assert!(build.publish(&cx, |_, _| Ok(())).is_err());
+            assert_eq!(read_pointer(root.path()).unwrap(), pointer);
+            assert_eq!(store.active(&cx).unwrap(), Some(current));
+        });
+    }
+
+    #[test]
+    fn retention_preserves_live_readers_and_prepared_previews_outside_the_history_allowance() {
+        run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let store = CompleteGenerationStore::create(&cx, root.path()).unwrap();
+            let reader = publish(&store, &cx, "live reader");
+            let predecessor = publish(&store, &cx, "actual predecessor").id().to_owned();
+            let build = store.begin(&cx).unwrap();
+            write_bundle(build.path(), "pinned preview");
+            let preview = build.prepare(&cx, |_, _| Ok(())).unwrap();
+            let preview_id = preview.target().id().to_owned();
+            drop(publish(&store, &cx, "current"));
+            assert_eq!(
+                store.plan_retention(&cx, 1).unwrap().retained,
+                [predecessor]
+            );
+            let mut pinned = vec![reader.id().to_owned(), preview_id];
+            pinned.sort_unstable();
+            let report = store.collect_retained(&cx, 1).unwrap();
+            assert!(report.removed.is_empty());
+            assert_eq!(report.pinned, pinned);
+            assert_eq!(
+                fs::read_to_string(reader.path().join("content.txt")).unwrap(),
+                "live reader"
+            );
+            assert_eq!(
+                fs::read_to_string(preview.target().path().join("content.txt")).unwrap(),
+                "pinned preview"
+            );
+            drop(reader);
+            drop(preview);
+            assert_eq!(store.collect_retained(&cx, 1).unwrap().removed, pinned);
         });
     }
 
