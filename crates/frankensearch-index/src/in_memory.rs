@@ -20,7 +20,7 @@
 //! ```
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::ffi::OsString;
 #[cfg(target_os = "linux")]
@@ -2129,11 +2129,32 @@ impl InMemoryVectorIndex {
                 reason: "vector slab allocation failed".to_owned(),
             })?;
 
+        // WAL appends become durable before their old main rows are tombstoned.
+        // A crash in that interval leaves both physical versions readable, but
+        // only the resident WAL version is current. Resolve that precedence
+        // before copying into a snapshot with no WAL of its own; otherwise the
+        // stale vector can win top-k and document lookups forever after reopen.
+        // The file opener already deduplicates WAL entries with last-write-wins
+        // semantics, so these borrowed IDs describe the entire replacement set.
+        let mut wal_doc_ids = HashSet::new();
+        wal_doc_ids
+            .try_reserve(index.wal_entries.len())
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "vectors".to_owned(),
+                value: index.wal_entries.len().to_string(),
+                reason: "WAL document-id lookup allocation failed".to_owned(),
+            })?;
+        wal_doc_ids.extend(index.wal_entries.iter().map(|entry| entry.doc_id.as_str()));
+
         for i in 0..count {
             if index.is_deleted(i) {
                 continue;
             }
-            doc_ids.push(fallible_doc_id_copy(index.doc_id_at(i)?)?);
+            let doc_id = index.doc_id_at(i)?;
+            if wal_doc_ids.contains(doc_id) {
+                continue;
+            }
+            doc_ids.push(fallible_doc_id_copy(doc_id)?);
             index.extend_vector_at_f16(i, &mut flat)?;
         }
 
@@ -4275,6 +4296,87 @@ mod tests {
         // Verify vectors were loaded in quantized form and still round-trip.
         let recovered = memory_index.vector_at_f32(0).unwrap();
         assert_eq!(recovered.len(), dim);
+    }
+
+    #[test]
+    fn from_fsvi_preserves_durable_wal_replacements_before_main_tombstones() {
+        for quantization in [Quantization::F16, Quantization::F32] {
+            let path = temp_index_path("wal-before-tombstone");
+            let mut writer = crate::VectorIndex::create_with_revision(
+                &path,
+                "test-embedder",
+                "rev-a",
+                2,
+                quantization,
+            )
+            .expect("create main index");
+            writer
+                .write_record("updated", &[1.0, 0.0])
+                .expect("write old high-scoring vector");
+            writer
+                .write_record("unchanged", &[0.75, 0.25])
+                .expect("write unchanged vector");
+            writer.finish().expect("seal main index");
+            let main_bytes = std::fs::read(&path).expect("retain main bytes");
+            let wal_path = crate::wal::wal_path_for(&path);
+
+            // Reproduce the real log-before-tombstone crash boundary. Both WAL
+            // batches are durable, while the superseded main row remains live.
+            // Repeated updates also exercise the opener's last-write-wins rule.
+            for rows in [
+                vec![("updated", vec![0.5, 0.5])],
+                vec![("updated", vec![0.0, 1.0]), ("added", vec![0.25, 0.75])],
+            ] {
+                let entries = rows
+                    .into_iter()
+                    .map(|(doc_id, embedding)| crate::wal::WalEntry {
+                        doc_id: doc_id.to_owned(),
+                        doc_id_hash: fnv1a_hash(doc_id.as_bytes()),
+                        embedding,
+                    })
+                    .collect::<Vec<_>>();
+                crate::wal::append_wal_batch(
+                    &wal_path,
+                    &entries,
+                    2,
+                    quantization,
+                    crate::next_generation(0),
+                    true,
+                )
+                .expect("persist replacement without tombstoning main");
+            }
+            let wal_bytes = std::fs::read(&wal_path).expect("retain WAL bytes");
+            let file_index = crate::VectorIndex::open_read_only(&path).expect("open reference");
+            assert_eq!(file_index.tombstone_count(), 0);
+            assert_eq!(file_index.wal_record_count(), 2);
+            let memory_index = InMemoryVectorIndex::from_fsvi(&path).expect("load snapshot");
+
+            assert_eq!(memory_index.record_count(), 3, "one row per live document");
+            let updated = memory_index
+                .index_of_doc_id("updated")
+                .expect("updated row");
+            assert_eq!(
+                memory_index.vector_at_f32(updated).expect("updated vector"),
+                vec![0.0, 1.0],
+                "document lookup must retain the latest WAL vector"
+            );
+            for query in [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]] {
+                for k in [1, 2, 3, 10] {
+                    let expected = file_index.search_top_k(&query, k, None).expect("reference");
+                    let actual = memory_index
+                        .search_top_k(&query, k, None)
+                        .expect("snapshot");
+                    let signature = |hits: &[VectorHit]| {
+                        hits.iter()
+                            .map(|hit| (hit.doc_id.clone(), hit.score.to_bits()))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(signature(&actual), signature(&expected));
+                }
+            }
+            assert_eq!(std::fs::read(&path).expect("main unchanged"), main_bytes);
+            assert_eq!(std::fs::read(&wal_path).expect("WAL unchanged"), wal_bytes);
+        }
     }
 
     // ─── Embedding-space identity (bd-9xuj T2-C3) ───────────────────────────
