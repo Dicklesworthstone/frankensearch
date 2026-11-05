@@ -581,9 +581,9 @@ impl SyncTwoTierSearcher {
     /// Join every tier this search will consult against the query bound to it,
     /// before any vector is read.
     ///
-    /// This runs first in [`Self::search_internal`], ahead of the `k == 0` and
-    /// zero-norm short circuits, so a query in the wrong space is refused even
-    /// when the search would otherwise have exited without touching an index.
+    /// This runs first in [`Self::search_internal`], ahead of the `k == 0`
+    /// return and the zero-norm fast-lane check, so a query in the wrong space
+    /// is refused even when its vector would never be searched.
     /// A refusal that depended on the search getting far enough to do work
     /// would not be a guard.
     fn admit<'query>(
@@ -645,23 +645,21 @@ impl SyncTwoTierSearcher {
                 metrics,
             });
         }
-        if query_vec.iter().all(|&value| value == 0.0) {
-            metrics.zero_signal = Some(ZeroSignalReason::ZeroNormQuery);
-            return Ok(SyncSearchOutcome {
-                phases,
-                final_results: Vec::new(),
-                metrics,
-            });
-        }
         let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
 
         let phase1_started = Instant::now();
-        let fast_hits = self.search_fast_hits(query_vec, fetch, filter)?;
-        // `phase1_vectors_searched` is diagnostic work accounting, not the
-        // bounded candidate-pool size. The fast-tier search evaluates the
-        // complete index before returning its top-k pool, matching the async
-        // searcher's metric contract and `TwoTierMetrics` documentation.
-        let phase1_vectors_searched = self.index.doc_count();
+        let (fast_hits, phase1_vectors_searched) = if query_vec.iter().all(|&value| value == 0.0) {
+            // Zero signal belongs to this semantic lane (bd-tqhc), not the
+            // whole query. Lexical matches and an independently admitted
+            // quality query can still answer it without any fast-vector work.
+            (Vec::new(), 0)
+        } else {
+            // Count the vectors evaluated, not the bounded candidate pool.
+            (
+                self.search_fast_hits(query_vec, fetch, filter)?,
+                self.index.doc_count(),
+            )
+        };
         metrics.phase1_vectors_searched = phase1_vectors_searched;
         let hash_control = sync_fast_is_hash_control(&self.index);
         metrics.publish_vector_candidates(fast_hits.len(), hash_control);
@@ -786,6 +784,17 @@ impl SyncTwoTierSearcher {
                 metrics,
             });
         };
+        if quality_query.vector().iter().all(|&value| value == 0.0) {
+            // A zero query has no quality evidence. Scanning or rescoring it
+            // would turn arbitrary zero-score ties into semantic results and
+            // could displace the useful fast or lexical answer already found.
+            metrics.skip_reason = Some("quality_query_zero_norm".to_owned());
+            return Ok(SyncSearchOutcome {
+                phases,
+                final_results: initial_results,
+                metrics,
+            });
+        }
         let quality_index = self
             .index
             .quality_index()
@@ -862,6 +871,11 @@ impl SyncTwoTierSearcher {
         };
         let quality_count = quality_scores_by_doc.len();
         metrics.phase2_vectors_searched = quality_count;
+        if quality_count > 0 {
+            // This classifies the combined semantic lane. Independent quality
+            // retrieval can supply signal even when the fast lane had none.
+            metrics.zero_signal = None;
+        }
         let quality_weight = saturating_f64_to_f32(self.config.quality_weight);
         let blended = match &quality_pool {
             SyncQualityPool::RescoredFastPool(scores) => {
@@ -1427,7 +1441,9 @@ fn unique_vector_hits_to_scored_results_owned(
 mod tests {
     use super::*;
     use frankensearch_core::ScoreSource;
-    use frankensearch_core::generation::EmbeddingIdentityBundleV1;
+    use frankensearch_core::generation::{
+        EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1, EmbeddingSpaceKindV1,
+    };
     use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
 
     /// Bind one synthetic vector to an explicitly synthetic identity.
@@ -1462,6 +1478,26 @@ mod tests {
         TieredQueryEmbeddings::fast_only(bound("sync-fixture", vector))
     }
 
+    /// A declared semantic test fixture, with the same validated shape used
+    /// by core identity tests. `explicit_test_model` alone is a hash control,
+    /// regardless of the name supplied to it.
+    fn semantic_identity(model: &str, dimension: u32) -> EmbeddingIdentityBundleV1 {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model, dimension);
+        identity.space.kind = EmbeddingSpaceKindV1::Semantic;
+        identity.space.hash_control = None;
+        identity.space.artifact_manifest_fingerprint = "a".repeat(64);
+        identity.space.artifacts = vec![EmbeddingArtifactIdentityV1 {
+            role: "weights".to_owned(),
+            sha256: "b".repeat(64),
+            size: 1,
+        }];
+        identity.producer.space_fingerprint = identity.space.fingerprint();
+        identity
+            .validate()
+            .expect("semantic fixture identity validates");
+        identity
+    }
+
     /// An in-memory tier loaded through exact FSVI v2 admission, so it carries
     /// an ATTESTED space identity read out of the artifact's own header.
     ///
@@ -1476,7 +1512,8 @@ mod tests {
         rows: &[(&str, &[f32])],
     ) -> (InMemoryVectorIndex, EmbeddingIdentityBundleV1) {
         let dimension = u32::try_from(rows[0].1.len()).expect("fixture dimension fits u32");
-        let mut artifact = EmbeddingIdentityBundleV1::explicit_test_model(model, dimension);
+        let query_identity = semantic_identity(model, dimension);
+        let mut artifact = query_identity.clone();
         "fsvi-v2".clone_into(&mut artifact.storage.format);
         artifact.storage.quantization = frankensearch_core::generation::QuantizationFormat::F16;
         "little-endian".clone_into(&mut artifact.storage.endianness);
@@ -1505,10 +1542,7 @@ mod tests {
         // The query-side bundle of the SAME space: in-process f32 storage,
         // which can never be byte-equal to the persisted f16 one. That is why
         // the join is on the space, not the whole bundle.
-        (
-            tier,
-            EmbeddingIdentityBundleV1::explicit_test_model(model, dimension),
-        )
+        (tier, query_identity)
     }
 
     #[cfg(target_os = "linux")]
@@ -1837,19 +1871,25 @@ mod tests {
             .expect("the producing space is admitted");
         assert_eq!(results[0].doc_id, "a");
 
-        // Same width, different space: refused, by the same contract field the
-        // async searcher and the owner-backed activation use.
-        let error = searcher
-            .search_collect(&fast_only_query(vec![1.0, 0.0]), 2)
-            .expect_err("a foreign embedding space must be refused");
-        assert!(
-            matches!(
-                error,
-                SearchError::InvalidConfig { ref field, .. }
-                    if field == "query_embedding.fast.space_identity"
-            ),
-            "got {error:?}"
-        );
+        // Same width, different space: refused even when zero signal or k=0
+        // would otherwise avoid vector work.
+        for (vector, k) in [
+            (vec![1.0, 0.0], 2),
+            (vec![0.0, 0.0], 2),
+            (vec![0.0, 0.0], 0),
+        ] {
+            let error = searcher
+                .search_collect(&fast_only_query(vector), k)
+                .expect_err("a foreign embedding space must be refused");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "query_embedding.fast.space_identity"
+                ),
+                "got {error:?}"
+            );
+        }
     }
 
     /// bd-ctzo C2 on the sync path: with an ATTESTED quality tier the refined
@@ -2077,17 +2117,294 @@ mod tests {
     }
 
     #[test]
-    fn zero_norm_query_over_empty_index_prefers_request_scoped_reason() {
+    fn zero_norm_query_preserves_request_scoped_reason_without_scanning() {
         // Request-scoped pre-scan classification outranks index state:
         // a zero-norm query is the caller's defect even on an empty index.
         let fast = InMemoryVectorIndex::from_vectors(Vec::new(), Vec::new(), 2).unwrap();
-        let index = Arc::new(InMemoryTwoTierIndex::new(fast, None));
-        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+        let empty = Arc::new(InMemoryTwoTierIndex::new(fast, None));
+        for index in [empty, make_index()] {
+            let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+            let (results, metrics) = searcher
+                .search_collect(&fast_only_query(vec![0.0, 0.0]), 3)
+                .unwrap();
+            assert!(results.is_empty());
+            assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
+            assert_eq!(metrics.phase1_vectors_searched, 0);
+            assert_eq!(metrics.phase2_vectors_searched, 0);
+        }
+    }
+
+    #[test]
+    fn zero_fast_query_keeps_filtered_lexical_results_in_collect_and_stream() {
+        let lexical = Arc::new(StaticLexical {
+            hits: vec![lexical_result("b", 10.0), lexical_result("lex-only", 9.0)],
+        });
+        let searcher =
+            SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default()).with_lexical(lexical);
+
+        // Missing and zero-norm quality queries both preserve the lexical
+        // answer without inventing semantic evidence or a Refined phase.
+        for query in [fast_only_query(vec![0.0, 0.0]), tiered(vec![0.0, 0.0])] {
+            let (results, metrics) = searcher
+                .search_collect_with_filter(&query, 3, Some(&ExcludeB))
+                .expect("zero fast signal still permits lexical retrieval");
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].doc_id, "lex-only");
+            assert_eq!(results[0].source, ScoreSource::Lexical);
+            assert_eq!(results[0].fast_score, None);
+            assert_eq!(results[0].quality_score, None);
+            assert_eq!(results[0].lexical_score, Some(9.0));
+            assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
+            assert_eq!(metrics.lexical_candidates, 1);
+            assert_eq!(metrics.semantic_candidates, 0);
+            assert_eq!(metrics.phase1_vectors_searched, 0);
+            assert_eq!(metrics.phase2_vectors_searched, 0);
+
+            let phases = searcher
+                .search_iter_with_filter(&query, 3, Some(&ExcludeB))
+                .collect::<Vec<_>>();
+            assert_eq!(phases.len(), 1);
+            let SearchPhase::Initial {
+                results: initial,
+                metrics: initial_metrics,
+                ..
+            } = &phases[0]
+            else {
+                panic!("lexical results must be available in the Initial phase");
+            };
+            assert_eq!(initial[0].doc_id, "lex-only");
+            assert_eq!(initial_metrics.vectors_searched, 0);
+            assert_eq!(initial_metrics.lexical_candidates, 1);
+            assert_eq!(
+                serde_json::to_value(initial).unwrap(),
+                serde_json::to_value(&results).unwrap(),
+                "collect and the last streamed phase must expose identical evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_fast_query_still_retrieves_from_an_attested_quality_tier() {
+        let dir = temp_dir("zero-fast-quality");
+        let (fast, fast_identity) = attested_tier(
+            dir.path(),
+            "vector.fast.idx",
+            "zero-fast",
+            31,
+            &[("fast-only", &[1.0, 0.0])],
+        );
+        let (quality, quality_identity) = attested_tier(
+            dir.path(),
+            "vector.quality.idx",
+            "independent-quality",
+            31,
+            &[
+                ("quality-other", &[1.0, 0.0]),
+                ("quality-only", &[0.0, 1.0]),
+            ],
+        );
+        let searcher = SyncTwoTierSearcher::new(
+            Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality))),
+            TwoTierConfig::default(),
+        );
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![0.0, 0.0], fast_identity).expect("bind zero fast"),
+            BoundQueryEmbedding::new(vec![0.0, 1.0], quality_identity).expect("bind quality"),
+        );
         let (results, metrics) = searcher
-            .search_collect(&fast_only_query(vec![0.0, 0.0]), 3)
-            .unwrap();
+            .search_collect(&query, 1)
+            .expect("the independent quality query can answer without fast candidates");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].doc_id, "quality-only");
+        assert_eq!(results[0].source, ScoreSource::SemanticQuality);
+        assert_eq!(results[0].index, None);
+        assert_eq!(results[0].fast_score, None);
+        assert_eq!(results[0].quality_score, Some(1.0));
+        assert_eq!(
+            metrics.zero_signal, None,
+            "quality hits make the combined semantic lane nonempty"
+        );
+        assert_eq!(metrics.phase1_vectors_searched, 0);
+        assert_eq!(metrics.phase2_vectors_searched, 2);
+        assert_eq!(metrics.skip_reason, None);
+
+        let phases = searcher.search_iter(&query, 1).collect::<Vec<_>>();
+        let [
+            SearchPhase::Initial {
+                results: initial,
+                metrics: initial_metrics,
+                ..
+            },
+            SearchPhase::Refined {
+                results: refined, ..
+            },
+        ] = phases.as_slice()
+        else {
+            panic!("independent quality retrieval must produce Initial then Refined");
+        };
+        assert!(initial.is_empty());
+        assert_eq!(initial_metrics.vectors_searched, 0);
+        assert_eq!(
+            serde_json::to_value(refined).unwrap(),
+            serde_json::to_value(&results).unwrap()
+        );
+    }
+
+    #[test]
+    fn zero_quality_query_preserves_fast_and_lexical_results_on_attested_tiers() {
+        let dir = temp_dir("zero-quality");
+        let (fast, fast_identity) = attested_tier(
+            dir.path(),
+            "vector.fast.idx",
+            "zero-quality-fast",
+            32,
+            &[("fast-only", &[1.0, 0.0])],
+        );
+        let (quality, quality_identity) = attested_tier(
+            dir.path(),
+            "vector.quality.idx",
+            "zero-quality-independent",
+            32,
+            &[("quality-only", &[0.0, 1.0])],
+        );
+        let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)));
+
+        // Both-zero queries must stay empty or lexical-only. A useful fast
+        // query must retain its results when only the quality vector is zero.
+        for fast_signal in [false, true] {
+            let query = TieredQueryEmbeddings::progressive(
+                BoundQueryEmbedding::new(
+                    vec![if fast_signal { 1.0 } else { 0.0 }, 0.0],
+                    fast_identity.clone(),
+                )
+                .expect("bind fast"),
+                BoundQueryEmbedding::new(vec![0.0, 0.0], quality_identity.clone())
+                    .expect("bind zero quality"),
+            );
+            for has_lexical in [false, true] {
+                let mut searcher =
+                    SyncTwoTierSearcher::new(Arc::clone(&index), TwoTierConfig::default());
+                if has_lexical {
+                    searcher = searcher.with_lexical(Arc::new(StaticLexical {
+                        hits: vec![lexical_result("lex-only", 10.0)],
+                    }));
+                }
+                let (results, metrics) = searcher.search_collect(&query, 2).unwrap();
+                let mut ids: Vec<&str> = results.iter().map(|hit| hit.doc_id.as_str()).collect();
+                ids.sort_unstable();
+                let mut expected = Vec::new();
+                if fast_signal {
+                    expected.push("fast-only");
+                }
+                if has_lexical {
+                    expected.push("lex-only");
+                }
+                assert_eq!(
+                    ids, expected,
+                    "zero quality must never retrieve quality-only"
+                );
+                for result in &results {
+                    assert_eq!(
+                        result.source,
+                        if result.doc_id == "fast-only" {
+                            ScoreSource::SemanticFast
+                        } else {
+                            ScoreSource::Lexical
+                        }
+                    );
+                    assert_eq!(result.quality_score, None);
+                }
+                assert_eq!(
+                    metrics.zero_signal,
+                    (!fast_signal).then_some(ZeroSignalReason::ZeroNormQuery)
+                );
+                assert_eq!(metrics.phase1_vectors_searched, usize::from(fast_signal));
+                assert_eq!(metrics.phase2_vectors_searched, 0);
+                assert_eq!(metrics.lexical_candidates, usize::from(has_lexical));
+                assert_eq!(
+                    metrics.skip_reason.as_deref(),
+                    Some("quality_query_zero_norm")
+                );
+
+                let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+                let [
+                    SearchPhase::Initial {
+                        results: initial, ..
+                    },
+                ] = phases.as_slice()
+                else {
+                    panic!("a zero quality query must not publish a Refined phase");
+                };
+                assert_eq!(
+                    serde_json::to_value(initial).unwrap(),
+                    serde_json::to_value(&results).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_quality_query_does_not_rescore_legacy_fast_hits() {
+        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
+        let query = TieredQueryEmbeddings::progressive(
+            bound("sync-fixture", vec![1.0, 0.0]),
+            bound("sync-fixture", vec![0.0, 0.0]),
+        );
+        let (results, metrics) = searcher.search_collect(&query, 2).unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(
+            results.iter().all(|hit| {
+                hit.source == ScoreSource::SemanticFast && hit.quality_score.is_none()
+            })
+        );
+        assert_eq!(metrics.zero_signal, None);
+        assert_eq!(metrics.phase2_vectors_searched, 0);
+        assert_eq!(
+            metrics.skip_reason.as_deref(),
+            Some("quality_query_zero_norm")
+        );
+        let phases = searcher.search_iter(&query, 2).collect::<Vec<_>>();
+        let [
+            SearchPhase::Initial {
+                results: initial, ..
+            },
+        ] = phases.as_slice()
+        else {
+            panic!("legacy rescoring must also skip a zero quality query");
+        };
+        assert_eq!(
+            serde_json::to_value(initial).unwrap(),
+            serde_json::to_value(&results).unwrap()
+        );
+    }
+
+    #[test]
+    fn zero_k_with_zero_fast_query_does_not_call_lexical_or_refine() {
+        struct UnreachableLexical;
+        impl SyncLexicalSearch for UnreachableLexical {
+            fn search_sync(
+                &self,
+                _query: &[f32],
+                _limit: usize,
+            ) -> SearchResult<Vec<ScoredResult>> {
+                panic!("a zero-k search must not call the lexical backend");
+            }
+        }
+        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
+            .with_lexical(Arc::new(UnreachableLexical));
+        let query = tiered(vec![0.0, 0.0]);
+        let (results, metrics) = searcher.search_collect(&query, 0).unwrap();
         assert!(results.is_empty());
-        assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
+        assert_eq!(metrics.zero_signal, None);
+        assert_eq!(metrics.phase1_vectors_searched, 0);
+        assert_eq!(metrics.phase2_vectors_searched, 0);
+        assert_eq!(searcher.search_iter(&query, 0).count(), 0);
     }
 
     #[test]
