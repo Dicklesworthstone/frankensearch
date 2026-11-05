@@ -2,28 +2,31 @@
 //!
 //! A separate startup grant permits changing the serving producer. This path
 //! retains the original qualified root, admits the complete selected successor,
-//! and replaces the model, reader and fixed scope together. It never rebuilds,
-//! publishes, writes a receipt, downloads a model or changes the selected tier.
+//! and replaces the model, reader and fixed scope together. Explicit quality
+//! completion retains the fast model and admits a full successor of the same
+//! source cohort. Neither operation rebuilds, publishes, writes a receipt or
+//! downloads a model.
 
 use super::{
     Arc, AuthorityModels, AuthorityRefV1, AuthoritySession, Cx, Deserialize, Embedder,
-    EmbedderTierTag, Error, Models, Path, PathBuf, Receipt, Result, SearchError,
-    admit_serving_models, checkpoint, models, prepare_scope, serve_refused,
+    EmbedderTierTag, Error, Models, NativeGenerationTopology, Path, PathBuf, Receipt, Result,
+    SearchError, admit_serving_models, checkpoint, models, prepare_scope, serve_refused,
 };
 
 const MAX_PATH_BYTES: usize = 4096;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
     ActivateModel,
+    ActivateQualityCompletion,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Request {
     #[serde(rename = "op")]
-    _operation: Operation,
+    operation: Operation,
     pub(super) id: Option<String>,
     receipt: PathBuf,
     expected_authority: Vec<u8>,
@@ -33,6 +36,17 @@ pub(super) struct Request {
 }
 
 impl Request {
+    pub(super) const fn completes_quality(&self) -> bool {
+        matches!(self.operation, Operation::ActivateQualityCompletion)
+    }
+
+    pub(super) const fn operation(&self) -> &'static str {
+        match self.operation {
+            Operation::ActivateModel => "activate_model",
+            Operation::ActivateQualityCompletion => "activate_quality_completion",
+        }
+    }
+
     fn model_options(
         &self,
         tier: EmbedderTierTag,
@@ -131,8 +145,20 @@ impl AuthoritySession {
         if expected != self.snapshot.authority() {
             return Err(serve_refused("stale_expected_authority"));
         }
-        let options =
-            request.model_options(self.receipt.tier, self.receipt.quality_identity.is_some())?;
+        let completes_quality = request.completes_quality();
+        let options = if completes_quality {
+            if self.receipt.topology() != NativeGenerationTopology::FastOnly {
+                return Err(serve_refused("quality_completion_requires_fast_only"));
+            }
+            // The fast provider is retained, not reloaded from request paths.
+            // Refuse drift before reading a candidate or loading its quality model.
+            let admission = self.models.admit(&self.receipt);
+            checkpoint(cx)?;
+            admission?;
+            request.model_options(EmbedderTierTag::Quality, true)?
+        } else {
+            request.model_options(self.receipt.tier, self.receipt.quality_identity.is_some())?
+        };
         let selected = Receipt::read(&request.receipt);
         checkpoint(cx)?;
         let selected =
@@ -144,7 +170,20 @@ impl AuthoritySession {
         {
             return Err(serve_refused("model_activation_root_or_tier_mismatch"));
         }
-        if selected.topology() != self.receipt.topology() {
+        if completes_quality {
+            if selected.topology() != NativeGenerationTopology::FullProgressive {
+                return Err(serve_refused("quality_completion_requires_full"));
+            }
+            if selected.identity != self.receipt.identity {
+                return Err(serve_refused("quality_completion_fast_identity_mismatch"));
+            }
+            if selected.generation.sequence <= self.receipt.generation.sequence {
+                return Err(serve_refused("quality_completion_not_newer_generation"));
+            }
+            if selected.documents != self.receipt.documents {
+                return Err(serve_refused("quality_completion_source_mismatch"));
+            }
+        } else if selected.topology() != self.receipt.topology() {
             return Err(serve_refused("model_activation_topology_mismatch"));
         }
         if selected.authority()?.sequence <= self.snapshot.authority().sequence {
@@ -159,6 +198,11 @@ impl AuthoritySession {
                 .as_ref()
                 .zip(self.receipt.quality_identity.as_ref())
                 .is_some_and(|(next, previous)| next.identity.input != previous.identity.input)
+            || (completes_quality
+                && selected.quality_identity.as_ref().is_some_and(|quality| {
+                    quality.identity.input != self.receipt.identity.identity.input
+                        || quality.identity.space.kind != self.receipt.identity.identity.space.kind
+                }))
         {
             return Err(serve_refused("model_activation_input_contract_mismatch"));
         }
@@ -171,6 +215,23 @@ impl AuthoritySession {
         let snapshot = Arc::new(
             snapshot.map_err(|error| bounded_error(error, "model_activation_admission_failed"))?,
         );
+        if completes_quality {
+            // A matching count or ID set cannot prove that bodies, titles or
+            // metadata stayed unchanged. The exact retained Quill image covers
+            // all source fields, and both admitted manifests bind the same cut.
+            let previous = self.snapshot.retained_snapshot().manifest();
+            let next = snapshot.retained_snapshot().manifest();
+            if next.source_checkpoint_sha256() != previous.source_checkpoint_sha256()
+                || next.document_set_sha256() != previous.document_set_sha256()
+                || next.components().lexical != previous.components().lexical
+                || snapshot.metadata().commit_range != self.snapshot.metadata().commit_range
+            {
+                return Err(serve_refused("quality_completion_source_mismatch"));
+            }
+            if snapshot.retrieval_configuration() != self.snapshot.retrieval_configuration() {
+                return Err(serve_refused("quality_completion_fast_retrieval_mismatch"));
+            }
+        }
         let scope = prepare_scope(
             cx,
             &snapshot,
@@ -185,14 +246,18 @@ impl AuthoritySession {
         } else {
             &options
         };
-        let model = load_model(
-            cx,
-            request.model_dir.as_deref(),
-            selected.tier,
-            primary_options,
-        );
-        checkpoint(cx)?;
-        let model = model.map_err(|error| bounded_error(error, "model_activation_load_failed"))?;
+        let model = if completes_quality {
+            Arc::clone(&self.models.models()?.fast)
+        } else {
+            let loaded = load_model(
+                cx,
+                request.model_dir.as_deref(),
+                selected.tier,
+                primary_options,
+            );
+            checkpoint(cx)?;
+            loaded.map_err(|error| bounded_error(error, "model_activation_load_failed"))?
+        };
         let quality = if selected.quality_identity.is_some() {
             let loaded = load_model(
                 cx,
@@ -209,8 +274,9 @@ impl AuthoritySession {
             fast: model,
             quality,
         };
-        admit_serving_models(&selected, &loaded)?;
+        let admission = admit_serving_models(&selected, &loaded);
         checkpoint(cx)?;
+        admission?;
 
         // Loading can be slow. A successor published meanwhile must not turn
         // this stale request into an implicit selection of that newer head.
@@ -226,8 +292,9 @@ impl AuthoritySession {
             return Err(serve_refused("model_activation_head_changed"));
         }
         drop(current);
-        admit_serving_models(&selected, &loaded)?;
+        let admission = admit_serving_models(&selected, &loaded);
         checkpoint(cx)?;
+        admission?;
 
         // The request loop exclusively owns all session fields. No fallible
         // operation or query can run between these assignments.
@@ -254,13 +321,26 @@ mod tests {
     }
 
     #[test]
-    fn model_activation_request_has_one_strict_operation_and_no_writer_fields() {
-        let parsed: Request = serde_json::from_value(request()).unwrap();
-        assert_eq!(parsed.id.as_deref(), Some("selected-model"));
-        for field in ["work_dir", "changes", "filter", "tier", "exact", "mode"] {
+    fn model_activation_requests_have_explicit_operations_and_no_writer_fields() {
+        for operation in ["activate_model", "activate_quality_completion"] {
             let mut value = request();
-            value[field] = serde_json::json!("ungranted");
-            assert!(serde_json::from_value::<Request>(value).is_err(), "{field}");
+            value["op"] = serde_json::json!(operation);
+            let parsed: Request = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(parsed.id.as_deref(), Some("selected-model"));
+            assert_eq!(parsed.operation(), operation);
+            assert_eq!(
+                parsed.completes_quality(),
+                operation == "activate_quality_completion"
+            );
+            assert!(matches!(
+                serde_json::from_value::<super::super::AuthorityRequest>(value.clone()).unwrap(),
+                super::super::AuthorityRequest::ModelActivation(_)
+            ));
+            for field in ["work_dir", "changes", "filter", "tier", "exact", "mode"] {
+                let mut extra = value.clone();
+                extra[field] = serde_json::json!("ungranted");
+                assert!(serde_json::from_value::<Request>(extra).is_err(), "{field}");
+            }
         }
         for operation in ["activate", "update", "fetch", "migrate", "ACTIVATE_MODEL"] {
             let mut value = request();

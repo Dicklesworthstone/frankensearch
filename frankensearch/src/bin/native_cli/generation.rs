@@ -201,6 +201,13 @@ migration using an exact receipt, expected_authority and explicit local model\n\
 paths. All selected producers, images and fixed scope are validated before the\n\
 swap; failure retains the old complete selection. Topology and prepared-input\n\
 contracts stay fixed. No model is downloaded and no new authority is published.\n\
+The same grant accepts op=activate_quality_completion for an already published\n\
+authority-complete-quality successor of a fast-only session. It retains the fast\n\
+model and loads only the explicitly selected quality model, using quality_backend\n\
+and quality_model_dir for native quality or model_dir for ONNX. The exact fast\n\
+identity, retrieval policy, source checkpoint, document set and Quill image must\n\
+match the serving generation. Full/quality queries become available only after\n\
+complete admission and a final current-head check; failure keeps fast serving.\n\
 Explicit --lexical-only on authority-search/serve runs retained Quill keyword\n\
 search without loading or invoking a model. It excludes model options and\n\
 --allow-updates, but permits source fetch and granted activation. The complete\n\
@@ -3673,6 +3680,11 @@ async fn serve_session(
     ready["documents"] = serde_json::json!(session.receipt.documents);
     ready["activation_enabled"] = serde_json::json!(session.allow_activation);
     ready["model_activation_enabled"] = serde_json::json!(session.allow_model_activation);
+    ready["quality_completion_activation_enabled"] = serde_json::json!(
+        session.allow_model_activation
+            && !session.models.is_lexical()
+            && session.receipt.topology() == NativeGenerationTopology::FastOnly
+    );
     ready["updates_enabled"] = serde_json::json!(session.update_limits.is_some());
     ready["fetch_enabled"] = serde_json::json!(true);
     ready["query_modes"] = if session.models.is_lexical() {
@@ -3735,20 +3747,37 @@ async fn serve_session(
                     .clone()
                     .filter(|id| super::serve::validate_id(Some(id)).is_ok());
                 let previous = session.snapshot.authority();
+                let completes_quality = request.completes_quality();
                 let result = session.activate_model(cx, &request).map(|()| {
-                    let mut response =
-                        session.response("model_activated", true, Some(ordinal), id.as_deref());
-                    response["operation"] = serde_json::json!("activate_model");
+                    let mut response = session.response(
+                        if completes_quality {
+                            "quality_completion_activated"
+                        } else {
+                            "model_activated"
+                        },
+                        true,
+                        Some(ordinal),
+                        id.as_deref(),
+                    );
+                    response["operation"] = serde_json::json!(request.operation());
                     response["serving"] = serde_json::json!("activated");
                     response["previous_authority"] =
                         serde_json::json!(previous.canonical_bytes().as_slice());
                     response["documents"] = serde_json::json!(session.receipt.documents);
-                    response["models_loaded"] =
-                        serde_json::json!(if session.receipt.quality_identity.is_some() {
-                            2
-                        } else {
-                            1
-                        });
+                    response["models_loaded"] = serde_json::json!(if !completes_quality
+                        && session.receipt.quality_identity.is_some()
+                    {
+                        2
+                    } else {
+                        1
+                    });
+                    if completes_quality {
+                        response["fast_model_retained"] = serde_json::json!(true);
+                        response["progressive_available"] = serde_json::json!(true);
+                        response["query_modes"] =
+                            serde_json::json!(["fast", "quality", "full", "lexical"]);
+                        response["default_mode"] = serde_json::json!("full");
+                    }
                     Some(response)
                 });
                 (id, result, false)
