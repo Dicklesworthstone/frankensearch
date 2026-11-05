@@ -1316,6 +1316,18 @@ enum WatcherLifecycle {
         generation: u64,
         stop: Arc<WatcherStop>,
     },
+    Abandoned {
+        generation: u64,
+        stop: Arc<WatcherStop>,
+        tasks: WatcherTasks,
+    },
+}
+
+#[derive(Default)]
+struct WatcherTasks {
+    producer: Option<ProducerHandle>,
+    ingest_task: Option<TaskHandle<SearchResult<()>>>,
+    failure: Option<SearchError>,
 }
 
 #[derive(Default)]
@@ -1335,8 +1347,7 @@ enum StartDecision {
     Drain {
         generation: u64,
         stop: Arc<WatcherStop>,
-        producer: ProducerHandle,
-        ingest_task: TaskHandle<SearchResult<()>>,
+        tasks: WatcherTasks,
     },
 }
 
@@ -1346,8 +1357,7 @@ enum StopDecision {
     Drain {
         generation: u64,
         stop: Arc<WatcherStop>,
-        producer: ProducerHandle,
-        ingest_task: TaskHandle<SearchResult<()>>,
+        tasks: WatcherTasks,
     },
 }
 
@@ -1378,27 +1388,12 @@ impl WatcherControl {
             } if !producer.is_finished() && !ingest_task.is_finished() => {
                 StartDecision::AlreadyRunning
             }
-            WatcherLifecycle::Running { .. } => {
-                let old = std::mem::take(&mut self.lifecycle);
-                let WatcherLifecycle::Running {
-                    generation,
-                    stop,
-                    producer,
-                    ingest_task,
-                } = old
-                else {
-                    unreachable!("running lifecycle was just matched")
-                };
-                stop.request();
-                self.lifecycle = WatcherLifecycle::Stopping {
-                    generation,
-                    stop: Arc::clone(&stop),
-                };
+            WatcherLifecycle::Running { .. } | WatcherLifecycle::Abandoned { .. } => {
+                let (generation, stop, tasks) = self.take_drain();
                 StartDecision::Drain {
                     generation,
                     stop,
-                    producer,
-                    ingest_task,
+                    tasks,
                 }
             }
         }
@@ -1415,30 +1410,46 @@ impl WatcherControl {
                 StopDecision::Wait
             }
             WatcherLifecycle::Stopping { .. } => StopDecision::Wait,
-            WatcherLifecycle::Running { .. } => {
-                let old = std::mem::take(&mut self.lifecycle);
-                let WatcherLifecycle::Running {
-                    generation,
-                    stop,
-                    producer,
-                    ingest_task,
-                } = old
-                else {
-                    unreachable!("running lifecycle was just matched")
-                };
-                stop.request();
-                self.lifecycle = WatcherLifecycle::Stopping {
-                    generation,
-                    stop: Arc::clone(&stop),
-                };
+            WatcherLifecycle::Running { .. } | WatcherLifecycle::Abandoned { .. } => {
+                let (generation, stop, tasks) = self.take_drain();
                 StopDecision::Drain {
                     generation,
                     stop,
-                    producer,
-                    ingest_task,
+                    tasks,
                 }
             }
         }
+    }
+
+    fn take_drain(&mut self) -> (u64, Arc<WatcherStop>, WatcherTasks) {
+        let (generation, stop, tasks) = match std::mem::take(&mut self.lifecycle) {
+            WatcherLifecycle::Running {
+                generation,
+                stop,
+                producer,
+                ingest_task,
+            } => (
+                generation,
+                stop,
+                WatcherTasks {
+                    producer: Some(producer),
+                    ingest_task: Some(ingest_task),
+                    failure: None,
+                },
+            ),
+            WatcherLifecycle::Abandoned {
+                generation,
+                stop,
+                tasks,
+            } => (generation, stop, tasks),
+            _ => unreachable!("only a running or abandoned generation can be drained"),
+        };
+        stop.request();
+        self.lifecycle = WatcherLifecycle::Stopping {
+            generation,
+            stop: Arc::clone(&stop),
+        };
+        (generation, stop, tasks)
     }
 
     fn generation_can_publish(&self, generation: u64) -> bool {
@@ -1566,8 +1577,8 @@ impl FsWatcher {
         self.stats.snapshot()
     }
 
-    /// Report whether a started watcher generation has reached a terminal task
-    /// outcome that its owner must join with [`Self::stop_checked`].
+    /// Report whether a watcher has a terminal task outcome or an abandoned
+    /// lifecycle transition to join with [`Self::stop_checked`].
     #[must_use]
     pub fn has_terminal_task_outcome(&self) -> bool {
         let control = lock_or_recover(&self.control);
@@ -1578,6 +1589,7 @@ impl FsWatcher {
                 ingest_task,
                 ..
             } => producer.is_finished() || ingest_task.is_finished(),
+            WatcherLifecycle::Abandoned { .. } => true,
             WatcherLifecycle::Starting { .. } | WatcherLifecycle::Stopping { .. } => false,
         }
     }
@@ -1630,20 +1642,11 @@ impl FsWatcher {
                 StartDecision::Drain {
                     generation,
                     stop,
-                    producer,
-                    ingest_task,
+                    tasks,
                 } => {
-                    stop.request();
-                    let result = finish_watcher_tasks(
-                        cx,
-                        Some(producer),
-                        Some(ingest_task),
-                        &self.ready_batches,
-                        &self.reconciliation,
-                    )
-                    .await;
-                    lock_or_recover(&self.control).complete_generation(generation);
-                    result?;
+                    WatcherDrain::new(self, generation, stop, tasks)
+                        .finish(cx)
+                        .await?;
                 }
                 StartDecision::Begin { generation, stop } => {
                     return self.start_generation(cx, generation, stop).await;
@@ -1664,6 +1667,9 @@ impl FsWatcher {
         let admitted_for_task = Arc::clone(&admitted);
         let producer_done = Arc::new(AtomicBool::new(false));
         let producer_done_for_task = Arc::clone(&producer_done);
+        let mut owner =
+            WatcherDrain::new(self, generation, Arc::clone(&stop), WatcherTasks::default());
+        owner.unstarted_producer = Some(Arc::clone(&producer_done));
         let ingest = Arc::clone(&self.ingest);
         let ingest_discovery = self.discovery.clone();
         let ingest_stats = Arc::clone(&self.stats);
@@ -1706,10 +1712,10 @@ impl FsWatcher {
                 let error = watcher_task_error(format!(
                     "failed to spawn caller-owned ingest task: {error}"
                 ));
-                lock_or_recover(&self.control).complete_generation(generation);
                 return Err(error);
             }
         };
+        owner.tasks.ingest_task = Some(ingest_task);
 
         for _ in 0..ADMISSION_POLLS {
             if admitted.load(Ordering::Acquire) {
@@ -1718,63 +1724,31 @@ impl FsWatcher {
             let still_starting = lock_or_recover(&self.control).generation_can_publish(generation);
             if stop.is_requested() || !still_starting {
                 stop.request();
-                ingest_task.abort_with_reason(CancelReason::shutdown());
-                let _ = finish_watcher_tasks(
-                    cx,
-                    None,
-                    Some(ingest_task),
-                    &self.ready_batches,
-                    &self.reconciliation,
-                )
-                .await;
-                lock_or_recover(&self.control).complete_generation(generation);
+                owner
+                    .ingest_task()
+                    .abort_with_reason(CancelReason::shutdown());
+                let _ = owner.finish(cx).await;
                 return Ok(());
             }
-            if ingest_task.is_finished() {
-                let result = finish_watcher_tasks(
-                    cx,
-                    None,
-                    Some(ingest_task),
-                    &self.ready_batches,
-                    &self.reconciliation,
-                )
-                .await;
-                lock_or_recover(&self.control).complete_generation(generation);
-                return result;
+            if owner.ingest_task().is_finished() {
+                return owner.finish(cx).await;
             }
             asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
         }
 
         if !admitted.load(Ordering::Acquire) {
             stop.request();
-            ingest_task.abort_with_reason(CancelReason::user(
+            owner.ingest_task().abort_with_reason(CancelReason::user(
                 "watcher ingest admission handshake timed out",
             ));
-            let _ = finish_watcher_tasks(
-                cx,
-                None,
-                Some(ingest_task),
-                &self.ready_batches,
-                &self.reconciliation,
-            )
-            .await;
+            let _ = owner.finish(cx).await;
             let error =
                 watcher_task_error("watcher ingest task was not admitted within 1000 polls");
-            lock_or_recover(&self.control).complete_generation(generation);
             return Err(error);
         }
 
-        if ingest_task.is_finished() {
-            let result = finish_watcher_tasks(
-                cx,
-                None,
-                Some(ingest_task),
-                &self.ready_batches,
-                &self.reconciliation,
-            )
-            .await;
-            lock_or_recover(&self.control).complete_generation(generation);
-            return result;
+        if owner.ingest_task().is_finished() {
+            return owner.finish(cx).await;
         }
 
         let producer_context = ProducerContext {
@@ -1797,33 +1771,28 @@ impl FsWatcher {
             Ok(producer) => producer,
             Err(error) => {
                 stop.request();
-                ingest_task.abort_with_reason(CancelReason::shutdown());
-                let _ = finish_watcher_tasks(
-                    cx,
-                    None,
-                    Some(ingest_task),
-                    &self.ready_batches,
-                    &self.reconciliation,
-                )
-                .await;
+                owner
+                    .ingest_task()
+                    .abort_with_reason(CancelReason::shutdown());
+                let _ = owner.finish(cx).await;
                 let error =
                     watcher_task_error(format!("failed to spawn watcher producer: {error}"));
-                lock_or_recover(&self.control).complete_generation(generation);
                 return Err(error);
             }
         };
 
-        let mut pair = Some((producer, ingest_task));
+        owner.unstarted_producer = None;
+        owner.tasks.producer = Some(producer);
         let published = {
             let mut control = lock_or_recover(&self.control);
             if control.generation_can_publish(generation) && !stop.is_requested() {
-                let (producer, ingest_task) = pair.take().expect("unpublished watcher pair");
                 control.lifecycle = WatcherLifecycle::Running {
                     generation,
                     stop: Arc::clone(&stop),
-                    producer,
-                    ingest_task,
+                    producer: owner.tasks.producer.take().expect("unpublished producer"),
+                    ingest_task: owner.tasks.ingest_task.take().expect("unpublished ingest"),
                 };
+                owner.completed = true;
                 true
             } else {
                 false
@@ -1834,18 +1803,7 @@ impl FsWatcher {
             return Ok(());
         }
 
-        stop.request();
-        let (producer, ingest_task) = pair.expect("unpublished watcher pair remains owned");
-        let result = finish_watcher_tasks(
-            cx,
-            Some(producer),
-            Some(ingest_task),
-            &self.ready_batches,
-            &self.reconciliation,
-        )
-        .await;
-        lock_or_recover(&self.control).complete_generation(generation);
-        result
+        owner.finish(cx).await
     }
 
     /// Stop background watch processing, logging any terminal task failure.
@@ -1893,20 +1851,11 @@ impl FsWatcher {
                 StopDecision::Drain {
                     generation,
                     stop,
-                    producer,
-                    ingest_task,
+                    tasks,
                 } => {
-                    stop.request();
-                    let result = finish_watcher_tasks(
-                        cx,
-                        Some(producer),
-                        Some(ingest_task),
-                        &self.ready_batches,
-                        &self.reconciliation,
-                    )
-                    .await;
-                    lock_or_recover(&self.control).complete_generation(generation);
-                    return result;
+                    return WatcherDrain::new(self, generation, stop, tasks)
+                        .finish(cx)
+                        .await;
                 }
             }
         }
@@ -2218,6 +2167,12 @@ impl Drop for FsWatcher {
             } => {
                 stop.request();
                 ingest_task.abort_with_reason(CancelReason::shutdown());
+            }
+            WatcherLifecycle::Abandoned { stop, tasks, .. } => {
+                stop.request();
+                if let Some(ingest_task) = &tasks.ingest_task {
+                    ingest_task.abort_with_reason(CancelReason::shutdown());
+                }
             }
         }
     }
@@ -3286,45 +3241,111 @@ fn fold_queue_into_reconciliation(
     lock_or_recover(reconciliation).require_for_events(&queued)
 }
 
-async fn finish_watcher_tasks(
-    cx: &Cx,
-    producer: Option<ProducerHandle>,
-    ingest_task: Option<TaskHandle<SearchResult<()>>>,
-    ready_batches: &ReadyBatchQueue,
-    reconciliation: &ReconciliationTracker,
-) -> SearchResult<()> {
-    let mut failure = None;
-    if let Some(producer) = producer {
-        match producer.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => failure = Some(error),
-            Err(error) => {
-                failure = Some(watcher_task_error(format!(
-                    "fsfs watcher producer panicked during shutdown: {error:?}"
-                )));
-            }
+/// Own a transition's tasks across every suspension. Dropping a public lifecycle
+/// future returns these owners to the control, so another caller can finish the
+/// same drain instead of waiting on an ownerless Starting/Stopping generation.
+struct WatcherDrain<'a> {
+    watcher: &'a FsWatcher,
+    generation: u64,
+    stop: Arc<WatcherStop>,
+    tasks: WatcherTasks,
+    unstarted_producer: Option<Arc<AtomicBool>>,
+    completed: bool,
+}
+
+impl<'a> WatcherDrain<'a> {
+    fn new(
+        watcher: &'a FsWatcher,
+        generation: u64,
+        stop: Arc<WatcherStop>,
+        tasks: WatcherTasks,
+    ) -> Self {
+        Self {
+            watcher,
+            generation,
+            stop,
+            tasks,
+            unstarted_producer: None,
+            completed: false,
         }
     }
 
-    if let Some(mut ingest_task) = ingest_task {
-        match ingest_task.join(cx).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                failure.get_or_insert(error);
-            }
-            Err(error) => {
-                failure.get_or_insert_with(|| {
-                    watcher_task_error(format!("fsfs watcher ingest task terminated: {error}"))
-                });
-            }
+    fn ingest_task(&self) -> &TaskHandle<SearchResult<()>> {
+        self.tasks.ingest_task.as_ref().expect("owned ingest task")
+    }
+
+    fn finish_unstarted_producer(&mut self) {
+        if let Some(done) = self.unstarted_producer.take() {
+            done.store(true, Ordering::Release);
         }
     }
 
-    // An aborted ingest cannot drain the producer's final flush. Every drain
-    // owner (stop, restart, or an unpublished start) must retain that work before
-    // publishing Stopped, even when joining already yielded a task failure.
-    let reconciled = fold_queue_into_reconciliation(ready_batches, reconciliation);
-    failure.map_or(reconciled, Err)
+    async fn finish(mut self, _cx: &Cx) -> SearchResult<()> {
+        self.stop.request();
+        self.finish_unstarted_producer();
+        if let Some(producer) = self.tasks.producer.take() {
+            match producer.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => self.tasks.failure = Some(error),
+                Err(error) => {
+                    self.tasks.failure = Some(watcher_task_error(format!(
+                        "fsfs watcher producer panicked during shutdown: {error:?}"
+                    )));
+                }
+            }
+        }
+
+        if let Some(ingest_task) = &mut self.tasks.ingest_task {
+            // poll_join retains the receiver on the handle without aborting
+            // the ingest when this waiting future is dropped. A successor
+            // owner resumes the same terminal receive and graceful stop.
+            match std::future::poll_fn(|context| ingest_task.poll_join(context)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    self.tasks.failure.get_or_insert(error);
+                }
+                Err(error) => {
+                    self.tasks.failure.get_or_insert_with(|| {
+                        watcher_task_error(format!("fsfs watcher ingest task terminated: {error}"))
+                    });
+                }
+            }
+            self.tasks.ingest_task = None;
+        }
+
+        // Both owners are terminal. Preserve every late observation before
+        // publishing Stopped, including an earlier task's failure.
+        let reconciled = fold_queue_into_reconciliation(
+            &self.watcher.ready_batches,
+            &self.watcher.reconciliation,
+        );
+        lock_or_recover(&self.watcher.control).complete_generation(self.generation);
+        self.completed = true;
+        self.tasks.failure.take().map_or(reconciled, Err)
+    }
+}
+
+impl Drop for WatcherDrain<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.stop.request();
+        self.finish_unstarted_producer();
+        let mut control = lock_or_recover(&self.watcher.control);
+        if self.tasks.producer.is_none() && self.tasks.ingest_task.is_none() {
+            control.complete_generation(self.generation);
+        } else {
+            // Starting/Stopping exclude a successor until this sole owner
+            // either publishes or completes the generation. Return the same
+            // generation and partial drain; do not mark live owners Stopped.
+            control.lifecycle = WatcherLifecycle::Abandoned {
+                generation: self.generation,
+                stop: Arc::clone(&self.stop),
+                tasks: std::mem::take(&mut self.tasks),
+            };
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8649,6 +8670,150 @@ mod tests {
         });
     }
 
+    #[test]
+    fn dropped_start_future_keeps_its_generation_drainable() {
+        run_on_runtime_task(|cx| async move {
+            let temp = tempdir().expect("tempdir");
+            let pipeline = Arc::new(RecordingPipeline::default());
+            let watcher = FsWatcher::new(
+                vec![temp.path().to_path_buf()],
+                DiscoveryConfig::default(),
+                pipeline.clone(),
+            );
+            let mut starting = Box::pin(watcher.start(&cx));
+            std::future::poll_fn(|context| {
+                assert!(starting.as_mut().poll(context).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(matches!(
+                &lock_or_recover(&watcher.control).lifecycle,
+                WatcherLifecycle::Starting { .. }
+            ));
+            drop(starting);
+
+            watcher
+                .stop_checked_bounded(&cx, 4)
+                .await
+                .expect("another caller must finish an abandoned start");
+            assert!(matches!(
+                &lock_or_recover(&watcher.control).lifecycle,
+                WatcherLifecycle::Stopped
+            ));
+
+            let path = temp.path().join("after-abandoned-start.rs");
+            fs::write(&path, "fn recovered() {}\n").expect("write recovery fixture");
+            watcher
+                .start(&cx)
+                .await
+                .expect("restart after abandoned start");
+            await_startup_reconciliation(&cx, &watcher).await;
+            watcher
+                .stop_checked(&cx)
+                .await
+                .expect("stop restarted watcher");
+            assert_eq!(lock_or_recover(&watcher.control).next_generation, 2);
+            assert!(pipeline.all_ops().iter().any(|op| {
+                matches!(op, WatchIngestOp::Upsert { file_key, .. }
+                    if file_key == &normalize_file_key(&path))
+            }));
+        });
+    }
+
+    #[test]
+    fn dropped_drain_futures_keep_live_ingest_owned_until_a_successor_joins_it() {
+        for restart_drain in [false, true] {
+            run_on_runtime_task(move |cx| async move {
+                let temp = tempdir().expect("tempdir");
+                let initial = temp.path().join("initial.rs");
+                fs::write(&initial, "fn initial() {}\n").expect("write initial fixture");
+                let pipeline = Arc::new(ParkedApplyPipeline::default());
+                let _release_on_unwind = ParkedApplyReleaseGuard {
+                    pipeline: Arc::clone(&pipeline),
+                };
+                let watcher = FsWatcher::new(
+                    vec![temp.path().to_path_buf()],
+                    DiscoveryConfig::default(),
+                    pipeline.clone(),
+                );
+                watcher.start(&cx).await.expect("start watcher");
+                for _ in 0..1_000 {
+                    if pipeline.entered.load(Ordering::Acquire) {
+                        break;
+                    }
+                    asupersync::time::sleep(cx.now(), Duration::from_millis(1)).await;
+                }
+                assert!(
+                    pipeline.entered.load(Ordering::Acquire),
+                    "apply must be parked"
+                );
+
+                let mut stopping = Box::pin(watcher.stop_checked(&cx));
+                std::future::poll_fn(|context| {
+                    assert!(stopping.as_mut().poll(context).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                drop(stopping);
+                assert!(watcher.has_terminal_task_outcome());
+
+                // Either public entry point can take the abandoned owners.
+                // Abandon it a second time while the same ingest is still live.
+                let mut draining: WatchIngestFuture<'_, ()> = if restart_drain {
+                    Box::pin(watcher.start(&cx))
+                } else {
+                    Box::pin(watcher.stop_checked(&cx))
+                };
+                std::future::poll_fn(|context| {
+                    assert!(draining.as_mut().poll(context).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                drop(draining);
+                assert_eq!(lock_or_recover(&watcher.control).next_generation, 1);
+                assert!(lock_or_recover(&pipeline.applied).is_empty());
+
+                let late_path = temp.path().join("late-delete.rs");
+                lock_or_recover(&watcher.ready_batches)
+                    .push_back(vec![WatchEvent::deleted(late_path.clone(), 901)]);
+                pipeline.released.store(true, Ordering::Release);
+                watcher
+                    .stop_checked_bounded(&cx, 4)
+                    .await
+                    .expect("replacement owner must finish the graceful drain");
+                assert!(lock_or_recover(&watcher.ready_batches).is_empty());
+                assert!(
+                    lock_or_recover(&watcher.reconciliation)
+                        .affected_paths
+                        .contains(&late_path)
+                );
+                assert!(matches!(
+                    &lock_or_recover(&watcher.control).lifecycle,
+                    WatcherLifecycle::Stopped
+                ));
+
+                let later = temp.path().join("after-abandoned-drain.rs");
+                fs::write(&later, "fn later() {}\n").expect("write restart fixture");
+                watcher.start(&cx).await.expect("restart drained watcher");
+                await_startup_reconciliation(&cx, &watcher).await;
+                watcher
+                    .stop_checked(&cx)
+                    .await
+                    .expect("stop restarted watcher");
+                assert_eq!(lock_or_recover(&watcher.control).next_generation, 2);
+                assert!(
+                    lock_or_recover(&pipeline.applied)
+                        .iter()
+                        .flatten()
+                        .any(|op| {
+                            matches!(op, WatchIngestOp::Upsert { file_key, .. }
+                        if file_key == &normalize_file_key(&later))
+                        })
+                );
+            });
+        }
+    }
+
     /// A wedged lifecycle transition must time out rather than poll forever.
     ///
     /// Both entry points wait on a generation another caller owns. The public
@@ -9697,6 +9862,10 @@ mod tests {
                     WatcherLifecycle::Stopped => true,
                     WatcherLifecycle::Running { producer, .. } => producer.is_finished(),
                     WatcherLifecycle::Starting { .. } | WatcherLifecycle::Stopping { .. } => false,
+                    WatcherLifecycle::Abandoned { tasks, .. } => tasks
+                        .producer
+                        .as_ref()
+                        .is_none_or(|producer| producer.is_finished()),
                 });
                 drop(control);
             }
